@@ -1,4 +1,5 @@
 local wezterm = require 'wezterm';
+local os_utils = require 'util.os'.os_utils
 local table_utils = require 'util.table'.table_utils
 
 local misc = {
@@ -22,7 +23,7 @@ local misc = {
       family = "MesloLGS NF",
     }
   }),
-  font_size = 14,
+  font_size = os_utils.system() == "macos" and 14 or 12,
   initial_cols = 150,
   initial_rows = 50,
 }

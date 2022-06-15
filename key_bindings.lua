@@ -1,4 +1,5 @@
 local wezterm = require 'wezterm'
+local os_utils = require 'util.os'.os_utils
 
 local function keybind(mods, key, action)
   return {mods = mods, key = key, action = action}
@@ -10,7 +11,7 @@ end
 
 local config = {}
 
-local command = "CMD"
+local command = os_utils.system() == "macos" and "CMD" or "CTRL"
 local shift = "SHIFT"
 local alt = "ALT"
 local command_shift = combine(command, shift)
