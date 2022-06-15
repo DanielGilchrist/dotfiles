@@ -15,6 +15,7 @@ local shift = "SHIFT"
 local alt = "ALT"
 local command_shift = combine(command, shift)
 local command_alt = combine(command, alt)
+local shift_alt = combine(shift, alt)
 
 config.keys = {
   keybind(command_shift, "r", "ReloadConfiguration"),
@@ -56,7 +57,14 @@ config.keys = {
   keybind(alt, "PageDown", wezterm.action{ScrollByPage = 1}),
   keybind(command_alt, "PageDown", wezterm.action{ScrollByPage = 6}),
 
-  keybind("CMD", "Enter", "ToggleFullScreen")
+  keybind(shift_alt, "{", wezterm.action{MoveTabRelative = -1}),
+  keybind(shift_alt, "}", wezterm.action{MoveTabRelative = 1}),
+
+  -- keybind(command, "p", wezterm.action{PaneSelect = {mode = "SwapWithActive"}}), -- Only available in nightly
+
+  keybind("CMD", "Enter", "ToggleFullScreen"),
+
+  keybind("CMD", "q", "Nop") -- disable - this shit is really annoying
 }
 
 return config
