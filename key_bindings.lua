@@ -46,6 +46,9 @@ config.keys = {
   keybind(command_alt, "UpArrow", wezterm.action{ActivatePaneDirection="Up"}),
   keybind(command_alt, "DownArrow", wezterm.action{ActivatePaneDirection="Down"}),
 
+  keybind(command, "LeftArrow", wezterm.action{ActivateTabRelative=-1}),
+  keybind(command, "RightArrow", wezterm.action{ActivateTabRelative=1}),
+
   keybind(command_shift, "UpArrow", "ScrollToTop"),
   keybind(command_shift, "DownArrow", "ScrollToBottom"),
 
