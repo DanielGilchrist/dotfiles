@@ -7,11 +7,12 @@ local misc = {
   automatically_reload_config = false,
   window_close_confirmation = "AlwaysPrompt",
   exit_behavior = "Close",
+  enable_scroll_bar = true, -- per pane scrollbar 👀  - https://github.com/wez/wezterm/pull/1886
   window_padding = {
-    left = 2,
-    right = 2,
-    top = 2,
-    bottom = 2,
+    left = 0,
+    right = 10, -- controls the width of the scrollbar
+    top = 4,
+    bottom = 0,
   },
   color_scheme = "MaterialOcean",
   font = wezterm.font_with_fallback({
