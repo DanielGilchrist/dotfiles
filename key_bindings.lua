@@ -64,8 +64,6 @@ config.keys = {
   -- keybind(command, "p", wezterm.action{PaneSelect = {mode = "SwapWithActive"}}), -- Only available in nightly
 
   keybind("CMD", "Enter", "ToggleFullScreen"),
-
-  keybind("CMD", "q", "Nop") -- disable - this shit is really annoying
 }
 
 return config
