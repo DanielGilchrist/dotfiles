@@ -61,7 +61,7 @@ config.keys = {
   keybind(shift_alt, "{", wezterm.action{MoveTabRelative = -1}),
   keybind(shift_alt, "}", wezterm.action{MoveTabRelative = 1}),
 
-  -- keybind(command, "p", wezterm.action{PaneSelect = {mode = "SwapWithActive"}}), -- Only available in nightly
+  keybind(command_shift, "p", wezterm.action{PaneSelect = {mode = "SwapWithActive"}}), -- Only available in nightly
 
   keybind("CMD", "Enter", "ToggleFullScreen"),
 }
