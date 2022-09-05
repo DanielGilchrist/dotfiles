@@ -14,6 +14,7 @@ local config = {}
 local command = os_utils.system() == "macos" and "CMD" or "CTRL"
 local shift = "SHIFT"
 local alt = "ALT"
+local enter = "Enter"
 local command_shift = combine(command, shift)
 local command_alt = combine(command, alt)
 local shift_alt = combine(shift, alt)
@@ -63,7 +64,7 @@ config.keys = {
 
   keybind(command_shift, "p", wezterm.action{PaneSelect = {mode = "SwapWithActive"}}), -- Only available in nightly
 
-  keybind("CMD", "Enter", "ToggleFullScreen"),
+  keybind(command, enter, "ToggleFullScreen"),
 }
 
 return config

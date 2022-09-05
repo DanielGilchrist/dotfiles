@@ -8,6 +8,7 @@ local misc = {
   window_close_confirmation = "AlwaysPrompt",
   exit_behavior = "Close",
   enable_scroll_bar = true, -- per pane scrollbar 👀  - https://github.com/wez/wezterm/pull/1886
+  scrollback_lines = 25000,
   window_padding = {
     left = 0,
     right = 10, -- controls the width of the scrollbar
@@ -27,6 +28,15 @@ local misc = {
   font_size = os_utils.system() == "macos" and 14 or 12,
   initial_cols = 150,
   initial_rows = 50,
+
+  mouse_bindings = {
+    -- CMD + click links
+    {
+      event = { Up = { streak = 1, button = 'Left' } },
+      mods = "CMD",
+      action = wezterm.action.OpenLinkAtMouseCursor,
+    },
+  },
 }
 
 return table_utils.merge_all(
