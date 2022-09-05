@@ -1,5 +1,5 @@
 local wezterm = require 'wezterm'
-local os_utils = require 'util.os'.os_utils
+local key_utils = require 'util.key'.key_utils
 
 local function keybind(mods, key, action)
   return {mods = mods, key = key, action = action}
@@ -11,7 +11,7 @@ end
 
 local config = {}
 
-local command = os_utils.system() == "macos" and "CMD" or "CTRL"
+local command = key_utils.command_key()
 local shift = "SHIFT"
 local alt = "ALT"
 local enter = "Enter"
@@ -62,7 +62,8 @@ config.keys = {
   keybind(shift_alt, "{", wezterm.action{MoveTabRelative = -1}),
   keybind(shift_alt, "}", wezterm.action{MoveTabRelative = 1}),
 
-  keybind(command_shift, "p", wezterm.action{PaneSelect = {mode = "SwapWithActive"}}), -- Only available in nightly
+  keybind(command_shift, "m", wezterm.action{PaneSelect = {mode = "SwapWithActive"}}),
+  keybind(command_shift, "p", wezterm.action{PaneSelect = {mode = "Activate"}}),
 
   keybind(command, enter, "ToggleFullScreen"),
 }

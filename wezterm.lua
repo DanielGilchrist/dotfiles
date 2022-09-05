@@ -1,6 +1,9 @@
 local wezterm = require 'wezterm';
 local os_utils = require 'util.os'.os_utils
+local key_utils = require 'util.key'.key_utils
 local table_utils = require 'util.table'.table_utils
+
+local command = key_utils.command_key()
 
 local misc = {
   native_macos_fullscreen_mode = true,
@@ -33,9 +36,9 @@ local misc = {
     -- CMD + click links
     {
       event = { Up = { streak = 1, button = 'Left' } },
-      mods = "CMD",
+      mods = command,
       action = wezterm.action.OpenLinkAtMouseCursor,
-    },
+    }
   },
 }
 
