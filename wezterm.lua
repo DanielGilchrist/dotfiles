@@ -1,4 +1,4 @@
-local wezterm = require 'wezterm';
+local wezterm = require 'wezterm'
 local os_utils = require 'util.os'.os_utils
 local key_utils = require 'util.key'.key_utils
 local table_utils = require 'util.table'.table_utils
