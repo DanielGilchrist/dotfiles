@@ -1,12 +1,12 @@
-local wezterm = require 'wezterm'
-local key_utils = require 'util.key'.key_utils
+local wezterm = require "wezterm"
+local key_utils = require "util.key".key_utils
 
 local function keybind(mods, key, action)
   return {mods = mods, key = key, action = action}
 end
 
 local function combine(key1, key2)
-  return key1 .. '|' .. key2
+  return key1 .. "|" .. key2
 end
 
 local config = {}

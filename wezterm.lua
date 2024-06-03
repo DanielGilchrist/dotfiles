@@ -1,7 +1,9 @@
-local wezterm = require 'wezterm'
-local os_utils = require 'util.os'.os_utils
-local key_utils = require 'util.key'.key_utils
-local table_utils = require 'util.table'.table_utils
+require "commands".register_commands()
+
+local wezterm = require "wezterm"
+local os_utils = require "util.os".os_utils
+local key_utils = require "util.key".key_utils
+local table_utils = require "util.table".table_utils
 
 local command = key_utils.command_key()
 
@@ -9,6 +11,7 @@ local misc = {
   native_macos_fullscreen_mode = true,
   automatically_reload_config = false,
   window_close_confirmation = "AlwaysPrompt",
+  notification_handling = "AlwaysShow",
   exit_behavior = "Close",
   enable_scroll_bar = true, -- per pane scrollbar 👀  - https://github.com/wez/wezterm/pull/1886
   scrollback_lines = 25000,
@@ -35,7 +38,7 @@ local misc = {
   mouse_bindings = {
     -- CMD + click links
     {
-      event = { Up = { streak = 1, button = 'Left' } },
+      event = { Up = { streak = 1, button = "Left" } },
       mods = command,
       action = wezterm.action.OpenLinkAtMouseCursor,
     }
