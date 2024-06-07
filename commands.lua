@@ -32,8 +32,7 @@ end
 
 local function wait_for_text_for(pane, ...)
   while true do
-    if has_text(pane, ...)
-    then
+    if has_text(pane, ...) then
       break
     else
       wezterm.sleep_ms(3000)
@@ -43,8 +42,7 @@ end
 
 local function notify(window, title, content)
   -- idk why but I can't get `window:toast_notification` to work on mac for the life of me
-  if os_utils.system() == "macos"
-  then
+  if os_utils.system() == "macos" then
     local q = "\""
     local command = "display notification " .. q .. content .. q .. " with title " .. q .. title .. q
     wezterm.run_child_process { "osascript", "-e", command }
@@ -53,9 +51,50 @@ local function notify(window, title, content)
   end
 end
 
+local function clear(pane)
+  pane:send_text('\x0c')
+end
+
+local function has_interrupted_system_call(pane)
+  return has_text(pane, "cd: Interrupted system call")
+end
+
+local function buffered_cdt(pane)
+  pane:send_text("cdt")
+  wezterm.sleep_ms(100)
+  pane:send_text("\n")
+end
+
+local function wait_for_text()
+  wezterm.sleep_ms(100)
+end
+
+local function handle_potential_interrupted_system_call_from_cdt(pane, already_tried)
+  if has_interrupted_system_call(pane) then
+    if already_tried then
+      notify(pane.window, "OpenWorkTabs", "Error! Can't continue due to issue with executing `cdt`")
+      return true
+    else
+      clear(pane)
+      buffered_cdt(pane)
+      wait_for_text()
+      return handle_potential_interrupted_system_call_from_cdt(pane, true)
+    end
+  else
+    return
+  end
+end
+
+local function handle_missing_cdt_command(pane)
+  if has_text(pane, "Unknown command") then
+    notify(pane.window, "OpenWorkTabs", "Error! Please set a `cdt` alias")
+    return true
+  end
+end
+
 local function open_work_tabs(region)
   return function(original_window, _original_pane, _line)
-    local export_region_and_cdt = function(pane)
+    local function export_region_and_cdt (pane)
       run_command(pane, "export REGION=" .. region)
       run_command(pane, "cdt")
     end
@@ -67,19 +106,13 @@ local function open_work_tabs(region)
     local _tab, server_pane, window = original_window:mux_window():spawn_tab {}
 
     export_region_and_cdt(server_pane)
+    wait_for_text()
 
-    -- Need to sleep a tiny bit for the `has_text` checks below
-    wezterm.sleep_ms(100)
-
-    if has_text(server_pane, "Unknown command")
-    then
-      notify(window, "OpenWorkTabs", "Error! Please set a `cdt` alias")
+    if handle_missing_cdt_command(server_pane) then
       return
     end
 
-    if has_text(server_pane, "cd: Interrupted system call")
-    then
-      notify(window, "OpenWorkTabs", "Error! Can't continue due to issue with `cd`")
+    if handle_potential_interrupted_system_call_from_cdt(server_pane) then
       return
     end
 
