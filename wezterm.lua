@@ -21,7 +21,7 @@ local misc = {
     top = 4,
     bottom = 0,
   },
-  color_scheme = "ayu",
+  color_scheme = "Ayu Dark (Gogh)",
   font = wezterm.font_with_fallback({
     {
       family = "JetBrains Mono",
