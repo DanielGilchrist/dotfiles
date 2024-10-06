@@ -1,4 +1,4 @@
-local os_utils = require "utils.os"
+local os_utils = require("utils.os")
 
 local key_utils = {}
 
