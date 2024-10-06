@@ -1,5 +1,5 @@
 local wezterm = require "wezterm"
-local os_utils = require "util.os".os_utils
+local os_utils = require "utils.os"
 
 local commands = {}
 
@@ -94,7 +94,7 @@ end
 
 local function open_work_tabs(region)
   return function(original_window, _original_pane, _line)
-    local function export_region_and_cdt (pane)
+    local function export_region_and_cdt(pane)
       run_command(pane, "export REGION=" .. region)
       run_command(pane, "cdt")
     end

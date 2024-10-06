@@ -12,6 +12,4 @@ function os_utils.system()
   end
 end
 
-return {
-  os_utils = os_utils
-}
+return os_utils

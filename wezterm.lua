@@ -1,9 +1,9 @@
 require("commands").register_commands()
 
 local wezterm = require("wezterm")
-local os_utils = require("util.os").os_utils
-local key_utils = require("util.key").key_utils
-local table_utils = require("util.table").table_utils
+local os_utils = require("utils.os")
+local key_utils = require("utils.key")
+local table_utils = require("utils.table")
 
 local command = key_utils.command_key()
 
