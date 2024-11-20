@@ -8,6 +8,8 @@ local table_utils = require("utils.table")
 local command = key_utils.command_key()
 
 local misc = {
+  front_end = "WebGpu",
+  webgpu_power_preference = "HighPerformance",
   native_macos_fullscreen_mode = true,
   automatically_reload_config = false,
   window_close_confirmation = "AlwaysPrompt",
