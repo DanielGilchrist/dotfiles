@@ -23,7 +23,7 @@ local misc = {
     top = 4,
     bottom = 0,
   },
-  color_scheme = "Ayu Mirage (Gogh)",
+  color_scheme = "tokyonight_night",
   font = wezterm.font_with_fallback({
     {
       family = "JetBrains Mono",
