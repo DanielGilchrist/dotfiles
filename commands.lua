@@ -133,6 +133,22 @@ local function open_work_tabs(region)
   end
 end
 
+local function bundle_open(original_window, original_pane, _original_line)
+  original_window:perform_action(
+    wezterm.action.PromptInputLine({
+      description = "Enter gem name for bundle open",
+      action = wezterm.action_callback(function(_window, _pane, input)
+        local _tab, pane, _window = original_window:mux_window():spawn_tab {}
+
+        if input then
+          run_command(pane, "bundle open " .. input)
+        end
+      end)
+    }),
+    original_pane
+  )
+end
+
 commands.register_commands = function()
   wezterm.on("augment-command-palette", function(_window, _pane)
     return {
@@ -143,6 +159,10 @@ commands.register_commands = function()
       {
         brief = "[EU] Open work tabs",
         action = wezterm.action_callback(open_work_tabs("eu"))
+      },
+      {
+        brief = "Bundle open",
+        action = wezterm.action_callback(bundle_open)
       }
     }
   end)
