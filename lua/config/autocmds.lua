@@ -4,6 +4,10 @@
 
 local create_autocmd = vim.api.nvim_create_autocmd
 
+vim.api.nvim_create_user_command("Dashboard", function()
+  Snacks.dashboard()
+end, {})
+
 -- nuke trailing whitespace on save
 create_autocmd("BufWritePre", {
   pattern = "*",
