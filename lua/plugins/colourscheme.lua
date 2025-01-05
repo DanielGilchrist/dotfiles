@@ -11,12 +11,12 @@ end
 
 return {
   colourscheme("scottmckendry/cyberdream.nvim", "cyberdream"),
-  colourscheme("marko-cerovac/material.nvim", "material"),
   colourscheme("Shatur/neovim-ayu", "ayu"),
+  colourscheme("ray-x/starry.nvim", "starry"),
   {
     "LazyVim/LazyVim",
     opts = {
-      colorscheme = "tokyonight-night",
+      colorscheme = "deepocean",
     },
   },
 }
