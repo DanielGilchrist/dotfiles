@@ -24,7 +24,7 @@ local misc = {
     top = 4,
     bottom = 0,
   },
-  color_scheme = "tokyonight_night",
+  color_scheme = "MaterialOcean",
   font = wezterm.font_with_fallback({
     {
       family = "JetBrains Mono",
