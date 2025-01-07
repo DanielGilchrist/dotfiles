@@ -1,14 +1,22 @@
-return {
-  time_worked_cmd = function(opts)
-    opts = opts == nil and {} or opts
-    local options_string = ""
+local function build_tanda_cli_cmd(args)
+  local command = string.format("tanda_cli %s 2>/dev/null", table.concat(args, " "))
+  local zsh_command = "zsh -ic '" .. command .. "'" -- zsh is a pain in the ass
+  return command .. " || " .. zsh_command .. " || " .. "echo \"tanda_cli isn't setup!\""
+end
 
-    if opts.no_colour then
-      options_string = options_string .. " --no-colour"
+return {
+  tanda_cli = function(args, opts)
+    opts = opts == nil and {} or opts
+
+    local command = build_tanda_cli_cmd(args)
+
+    if not opts.on_stdout then
+      return command
     end
 
-    local command = string.format("tanda_cli time_worked week%s 2>/dev/null", options_string)
-    local zsh_command = "zsh -ic '" .. command .. "'" -- zsh is a pain in the ass
-    return command .. " || " .. zsh_command .. " || " .. "echo \"tanda_cli isn't setup!\""
+    vim.fn.jobstart(command, {
+      stdout_buffered = true,
+      on_stdout = opts.on_stdout,
+    })
   end
 }

@@ -5,21 +5,7 @@ local function load(name)
 end
 
 local function register_time_worked()
-  local function time_worked()
-    local notify = require("../utils/notify")
-    local time_worked_cmd = require("../utils/cmd").time_worked_cmd({ no_colour = true })
 
-    local function on_stdout(_, data)
-      notify.info(data)
-    end
-
-    vim.fn.jobstart(time_worked_cmd, {
-      stdout_buffered = true,
-      on_stdout = on_stdout,
-    })
-  end
-
-  vim.api.nvim_create_user_command("TimeWorked", time_worked, {})
 end
 
 return {
@@ -31,6 +17,7 @@ return {
     load("scratchpads")
     load("yank_test_line")
     load("bundle_open")
+    load("tanda_cli")
 
     register_time_worked()
   end,

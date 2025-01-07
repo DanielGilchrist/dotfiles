@@ -48,7 +48,7 @@ return {
           icon = "⏲",
           title = "Time Worked",
           section = "terminal",
-          cmd = cmd.time_worked_cmd(),
+          cmd = cmd.tanda_cli({ "time_worked", "week" }),
           padding = 1,
           random = os.time(),
         },
