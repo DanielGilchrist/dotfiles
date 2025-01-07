@@ -21,5 +21,6 @@ install ripgrep rg
 install fzf
 install lazygit
 install crystalline
+install spotify_player
 
 echo -e "\nInstallation complete!"
