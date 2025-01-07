@@ -10,6 +10,9 @@ local function colourscheme(source, name, opts)
 end
 
 return {
+  colourscheme("catppuccin/nvim", "catppuccin", {
+    transparent_background = true,
+  }),
   colourscheme("scottmckendry/cyberdream.nvim", "cyberdream"),
   colourscheme("Shatur/neovim-ayu", "ayu"),
   colourscheme("ray-x/starry.nvim", "starry"),
