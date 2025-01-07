@@ -48,3 +48,15 @@ map("n", l("jC"), function()
 
   vim.cmd(command)
 end, { desc = "Jump to file from clipboard" })
+
+map("n", l("mo"), function()
+  Snacks.terminal.toggle("spotify_player", {
+    win = {
+      style = "terminal",
+      keys = {
+        ["<esc>"] = "hide",
+        ["<C-/>"] = "hide",
+      }
+    }
+  })
+end, { desc = "Open spotify music player" })
