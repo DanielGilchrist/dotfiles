@@ -25,6 +25,7 @@ local misc = {
     bottom = 0,
   },
   color_scheme = "Catppuccin Mocha",
+  window_background_opacity = 0.95,
   font = wezterm.font_with_fallback({
     {
       family = "JetBrains Mono",
