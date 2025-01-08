@@ -64,6 +64,7 @@ return {
         root_dir = lspconfig.util.root_pattern("shard.yml", ".git", ".")
       },
       flow = {},
+      gopls = {},
       rubocop = {
         mason = false,
         cmd = gemfile_command_or_fallback("rubocop", { "rubocop", "--lsp" }, ""),
