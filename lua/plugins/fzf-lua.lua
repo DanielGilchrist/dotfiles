@@ -30,6 +30,9 @@ return {
   "ibhagwan/fzf-lua",
   opts = {
     colorschemes = { ignore_patterns = shit_colourschemes },
+    files = {
+      git_icons = false,
+    },
     grep = {
       rg_glob = true, -- Allows filtering by filetype in grep with `foo -- *.rb` for example
     }
