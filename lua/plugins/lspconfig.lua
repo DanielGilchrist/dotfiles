@@ -3,40 +3,37 @@ local function disable_format(client)
   client.server_capabilities.documentRangeFormattingProvider = false
 end
 
-local function cmd_noop()
-  return "echo"
-end
-
-local function normalise_command(cmd)
-  if type(cmd) == "string" then
-    cmd = cmd == "" and cmd_noop() or cmd
-    return { cmd }
-  elseif type(cmd) == "table" then
-    return cmd
-  else
-    error("cmd must be a string or a table!: " .. vim.inspect(cmd))
-  end
-end
-
-local function gemfile_command_or_fallback(gem_name, command, fallback)
-  command = command == nil and normalise_command(gem_name) or normalise_command(command)
-  fallback = fallback == nil and command or normalise_command(fallback)
-
-  local gemfile_lock = vim.fn.findfile('Gemfile.lock', '.;')
-
-  if gemfile_lock ~= "" then
-    local is_installed = vim.fn.systemlist("grep '" .. gem_name .. "' " .. gemfile_lock)
-
-    if not vim.tbl_isempty(is_installed) then
-      return vim.list_extend({ "bundle", "exec" }, command)
-    end
-  end
-
-  return fallback
-end
-
 local function asdf_shim(command)
-  vim.fn.expand("~/.asdf/shims/" .. command)
+  return { vim.fn.expand("~/.asdf/shims/" .. command) }
+end
+
+-- https://shopify.github.io/ruby-lsp/editors.html#additional-setup-optional
+local function add_ruby_deps_command(client, bufnr)
+  vim.api.nvim_buf_create_user_command(bufnr, "ShowRubyDeps", function(opts)
+      local params = vim.lsp.util.make_text_document_params()
+      local showAll = opts.args == "all"
+
+      client.request("rubyLsp/workspace/dependencies", params, function(error, result)
+        if error then
+          print("Error showing deps: " .. error)
+          return
+        end
+
+        local qf_list = {}
+        for _, item in ipairs(result) do
+          if showAll or item.dependency then
+            table.insert(qf_list, {
+              text = string.format("%s (%s) - %s", item.name, item.version, item.dependency),
+              filename = item.path
+            })
+          end
+        end
+
+        vim.fn.setqflist(qf_list)
+        vim.cmd('copen')
+      end, bufnr)
+    end,
+    { nargs = "?", complete = function() return { "all" } end })
 end
 
 return {
@@ -55,6 +52,11 @@ return {
           disable_format(client)
         end
       end,
+      ruby_lsp = function(_, rlsp_opts)
+        rlsp_opts.on_attach = function(client, buffer)
+          add_ruby_deps_command(client, buffer)
+        end
+      end,
     }
 
     opts.servers = {
@@ -67,16 +69,17 @@ return {
       gopls = {},
       rubocop = {
         mason = false,
-        cmd = gemfile_command_or_fallback("rubocop", { "rubocop", "--lsp" }, ""),
+        cmd = { "bundle", "exec", "rubocop", "--lsp" },
         root_dir = lspconfig.util.root_pattern("Gemfile", ".git", ".")
       },
       ruby_lsp = {
         mason = false,
-        cmd = gemfile_command_or_fallback("ruby-lsp", nil, asdf_shim("ruby-lsp"))
+        cmd = asdf_shim("ruby-lsp")
       },
       sorbet = {
         mason = false,
-        cmd = gemfile_command_or_fallback("sorbet", { "srb", "tc", "--lsp" }, "")
+        cmd = { "bundle", "exec", "srb", "tc", "--lsp" },
+        root_dir = lspconfig.util.root_pattern("Gemfile", ".git", ".")
       },
       yamlls = {
         settings = {
