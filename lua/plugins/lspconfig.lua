@@ -39,8 +39,6 @@ end
 return {
   "neovim/nvim-lspconfig",
   opts = function(_, opts)
-    local lspconfig = require("lspconfig")
-
     opts.inlay_hints = {
       enabled = false,
     }
@@ -63,23 +61,22 @@ return {
       crystalline = {
         mason = false,
         cmd = { "/usr/local/bin/crystalline" },
-        root_dir = lspconfig.util.root_pattern("shard.yml", ".git", ".")
       },
       flow = {},
       gopls = {},
       rubocop = {
+        single_file_support = false,
         mason = false,
         cmd = { "bundle", "exec", "rubocop", "--lsp" },
-        root_dir = lspconfig.util.root_pattern("Gemfile", ".git", ".")
       },
       ruby_lsp = {
         mason = false,
         cmd = asdf_shim("ruby-lsp")
       },
       sorbet = {
+        single_file_support = false,
         mason = false,
         cmd = { "bundle", "exec", "srb", "tc", "--lsp" },
-        root_dir = lspconfig.util.root_pattern("Gemfile", ".git", ".")
       },
       yamlls = {
         settings = {
