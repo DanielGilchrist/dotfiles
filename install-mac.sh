@@ -2,6 +2,7 @@
 
 CONFIG_DIR="$HOME/.config"
 BACKUP_DIR="$HOME/.oldconfig"
+DOTFILES_REPO="https://github.com/DanielGilchrist/dotfiles.git"
 
 command_exists() {
   command -v "$1" >/dev/null 2>&1
@@ -18,6 +19,22 @@ install_brew_package() {
   fi
 }
 
+is_dotfiles_repo() {
+  if [ -d "$CONFIG_DIR/.git" ]; then
+    cd "$CONFIG_DIR"
+    remote_url=$(git remote get-url origin 2>/dev/null)
+    if [ "$remote_url" = $DOTFILES_REPO ]; then
+      return 0
+    fi
+  fi
+  return 1
+}
+
+clone_dotfiles() {
+  echo "Creating new config directory from dotfiles..."
+  git clone "$DOTFILES_REPO" "$CONFIG_DIR"
+}
+
 if ! command_exists brew; then
   echo "Installing Homebrew..."
   /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
@@ -27,20 +44,28 @@ fi
 
 eval "$(/opt/homebrew/bin/brew shellenv)"
 
-# Backup existing config if it exists
-if [ -d "$CONFIG_DIR" ]; then
+if is_dotfiles_repo; then
+  echo "dotfiles repository already exists in $CONFIG_DIR, skipping clone..."
+elif [ -d "$CONFIG_DIR" ]; then
+  read -p "$CONFIG_DIR already exists. Would you like to back it up and continue? (y/n) " -n 1 -r
+  echo
+  if [[ $REPLY =~ ^[Yy]$ ]]; then
     echo "Backing up existing config to $BACKUP_DIR..."
     mv "$CONFIG_DIR" "$BACKUP_DIR"
+    clone_dotfiles
+  else
+    echo "Installation cancelled."
+    exit 1
+  fi
+else
+  echo "Creating new config directory from dotfiles..."
+  clone_dotfiles
 fi
 
-echo "Creating new config directory from dotfiles..."
-git clone https://github.com/DanielGilchrist/dotfiles.git "$CONFIG_DIR"
-
 echo "Installing packages..."
-
 install_brew_package fish
 install_brew_package wezterm
-install_brew_package neovim
+install_brew_package neovim nvim
 install_brew_package gh
 install_brew_package asdf
 
@@ -69,5 +94,6 @@ if [ "$SHELL" != "$(which fish)" ]; then
   chsh -s "$(which fish)"
 fi
 
+echo
 echo "Installation complete!"
 echo "Start a new terminal session to use fish shell."
