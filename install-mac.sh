@@ -30,6 +30,17 @@ install_brew_cask() {
   fi
 }
 
+install_asdf_plugin() {
+  local plugin="$1"
+  local url="$2"
+  if ! asdf plugin list | grep -q "^$plugin$"; then
+    echo "Installing asdf $plugin plugin..."
+    asdf plugin add $plugin $url
+  else
+    echo "asdf $plugin plugin already installed."
+  fi
+}
+
 is_dotfiles_repo() {
   if [ -d "$CONFIG_DIR/.git" ]; then
     cd "$CONFIG_DIR"
@@ -97,6 +108,10 @@ install_brew_package fzf
 install_brew_package lazygit
 install_brew_package crystalline
 install_brew_package spotify_player
+
+install_asdf_plugin ruby https://github.com/asdf-vm/asdf-ruby.git
+install_asdf_plugin crystal https://github.com/asdf-community/asdf-crystal.git
+install_asdf_plugin nodejs https://github.com/asdf-vm/asdf-nodejs.git
 
 if ! command_exists rustup; then
   echo "Installing rustup..."
