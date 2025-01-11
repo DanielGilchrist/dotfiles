@@ -42,7 +42,14 @@ else
   echo "Homebrew is already installed."
 fi
 
-eval "$(/opt/homebrew/bin/brew shellenv)"
+if [ -f "/opt/homebrew/bin/brew" ]; then
+  eval "$(/opt/homebrew/bin/brew shellenv)" # Apple Silicon
+elif [ -f "/usr/local/bin/brew" ]; then
+  eval "$(/usr/local/bin/brew shellenv)"    # Intel
+else
+  echo "Error: Homebrew installation not found"
+  exit 1
+fi
 
 if is_dotfiles_repo; then
   echo "dotfiles repository already exists in $CONFIG_DIR, skipping clone..."
@@ -62,6 +69,7 @@ else
   clone_dotfiles
 fi
 
+echo
 echo "Installing packages..."
 install_brew_package fish
 install_brew_package wezterm
