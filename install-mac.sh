@@ -19,6 +19,17 @@ install_brew_package() {
   fi
 }
 
+install_brew_cask() {
+  local cask="$1"
+  local executable="${2:-$1}"
+  if command_exists $executable; then
+    echo "$executable is already installed."
+  else
+    echo "Installing $cask cask..."
+    brew install --cask $cask
+  fi
+}
+
 is_dotfiles_repo() {
   if [ -d "$CONFIG_DIR/.git" ]; then
     cd "$CONFIG_DIR"
@@ -72,7 +83,7 @@ fi
 echo
 echo "Installing packages..."
 install_brew_package fish
-install_brew_package wezterm
+install_brew_cask wezterm@nightly wezterm
 install_brew_package neovim nvim
 install_brew_package gh
 install_brew_package asdf
