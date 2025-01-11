@@ -88,6 +88,8 @@ install_brew_cask wezterm@nightly wezterm
 install_brew_package neovim nvim
 install_brew_package gh
 install_brew_package asdf
+install_brew_cask font-jetbrains-mono
+install_brew_cask font-meslo-lg-nerd-font
 
 install_brew_package fd
 install_brew_package ripgrep rg
