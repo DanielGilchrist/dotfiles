@@ -12,7 +12,10 @@ return {
     },
     completion = {
       list = {
-        selection = "manual",
+        selection = {
+          preselect = false,
+          auto_insert = false,
+        },
       },
       trigger = {
         show_on_insert_on_trigger_character = false,
