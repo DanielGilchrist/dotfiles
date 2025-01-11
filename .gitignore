@@ -1,0 +1,23 @@
+.DS_STORE
+
+spotify-player
+
+# fish
+fish/secret
+
+fishd.tmp.*
+.fishd.*
+fish_history
+fish/fish_history
+fish_variables
+
+fish/generated_completions/
+fish/conf.d/
+fish/completions/
+
+!fish/conf.d/custom_*.fish
+!fish/functions/custom_*.fish
+
+# temp
+nvim-git-backup
+wezterm-git-backup
