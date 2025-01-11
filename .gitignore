@@ -18,6 +18,3 @@ fish/completions/
 !fish/conf.d/custom_*.fish
 !fish/functions/custom_*.fish
 
-# temp
-nvim-git-backup
-wezterm-git-backup
