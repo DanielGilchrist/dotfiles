@@ -35,6 +35,14 @@ return {
     },
     grep = {
       rg_glob = true, -- Allows filtering by filetype in grep with `foo -- *.rb` for example
+    },
+    oldfiles = {
+      include_current_session = true,
+    },
+    previewers = {
+      builtin = {
+        syntax_limit_b = 1024 * 100 -- 100KB
+      }
     }
   }
 }
