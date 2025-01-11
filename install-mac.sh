@@ -82,13 +82,13 @@ fi
 
 echo
 echo "Installing packages..."
+
 install_brew_package fish
 install_brew_cask wezterm@nightly wezterm
 install_brew_package neovim nvim
 install_brew_package gh
 install_brew_package asdf
 
-# nvim specific
 install_brew_package fd
 install_brew_package ripgrep rg
 install_brew_package fzf
