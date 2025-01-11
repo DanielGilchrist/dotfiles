@@ -3,7 +3,7 @@
 ## Installation
 ### OSX
 ```sh
-curl -fsSL https://raw.githubusercontent.com/DanielGilchrist/dotfiles/main/install-mac.sh | bash
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/DanielGilchrist/dotfiles/main/install-mac.sh)"
 ```
 ### Linux
 ```sh
