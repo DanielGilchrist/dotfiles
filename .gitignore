@@ -24,3 +24,12 @@ fish/conf.d/*_tide_*.fish
 fish/functions/fisher.fish
 fish/completions/fisher.fish
 
+# nvim
+tt.*
+.tests
+doc/tags
+debug
+.repro
+foo.*
+*.log
+data
