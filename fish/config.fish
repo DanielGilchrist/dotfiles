@@ -1,13 +1,21 @@
-if test (uname -m) = "arm64"
-  eval "$(/opt/homebrew/bin/brew shellenv)" # Apple Silicon
-else
-  eval "$(/usr/local/bin/brew shellenv)"    # Intel
+# Apple Silicon
+if test -f /opt/homebrew/bin/brew
+    eval "$(/opt/homebrew/bin/brew shellenv)"
 end
 
+# Intel
+if test -f /usr/local/bin/brew
+    eval "$(/usr/local/bin/brew shellenv)"
+end
+
+# Apple Silicon
 if test -f /opt/homebrew/opt/asdf/libexec/asdf.fish
-  source /opt/homebrew/opt/asdf/libexec/asdf.fish  # Apple Silicon
-else if test -f /usr/local/opt/asdf/libexec/asdf.fish
-  source /usr/local/opt/asdf/libexec/asdf.fish     # Intel
+  source /opt/homebrew/opt/asdf/libexec/asdf.fish
+end
+
+# Intel
+if test -f /usr/local/opt/asdf/libexec/asdf.fish
+  source /usr/local/opt/asdf/libexec/asdf.fish
 end
 
 if test -d ~/.config/fish/secret
