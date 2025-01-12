@@ -11,7 +11,6 @@ local misc = {
   front_end = "WebGpu",
   webgpu_power_preference = "HighPerformance",
   max_fps = 144,
-  native_macos_fullscreen_mode = true,
   automatically_reload_config = false,
   window_close_confirmation = "AlwaysPrompt",
   notification_handling = "AlwaysShow",
@@ -25,7 +24,8 @@ local misc = {
     bottom = 0,
   },
   color_scheme = "Catppuccin Mocha",
-  window_background_opacity = 0.95,
+  window_background_opacity = 0.90,
+  macos_window_background_blur = 20,
   font = wezterm.font_with_fallback({
     {
       family = "JetBrains Mono",
