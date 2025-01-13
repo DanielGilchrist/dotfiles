@@ -1,3 +1,15 @@
+set CONFIG_DIR "$HOME/.config"
+
+if test -f ~/.config/fish/alias.fish
+  source ~/.config/fish/alias.fish
+end
+
+if test -d $CONFIG_DIR/fish/secret
+  for f in $CONFIG_DIR/fish/secret/**/*.fish
+    source $f
+  end
+end
+
 # Apple Silicon
 if test -f /opt/homebrew/bin/brew
     eval "$(/opt/homebrew/bin/brew shellenv)"
@@ -16,16 +28,6 @@ end
 # Intel
 if test -f /usr/local/opt/asdf/libexec/asdf.fish
   source /usr/local/opt/asdf/libexec/asdf.fish
-end
-
-if test -d ~/.config/fish/secret
-  for f in ~/.config/fish/secret/**/*.fish
-    source $f
-  end
-end
-
-if test -f ~/.config/fish/alias.fish
-  source ~/.config/fish/alias.fish
 end
 
 if test -f "$HOME/.cargo/env.fish"
