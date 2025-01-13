@@ -1,6 +1,5 @@
 set REPOS_DIR "$HOME/Documents/repos"
 set PERSONAL_DIR $REPOS_DIR/DanielGilchrist
-set CONFIG_DIR "$HOME/.config"
 
 # whatever
 alias srbtc="bundle exec srb tc"
