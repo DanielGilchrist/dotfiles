@@ -16,8 +16,8 @@
   "buffer_font_size": 15,
   "theme": {
     "mode": "dark",
-    "light": "Ayu Mirage",
-    "dark": "Ayu Dark"
+    "light": "Catppuccin Frappé",
+    "dark": "Catppuccin Mocha"
   },
   "languages": {
     "Ruby": {
