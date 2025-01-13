@@ -9,7 +9,8 @@
   {
     "context": "Workspace",
     "bindings": {
-      "alt-g": ["task::Spawn", { "task_name": "lazygit" }]
+      "alt-g": ["task::Spawn", { "task_name": "lazygit" }],
+      "alt-m": ["task::Spawn", { "task_name": "Spotify" }]
     }
   },
   {
