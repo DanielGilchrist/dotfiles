@@ -1,11 +1,19 @@
 require("commands").register_commands()
 
 local wezterm = require("wezterm")
+local mux = wezterm.mux
 local os_utils = require("utils.os")
 local key_utils = require("utils.key")
 local table_utils = require("utils.table")
 
 local command = key_utils.command_key()
+
+wezterm.on("gui-startup", function(cmd)
+  local _tab, _pane, window = mux.spawn_window(cmd or {})
+  local gui_window = window:gui_window()
+
+  gui_window:toggle_fullscreen()
+end)
 
 local misc = {
   front_end = "WebGpu",
