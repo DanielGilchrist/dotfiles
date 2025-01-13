@@ -3,6 +3,13 @@
   {
     "label": "lazygit",
     "command": "lazygit",
-    "use_new_terminal": true
+    "use_new_terminal": true,
+    "reveal_target": "center"
+  },
+  {
+    "label": "Spotify",
+    "command": "spotify_player",
+    "use_new_terminal": true,
+    "reveal_target": "center"
   }
 ]
