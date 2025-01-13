@@ -1,5 +1,6 @@
 .DS_STORE
 
+github-copilot
 spotify-player
 
 # fish
@@ -33,3 +34,7 @@ debug
 foo.*
 *.log
 data
+
+# zed
+conversations/
+prompts/
