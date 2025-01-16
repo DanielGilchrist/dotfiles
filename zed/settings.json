@@ -10,7 +10,7 @@
   "project_panel": {
     "dock": "right"
   },
-  "vim_mode": true,
+  "vim_mode": false,
   "ui_font_size": 16,
   "buffer_font_family": "JetBrains Mono",
   "buffer_font_size": 15,
@@ -21,7 +21,21 @@
   },
   "languages": {
     "Ruby": {
-      "language_servers": ["ruby-lsp", "rubopcop", "sorbet", "!solargraph"]
+      "language_servers": ["sorbet", "ruby-lsp", "rubopcop", "!solargraph"]
+    }
+  },
+  "lsp": {
+    "sorbet": {
+      "binary": {
+        "path": "bundle",
+        "arguments": [
+          "exec",
+          "srb",
+          "tc",
+          "--lsp",
+          "--enable-all-experimental-lsp-features"
+        ]
+      }
     }
   }
 }
