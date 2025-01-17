@@ -19,6 +19,9 @@
     "light": "Catppuccin Frappé",
     "dark": "Catppuccin Mocha"
   },
+  "file_types": {
+    "Ruby": ["rbi"]
+  },
   "languages": {
     "Ruby": {
       "language_servers": ["sorbet", "ruby-lsp", "rubopcop", "!solargraph"]
