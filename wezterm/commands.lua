@@ -125,7 +125,7 @@ local function open_work_tabs(region)
     wait_for_text_for(tunnel_pane, "INFO: Ready!")
 
     run_command(server_pane, "bin/dev server")
-    wait_for_text_for(server_pane, "Connection to", " closed")
+    wait_for_text_for(server_pane, "Bundle complete!", "Done in")
 
     run_command(webpack_pane, "bin/dev webpack")
     run_command(console_pane, "bin/dev console")
