@@ -49,6 +49,22 @@ map("n", l("jC"), function()
   vim.cmd(command)
 end, { desc = "Jump to file from clipboard" })
 
+-- Music (spotify_player)
+local function playback(command)
+  local cmd = { "spotify_player", "playback" }
+
+  if type(command) == "table" then
+    vim.list_extend(cmd, command)
+  else
+    table.insert(cmd, command)
+  end
+
+  vim.fn.jobstart(cmd, {
+    on_stdout = function()
+    end
+  })
+end
+
 map("n", l("mo"), function()
   Snacks.terminal.toggle("spotify_player", {
     win = {
@@ -60,3 +76,23 @@ map("n", l("mo"), function()
     }
   })
 end, { desc = "Open spotify music player" })
+
+map("n", l("mn"), function()
+  playback("next")
+end, { desc = "Next song" })
+
+map("n", l("mp"), function()
+  playback("previous")
+end, { desc = "Previous song" })
+
+map("n", l("mt"), function()
+  playback("play-pause")
+end, { desc = "Toggle play/pause" })
+
+map("n", l("mf"), function()
+  playback({ "seek", "10000" })
+end, { desc = "Fast-forward 10 seconds" })
+
+map("n", l("mb"), function()
+  playback({ "seek", "--", "-10000" })
+end, { desc = "Rewind 10 seconds" })
