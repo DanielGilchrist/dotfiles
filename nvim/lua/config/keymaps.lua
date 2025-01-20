@@ -60,7 +60,21 @@ local function playback(command)
   end
 
   vim.fn.jobstart(cmd, {
-    on_stdout = function()
+    stderr_buffered = true,
+    on_stderr = function(_, data)
+      local error_message = table.concat(data)
+      if error_message == "" then
+        return
+      end
+
+      local notify = require("../utils/notify")
+
+      -- "Bad request: no playback found" or "Bad request: no active playback found!"
+      if string.find(error_message, "no") and string.find(error_message, "playback") then
+        notify.warn("A song isn't currently playing.")
+      else
+        notify.error(string.format("Unhandled error: \"%s\"", error_message))
+      end
     end
   })
 end
