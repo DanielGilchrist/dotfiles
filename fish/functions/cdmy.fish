@@ -1,3 +1,3 @@
 function cdmy
-    cd "$PERSONAL_DIR/$argv"
+  _cd_to $PERSONAL_DIR $argv
 end
