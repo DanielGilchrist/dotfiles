@@ -1,0 +1,7 @@
+gui:
+  skipStashWarning: true
+
+git:
+  parseEmoji: true
+
+notARepository: quit
