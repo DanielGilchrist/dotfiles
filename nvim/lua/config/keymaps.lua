@@ -21,9 +21,35 @@ end, { desc = "Copy remote link to clipboard", noremap = true })
 -- Diagnostic keymaps
 map("n", "]d", vim.diagnostic.goto_next, { desc = "Go to next diagnostic" })
 
+-- treesj
 map("n", l("cS"), function()
   require("treesj").toggle({ split = { recursive = true } })
 end, { desc = "treesj toggle" })
+
+-- git-conflict.nvim
+map("n", l("gCa"), function()
+  vim.cmd("GitConflictChooseOurs")
+end, { desc = "Conflict - Accept current changes" })
+
+map("n", l("gCi"), function()
+  vim.cmd("GitConflictChooseTheirs")
+end, { desc = "Conflict - Accept incoming changes" })
+
+map("n", l("gCb"), function()
+  vim.cmd("GitConflictChooseBoth")
+end, { desc = "Conflict - Accept both changes" })
+
+map("n", l("gCn"), function()
+  vim.cmd("GitConflictChooseNone")
+end, { desc = "Conflict - Accept none of the changes" })
+
+map("n", l("gCn"), function()
+  vim.cmd("GitConflictCNextConflict")
+end, { desc = "Conflict - Move to next" })
+
+map("n", l("gCp"), function()
+  vim.cmd("GitConflictPrevConflict")
+end, { desc = "Conflict - Move to previous" })
 
 -- custom keymaps
 map("n", l("jC"), function()
