@@ -28,6 +28,9 @@ local shit_colourschemes = {
 
 return {
   "ibhagwan/fzf-lua",
+  keys = {
+    { "<leader>sB", "<cmd>FzfLua lines<cr>", desc = "Buffers" }
+  },
   opts = {
     colorschemes = { ignore_patterns = shit_colourschemes },
     files = {
