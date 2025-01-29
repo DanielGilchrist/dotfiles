@@ -66,28 +66,39 @@ config.keys = {
     })
   ),
 
+  keybind(command, enter, "ToggleFullScreen"),
+
+  -- Switch active pane
   keybind(command_alt, "LeftArrow", wezterm.action({ ActivatePaneDirection = "Left" })),
   keybind(command_alt, "RightArrow", wezterm.action({ ActivatePaneDirection = "Right" })),
   keybind(command_alt, "UpArrow", wezterm.action({ ActivatePaneDirection = "Up" })),
   keybind(command_alt, "DownArrow", wezterm.action({ ActivatePaneDirection = "Down" })),
 
+  -- Switch between tabs
   keybind(command, "LeftArrow", wezterm.action({ ActivateTabRelative = -1 })),
   keybind(command, "RightArrow", wezterm.action({ ActivateTabRelative = 1 })),
 
+  -- Scrolling
   keybind(command_shift, "UpArrow", "ScrollToTop"),
   keybind(command_shift, "DownArrow", "ScrollToBottom"),
   keybind(alt, "PageUp", wezterm.action({ ScrollByPage = -1 })),
-  keybind(command_alt, "PageUp", wezterm.action({ ScrollByPage = -6 })),
   keybind(alt, "PageDown", wezterm.action({ ScrollByPage = 1 })),
+  keybind(command_alt, "PageUp", wezterm.action({ ScrollByPage = -6 })),
   keybind(command_alt, "PageDown", wezterm.action({ ScrollByPage = 6 })),
 
+  -- Move tabs
   keybind(shift_alt, "{", wezterm.action({ MoveTabRelative = -1 })),
   keybind(shift_alt, "}", wezterm.action({ MoveTabRelative = 1 })),
 
+  -- Move panes
   keybind(command_shift, "m", wezterm.action({ PaneSelect = { mode = "SwapWithActive" } })),
   keybind(command_shift, "p", wezterm.action({ PaneSelect = { mode = "Activate" } })),
 
-  keybind(command, enter, "ToggleFullScreen"),
+  -- Resize panes
+  keybind(command_alt, "h", wezterm.action({ AdjustPaneSize = { "Left", 5 } })),
+  keybind(command_alt, "l", wezterm.action({ AdjustPaneSize = { "Right", 5 } })),
+  keybind(command_alt, "k", wezterm.action({ AdjustPaneSize = { "Up", 5 } })),
+  keybind(command_alt, "j", wezterm.action({ AdjustPaneSize = { "Down", 5 } })),
 }
 
 return config
