@@ -54,7 +54,9 @@
   "treesj": { "branch": "main", "commit": "48c1a7539f376fd40ceb9cf12d697040fcf90649" },
   "trouble.nvim": { "branch": "main", "commit": "6f380b8826fb819c752c8fd7daaee9ef96d4c689" },
   "ts-comments.nvim": { "branch": "main", "commit": "872dcfa0418f4a33b7437fb4d9f4e89f2f000d74" },
+  "typr": { "branch": "main", "commit": "31cb35d311dfa4f32a6cf1ec3ff9f5073106f6e2" },
   "vim-crystal": { "branch": "master", "commit": "fbaa42625303838a9be860250323364fe5658b0c" },
   "vim-haml": { "branch": "master", "commit": "c30ee7d885aa1a1cf17d856ab932de75ab789d5d" },
+  "volt": { "branch": "main", "commit": "3bedb1576db574af160643eea7df3b09dbe5ee9c" },
   "which-key.nvim": { "branch": "main", "commit": "0e76a87ac51772569aec678dc74baa8e2a86100c" }
 }
