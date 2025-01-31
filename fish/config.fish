@@ -34,6 +34,7 @@ if test -f "$HOME/.cargo/env.fish"
   source "$HOME/.cargo/env.fish"
 end
 
+set -gx MAKEFLAGS "-j$(nproc)"
 set -gx XDG_CONFIG_HOME "$HOME/.config"
 set -gx ASDF_GOLANG_MOD_VERSION_ENABLED true
 set -gx HOMEBREW_NO_AUTO_UPDATE 1
