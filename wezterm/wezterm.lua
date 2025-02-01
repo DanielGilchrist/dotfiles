@@ -28,7 +28,7 @@ local misc = {
   window_padding = {
     left = 0,
     right = 10, -- controls the width of the scrollbar
-    top = 4,
+    top = 0,
     bottom = 0,
   },
   color_scheme = "Catppuccin Mocha",
