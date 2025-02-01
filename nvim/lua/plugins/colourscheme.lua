@@ -16,10 +16,11 @@ return {
   colourscheme("scottmckendry/cyberdream.nvim", "cyberdream"),
   colourscheme("Shatur/neovim-ayu", "ayu"),
   colourscheme("ray-x/starry.nvim", "starry"),
+  colourscheme("wtfox/jellybeans.nvim", "jellybeans"),
   {
     "LazyVim/LazyVim",
     opts = {
-      colorscheme = "catppuccin-mocha",
+      colorscheme = "jellybeans",
     },
   },
 }
