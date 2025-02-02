@@ -26,7 +26,7 @@ local misc = {
   notification_handling = "AlwaysShow",
   exit_behavior = "Close",
 
-  enable_scroll_bar = false, -- per pane scrollbar 👀  - https://github.com/wez/wezterm/pull/1886
+  enable_scroll_bar = true, -- per pane scrollbar 👀  - https://github.com/wez/wezterm/pull/1886
   scrollback_lines = 50000,
 
   window_padding = {
