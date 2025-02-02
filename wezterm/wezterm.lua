@@ -32,7 +32,7 @@ local misc = {
   window_padding = {
     left = 0,
     right = 10, -- controls the width of the scrollbar
-    top = 10,
+    top = 13,
     bottom = 0,
   },
   window_background_opacity = 0.90,
