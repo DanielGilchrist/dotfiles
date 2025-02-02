@@ -32,7 +32,7 @@ local misc = {
   window_padding = {
     left = 0,
     right = 10, -- controls the width of the scrollbar
-    top = 13,
+    top = 10,
     bottom = 0,
   },
   window_background_opacity = 0.90,
@@ -64,7 +64,6 @@ local tabs = {
   enable_tab_bar = true,
   use_fancy_tab_bar = false,
   hide_tab_bar_if_only_one_tab = true,
-  tab_bar_at_bottom = true,
 
   tab_bar_style = {
     new_tab = new_tab_icon,
