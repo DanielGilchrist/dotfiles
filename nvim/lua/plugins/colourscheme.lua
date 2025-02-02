@@ -13,6 +13,9 @@ return {
   colourscheme("catppuccin/nvim", "catppuccin", {
     transparent_background = true,
   }),
+  colourscheme("folke/tokyonight.nvim", "tokyonight", {
+    transparent = true,
+  }),
   colourscheme("scottmckendry/cyberdream.nvim", "cyberdream"),
   colourscheme("Shatur/neovim-ayu", "ayu"),
   colourscheme("ray-x/starry.nvim", "starry"),
@@ -20,7 +23,7 @@ return {
   {
     "LazyVim/LazyVim",
     opts = {
-      colorscheme = "jellybeans",
+      colorscheme = "tokyonight-night",
     },
   },
 }
