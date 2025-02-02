@@ -59,4 +59,18 @@ local misc = {
   },
 }
 
-return table_utils.merge_all(misc, require("key_bindings"), {})
+local new_tab_icon = " + "
+local tabs = {
+  enable_tab_bar = true,
+  use_fancy_tab_bar = false,
+  hide_tab_bar_if_only_one_tab = true,
+
+  tab_bar_style = {
+    new_tab = new_tab_icon,
+    new_tab_hover = new_tab_icon,
+  },
+
+  tab_max_width = 25,
+}
+
+return table_utils.merge_all(misc, require("key_bindings"), tabs, {})
