@@ -15,6 +15,34 @@ local function default_logo()
   ]]
 end
 
+local shit_colourschemes = {
+  "^blue$",
+  "^darkblue$",
+  "^default$",
+  "^delek$",
+  "^desert$",
+  "^elflord$",
+  "^evening$",
+  "^habamax$",
+  "^industry$",
+  "^koehler$",
+  "^lunaperche$",
+  "^morning$",
+  "^murphy$",
+  "^pablo$",
+  "^peachpuff$",
+  "^quiet$",
+  "^ron$",
+  "^shine$",
+  "^slate$",
+  "^sorbet$",
+  "^torte$",
+  "^vim$",
+  "^wildcharm$",
+  "^zaibatsu$",
+  "^zellner$",
+}
+
 -- Create logo and save in dir with
 -- https://patorjk.com/software/taag/#p=display&f=ANSI%20Shadow&t=LAZYVIM
 local function logo_path(header_name)
@@ -65,6 +93,22 @@ return {
       win = {
         position = "float"
       }
+    },
+  },
+  keys = {
+    { "<leader>uC",
+      function()
+        Snacks.picker.colorschemes({ transform = function(item)
+          for _, pattern in ipairs(shit_colourschemes) do
+            if item.text:match(pattern) then
+              return false
+            end
+          end
+
+          return true
+        end})
+      end,
+      desc = "Colorschemes"
     },
   }
 }
