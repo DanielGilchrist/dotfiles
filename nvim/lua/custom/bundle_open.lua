@@ -48,36 +48,36 @@ local function fetch_gem_list(callback)
 end
 
 local function open_gem()
-  local function open_selected_gem(selected)
-    if selected and selected[1] then
+  local function open_selected_gem(picker, item)
+    picker:close()
+
+    if item then
       local cwd = vim.fn.getcwd()
       local cmd = string.format(
         "wezterm cli spawn --cwd=%s -- bundle open %s",
         vim.fn.shellescape(cwd),
-        vim.fn.shellescape(selected[1])
+        vim.fn.shellescape(item.text)
       )
       vim.fn.system(cmd)
     end
   end
 
   fetch_gem_list(function(gems)
-    require("fzf-lua").fzf_exec(gems, {
-      prompt = "Bundle Open> ",
-      actions = {
-        ["default"] = open_selected_gem,
-      },
-      file_icons = false,
-      git_icons = false,
-      fzf_opts = {
-        ["--layout"] = "reverse-list",
-      },
-      winopts = {
-        width = 0.5,
-        height = 0.4,
-        row = 0.35,
-        col = 0.5,
-        border = "rounded",
-      },
+    local items = vim.tbl_map(function(gem)
+      return {
+        text = gem,
+      }
+    end, gems)
+
+    Snacks.picker.pick({
+      items = items,
+      format = "text",
+      preview = "none",
+      source = "Bundle Open> ",
+      confirm = open_selected_gem,
+      layout = {
+        preset = "vscode"
+      }
     })
   end)
 end
