@@ -96,7 +96,8 @@ return {
     },
   },
   keys = {
-    { "<leader>uC",
+    {
+      "<leader>uC",
       function()
         Snacks.picker.colorschemes({ transform = function(item)
           for _, pattern in ipairs(shit_colourschemes) do
