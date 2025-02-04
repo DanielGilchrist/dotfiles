@@ -15,6 +15,7 @@ if vim.g.neovide then
   vim.g.neovide_cursor_vfx_mode = "railgun"
 end
 
+vim.g.lazyvim_picker = "snacks"
 vim.g.lazyvim_ruby_lsp = "ruby_lsp"
 vim.g.lazyvim_ruby_formatter = "rubocop"
 
