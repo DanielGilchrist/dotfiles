@@ -1,28 +1,26 @@
 local notify = require("../utils/notify")
 local scratchpads_dir = vim.fn.expand("~/.local/share/scratchpads/")
 
-local function fzf_search(title, opts)
-  opts = opts or {}
+local function scratch_search(title, opts)
+  opts = opts == nil and {} or opts
 
-  local base_opts = {
-    prompt = title .. "> ",
-    cwd = scratchpads_dir,
-    cmd = "fd -t f",
-    file_icons = false,
-    git_icons = false,
-    actions = {
-      ["default"] = opts.default_action,
-    }
+  local args = {
+    dirs = { scratchpads_dir }
   }
 
-  if opts.multi_select then
-    base_opts.fzf_opts = {
-      ["--multi"] = "",
-      ["--marker"] = "▸",
-    }
+  if opts.confirm then
+    args.confirm = function(picker, item)
+      picker:close()
+
+      if opts.multiselect then
+        opts.confirm(picker:selected())
+      else
+        opts.confirm(item)
+      end
+    end
   end
 
-  require("fzf-lua").files(vim.tbl_deep_extend("force", base_opts, opts))
+  Snacks.picker.files(args)
 end
 
 local function build_new_filename(count, extension)
@@ -74,13 +72,7 @@ local function open_scratchpad()
   if scratchpads_dir_not_created() or #vim.fn.globpath(scratchpads_dir, "*") == 0 then
     notify.warn("No scratchpads have been created. Create one with `:ScratchNew`.")
   else
-    fzf_search("Search Scratchpads", {
-      default_action = function(selected)
-        if selected and selected[1] then
-          vim.cmd("edit " .. scratchpads_dir .. selected[1])
-        end
-      end
-    })
+    scratch_search("Search Scratchpads")
   end
 end
 
@@ -120,7 +112,7 @@ local function remove_scratchpad()
 
     local files_to_delete = {}
     for i, file in ipairs(selected) do
-      files_to_delete[i] = file
+      files_to_delete[i] = file.text
     end
 
     local file_list = table.concat(files_to_delete, "\n")
@@ -129,27 +121,22 @@ local function remove_scratchpad()
     vim.ui.input({ prompt = input_prompt }, function(input)
       if input == "y" then
         for _, file in ipairs(files_to_delete) do
-          local full_path = scratchpads_dir .. file
-          local success, err = os.remove(full_path)
+          local success, err = os.remove(file)
           if not success then
             notify.error(string.format("Failed to remove %s: %s", file, err))
           else
             notify.info(string.format("Removed %s", file))
           end
         end
-        notify.info("Removed scratchpads:\n\n" .. file_list)
       else
         notify.warn("Action to remove scratchpads cancelled.")
       end
     end)
   end
 
-  fzf_search("Delete Scratchpad", {
-    multi_select = true,
-    default_action = delete_scratchpads,
-    keymap = {
-      ["toggle-select"] = { "<Tab>", "<S-Tab>" },
-    }
+  scratch_search("Delete Scratchpad", {
+    multiselect = true,
+    confirm = delete_scratchpads,
   })
 end
 
