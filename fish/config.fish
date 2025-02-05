@@ -10,25 +10,8 @@ if test -d $CONFIG_DIR/fish/secret
   end
 end
 
-# Apple Silicon
-if test -f /opt/homebrew/bin/brew
-    eval "$(/opt/homebrew/bin/brew shellenv)"
-end
-
-# Intel
-if test -f /usr/local/bin/brew
-    eval "$(/usr/local/bin/brew shellenv)"
-end
-
-# Apple Silicon
-if test -f /opt/homebrew/opt/asdf/libexec/asdf.fish
-  source /opt/homebrew/opt/asdf/libexec/asdf.fish
-end
-
-# Intel
-if test -f /usr/local/opt/asdf/libexec/asdf.fish
-  source /usr/local/opt/asdf/libexec/asdf.fish
-end
+source $CONFIG_DIR/fish/config/apple_silicon.fish
+source $CONFIG_DIR/fish/config/intel.fish
 
 if test -f "$HOME/.cargo/env.fish"
   source "$HOME/.cargo/env.fish"
