@@ -1,3 +1,8 @@
+local function register_default(opts, ...)
+  local args = { ... }
+  vim.list_extend(opts.groups.default, args)
+end
+
 return {
   "monaqa/dial.nvim",
   opts = function(_, opts)
@@ -9,6 +14,16 @@ return {
       cyclic = true,
     })
 
-    table.insert(opts.groups.default, sorbet_sigil)
+    local http_verbs_lowercase = augend.constant.new({
+      elements = { "get", "post", "patch", "put", "delete" },
+      word = true,
+      cyclic = true,
+    })
+
+    register_default(
+      opts,
+      sorbet_sigil,
+      http_verbs_lowercase
+    )
   end
 }
