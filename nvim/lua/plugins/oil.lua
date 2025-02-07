@@ -18,7 +18,7 @@ return {
     {
       "<leader>e",
       function()
-        require("oil").open_float()
+        require("oil").toggle_float()
       end,
       desc = "Explore Files (Oil)",
     }
