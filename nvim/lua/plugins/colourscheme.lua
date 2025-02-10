@@ -19,11 +19,13 @@ return {
   colourscheme("scottmckendry/cyberdream.nvim", "cyberdream"),
   colourscheme("Shatur/neovim-ayu", "ayu"),
   colourscheme("ray-x/starry.nvim", "starry"),
-  colourscheme("wtfox/jellybeans.nvim", "jellybeans"),
+  colourscheme("wtfox/jellybeans.nvim", "jellybeans", {
+    transparent = true,
+  }),
   {
     "LazyVim/LazyVim",
     opts = {
-      colorscheme = "tokyonight-night",
+      colorscheme = "jellybeans",
     },
   },
 }
