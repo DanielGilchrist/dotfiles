@@ -20,7 +20,7 @@ local misc = {
   webgpu_power_preference = "HighPerformance",
   max_fps = 144,
 
-  color_scheme = "Tokyo Night",
+  color_scheme = "Jellybeans",
   automatically_reload_config = false,
   window_close_confirmation = "AlwaysPrompt",
   notification_handling = "AlwaysShow",
