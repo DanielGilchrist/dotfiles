@@ -9,5 +9,5 @@ alias poke_search="$PERSONAL_DIR/poke_search/target/release/poke_search"
 alias pks=poke_search
 
 # dev
-alias fug="fish /Users/danielgilchrist/Documents/repos/DanielGilchrist/thefug/thefug"
-alias thefugbindev="/Users/danielgilchrist/Documents/repos/DanielGilchrist/thefug/target/debug/thefugbindev"
+alias fug="fish $REPOS_DIR/DanielGilchrist/thefug/thefug"
+alias thefugbindev="$REPOS_DIR/DanielGilchrist/thefug/target/debug/thefugbindev"
