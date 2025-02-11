@@ -99,15 +99,17 @@ return {
     {
       "<leader>uC",
       function()
-        Snacks.picker.colorschemes({ transform = function(item)
-          for _, pattern in ipairs(shit_colourschemes) do
-            if item.text:match(pattern) then
-              return false
+        Snacks.picker.colorschemes({
+          transform = function(item)
+            for _, pattern in ipairs(shit_colourschemes) do
+              if item.text:match(pattern) then
+                return false
+              end
             end
-          end
 
-          return true
-        end})
+            return true
+          end
+        })
       end,
       desc = "Colorschemes"
     },
