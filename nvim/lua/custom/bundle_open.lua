@@ -73,7 +73,7 @@ local function open_gem()
       items = items,
       format = "text",
       preview = "none",
-      source = "Bundle Open> ",
+      source = "Bundle Open",
       confirm = open_selected_gem,
       layout = {
         preset = "vscode"
