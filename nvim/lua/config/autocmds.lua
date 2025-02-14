@@ -8,11 +8,6 @@ vim.api.nvim_create_user_command("Dashboard", function()
   Snacks.dashboard()
 end, {})
 
-vim.api.nvim_create_user_command("Clear", function()
-  vim.cmd("%bd")
-  vim.cmd("Dashboard")
-end, {})
-
 -- nuke trailing whitespace on save
 create_autocmd("BufWritePre", {
   pattern = "*",
