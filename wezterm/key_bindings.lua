@@ -39,7 +39,7 @@ config.keys = {
     wezterm.action({
       SplitPane = {
         direction = "Right",
-        size = { Percent = 30 }
+        size = { Percent = 35 }
       }
     })
   ),
