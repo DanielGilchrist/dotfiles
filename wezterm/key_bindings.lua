@@ -33,6 +33,16 @@ config.keys = {
       }
     })
   ),
+  keybind(
+    command,
+    "s",
+    wezterm.action({
+      SplitPane = {
+        direction = "Right",
+        size = { Percent = 30 }
+      }
+    })
+  ),
 
   keybind(
     command_shift,
