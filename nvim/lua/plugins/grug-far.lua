@@ -13,5 +13,10 @@ return {
       mode = "v",
       desc = "Search and replace (Current file)"
     }
-  }
+  },
+  -- opts = {
+  --   prefills = {
+  --     flags = "--hidden --glob '!.git'"
+  --   }
+  -- }
 }
