@@ -1,31 +1,52 @@
-local function colourscheme(source, name, opts)
-  opts = opts == nil and {} or opts
+local function colourscheme(source, options)
+  options = options == nil and {} or options
 
-  return {
-    source,
-    name = name,
-    opts = opts,
-    event = "User LazyColorscheme",
-  }
+  return vim.tbl_extend(
+    "error",
+    {
+      source,
+      event = "User LazyColorscheme"
+    },
+    options
+  )
 end
 
 return {
-  colourscheme("catppuccin/nvim", "catppuccin", {
-    transparent_background = true,
+  colourscheme("catppuccin/nvim", {
+    opts = {
+      transparent_background = true,
+    }
   }),
-  colourscheme("folke/tokyonight.nvim", "tokyonight", {
-    transparent = true,
+  colourscheme("folke/tokyonight.nvim", {
+    opts = {
+      transparent = true,
+    }
   }),
-  colourscheme("scottmckendry/cyberdream.nvim", "cyberdream"),
-  colourscheme("Shatur/neovim-ayu", "ayu"),
-  colourscheme("ray-x/starry.nvim", "starry"),
-  colourscheme("wtfox/jellybeans.nvim", "jellybeans", {
-    transparent = true,
+  colourscheme("scottmckendry/cyberdream.nvim"),
+  colourscheme("Shatur/neovim-ayu"),
+  colourscheme("wtfox/jellybeans.nvim", {
+    opts = {
+      transparent = true,
+    }
+  }),
+  colourscheme("rose-pine/neovim", {
+    opts = {
+      styles = {
+        transparency = true,
+      }
+    }
+  }),
+  colourscheme("neanias/everforest-nvim", {
+    config = function()
+      require("everforest").setup({
+        transparent_background_level = 2,
+      })
+    end,
   }),
   {
     "LazyVim/LazyVim",
     opts = {
-      colorscheme = "jellybeans",
+      colorscheme = "everforest",
     },
   },
 }
