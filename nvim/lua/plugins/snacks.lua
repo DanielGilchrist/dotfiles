@@ -89,11 +89,7 @@ return {
       timeout = 5000,
       top_down = false,
     },
-    terminal = {
-      win = {
-        position = "right"
-      }
-    },
+    terminal = {},
   },
   keys = {
     {
