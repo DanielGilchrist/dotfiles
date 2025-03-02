@@ -14,9 +14,10 @@ return {
       desc = "Search and replace (Current file)"
     }
   },
-  -- opts = {
-  --   prefills = {
-  --     flags = "--hidden --glob '!.git'"
-  --   }
-  -- }
+  opts = {
+    prefills = {
+      flags = "--hidden",
+      filesFilter = "!.git"
+    }
+  }
 }
