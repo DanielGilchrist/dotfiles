@@ -53,6 +53,20 @@ local function load_header(header_name)
   return file.read(logo_path(header_name .. ".txt")) or default_logo()
 end
 
+local function open_terminal(opts)
+  opts = opts == nil and {} or opts
+
+  local default_opts = {
+    win = {
+      position = "right"
+    }
+  }
+
+  local merged_opts = vim.tbl_extend("force", default_opts, opts)
+
+  Snacks.terminal(nil, merged_opts)
+end
+
 return {
   "folke/snacks.nvim",
   opts = { -- https://github.com/folke/snacks.nvim/tree/main/docs
@@ -92,6 +106,7 @@ return {
     terminal = {},
   },
   keys = {
+    -- Picker
     {
       "<leader>uC",
       function()
@@ -108,6 +123,31 @@ return {
         })
       end,
       desc = "Colorschemes"
+    },
+    -- Terminal
+    {
+      "<leader>fT",
+      function()
+        open_terminal()
+      end,
+      desc = "Terminal (cwd)",
+      mode = "n"
+    },
+    {
+      "<leader>ft",
+      function()
+        open_terminal({ cwd = LazyVim.root() })
+      end,
+      desc = "Terminal (Root Dir)",
+      mode = "n"
+    },
+    {
+      "<c-/>",
+      function()
+        open_terminal({ cwd = LazyVim.root() })
+      end,
+      desc = "Terminal (Root Dir)",
+      mode = "n"
     },
   }
 }
