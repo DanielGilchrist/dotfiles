@@ -1,5 +1,6 @@
 local header = "neovim"
 
+local notify = require("../utils/notify")
 local cmd = require("../utils/cmd")
 local file = require("../utils/file")
 local path = require("../utils/path")
@@ -97,6 +98,10 @@ return {
         { section = "startup" },
       },
     },
+    gitbrowse = {
+      notify = true,
+      what = "permalink"
+    },
     notifier = {
       date_format = "%I:%M%p",
       style = "fancy",
@@ -118,6 +123,21 @@ return {
     terminal = {},
   },
   keys = {
+    -- GitBrowse
+    {
+      "<leader>gY",
+      function()
+        Snacks.gitbrowse({
+          open = function(url)
+            vim.fn.setreg("+", url)
+            notify.info(url)
+          end,
+          notify = false
+        })
+      end,
+      desc = "Git Browse (Copy)",
+      mode = { "n", "x" }
+    },
     -- Picker
     {
       "<leader>uC",
