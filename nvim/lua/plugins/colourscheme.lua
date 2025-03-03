@@ -13,6 +13,7 @@ end
 
 return {
   colourscheme("catppuccin/nvim", {
+    name = "catppuccin",
     opts = {
       transparent_background = true,
     }
@@ -30,6 +31,7 @@ return {
     }
   }),
   colourscheme("rose-pine/neovim", {
+    name = "rose-pine",
     opts = {
       styles = {
         transparency = true,
