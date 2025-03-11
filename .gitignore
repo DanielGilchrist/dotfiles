@@ -1,11 +1,12 @@
 .DS_STORE
 
-github-copilot
 ngrok
+irb/irb_history
 
 # wtf?
 StardewValley/
 configstore/
+github-copilot
 
 # fish
 fish/secret
