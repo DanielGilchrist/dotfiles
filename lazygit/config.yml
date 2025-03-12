@@ -2,6 +2,8 @@ gui:
   skipStashWarning: true
 
 git:
+  paging:
+    externalDiffCommand: difft --color=always --display=inline --syntax-highlight=on --tab-width=2
   parseEmoji: true
 
 notARepository: quit
