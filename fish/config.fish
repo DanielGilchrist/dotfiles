@@ -17,6 +17,8 @@ if test -f "$HOME/.cargo/env.fish"
   source "$HOME/.cargo/env.fish"
 end
 
+alias nproc="sysctl -n hw.logicalcpu"
+
 set -gx MAKEFLAGS "-j$(nproc)"
 set -gx XDG_CONFIG_HOME "$HOME/.config"
 set -gx HOMEBREW_NO_AUTO_UPDATE 1
