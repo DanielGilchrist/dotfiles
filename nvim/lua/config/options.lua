@@ -6,6 +6,11 @@
 
 if vim.g.neovide then
   vim.o.guifont = "JetBrains Mono"
+
+  -- NOTE: Transparency doesn't currently work on macos fullscreen
+  -- vim.g.neovide_opacity = 0.8
+  -- vim.g.neovide_normal_opacity = 0.8
+
   vim.g.neovide_fullscreen = true
   vim.g.neovide_confirm_quit = true
   vim.g.neovide_hide_mouse_when_typing = true
