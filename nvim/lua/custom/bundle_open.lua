@@ -5,7 +5,7 @@ local function fetch_gem_list(callback)
   local gems = {}
   local error_message = nil
 
-  notify.info("Fetching gem list for " .. vim.fn.getcwd() .. "...", {
+  notify.info("Fetching gem list for " .. vim.fn.fnamemodify(vim.fn.getcwd(), ":t") .. "...", {
     id = notify_gem_list_id,
     timeout = false,
   })
