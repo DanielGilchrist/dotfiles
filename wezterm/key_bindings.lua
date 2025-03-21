@@ -71,7 +71,7 @@ config.keys = {
     "w",
     wezterm.action({
       CloseCurrentTab = {
-        confirm = true,
+        confirm = false,
       },
     })
   ),
