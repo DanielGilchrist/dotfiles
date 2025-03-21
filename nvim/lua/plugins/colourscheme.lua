@@ -23,6 +23,11 @@ return {
       transparent = true,
     }
   }),
+  colourscheme("ellisonleao/gruvbox.nvim", {
+    opts = {
+      transparent_mode = true
+    }
+  }),
   colourscheme("scottmckendry/cyberdream.nvim"),
   colourscheme("Shatur/neovim-ayu"),
   colourscheme("wtfox/jellybeans.nvim", {
@@ -49,7 +54,7 @@ return {
   {
     "LazyVim/LazyVim",
     opts = {
-      colorscheme = "rose-pine-moon",
+      colorscheme = "gruvbox",
     },
   },
 }
