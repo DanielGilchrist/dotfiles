@@ -103,7 +103,10 @@ local function open_work_tabs(region)
       export_region_and_cdt(new_pane)
     end)
 
-    local _tab, server_pane, _window = original_window:mux_window():spawn_tab({})
+    local _tab, server_pane, window = original_window:mux_window():spawn_tab({})
+
+    local gui_window = window:gui_window()
+    gui_window:perform_action(wezterm.action.MoveTab(0), server_pane)
 
     export_region_and_cdt(server_pane)
     wait_for_text()
