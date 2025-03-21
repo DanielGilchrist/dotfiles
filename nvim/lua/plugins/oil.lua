@@ -7,6 +7,9 @@ return {
     },
   },
   opts = {
+    keymaps = {
+      ["q"] = { "actions.close", mode = "n" }
+    },
     float = {
       padding = 5,
     },
