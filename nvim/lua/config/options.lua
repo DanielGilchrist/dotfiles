@@ -31,3 +31,7 @@ vim.filetype.add({
 })
 
 vim.opt.relativenumber = true
+
+vim.diagnostic.config({
+  virtual_lines = true,
+})
