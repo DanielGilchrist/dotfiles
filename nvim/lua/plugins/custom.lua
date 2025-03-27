@@ -4,10 +4,6 @@ local function load(name)
   require("custom." .. name)
 end
 
-local function register_time_worked()
-
-end
-
 return {
   lazy = true,
   event = { "CmdlineEnter" },
@@ -18,7 +14,6 @@ return {
     load("yank_test_line")
     load("bundle_open")
     load("tanda_cli")
-
-    register_time_worked()
+    load("rails_test_open")
   end,
 }
