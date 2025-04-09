@@ -36,15 +36,42 @@ local function add_ruby_deps_command(client, bufnr)
     { nargs = "?", complete = function() return { "all" } end })
 end
 
+local function gopls_organise_imports_and_format_on_save(client, bufnr)
+  vim.api.nvim_create_autocmd("BufWritePre", {
+    buffer = bufnr,
+    callback = function()
+      -- Organise imports
+      local params = vim.lsp.util.make_range_params(nil, client.offset_encoding)
+      params = vim.tbl_extend("force", params, {
+        context = { only = { "source.organizeImports" } }
+      })
+
+      local result = vim.lsp.buf_request_sync(bufnr, "textDocument/codeAction", params, 3000)
+      for _, res in pairs(result or {}) do
+        for _, r in pairs(res.result or {}) do
+          if r.edit then
+            vim.lsp.util.apply_workspace_edit(r.edit, client.offset_encoding)
+          elseif r.command then
+            local ctx = { bufnr = bufnr }
+            client:exec_cmd(r.command, ctx)
+          end
+        end
+      end
+
+      -- Format file
+      vim.lsp.buf.format({ async = false, bufnr = bufnr })
+    end,
+    group = vim.api.nvim_create_augroup("GoFormat" .. bufnr, { clear = true }),
+  })
+end
+
 return {
   "neovim/nvim-lspconfig",
   opts = function(_, opts)
     opts.diagnostics.virtual_text = false
-
     opts.inlay_hints = {
       enabled = false,
     }
-
     opts.setup = {
       -- TODO: Can be re-enabled if the following issue is ever resolved: https://github.com/elbywan/crystalline/issues/41
       crystalline = function(_, cr_opts)
@@ -57,15 +84,30 @@ return {
           add_ruby_deps_command(client, buffer)
         end
       end,
-    }
+      gopls = function(_, gopls_opts)
+        gopls_opts.settings = {
+          gopls = {
+            gofumpt = true,
+            staticcheck = true,
+            analyses = {
+              unusedparams = true,
+            },
+            importOrganization = true,
+          },
+        }
 
+        gopls_opts.on_attach = function(client, bufnr)
+          gopls_organise_imports_and_format_on_save(client, bufnr)
+        end
+      end,
+    }
     opts.servers = {
       crystalline = {
         mason = false,
         cmd = { "/usr/local/bin/crystalline" },
       },
       flow = {},
-      gopls = {},
+      gopls = {}, -- Settings will be added via the setup function above
       rubocop = {
         single_file_support = false,
         mason = false,

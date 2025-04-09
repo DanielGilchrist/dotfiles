@@ -7,6 +7,26 @@ local l = function(keys)
   return "<leader>" .. keys
 end
 
+-- Debug
+map("n", l("wtf"), function()
+  local ft = vim.bo.filetype
+  if ft == "ruby" or ft == "eruby" or ft == "haml" or ft == "crystal" then
+    vim.cmd('normal! oputs "#" * 90')
+    vim.cmd('normal! oputs caller')
+    vim.cmd('normal! oputs "#" * 90')
+  elseif ft == "rust" then
+    vim.cmd('normal! oprintln!("{}", "#".repeat(90));')
+    vim.cmd('normal! oeprintln!("{:?}", std::backtrace::Backtrace::capture());')
+    vim.cmd('normal! oprintln!("{}", "#".repeat(90));')
+  elseif ft == "go" then
+    vim.cmd('normal! ofmt.Println(strings.Repeat("#", 90))')
+    vim.cmd('normal! odebug.PrintStack()')
+    vim.cmd('normal! ofmt.Println(strings.Repeat("#", 90))')
+  else
+    print("No debug template for filetype: " .. ft)
+  end
+end, { desc = "Insert debug trace for current language" })
+
 -- Clipboard
 map("n", l("jC"), function()
   local notify = require("../utils/notify")
