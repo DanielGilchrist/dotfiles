@@ -10,10 +10,18 @@ end
 -- Debug
 map("n", l("wtf"), function()
   local ft = vim.bo.filetype
-  if ft == "ruby" or ft == "eruby" or ft == "haml" or ft == "crystal" then
+  if ft == "ruby" or ft == "crystal" then
     vim.cmd('normal! oputs "#" * 90')
     vim.cmd('normal! oputs caller')
     vim.cmd('normal! oputs "#" * 90')
+  elseif ft == "haml" then
+    vim.cmd('normal! o- puts "#" * 90')
+    vim.cmd('normal! o- puts caller')
+    vim.cmd('normal! o- puts "#" * 90')
+  elseif ft == "eruby" then
+    vim.cmd('normal! o<% puts "#" * 90 %>')
+    vim.cmd('normal! o<% puts caller %>')
+    vim.cmd('normal! o<% puts "#" * 90 %>')
   elseif ft == "rust" then
     vim.cmd('normal! oprintln!("{}", "#".repeat(90));')
     vim.cmd('normal! oeprintln!("{:?}", std::backtrace::Backtrace::capture());')
@@ -23,7 +31,7 @@ map("n", l("wtf"), function()
     vim.cmd('normal! odebug.PrintStack()')
     vim.cmd('normal! ofmt.Println(strings.Repeat("#", 90))')
   else
-    print("No debug template for filetype: " .. ft)
+    print("No <leader>wtf definition for '" .. ft .. "'")
   end
 end, { desc = "Insert debug trace for current language" })
 
