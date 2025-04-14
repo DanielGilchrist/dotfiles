@@ -13,15 +13,14 @@ return {
   build = "make",
   opts = {
     provider = "claude",
-    auto_suggestions_provider = "claude",
     claude = {
       endpoint = "https://api.anthropic.com",
       model = "claude-3-7-sonnet-latest",
       temperature = 0,
-      max_tokens = 16000
+      max_tokens = 4096,
     },
     behaviour = {
-      auto_suggestions = true,
+      auto_suggestions = false,
       enable_claude_text_editor_tool_mode = true,
     },
     ask = {
