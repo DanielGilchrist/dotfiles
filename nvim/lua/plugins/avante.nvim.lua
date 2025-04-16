@@ -1,5 +1,6 @@
 return {
   "yetone/avante.nvim",
+  event = "VeryLazy",
   dependencies = {
     "nvim-tree/nvim-web-devicons",
     "stevearc/dressing.nvim",
