@@ -1,10 +1,11 @@
 return {
   "yetone/avante.nvim",
-  event = "VeryLazy",
-  dependencies = {
-    "nvim-tree/nvim-web-devicons",
+  event = "Bufread",
+   dependencies = {
+    "echasnovski/mini.icons",
     "stevearc/dressing.nvim",
     "nvim-lua/plenary.nvim",
+    "MunifTanjim/nui.nvim",
     {
       "MeanderingProgrammer/render-markdown.nvim",
       opts = { file_types = { "markdown", "Avante" } },
