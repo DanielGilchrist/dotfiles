@@ -1,7 +1,6 @@
 return {
   "GeorgesAlkhouri/nvim-aider",
   cmd = "Aider",
-  -- Example key mappings for common actions:
   keys = {
     { "<leader>a/", "<cmd>Aider toggle<cr>", desc = "Toggle Aider" },
     { "<leader>as", "<cmd>Aider send<cr>", desc = "Send to Aider", mode = { "n", "v" } },
@@ -10,11 +9,14 @@ return {
     { "<leader>a+", "<cmd>Aider add<cr>", desc = "Add File" },
     { "<leader>a-", "<cmd>Aider drop<cr>", desc = "Drop File" },
     { "<leader>ar", "<cmd>Aider add readonly<cr>", desc = "Add Read-Only" },
-    -- Example nvim-tree.lua integration if needed
-    { "<leader>a+", "<cmd>AiderTreeAddFile<cr>", desc = "Add File from Tree to Aider", ft = "NvimTree" },
-    { "<leader>a-", "<cmd>AiderTreeDropFile<cr>", desc = "Drop File from Tree from Aider", ft = "NvimTree" },
   },
   dependencies = {
     "folke/snacks.nvim",
+  },
+  opts = {
+    args = {
+      "--cache-prompts",
+      "--no-stream",
+    }
   }
 }
