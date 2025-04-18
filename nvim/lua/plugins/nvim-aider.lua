@@ -17,6 +17,9 @@ return {
     args = {
       "--cache-prompts",
       "--no-stream",
-    }
+    },
+    picker_cfg = {
+      preset = "select",
+    },
   }
 }
