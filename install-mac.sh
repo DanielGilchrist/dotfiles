@@ -108,6 +108,7 @@ install_brew_package fzf
 install_brew_package lazygit
 install_brew_package crystalline
 install_brew_package spotify_player
+install_brew_package aider
 
 install_asdf_plugin ruby https://github.com/asdf-vm/asdf-ruby.git
 install_asdf_plugin crystal https://github.com/asdf-community/asdf-crystal.git
