@@ -36,6 +36,13 @@ map("n", l("wtf"), function()
 end, { desc = "Insert debug trace for current language" })
 
 -- Clipboard
+map("n", l("bc"), function()
+  local notify = require("../utils/notify")
+  local path = vim.fn.expand("%:.")
+  vim.fn.setreg('+', path)
+  notify.info("Copied " .. path .. " to clipboard")
+end, { desc = "Copy relative file path for current buffer" })
+
 map("n", l("jC"), function()
   local notify = require("../utils/notify")
   local clipboard_contents = vim.fn.getreg("+")
