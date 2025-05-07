@@ -14,6 +14,6 @@ return {
     load("yank_test_line")
     load("bundle_open")
     load("tanda_cli")
-    load("rails_test_open")
+    load("test_open")
   end,
 }

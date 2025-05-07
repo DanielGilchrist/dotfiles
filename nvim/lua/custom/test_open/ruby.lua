@@ -1,4 +1,4 @@
-local notify = require("../utils/notify")
+local notify = require("utils.notify")
 
 local TargetPath = {}
 TargetPath.__index = TargetPath
@@ -99,28 +99,24 @@ function TargetPath:__parse_test_to_file_fallback_path(path)
   return base_path .. ".rb"
 end
 
-local function open_test()
-  local current_file_path = vim.fn.expand("%:p")
-  local target_path = TargetPath.new(current_file_path)
-  local target_file = target_path:file()
-
-  if target_file then
-    vim.cmd("edit " .. target_file)
-    return
-  end
-
-  local target_directory = target_path:directory()
-
-  if target_directory then
-    require("oil").toggle_float(target_directory)
-    return
-  end
-
-  notify.info("Unable to find corresponding file!")
-end
-
-vim.api.nvim_create_user_command("TestOpen", open_test, {})
-
 return {
-  open_test = open_test
+  open_test = function()
+    local current_file_path = vim.fn.expand("%:p")
+    local target_path = TargetPath.new(current_file_path)
+    local target_file = target_path:file()
+
+    if target_file then
+      vim.cmd("edit " .. target_file)
+      return
+    end
+
+    local target_directory = target_path:directory()
+
+    if target_directory then
+      require("oil").toggle_float(target_directory)
+      return
+    end
+
+    notify.info("Unable to find corresponding file!")
+  end
 }
