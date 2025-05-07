@@ -120,3 +120,7 @@ local function open_test()
 end
 
 vim.api.nvim_create_user_command("TestOpen", open_test, {})
+
+return {
+  open_test = open_test
+}
