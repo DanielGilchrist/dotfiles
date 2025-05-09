@@ -79,11 +79,6 @@ return {
           disable_format(client)
         end
       end,
-      ruby_lsp = function(_, rlsp_opts)
-        rlsp_opts.on_attach = function(client, buffer)
-          add_ruby_deps_command(client, buffer)
-        end
-      end,
       gopls = function(_, gopls_opts)
         gopls_opts.settings = {
           gopls = {
@@ -98,6 +93,11 @@ return {
 
         gopls_opts.on_attach = function(client, bufnr)
           gopls_organise_imports_and_format_on_save(client, bufnr)
+        end
+      end,
+      ruby_lsp = function(_, rlsp_opts)
+        rlsp_opts.on_attach = function(client, buffer)
+          add_ruby_deps_command(client, buffer)
         end
       end,
     }
