@@ -1,9 +1,0 @@
-fullscreen = true
-
-font-family = "JetBrains Mono"
-font-size = 14
-
-theme = "catppuccin-mocha"
-
-keybind = global:ctrl+grave_accent=toggle_quick_terminal
-
