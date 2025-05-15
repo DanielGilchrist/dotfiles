@@ -32,14 +32,14 @@ return {
   colourscheme("Shatur/neovim-ayu"),
   colourscheme("wtfox/jellybeans.nvim", {
     opts = {
-      transparent = true,
+      transparent = false,
     }
   }),
   colourscheme("rose-pine/neovim", {
     name = "rose-pine",
     opts = {
       styles = {
-        transparency = true,
+        transparency = false,
       }
     }
   }),
@@ -47,14 +47,14 @@ return {
     config = function()
       require("everforest").setup({
         background = "hard",
-        transparent_background_level = 2,
+        -- transparent_background_level = 2,
       })
     end,
   }),
   {
     "LazyVim/LazyVim",
     opts = {
-      colorscheme = "gruvbox",
+      colorscheme = "everforest",
     },
   },
 }

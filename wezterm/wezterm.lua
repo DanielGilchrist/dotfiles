@@ -20,7 +20,7 @@ local misc = {
   webgpu_power_preference = "HighPerformance",
   max_fps = 144,
 
-  color_scheme = "Gruvbox dark, hard (base16)",
+  color_scheme = "Everforest Dark (Gogh)",
   automatically_reload_config = false,
   window_close_confirmation = "AlwaysPrompt",
   notification_handling = "AlwaysShow",
@@ -35,8 +35,8 @@ local misc = {
     top = 10,
     bottom = 0,
   },
-  window_background_opacity = 0.90,
-  macos_window_background_blur = 20,
+  -- window_background_opacity = 0.90,
+  -- macos_window_background_blur = 20,
 
   font = wezterm.font_with_fallback({
     {
