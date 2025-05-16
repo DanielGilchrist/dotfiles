@@ -35,6 +35,7 @@ local misc = {
     top = 10,
     bottom = 0,
   },
+  native_macos_fullscreen_mode = true,
   -- window_background_opacity = 0.90,
   -- macos_window_background_blur = 20,
 
