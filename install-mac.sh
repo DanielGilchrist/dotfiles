@@ -109,10 +109,12 @@ install_brew_package lazygit
 install_brew_package crystalline
 install_brew_package spotify_player
 install_brew_package aider
+install_brew_package watchman
 
 install_asdf_plugin ruby https://github.com/asdf-vm/asdf-ruby.git
 install_asdf_plugin crystal https://github.com/asdf-community/asdf-crystal.git
 install_asdf_plugin nodejs https://github.com/asdf-vm/asdf-nodejs.git
+install_asdf_plugin golang https://github.com/asdf-community/asdf-golang.git
 
 if ! command_exists rustup; then
   echo "Installing rustup..."
