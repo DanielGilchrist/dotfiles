@@ -5,3 +5,6 @@ git:
   parseEmoji: true
 
 notARepository: quit
+
+os:
+  editPreset: nvim
