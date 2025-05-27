@@ -65,6 +65,21 @@ local function gopls_organise_imports_and_format_on_save(client, bufnr)
   })
 end
 
+local function find_crystalline()
+  local paths = {
+    "/opt/homebrew/bin/crystalline", -- Apple Silicon Mac
+    "/usr/local/bin/crystalline",    -- Intel Mac/Linux
+  }
+
+  for _, path in ipairs(paths) do
+    if vim.fn.executable(path) == 1 then
+      return path
+    end
+  end
+
+  return "crystalline"
+end
+
 return {
   "neovim/nvim-lspconfig",
   opts = function(_, opts)
@@ -104,7 +119,7 @@ return {
     opts.servers = {
       crystalline = {
         mason = false,
-        cmd = { "/usr/local/bin/crystalline" },
+        cmd = { find_crystalline() },
       },
       flow = {},
       gopls = {}, -- Settings will be added via the setup function above
