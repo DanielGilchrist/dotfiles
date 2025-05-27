@@ -1,3 +1,5 @@
+transparent = false
+
 local function colourscheme(source, options)
   options = options == nil and {} or options
 
@@ -15,31 +17,31 @@ return {
   colourscheme("catppuccin/nvim", {
     name = "catppuccin",
     opts = {
-      transparent_background = true,
+      transparent_background = transparent,
     }
   }),
   colourscheme("folke/tokyonight.nvim", {
     opts = {
-      transparent = true,
+      transparent = transparent,
     }
   }),
   colourscheme("ellisonleao/gruvbox.nvim", {
     opts = {
-      transparent_mode = true
+      transparent_mode = transparent
     }
   }),
   colourscheme("scottmckendry/cyberdream.nvim"),
   colourscheme("Shatur/neovim-ayu"),
   colourscheme("wtfox/jellybeans.nvim", {
     opts = {
-      transparent = false,
+      transparent = transparent,
     }
   }),
   colourscheme("rose-pine/neovim", {
     name = "rose-pine",
     opts = {
       styles = {
-        transparency = false,
+        transparency = transparent,
       }
     }
   }),
@@ -51,10 +53,17 @@ return {
       })
     end,
   }),
+  colourscheme("EdenEast/nightfox.nvim", {
+    opts = {
+      options = {
+        transparent = transparent
+      }
+    }
+  }),
   {
     "LazyVim/LazyVim",
     opts = {
-      colorscheme = "everforest",
+      colorscheme = "carbonfox",
     },
   },
 }
