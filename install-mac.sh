@@ -110,6 +110,8 @@ install_brew_package crystalline
 install_brew_package spotify_player
 install_brew_package aider
 install_brew_package watchman
+install_brew_package imagemagick
+install_brew_package ghostscript
 
 install_asdf_plugin ruby https://github.com/asdf-vm/asdf-ruby.git
 install_asdf_plugin crystal https://github.com/asdf-community/asdf-crystal.git
