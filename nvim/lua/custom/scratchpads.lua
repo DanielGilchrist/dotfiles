@@ -56,6 +56,7 @@ local function new_scratchpad()
     { lang = "Text",       ext = ".txt" },
     { lang = "Bash",       ext = ".sh" },
     { lang = "Fish",       ext = ".fish" },
+    { lang = "JSON",       ext = ".json" },
   }, {
     prompt = "Select a language",
     format_item = function(item)
