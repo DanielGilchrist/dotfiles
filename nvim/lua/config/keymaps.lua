@@ -104,7 +104,6 @@ end
 map("n", l("mo"), function()
   Snacks.terminal.toggle("spotify_player", {
     win = {
-      style = "terminal",
       keys = {
         ["<esc>"] = "hide",
         ["<C-/>"] = "hide",
@@ -132,3 +131,14 @@ end, { desc = "Fast-forward 10 seconds" })
 map("n", l("mb"), function()
   playback({ "seek", "--", "-10000" })
 end, { desc = "Rewind 10 seconds" })
+
+map("n", l("ts"), function()
+  Snacks.terminal.toggle("tetrigo", {
+    win = {
+      keys = {
+        ["<esc>"] = "hide",
+        ["<C-/>"] = "hide",
+      }
+    }
+  })
+end, { desc = "Launch Tetris" })
