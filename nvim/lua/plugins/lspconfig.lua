@@ -112,6 +112,13 @@ return {
       end,
       ruby_lsp = function(_, rlsp_opts)
         rlsp_opts.on_attach = function(client, buffer)
+          client.commands["rubyLsp.openFile"] = function(command, ctx)
+            local args = command.arguments[1]
+            if args and args[1] then
+              vim.cmd("edit " .. vim.uri_to_fname(args[1]))
+            end
+          end
+
           add_ruby_deps_command(client, buffer)
         end
       end,
