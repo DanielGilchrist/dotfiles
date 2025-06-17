@@ -37,14 +37,6 @@ return {
       transparent = transparent,
     }
   }),
-  colourscheme("rose-pine/neovim", {
-    name = "rose-pine",
-    opts = {
-      styles = {
-        transparency = transparent,
-      }
-    }
-  }),
   colourscheme("neanias/everforest-nvim", {
     config = function()
       require("everforest").setup({
@@ -60,10 +52,15 @@ return {
       }
     }
   }),
+  colourscheme("daneofmanythings/chalktone.nvim", {
+    opts = {
+      theme = "default"
+    }
+  }),
   {
     "LazyVim/LazyVim",
     opts = {
-      colorscheme = "jellybeans",
+      colorscheme = "chalktone",
     },
   },
 }
