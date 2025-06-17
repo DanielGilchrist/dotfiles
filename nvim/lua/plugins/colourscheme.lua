@@ -31,7 +31,6 @@ return {
     }
   }),
   colourscheme("scottmckendry/cyberdream.nvim"),
-  colourscheme("Shatur/neovim-ayu"),
   colourscheme("wtfox/jellybeans.nvim", {
     opts = {
       transparent = transparent,
@@ -52,15 +51,11 @@ return {
       }
     }
   }),
-  colourscheme("daneofmanythings/chalktone.nvim", {
-    opts = {
-      theme = "default"
-    }
-  }),
+  colourscheme("RRethy/base16-nvim"),
   {
     "LazyVim/LazyVim",
     opts = {
-      colorscheme = "chalktone",
+      colorscheme = "base16-ayu-dark",
     },
   },
 }
