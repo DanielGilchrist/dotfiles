@@ -25,6 +25,7 @@ set -gx HOMEBREW_NO_AUTO_UPDATE 1
 set -gx JAVA_HOME "/Applications/Android Studio.app/Contents/jbr/Contents/Home"
 set -gx ANDROID_HOME $HOME/Library/Android/sdk
 set -gx EDITOR (which nvim)
+set -gx MANPAGER 'nvim +Man!'
 
 set -gx ASDF_CONFIG_FILE "$HOME/.config/.asdfrc"
 set -gx ASDF_GOLANG_MOD_VERSION_ENABLED true
