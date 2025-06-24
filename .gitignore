@@ -41,6 +41,10 @@ foo.*
 *.log
 data
 
+# Claude/MCP
+claude-code/projects.yml
+rails-mcp/
+
 # zed
 conversations/
 prompts/
