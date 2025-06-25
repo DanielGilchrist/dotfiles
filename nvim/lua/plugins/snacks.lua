@@ -109,6 +109,11 @@ return {
       top_down = false,
     },
     picker = {
+      previewers = {
+        file = {
+          max_size = (1024 * 1024) * 3
+        },
+      },
       win = {
         input = {
           keys = {
