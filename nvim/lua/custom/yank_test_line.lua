@@ -41,6 +41,10 @@ local function find_test_line_number()
       return cursor_line
     end
 
+    if line_content:match("^%s*it%s") then
+      return cursor_line
+    end
+
     cursor_line = cursor_line - 1
   end
 end
