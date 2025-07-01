@@ -72,7 +72,7 @@ function TargetPath:__parse_functional_target_path(path)
   if not path:match("app/") and path:match("controllers/") then
     local result = path:gsub("controllers/", "functional/")
     return result
-  elseif path:match("functional/") then
+  elseif path:match("test/") and path:match("functional/") then
     local result = path:gsub("functional/", "controllers/")
     return result
   end
@@ -83,7 +83,7 @@ function TargetPath:__parse_integration_target_path(path)
   if not path:match("app/") and path:match("controllers/") then
     local result = path:gsub("controllers/", "integration/")
     return result
-  elseif path:match("integration/") then
+  elseif path:match("test/") and path:match("integration/") then
     local result = path:gsub("integration/", "controllers/")
     return result
   end
