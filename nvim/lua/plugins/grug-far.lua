@@ -2,7 +2,7 @@ return {
   "MagicDuck/grug-far.nvim",
   keys = {
     {
-      "<leader>cr",
+      "<leader>br",
       function()
         require('grug-far').with_visual_selection({
           prefills = {
