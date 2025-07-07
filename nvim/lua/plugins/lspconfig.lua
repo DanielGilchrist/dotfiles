@@ -131,7 +131,7 @@ return {
         mason = false,
         cmd = { find_crystalline() },
       },
-      flow = {},
+      -- flow = {},
       gopls = {}, -- Settings will be added via the setup function above
       rubocop = {
         single_file_support = false,
