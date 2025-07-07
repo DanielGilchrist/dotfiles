@@ -14,35 +14,12 @@ local function colourscheme(source, options)
 end
 
 return {
-  colourscheme("catppuccin/nvim", {
-    name = "catppuccin",
-    opts = {
-      transparent_background = transparent,
-    }
-  }),
-  colourscheme("folke/tokyonight.nvim", {
-    opts = {
-      transparent = transparent,
-    }
-  }),
-  colourscheme("ellisonleao/gruvbox.nvim", {
-    opts = {
-      transparent_mode = transparent
-    }
-  }),
+  colourscheme("RRethy/base16-nvim"),
   colourscheme("scottmckendry/cyberdream.nvim"),
   colourscheme("wtfox/jellybeans.nvim", {
     opts = {
       transparent = transparent,
     }
-  }),
-  colourscheme("neanias/everforest-nvim", {
-    config = function()
-      require("everforest").setup({
-        background = "hard",
-        -- transparent_background_level = 2,
-      })
-    end,
   }),
   colourscheme("EdenEast/nightfox.nvim", {
     opts = {
@@ -51,11 +28,10 @@ return {
       }
     }
   }),
-  colourscheme("RRethy/base16-nvim"),
   {
     "LazyVim/LazyVim",
     opts = {
-      colorscheme = "base16-ayu-dark",
+      colorscheme = "base16-gruvbox-material-dark-hard",
     },
   },
 }
