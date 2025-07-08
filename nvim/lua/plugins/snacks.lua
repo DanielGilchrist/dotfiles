@@ -109,6 +109,12 @@ return {
       top_down = false,
     },
     picker = {
+      hidden = true,
+      sources = {
+        files = {
+          hidden = true
+        }
+      },
       previewers = {
         file = {
           max_size = (1024 * 1024) * 3
