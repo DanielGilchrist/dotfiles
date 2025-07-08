@@ -1,0 +1,5 @@
+return {
+  server = {
+    mason = false,
+  }
+}
