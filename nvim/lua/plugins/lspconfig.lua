@@ -7,6 +7,11 @@ local function asdf_shim(command)
   return { vim.fn.expand("~/.asdf/shims/" .. command) }
 end
 
+local function gem_available(gem_name)
+  local result = vim.fn.system("bundle show " .. gem_name .. " 2>/dev/null")
+  return vim.v.shell_error == 0
+end
+
 -- https://shopify.github.io/ruby-lsp/editors.html#additional-setup-optional
 local function add_ruby_deps_command(client, bufnr)
   vim.api.nvim_buf_create_user_command(bufnr, "ShowRubyDeps", function(opts)
@@ -113,6 +118,9 @@ return {
           gopls_organise_imports_and_format_on_save(client, bufnr)
         end
       end,
+      rubocop = function(_, rubocop_opts)
+        rubocop_opts.autostart = gem_available("rubocop")
+      end,
       ruby_lsp = function(_, rlsp_opts)
         rlsp_opts.on_attach = function(client, buffer)
           client.commands["rubyLsp.openFile"] = function(command, ctx)
@@ -124,6 +132,9 @@ return {
 
           add_ruby_deps_command(client, buffer)
         end
+      end,
+      sorbet = function(_, sorbet_opts)
+        sorbet_opts.autostart = gem_available("sorbet")
       end,
     }
     opts.servers = {
