@@ -24,29 +24,31 @@ local function load_header(header_name)
 end
 
 return {
-  enabled = true,
-  preset = {
-    header = load_header(header)
-  },
-  sections = {
-    { section = "header" },
-    { section = "keys",  padding = 1 },
-    {
-      icon = " ",
-      title = "Projects",
-      section = "projects",
-      indent = 2,
-      padding = 1,
-      limit = 10,
+  opts = {
+    enabled = true,
+    preset = {
+      header = load_header(header)
     },
-    {
-      icon = "⏲",
-      title = "Time Worked",
-      section = "terminal",
-      cmd = cmd.tanda_cli({ "time_worked", "week" }),
-      padding = 1,
-      random = os.time(),
+    sections = {
+      { section = "header" },
+      { section = "keys",  padding = 1 },
+      {
+        icon = " ",
+        title = "Projects",
+        section = "projects",
+        indent = 2,
+        padding = 1,
+        limit = 10,
+      },
+      {
+        icon = "⏲",
+        title = "Time Worked",
+        section = "terminal",
+        cmd = cmd.tanda_cli({ "time_worked", "week" }),
+        padding = 1,
+        random = os.time(),
+      },
+      { section = "startup" },
     },
-    { section = "startup" },
   },
 }

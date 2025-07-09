@@ -1,8 +1,10 @@
 local notify = require("../utils/notify")
 
 return {
-  notify = true,
-  what = "permalink",
+  opts = {
+    notify = true,
+    what = "permalink",
+  },
   keys = {
     {
       "<leader>gY",
