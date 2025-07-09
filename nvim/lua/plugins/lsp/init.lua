@@ -1,43 +1,31 @@
-local function load_servers()
-  local servers = {}
-  local setup = {}
+local loader = require("utils.plugin_loader")
 
-  local servers_dir = vim.fn.stdpath("config") .. "/lua/plugins/lsp/servers"
-  local files = vim.fn.glob(servers_dir .. "/*.lua", false, true)
+local setup = {}
+local servers = {}
 
-  for _, file in ipairs(files) do
-    local name = vim.fn.fnamemodify(file, ":t:r")
-    local ok, config = pcall(require, "plugins.lsp.servers." .. name)
-
-    if ok and config then
-      if config.server then
-        servers[name] = config.server
-      end
-      if config.setup then
-        setup[name] = config.setup
-      end
-    end
+loader.each_config("plugins/lsp/servers", function(config, name)
+  if config.setup then
+    setup[name] = config.setup
   end
 
-  return servers, setup
-end
+  if config.server then
+    servers[name] = config.server
+  end
+end)
 
 return {
   "neovim/nvim-lspconfig",
-  opts = function(_, opts)
-    local servers, setup = load_servers()
-
-    opts.diagnostics.virtual_text = false
-
-    opts.codelens = {
-      enabled = true
-    }
-
-    opts.inlay_hints = {
+  opts = {
+    setup = setup,
+    servers = servers,
+    codelens = {
+      enabled = true,
+    },
+    diagnostics = {
+      virtual_text = false,
+    },
+    inlay_hints = {
       enabled = false,
-    }
-
-    opts.servers = servers
-    opts.setup = setup
-  end,
+    },
+  },
 }

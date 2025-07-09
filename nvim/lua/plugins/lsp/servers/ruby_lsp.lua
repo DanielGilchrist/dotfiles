@@ -36,14 +36,14 @@ local function open_file(command, ctx)
 end
 
 return {
-  server = {
-    mason = false,
-    cmd = utils.asdf_shim("ruby-lsp")
-  },
   setup = function(_, opts)
     opts.on_attach = function(client, buffer)
       client.commands["rubyLsp.openFile"] = open_file
       add_ruby_deps_command(client, buffer)
     end
-  end
+  end,
+  server = {
+    mason = false,
+    cmd = utils.asdf_shim("ruby-lsp")
+  },
 }

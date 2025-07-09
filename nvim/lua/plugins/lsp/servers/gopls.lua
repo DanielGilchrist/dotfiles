@@ -28,7 +28,6 @@ local function organise_imports_and_format_on_save(client, bufnr)
 end
 
 return {
-  server = {},
   setup = function(_, opts)
     opts.settings = {
       gopls = {
