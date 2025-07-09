@@ -1,10 +1,12 @@
 local loader = require("utils.plugin_loader")
 
-local components = {}
+local opts = {}
 local keys = {}
 
 loader.each_config("plugins/snacks", function(config, name)
-  components[name] = config
+  if config.opts then
+    opts[name] = config.opts
+  end
 
   if config.keys then
     vim.list_extend(keys, config.keys)
@@ -13,6 +15,6 @@ end)
 
 return {
   "folke/snacks.nvim",
-  opts = components,
+  opts = opts,
   keys = keys,
 }
