@@ -16,13 +16,13 @@ local function find_crystalline()
 end
 
 return {
-  server = {
-    mason = false,
-    cmd = { find_crystalline() },
-  },
   setup = function(_, opts)
     opts.on_attach = function(client)
       utils.disable_format(client)
     end
-  end
+  end,
+  server = {
+    mason = false,
+    cmd = { find_crystalline() },
+  },
 }
