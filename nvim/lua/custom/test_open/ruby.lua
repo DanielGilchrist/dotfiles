@@ -19,7 +19,7 @@ function TargetPath.new(path)
   local functional_target_path = self:__parse_functional_target_path(target_path)
   local integration_target_path = self:__parse_integration_target_path(target_path)
   local test_to_file_fallback_path = self:__parse_test_to_file_fallback_path(
-    functional_target_path or integration_target_path
+    target_path or functional_target_path or integration_target_path
   )
 
   if functional_target_path then
