@@ -1,14 +1,19 @@
-return {
-  read = function(path)
-    local file = io.open(path, "r")
+M = {}
 
-    if not file then
-      return nil
-    end
+---Read the contents of a file
+---@param path string
+---@return string?
+M.read = function(path)
+  local file = io.open(path, "r")
 
-    local contents = file:read("*a")
-    file:close()
-
-    return contents
+  if not file then
+    return nil
   end
-}
+
+  local contents = file:read("*a")
+  file:close()
+
+  return contents
+end
+
+return M
