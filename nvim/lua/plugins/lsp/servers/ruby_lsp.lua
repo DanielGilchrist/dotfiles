@@ -1,7 +1,7 @@
 local utils = require("plugins.lsp.utils")
 
 local function add_ruby_deps_command(client, bufnr)
-  vim.api.nvim_buf_create_user_command(bufnr, "ShowRubyDeps", function(opts)
+  local show_ruby_deps = function(opts)
     local params = vim.lsp.util.make_text_document_params()
     local showAll = opts.args == "all"
 
@@ -24,11 +24,26 @@ local function add_ruby_deps_command(client, bufnr)
       vim.fn.setqflist(qf_list)
       vim.cmd('copen')
     end, bufnr)
-  end,
-  { nargs = "?", complete = function() return { "all" } end })
+  end
+
+  vim.api.nvim_buf_create_user_command(bufnr, "ShowRubyDeps", show_ruby_deps, {
+    nargs = "?",
+    complete = function()
+      return { "all" }
+    end
+  })
 end
 
-local function open_file(command, ctx)
+local function disable_features_present_in_sorbet(client, bufnr)
+  utils.each_client({ bufnr = bufnr }, function(c)
+    if c.name == "sorbet" then
+      client.server_capabilities.documentSymbolProvider = false
+      return true
+    end
+  end)
+end
+
+local function open_file(command, _ctx)
   local args = command.arguments[1]
   if args and args[1] then
     vim.cmd("edit " .. vim.uri_to_fname(args[1]))
@@ -37,9 +52,10 @@ end
 
 return {
   setup = function(_, opts)
-    opts.on_attach = function(client, buffer)
+    opts.on_attach = function(client, bufnr)
       client.commands["rubyLsp.openFile"] = open_file
-      add_ruby_deps_command(client, buffer)
+      add_ruby_deps_command(client, bufnr)
+      disable_features_present_in_sorbet(client, bufnr)
     end
   end,
   server = {
