@@ -5,6 +5,7 @@ return {
       "<leader>br",
       function()
         require('grug-far').with_visual_selection({
+          startCursorRow = 2,
           prefills = {
             paths = vim.fn.expand("%"),
           },
@@ -15,6 +16,7 @@ return {
     }
   },
   opts = {
+    startInInsertMode = false,
     prefills = {
       flags = "--hidden",
       filesFilter = "!.git"
