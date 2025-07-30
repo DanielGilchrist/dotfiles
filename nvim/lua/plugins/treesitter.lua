@@ -4,6 +4,7 @@ return {
     opts = {
       ensure_installed = {
         "ruby",
+        "rbs",
         "rust",
         "go",
         "lua",
