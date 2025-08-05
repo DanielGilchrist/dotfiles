@@ -116,22 +116,23 @@ local function remove_scratchpad()
       files_to_delete[i] = file.text
     end
 
-    vim.ui.select({ "Yes", "No" }, {
-      prompt = "Remove selected scratchpads?",
-    }, function(choice)
-      if choice == "Yes" then
-        for _, file in ipairs(files_to_delete) do
-          local success, err = os.remove(file)
-          if not success then
-            notify.error(string.format("Failed to remove %s: %s", file, err))
-          else
-            notify.info(string.format("Removed %s", file))
+    require("utils.ui").confirm(
+      "Remove selected scratchpads?",
+      function(choice)
+        if choice == "Ok" then
+          for _, file in ipairs(files_to_delete) do
+            local success, err = os.remove(file)
+            if not success then
+              notify.error(string.format("Failed to remove %s: %s", file, err))
+            else
+              notify.info(string.format("Removed %s", file))
+            end
           end
+        else
+          notify.warn("Action to remove scratchpads cancelled.")
         end
-      else
-        notify.warn("Action to remove scratchpads cancelled.")
       end
-    end)
+    )
   end
 
   scratch_search("Delete Scratchpad", {
