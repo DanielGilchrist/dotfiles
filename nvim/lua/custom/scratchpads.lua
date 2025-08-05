@@ -1,7 +1,7 @@
 local notify = require("../utils/notify")
 local scratchpads_dir = vim.fn.expand("~/.local/share/scratchpads/")
 
-local function scratch_search(title, opts)
+local function scratch_search(_title, opts)
   opts = opts == nil and {} or opts
 
   local args = {
@@ -116,11 +116,10 @@ local function remove_scratchpad()
       files_to_delete[i] = file.text
     end
 
-    local file_list = table.concat(files_to_delete, "\n")
-    local input_prompt = "Are you sure you want to remove these scratchpads? (y/n)\n\n"
-
-    vim.ui.input({ prompt = input_prompt }, function(input)
-      if input == "y" then
+    vim.ui.select({ "Yes", "No" }, {
+      prompt = "Remove selected scratchpads?",
+    }, function(choice)
+      if choice == "Yes" then
         for _, file in ipairs(files_to_delete) do
           local success, err = os.remove(file)
           if not success then
