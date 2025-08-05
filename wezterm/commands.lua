@@ -1,7 +1,21 @@
 local wezterm = require("wezterm")
 local os_utils = require("utils.os")
 
-local commands = {}
+local M = {}
+
+local pane_direction = {
+  Right = "Right",
+  Bottom = "Bottom"
+}
+
+local commands = {
+  CDT     = "cdt",
+  Console = "bin/dev console",
+  Server  = "bin/dev server",
+  Tunnel  = "bin/tunnel",
+  Worker  = "bin/dev worker",
+  Webpack = "bin/dev webpack"
+}
 
 local function split_pane_with(func)
   return function(pane, direction, size)
@@ -60,7 +74,7 @@ local function has_interrupted_system_call(pane)
 end
 
 local function buffered_cdt(pane)
-  pane:send_text("cdt")
+  pane:send_text(commands.CDT)
   wezterm.sleep_ms(100)
   pane:send_text("\n")
 end
@@ -96,7 +110,7 @@ local function open_work_tabs(region)
   return function(original_window, _original_pane, _line)
     local function export_region_and_cdt(pane)
       run_command(pane, "export REGION=" .. region)
-      run_command(pane, "cdt")
+      run_command(pane, commands.CDT)
     end
 
     local split_pane_with_setup = split_pane_with(function(new_pane)
@@ -119,24 +133,24 @@ local function open_work_tabs(region)
       return
     end
 
-    local console_pane = split_pane_with_setup(server_pane, "Right")
-    local webpack_pane = split_pane_with_setup(console_pane, "Bottom", 0.1)
-    local tunnel_pane = split_pane_with_setup(server_pane, "Bottom", 0.1)
-    local worker_pane = split_pane_with_setup(server_pane, "Bottom", 0.4)
+    local console_pane = split_pane_with_setup(server_pane, pane_direction.Right)
+    local webpack_pane = split_pane_with_setup(console_pane, pane_direction.Bottom, 0.1)
+    local tunnel_pane = split_pane_with_setup(server_pane, pane_direction.Bottom, 0.1)
+    local worker_pane = split_pane_with_setup(server_pane, pane_direction.Bottom, 0.4)
 
-    run_command(tunnel_pane, "bin/tunnel")
+    run_command(tunnel_pane, commands.Tunnel)
     wait_for_text_for(tunnel_pane, "INFO: Ready!")
 
-    run_command(server_pane, "bin/dev server")
+    run_command(server_pane, commands.Server)
     wait_for_text_for(server_pane, "Bundle complete!", "Done in")
 
-    run_command(webpack_pane, "bin/dev webpack")
-    run_command(console_pane, "bin/dev console")
-    run_command(worker_pane, "bin/dev worker")
+    run_command(webpack_pane, commands.Webpack)
+    run_command(console_pane, commands.Console)
+    run_command(worker_pane, commands.Worker)
   end
 end
 
-commands.register_commands = function()
+M.register_commands = function()
   wezterm.on("augment-command-palette", function(_window, _pane)
     return {
       {
@@ -151,4 +165,4 @@ commands.register_commands = function()
   end)
 end
 
-return commands
+return M
