@@ -108,7 +108,6 @@ install_brew_package fzf
 install_brew_package lazygit
 install_brew_package crystalline
 install_brew_package spotify_player
-install_brew_package aider
 install_brew_package watchman
 install_brew_package imagemagick
 install_brew_package ghostscript
