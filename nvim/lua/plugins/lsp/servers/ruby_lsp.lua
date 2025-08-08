@@ -64,6 +64,13 @@ return {
   end,
   server = {
     mason = false,
-    cmd = utils.asdf_shim("ruby-lsp")
+    cmd = utils.asdf_shim("ruby-lsp"),
+    init_options = {
+      addonSettings = {
+        ["Ruby LSP Rails"] = {
+          enablePendingMigrationsPrompt = false,
+        },
+      },
+    },
   },
 }
