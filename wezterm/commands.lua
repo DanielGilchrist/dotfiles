@@ -3,18 +3,44 @@ local os_utils = require("utils.os")
 
 local M = {}
 
+---@class (exact) PaneDirection
+---@field Right string
+---@field Bottom string
+
+---@type PaneDirection
 local pane_direction = {
   Right = "Right",
   Bottom = "Bottom"
 }
 
+---@class (exact) Commands
+---@field CDT string
+---@field Console string
+---@field Server string
+---@field Start string
+---@field Tunnel string
+---@field Worker string
+---@field Webpack string
+
+---@type Commands
 local commands = {
   CDT     = "cdt",
   Console = "bin/dev console",
   Server  = "bin/dev server",
+  Start   = "bin/dev start",
   Tunnel  = "bin/tunnel",
-  Worker  = "bin/dev worker",
+  Worker  = "bin/dev worker --scale=2",
   Webpack = "bin/dev webpack"
+}
+
+---@class (exact) Region
+---@field APAC string
+---@field EU string
+
+---@type Region
+local regions = {
+  APAC = "apac",
+  EU   = "eu"
 }
 
 local function split_pane_with(func)
@@ -49,7 +75,7 @@ local function wait_for_text_for(pane, ...)
     if has_text(pane, ...) then
       break
     else
-      wezterm.sleep_ms(3000)
+      wezterm.sleep_ms(1000)
     end
   end
 end
@@ -138,11 +164,16 @@ local function open_work_tabs(region)
     local tunnel_pane = split_pane_with_setup(server_pane, pane_direction.Bottom, 0.1)
     local worker_pane = split_pane_with_setup(server_pane, pane_direction.Bottom, 0.4)
 
+    if region == regions.EU then
+      run_command(tunnel_pane, commands.Start)
+      wait_for_text_for(tunnel_pane, "Your dev box", "is ready to be used")
+    end
+
     run_command(tunnel_pane, commands.Tunnel)
     wait_for_text_for(tunnel_pane, "INFO: Ready!")
 
     run_command(server_pane, commands.Server)
-    wait_for_text_for(server_pane, "Bundle complete!", "Done in")
+    wait_for_text_for(server_pane, "Bundle complete!", "Done in", "Running server at")
 
     run_command(webpack_pane, commands.Webpack)
     run_command(console_pane, commands.Console)
@@ -155,11 +186,11 @@ M.register_commands = function()
     return {
       {
         brief = "[APAC] Open work tabs",
-        action = wezterm.action_callback(open_work_tabs("apac"))
+        action = wezterm.action_callback(open_work_tabs(regions.APAC))
       },
       {
         brief = "[EU] Open work tabs",
-        action = wezterm.action_callback(open_work_tabs("eu"))
+        action = wezterm.action_callback(open_work_tabs(regions.EU))
       },
     }
   end)
