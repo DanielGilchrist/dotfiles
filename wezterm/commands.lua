@@ -173,7 +173,7 @@ local function open_work_tabs(region)
     wait_for_text_for(tunnel_pane, "INFO: Ready!")
 
     run_command(server_pane, commands.Server)
-    wait_for_text_for(server_pane, "Bundle complete!", "Done in", "Running server at")
+    wait_for_text_for(server_pane, "Done in", "Running server at")
 
     run_command(webpack_pane, commands.Webpack)
     run_command(console_pane, commands.Console)
