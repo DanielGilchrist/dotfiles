@@ -5,24 +5,28 @@ local function info(_, data)
   notify.info(data)
 end
 
+local function error(_, data)
+  notify.error(data)
+end
+
 local function clock_in()
-  tanda_cli({ "clockin", "start", "--no-colour" }, { on_stdout = info })
+  tanda_cli({ "clockin", "start", "--no-colour" }, { on_stdout = info, on_stderr = error })
 end
 
 local function clock_break_start()
-  tanda_cli({ "clockin", "break", "start", "--no-colour" }, { on_stdout = info })
+  tanda_cli({ "clockin", "break", "start", "--no-colour" }, { on_stdout = info, on_stderr = error })
 end
 
 local function clock_break_finish()
-  tanda_cli({ "clockin", "break", "finish", "--no-colour" }, { on_stdout = info })
+  tanda_cli({ "clockin", "break", "finish", "--no-colour" }, { on_stdout = info, on_stderr = error })
 end
 
 local function clock_out()
-  tanda_cli({ "clockin", "finish", "--no-colour" }, { on_stdout = info })
+  tanda_cli({ "clockin", "finish", "--no-colour" }, { on_stdout = info, on_stderr = error })
 end
 
 local function time_worked()
-  tanda_cli({ "time_worked", "week", "--no-colour" }, { on_stdout = info })
+  tanda_cli({ "time_worked", "week", "--no-colour" }, { on_stdout = info, on_stderr = error })
 end
 
 local function time_worked_display()
@@ -41,7 +45,7 @@ local function time_worked_display()
     })
   end
 
-  tanda_cli({ "time_worked", "week", "--display", "--no-colour" }, { on_stdout = spawn_window })
+  tanda_cli({ "time_worked", "week", "--display", "--no-colour" }, { on_stdout = spawn_window, on_stderr = spawn_window })
 end
 
 vim.api.nvim_create_user_command("ClockIn", clock_in, {})
