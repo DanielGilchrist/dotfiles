@@ -139,9 +139,7 @@ local function open_work_tabs(region)
       run_command(pane, commands.CDT)
     end
 
-    local split_pane_with_setup = split_pane_with(function(new_pane)
-      export_region_and_cdt(new_pane)
-    end)
+    local split_pane_with_setup = split_pane_with(export_region_and_cdt)
 
     local _tab, server_pane, window = original_window:mux_window():spawn_tab({})
 
