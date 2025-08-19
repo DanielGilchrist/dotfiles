@@ -99,8 +99,7 @@ install_brew_cask wezterm@nightly wezterm
 install_brew_package neovim nvim
 install_brew_package gh
 install_brew_package asdf
-install_brew_cask font-jetbrains-mono
-install_brew_cask font-meslo-lg-nerd-font
+install_brew_cask font-jetbrains-mono-nerd-font
 
 install_brew_package fd
 install_brew_package ripgrep rg
@@ -109,8 +108,8 @@ install_brew_package lazygit
 install_brew_package crystalline
 install_brew_package spotify_player
 install_brew_package watchman
-install_brew_package imagemagick
-install_brew_package ghostscript
+install_brew_package imagemagick magick
+install_brew_package ghostscript gs
 
 install_asdf_plugin ruby https://github.com/asdf-vm/asdf-ruby.git
 install_asdf_plugin crystal https://github.com/asdf-community/asdf-crystal.git

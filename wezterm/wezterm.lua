@@ -41,11 +41,8 @@ local misc = {
 
   font = wezterm.font_with_fallback({
     {
-      family = "JetBrains Mono",
+      family = "JetBrains Mono NL",
       harfbuzz_features = { "liga=1" },
-    },
-    {
-      family = "MesloLGS NF",
     },
   }),
   font_size = os_utils.system() == "macos" and 14 or 12,
