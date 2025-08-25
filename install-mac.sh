@@ -110,6 +110,7 @@ install_brew_package spotify_player
 install_brew_package watchman
 install_brew_package imagemagick magick
 install_brew_package ghostscript gs
+install_brew_package sst/tap/opencode opencode
 
 install_asdf_plugin ruby https://github.com/asdf-vm/asdf-ruby.git
 install_asdf_plugin crystal https://github.com/asdf-community/asdf-crystal.git
