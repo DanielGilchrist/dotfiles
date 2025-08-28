@@ -7,4 +7,5 @@ return {
   disable_plugin("stevearc/conform.nvim"),
   disable_plugin("rafamadriz/friendly-snippets"),
   disable_plugin("nvim-neo-tree/neo-tree.nvim"), -- replaced by oil.nvim
+  disable_plugin("monaqa/dial.nvim"),
 }

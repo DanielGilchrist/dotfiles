@@ -1,33 +1,28 @@
-local file = require("../utils/file")
-local path = require("../utils/path")
 local cmd = require("../utils/cmd")
+local header = [[
 
-local header = "neovim"
+ FISH
+ ┌───────────────────────────────────────────────────────────────┐
+ │         ○                                             ○       │
+ │                 ><(((((((((((((º>          ○                  │
+ │    ○         ○                                                │
+ │       <º))))))><                        ><((((((((º>          │
+ │                    ○       <º)))))><                          │
+ │   ><((º>                                           ○          │
+ │             ○              ○                                  │
+ │                                   <º((((((((><                │
+ │       ○          ><(((º>                                  ○   │
+ │                                      ○                        │
+ │             ○           <º))))><                ○             │
+ └───────────────────────────────────────────────────────────────┘
 
-local function default_logo()
-  return [[
-      ██╗      █████╗ ███████╗██╗   ██╗██╗   ██╗██╗███╗   ███╗          Z
-      ██║     ██╔══██╗╚══███╔╝╚██╗ ██╔╝██║   ██║██║████╗ ████║      Z
-      ██║     ███████║  ███╔╝  ╚████╔╝ ██║   ██║██║██╔████╔██║   z
-      ██║     ██╔══██║ ███╔╝    ╚██╔╝  ╚██╗ ██╔╝██║██║╚██╔╝██║ z
-      ███████╗██║  ██║███████╗   ██║    ╚████╔╝ ██║██║ ╚═╝ ██║
-      ╚══════╝╚═╝  ╚═╝╚══════╝   ╚═╝     ╚═══╝  ╚═╝╚═╝     ╚═╝
-  ]]
-end
-
-local function logo_path(header_name)
-  return path.absolute_path("/plugins/logos/") .. header_name
-end
-
-local function load_header(header_name)
-  return file.read(logo_path(header_name .. ".txt")) or default_logo()
-end
+]]
 
 return {
   opts = {
     enabled = true,
     preset = {
-      header = load_header(header)
+      header = header
     },
     sections = {
       { section = "header" },
