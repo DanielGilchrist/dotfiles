@@ -15,19 +15,6 @@ end
 
 return {
   colourscheme("RRethy/base16-nvim"),
-  colourscheme("scottmckendry/cyberdream.nvim"),
-  colourscheme("wtfox/jellybeans.nvim", {
-    opts = {
-      transparent = transparent,
-    }
-  }),
-  colourscheme("EdenEast/nightfox.nvim", {
-    opts = {
-      options = {
-        transparent = transparent
-      }
-    }
-  }),
   {
     "LazyVim/LazyVim",
     opts = {
