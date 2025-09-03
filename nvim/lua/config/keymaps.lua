@@ -102,7 +102,7 @@ local function playback(command)
 end
 
 map("n", l("mo"), function()
-  Snacks.terminal.toggle("spotify_player", {
+  Snacks.terminal.toggle("spotify", {
     win = {
       keys = {
         ["<esc>"] = "hide",
