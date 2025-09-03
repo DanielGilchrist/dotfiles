@@ -4,9 +4,7 @@ set PERSONAL_DIR $REPOS_DIR/DanielGilchrist
 alias srbtc="bundle exec srb tc"
 alias lg=lazygit
 
-# TODO: Replace with `brew install spotify_player` once new version is cut
-# alias spotify=spotify_player
-alias spotify="/Users/danielgilchrist/Documents/repos/DanielGilchrist/spotify-player/target/release/spotify_player"
+alias spotify=spotify_player
 
 # personal projects
 alias tanda_cli="$PERSONAL_DIR/tanda_cli/bin/tanda_cli"
