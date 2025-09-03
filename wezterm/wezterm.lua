@@ -20,7 +20,38 @@ local misc = {
   webgpu_power_preference = "HighPerformance",
   max_fps = 144,
 
-  color_scheme = "Gruvbox dark, hard (base16)",
+  color_scheme = "Catppuccin Mocha",
+  colors = {
+    background = "#1E2528",
+    foreground = "#F8F9E8",
+    scrollbar_thumb = "#58686D",
+    split = "#CBE3B3",
+
+    tab_bar = {
+      background = "#191E21",
+      active_tab = {
+        bg_color = "#CBE3B3",
+        fg_color = "#171C1F",
+      },
+      new_tab = {
+        bg_color = "#191E21",
+        fg_color = "#CBE3B3",
+      },
+      new_tab_hover = {
+        bg_color = "#262F33",
+        fg_color = "#CBE3B3",
+      },
+      inactive_tab = {
+        bg_color = "#191E21",
+        fg_color = "#6F8788",
+      },
+      inactive_tab_hover = {
+        bg_color = "#262F33",
+        fg_color = "#ADC9BC",
+      },
+    },
+  },
+
   automatically_reload_config = false,
   window_close_confirmation = "AlwaysPrompt",
   notification_handling = "AlwaysShow",
