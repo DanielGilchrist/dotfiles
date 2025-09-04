@@ -8,5 +8,9 @@ return {
     screensaver = {
       timeout = timeout(1),
     },
+    sprite = {
+      left = "<º))><",
+      right = "><((º>"
+    }
   }
 }
