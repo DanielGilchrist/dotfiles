@@ -29,7 +29,7 @@ local commands = {
   Server  = "bin/dev server",
   Start   = "bin/dev start",
   Tunnel  = "bin/tunnel",
-  Worker  = "bin/dev worker --scale=2",
+  Worker  = "bin/dev worker",
   Webpack = "bin/dev webpack"
 }
 
