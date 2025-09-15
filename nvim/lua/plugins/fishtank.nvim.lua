@@ -10,7 +10,8 @@ return {
     },
     sprite = {
       left = "<º))><",
-      right = "><((º>"
+      right = "><((º>",
+      color = "#f542dd"
     }
   }
 }
