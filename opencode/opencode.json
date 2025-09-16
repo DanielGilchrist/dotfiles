@@ -16,6 +16,7 @@
       "grep *": "allow",
       "find *": "allow",
       "fd *": "allow",
+      "sed *": "allow",
       "cat *": "allow",
       "head *": "allow",
       "tail *": "allow",
