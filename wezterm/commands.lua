@@ -70,6 +70,13 @@ local function run_command(pane, command)
 	pane:send_text(command .. "\n")
 end
 
+local function run_commands(pane, ...)
+	local commands_table = { ... }
+	local joined_command = table.concat(commands_table, " && ")
+
+	run_command(pane, joined_command)
+end
+
 local function wait_for_text_for(pane, ...)
 	while true do
 		if has_text(pane, ...) then
@@ -135,8 +142,8 @@ end
 local function open_work_tabs(region)
 	return function(original_window, _original_pane, _line)
 		local function export_region_and_cdt(pane)
-			run_command(pane, "export REGION=" .. region)
-			run_command(pane, commands.CDT)
+			local export_region = "export REGION=" .. region
+			run_commands(pane, export_region, commands.CDT)
 		end
 
 		local split_pane_with_setup = split_pane_with(export_region_and_cdt)
@@ -167,6 +174,7 @@ local function open_work_tabs(region)
 			wait_for_text_for(tunnel_pane, "Your dev box", "is ready to be used")
 		end
 
+		wait_for_text_for(tunnel_pane, "Welcome to fish")
 		run_command(tunnel_pane, commands.Tunnel)
 		wait_for_text_for(tunnel_pane, "INFO: Ready!")
 
