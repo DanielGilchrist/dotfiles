@@ -4,35 +4,47 @@
 [init]
 	defaultBranch = main
 
+[core]
+	hooksPath = /dev/null
+
 [branch]
   sort = "-committerdate"
+
 [column]
   ui = auto
+
 [commit]
   verbose = true
+
 [diff]
   algorithm = histogram
   colorMoved = plain
   mnemonicPrefix = true
   renames = true
+
 [fetch]
   prune = true
   pruneTags = true
   all = true
+
 [filter "lfs"]
 	required = true
 	clean = git-lfs clean -- %f
 	smudge = git-lfs smudge -- %f
 	process = git-lfs filter-process
+
 [help]
   autocorrect = prompt
+
 [push]
   default = simple
   autoSetupRemote = true
+
 [rebase]
   autoStash = true
   autoSquash = true
   updateRefs = true
+
 [tag]
   sort = version:refname
 
