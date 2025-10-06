@@ -72,7 +72,7 @@ local misc = {
 
 	font = wezterm.font_with_fallback({
 		{
-			family = "JetBrains Mono NL",
+			family = "JetBrainsMono NF",
 			harfbuzz_features = { "liga=1" },
 		},
 	}),
