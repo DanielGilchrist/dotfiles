@@ -15,5 +15,6 @@ return {
     load("bundle_open")
     load("tanda_cli")
     load("test_open")
+    load("srb_tc")
   end,
 }
