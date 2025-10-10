@@ -25,6 +25,7 @@
       "tail *": "allow",
       "pwd": "allow",
       "cd *": "allow",
+      "mkdir *": "allow",
       "bundle exec srb tc": "allow"
     }
   }
