@@ -111,6 +111,8 @@ install_brew_package watchman
 install_brew_package imagemagick magick
 install_brew_package ghostscript gs
 install_brew_package sst/tap/opencode opencode
+install_brew_package libsixel
+install_brew_package mpv
 
 install_asdf_plugin ruby https://github.com/asdf-vm/asdf-ruby.git
 install_asdf_plugin crystal https://github.com/asdf-community/asdf-crystal.git
@@ -120,8 +122,19 @@ install_asdf_plugin golang https://github.com/asdf-community/asdf-golang.git
 if ! command_exists rustup; then
   echo "Installing rustup..."
   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+  echo "Installing Rust..."
+  rustup default stable
 else
   echo "rustup is already installed."
+fi
+
+if ! command_exists youtube-tui; then
+  echo "Installing youtube-tui..."
+  export PKG_CONFIG_PATH="/opt/homebrew/lib/pkgconfig:$PKG_CONFIG_PATH"
+  export LIBRARY_PATH="/opt/homebrew/lib:$LIBRARY_PATH"
+  cargo install youtube-tui
+else
+  echo "youtube-tui is already installed."
 fi
 
 if ! grep -q fish /etc/shells; then
