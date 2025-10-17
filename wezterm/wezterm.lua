@@ -9,17 +9,6 @@ local table_utils = require("utils.table")
 
 local command = key_utils.command_key()
 
-local function set_path()
-  local original_path = os.getenv("PATH")
-  local system = os_utils.system()
-
-  if system == "macos" then
-    return "/opt/homebrew/bin:" .. original_path
-  else
-    return original_path
-  end
-end
-
 wezterm.on("gui-startup", function(cmd)
   local _tab, _pane, window = mux.spawn_window(cmd or {})
   local gui_window = window:gui_window()
@@ -28,9 +17,6 @@ wezterm.on("gui-startup", function(cmd)
 end)
 
 local misc = {
-  set_environment_variables = {
-    PATH = set_path()
-  },
   front_end = "WebGpu",
   webgpu_power_preference = "HighPerformance",
   max_fps = 144,
