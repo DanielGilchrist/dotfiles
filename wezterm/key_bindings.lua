@@ -1,5 +1,7 @@
+local os = require("os")
 local wezterm = require("wezterm")
 local key_utils = require("utils.key")
+local os_utils = require("utils.os")
 
 local function keybind(mods, key, action)
   return { mods = mods, key = key, action = action }
@@ -7,6 +9,17 @@ end
 
 local function combine(key1, key2)
   return key1 .. "|" .. key2
+end
+
+local function set_path()
+  local original_path = os.getenv("PATH")
+  local system = os_utils.system()
+
+  if system == "macos" then
+    return "/opt/homebrew/bin:" .. original_path
+  else
+    return original_path
+  end
 end
 
 local config = {}
@@ -41,6 +54,9 @@ config.keys = {
     window:perform_action(
       wezterm.action.SpawnCommandInNewTab {
         args = { "nvim", name },
+        set_environment_variables = {
+          PATH = set_path()
+        }
       },
       pane
     )
