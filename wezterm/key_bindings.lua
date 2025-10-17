@@ -2,11 +2,11 @@ local wezterm = require("wezterm")
 local key_utils = require("utils.key")
 
 local function keybind(mods, key, action)
-	return { mods = mods, key = key, action = action }
+  return { mods = mods, key = key, action = action }
 end
 
 local function combine(key1, key2)
-	return key1 .. "|" .. key2
+  return key1 .. "|" .. key2
 end
 
 local config = {}
@@ -20,95 +20,121 @@ local command_alt = combine(command, alt)
 local shift_alt = combine(shift, alt)
 
 config.keys = {
-	keybind(command_shift, "r", "ReloadConfiguration"),
+  keybind(command_shift, "r", "ReloadConfiguration"),
 
-	keybind(command_shift, "n", wezterm.action.SpawnWindow),
+  keybind(command_shift, "n", wezterm.action.SpawnWindow),
 
-	keybind(
-		command,
-		"d",
-		wezterm.action({
-			SplitHorizontal = {
-				domain = "CurrentPaneDomain",
-			},
-		})
-	),
-	keybind(
-		command,
-		"s",
-		wezterm.action({
-			SplitPane = {
-				direction = "Right",
-				size = { Percent = 35 },
-			},
-		})
-	),
+  keybind(command_shift, "f", wezterm.action_callback(function(window, pane)
+    local io = require("io")
+    local os = require("os")
 
-	keybind(
-		command_shift,
-		"d",
-		wezterm.action({
-			SplitVertical = {
-				domain = "CurrentPaneDomain",
-			},
-		})
-	),
+    local text = pane:get_lines_as_text(pane:get_dimensions().scrollback_rows)
 
-	keybind(command, "k", wezterm.action({ ClearScrollback = "ScrollbackAndViewport" })),
+    local name = os.tmpname()
+    local file = io.open(name, 'w+')
+    ---@cast file -nil
 
-	keybind(
-		command,
-		"w",
-		wezterm.action({
-			CloseCurrentPane = {
-				confirm = false,
-			},
-		})
-	),
+    file:write(text)
+    file:flush()
+    file:close()
 
-	keybind(
-		command_shift,
-		"w",
-		wezterm.action({
-			CloseCurrentTab = {
-				confirm = false,
-			},
-		})
-	),
+    window:perform_action(
+      wezterm.action.SpawnCommandInNewTab {
+        args = { "nvim", name },
+      },
+      pane
+    )
 
-	keybind(command, enter, "ToggleFullScreen"),
+    -- Wait a likely enough amount of time for neovim to have read the file before we remove it.
+    wezterm.sleep_ms(1000)
+    os.remove(name)
+  end)),
 
-	-- Switch active pane
-	keybind(command_alt, "LeftArrow", wezterm.action({ ActivatePaneDirection = "Left" })),
-	keybind(command_alt, "RightArrow", wezterm.action({ ActivatePaneDirection = "Right" })),
-	keybind(command_alt, "UpArrow", wezterm.action({ ActivatePaneDirection = "Up" })),
-	keybind(command_alt, "DownArrow", wezterm.action({ ActivatePaneDirection = "Down" })),
+  keybind(
+    command,
+    "d",
+    wezterm.action({
+      SplitHorizontal = {
+        domain = "CurrentPaneDomain",
+      },
+    })
+  ),
+  keybind(
+    command,
+    "s",
+    wezterm.action({
+      SplitPane = {
+        direction = "Right",
+        size = { Percent = 35 },
+      },
+    })
+  ),
 
-	-- Switch between tabs
-	keybind(command, "LeftArrow", wezterm.action({ ActivateTabRelative = -1 })),
-	keybind(command, "RightArrow", wezterm.action({ ActivateTabRelative = 1 })),
+  keybind(
+    command_shift,
+    "d",
+    wezterm.action({
+      SplitVertical = {
+        domain = "CurrentPaneDomain",
+      },
+    })
+  ),
 
-	-- Scrolling
-	keybind(command_shift, "UpArrow", "ScrollToTop"),
-	keybind(command_shift, "DownArrow", "ScrollToBottom"),
-	keybind(alt, "PageUp", wezterm.action({ ScrollByPage = -1 })),
-	keybind(alt, "PageDown", wezterm.action({ ScrollByPage = 1 })),
-	keybind(command_alt, "PageUp", wezterm.action({ ScrollByPage = -6 })),
-	keybind(command_alt, "PageDown", wezterm.action({ ScrollByPage = 6 })),
+  keybind(command, "k", wezterm.action({ ClearScrollback = "ScrollbackAndViewport" })),
 
-	-- Move tabs
-	keybind(shift_alt, "{", wezterm.action({ MoveTabRelative = -1 })),
-	keybind(shift_alt, "}", wezterm.action({ MoveTabRelative = 1 })),
+  keybind(
+    command,
+    "w",
+    wezterm.action({
+      CloseCurrentPane = {
+        confirm = false,
+      },
+    })
+  ),
 
-	-- Move panes
-	keybind(command_shift, "m", wezterm.action({ PaneSelect = { mode = "SwapWithActive" } })),
-	keybind(command_shift, "p", wezterm.action({ PaneSelect = { mode = "Activate" } })),
+  keybind(
+    command_shift,
+    "w",
+    wezterm.action({
+      CloseCurrentTab = {
+        confirm = false,
+      },
+    })
+  ),
 
-	-- Resize panes
-	keybind(command_alt, "h", wezterm.action({ AdjustPaneSize = { "Left", 5 } })),
-	keybind(command_alt, "l", wezterm.action({ AdjustPaneSize = { "Right", 5 } })),
-	keybind(command_alt, "k", wezterm.action({ AdjustPaneSize = { "Up", 5 } })),
-	keybind(command_alt, "j", wezterm.action({ AdjustPaneSize = { "Down", 5 } })),
+  keybind(command, enter, "ToggleFullScreen"),
+
+  -- Switch active pane
+  keybind(command_alt, "LeftArrow", wezterm.action({ ActivatePaneDirection = "Left" })),
+  keybind(command_alt, "RightArrow", wezterm.action({ ActivatePaneDirection = "Right" })),
+  keybind(command_alt, "UpArrow", wezterm.action({ ActivatePaneDirection = "Up" })),
+  keybind(command_alt, "DownArrow", wezterm.action({ ActivatePaneDirection = "Down" })),
+
+  -- Switch between tabs
+  keybind(command, "LeftArrow", wezterm.action({ ActivateTabRelative = -1 })),
+  keybind(command, "RightArrow", wezterm.action({ ActivateTabRelative = 1 })),
+
+  -- Scrolling
+  keybind(command_shift, "UpArrow", "ScrollToTop"),
+  keybind(command_shift, "DownArrow", "ScrollToBottom"),
+  keybind(alt, "PageUp", wezterm.action({ ScrollByPage = -1 })),
+  keybind(alt, "PageDown", wezterm.action({ ScrollByPage = 1 })),
+  keybind(command_alt, "PageUp", wezterm.action({ ScrollByPage = -6 })),
+  keybind(command_alt, "PageDown", wezterm.action({ ScrollByPage = 6 })),
+
+  -- Move tabs
+  keybind(shift_alt, "{", wezterm.action({ MoveTabRelative = -1 })),
+  keybind(shift_alt, "}", wezterm.action({ MoveTabRelative = 1 })),
+
+  -- Move panes
+  keybind(command_shift, "m", wezterm.action({ PaneSelect = { mode = "SwapWithActive" } })),
+  keybind(command_shift, "p", wezterm.action({ PaneSelect = { mode = "Activate" } })),
+
+  -- Resize panes
+  keybind(command_alt, "h", wezterm.action({ AdjustPaneSize = { "Left", 5 } })),
+  keybind(command_alt, "l", wezterm.action({ AdjustPaneSize = { "Right", 5 } })),
+  keybind(command_alt, "k", wezterm.action({ AdjustPaneSize = { "Up", 5 } })),
+  keybind(command_alt, "j", wezterm.action({ AdjustPaneSize = { "Down", 5 } })),
 }
 
 return config
