@@ -21,7 +21,6 @@ fish_variables
 
 fish/generated_completions/
 fish/conf.d/
-fish/completions/
 
 fish/functions/fisher.fish
 fish/functions/_tide_*.fish
