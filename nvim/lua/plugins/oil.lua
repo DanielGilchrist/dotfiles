@@ -11,7 +11,8 @@ return {
       ["q"] = { "actions.close", mode = "n" }
     },
     float = {
-      padding = 5,
+      border = "rounded",
+      padding = 3,
       preview = {
         vertical = true
       }
