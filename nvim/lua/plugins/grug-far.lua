@@ -2,6 +2,17 @@ return {
   "MagicDuck/grug-far.nvim",
   keys = {
     {
+      "<leader>sr",
+      function()
+        local grug = require("grug-far")
+        grug.open({
+          transient = true,
+        })
+      end,
+      mode = { "n", "x" },
+      desc = "Search and Replace",
+    },
+    {
       "<leader>br",
       function()
         require('grug-far').with_visual_selection({
