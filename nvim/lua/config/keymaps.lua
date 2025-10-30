@@ -102,14 +102,7 @@ local function playback(command)
 end
 
 map("n", l("mo"), function()
-  Snacks.terminal.toggle("spotify", {
-    win = {
-      keys = {
-        ["<esc>"] = "hide",
-        ["<C-/>"] = "hide",
-      }
-    }
-  })
+  Snacks.terminal.toggle("spotify")
 end, { desc = "Open spotify music player" })
 
 map("n", l("mn"), function()
@@ -133,12 +126,10 @@ map("n", l("mb"), function()
 end, { desc = "Rewind 10 seconds" })
 
 map("n", l("ts"), function()
-  Snacks.terminal.toggle("tetrigo", {
-    win = {
-      keys = {
-        ["<esc>"] = "hide",
-        ["<C-/>"] = "hide",
-      }
-    }
-  })
+  Snacks.terminal.toggle("tetrigo")
 end, { desc = "Launch Tetris" })
+
+-- btop
+map("n", l("bt"), function()
+  Snacks.terminal.toggle("btop")
+end, { desc = "Launch btop" })
