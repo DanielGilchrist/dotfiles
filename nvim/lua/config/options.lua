@@ -5,7 +5,7 @@
 -- vim.lsp.set_log_level("debug")
 
 if vim.g.neovide then
-  vim.o.guifont = "JetBrains Mono:h13"
+  vim.o.guifont = "JetBrainsMono NF:h14"
 
   -- NOTE: Transparency doesn't currently work on macos fullscreen
   -- vim.g.neovide_opacity = 0.8
