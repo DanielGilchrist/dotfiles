@@ -1,4 +1,6 @@
 local os = require("os")
+local io = require("io")
+
 local wezterm = require("wezterm")
 local key_utils = require("utils.key")
 local os_utils = require("utils.os")
@@ -38,9 +40,6 @@ config.keys = {
   keybind(command_shift, "n", wezterm.action.SpawnWindow),
 
   keybind(command_shift, "f", wezterm.action_callback(function(window, pane)
-    local io = require("io")
-    local os = require("os")
-
     local text = pane:get_lines_as_text(pane:get_dimensions().scrollback_rows)
 
     local name = os.tmpname()
