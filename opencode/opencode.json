@@ -28,7 +28,8 @@
       "mkdir *": "allow",
       "bundle exec srb tc": "allow",
       "yarn test *": "allow",
-      "npm test *": "allow"
+      "npm test *": "allow",
+      "awk *": "allow"
     }
   }
 }
