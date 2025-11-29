@@ -25,21 +25,23 @@ local function set_path()
 end
 
 local config = {}
+local keys = {
+  COMMAND = key_utils.command_key(),
+  SHIFT = "SHIFT",
+  ALT = "ALT",
+  ENTER = "Enter",
+}
 
-local command = key_utils.command_key()
-local shift = "SHIFT"
-local alt = "ALT"
-local enter = "Enter"
-local command_shift = combine(command, shift)
-local command_alt = combine(command, alt)
-local shift_alt = combine(shift, alt)
+keys.COMMAND_SHIFT = combine(keys.COMMAND, keys.SHIFT)
+keys.COMMAND_ALT = combine(keys.COMMAND, keys.ALT)
+keys.SHIFT_ALT = combine(keys.SHIFT, keys.ALT)
 
 config.keys = {
-  keybind(command_shift, "r", "ReloadConfiguration"),
+  keybind(keys.COMMAND_SHIFT, "r", "ReloadConfiguration"),
 
-  keybind(command_shift, "n", wezterm.action.SpawnWindow),
+  keybind(keys.COMMAND_SHIFT, "n", wezterm.action.SpawnWindow),
 
-  keybind(command_shift, "f", wezterm.action_callback(function(window, pane)
+  keybind(keys.COMMAND_SHIFT, "f", wezterm.action_callback(function(window, pane)
     local text = pane:get_lines_as_text(pane:get_dimensions().scrollback_rows)
 
     local name = os.tmpname()
@@ -66,7 +68,7 @@ config.keys = {
   end)),
 
   keybind(
-    command,
+    keys.COMMAND,
     "d",
     wezterm.action({
       SplitHorizontal = {
@@ -75,7 +77,7 @@ config.keys = {
     })
   ),
   keybind(
-    command,
+    keys.COMMAND,
     "s",
     wezterm.action({
       SplitPane = {
@@ -86,7 +88,7 @@ config.keys = {
   ),
 
   keybind(
-    command_shift,
+    keys.COMMAND_SHIFT,
     "d",
     wezterm.action({
       SplitVertical = {
@@ -95,10 +97,10 @@ config.keys = {
     })
   ),
 
-  keybind(command, "k", wezterm.action({ ClearScrollback = "ScrollbackAndViewport" })),
+  keybind(keys.COMMAND, "k", wezterm.action({ ClearScrollback = "ScrollbackAndViewport" })),
 
   keybind(
-    command,
+    keys.COMMAND,
     "w",
     wezterm.action({
       CloseCurrentPane = {
@@ -108,7 +110,7 @@ config.keys = {
   ),
 
   keybind(
-    command_shift,
+    keys.COMMAND_SHIFT,
     "w",
     wezterm.action({
       CloseCurrentTab = {
@@ -117,39 +119,41 @@ config.keys = {
     })
   ),
 
-  keybind(command, enter, "ToggleFullScreen"),
+  keybind(keys.COMMAND, keys.ENTER, "ToggleFullScreen"),
+
+  keybind(keys.SHIFT, keys.ENTER, wezterm.action({ SendString = "\x1b[13;2u" })),
 
   -- Switch active pane
-  keybind(command_alt, "LeftArrow", wezterm.action({ ActivatePaneDirection = "Left" })),
-  keybind(command_alt, "RightArrow", wezterm.action({ ActivatePaneDirection = "Right" })),
-  keybind(command_alt, "UpArrow", wezterm.action({ ActivatePaneDirection = "Up" })),
-  keybind(command_alt, "DownArrow", wezterm.action({ ActivatePaneDirection = "Down" })),
+  keybind(keys.COMMAND_ALT, "LeftArrow", wezterm.action({ ActivatePaneDirection = "Left" })),
+  keybind(keys.COMMAND_ALT, "RightArrow", wezterm.action({ ActivatePaneDirection = "Right" })),
+  keybind(keys.COMMAND_ALT, "UpArrow", wezterm.action({ ActivatePaneDirection = "Up" })),
+  keybind(keys.COMMAND_ALT, "DownArrow", wezterm.action({ ActivatePaneDirection = "Down" })),
 
   -- Switch between tabs
-  keybind(command, "LeftArrow", wezterm.action({ ActivateTabRelative = -1 })),
-  keybind(command, "RightArrow", wezterm.action({ ActivateTabRelative = 1 })),
+  keybind(keys.COMMAND, "LeftArrow", wezterm.action({ ActivateTabRelative = -1 })),
+  keybind(keys.COMMAND, "RightArrow", wezterm.action({ ActivateTabRelative = 1 })),
 
   -- Scrolling
-  keybind(command_shift, "UpArrow", "ScrollToTop"),
-  keybind(command_shift, "DownArrow", "ScrollToBottom"),
-  keybind(alt, "PageUp", wezterm.action({ ScrollByPage = -1 })),
-  keybind(alt, "PageDown", wezterm.action({ ScrollByPage = 1 })),
-  keybind(command_alt, "PageUp", wezterm.action({ ScrollByPage = -6 })),
-  keybind(command_alt, "PageDown", wezterm.action({ ScrollByPage = 6 })),
+  keybind(keys.COMMAND_SHIFT, "UpArrow", "ScrollToTop"),
+  keybind(keys.COMMAND_SHIFT, "DownArrow", "ScrollToBottom"),
+  keybind(keys.ALT, "PageUp", wezterm.action({ ScrollByPage = -1 })),
+  keybind(keys.ALT, "PageDown", wezterm.action({ ScrollByPage = 1 })),
+  keybind(keys.COMMAND_ALT, "PageUp", wezterm.action({ ScrollByPage = -6 })),
+  keybind(keys.COMMAND_ALT, "PageDown", wezterm.action({ ScrollByPage = 6 })),
 
   -- Move tabs
-  keybind(shift_alt, "{", wezterm.action({ MoveTabRelative = -1 })),
-  keybind(shift_alt, "}", wezterm.action({ MoveTabRelative = 1 })),
+  keybind(keys.SHIFT_ALT, "{", wezterm.action({ MoveTabRelative = -1 })),
+  keybind(keys.SHIFT_ALT, "}", wezterm.action({ MoveTabRelative = 1 })),
 
   -- Move panes
-  keybind(command_shift, "m", wezterm.action({ PaneSelect = { mode = "SwapWithActive" } })),
-  keybind(command_shift, "p", wezterm.action({ PaneSelect = { mode = "Activate" } })),
+  keybind(keys.COMMAND_SHIFT, "m", wezterm.action({ PaneSelect = { mode = "SwapWithActive" } })),
+  keybind(keys.COMMAND_SHIFT, "p", wezterm.action({ PaneSelect = { mode = "Activate" } })),
 
   -- Resize panes
-  keybind(command_alt, "h", wezterm.action({ AdjustPaneSize = { "Left", 5 } })),
-  keybind(command_alt, "l", wezterm.action({ AdjustPaneSize = { "Right", 5 } })),
-  keybind(command_alt, "k", wezterm.action({ AdjustPaneSize = { "Up", 5 } })),
-  keybind(command_alt, "j", wezterm.action({ AdjustPaneSize = { "Down", 5 } })),
+  keybind(keys.COMMAND_ALT, "h", wezterm.action({ AdjustPaneSize = { "Left", 5 } })),
+  keybind(keys.COMMAND_ALT, "l", wezterm.action({ AdjustPaneSize = { "Right", 5 } })),
+  keybind(keys.COMMAND_ALT, "k", wezterm.action({ AdjustPaneSize = { "Up", 5 } })),
+  keybind(keys.COMMAND_ALT, "j", wezterm.action({ AdjustPaneSize = { "Down", 5 } })),
 }
 
 return config
