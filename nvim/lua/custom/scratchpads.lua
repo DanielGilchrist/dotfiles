@@ -5,7 +5,8 @@ local function scratch_search(_title, opts)
   opts = opts == nil and {} or opts
 
   local args = {
-    dirs = { scratchpads_dir }
+    dirs = { scratchpads_dir },
+    hidden = false,
   }
 
   if opts.confirm then
