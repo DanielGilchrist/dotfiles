@@ -172,7 +172,7 @@ local function open_work_tabs(region)
 
     wait_for_text_for(tunnel_pane, "Welcome to fish")
 
-    if region == regions.APAC and region == regions.EU then
+    if region == regions.APAC or region == regions.EU then
       run_command(tunnel_pane, commands.Start)
       wait_for_text_for(tunnel_pane, "Your dev box", "is ready to be used")
     end
