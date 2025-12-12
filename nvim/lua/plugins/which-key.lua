@@ -6,6 +6,6 @@ return {
       { "<leader>j", group = "+Jump to", icon = { icon = "󰪹", color = "blue" } },
       { "<leader>m", group = "+Music", icon = { icon = "", color = "green" } },
     },
-    preset = "modern"
+    preset = "helix"
   }
 }
