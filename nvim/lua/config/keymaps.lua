@@ -48,29 +48,6 @@ map("n", l("bc"), function()
   notify.info("Copied " .. path .. " to clipboard")
 end, { desc = "Copy relative file path for current buffer" })
 
-map("n", l("jC"), function()
-  local notify = require("../utils/notify")
-  local clipboard_contents = vim.fn.getreg("+")
-  local file_path, line = clipboard_contents:match("(.+):(%d+)")
-
-  if not file_path then
-    file_path = clipboard_contents:match("(.+)$")
-  end
-
-  if not file_path or not vim.loop.fs_stat(file_path) then
-    local message = string.format("\"%s\" is not a valid file to jump to!", file_path)
-    return notify.error(message)
-  end
-
-  local command = "edit " .. file_path
-
-  if line then
-    command = command .. " | " .. line
-  end
-
-  vim.cmd(command)
-end, { desc = "Jump to file from clipboard" })
-
 -- Music (spotify_player)
 local function playback(command)
   local cmd = { "spotify_player", "playback" }
