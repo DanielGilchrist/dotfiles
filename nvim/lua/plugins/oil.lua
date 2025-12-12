@@ -8,7 +8,9 @@ return {
   },
   opts = {
     keymaps = {
-      ["q"] = { "actions.close", mode = "n" }
+      ["q"] = { "actions.close", mode = "n" },
+      ["<C-d>"] = { "actions.preview_scroll_down", mode = "n" },
+      ["<C-u>"] = { "actions.preview_scroll_up", mode = "n" }
     },
     float = {
       border = "rounded",
@@ -16,6 +18,9 @@ return {
       preview = {
         vertical = true
       }
+    },
+    preview_win = {
+      preview_method = "load",
     },
     view_options = {
       show_hidden = true,
