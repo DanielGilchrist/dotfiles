@@ -12,6 +12,7 @@ return {
       left = "<º))><",
       right = "><((º>",
       color = "#6434d4",
-    }
+    },
+    numberOfFish = 3
   }
 }
