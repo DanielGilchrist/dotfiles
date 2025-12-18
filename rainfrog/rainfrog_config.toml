@@ -1,0 +1,10 @@
+[settings]
+mouse_mode = false
+data_compact_columns = true
+data_row_spacer = false
+
+[keybindings.Editor]
+"<shift-enter>" = "SubmitEditorQuery"
+
+[db]
+tanda-test = { host = "localhost", driver = "postgres", port = 5432, database = "tanda_test", username = "danielgilchrist", default = true }

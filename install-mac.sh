@@ -114,6 +114,7 @@ install_brew_package sst/tap/opencode opencode
 install_brew_package libsixel
 install_brew_package mpv
 install_brew_package btop
+install_brew_package rainfrog
 
 install_asdf_plugin ruby https://github.com/asdf-vm/asdf-ruby.git
 install_asdf_plugin crystal https://github.com/asdf-community/asdf-crystal.git
