@@ -1,4 +1,6 @@
 local notify = require("../utils/notify")
+local is = require("../utils/is")
+local str = require("../utils/str")
 local scratchpads_dir = vim.fn.expand("~/.local/share/scratchpads/")
 
 local function scratch_search(_title, opts)
@@ -29,7 +31,7 @@ local function build_new_filename(count, extension)
 end
 
 local function scratchpads_dir_not_created()
-  return vim.fn.isdirectory(scratchpads_dir) == 0
+  return is.not_directory(scratchpads_dir)
 end
 
 local function create_scratchpad(extension)
@@ -40,7 +42,7 @@ local function create_scratchpad(extension)
   local count = 1
   local filename = build_new_filename(count, extension)
 
-  while vim.fn.filereadable(filename) == 1 do
+  while is.file_readable(filename) do
     count = count + 1
     filename = build_new_filename(count, extension)
   end
@@ -80,7 +82,7 @@ local function open_scratchpad()
 end
 
 local function valid_scratch_file(filename)
-  return filename ~= "" and vim.fn.filereadable(filename) and filename:find(scratchpads_dir, 1, true)
+  return is.not_empty(filename) and is.file_readable(filename) and str.includes(filename, scratchpads_dir, true)
 end
 
 local function rename_scratchpad()

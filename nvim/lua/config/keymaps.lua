@@ -50,9 +50,10 @@ end, { desc = "Copy relative file path for current buffer" })
 
 -- Music (spotify_player)
 local function playback(command)
+  local is = require("utils.is")
   local cmd = { "spotify_player", "playback" }
 
-  if type(command) == "table" then
+  if is.table(command) then
     vim.list_extend(cmd, command)
   else
     table.insert(cmd, command)
@@ -61,8 +62,9 @@ local function playback(command)
   vim.fn.jobstart(cmd, {
     stderr_buffered = true,
     on_stderr = function(_, data)
+      local is = require("utils.is")
       local error_message = table.concat(data)
-      if error_message == "" then
+      if is.empty(error_message) then
         return
       end
 

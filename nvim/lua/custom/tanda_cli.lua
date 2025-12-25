@@ -1,25 +1,6 @@
 local tanda_cli = require("../utils/cmd").tanda_cli
 local notify = require("../utils/notify")
-
-local function is_empty_table(value)
-  return type(value) == "table" and vim.tbl_isempty(value) or value[1] == ""
-end
-
-local function is_empty(value)
-  return value == nil or value == "" or is_empty_table(value)
-end
-
-local function not_empty(maybe_string)
-  return not is_empty(maybe_string)
-end
-
-local function handler(callback)
-  return function(_, data)
-    if not_empty(data) then
-      return callback(data)
-    end
-  end
-end
+local cmd = require("../utils/cmd")
 
 local function default_options(opts)
   opts = opts == nil and {} or opts
@@ -27,8 +8,8 @@ local function default_options(opts)
   return vim.tbl_extend(
     "force",
     {
-      on_stdout = handler(notify.info),
-      on_stderr = handler(notify.error),
+      on_stdout = cmd.default_handler(notify.info),
+      on_stderr = cmd.default_handler(notify.error),
     },
     opts
   )
@@ -72,7 +53,7 @@ local function time_worked_display()
 
   tanda_cli(
     { "time_worked", "week", "--display", "--no-colour" },
-    { on_stdout = handler(spawn_window), on_stderr = handler(spawn_window) }
+    { on_stdout = cmd.default_handler(spawn_window), on_stderr = cmd.default_handler(spawn_window) }
   )
 end
 

@@ -18,3 +18,4 @@ alias shoo="$PERSONAL_DIR/shoo/bin/shoo"
 alias ghp="shoo notification purge"
 alias linear="$PERSONAL_DIR/linear-tui/target/release/linear-tui"
 alias frog=rainfrog
+alias acli=arduino-cli

@@ -1,4 +1,5 @@
 local notify = require("../utils/notify")
+local cmd = require("../utils/cmd")
 local notify_id = "srb-tc-id"
 
 local function parse_srb_errors(output)
@@ -56,7 +57,7 @@ local function run_srb_tc()
   local function on_exit(_, code)
     notify.hide(notify_id)
 
-    if code == 0 then
+    if cmd.success(code) then
       notify.info("No type errors found!")
       return
     end

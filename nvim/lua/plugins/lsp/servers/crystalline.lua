@@ -1,4 +1,5 @@
 local utils = require("plugins.lsp.utils")
+local is = require("utils.is")
 
 local function find_crystalline()
   local paths = {
@@ -7,7 +8,7 @@ local function find_crystalline()
   }
 
   for _, path in ipairs(paths) do
-    if vim.fn.executable(path) == 1 then
+    if is.executable(path) then
       return path
     end
   end

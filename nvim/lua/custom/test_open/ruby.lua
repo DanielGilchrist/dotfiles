@@ -1,4 +1,6 @@
 local notify = require("utils.notify")
+local is = require("utils.is")
+local str = require("utils.str")
 
 local TargetPath = {}
 TargetPath.__index = TargetPath
@@ -39,7 +41,7 @@ end
 
 function TargetPath:file()
   for _, path in ipairs(self.paths) do
-    if vim.fn.filereadable(path) == 1 then
+    if is.file_readable(path) then
       return path
     end
   end
@@ -50,7 +52,7 @@ function TargetPath:directory()
   for _, path in ipairs(self.paths) do
     local directory = path:gsub("_test", ""):gsub(".rb", "")
 
-    if vim.fn.isdirectory(directory) == 1 then
+    if is.directory(directory) then
       return directory
     end
   end
@@ -58,10 +60,10 @@ function TargetPath:directory()
 end
 
 function TargetPath:__parse_target_path(path)
-  if path:match("app/") then
+  if str.includes(path, "app/") then
     local result = path:gsub("app/", "test/"):gsub("%.rb$", "_test.rb")
     return result
-  elseif path:match("test/") then
+  elseif str.includes(path, "test/") then
     local result = path:gsub("test/", "app/"):gsub("_test%.rb$", ".rb")
     return result
   end
@@ -69,10 +71,10 @@ function TargetPath:__parse_target_path(path)
 end
 
 function TargetPath:__parse_functional_target_path(path)
-  if not path:match("app/") and path:match("controllers/") then
+  if str.excludes(path, "app/") and str.includes(path, "controllers/") then
     local result = path:gsub("controllers/", "functional/")
     return result
-  elseif path:match("test/") and path:match("functional/") then
+  elseif str.includes(path, "test/") and str.includes(path, "functional/") then
     local result = path:gsub("functional/", "controllers/")
     return result
   end
@@ -80,10 +82,10 @@ function TargetPath:__parse_functional_target_path(path)
 end
 
 function TargetPath:__parse_integration_target_path(path)
-  if not path:match("app/") and path:match("controllers/") then
+  if str.excludes(path, "app/") and str.includes(path, "controllers/") then
     local result = path:gsub("controllers/", "integration/")
     return result
-  elseif path:match("test/") and path:match("integration/") then
+  elseif str.includes(path, "test/") and str.includes(path, "integration/") then
     local result = path:gsub("integration/", "controllers/")
     return result
   end
@@ -91,7 +93,7 @@ function TargetPath:__parse_integration_target_path(path)
 end
 
 function TargetPath:__parse_test_to_file_fallback_path(path)
-  if not path or not path:match("app/") then
+  if not path or str.excludes(path, "app/") then
     return
   end
 

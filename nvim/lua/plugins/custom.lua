@@ -16,5 +16,6 @@ return {
     load("tanda_cli")
     load("test_open")
     load("srb_tc")
+    load("arduino_cli")
   end,
 }
