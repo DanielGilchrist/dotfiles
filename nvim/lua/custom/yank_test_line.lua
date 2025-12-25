@@ -1,4 +1,5 @@
 local notify = require("../utils/notify")
+local str = require("../utils/str")
 
 local function double_quote(text)
   return '"' .. text .. '"'
@@ -6,7 +7,7 @@ end
 
 local function maybe_test_name()
   local file_path = vim.fn.expand("%:p")
-  if file_path:find("^test") ~= nil then
+  if str.starts_with(file_path, "test") then
     return
   end
 

@@ -1,4 +1,5 @@
 local notify = require("../utils/notify")
+local is = require("../utils/is")
 local notify_gem_list_id = "bundle-open-gem-list-id"
 
 local function fetch_gem_list(callback)
@@ -12,7 +13,7 @@ local function fetch_gem_list(callback)
 
   local function on_stdout(_, data)
     for _, line in ipairs(data) do
-      if line ~= "" then
+      if is.not_empty(line) then
         table.insert(gems, line)
       end
     end

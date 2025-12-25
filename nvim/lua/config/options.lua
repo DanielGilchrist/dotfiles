@@ -30,4 +30,10 @@ vim.filetype.add({
   },
 })
 
+vim.filetype.add({
+  extension = {
+    ino = "arduino"
+  }
+})
+
 vim.opt.relativenumber = true
