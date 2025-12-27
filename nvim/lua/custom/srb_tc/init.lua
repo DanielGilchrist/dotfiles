@@ -1,5 +1,5 @@
-local notify = require("../utils/notify")
-local cmd = require("../utils/cmd")
+local notify = require("utils.notify")
+local cmd = require("utils.cmd")
 local notify_id = "srb-tc-id"
 
 local function parse_srb_errors(output)
@@ -30,10 +30,10 @@ local function open_files_in_new_tab(files)
     table.insert(file_args, item.file)
   end
 
-  local cmd =
-    string.format("wezterm cli spawn --cwd=%s -- nvim %s", vim.fn.shellescape(cwd), table.concat(file_args, " "))
+  local command =
+      string.format("wezterm cli spawn --cwd=%s -- nvim %s", vim.fn.shellescape(cwd), table.concat(file_args, " "))
 
-  vim.fn.system(cmd)
+  vim.fn.system(command)
   notify.info(string.format("Opened %d files in new tab", #files))
 end
 
@@ -81,4 +81,6 @@ local function run_srb_tc()
   })
 end
 
-vim.api.nvim_create_user_command("SrbTc", run_srb_tc, {})
+return {
+  run = run_srb_tc,
+}

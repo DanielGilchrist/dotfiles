@@ -78,5 +78,7 @@ local function yank_test_line_with_number()
   end
 end
 
-vim.api.nvim_create_user_command("Ytest", yank_test_line, {})
-vim.api.nvim_create_user_command("Ytestn", yank_test_line_with_number, {})
+return {
+  yank = yank_test_line,
+  yank_with_number = yank_test_line_with_number,
+}

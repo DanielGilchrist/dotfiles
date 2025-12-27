@@ -57,9 +57,11 @@ local function time_worked_display()
   )
 end
 
-vim.api.nvim_create_user_command("ClockIn", clock_in, {})
-vim.api.nvim_create_user_command("ClockBreakStart", clock_break_start, {})
-vim.api.nvim_create_user_command("ClockBreakFinish", clock_break_finish, {})
-vim.api.nvim_create_user_command("ClockOut", clock_out, {})
-vim.api.nvim_create_user_command("TimeWorked", time_worked, {})
-vim.api.nvim_create_user_command("TimeWorkedDisplay", time_worked_display, {})
+return {
+  clock_in = clock_in,
+  clock_break_start = clock_break_start,
+  clock_break_finish = clock_break_finish,
+  clock_out = clock_out,
+  time_worked = time_worked,
+  time_worked_display = time_worked_display,
+}

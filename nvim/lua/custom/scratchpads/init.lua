@@ -1,6 +1,6 @@
-local notify = require("../utils/notify")
-local is = require("../utils/is")
-local str = require("../utils/str")
+local notify = require("utils.notify")
+local is = require("utils.is")
+local str = require("utils.str")
 local scratchpads_dir = vim.fn.expand("~/.local/share/scratchpads/")
 
 local function scratch_search(_title, opts)
@@ -145,7 +145,9 @@ local function remove_scratchpad()
   })
 end
 
-vim.api.nvim_create_user_command("ScratchNew", new_scratchpad, {})
-vim.api.nvim_create_user_command("ScratchOpen", open_scratchpad, {})
-vim.api.nvim_create_user_command("ScratchRename", rename_scratchpad, {})
-vim.api.nvim_create_user_command("ScratchRemove", remove_scratchpad, {})
+return {
+  new = new_scratchpad,
+  open = open_scratchpad,
+  rename = rename_scratchpad,
+  remove = remove_scratchpad,
+}
