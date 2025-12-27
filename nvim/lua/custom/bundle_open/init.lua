@@ -1,5 +1,5 @@
-local notify = require("../utils/notify")
-local is = require("../utils/is")
+local notify = require("utils.notify")
+local is = require("utils.is")
 local notify_gem_list_id = "bundle-open-gem-list-id"
 
 local function fetch_gem_list(callback)
@@ -83,4 +83,6 @@ local function open_gem()
   end)
 end
 
-vim.api.nvim_create_user_command("BundleOpen", open_gem, {})
+return {
+  open = open_gem,
+}

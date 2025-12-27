@@ -8,9 +8,7 @@ local l = function(keys)
 end
 
 -- Navigation
-map("n", l("to"), function()
-  require("custom.test_open").open_test()
-end, { desc = "Switch to and from a corresponding test file" })
+map("n", l("to"), "<cmd>TestOpen", { desc = "Switch to and from a corresponding test file" })
 
 -- Debug
 map("n", l("wtf"), function()
