@@ -5,7 +5,6 @@ local function custom_plugin(name, opts)
     "force",
     {
       lazy = true,
-      event = { "CmdlineEnter" },
       dir = vim.fn.stdpath("config") .. "/lua/custom/" .. name,
       name = name,
     },
@@ -14,11 +13,11 @@ local function custom_plugin(name, opts)
 end
 
 return {
-  custom_plugin("scratchpads"),
-  custom_plugin("yank_test_line"),
-  custom_plugin("bundle_open"),
-  custom_plugin("tanda_cli"),
-  custom_plugin("test_open"),
-  custom_plugin("srb_tc"),
+  custom_plugin("scratchpads", { event = "CmdlineEnter" }),
+  custom_plugin("yank_test_line", { event = "CmdlineEnter" }),
+  custom_plugin("bundle_open", { event = "CmdlineEnter" }),
+  custom_plugin("tanda_cli", { event = "CmdlineEnter" }),
+  custom_plugin("test_open", { event = "CmdlineEnter" }),
+  custom_plugin("srb_tc", { event = "CmdlineEnter" }),
   custom_plugin("arduino_cli", { ft = "arduino" }),
 }
