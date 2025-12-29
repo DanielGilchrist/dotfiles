@@ -1,5 +1,5 @@
-local notify = require("../utils/notify")
-local str = require("../utils/str")
+local notify = require("utils.notify")
+local str = require("utils.str")
 
 local function double_quote(text)
   return '"' .. text .. '"'

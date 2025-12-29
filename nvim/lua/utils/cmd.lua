@@ -1,4 +1,5 @@
 local is = require("utils.is")
+
 ---Build the tanda_cli command with fallback to zsh
 ---@param args string[] Command arguments
 ---@return string # The full command string with fallbacks

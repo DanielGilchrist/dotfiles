@@ -2,7 +2,11 @@
 -- Default keymaps that are always set: https://github.com/LazyVim/LazyVim/blob/main/lua/lazyvim/config/keymaps.lua
 -- Add any additional keymaps here
 
+local notify = require("utils.notify")
+local is = require("utils.is")
+
 local map = vim.keymap.set
+
 local l = function(keys)
   return "<leader>" .. keys
 end
@@ -40,7 +44,6 @@ end, { desc = "Insert debug trace for current language" })
 
 -- Clipboard
 map("n", l("bc"), function()
-  local notify = require("../utils/notify")
   local path = vim.fn.expand("%:.")
   vim.fn.setreg('+', path)
   notify.info("Copied " .. path .. " to clipboard")
@@ -48,7 +51,6 @@ end, { desc = "Copy relative file path for current buffer" })
 
 -- Music (spotify_player)
 local function playback(command)
-  local is = require("utils.is")
   local cmd = { "spotify_player", "playback" }
 
   if is.table(command) then
@@ -60,13 +62,10 @@ local function playback(command)
   vim.fn.jobstart(cmd, {
     stderr_buffered = true,
     on_stderr = function(_, data)
-      local is = require("utils.is")
       local error_message = table.concat(data)
       if is.empty(error_message) then
         return
       end
-
-      local notify = require("../utils/notify")
 
       -- "Bad request: no playback found" or "Bad request: no active playback found!"
       if string.find(error_message, "no") and string.find(error_message, "playback") then

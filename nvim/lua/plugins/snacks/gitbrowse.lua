@@ -1,4 +1,4 @@
-local notify = require("../utils/notify")
+local notify = require("utils.notify")
 
 return {
   opts = {

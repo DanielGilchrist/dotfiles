@@ -1,11 +1,14 @@
+local grug_far = function()
+  return require("grug-far")
+end
+
 return {
   "MagicDuck/grug-far.nvim",
   keys = {
     {
       "<leader>sr",
       function()
-        local grug = require("grug-far")
-        grug.open({
+        grug_far().open({
           transient = true,
         })
       end,
@@ -15,7 +18,7 @@ return {
     {
       "<leader>br",
       function()
-        require('grug-far').with_visual_selection({
+        grug_far().with_visual_selection({
           startCursorRow = 2,
           prefills = {
             paths = vim.fn.expand("%"),
