@@ -4,6 +4,11 @@
 
 local create_autocmd = vim.api.nvim_create_autocmd
 
+local function set_line_wrap()
+  vim.opt_local.wrap = true
+  vim.opt_local.linebreak = true
+end
+
 vim.api.nvim_create_user_command("Dashboard", function()
   Snacks.dashboard()
 end, {})
@@ -29,8 +34,10 @@ create_autocmd("InsertLeave", {
 
 vim.api.nvim_create_autocmd("FileType", {
   pattern = "markdown",
-  callback = function()
-    vim.opt_local.wrap = true
-    vim.opt_local.linebreak = true
-  end,
+  callback = set_line_wrap,
+})
+
+vim.api.nvim_create_autocmd("FileType", {
+  pattern = "haml",
+  callback = set_line_wrap,
 })
