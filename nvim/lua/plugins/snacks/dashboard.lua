@@ -1,4 +1,4 @@
-local cmd = require("../utils/cmd")
+local cmd = require("utils.cmd")
 local header = [[
 
  FISH

@@ -1,6 +1,5 @@
-local tanda_cli = require("../utils/cmd").tanda_cli
-local notify = require("../utils/notify")
-local cmd = require("../utils/cmd")
+local cmd = require("utils.cmd")
+local notify = require("utils.notify")
 
 local function default_options(opts)
   opts = opts == nil and {} or opts
@@ -16,30 +15,28 @@ local function default_options(opts)
 end
 
 local function clock_in()
-  tanda_cli({ "clockin", "start", "--no-colour" }, default_options())
+  cmd.tanda_cli({ "clockin", "start", "--no-colour" }, default_options())
 end
 
 local function clock_break_start()
-  tanda_cli({ "clockin", "break", "start", "--no-colour" }, default_options())
+  cmd.tanda_cli({ "clockin", "break", "start", "--no-colour" }, default_options())
 end
 
 local function clock_break_finish()
-  tanda_cli({ "clockin", "break", "finish", "--no-colour" }, default_options())
+  cmd.tanda_cli({ "clockin", "break", "finish", "--no-colour" }, default_options())
 end
 
 local function clock_out()
-  tanda_cli({ "clockin", "finish", "--no-colour" }, default_options())
+  cmd.tanda_cli({ "clockin", "finish", "--no-colour" }, default_options())
 end
 
 local function time_worked()
-  tanda_cli({ "time_worked", "week", "--no-colour" }, default_options())
+  cmd.tanda_cli({ "time_worked", "week", "--no-colour" }, default_options())
 end
 
 local function time_worked_display()
   local function spawn_window(data)
-    local snacks = require("snacks")
-
-    snacks.win({
+    Snacks.win({
       title = "Time worked for the week",
       text = data,
       width = 0.4,
@@ -51,7 +48,7 @@ local function time_worked_display()
     })
   end
 
-  tanda_cli(
+  cmd.tanda_cli(
     { "time_worked", "week", "--display", "--no-colour" },
     { on_stdout = cmd.default_handler(spawn_window), on_stderr = cmd.default_handler(spawn_window) }
   )
