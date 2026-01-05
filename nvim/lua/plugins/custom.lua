@@ -20,4 +20,5 @@ return {
   custom_plugin("test_open", { event = "CmdlineEnter" }),
   custom_plugin("srb_tc", { event = "CmdlineEnter" }),
   custom_plugin("arduino_cli", { ft = "arduino" }),
+  custom_plugin("lint_disable", { ft = { "ruby" } })
 }
