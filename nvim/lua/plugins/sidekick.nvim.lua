@@ -1,3 +1,7 @@
+local function toggle_opencode()
+  require("sidekick.cli").toggle({ name = "opencode", focus = true })
+end
+
 return {
   "folke/sidekick.nvim",
   opts = {
@@ -7,11 +11,10 @@ return {
   },
   keys = {
     {
-      "<leader>ac",
-      function()
-        require("sidekick.cli").toggle({ name = "opencode", focus = true })
-      end,
-      desc = "Sidekick opencode toggle"
+      "<c-.>",
+      toggle_opencode,
+      desc = "Toggle OpenCode",
+      mode = { "n", "t", "i", "x" },
     },
   }
 }
