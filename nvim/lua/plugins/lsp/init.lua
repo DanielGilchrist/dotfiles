@@ -1,4 +1,6 @@
 local loader = require("utils.plugin_loader")
+local is = require("utils.is")
+local notify = require("utils.notify")
 
 local setup = {}
 local servers = {}
@@ -13,6 +15,7 @@ loader.each_config("plugins/lsp/servers", function(config, name)
   end
 end)
 
+-- TODO: Extract this function to a separate file and avoid nesting functions
 local function combined_hover()
   local clients = vim.lsp.get_clients({ bufnr = 0 })
   local results = {}
@@ -51,15 +54,34 @@ local function combined_hover()
     )
   end
 
+  local extract_contents = function(result)
+    if is.empty(result) then
+      return nil
+    end
+
+    local value = result.contents.value
+
+    if is.empty(value) then
+      return nil
+    end
+
+    return value
+  end
+
   local handle_client = function(client)
     handle_count = handle_count + 1
 
     local params = vim.lsp.util.make_position_params(0, client.offset_encoding)
 
     local handle_hover = function(err, result)
-      if not err and result and result.contents then
-        local value = type(result.contents) == "string" and result.contents or result.contents.value
-        table.insert(results, { name = client.name, contents = value })
+      if is.not_empty(err) then
+        return notify.error(vim.inspect(err))
+      end
+
+      local contents = extract_contents(result)
+
+      if contents then
+        table.insert(results, { name = client.name, contents = contents })
       end
 
       handle_count = handle_count - 1
@@ -68,7 +90,7 @@ local function combined_hover()
         return
       end
 
-      if #results == 0 then
+      if is.empty(results) then
         return
       end
 
