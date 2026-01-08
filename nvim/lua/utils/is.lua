@@ -7,6 +7,13 @@ function M.table(value)
   return type(value) == "table"
 end
 
+---Check if a value is a string
+---@param value any
+---@return boolean
+function M.string(value)
+  return type(value) == "string"
+end
+
 ---Check if a path is executable
 ---@param path string
 ---@return boolean
