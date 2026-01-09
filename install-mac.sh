@@ -100,6 +100,7 @@ install_brew_package neovim nvim
 install_brew_package gh
 install_brew_package asdf
 install_brew_cask font-jetbrains-mono-nerd-font
+install_brew_cask nikitabobko/tap/aerospace
 
 install_brew_package fd
 install_brew_package ripgrep rg
