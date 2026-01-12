@@ -30,6 +30,7 @@ set -gx RAINFROG_CONFIG "$HOME/.config/rainfrog"
 
 set -gx ASDF_CONFIG_FILE "$HOME/.config/.asdfrc"
 set -gx ASDF_GOLANG_MOD_VERSION_ENABLED true
+set -gx OPENCODE_DISABLE_CLAUDE_CODE true
 
 set -gx PATH $HOME/.asdf/shims $PATH
 set -gx PATH $PATH $ANDROID_HOME/emulator

@@ -8,9 +8,6 @@
     "~/.config/opencode/AGENTS_LOCAL.md"
   ],
   "permission": {
-    "skill": {
-      "*": "deny"
-    },
     "edit": "allow",
     "webfetch": "ask",
     "bash": {
