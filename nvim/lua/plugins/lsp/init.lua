@@ -6,13 +6,21 @@ local setup = {}
 local servers = {}
 
 loader.each_config("plugins/lsp/servers", function(config, name)
-  if config.setup then
-    setup[name] = config.setup
+  local setup_config = config.setup
+  if setup_config then
+    if is.table(setup_config) then
+      local setup_table = setup_config
+      setup_config = function(_, opts)
+        for k, v in pairs(setup_table) do
+          opts[k] = v
+        end
+      end
+    end
+
+    setup[name] = setup_config
   end
 
-  if config.server then
-    servers[name] = config.server
-  end
+  servers[name] = config.server or {}
 end)
 
 -- TODO: Extract this function to a separate file and avoid nesting functions

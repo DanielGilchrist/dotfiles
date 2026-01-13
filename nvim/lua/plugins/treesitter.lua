@@ -11,6 +11,7 @@ return {
         "javascript",
         "json",
         "html",
+        "swift",
       },
       highlight = {
         enable = true,
