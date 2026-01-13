@@ -28,8 +28,8 @@ local function organise_imports_and_format_on_save(client, bufnr)
 end
 
 return {
-  setup = function(_, opts)
-    opts.settings = {
+  setup = {
+    settings = {
       gopls = {
         gofumpt = true,
         staticcheck = true,
@@ -38,10 +38,9 @@ return {
         },
         importOrganization = true,
       },
-    }
-
-    opts.on_attach = function(client, bufnr)
+    },
+    on_attach = function(client, bufnr)
       organise_imports_and_format_on_save(client, bufnr)
     end
-  end
+  }
 }

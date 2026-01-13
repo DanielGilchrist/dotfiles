@@ -51,17 +51,16 @@ local function open_file(command, _ctx)
 end
 
 return {
-  setup = function(_, opts)
-    opts.on_attach = function(client, bufnr)
+  setup = {
+    on_attach = function(client, bufnr)
       client.commands["rubyLsp.openFile"] = open_file
       add_ruby_deps_command(client, bufnr)
       disable_features_present_in_sorbet(client, bufnr)
-    end
-
-    opts.cmd_env = {
+    end,
+    cmd_env = {
       RAILS_ENV = "test",
     }
-  end,
+  },
   server = {
     mason = false,
     cmd = utils.asdf_shim("ruby-lsp"),
