@@ -1,12 +1,22 @@
 local is = require("utils.is")
 
----Build the tanda_cli command with fallback to zsh
+---Build a command with fallback if not setup
+---@param command_name string The name of the command
 ---@param args string[] Command arguments
 ---@return string # The full command string with fallbacks
-local function build_tanda_cli_cmd(args)
-  local command = string.format("tanda_cli %s 2>/dev/null", table.concat(args, " "))
-  local zsh_command = "zsh -ic '" .. command .. "'" -- zsh is a pain in the ass
-  return command .. " || " .. zsh_command .. " || " .. "echo \"tanda_cli isn't setup!\""
+local function build_command_with_fallback(command_name, args)
+  local command = string.format("%s %s 2>/dev/null", command_name, table.concat(args, " "))
+  local fallback = string.format("echo \"\"%s\" isn't setup!\"", command_name)
+
+  return command .. " || " .. fallback
+end
+
+local function validate_cli_opts(opts)
+  if opts.on_stdout or opts.onstderr then
+    return
+  end
+
+  error(string.format("`opts` must contain at least one of `on_stdout` or `onstderr`!"))
 end
 
 M = {}
@@ -33,15 +43,16 @@ end
 ---@field on_stdout? fun(job_id: integer, data: string[], name: string) Callback for stdout
 ---@field on_stderr? fun(job_id: integer, data: string[], name: string) Callback for stderr
 
+---@param args string[] Command arguments
 ---@param opts? TandaCliOpts Optional configuration
 ---@return string? # Returns command string if no `on_stdout` or `on_stderr` provided
 M.tanda_cli = function(args, opts)
   opts = opts == nil and {} or opts
   ---@cast opts -nil
 
-  local command = build_tanda_cli_cmd(args)
+  local command = build_command_with_fallback("tanda_cli", args)
 
-  if not opts.on_stdout or not opts.on_stderr then
+  if not opts.on_stdout and not opts.on_stderr then
     return command
   end
 
@@ -62,13 +73,32 @@ M.arduino_cli = function(args, opts)
   opts = opts == nil and {} or opts
   ---@cast opts -nil
 
-  if not opts.on_stdout or not opts.on_stderr then
-    return
-  end
+  validate_cli_opts(opts)
 
   vim.fn.jobstart(vim.list_extend({ "arduino-cli" }, args), {
     stdout_buffered = true,
     stderr_buffered = true,
+    on_stdout = opts.on_stdout,
+    on_stderr = opts.on_stderr,
+  })
+end
+
+---@class ShooCliOpts
+---@field on_stdout? fun(job_id: integer, data: string[], name: string) Callback for stdout
+---@field on_stderr? fun(job_id: integer, data: string[], name: string) Callback for stderr
+
+---@param args string[] Command arguments
+---@param opts? ShooCliOpts Optional configuration
+M.shoo = function(args, opts)
+  opts = opts == nil and {} or opts
+  ---@cast opts -nil
+
+  validate_cli_opts(opts)
+
+  local command = build_command_with_fallback("shoo", args)
+
+  vim.fn.jobstart(command, {
+    stdout_buffered = true,
     on_stdout = opts.on_stdout,
     on_stderr = opts.on_stderr,
   })
