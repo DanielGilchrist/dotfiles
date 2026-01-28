@@ -2,11 +2,19 @@
   "$schema": "https://opencode.ai/config.json",
   "theme": "system",
   "plugin": [
-    "opencode-anthropic-auth"
+    "opencode-anthropic-auth@latest"
   ],
   "instructions": [
     "~/.config/opencode/AGENTS_LOCAL.md"
   ],
+  "mode": {
+    "build": {
+      "prompt": "You are Claude Code, Anthropic's official CLI for Claude."
+    },
+    "plan": {
+      "prompt": "You are Claude Code, Anthropic's official CLI for Claude."
+    }
+  },
   "permission": {
     "edit": "allow",
     "webfetch": "ask",
@@ -34,7 +42,8 @@
       "yarn test*": "allow",
       "npm test*": "allow",
       "awk*": "allow",
-      "bin/dev test*": "allow"
+      "bin/dev test*": "allow",
+      "wc*": "allow"
     }
   }
 }
