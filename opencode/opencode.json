@@ -33,7 +33,8 @@
       "bundle exec srb tc": "allow",
       "yarn test*": "allow",
       "npm test*": "allow",
-      "awk*": "allow"
+      "awk*": "allow",
+      "bin/dev test*": "allow"
     }
   }
 }
