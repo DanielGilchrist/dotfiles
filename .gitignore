@@ -6,6 +6,7 @@ youtube-tui
 tfenv
 swiftpm/
 mozilla
+.tool-versions
 
 # wtf?
 StardewValley/
@@ -78,3 +79,4 @@ cachyos-hello.json
 arkrc
 micro/
 libinput-gestures.conf
+trashrc
