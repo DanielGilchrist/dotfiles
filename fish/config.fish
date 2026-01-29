@@ -36,6 +36,9 @@ set -gx PATH $HOME/.asdf/shims $PATH
 set -gx PATH $PATH $ANDROID_HOME/emulator
 set -gx PATH $PATH $ANDROID_HOME/platform-tools
 
+# linux
+set -gx __NV_DISABLE_EXPLICIT_SYNC 1
+
 if status is-interactive
   # Commands to run in interactive sessions can go here
 end

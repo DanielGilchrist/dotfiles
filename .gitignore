@@ -5,6 +5,7 @@ shoo/config.yml
 youtube-tui
 tfenv
 swiftpm/
+mozilla
 
 # wtf?
 StardewValley/
@@ -49,3 +50,31 @@ opencode/AGENTS_LOCAL.md
 # zed
 conversations/
 prompts/
+
+# KDE/Plasma
+k*
+plasma*
+Trolltech.conf
+baloofilerc
+powermanagementprofilesrc
+
+# GTK
+gtk-*/
+gtkrc*
+
+# System/Desktop
+autostart/
+dconf/
+pulse/
+libaccounts-glib/
+xsettingsd/
+user-dirs.*
+
+# CachyOS
+cachyos*/
+cachyos-hello.json
+
+# Misc
+arkrc
+micro/
+libinput-gestures.conf
