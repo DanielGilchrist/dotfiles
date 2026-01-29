@@ -101,6 +101,7 @@ install_package arduino-cli
 
 install_asdf_plugin ruby https://github.com/asdf-vm/asdf-ruby.git
 install_asdf_plugin crystal https://github.com/asdf-community/asdf-crystal.git
+install_asdf_plugin nodejs https://github.com/asdf-vm/asdf-nodejs.git
 
 if ! command_exists rustup; then
   echo "Installing rustup..."
