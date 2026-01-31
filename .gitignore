@@ -58,6 +58,7 @@ plasma*
 Trolltech.conf
 baloofilerc
 powermanagementprofilesrc
+KDE
 
 # GTK
 gtk-*/
@@ -80,3 +81,5 @@ arkrc
 micro/
 libinput-gestures.conf
 trashrc
+discord
+bluedevilglobalrc
