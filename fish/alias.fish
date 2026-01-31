@@ -19,3 +19,4 @@ alias ghp="shoo notification purge"
 alias linear="$PERSONAL_DIR/linear-tui/target/release/linear-tui"
 alias frog=rainfrog
 alias acli=arduino-cli
+alias reload-thinkfan="sudo rmmod thinkpad_acpi; and sudo modprobe thinkpad_acpi"
