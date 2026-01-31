@@ -39,6 +39,7 @@ keys.SHIFT_ALT = combine(keys.SHIFT, keys.ALT)
 config.keys = {
   keybind(keys.COMMAND_SHIFT, "r", "ReloadConfiguration"),
 
+  keybind(keys.COMMAND, "t", wezterm.action.SpawnTab("CurrentPaneDomain")),
   keybind(keys.COMMAND_SHIFT, "n", wezterm.action.SpawnWindow),
 
   keybind(keys.COMMAND_SHIFT, "f", wezterm.action_callback(function(window, pane)
