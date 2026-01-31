@@ -1,7 +1,7 @@
 set CONFIG_DIR "$HOME/.config"
 
-if test -f ~/.config/fish/alias.fish
-  source ~/.config/fish/alias.fish
+if test -f $CONFIG_DIR/fish/alias.fish
+  source $CONFIG_DIR/fish/alias.fish
 end
 
 if test -d $CONFIG_DIR/fish/secret
@@ -10,34 +10,28 @@ if test -d $CONFIG_DIR/fish/secret
   end
 end
 
-source $CONFIG_DIR/fish/config/apple_silicon.fish
-source $CONFIG_DIR/fish/config/intel.fish
+switch (uname)
+  case Darwin
+    source $CONFIG_DIR/fish/config/macos.fish
+  case Linux
+    source $CONFIG_DIR/fish/config/linux.fish
+end
 
 if test -f "$HOME/.cargo/env.fish"
   source "$HOME/.cargo/env.fish"
 end
 
-alias nproc="sysctl -n hw.logicalcpu"
-
 set -gx MAKEFLAGS "-j$(nproc)"
-set -gx XDG_CONFIG_HOME "$HOME/.config"
-set -gx HOMEBREW_NO_AUTO_UPDATE 1
-set -gx JAVA_HOME "/Applications/Android Studio.app/Contents/jbr/Contents/Home"
-set -gx ANDROID_HOME $HOME/Library/Android/sdk
+set -gx XDG_CONFIG_HOME $CONFIG_DIR
 set -gx EDITOR (which nvim)
 set -gx MANPAGER 'nvim +Man!'
-set -gx RAINFROG_CONFIG "$HOME/.config/rainfrog"
+set -gx RAINFROG_CONFIG "$CONFIG_DIR/rainfrog"
 
-set -gx ASDF_CONFIG_FILE "$HOME/.config/.asdfrc"
+set -gx ASDF_CONFIG_FILE "$CONFIG_DIR/.asdfrc"
 set -gx ASDF_GOLANG_MOD_VERSION_ENABLED true
 set -gx OPENCODE_DISABLE_CLAUDE_CODE true
 
 set -gx PATH $HOME/.asdf/shims $PATH
-set -gx PATH $PATH $ANDROID_HOME/emulator
-set -gx PATH $PATH $ANDROID_HOME/platform-tools
-
-# linux
-set -gx __NV_DISABLE_EXPLICIT_SYNC 1
 
 if status is-interactive
   # Commands to run in interactive sessions can go here
