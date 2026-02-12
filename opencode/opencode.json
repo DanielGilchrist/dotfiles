@@ -48,7 +48,8 @@
       "wc*": "allow",
       "sort*": "allow",
       "xargs*": "allow",
-      "bin/dev*": "allow"
+      "bin/dev*": "allow",
+      "cargo*": "allow"
     }
   }
 }
