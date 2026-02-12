@@ -26,6 +26,9 @@
       "git diff*": "allow",
       "git blame*": "allow",
       "git shortlog*": "allow",
+      "git worktree*": "allow",
+      "git fetch*": "allow",
+      "git branch*": "allow",
       "rg*": "allow",
       "ls*": "allow",
       "grep*": "allow",
@@ -43,7 +46,9 @@
       "npm test*": "allow",
       "awk*": "allow",
       "bin/dev test*": "allow",
-      "wc*": "allow"
+      "wc*": "allow",
+      "sort*": "allow",
+      "xargs*": "allow"
     }
   }
 }
