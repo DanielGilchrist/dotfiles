@@ -41,7 +41,7 @@
       "pwd": "allow",
       "cd*": "allow",
       "mkdir*": "allow",
-      "bundle exec srb tc": "allow",
+      "bundle exec srb tc*": "allow",
       "yarn test*": "allow",
       "npm test*": "allow",
       "awk*": "allow",
