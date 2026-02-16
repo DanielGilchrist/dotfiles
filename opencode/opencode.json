@@ -49,7 +49,11 @@
       "sort*": "allow",
       "xargs*": "allow",
       "bin/dev*": "allow",
-      "cargo*": "allow"
+      "cargo*": "allow",
+      "gh issue view*": "allow",
+      "gh repo view*": "allow",
+      "gh pr view*": "allow",
+      "gh pr create*": "allow"
     }
   }
 }
