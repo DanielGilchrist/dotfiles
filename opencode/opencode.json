@@ -50,6 +50,7 @@
       "xargs*": "allow",
       "bin/dev*": "allow",
       "cargo*": "allow",
+      "crystal*": "allow",
       "gh issue view*": "allow",
       "gh repo view*": "allow",
       "gh pr view*": "allow",
