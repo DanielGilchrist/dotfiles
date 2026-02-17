@@ -7,6 +7,7 @@ tfenv
 swiftpm/
 mozilla
 .tool-versions
+rails-mcp
 
 # wtf?
 StardewValley/
