@@ -55,8 +55,8 @@ local misc = {
   scrollback_lines = 50000,
 
   window_padding = {
-    left = 0,
-    right = 10, -- controls the width of the scrollbar
+    left = 15,
+    right = 15, -- controls the width of the scrollbar
     top = 10,
     bottom = 0,
   },
