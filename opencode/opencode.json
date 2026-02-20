@@ -55,6 +55,7 @@
       "crystal*": "allow",
       "bundle*": "allow",
       "gh issue view*": "allow",
+      "gh issue list*": "allow",
       "gh repo view*": "allow",
       "gh pr view*": "allow",
       "gh pr create*": "allow"
