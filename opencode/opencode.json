@@ -18,6 +18,10 @@
   "permission": {
     "edit": "allow",
     "webfetch": "ask",
+    "external_directory": {
+      "~/Documents/repos/**": "allow",
+      "~/.asdf/installs/**": "allow"
+    },
     "bash": {
       "*": "ask",
       "git status": "allow",
