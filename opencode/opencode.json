@@ -58,7 +58,8 @@
       "gh issue list*": "allow",
       "gh repo view*": "allow",
       "gh pr view*": "allow",
-      "gh pr create*": "allow"
+      "gh pr create*": "allow",
+      "gh search*": "allow"
     }
   }
 }
