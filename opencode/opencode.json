@@ -42,6 +42,7 @@
       "cd*": "allow",
       "mkdir*": "allow",
       "uniq*": "allow",
+      "echo*": "allow",
       "bundle exec srb tc*": "allow",
       "yarn test*": "allow",
       "npm test*": "allow",
