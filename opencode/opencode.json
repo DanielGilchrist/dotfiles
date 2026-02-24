@@ -63,7 +63,10 @@
       "gh repo view*": "allow",
       "gh pr view*": "allow",
       "gh pr create*": "allow",
-      "gh search*": "allow"
+      "gh pr list*": "allow",
+      "gh search*": "allow",
+      "gh release view*": "allow",
+      "gh release list*": "allow"
     }
   }
 }
