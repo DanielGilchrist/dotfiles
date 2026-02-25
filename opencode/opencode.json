@@ -58,6 +58,7 @@
       "cargo*": "allow",
       "crystal*": "allow",
       "bundle*": "allow",
+      "bun*": "allow",
       "gh issue view*": "allow",
       "gh issue list*": "allow",
       "gh repo view*": "allow",
