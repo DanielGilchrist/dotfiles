@@ -31,7 +31,8 @@
     "webfetch": "ask",
     "external_directory": {
       "~/Documents/repos/**": "allow",
-      "~/.asdf/installs/**": "allow"
+      "~/.asdf/installs/**": "allow",
+      "~/worktrees/**": "allow"
     },
     "bash": {
       "*": "ask",
