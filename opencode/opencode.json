@@ -15,6 +15,17 @@
       "prompt": "You are Claude Code, Anthropic's official CLI for Claude."
     }
   },
+  "mcp": {
+    "linear": {
+      "type": "local",
+      "command": [
+        "npx",
+        "-y",
+        "mcp-linear"
+      ],
+      "enabled": true
+    }
+  },
   "permission": {
     "edit": "allow",
     "webfetch": "ask",
