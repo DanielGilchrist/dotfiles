@@ -21,7 +21,8 @@
       "command": [
         "npx",
         "-y",
-        "mcp-linear"
+        "mcp-remote",
+        "https://mcp.linear.app/sse"
       ],
       "enabled": true
     }
