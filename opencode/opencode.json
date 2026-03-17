@@ -45,6 +45,8 @@
       "git worktree*": "allow",
       "git fetch*": "allow",
       "git branch*": "allow",
+      "git add*": "allow",
+      "git commit*": "allow",
       "rg*": "allow",
       "ls*": "allow",
       "grep*": "allow",
