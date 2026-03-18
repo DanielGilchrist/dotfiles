@@ -88,6 +88,7 @@
       "gh pr view*": "allow",
       "gh pr create*": "allow",
       "gh pr list*": "allow",
+      "gh pr diff*": "allow",
       "gh search*": "allow",
       "gh release view*": "allow",
       "gh release list*": "allow",
