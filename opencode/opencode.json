@@ -24,6 +24,15 @@
         "https://mcp.linear.app/sse"
       ],
       "enabled": true
+    },
+    "circleci": {
+      "type": "local",
+      "command": [
+        "npx",
+        "-y",
+        "@circleci/mcp-server-circleci@latest"
+      ],
+      "enabled": true
     }
   },
   "permission": {
