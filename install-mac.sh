@@ -114,6 +114,7 @@ install_brew_package ghostscript gs
 install_brew_package sst/tap/opencode opencode
 install_brew_package libsixel
 install_brew_package mpv
+install_brew_package automake
 install_brew_package btop
 install_brew_package rainfrog
 install_brew_package arduino-cli
@@ -136,7 +137,7 @@ if ! command_exists youtube-tui; then
   echo "Installing youtube-tui..."
   export PKG_CONFIG_PATH="/opt/homebrew/lib/pkgconfig:$PKG_CONFIG_PATH"
   export LIBRARY_PATH="/opt/homebrew/lib:$LIBRARY_PATH"
-  cargo install youtube-tui
+  cargo install --git https://github.com/Siriusmart/youtube-tui.git youtube-tui
 else
   echo "youtube-tui is already installed."
 fi
