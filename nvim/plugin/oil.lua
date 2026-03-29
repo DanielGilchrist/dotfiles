@@ -1,4 +1,5 @@
 local pack = require("utils.pack")
+
 pack.add({
   "https://github.com/stevearc/oil.nvim",
   "https://github.com/nvim-mini/mini.icons",

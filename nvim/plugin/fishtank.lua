@@ -1,4 +1,5 @@
 local pack = require("utils.pack")
+
 pack.add({ "https://github.com/nullromo/fishtank.nvim" })
 
 local function timeout(minutes)

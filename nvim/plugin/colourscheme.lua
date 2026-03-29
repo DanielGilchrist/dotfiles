@@ -1,4 +1,5 @@
 local pack = require("utils.pack")
+
 pack.add({
   "https://github.com/RRethy/base16-nvim",
   { src = "https://github.com/everviolet/nvim", name = "evergarden" },
