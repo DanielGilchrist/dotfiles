@@ -45,7 +45,11 @@ return {
     { "<leader>sc", function() Snacks.picker.command_history() end, desc = "Command History" },
     { "<leader>sC", function() Snacks.picker.commands() end, desc = "Commands" },
     { "<leader>gs", function() Snacks.picker.git_status() end, desc = "Git Status" },
-    { "<leader>gc", function() Snacks.picker.git_log() end, desc = "Git Log" },
+    { "<leader>gS", function() Snacks.picker.git_stash() end, desc = "Git Stash" },
+    { "<leader>gl", function() Snacks.picker.git_log() end, desc = "Git Log" },
+    { "<leader>gL", function() Snacks.picker.git_log({ cwd = vim.uv.cwd() }) end, desc = "Git Log (cwd)" },
+    { "<leader>gf", function() Snacks.picker.git_log_file() end, desc = "Git File History" },
+    { "<leader>gd", function() Snacks.picker.git_diff() end, desc = "Git Diff" },
     { "<leader>uC", function() Snacks.picker.colorschemes() end, desc = "Colorschemes" },
   },
 }
