@@ -120,6 +120,7 @@ install_brew_package automake
 install_brew_package btop
 install_brew_package rainfrog
 install_brew_package arduino-cli
+install_brew_package lua-language-server
 
 install_asdf_plugin ruby https://github.com/asdf-vm/asdf-ruby.git
 install_asdf_plugin crystal https://github.com/asdf-community/asdf-crystal.git
