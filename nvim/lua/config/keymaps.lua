@@ -119,7 +119,7 @@ map("n", leader("mf"), function() playback({ "seek", "10000" }) end, { desc = "F
 map("n", leader("mb"), function() playback({ "seek", "--", "-10000" }) end, { desc = "Rewind 10s" })
 
 -- Lazygit
-map("n", leader("gg"), function() Snacks.terminal.toggle("lazygit", { cwd = require("utils.path").root() }) end, { desc = "Lazygit" })
+map("n", leader("gg"), function() Snacks.lazygit({ cwd = require("utils.path").root() }) end, { desc = "Lazygit" })
 
 -- btop / tetris
 map("n", leader("ts"), function() Snacks.terminal.toggle("tetrigo") end, { desc = "Launch Tetris" })
