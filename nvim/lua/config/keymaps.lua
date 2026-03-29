@@ -34,6 +34,10 @@ map("n", "<S-l>", "<cmd>bnext<cr>", { desc = "Next Buffer" })
 map("n", "[b", "<cmd>bprevious<cr>", { desc = "Prev Buffer" })
 map("n", "]b", "<cmd>bnext<cr>", { desc = "Next Buffer" })
 
+map("n", leader("bd"), function() Snacks.bufdelete() end, { desc = "Delete Buffer" })
+map("n", leader("bD"), function() Snacks.bufdelete.all() end, { desc = "Delete All Buffers" })
+map("n", leader("bo"), function() Snacks.bufdelete.other() end, { desc = "Delete Other Buffers" })
+
 -- Clear search highlight
 map("n", "<Esc>", "<cmd>nohlsearch<cr><Esc>", { desc = "Clear Search Highlight" })
 
