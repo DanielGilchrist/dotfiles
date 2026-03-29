@@ -13,3 +13,10 @@ require("nvim-treesitter.parsers").crystal = {
     queries = "queries/nvim",
   },
 }
+
+-- Enable treesitter highlighting for all filetypes with an installed parser
+vim.api.nvim_create_autocmd("FileType", {
+  callback = function()
+    pcall(vim.treesitter.start)
+  end,
+})
