@@ -1,5 +1,9 @@
 local pack = require("utils.pack")
 
+pack.on_change("blink.cmp", function(data)
+  vim.system({ "cargo", "build", "--release" }, { cwd = data.path }):wait()
+end)
+
 pack.add({
   { src = "https://github.com/saghen/blink.cmp", version = vim.version.range("1.x") },
 })

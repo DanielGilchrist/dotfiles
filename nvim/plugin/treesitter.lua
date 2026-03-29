@@ -1,5 +1,10 @@
 local pack = require("utils.pack")
 
+pack.on_change("nvim-treesitter", function(data)
+  if not data.active then vim.cmd.packadd("nvim-treesitter") end
+  vim.cmd("TSUpdate")
+end)
+
 pack.add({
   { src = "https://github.com/nvim-treesitter/nvim-treesitter", version = "main" },
 })

@@ -3,6 +3,9 @@ local M = {}
 ---@type table<string, true>
 local registered = {}
 
+---@type table<string, fun(ev: table)>
+local hooks = {}
+
 ---Extract plugin names from a spec list
 ---@param specs (string|table)[]
 ---@return string[]
@@ -41,6 +44,26 @@ function M.later(specs, callback)
   end)
 end
 
+---Register a hook to run on plugin install/update
+---@param name string Plugin name
+---@param callback fun(ev: table) Receives the PackChanged event data
+function M.on_change(name, callback)
+  hooks[name] = callback
+end
+
+---Dispatch a PackChanged event to registered hooks
+---@param ev table The autocmd event
+function M.handle_change(ev)
+  local name = ev.data.spec.name
+  local kind = ev.data.kind
+  if kind ~= "install" and kind ~= "update" then return end
+
+  local hook = hooks[name]
+  if hook then
+    hook(ev.data)
+  end
+end
+
 ---Get list of orphaned plugins (installed but not registered in config)
 ---@return string[]
 function M.orphans()
@@ -57,11 +80,5 @@ function M.clean()
     vim.pack.del(orphans)
   end
 end
-
--- Auto-clean orphans after startup
-vim.api.nvim_create_autocmd("VimEnter", {
-  once = true,
-  callback = M.clean,
-})
 
 return M
