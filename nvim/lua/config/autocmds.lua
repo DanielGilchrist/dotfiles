@@ -42,7 +42,7 @@ autocmd("BufReadPost", {
 
 -- Close certain filetypes with q
 autocmd("FileType", {
-  pattern = { "help", "notify", "checkhealth", "qf", "man" },
+  pattern = { "help", "notify", "checkhealth", "qf", "man", "grug-far" },
   callback = function(ev)
     vim.bo[ev.buf].buflisted = false
     vim.keymap.set("n", "q", "<cmd>close<cr>", { buf = ev.buf, silent = true })
