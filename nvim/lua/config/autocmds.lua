@@ -1,59 +1,89 @@
--- Autocmds are automatically loaded on the VeryLazy event
--- Default autocmds that are always set: https://github.com/LazyVim/LazyVim/blob/main/lua/lazyvim/config/autocmds.lua
--- Add any additional autocmds here
+local autocmd = vim.api.nvim_create_autocmd
 
-local create_autocmd = vim.api.nvim_create_autocmd
-
-local function set_line_wrap()
-  vim.opt_local.wrap = true
-  vim.opt_local.linebreak = true
-end
-
-vim.api.nvim_create_autocmd("User", {
-  pattern = "TSUpdate",
+-- Check if file changed outside Neovim
+autocmd({ "FocusGained", "TermClose", "TermLeave" }, {
   callback = function()
-    require("nvim-treesitter.parsers").crystal = {
-      install_info = {
-        url = "https://github.com/crystal-lang-tools/tree-sitter-crystal",
-        generate = false,
-        generate_from_json = false,
-        queries = "queries/nvim"
-      },
-    }
+    if vim.o.buftype ~= "nofile" then vim.cmd("checktime") end
   end,
 })
 
-vim.treesitter.language.register("crystal", { "cr" })
+-- Highlight on yank
+autocmd("TextYankPost", {
+  callback = function()
+    vim.hl.on_yank()
+  end,
+})
 
-vim.api.nvim_create_user_command("Dashboard", function()
-  Snacks.dashboard()
-end, {})
+-- Resize splits on window resize
+autocmd("VimResized", {
+  callback = function()
+    local current_tab = vim.fn.tabpagenr()
+    vim.cmd("tabdo wincmd =")
+    vim.cmd("tabnext " .. current_tab)
+  end,
+})
 
--- nuke trailing whitespace on save
-create_autocmd("BufWritePre", {
+-- Go to last cursor position when opening a buffer
+autocmd("BufReadPost", {
+  callback = function(ev)
+    local exclude = { "gitcommit" }
+    local buf = ev.buf
+    if vim.tbl_contains(exclude, vim.bo[buf].filetype) or vim.b[buf]._last_loc then
+      return
+    end
+    vim.b[buf]._last_loc = true
+    local mark = vim.api.nvim_buf_get_mark(buf, '"')
+    local lcount = vim.api.nvim_buf_line_count(buf)
+    if mark[1] > 0 and mark[1] <= lcount then
+      pcall(vim.api.nvim_win_set_cursor, 0, mark)
+    end
+  end,
+})
+
+-- Close certain filetypes with q
+autocmd("FileType", {
+  pattern = { "help", "notify", "checkhealth", "qf", "man" },
+  callback = function(ev)
+    vim.bo[ev.buf].buflisted = false
+    vim.keymap.set("n", "q", "<cmd>close<cr>", { buf = ev.buf, silent = true })
+  end,
+})
+
+-- Strip trailing whitespace on save
+autocmd("BufWritePre", {
   pattern = "*",
   command = [[%s/\s\+$//e]],
 })
 
--- Show absolute numbers in insert mode
-create_autocmd("InsertEnter", {
+-- Relative number toggle in insert mode
+autocmd("InsertEnter", {
+  callback = function() vim.opt.relativenumber = false end,
+})
+autocmd("InsertLeave", {
+  callback = function() vim.opt.relativenumber = true end,
+})
+
+-- Line wrap for specific filetypes
+autocmd("FileType", {
+  pattern = { "markdown", "haml" },
   callback = function()
-    vim.opt.relativenumber = false
+    vim.opt_local.wrap = true
+    vim.opt_local.linebreak = true
+  end,
+})
+
+-- Suppress "[Process exited 0]" virtual text in terminal buffers (0.12 feature)
+local term_acs = vim.api.nvim_get_autocmds({ group = "nvim.terminal", event = "TermClose" })
+for _, ac in ipairs(term_acs) do
+  if ac.desc and ac.desc:match("Process exited") then
+    vim.api.nvim_del_autocmd(ac.id)
   end
-})
+end
 
-create_autocmd("InsertLeave", {
-  callback = function()
-    vim.opt.relativenumber = true
-  end
-})
+-- Crystal treesitter registration
+vim.treesitter.language.register("crystal", { "cr" })
 
-vim.api.nvim_create_autocmd("FileType", {
-  pattern = "markdown",
-  callback = set_line_wrap,
-})
-
-vim.api.nvim_create_autocmd("FileType", {
-  pattern = "haml",
-  callback = set_line_wrap,
-})
+-- Dashboard command
+vim.api.nvim_create_user_command("Dashboard", function()
+  Snacks.dashboard()
+end, {})

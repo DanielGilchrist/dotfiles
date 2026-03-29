@@ -43,7 +43,6 @@ return {
         padding = 1,
         random = os.time(),
       },
-      { section = "startup" },
     },
   },
 }

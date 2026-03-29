@@ -1,3 +1,5 @@
+local path = require("utils.path")
+
 local function open_terminal(opts)
   opts = opts == nil and {} or opts
 
@@ -99,7 +101,7 @@ return {
     {
       "<leader>ft",
       function()
-        open_terminal({ cwd = LazyVim.root() })
+        open_terminal({ cwd = path.root() })
       end,
       desc = "Terminal (Root Dir)",
       mode = "n"
@@ -107,7 +109,7 @@ return {
     {
       "<c-/>",
       function()
-        open_terminal({ cwd = LazyVim.root() })
+        open_terminal({ cwd = path.root() })
       end,
       desc = "Terminal (Root Dir)",
       mode = "n"
