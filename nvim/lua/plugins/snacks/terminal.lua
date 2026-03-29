@@ -109,10 +109,10 @@ return {
     {
       "<c-/>",
       function()
-        open_terminal({ cwd = path.root() })
+        Snacks.terminal.toggle(nil, { cwd = path.root() })
       end,
       desc = "Terminal (Root Dir)",
-      mode = "n"
+      mode = { "n", "t" }
     },
     {
       "<c-,>",
