@@ -75,6 +75,11 @@ vim.api.nvim_create_autocmd("LspAttach", {
   end,
 })
 
+
+vim.api.nvim_create_user_command("LspLog", function()
+  vim.cmd.edit(vim.lsp.get_log_path())
+end, {})
+
 -- Enable LSP servers (configs auto-loaded from lsp/ directory)
 vim.lsp.enable({
   "arduino_language_server",
