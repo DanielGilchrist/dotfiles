@@ -6,14 +6,6 @@
   "instructions": [
     "~/.config/opencode/AGENTS_LOCAL.md"
   ],
-  "mode": {
-    "build": {
-      "prompt": "You are Claude Code, Anthropic's official CLI for Claude."
-    },
-    "plan": {
-      "prompt": "You are Claude Code, Anthropic's official CLI for Claude."
-    }
-  },
   "mcp": {
     "linear": {
       "type": "local",
