@@ -112,14 +112,14 @@ vim.api.nvim_create_autocmd("LspAttach", {
     map("n", "<leader>ca", vim.lsp.buf.code_action, "Code Action")
     map("n", "<leader>cr", vim.lsp.buf.rename, "Rename")
     map("n", "<leader>cc", vim.lsp.codelens.run, "Run Codelens")
-    map("n", "<leader>cC", vim.lsp.codelens.refresh, "Refresh Codelens")
+    map("n", "<leader>cC", function() vim.lsp.codelens.enable(true) end, "Refresh Codelens")
     map("n", "<leader>cd", vim.diagnostic.open_float, "Line Diagnostics")
     map("n", "<leader>cf", function() vim.lsp.buf.format({ async = true }) end, "Format")
   end,
 })
 
 vim.api.nvim_create_user_command("LspLog", function()
-  vim.cmd.edit(vim.lsp.get_log_path())
+  vim.cmd.edit(vim.lsp.log.get_filename())
 end, {})
 
 -- Enable LSP servers (configs auto-loaded from lsp/ directory)
