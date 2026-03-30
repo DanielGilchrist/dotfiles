@@ -1,11 +1,6 @@
 local pack = require("utils.pack")
 
-pack.add({
-  "https://github.com/stevearc/oil.nvim",
-  "https://github.com/nvim-mini/mini.icons",
-})
-
-require("mini.icons").setup()
+pack.add({ "https://github.com/stevearc/oil.nvim" })
 
 require("oil").setup({
   keymaps = {
