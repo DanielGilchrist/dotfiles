@@ -7,5 +7,6 @@ return {
   },
   keys = {
     { "<leader>sn", function() Snacks.notifier.show_history() end, desc = "Notification History" },
+    { "<leader>un", function() Snacks.notifier.hide() end, desc = "Dismiss Notifications" },
   },
 }
