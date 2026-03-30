@@ -9,6 +9,12 @@ pack.add({
   { src = "https://github.com/nvim-treesitter/nvim-treesitter", version = "main" },
 })
 
+-- nvim-treesitter main branch stores queries in runtime/ which needs to be on rtp
+local ts_path = vim.fn.stdpath("data") .. "/site/pack/core/opt/nvim-treesitter/runtime"
+if vim.uv.fs_stat(ts_path) then
+  vim.opt.rtp:append(ts_path)
+end
+
 -- Register crystal parser
 require("nvim-treesitter.parsers").crystal = {
   install_info = {

@@ -6,44 +6,87 @@ vim.diagnostic.config({
   virtual_text = false,
 })
 
--- Smart hover: uses default hover for single client (noice-compatible),
--- falls back to combined hover when multiple clients provide hover
-local function smart_hover()
+-- Combined hover (merges hover results from all attached LSP clients)
+local function combined_hover()
   local clients = vim.lsp.get_clients({ bufnr = 0 })
-  local hover_clients = vim.iter(clients)
-    :filter(function(c) return c:supports_method("textDocument/hover", 0) end)
-    :totable()
+  local results = {}
+  local handle_count = 0
 
-  if #hover_clients <= 1 then
-    return vim.lsp.buf.hover()
+  local function open_hover_window()
+    table.sort(results, function(a, b) return #a.contents < #b.contents end)
+
+    local lines = {}
+
+    for i, item in ipairs(results) do
+      if i > 1 then
+        table.insert(lines, "")
+        table.insert(lines, "---")
+        table.insert(lines, "")
+      end
+
+      if #results > 1 then
+        table.insert(lines, "**" .. item.name .. "**")
+        table.insert(lines, "")
+      end
+
+      vim.list_extend(lines, vim.split(item.contents, "\n"))
+    end
+
+    vim.lsp.util.open_floating_preview(
+      lines,
+      "markdown",
+      {
+        border = "rounded",
+        focusable = true,
+        focus_id = "hover",
+      }
+    )
   end
 
-  -- Multiple clients: merge results
-  local results = {}
-  local pending = #hover_clients
+  local function extract_contents(result)
+    if is.empty(result) then
+      return nil
+    end
 
-  for _, client in ipairs(hover_clients) do
-    local params = vim.lsp.util.make_position_params(0, client.offset_encoding)
-    client:request("textDocument/hover", params, function(err, result)
-      if not err and result and result.contents and result.contents.value and result.contents.value ~= "" then
-        table.insert(results, { name = client.name, contents = result.contents.value })
-      end
-      pending = pending - 1
-      if pending == 0 and #results > 0 then
-        table.sort(results, function(a, b) return #a.contents < #b.contents end)
-        local lines = {}
-        for i, item in ipairs(results) do
-          if i > 1 then vim.list_extend(lines, { "", "---", "" }) end
-          vim.list_extend(lines, { "**" .. item.name .. "**", "" })
-          vim.list_extend(lines, vim.split(item.contents, "\n"))
+    local value = result.contents.value
+
+    if is.empty(value) then
+      return nil
+    end
+
+    return value
+  end
+
+  for _, client in ipairs(clients) do
+    if client:supports_method("textDocument/hover", 0) then
+      handle_count = handle_count + 1
+
+      local params = vim.lsp.util.make_position_params(0, client.offset_encoding)
+
+      client:request("textDocument/hover", params, function(err, result)
+        if is.not_empty(err) then
+          return notify.error(vim.inspect(err))
         end
-        vim.lsp.util.open_floating_preview(lines, "markdown", {
-          border = "rounded",
-          focusable = true,
-          focus_id = "hover",
-        })
-      end
-    end)
+
+        local contents = extract_contents(result)
+
+        if contents then
+          table.insert(results, { name = client.name, contents = contents })
+        end
+
+        handle_count = handle_count - 1
+
+        if handle_count ~= 0 then
+          return
+        end
+
+        if is.empty(results) then
+          return
+        end
+
+        open_hover_window()
+      end)
+    end
   end
 end
 
@@ -63,7 +106,7 @@ vim.api.nvim_create_autocmd("LspAttach", {
     map("n", "gD", vim.lsp.buf.declaration, "Go to Declaration")
     map("n", "gK", vim.lsp.buf.signature_help, "Signature Help")
     map("i", "<c-k>", vim.lsp.buf.signature_help, "Signature Help")
-    map("n", "K", smart_hover, "Hover")
+    map("n", "K", combined_hover, "Hover")
 
     -- Code actions (leader-c)
     map("n", "<leader>ca", vim.lsp.buf.code_action, "Code Action")
@@ -74,7 +117,6 @@ vim.api.nvim_create_autocmd("LspAttach", {
     map("n", "<leader>cf", function() vim.lsp.buf.format({ async = true }) end, "Format")
   end,
 })
-
 
 vim.api.nvim_create_user_command("LspLog", function()
   vim.cmd.edit(vim.lsp.get_log_path())
