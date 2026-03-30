@@ -98,11 +98,11 @@ vim.api.nvim_create_autocmd("LspAttach", {
       vim.keymap.set(mode, lhs, rhs, { buf = buf, desc = desc })
     end
 
-    -- Navigation
-    map("n", "gd", vim.lsp.buf.definition, "Go to Definition")
-    map("n", "gr", vim.lsp.buf.references, "References")
-    map("n", "gI", vim.lsp.buf.implementation, "Go to Implementation")
-    map("n", "gy", vim.lsp.buf.type_definition, "Go to Type Definition")
+    -- Navigation (snacks picker for multi-result)
+    map("n", "gd", function() Snacks.picker.lsp_definitions() end, "Go to Definition")
+    map("n", "gr", function() Snacks.picker.lsp_references() end, "References")
+    map("n", "gI", function() Snacks.picker.lsp_implementations() end, "Go to Implementation")
+    map("n", "gy", function() Snacks.picker.lsp_type_definitions() end, "Go to Type Definition")
     map("n", "gD", vim.lsp.buf.declaration, "Go to Declaration")
     map("n", "gK", vim.lsp.buf.signature_help, "Signature Help")
     map("i", "<c-k>", vim.lsp.buf.signature_help, "Signature Help")
