@@ -111,7 +111,7 @@ install_brew_package spotify_player
 install_brew_package watchman
 install_brew_package imagemagick magick
 install_brew_package ghostscript gs
-install_brew_package sst/tap/opencode opencode
+install_brew_package anomalyco/tap/opencode opencode
 install_brew_package libsixel
 install_brew_package mpv
 install_brew_package automake
