@@ -77,6 +77,28 @@ user-dirs.*
 cachyos*/
 cachyos-hello.json
 
+# claude
+claude/backups/
+claude/cache/
+claude/debug/
+claude/downloads/
+claude/file-history/
+claude/history.jsonl
+claude/ide/
+claude/mcp-needs-auth-cache.json
+claude/paste-cache/
+claude/plugins/
+claude/policy-limits.json
+claude/projects/
+claude/session-env/
+claude/sessions/
+claude/shell-snapshots/
+claude/stats-cache.json
+claude/statsig/
+claude/tasks/
+claude/telemetry/
+claude/todos/
+
 # Misc
 arkrc
 micro/
