@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "claudeMdExcludes": [
+    "**/CLAUDE.md",
+    "**/.claude/CLAUDE.md",
+    "**/.claude/rules/**",
+    "**/AGENTS.md"
+  ],
+  "additionalDirectories": [
+    "~/Documents/repos",
+    "~/.asdf/installs",
+    "~/worktrees"
+  ],
+  "permissions": {
+    "allow": [
+      "Edit",
+      "Bash(git status*)",
+      "Bash(git log*)",
+      "Bash(git show*)",
+      "Bash(git diff*)",
+      "Bash(git blame*)",
+      "Bash(git shortlog*)",
+      "Bash(git worktree*)",
+      "Bash(git fetch*)",
+      "Bash(git branch*)",
+      "Bash(git add*)",
+      "Bash(git commit*)",
+      "Bash(rg *)",
+      "Bash(ls*)",
+      "Bash(grep*)",
+      "Bash(find *)",
+      "Bash(fd *)",
+      "Bash(sed *)",
+      "Bash(cat *)",
+      "Bash(head *)",
+      "Bash(tail *)",
+      "Bash(pwd)",
+      "Bash(cd *)",
+      "Bash(mkdir *)",
+      "Bash(uniq*)",
+      "Bash(echo *)",
+      "Bash(awk *)",
+      "Bash(wc *)",
+      "Bash(sort *)",
+      "Bash(xargs *)",
+      "Bash(bundle exec srb tc*)",
+      "Bash(yarn test*)",
+      "Bash(npm test*)",
+      "Bash(bin/dev*)",
+      "Bash(cargo *)",
+      "Bash(crystal *)",
+      "Bash(bundle *)",
+      "Bash(bun *)",
+      "Bash(gh issue view*)",
+      "Bash(gh issue list*)",
+      "Bash(gh repo view*)",
+      "Bash(gh pr view*)",
+      "Bash(gh pr create*)",
+      "Bash(gh pr list*)",
+      "Bash(gh pr diff*)",
+      "Bash(gh search*)",
+      "Bash(gh release view*)",
+      "Bash(gh release list*)",
+      "Bash(which *)"
+    ],
+    "deny": []
+  },
+  "mcpServers": {
+    "circleci": {
+      "command": "npx",
+      "args": ["-y", "@circleci/mcp-server-circleci@latest"]
+    }
+  }
+}

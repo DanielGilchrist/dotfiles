@@ -79,6 +79,7 @@ install_package wl-clipboard wl-copy
 install_package github-cli gh
 install_package asdf-vm asdf
 install_package ttf-jetbrains-mono-nerd
+install_package claude-code claude
 
 install_package fd
 install_package ripgrep rg
@@ -128,6 +129,18 @@ fi
 if [ "$SHELL" != "$(which fish)" ]; then
   echo "Setting fish as default shell..."
   chsh -s "$(which fish)"
+fi
+
+if [ ! -L "$HOME/.claude" ]; then
+  if [ -d "$HOME/.claude" ]; then
+    echo "Moving existing ~/.claude contents to $CONFIG_DIR/claude..."
+    cp -rn "$HOME/.claude/"* "$CONFIG_DIR/claude/" 2>/dev/null
+    rm -rf "$HOME/.claude"
+  fi
+  echo "Symlinking ~/.claude -> $CONFIG_DIR/claude..."
+  ln -s "$CONFIG_DIR/claude" "$HOME/.claude"
+else
+  echo "~/.claude symlink already exists."
 fi
 
 echo

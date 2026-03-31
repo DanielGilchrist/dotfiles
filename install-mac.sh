@@ -102,6 +102,7 @@ gh extension install dlvhdr/gh-dash
 install_brew_package asdf
 install_brew_cask font-jetbrains-mono-nerd-font
 install_brew_cask nikitabobko/tap/aerospace
+install_brew_cask claude-code claude
 
 install_brew_package fd
 install_brew_package ripgrep rg
@@ -151,6 +152,18 @@ fi
 if [ "$SHELL" != "$(which fish)" ]; then
   echo "Setting fish as default shell..."
   chsh -s "$(which fish)"
+fi
+
+if [ ! -L "$HOME/.claude" ]; then
+  if [ -d "$HOME/.claude" ]; then
+    echo "Moving existing ~/.claude contents to $CONFIG_DIR/claude..."
+    cp -rn "$HOME/.claude/"* "$CONFIG_DIR/claude/" 2>/dev/null
+    rm -rf "$HOME/.claude"
+  fi
+  echo "Symlinking ~/.claude -> $CONFIG_DIR/claude..."
+  ln -s "$CONFIG_DIR/claude" "$HOME/.claude"
+else
+  echo "~/.claude symlink already exists."
 fi
 
 echo
