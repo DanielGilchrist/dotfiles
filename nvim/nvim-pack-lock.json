@@ -10,7 +10,7 @@
       "src": "https://github.com/hat0uma/csvview.nvim"
     },
     "evergarden": {
-      "rev": "ded46a3eaaab08ffd9ba206bd7eff9e93598d2e5",
+      "rev": "f74fc61a5345818caf7c56bd4c6dcd16f17a1fdd",
       "src": "https://github.com/everviolet/nvim"
     },
     "fishtank.nvim": {
@@ -22,7 +22,7 @@
       "src": "https://github.com/folke/flash.nvim"
     },
     "gitsigns.nvim": {
-      "rev": "50c205548d8b037b7ff6378fca6d21146f0b6161",
+      "rev": "0f00d07c2c3106ba6abd594ac1c17f211141b7b5",
       "src": "https://github.com/lewis6991/gitsigns.nvim"
     },
     "grug-far.nvim": {
@@ -58,7 +58,7 @@
       "src": "https://github.com/MunifTanjim/nui.nvim"
     },
     "nvim-treesitter": {
-      "rev": "7caec274fd19c12b55902a5b795100d21531391f",
+      "rev": "c82bf96f0a773d85304feeb695e1e23b2207ac35",
       "src": "https://github.com/nvim-treesitter/nvim-treesitter",
       "version": "'main'"
     },
