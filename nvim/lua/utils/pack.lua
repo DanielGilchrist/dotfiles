@@ -21,13 +21,19 @@ local function extract_names(specs)
   return names
 end
 
+---Registers specs so we can keep track of installed plugins
+---@param specs (string|table)[]
+local function register(specs)
+  for _, name in ipairs(extract_names(specs)) do
+    registered[name] = true
+  end
+end
+
 ---Add plugins (wrapper around vim.pack.add)
 ---@param specs (string|table)[]
 ---@param opts? table
 function M.add(specs, opts)
-  for _, name in ipairs(extract_names(specs)) do
-    registered[name] = true
-  end
+  register(specs)
   vim.pack.add(specs, opts)
 end
 
@@ -35,9 +41,8 @@ end
 ---@param specs (string|table)[]
 ---@param callback fun() Called after plugins are loaded
 function M.later(specs, callback)
-  for _, name in ipairs(extract_names(specs)) do
-    registered[name] = true
-  end
+  register(specs)
+
   vim.schedule(function()
     vim.pack.add(specs)
     callback()
@@ -64,20 +69,20 @@ function M.handle_change(ev)
   end
 end
 
----Get list of orphaned plugins (installed but not registered in config)
+---Get list of plugins to remove (installed but not registered in config)
 ---@return string[]
-function M.orphans()
+function M.plugins_to_remove()
   return vim.iter(vim.pack.get())
     :filter(function(p) return not registered[p.spec.name] end)
     :map(function(p) return p.spec.name end)
     :totable()
 end
 
----Remove orphaned plugins
+---Remove plugins that aren't registered
 function M.clean()
-  local orphans = M.orphans()
-  if #orphans > 0 then
-    vim.pack.del(orphans)
+  local plugins_to_remove = M.plugins_to_remove()
+  if #plugins_to_remove > 0 then
+    vim.pack.del(plugins_to_remove)
   end
 end
 
