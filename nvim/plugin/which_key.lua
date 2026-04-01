@@ -16,6 +16,8 @@ pack.later({ "https://github.com/folke/which-key.nvim" }, function()
       { "<leader>t", group = "Test/Toggle" },
       { "<leader>u", group = "UI" },
       { "<leader>w", group = "Windows" },
+      { "]", group = "Next" },
+      { "[", group = "Previous" },
     },
     preset = "helix",
   })
