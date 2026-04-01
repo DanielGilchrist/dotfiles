@@ -11,6 +11,6 @@ return {
   ---@param markers? string[] File/dir names that identify a project root (default: { ".git" })
   ---@return string # Project root path, falls back to cwd
   root = function(markers)
-    return vim.fs.root(0, markers or { ".git" }) or vim.uv.cwd()
+    return vim.fs.root(0, markers or { ".git" }) or vim.uv.cwd() or error("FAAAAAAAAAAH")
   end,
 }
