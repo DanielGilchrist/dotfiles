@@ -34,7 +34,16 @@ vim.api.nvim_create_user_command(
   { desc = "Select board then compile and upload to it" }
 )
 
-vim.keymap.set("n", "<leader>rc", "<cmd>ArduinoCompile<cr>", { desc = "Arduino: Compile" })
-vim.keymap.set("n", "<leader>ru", "<cmd>ArduinoUpload<cr>", { desc = "Arduino: Upload" })
-vim.keymap.set("n", "<leader>rr", "<cmd>ArduinoRun<cr>", { desc = "Arduino: Run (Compile + Upload)" })
-vim.keymap.set("n", "<leader>rs", "<cmd>ArduinoRunSelect<cr>", { desc = "Arduino: Select Board and Run" })
+vim.api.nvim_create_autocmd("FileType", {
+  pattern = "arduino",
+  callback = function(ev)
+    local map = function(lhs, rhs, desc)
+      vim.keymap.set("n", lhs, rhs, { buf = ev.buf, desc = desc })
+    end
+
+    map("<leader>rc", "<cmd>ArduinoCompile<cr>", "Arduino: Compile")
+    map("<leader>ru", "<cmd>ArduinoUpload<cr>", "Arduino: Upload")
+    map("<leader>rr", "<cmd>ArduinoRun<cr>", "Arduino: Run (Compile + Upload)")
+    map("<leader>rs", "<cmd>ArduinoRunSelect<cr>", "Arduino: Select Board and Run")
+  end,
+})

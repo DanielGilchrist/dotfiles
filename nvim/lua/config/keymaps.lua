@@ -84,7 +84,7 @@ map("n", leader("wtf"), function()
   else
     print("No <leader>wtf definition for '" .. ft .. "'")
   end
-end, { desc = "Insert debug trace for current language" })
+end, { desc = "fuck?" })
 
 -- Copy file path
 map("n", leader("bc"), function()
