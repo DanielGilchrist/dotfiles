@@ -33,6 +33,10 @@
       "rev": "47f91c416daef12db467145e16bed5bbfe00add8",
       "src": "https://github.com/nvim-lualine/lualine.nvim"
     },
+    "mini.ai": {
+      "rev": "4b0a6207341d895b6cfe9bcb1e4d3e8607bfe4f4",
+      "src": "https://github.com/echasnovski/mini.ai"
+    },
     "mini.icons": {
       "rev": "5b9076dae1bfbe47ba4a14bc8b967cde0ab5d77e",
       "src": "https://github.com/nvim-mini/mini.icons"
