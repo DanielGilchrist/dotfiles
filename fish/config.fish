@@ -36,4 +36,8 @@ set -gx PATH $HOME/.asdf/shims $PATH
 if status is-interactive
   # Commands to run in interactive sessions can go here
 end
+
+# Fix tide prompt icon on Fish 4.3+ (https://github.com/IlanCosman/tide/issues/622)
+set -gx tide_character_vi_icon_default "❯"
+
 export PATH="$HOME/.local/bin:$PATH"
