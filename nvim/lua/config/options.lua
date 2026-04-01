@@ -26,7 +26,7 @@ opt.shiftwidth = 2
 opt.shortmess:append({ W = true, I = true, c = true, C = true })
 opt.showmode = false
 opt.sidescrolloff = 8
-opt.signcolumn = "yes"
+opt.signcolumn = "auto"
 opt.smartcase = true
 opt.smartindent = true
 opt.splitbelow = true
