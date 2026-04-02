@@ -1,3 +1,5 @@
 
 # Added by swiftly
-source "/Users/daniel/.swiftly/env.fish"
+if test -f "$HOME/.swiftly/env.fish"
+    source "$HOME/.swiftly/env.fish"
+end
