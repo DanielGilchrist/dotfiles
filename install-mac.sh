@@ -136,6 +136,13 @@ else
   echo "rustup is already installed."
 fi
 
+if ! command_exists tree-sitter; then
+  echo "Installing tree-sitter-cli..."
+  cargo install --locked tree-sitter-cli
+else
+  echo "tree-sitter-cli is already installed."
+fi
+
 if ! command_exists youtube-tui; then
   echo "Installing youtube-tui..."
   export PKG_CONFIG_PATH="/opt/homebrew/lib/pkgconfig:$PKG_CONFIG_PATH"

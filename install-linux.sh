@@ -96,6 +96,7 @@ install_package btop
 install_package rainfrog
 install_package arduino-cli
 install_package lua-language-server
+install_package tree-sitter-cli tree-sitter
 
 # watchman is currently broken on Arch - upstream hasn't provided Linux binaries since April 2024
 # Uncomment if you want to try anyway:
@@ -113,6 +114,13 @@ if ! command_exists rustup; then
   rustup default stable
 else
   echo "rustup is already installed."
+fi
+
+if ! command_exists tree-sitter; then
+  echo "Installing tree-sitter-cli..."
+  cargo install --locked tree-sitter-cli
+else
+  echo "tree-sitter-cli is already installed."
 fi
 
 if ! command_exists youtube-tui; then
