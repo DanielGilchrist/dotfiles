@@ -5,4 +5,8 @@ return {
     timeout = 5000,
     top_down = true,
   },
+  keys = {
+    { "<leader>sn", function() Snacks.notifier.show_history() end, desc = "Notification History" },
+    { "<leader>un", function() Snacks.notifier.hide() end, desc = "Dismiss Notifications" },
+  },
 }

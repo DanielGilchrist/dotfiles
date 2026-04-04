@@ -1,7 +1,6 @@
 function oil
   nvim -c 'lua
-    require("lazy").load({ plugins = { "oil.nvim" } })
-    oil = require("oil")
+    local oil = require("oil")
     oil.open()
 
     -- Override the close action to also quit nvim when oil closes
