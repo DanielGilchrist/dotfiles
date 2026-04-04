@@ -1,5 +1,5 @@
 local pack = require("utils.pack")
 
-pack.add({ "https://github.com/nvim-mini/mini.surround" })
-
-require("mini.surround").setup()
+pack.later({ "https://github.com/nvim-mini/mini.surround" }, function()
+  require("mini.surround").setup()
+end)

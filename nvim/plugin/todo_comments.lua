@@ -1,5 +1,5 @@
 local pack = require("utils.pack")
 
-pack.add({ "https://github.com/folke/todo-comments.nvim" })
-
-require("todo-comments").setup()
+pack.later({ "https://github.com/folke/todo-comments.nvim" }, function()
+  require("todo-comments").setup()
+end)
