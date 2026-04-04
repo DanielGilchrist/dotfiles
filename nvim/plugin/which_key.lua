@@ -1,0 +1,26 @@
+local pack = require("utils.pack")
+
+pack.later({ "https://github.com/folke/which-key.nvim" }, function()
+  require("which-key").setup({
+    spec = {
+      { "<leader>b", group = "Buffer" },
+      { "<leader>c", group = "Code" },
+      { "<leader>f", group = "Find/File" },
+      { "<leader>g", group = "Git" },
+      { "<leader>m", group = "Music", icon = { icon = "", color = "green" } },
+      { "<leader>q", group = "Quit" },
+      { "<leader>r", group = "Arduino", icon = { icon = "", color = "blue" } },
+      { "<leader>s", group = "Search" },
+      { "<leader>t", group = "Test/Toggle" },
+      { "<leader>u", group = "UI" },
+      { "<leader>w", group = "What" },
+      { "<leader>wt", group = "the" },
+      { "<leader>-", icon = { icon = "󰤻", color = "blue" } },
+      { "<leader>/", icon = { icon = "󱈇", color = "blue" } },
+      { "<leader>|", icon = { icon = "󰤼", color = "blue" } },
+      { "]", group = "Next" },
+      { "[", group = "Previous" },
+    },
+    preset = "helix",
+  })
+end)
