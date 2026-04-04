@@ -1,5 +1,5 @@
 local pack = require("utils.pack")
 
-pack.add({ "https://github.com/folke/persistence.nvim" })
-
-require("persistence").setup()
+pack.later({ "https://github.com/folke/persistence.nvim" }, function()
+  require("persistence").setup()
+end)
