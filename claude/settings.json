@@ -1,6 +1,5 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-settings.json",
-  "defaultMode": "acceptEdits",
   "permissions": {
     "allow": [
       "Edit",
@@ -87,12 +86,17 @@
       }
     ]
   },
+  "enabledPlugins": {
+    "ruby-lsp@claude-plugins-official": true,
+    "rust-analyzer-lsp@claude-plugins-official": true
+  },
   "claudeMdExcludes": [
     "CLAUDE.md",
     ".claude/CLAUDE.md",
     ".claude/rules/**",
     "AGENTS.md"
   ],
+  "defaultMode": "acceptEdits",
   "additionalDirectories": [
     "~/Documents/repos",
     "~/.asdf/installs",
@@ -106,8 +110,5 @@
         "@circleci/mcp-server-circleci@latest"
       ]
     }
-  },
-  "enabledPlugins": {
-    "ruby-lsp@claude-plugins-official": true
   }
 }
