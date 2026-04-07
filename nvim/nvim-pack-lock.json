@@ -98,6 +98,10 @@
       "rev": "c30ee7d885aa1a1cf17d856ab932de75ab789d5d",
       "src": "https://github.com/tpope/vim-haml"
     },
+    "wezterm-types": {
+      "rev": "880c18529f0b2dd9deb10b84407dc511012946c9",
+      "src": "https://github.com/DrKJeff16/wezterm-types"
+    },
     "which-key.nvim": {
       "rev": "3aab2147e74890957785941f0c1ad87d0a44c15a",
       "src": "https://github.com/folke/which-key.nvim"

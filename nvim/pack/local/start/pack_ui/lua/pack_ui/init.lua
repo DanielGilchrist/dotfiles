@@ -68,7 +68,7 @@ local function render(lines, highlights)
   vim.api.nvim_buf_clear_namespace(buf, ns, 0, -1)
   if highlights then
     for _, hl in ipairs(highlights) do
-      vim.api.nvim_buf_add_highlight(buf, ns, hl[1], hl[2], hl[3], hl[4])
+      vim.hl.range(buf, ns, hl[1], { hl[2], hl[3] }, { hl[2], hl[4] })
     end
   end
 end
