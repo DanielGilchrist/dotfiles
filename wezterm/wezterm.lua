@@ -70,7 +70,7 @@ local misc = {
       harfbuzz_features = { "liga=1" },
     },
   }),
-  font_size = os_utils.system() == "macos" and 14 or 12,
+  font_size = os_utils.system() == "macos" and 14.4 or 12,
 
   mouse_bindings = {
     -- CMD + click links
