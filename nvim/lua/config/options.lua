@@ -45,7 +45,7 @@ opt.wrap = false
 vim.g.markdown_recommended_style = 0
 
 if vim.g.neovide then
-  vim.o.guifont = "JetBrainsMono NF:h14"
+  vim.o.guifont = "JetBrainsMono NF:h14.4"
   vim.g.neovide_fullscreen = true
   vim.g.neovide_confirm_quit = true
   vim.g.neovide_hide_mouse_when_typing = true
