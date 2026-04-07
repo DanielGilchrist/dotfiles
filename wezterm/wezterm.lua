@@ -1,8 +1,6 @@
 require("commands").register_commands()
 
-local os = require("os")
 local wezterm = require("wezterm")
-local mux = wezterm.mux
 local os_utils = require("utils.os")
 local key_utils = require("utils.key")
 local table_utils = require("utils.table")
