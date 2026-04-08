@@ -140,29 +140,32 @@ local function handle_missing_cdt_command(pane)
   end
 end
 
-local function open_work_tabs(region)
+local function open_work_environment(region, cd_command)
   return function(original_window, _original_pane, _line)
-    local function export_region_and_cdt(pane)
-      local export_region = "export REGION=" .. region
-      run_commands(pane, export_region, commands.CDT)
+    local use_cdt = cd_command == commands.CDT
+
+    local function setup_pane(pane)
+      run_commands(pane, "export REGION=" .. region, cd_command)
     end
 
-    local split_pane_with_setup = split_pane_with(export_region_and_cdt)
+    local split_pane_with_setup = split_pane_with(setup_pane)
 
     local _tab, server_pane, window = original_window:mux_window():spawn_tab({})
 
     local gui_window = window:gui_window()
     gui_window:perform_action(wezterm.action.MoveTab(0), server_pane)
 
-    export_region_and_cdt(server_pane)
+    setup_pane(server_pane)
     wait_for_text()
 
-    if handle_missing_cdt_command(server_pane) then
-      return
-    end
+    if use_cdt then
+      if handle_missing_cdt_command(server_pane) then
+        return
+      end
 
-    if handle_potential_interrupted_system_call_from_cdt(server_pane) then
-      return
+      if handle_potential_interrupted_system_call_from_cdt(server_pane) then
+        return
+      end
     end
 
     local console_pane = split_pane_with_setup(server_pane, pane_direction.Right)
@@ -189,20 +192,57 @@ local function open_work_tabs(region)
   end
 end
 
+local function worktree_choices()
+  local worktrees_dir = wezterm.home_dir .. "/worktrees"
+  local success, stdout, _stderr = wezterm.run_child_process({ "ls", worktrees_dir })
+
+  if not success or stdout == "" then
+    return {}
+  end
+
+  local choices = {}
+  for name in stdout:gmatch("[^\n]+") do
+    table.insert(choices, { label = name, id = name })
+  end
+
+  return choices
+end
+
+local function open_worktree_selector()
+  return function(window, pane)
+    window:perform_action(wezterm.action.InputSelector({
+      title = "Select a worktree",
+      choices = worktree_choices(),
+      action = wezterm.action_callback(function(inner_window, inner_pane, id, _label)
+        if not id then
+          return
+        end
+
+        local cd_command = "cd ~/worktrees/" .. id
+        open_work_environment(regions.US, cd_command)(inner_window, inner_pane)
+      end),
+    }), pane)
+  end
+end
+
 M.register_commands = function()
   wezterm.on("augment-command-palette", function(_window, _pane)
     return {
       {
         brief = "[APAC] Open work tabs",
-        action = wezterm.action_callback(open_work_tabs(regions.APAC)),
+        action = wezterm.action_callback(open_work_environment(regions.APAC, commands.CDT)),
       },
       {
         brief = "[EU] Open work tabs",
-        action = wezterm.action_callback(open_work_tabs(regions.EU)),
+        action = wezterm.action_callback(open_work_environment(regions.EU, commands.CDT)),
       },
       {
         brief = "[US] Open work tabs",
-        action = wezterm.action_callback(open_work_tabs(regions.US)),
+        action = wezterm.action_callback(open_work_environment(regions.US, commands.CDT)),
+      },
+      {
+        brief = "[US] Open worktree tabs",
+        action = wezterm.action_callback(open_worktree_selector()),
       },
     }
   end)
