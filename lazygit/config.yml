@@ -1,10 +1,9 @@
 gui:
   skipStashWarning: true
-
 git:
   parseEmoji: true
-
+  pagers:
+    - externalDiffCommand: difft --color=always
 notARepository: quit
-
 os:
   editPreset: nvim

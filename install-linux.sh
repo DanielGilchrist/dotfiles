@@ -96,6 +96,7 @@ install_package btop
 install_package rainfrog
 install_package arduino-cli
 install_package lua-language-server
+install_package difftastic difft
 install_package tree-sitter-cli tree-sitter
 
 # watchman is currently broken on Arch - upstream hasn't provided Linux binaries since April 2024
