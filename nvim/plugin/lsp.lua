@@ -90,6 +90,26 @@ local function combined_hover()
   end
 end
 
+-- Format on save
+vim.g.autoformat = true
+
+vim.api.nvim_create_autocmd("BufWritePre", {
+  group = vim.api.nvim_create_augroup("LspAutoFormat", {}),
+  callback = function(ev)
+    local buf = ev.buf
+    local baf = vim.b[buf].autoformat
+
+    if baf == false or (baf == nil and not vim.g.autoformat) then
+      return
+    end
+
+    local clients = vim.lsp.get_clients({ bufnr = buf, method = "textDocument/formatting" })
+    if #clients > 0 then
+      vim.lsp.buf.format({ bufnr = buf })
+    end
+  end,
+})
+
 -- LSP keymaps on attach
 vim.api.nvim_create_autocmd("LspAttach", {
   callback = function(ev)
@@ -115,6 +135,16 @@ vim.api.nvim_create_autocmd("LspAttach", {
     map("n", "<leader>cC", function() vim.lsp.codelens.enable(true) end, "Refresh Codelens")
     map("n", "<leader>cd", vim.diagnostic.open_float, "Line Diagnostics")
     map("n", "<leader>cf", function() vim.lsp.buf.format({ async = true }) end, "Format")
+
+    map("n", "<leader>uf", function()
+      vim.g.autoformat = not vim.g.autoformat
+      vim.notify("Autoformat (global): " .. (vim.g.autoformat and "enabled" or "disabled"))
+    end, "Toggle Autoformat (Global)")
+
+    map("n", "<leader>uF", function()
+      vim.b[buf].autoformat = not vim.b[buf].autoformat
+      vim.notify("Autoformat (buffer): " .. (vim.b[buf].autoformat and "enabled" or "disabled"))
+    end, "Toggle Autoformat (Buffer)")
   end,
 })
 
