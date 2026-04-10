@@ -5,7 +5,7 @@ local is = require("utils.is")
 ---@param args string[] Command arguments
 ---@return string # The full command string with fallbacks
 local function build_command_with_fallback(command_name, args)
-  local command = string.format("%s %s 2>/dev/null", command_name, table.concat(args, " "))
+  local command = string.format("%s %s", command_name, table.concat(args, " "))
   local fallback = string.format("echo \"\"%s\" isn't setup!\"", command_name)
 
   return command .. " || " .. fallback
@@ -58,6 +58,7 @@ M.tanda_cli = function(args, opts)
 
   vim.fn.jobstart(command, {
     stdout_buffered = true,
+    stderr_buffered = true,
     on_stdout = opts.on_stdout,
     on_stderr = opts.on_stderr,
   })
