@@ -1,15 +1,15 @@
-local pack = require("utils.pack")
-
-pack.later({ "https://github.com/folke/which-key.nvim" }, function()
-  require("which-key").setup({
+return {
+  "folke/which-key.nvim",
+  event = "VeryLazy",
+  opts = {
     spec = {
       { "<leader>b", group = "Buffer" },
       { "<leader>c", group = "Code" },
       { "<leader>f", group = "Find/File" },
       { "<leader>g", group = "Git" },
-      { "<leader>m", group = "Music", icon = { icon = "", color = "green" } },
+      { "<leader>m", group = "Music", icon = { icon = "", color = "green" } },
       { "<leader>q", group = "Quit" },
-      { "<leader>r", group = "Arduino", icon = { icon = "", color = "blue" } },
+      { "<leader>r", group = "Arduino", icon = { icon = "", color = "blue" } },
       { "<leader>s", group = "Search" },
       { "<leader>t", group = "Test/Toggle" },
       { "<leader>u", group = "UI" },
@@ -22,5 +22,5 @@ pack.later({ "https://github.com/folke/which-key.nvim" }, function()
       { "[", group = "Previous" },
     },
     preset = "helix",
-  })
-end)
+  },
+}
