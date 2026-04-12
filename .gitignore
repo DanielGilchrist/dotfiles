@@ -37,7 +37,7 @@ conversations/
 prompts/
 
 # KDE/Plasma
-k*
+kde*
 plasma*
 Trolltech.conf
 baloofilerc
