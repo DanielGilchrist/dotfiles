@@ -1,7 +1,7 @@
-local pack = require("utils.pack")
-
-pack.later({ "https://github.com/hat0uma/csvview.nvim" }, function()
-  require("csvview").setup({
+return {
+  "hat0uma/csvview.nvim",
+  cmd = { "CsvViewEnable", "CsvViewDisable", "CsvViewToggle" },
+  opts = {
     parser = { comments = { "#", "//" } },
     keymaps = {
       textobject_field_inner = { "if", mode = { "o", "x" } },
@@ -14,5 +14,5 @@ pack.later({ "https://github.com/hat0uma/csvview.nvim" }, function()
     view = {
       display_mode = "border",
     },
-  })
-end)
+  },
+}

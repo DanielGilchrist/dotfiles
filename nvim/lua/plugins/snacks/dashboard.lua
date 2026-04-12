@@ -30,7 +30,7 @@ return {
         { icon = "\u{f0c5} ", key = "r", desc = "Recent Files", action = ":lua Snacks.dashboard.pick('oldfiles')" },
         { icon = "\u{f423} ", key = "c", desc = "Config", action = ":lua Snacks.dashboard.pick('files', {cwd = vim.fn.stdpath('config')})" },
         { icon = "\u{e348} ", key = "s", desc = "Restore Session", action = ":lua require('persistence').load()" },
-        { icon = "\u{f187} ", key = "p", desc = "Plugins", action = ":Pack" },
+        { icon = "\u{f187} ", key = "p", desc = "Plugins", action = ":Lazy" },
         { icon = "\u{f426} ", key = "q", desc = "Quit", action = ":qa" },
       },
     },

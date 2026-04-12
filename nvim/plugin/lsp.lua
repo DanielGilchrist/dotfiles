@@ -1,12 +1,6 @@
 local is = require("utils.is")
 local notify = require("utils.notify")
 
--- Diagnostics
-vim.diagnostic.config({
-  virtual_text = false,
-})
-
--- Combined hover (merges hover results from all attached LSP clients)
 local function combined_hover()
   local clients = vim.lsp.get_clients({ bufnr = 0 })
   local results = {}
@@ -90,7 +84,10 @@ local function combined_hover()
   end
 end
 
--- Format on save
+vim.diagnostic.config({
+  virtual_text = false,
+})
+
 vim.g.autoformat = true
 
 vim.api.nvim_create_autocmd("BufWritePre", {
@@ -110,7 +107,6 @@ vim.api.nvim_create_autocmd("BufWritePre", {
   end,
 })
 
--- LSP keymaps on attach
 vim.api.nvim_create_autocmd("LspAttach", {
   callback = function(ev)
     local buf = ev.buf
@@ -118,7 +114,6 @@ vim.api.nvim_create_autocmd("LspAttach", {
       vim.keymap.set(mode, lhs, rhs, { buf = buf, desc = desc })
     end
 
-    -- Navigation (snacks picker for multi-result)
     map("n", "gd", function() Snacks.picker.lsp_definitions() end, "Go to Definition")
     map("n", "gr", function() Snacks.picker.lsp_references() end, "References")
     map("n", "gI", function() Snacks.picker.lsp_implementations() end, "Go to Implementation")
@@ -128,7 +123,6 @@ vim.api.nvim_create_autocmd("LspAttach", {
     map("i", "<c-k>", vim.lsp.buf.signature_help, "Signature Help")
     map("n", "K", combined_hover, "Hover")
 
-    -- Code actions (leader-c)
     map("n", "<leader>ca", vim.lsp.buf.code_action, "Code Action")
     map("n", "<leader>cr", vim.lsp.buf.rename, "Rename")
     map("n", "<leader>cc", vim.lsp.codelens.run, "Run Codelens")
@@ -152,7 +146,6 @@ vim.api.nvim_create_user_command("LspLog", function()
   vim.cmd.edit(vim.lsp.log.get_filename())
 end, {})
 
--- Enable LSP servers (configs auto-loaded from lsp/ directory)
 vim.lsp.enable({
   "arduino_language_server",
   "crystalline",
