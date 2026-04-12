@@ -69,10 +69,9 @@ return {
     },
     sections = {
       { section = "header", padding = 0 },
-      { key = "s", action = ":lua require('persistence').load()", hidden = true },
       { key = "q", action = ":qa", hidden = true },
       { key = "l", action = ":Lazy", hidden = true },
-      { icon = "󰍛", title = "Last Session", indent = 2, padding = 1, session_buffers },
+      { icon = "󰍛", title = "Last Session", key = "s", action = ":lua require('persistence').load()", indent = 2, padding = 1, session_buffers },
       { icon = "", title = "Projects", section = "projects", indent = 2, padding = 1, limit = 5 },
       function()
         local stats = require("lazy").stats()
