@@ -45,16 +45,11 @@ end
 
 ---@param args string[] Command arguments
 ---@param opts? TandaCliOpts Optional configuration
----@return string? # Returns command string if no `on_stdout` or `on_stderr` provided
 M.tanda_cli = function(args, opts)
   opts = opts == nil and {} or opts
   ---@cast opts -nil
 
   local command = build_command_with_fallback("tanda_cli", args)
-
-  if not opts.on_stdout and not opts.on_stderr then
-    return command
-  end
 
   vim.fn.jobstart(command, {
     stdout_buffered = true,
@@ -62,6 +57,12 @@ M.tanda_cli = function(args, opts)
     on_stdout = opts.on_stdout,
     on_stderr = opts.on_stderr,
   })
+end
+
+---@param args string[] Command arguments
+---@return string
+M.tanda_cli_command = function(args)
+  return build_command_with_fallback("tanda_cli", args)
 end
 
 ---@class ArduinoCliOpts
