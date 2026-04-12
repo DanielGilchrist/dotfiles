@@ -13,7 +13,7 @@ return {
       { "<leader>s", group = "Search" },
       { "<leader>t", group = "Test/Toggle" },
       { "<leader>u", group = "UI" },
-      { "<leader>w", group = "What" },
+      { "<leader>w", group = "What", icon = "󱍋" },
       { "<leader>wt", group = "the" },
       { "<leader>-", icon = { icon = "󰤻", color = "blue" } },
       { "<leader>/", icon = { icon = "󱈇", color = "blue" } },
