@@ -63,15 +63,6 @@ autocmd("InsertLeave", {
   callback = function() vim.opt.relativenumber = true end,
 })
 
--- Line wrap for specific filetypes
-autocmd("FileType", {
-  pattern = { "markdown", "haml" },
-  callback = function()
-    vim.opt_local.wrap = true
-    vim.opt_local.linebreak = true
-  end,
-})
-
 -- Suppress "[Process exited 0]" virtual text in terminal buffers (0.12 feature)
 local term_acs = vim.api.nvim_get_autocmds({ group = "nvim.terminal", event = "TermClose" })
 for _, ac in ipairs(term_acs) do
