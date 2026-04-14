@@ -81,6 +81,10 @@ map("n", leader("wtf"), function()
     vim.cmd('normal! ofmt.Println(strings.Repeat("#", 90))')
     vim.cmd('normal! odebug.PrintStack()')
     vim.cmd('normal! ofmt.Println(strings.Repeat("#", 90))')
+  elseif ft == "lua" then
+    vim.cmd('normal! oprint(string.rep("#", 90))')
+    vim.cmd('normal! oprint(debug.traceback())')
+    vim.cmd('normal! oprint(string.rep("#", 90))')
   else
     print("No <leader>wtf definition for '" .. ft .. "'")
   end
