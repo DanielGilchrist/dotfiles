@@ -98,7 +98,14 @@ config.keys = {
     })
   ),
 
-  keybind(keys.COMMAND, "k", wezterm.action({ ClearScrollback = "ScrollbackAndViewport" })),
+  keybind(keys.COMMAND, "k", wezterm.action_callback(function(window, pane)
+    local process_name = pane:get_foreground_process_name()
+    if process_name and process_name:find("nvim") then
+      return
+    end
+
+    window:perform_action(wezterm.action({ ClearScrollback = "ScrollbackAndViewport" }), pane)
+  end)),
 
   keybind(
     keys.COMMAND,
