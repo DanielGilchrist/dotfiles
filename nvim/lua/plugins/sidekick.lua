@@ -2,12 +2,22 @@ return {
   "folke/sidekick.nvim",
   opts = {
     nes = { enabled = false },
+    cli = {},
   },
   keys = {
     {
       "<c-.>",
-      function() require("sidekick.cli").toggle({ name = "opencode", focus = true }) end,
-      desc = "Toggle OpenCode",
+      function()
+        local State = require("sidekick.cli.state")
+        local states = State.get({ attached = true, terminal = true })
+
+        if #states > 0 then
+          require("sidekick.cli").toggle({ name = states[1].tool.name, focus = true })
+        else
+          require("sidekick.cli").select({ focus = true, filter = { installed = true } })
+        end
+      end,
+      desc = "Toggle AI CLI",
       mode = { "n", "t", "i", "x" },
     },
     { "<leader>a", "", desc = "+ai", mode = { "n", "v" } },
@@ -18,7 +28,7 @@ return {
     },
     {
       "<leader>as",
-      function() require("sidekick.cli").select() end,
+      function() require("sidekick.cli").select({ filter = { installed = true } }) end,
       desc = "Select CLI",
     },
     {
