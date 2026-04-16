@@ -126,6 +126,26 @@ map("n", leader("mt"), function() playback("play-pause") end, { desc = "Toggle p
 map("n", leader("mf"), function() playback({ "seek", "10000" }) end, { desc = "Fast-forward 10s" })
 map("n", leader("mb"), function() playback({ "seek", "--", "-10000" }) end, { desc = "Rewind 10s" })
 
+local terminal_state = { last = nil }
+
+map("t", "<C-;>", function()
+  local buf = vim.api.nvim_get_current_buf()
+  for _, terminal in pairs(Snacks.terminal.list()) do
+    if terminal.buf == buf then
+      terminal_state.last = terminal
+      terminal:hide()
+      return
+    end
+  end
+end, { desc = "Toggle Terminal" })
+
+map("n", "<C-;>", function()
+  local terminal = terminal_state.last
+  if terminal then
+    terminal:show()
+  end
+end, { desc = "Toggle Terminal" })
+
 -- Lazygit
 map("n", leader("gg"), function() Snacks.lazygit({ cwd = require("utils.path").root() }) end, { desc = "Lazygit" })
 
