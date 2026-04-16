@@ -3,9 +3,15 @@ client_id_command = "spotify_player_client_id"
 client_port = 8080
 login_redirect_uri = "http://127.0.0.1:8989/login"
 playback_format = """
-{status} {track} • {artists}
-{album}
+{status} {track} • {artists} {liked}
+{album} • {genres}
 {metadata}"""
+playback_metadata_fields = [
+    "repeat",
+    "shuffle",
+    "volume",
+    "device",
+]
 notify_timeout_in_secs = 0
 tracks_playback_limit = 50
 app_refresh_duration_in_ms = 32
@@ -14,18 +20,25 @@ page_size_in_rows = 20
 play_icon = "▶"
 pause_icon = "▌▌"
 liked_icon = "♥"
+explicit_icon = "(E)"
 border_type = "Rounded"
 progress_bar_type = "Rectangle"
+progress_bar_position = "Bottom"
+genre_num = 2
 cover_img_length = 9
 cover_img_width = 5
 cover_img_scale = 1.0
 enable_media_control = true
 enable_streaming = "Always"
+enable_audio_visualization = true
 enable_notify = false
 enable_cover_image_cache = true
 default_device = "nvim"
 notify_streaming_only = false
 seek_duration_secs = 10
+sort_artist_albums_by_type = false
+volume_scroll_step = 10
+enable_mouse_scroll_volume = true
 
 [notify_format]
 summary = "{track} • {artists}"
