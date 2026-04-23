@@ -60,5 +60,8 @@
 [include]
   path = ~/.gitconfig.local
 
+[includeIf "gitdir:~/Documents/repos/TandaHQ/"]
+  path = ~/.gitconfig.work
+
 [rerere]
 	enabled = true
