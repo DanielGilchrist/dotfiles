@@ -108,6 +108,7 @@ install_brew_package fd
 install_brew_package ripgrep rg
 install_brew_package fzf
 install_brew_package lazygit
+install_brew_package zellij
 install_brew_package crystalline
 install_brew_package spotify_player
 install_brew_package watchman

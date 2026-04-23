@@ -85,6 +85,7 @@ install_package fd
 install_package ripgrep rg
 install_package fzf
 install_package lazygit
+install_package zellij
 install_package crystalline-bin crystalline
 install_package spotify-player
 install_package imagemagick magick

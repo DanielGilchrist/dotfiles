@@ -61,6 +61,8 @@ cachyos*/
 cachyos-hello.json
 
 # claude
+claude/.credentials.json
+claude/remote-settings.json
 claude/backups/
 claude/cache/
 claude/debug/
