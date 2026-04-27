@@ -321,6 +321,8 @@ web_client {
 // Default: "default"
 // 
 default_layout "compact"
+
+theme "everforest-dark"
  
 // The folder in which Zellij will look for layouts
 // (Requires restart)
@@ -339,7 +341,7 @@ default_layout "compact"
 //   - true (default)
 //   - false
 // 
-// mouse_mode false
+mouse_mode true
  
 // Toggle having pane frames around the panes
 // Options:
