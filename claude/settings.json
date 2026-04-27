@@ -111,5 +111,6 @@
         "@circleci/mcp-server-circleci@latest"
       ]
     }
-  }
+  },
+  "effortLevel": "medium"
 }
