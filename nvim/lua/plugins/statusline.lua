@@ -15,7 +15,7 @@ return {
   },
   {
     "echasnovski/mini.tabline",
-    opts = {},
+    opts = { tabpage_section = "none" },
     config = function(_, opts)
       require("mini.tabline").setup(opts)
       set_tabline_highlights()
