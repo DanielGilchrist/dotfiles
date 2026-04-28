@@ -181,7 +181,12 @@ local function open_work_environment(region, cd_command)
     end
 
     run_command(tunnel_pane, commands.Tunnel)
-    wait_for_text_for(tunnel_pane, "INFO: Ready!")
+    wait_for_text_for(tunnel_pane, "Enter your developer name:", "INFO: Ready!")
+
+    if has_text(tunnel_pane, "Enter your developer name:") then
+      run_command(tunnel_pane, "dangilchrist")
+      wait_for_text_for(tunnel_pane, "INFO: Ready!")
+    end
 
     run_command(server_pane, commands.Server)
     wait_for_text_for(server_pane, "Done in", "Running server at")
