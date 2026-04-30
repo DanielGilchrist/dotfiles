@@ -31,10 +31,9 @@ function zj --description "Start or attach to a zellij session in the current di
     end
 
     if zellij list-sessions -s 2>/dev/null | string match -q -- $name
-        # If attaching to an existing session from inside wezterm, ask the agents
-        # tab to zoom its corresponding pane to full size so zellij's mirror
-        # multi-attach renders at the new attacher's full window size instead of
-        # the smaller split's size. Unzoom on detach.
+        # If attaching from inside wezterm, ask the agents tab to zoom its
+        # corresponding pane to full size so zellij's mirror multi-attach
+        # renders at this attacher's full window size. Unzoom on detach.
         set -l zoom 0
         if functions -q _term_inside; and _term_inside; and functions -q _term_emit_event
             set zoom 1
@@ -53,28 +52,8 @@ function zj --description "Start or attach to a zellij session in the current di
         return
     end
 
-    set -l cmd_bin $initial_cmd[1]
-    set -l cmd_args $initial_cmd[2..-1]
-
-    set -l layout_base (mktemp -t zj-layout)
-    set -l layout_file "$layout_base.kdl"
-    mv $layout_base $layout_file
-
-    set -l status_bar '        pane size=1 borderless=true {
-            plugin location="zellij:compact-bar"
-        }
-'
-
-    if test (count $cmd_args) -eq 0
-        printf 'layout {\n    tab {\n        pane command="%s"\n%s    }\n}\n' "$cmd_bin" "$status_bar" > $layout_file
-    else
-        set -l quoted
-        for a in $cmd_args
-            set -l esc (string replace -a '\\' '\\\\' -- $a | string replace -a '"' '\\"' | string replace -a \n '\\n' | string replace -a \t '\\t')
-            set -a quoted "\"$esc\""
-        end
-        printf 'layout {\n    tab {\n        pane command="%s" {\n            args %s\n        }\n%s    }\n}\n' "$cmd_bin" (string join " " $quoted) "$status_bar" > $layout_file
-    end
+    set -l layout_file /tmp/zj-(random).kdl
+    _zj_write_layout $layout_file $initial_cmd
 
     if set -q _flag_debug
         echo "--- layout file: $layout_file ---" >&2
