@@ -99,16 +99,17 @@ function agent --description "Spawn a Claude agent in a worktree + zellij sessio
             set err_log /dev/null
         end
 
+        # Worktree is detached at the default branch (origin/master or origin/main).
+        # Claude is responsible for creating an appropriately-named branch off
+        # this point before making changes (instructed via the initial prompt).
         set -l add_status 1
         if test -n "$base"
-            if git -C $repo_root worktree add $worktree_path -b $branch $base 2>$err_log
+            if git -C $repo_root worktree add --detach $worktree_path $base 2>$err_log
                 set add_status 0
             end
         end
         if test $add_status -ne 0
-            if git -C $repo_root worktree add $worktree_path -b $branch 2>$err_log
-                set add_status 0
-            else if git -C $repo_root worktree add $worktree_path $branch 2>$err_log
+            if git -C $repo_root worktree add --detach $worktree_path 2>$err_log
                 set add_status 0
             end
         end
@@ -127,13 +128,16 @@ function agent --description "Spawn a Claude agent in a worktree + zellij sessio
     if test $session_exists -eq 1
         set zj_cmd "zj $branch"
     else
-        set zj_cmd "zj $branch -- claude --permission-mode acceptEdits"
+        set -l branch_instruction "This worktree is checked out detached at the repo's default branch. Before making any changes, create a branch with `git checkout -b <kebab-case-name>` describing the task."
         if test -n "$_flag_seed" -a -f "$_flag_seed"
             set -l seed_path /tmp/agent-seed-$branch-(random).md
             cp $_flag_seed $seed_path
-            set -l meta "Read $seed_path for your task, then `rm $seed_path` before doing anything else."
+            set -l meta "$branch_instruction Then read $seed_path for your task, and `rm $seed_path` before doing anything else."
             set -l escaped (string escape -- $meta)
             set zj_cmd "zj $branch -- claude --add-dir /tmp --permission-mode acceptEdits $escaped"
+        else
+            set -l escaped (string escape -- $branch_instruction)
+            set zj_cmd "zj $branch -- claude --permission-mode acceptEdits $escaped"
         end
     end
 
