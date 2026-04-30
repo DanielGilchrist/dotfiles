@@ -7,6 +7,20 @@ local function local_plugin(name, opts)
 end
 
 return {
+  local_plugin("agent_nvim", {
+    keys = {
+      { "<leader>z", desc = "+agent" },
+      { "<leader>zn", desc = "new" },
+      { "<leader>zo", desc = "open/pick" },
+      { "<leader>zs", desc = "send file ref" },
+      { "<leader>zv", mode = "x", desc = "send selection" },
+      { "<leader>zp", desc = "prompt" },
+      { "<leader>zt", desc = "switch target" },
+      { "<leader>zk", desc = "kill target" },
+      { "<C-.>", mode = { "n", "i", "t", "x" }, desc = "agent: toggle" },
+    },
+    cmd = { "AgentNew", "AgentOpen", "AgentSend", "AgentPrompt", "AgentSwitch", "AgentKill" },
+  }),
   local_plugin("arduino_cli", { ft = "arduino" }),
   local_plugin("bundle_open", { cmd = "BundleOpen" }),
   local_plugin("lint_disable", { keys = { { "<leader>cD", function() require("lint_disable").disable_lint() end, desc = "Disable lint rule inline" } } }),

@@ -1,6 +1,7 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-settings.json",
   "permissions": {
+    "defaultMode": "acceptEdits",
     "allow": [
       "Edit",
       "Bash(git status)",
@@ -19,6 +20,7 @@
       "Bash(git branch *)",
       "Bash(git add *)",
       "Bash(git commit *)",
+      "Bash(git checkout *)",
       "Bash(rg *)",
       "Bash(ls)",
       "Bash(ls *)",
@@ -59,7 +61,30 @@
       "Bash(gh search *)",
       "Bash(gh release view *)",
       "Bash(gh release list *)",
-      "Bash(which *)"
+      "Bash(which *)",
+      "Bash(RAILS_ENV=test bin/rails *)",
+      "Bash(bin/rails *)",
+      "Bash(bundle exec rubocop)",
+      "Bash(bundle exec rubocop *)",
+      "Bash(bundle exec haml-lint *)",
+      "Bash(jq *)",
+      "Bash(time *)",
+      "Bash(open *)",
+      "Bash(touch *)",
+      "Bash(diff *)",
+      "Bash(printf *)",
+      "Bash(stat *)",
+      "Bash(file *)",
+      "Bash(test *)",
+      "Bash(date *)",
+      "Bash(env)",
+      "Bash(env *)",
+      "Bash(true)",
+      "Bash(false)",
+      "Bash(rm /tmp/agent-seed-*)",
+      "Read",
+      "WebFetch",
+      "WebSearch"
     ],
     "deny": []
   },
@@ -97,6 +122,7 @@
     ".claude/rules/**",
     "AGENTS.md"
   ],
+  "disabledMcpjsonServers": ["chrome-devtools"],
   "defaultMode": "acceptEdits",
   "additionalDirectories": [
     "~/Documents/repos",

@@ -153,7 +153,7 @@ local function open_work_environment(region, cd_command)
     local _tab, server_pane, window = original_window:mux_window():spawn_tab({})
 
     local gui_window = window:gui_window()
-    gui_window:perform_action(wezterm.action.MoveTab(0), server_pane)
+    require("utils.tab").move_to_first(gui_window, server_pane)
 
     setup_pane(server_pane)
     wait_for_text()
