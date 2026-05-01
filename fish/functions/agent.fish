@@ -40,7 +40,10 @@ function agent --description "Spawn a Claude agent in a worktree + zellij sessio
 
     set -l repo_root $_flag_repo
     if test -z "$repo_root"
-        set repo_root (git rev-parse --show-toplevel 2>/dev/null)
+        # Resolve to the MAIN worktree, not whichever worktree we're currently
+        # inside — otherwise spawning from one agent's worktree creates nested
+        # worktrees under ~/worktrees/<branch-name>/<new-branch>.
+        set repo_root (git worktree list --porcelain 2>/dev/null | head -1 | string replace -r '^worktree ' '')
     end
     if test -z "$repo_root"
         echo "agent: not in a git repo and --repo not given" >&2
