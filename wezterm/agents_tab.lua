@@ -131,6 +131,24 @@ end
 M.move_left = move(-1)
 M.move_right = move(1)
 
+---Block a close action when the active tab is the agents tab. Otherwise
+---perform the action.
+---@param close_action any
+---@return any
+local function refuse_on_agents_tab(close_action)
+  return wezterm.action_callback(function(window, pane)
+    local tab = window:active_tab()
+    if tab and tab:get_title() == M.TITLE then
+      window:toast_notification("agent", "agents tab — use `agent-rm` to remove", nil, 2000)
+      return
+    end
+    window:perform_action(close_action, pane)
+  end)
+end
+
+M.close_pane = refuse_on_agents_tab(wezterm.action({ CloseCurrentPane = { confirm = false } }))
+M.close_tab = refuse_on_agents_tab(wezterm.action({ CloseCurrentTab = { confirm = false } }))
+
 ---@param window any
 ---@param pane any
 local function do_pin_to_zero(window, pane)
@@ -169,13 +187,23 @@ end
 M.pin_to_zero = wezterm.action_callback(do_pin_to_zero)
 
 ---@param tab any
+---@param _tabs any
+---@param _panes any
+---@param config any
 ---@return string|table
-local function format_tab_title(tab)
+local function format_tab_title(tab, _tabs, _panes, config)
   local title = tab.tab_title and tab.tab_title ~= "" and tab.tab_title or (tab.active_pane and tab.active_pane.title or "")
   if title == M.TITLE then
+    -- Active: same as a regular active tab so the agents tab blends in when
+    -- focused. Inactive: orange accent so it's distinguishable from normal
+    -- tabs at a glance. Bold either way to make it pop.
+    local active_tab = config.colors and config.colors.tab_bar and config.colors.tab_bar.active_tab or {}
+    local active_bg = active_tab.bg_color or "#CBE3B3"
+    local fg = active_tab.fg_color or "#171C1F"
+    local bg = tab.is_active and active_bg or "#E69875"
     return {
-      { Background = { Color = "#E69875" } },
-      { Foreground = { Color = "#171C1F" } },
+      { Background = { Color = bg } },
+      { Foreground = { Color = fg } },
       { Attribute = { Intensity = "Bold" } },
       { Text = " ✦ " .. M.TITLE .. " " },
     }

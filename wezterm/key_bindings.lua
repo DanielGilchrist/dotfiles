@@ -109,8 +109,9 @@ config.keys = {
     window:perform_action(wezterm.action({ ClearScrollback = "ScrollbackAndViewport" }), pane)
   end)),
 
-  keybind(keys.COMMAND, "w", wezterm.action({ CloseCurrentPane = { confirm = false } })),
-  keybind(keys.COMMAND_SHIFT, "w", wezterm.action({ CloseCurrentTab = { confirm = false } })),
+  -- CMD+W / CMD+Shift+W refuse to act on the agents tab. Use `agent-rm` to remove.
+  keybind(keys.COMMAND, "w", agents_tab.close_pane),
+  keybind(keys.COMMAND_SHIFT, "w", agents_tab.close_tab),
 
   keybind(keys.COMMAND, keys.ENTER, "ToggleFullScreen"),
   keybind(keys.SHIFT, keys.ENTER, wezterm.action({ SendString = "\x1b[13;2u" })),
