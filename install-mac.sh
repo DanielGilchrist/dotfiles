@@ -54,7 +54,7 @@ is_dotfiles_repo() {
 
 clone_dotfiles() {
   echo "Creating new config directory from dotfiles..."
-  git clone "$DOTFILES_REPO" "$CONFIG_DIR"
+  git clone --recurse-submodules "$DOTFILES_REPO" "$CONFIG_DIR"
 }
 
 if ! command_exists brew; then
@@ -109,6 +109,7 @@ install_brew_package ripgrep rg
 install_brew_package fzf
 install_brew_package lazygit
 install_brew_package zellij
+install_brew_package jq
 install_brew_package crystalline
 install_brew_package spotify_player
 install_brew_package watchman

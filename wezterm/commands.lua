@@ -153,7 +153,7 @@ local function open_work_environment(region, cd_command)
     local _tab, server_pane, window = original_window:mux_window():spawn_tab({})
 
     local gui_window = window:gui_window()
-    gui_window:perform_action(wezterm.action.MoveTab(0), server_pane)
+    require("utils.tab").move_to_first(gui_window, server_pane)
 
     setup_pane(server_pane)
     wait_for_text()
@@ -199,15 +199,22 @@ end
 
 local function worktree_choices()
   local worktrees_dir = wezterm.home_dir .. "/worktrees"
-  local success, stdout, _stderr = wezterm.run_child_process({ "ls", worktrees_dir })
+  -- New layout: ~/worktrees/<repo>/<branch>. Find one level deep so we get
+  -- every branch across every repo.
+  local success, stdout, _stderr = wezterm.run_child_process({
+    "find", worktrees_dir, "-mindepth", "2", "-maxdepth", "2", "-type", "d",
+  })
 
   if not success or stdout == "" then
     return {}
   end
 
   local choices = {}
-  for name in stdout:gmatch("[^\n]+") do
-    table.insert(choices, { label = name, id = name })
+  for path in stdout:gmatch("[^\n]+") do
+    local repo, branch = path:match("/worktrees/([^/]+)/([^/]+)$")
+    if repo and branch then
+      table.insert(choices, { label = repo .. "/" .. branch, id = repo .. "/" .. branch })
+    end
   end
 
   return choices

@@ -43,7 +43,7 @@ is_dotfiles_repo() {
 
 clone_dotfiles() {
   echo "Creating new config directory from dotfiles..."
-  git clone "$DOTFILES_REPO" "$CONFIG_DIR"
+  git clone --recurse-submodules "$DOTFILES_REPO" "$CONFIG_DIR"
 }
 
 if ! command_exists paru; then
@@ -86,6 +86,7 @@ install_package ripgrep rg
 install_package fzf
 install_package lazygit
 install_package zellij
+install_package jq
 install_package crystalline-bin crystalline
 install_package spotify-player
 install_package imagemagick magick
