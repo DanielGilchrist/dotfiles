@@ -14,6 +14,39 @@ local wezterm = require("wezterm")
 local M = {}
 
 M.TITLE = "agents"
+M.MARKER_FILE = "/tmp/wezterm-agents-tab"
+
+---Read the persisted agents tab id from disk. Cold-start fallback only.
+---@return integer|nil
+local function read_marker_file()
+  local f = io.open(M.MARKER_FILE, "r")
+  if not f then return nil end
+  local raw = f:read("*l")
+  f:close()
+  if not raw then return nil end
+  return tonumber(raw)
+end
+
+---Cached lookup. `wezterm.GLOBAL.agents_tab_id` is populated by the
+---`agents-tab-id` user-var event (emitted from `agent.fish`). Falls back
+---to a one-time disk read so we still recover the id after a wezterm
+---restart (the file persists in /tmp until reboot or first new spawn).
+---@return integer|nil
+local function get_marker()
+  local id = wezterm.GLOBAL.agents_tab_id
+  if type(id) == "number" then return id end
+  id = read_marker_file()
+  if id then wezterm.GLOBAL.agents_tab_id = id end
+  return id
+end
+
+---@param tab_id integer|nil
+---@return boolean
+local function is_agents_tab_id(tab_id)
+  if not tab_id then return false end
+  local marker = get_marker()
+  return marker ~= nil and marker == tab_id
+end
 
 ---@param tabs MuxTab[]
 ---@param tab_id integer
@@ -29,8 +62,10 @@ end
 ---@return MuxTab|nil mux_tab
 ---@return integer|nil zero-based index
 local function find_agents_tab(tabs)
+  local marker = get_marker()
+  if not marker then return nil, nil end
   for i, t in ipairs(tabs) do
-    if t:get_title() == M.TITLE then return t, i - 1 end
+    if t:tab_id() == marker then return t, i - 1 end
   end
   return nil, nil
 end
@@ -113,7 +148,7 @@ M.cycle_right = cycle(1)
 local function move(direction)
   return wezterm.action_callback(function(window, pane)
     local active = window:active_tab()
-    if not active or active:get_title() == M.TITLE then return end
+    if not active or is_agents_tab_id(active:tab_id()) then return end
 
     local tabs = window:mux_window():tabs()
     local active_idx = index_of(tabs, active:tab_id())
@@ -121,7 +156,7 @@ local function move(direction)
     local target_idx = active_idx + direction
     if target_idx < 0 or target_idx >= #tabs then return end
 
-    if tabs[target_idx + 1]:get_title() == M.TITLE then
+    if is_agents_tab_id(tabs[target_idx + 1]:tab_id()) then
       target_idx = target_idx + direction
     end
     if target_idx < 0 or target_idx >= #tabs then return end
@@ -140,7 +175,7 @@ M.move_right = move(1)
 local function refuse_on_agents_tab(close_action)
   return wezterm.action_callback(function(window, pane)
     local tab = window:active_tab()
-    if tab and tab:get_title() == M.TITLE then
+    if tab and is_agents_tab_id(tab:tab_id()) then
       window:toast_notification("agent", "agents tab — use `agent-rm` to remove", nil, 2000)
       return
     end
@@ -193,7 +228,7 @@ M.pin_to_zero = wezterm.action_callback(do_pin_to_zero)
 ---@return string|table
 local function format_tab_title(tab, _, _, config)
   local title = tab.tab_title and tab.tab_title ~= "" and tab.tab_title or (tab.active_pane and tab.active_pane.title or "")
-  if title == M.TITLE then
+  if is_agents_tab_id(tab.tab_id) then
     -- Active: same as a regular active tab so the agents tab blends in when
     -- focused. Inactive: orange accent so it's distinguishable from normal
     -- tabs at a glance. Bold either way to make it pop.
@@ -221,7 +256,7 @@ local function find_agent_pane(window, session_name)
   local cwd_suffix = "/" .. session_name .. "/"
   local cwd_suffix_no_slash = "/" .. session_name
   for _, t in ipairs(window:mux_window():tabs()) do
-    if t:get_title() == M.TITLE then
+    if is_agents_tab_id(t:tab_id()) then
       for _, p in ipairs(t:panes()) do
         local cwd = p:get_current_working_dir()
         local path = ""
@@ -274,6 +309,9 @@ M.register = function()
       set_agent_pane_zoom(window, value, true)
     elseif name == "agent-unzoom" then
       set_agent_pane_zoom(window, value, false)
+    elseif name == "agents-tab-id" then
+      local id = tonumber(value)
+      if id then wezterm.GLOBAL.agents_tab_id = id end
     end
   end)
 end

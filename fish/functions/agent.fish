@@ -168,7 +168,7 @@ function agent --description "Spawn a Claude agent in a worktree + zellij sessio
         return 0
     end
 
-    set -l agents_tab_id (_term_tab_with_title $agents_tab_title)
+    set -l agents_tab_id (_term_agents_tab_id)
     set -q _flag_debug; and echo "[debug] agents_tab_id='$agents_tab_id'" >&2
 
     set -l current_pane (_term_current_pane_id)
@@ -179,6 +179,7 @@ function agent --description "Spawn a Claude agent in a worktree + zellij sessio
             echo "agent: failed to spawn agents tab" >&2
             return 1
         end
+        _term_record_agents_tab $new_pane
         _term_emit_event agent-action pin-agents-tab
     else
         set -l count (_term_panes_in_tab $agents_tab_id)
