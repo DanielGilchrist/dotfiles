@@ -33,24 +33,9 @@ function agent --description "Spawn a Claude agent in a worktree + zellij sessio
         return 1
     end
 
-    if test -n "$_flag_prompt"
-        if test -n "$_flag_seed"
-            echo "agent: pass either -e or --seed, not both" >&2
-            return 1
-        end
-        set _flag_seed (mktemp -t agent-prompt)
-        printf "%s" $_flag_prompt > $_flag_seed
-    else if test -z "$_flag_seed"; and status --is-interactive
-        set -l editor_path /tmp/agent-prompt-$branch-(random).md
-        touch $editor_path
-        nvim $editor_path
-        if test -s $editor_path
-            set _flag_seed $editor_path
-        else
-            rm -f $editor_path
-            echo "agent: cancelled (empty prompt)"
-            return 0
-        end
+    if test -n "$_flag_prompt" -a -n "$_flag_seed"
+        echo "agent: pass either -e or --seed, not both" >&2
+        return 1
     end
 
     set -l repo_root $_flag_repo
@@ -73,6 +58,25 @@ function agent --description "Spawn a Claude agent in a worktree + zellij sessio
     zellij list-sessions -s 2>/dev/null | string match -q -- $branch; and set session_exists 1
 
     set -q _flag_debug; and echo "[debug] worktree_exists=$worktree_exists session_exists=$session_exists" >&2
+
+    # Seed handling. -e/--seed always honoured. If neither AND it's a fresh
+    # spawn (no worktree, no session), open nvim for a multi-line prompt.
+    # Reconnect cases (worktree or session already there) skip the editor.
+    if test -n "$_flag_prompt"
+        set _flag_seed (mktemp -t agent-prompt)
+        printf "%s" $_flag_prompt > $_flag_seed
+    else if test -z "$_flag_seed" -a $worktree_exists -eq 0 -a $session_exists -eq 0; and status --is-interactive
+        set -l editor_path /tmp/agent-prompt-$branch-(random).md
+        touch $editor_path
+        nvim $editor_path
+        if test -s $editor_path
+            set _flag_seed $editor_path
+        else
+            rm -f $editor_path
+            echo "agent: cancelled (empty prompt)"
+            return 0
+        end
+    end
 
     if test $worktree_exists -eq 0
         mkdir -p $worktrees_dir
