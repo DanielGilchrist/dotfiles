@@ -11,11 +11,13 @@ How this dotfiles repo wires up parallel Claude Code agents in worktrees, surfac
 
 ## Fish functions
 
+These are **fish functions, not binaries**. From bash (or any non-fish shell, including Claude Code's `Bash` tool) invoke them via `fish -c '...'` — calling `agent ...` directly will fail with `command not found`.
+
 | Command | Description |
 |---|---|
-| `agent <name>` | Spawn an agent. Opens nvim for a multi-line prompt; `:wq` with content seeds Claude, `:q` empty cancels. Names cap at 25 chars (zellij socket limit on macOS). |
-| `agent <name> -e "..."` | Same but seed inline. |
-| `agent <name> --seed <file>` | Same but seed from a file. |
+| `agent <name>` | Spawn an agent. Opens nvim for a multi-line prompt; `:wq` with content seeds Claude, `:q` empty cancels. **Do not use this form from a non-interactive shell — the nvim instance will block forever; use `-e` or `--seed` instead.** Names cap at 25 chars (zellij socket limit on macOS). |
+| `agent <name> -e "..."` | Same but seed inline. Best for short single-line prompts; quoting multi-line markdown inline is fragile. |
+| `agent <name> --seed <file>` | Same but seed from a file. **Preferred when the seed is long or contains markdown / quotes / backticks** — write the seed to a temp file with the `Write` tool and pass the path. |
 | `agent-rm <name>` | Force-tear-down: worktree + branch + session + pane. Infers from cwd if omitted. |
 | `agent-rm --all` | Same, for every worktree + zellij session. Confirms first. |
 | `zj <name>` | Attach (or create) a zellij session. Tab-completes from running sessions. |
