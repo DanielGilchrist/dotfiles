@@ -1,5 +1,8 @@
 eval "$(/opt/homebrew/bin/brew shellenv)"
-source /opt/homebrew/opt/asdf/libexec/asdf.fish
+
+if type -q asdf
+    asdf completion fish | source
+end
 
 alias nproc="sysctl -n hw.logicalcpu"
 
