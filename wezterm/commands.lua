@@ -199,15 +199,22 @@ end
 
 local function worktree_choices()
   local worktrees_dir = wezterm.home_dir .. "/worktrees"
-  local success, stdout, _stderr = wezterm.run_child_process({ "ls", worktrees_dir })
+  -- New layout: ~/worktrees/<repo>/<branch>. Find one level deep so we get
+  -- every branch across every repo.
+  local success, stdout, _stderr = wezterm.run_child_process({
+    "find", worktrees_dir, "-mindepth", "2", "-maxdepth", "2", "-type", "d",
+  })
 
   if not success or stdout == "" then
     return {}
   end
 
   local choices = {}
-  for name in stdout:gmatch("[^\n]+") do
-    table.insert(choices, { label = name, id = name })
+  for path in stdout:gmatch("[^\n]+") do
+    local repo, branch = path:match("/worktrees/([^/]+)/([^/]+)$")
+    if repo and branch then
+      table.insert(choices, { label = repo .. "/" .. branch, id = repo .. "/" .. branch })
+    end
   end
 
   return choices
