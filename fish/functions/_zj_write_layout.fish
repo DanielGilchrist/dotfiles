@@ -18,6 +18,9 @@ function _zj_write_layout --description "Write a zellij layout file: one command
     echo "layout {
     tab {
 $pane_block
+        pane size=1 borderless=true {
+            plugin location=\"zellij:compact-bar\"
+        }
     }
 }" > $file
 end
