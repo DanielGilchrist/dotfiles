@@ -82,6 +82,17 @@
       "Bash(true)",
       "Bash(false)",
       "Bash(rm /tmp/agent-seed-*)",
+      "Bash(rm /tmp/seed-*)",
+      "Bash(git push*)",
+      "Bash(* 2>/dev/null)",
+      "Bash(* >/dev/null)",
+      "Bash(* >/dev/null 2>&1)",
+      "Bash(* 2>&1 >/dev/null)",
+      "Bash(* > /dev/null)",
+      "Bash(* > /dev/null 2>&1)",
+      "Bash(fish -c 'agent *)",
+      "Bash(fish -c \"agent *)",
+      "Bash(fish -c 'type agent*)",
       "Read",
       "WebFetch",
       "WebSearch"
@@ -100,6 +111,15 @@
       }
     ],
     "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "INPUT=$(cat); CMD=$(echo \"$INPUT\" | jq -r '.tool_input.command // empty'); if echo \"$CMD\" | grep -qE '(^|[ ;&|])git[[:space:]]+push'; then BR=$(git branch --show-current 2>/dev/null); if [ \"$BR\" = main ] || [ \"$BR\" = master ]; then echo \"BLOCKED: refusing git push from protected branch '$BR'\" >&2; exit 2; fi; fi; exit 0"
+          }
+        ]
+      },
       {
         "matcher": "Skill",
         "hooks": [
