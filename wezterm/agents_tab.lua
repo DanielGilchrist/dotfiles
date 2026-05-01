@@ -216,9 +216,24 @@ end
 ---@return any|nil tab
 ---@return any|nil pane
 local function find_agent_pane(window, session_name)
+  -- Match by pane cwd (~/worktrees/<repo>/<session>/) so this works even
+  -- when the program in the pane (claude) has overridden the pane title.
+  local cwd_suffix = "/" .. session_name .. "/"
+  local cwd_suffix_no_slash = "/" .. session_name
   for _, t in ipairs(window:mux_window():tabs()) do
     if t:get_title() == M.TITLE then
       for _, p in ipairs(t:panes()) do
+        local cwd = p:get_current_working_dir()
+        local path = ""
+        if cwd then
+          path = type(cwd) == "string" and cwd or (cwd.file_path or "")
+        end
+        if path ~= "" then
+          if path:sub(-#cwd_suffix) == cwd_suffix or path:sub(-#cwd_suffix_no_slash) == cwd_suffix_no_slash then
+            return t, p
+          end
+        end
+        -- Fall back to title match in case cwd isn't populated yet.
         local title = p:get_title() or ""
         if title:find(session_name, 1, true) then
           return t, p
@@ -235,8 +250,19 @@ end
 local function set_agent_pane_zoom(window, session_name, zoomed)
   local tab, target = find_agent_pane(window, session_name)
   if not tab or not target then return end
+
+  -- pane:activate() forces the tab to foreground, which would yank the
+  -- user away from whatever tab they were on. Snapshot the active tab
+  -- first and restore it after zooming.
+  local prev_tab = window:active_tab()
   target:activate()
   tab:set_zoomed(zoomed)
+  if prev_tab and prev_tab:tab_id() ~= tab:tab_id() then
+    local idx = index_of(window:mux_window():tabs(), prev_tab:tab_id())
+    if idx then
+      window:perform_action(wezterm.action.ActivateTab(idx), window:active_pane())
+    end
+  end
 end
 
 M.register = function()
