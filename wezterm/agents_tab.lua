@@ -2,18 +2,20 @@ local wezterm = require("wezterm")
 
 ---@class AgentsTabModule
 ---@field TITLE string
----@field toggle any
----@field cycle_left any
----@field cycle_right any
----@field move_left any
----@field move_right any
----@field pin_to_zero any
+---@field toggle Action
+---@field cycle_left Action
+---@field cycle_right Action
+---@field move_left Action
+---@field move_right Action
+---@field close_pane Action
+---@field close_tab Action
+---@field pin_to_zero Action
 ---@field register fun(): nil
 local M = {}
 
 M.TITLE = "agents"
 
----@param tabs table[]
+---@param tabs MuxTab[]
 ---@param tab_id integer
 ---@return integer|nil zero-based index, or nil if not found
 local function index_of(tabs, tab_id)
@@ -23,8 +25,8 @@ local function index_of(tabs, tab_id)
   return nil
 end
 
----@param tabs table[]
----@return any|nil mux_tab
+---@param tabs MuxTab[]
+---@return MuxTab|nil mux_tab
 ---@return integer|nil zero-based index
 local function find_agents_tab(tabs)
   for i, t in ipairs(tabs) do
@@ -46,7 +48,7 @@ M.toggle = wezterm.action_callback(function(window, pane)
 
   if active_id == agents:tab_id() then
     local prev_id = wezterm.GLOBAL.agent_prev_tab
-    if prev_id then
+    if type(prev_id) == "number" then
       local prev_idx = index_of(tabs, prev_id)
       if prev_idx then
         window:perform_action(wezterm.action.ActivateTab(prev_idx), pane)
@@ -67,14 +69,14 @@ M.toggle = wezterm.action_callback(function(window, pane)
 end)
 
 ---@param direction integer
----@return any
+---@return Action
 local function cycle(direction)
   return wezterm.action_callback(function(window, pane)
     local tabs = window:mux_window():tabs()
     local agents = find_agents_tab(tabs)
     local agents_id = agents and agents:tab_id() or nil
 
-    ---@type {tab: any, idx: integer}[]
+    ---@type {tab: MuxTab, idx: integer}[]
     local cyclable = {}
     for i, t in ipairs(tabs) do
       if t:tab_id() ~= agents_id then
@@ -107,7 +109,7 @@ M.cycle_left = cycle(-1)
 M.cycle_right = cycle(1)
 
 ---@param direction integer
----@return any
+---@return Action
 local function move(direction)
   return wezterm.action_callback(function(window, pane)
     local active = window:active_tab()
@@ -133,8 +135,8 @@ M.move_right = move(1)
 
 ---Block a close action when the active tab is the agents tab. Otherwise
 ---perform the action.
----@param close_action any
----@return any
+---@param close_action Action
+---@return Action
 local function refuse_on_agents_tab(close_action)
   return wezterm.action_callback(function(window, pane)
     local tab = window:active_tab()
@@ -149,8 +151,8 @@ end
 M.close_pane = refuse_on_agents_tab(wezterm.action({ CloseCurrentPane = { confirm = false } }))
 M.close_tab = refuse_on_agents_tab(wezterm.action({ CloseCurrentTab = { confirm = false } }))
 
----@param window any
----@param pane any
+---@param window Window
+---@param pane Pane
 local function do_pin_to_zero(window, pane)
   local function attempt()
     local tabs = window:mux_window():tabs()
@@ -186,12 +188,10 @@ end
 
 M.pin_to_zero = wezterm.action_callback(do_pin_to_zero)
 
----@param tab any
----@param _tabs any
----@param _panes any
----@param config any
+---@param tab TabInformation
+---@param config Config
 ---@return string|table
-local function format_tab_title(tab, _tabs, _panes, config)
+local function format_tab_title(tab, _, _, config)
   local title = tab.tab_title and tab.tab_title ~= "" and tab.tab_title or (tab.active_pane and tab.active_pane.title or "")
   if title == M.TITLE then
     -- Active: same as a regular active tab so the agents tab blends in when
@@ -211,10 +211,10 @@ local function format_tab_title(tab, _tabs, _panes, config)
   return " " .. title .. " "
 end
 
----@param window any
+---@param window Window
 ---@param session_name string
----@return any|nil tab
----@return any|nil pane
+---@return MuxTab|nil tab
+---@return Pane|nil pane
 local function find_agent_pane(window, session_name)
   -- Match by pane cwd (~/worktrees/<repo>/<session>/) so this works even
   -- when the program in the pane (claude) has overridden the pane title.
@@ -244,7 +244,7 @@ local function find_agent_pane(window, session_name)
   return nil, nil
 end
 
----@param window any
+---@param window Window
 ---@param session_name string
 ---@param zoomed boolean
 local function set_agent_pane_zoom(window, session_name, zoomed)

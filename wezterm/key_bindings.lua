@@ -7,15 +7,10 @@ local os_utils = require("utils.os")
 local agents_tab = require("agents_tab")
 local worktree_picker = require("worktree_picker")
 
----@class KeyBinding
----@field mods string
----@field key string
----@field action any
-
 ---@param mods string
 ---@param key string
----@param action any
----@return KeyBinding
+---@param action Action
+---@return Key
 local function keybind(mods, key, action)
   return { mods = mods, key = key, action = action }
 end
@@ -40,8 +35,8 @@ local function set_path()
 end
 
 ---@class KeyConfig
----@field keys KeyBinding[]
----@field key_tables table<string, KeyBinding[]>
+---@field keys Key[]
+---@field key_tables table<string, Key[]>
 local config = {}
 
 ---@class KeyMods
