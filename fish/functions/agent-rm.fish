@@ -1,4 +1,4 @@
-function agent-rm --description "Force-tear-down an agent: worktree + zellij session + wezterm pane"
+function agent-rm --description "Force-tear-down an agent: worktree + zellij session + meta-session pane"
     argparse --name=agent-rm 'h/help' 'a/all' -- $argv
     or return
 
@@ -8,9 +8,9 @@ function agent-rm --description "Force-tear-down an agent: worktree + zellij ses
         echo ""
         echo "  no arg          — infer branch from current cwd (must be inside a worktree)"
         echo "  <branch-name>   — explicit"
-        echo "  -a, --all       — nuke every worktree + zellij session + agents pane (confirms first)"
+        echo "  -a, --all       — nuke every worktree + zellij session + meta-session pane (confirms first)"
         echo ""
-        echo "Always force-removes. Worktree, branch, zellij session, wezterm pane all go."
+        echo "Always force-removes. Worktree, branch, zellij session, meta-session pane all go."
         return 0
     end
 
@@ -21,7 +21,7 @@ function agent-rm --description "Force-tear-down an agent: worktree + zellij ses
                 set -a branches (basename $d)
             end
         end
-        set -l sessions (zellij list-sessions -s 2>/dev/null)
+        set -l sessions (zellij list-sessions -s 2>/dev/null | string match -v -- agents)
         set -l all_names (printf '%s\n' $branches $sessions | sort -u)
         if test -z "$all_names"
             echo "agent-rm: nothing to remove"
@@ -57,6 +57,11 @@ function agent-rm --description "Force-tear-down an agent: worktree + zellij ses
         end
     end
 
+    if test "$branch" = agents
+        echo "agent-rm: refusing to remove the meta-session itself" >&2
+        return 1
+    end
+
     set -l worktree_path
     for candidate in (find $HOME/worktrees -mindepth 1 -maxdepth 2 -name $branch -type d 2>/dev/null)
         if test -e "$candidate/.git"
@@ -71,25 +76,23 @@ function agent-rm --description "Force-tear-down an agent: worktree + zellij ses
             git -C $main_repo worktree remove --force $worktree_path 2>/dev/null
             git -C $main_repo branch -D $branch 2>/dev/null
         end
-        # Fallback: physically remove if anything's left.
         rm -rf $worktree_path 2>/dev/null
     end
 
-    # Also try to delete the branch from the current repo if any (handles orphan
-    # branches left behind when a previous worktree was removed manually).
     set -l current_repo (git rev-parse --show-toplevel 2>/dev/null)
     if test -n "$current_repo"
         git -C $current_repo branch -D $branch 2>/dev/null
     end
 
-    zellij delete-session --force $branch 2>/dev/null
-
-    if _term_inside; and test -n "$worktree_path"
-        set -l pane_id (_term_pane_for_cwd $worktree_path)
+    # Close the meta-session pane first (so its `zellij attach` exits cleanly), then kill the per-agent session.
+    if _agent_meta_exists
+        set -l pane_id (_agent_meta_pane_id $branch)
         if test -n "$pane_id"
-            _term_kill_pane $pane_id
+            zellij --session agents action close-pane --pane-id $pane_id 2>/dev/null
         end
     end
+
+    zellij delete-session --force $branch 2>/dev/null
 
     echo "agent-rm: removed $branch"
 end

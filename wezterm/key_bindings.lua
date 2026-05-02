@@ -91,9 +91,10 @@ config.keys = {
     os.remove(name)
   end)),
 
-  keybind(keys.COMMAND, "d", wezterm.action({ SplitHorizontal = { domain = "CurrentPaneDomain" } })),
-  keybind(keys.COMMAND, "s", wezterm.action({ SplitPane = { direction = "Right", size = { Percent = 35 } } })),
-  keybind(keys.COMMAND_SHIFT, "d", wezterm.action({ SplitVertical = { domain = "CurrentPaneDomain" } })),
+  -- Pane splits — refused on the agents tab (only one wezterm pane there: the meta-session viewport).
+  keybind(keys.COMMAND, "d", agents_tab.split_horizontal),
+  keybind(keys.COMMAND, "s", agents_tab.split_right_35),
+  keybind(keys.COMMAND_SHIFT, "d", agents_tab.split_vertical),
 
   keybind(keys.COMMAND, "k", wezterm.action_callback(function(window, pane)
     local process_name = pane:get_foreground_process_name()

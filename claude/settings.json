@@ -1,7 +1,6 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-settings.json",
   "permissions": {
-    "defaultMode": "acceptEdits",
     "allow": [
       "Edit",
       "Bash(git status)",
@@ -97,8 +96,12 @@
       "WebFetch",
       "WebSearch"
     ],
-    "deny": []
+    "deny": [],
+    "defaultMode": "acceptEdits"
   },
+  "disabledMcpjsonServers": [
+    "chrome-devtools"
+  ],
   "hooks": {
     "UserPromptSubmit": [
       {
@@ -136,13 +139,13 @@
     "rust-analyzer-lsp@claude-plugins-official": true,
     "lua-lsp@claude-plugins-official": true
   },
+  "effortLevel": "medium",
   "claudeMdExcludes": [
     "CLAUDE.md",
     ".claude/CLAUDE.md",
     ".claude/rules/**",
     "AGENTS.md"
   ],
-  "disabledMcpjsonServers": ["chrome-devtools"],
   "defaultMode": "acceptEdits",
   "additionalDirectories": [
     "~/Documents/repos",
@@ -157,6 +160,5 @@
         "@circleci/mcp-server-circleci@latest"
       ]
     }
-  },
-  "effortLevel": "medium"
+  }
 }

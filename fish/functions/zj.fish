@@ -31,18 +31,22 @@ function zj --description "Start or attach to a zellij session in the current di
     end
 
     if zellij list-sessions -s 2>/dev/null | string match -q -- $name
-        # If attaching from inside wezterm, ask the agents tab to zoom its
-        # corresponding pane to full size so zellij's mirror multi-attach
-        # renders at this attacher's full window size. Unzoom on detach.
-        set -l zoom 0
-        if functions -q _term_inside; and _term_inside; and functions -q _term_emit_event
-            set zoom 1
-            _term_emit_event agent-zoom $name
+        # If a meta-session pane corresponds to this session, fullscreen it
+        # while we're attached so its render dimensions don't constrain us.
+        # Skip when attaching to the meta-session itself.
+        set -l meta_pane
+        if test "$name" != agents; and _agent_meta_exists
+            set meta_pane (_agent_meta_pane_id $name)
+            if test -n "$meta_pane"
+                zellij --session agents action toggle-fullscreen --pane-id $meta_pane 2>/dev/null
+            end
         end
+
         zellij attach $name
         set -l exit_status $status
-        if test $zoom -eq 1
-            _term_emit_event agent-unzoom $name
+
+        if test -n "$meta_pane"
+            zellij --session agents action toggle-fullscreen --pane-id $meta_pane 2>/dev/null
         end
         return $exit_status
     end
