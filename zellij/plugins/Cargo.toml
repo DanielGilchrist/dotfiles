@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = ["page-indicator"]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+
+[workspace.dependencies]
+zellij-tile = "0.44.1"
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+codegen-units = 1

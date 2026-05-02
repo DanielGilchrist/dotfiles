@@ -195,19 +195,28 @@ function agent --description "Spawn a Claude agent in a worktree, as a pane in t
                 return 1
             end
         else
-            zellij --session agents action new-tab --cwd $worktree_path -- fish -c $pane_cmd >/dev/null
+            # New tab: use a temp layout so the page-indicator pane and
+            # swap_tiled_layout apply (zellij doesn't inherit swap layouts
+            # across tabs created by the bare `new-tab` action).
+            set -l spill_layout (mktemp -t agents-spill).kdl
+            _agent_write_meta_layout $spill_layout $branch $pane_cmd
+            zellij --session agents action new-tab --layout $spill_layout >/dev/null
             or begin
+                rm -f $spill_layout
                 echo "agent: failed to spawn new tab in meta-session" >&2
                 return 1
             end
-            zellij --session agents action rename-pane $branch 2>/dev/null
+            rm -f $spill_layout
         end
 
         _agent_ensure_meta_tab >/dev/null
     else
-        # Bootstrap meta-session via a wezterm tab.
+        # Bootstrap meta-session via a wezterm tab. Prepend a one-shot
+        # toggle-pane-frames to the first agent pane so the meta-session
+        # shows pane borders (active-pane highlight). Session-scoped, so it
+        # persists for subsequent panes.
         set -l layout_file (mktemp -t agents-layout).kdl
-        _agent_write_meta_layout $layout_file $branch $pane_cmd
+        _agent_write_meta_layout $layout_file $branch "zellij action toggle-pane-frames; and $pane_cmd"
 
         set -q _flag_debug; and begin
             echo "[debug] meta layout:" >&2

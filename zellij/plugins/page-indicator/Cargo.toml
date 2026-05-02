@@ -1,0 +1,7 @@
+[package]
+name = "page-indicator"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+zellij-tile.workspace = true

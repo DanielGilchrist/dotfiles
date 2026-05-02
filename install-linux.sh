@@ -119,6 +119,14 @@ else
   echo "rustup is already installed."
 fi
 
+echo "Ensuring wasm32-wasip1 target for zellij plugins..."
+rustup target add wasm32-wasip1
+
+if [ -f "$CONFIG_DIR/zellij/plugins/build.fish" ]; then
+  echo "Building local zellij plugins..."
+  fish "$CONFIG_DIR/zellij/plugins/build.fish"
+fi
+
 if ! command_exists tree-sitter; then
   echo "Installing tree-sitter-cli..."
   cargo install --locked tree-sitter-cli
