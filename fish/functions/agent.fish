@@ -1,16 +1,24 @@
-function agent --description "Spawn a Claude agent in a worktree + zellij session + agents tab pane"
-    argparse --name=agent 'h/help' 'd/debug' 'e/prompt=' 'seed=' 'repo=' 'no-focus' -- $argv
+function agent --description "Spawn a Claude agent in a worktree, as a pane in the agents meta-session"
+    argparse --name=agent 'h/help' 'd/debug' 'e/prompt=' 'seed=' 'repo=' 'no-focus' 'restore' -- $argv
     or return
 
     if set -q _flag_help
         echo "usage: agent <name> [-e <prompt> | --seed <file>] [--repo <path>]"
+        echo "       agent --restore"
         echo ""
         echo "  <name>               — required. Used as worktree dir, git branch, and zellij session name."
         echo "  -e, --prompt <text>  — inline prompt seeded into Claude as the first message"
         echo "  --seed <file>        — multi-line prompt from a file (same as -e)"
         echo "  --repo <path>        — repo root (defaults to git rev-parse from cwd)"
+        echo "  --restore            — rebuild the agents grid from live per-agent sessions"
+        echo "  --no-focus           — don't refocus the calling pane after spawn"
         echo "  -d, --debug          — print spawn commands to stderr"
         return 0
+    end
+
+    if set -q _flag_restore
+        _agent_restore
+        return $status
     end
 
     if test (count $argv) -lt 1
@@ -20,16 +28,15 @@ function agent --description "Spawn a Claude agent in a worktree + zellij sessio
     end
 
     set -l branch $argv[1]
-    set -l agents_tab_title agents
-    set -l max_agents 8
 
-    # Zellij's session name length is capped by the unix-socket path budget
-    # (macOS sockaddr_un limit ~= 104 chars). On macOS the leftover for the
-    # session name is ~25 chars; longer names hard-error from zellij later
-    # which manifests as a silently-dying spawn.
+    if test "$branch" = agents
+        echo "agent: 'agents' is reserved (used for the meta-session)" >&2
+        return 1
+    end
+
+    # Zellij session-name length is capped by the macOS unix-socket budget (~25 chars).
     if test (string length -- $branch) -gt 25
         echo "agent: name too long ("(string length -- $branch)" chars); zellij caps session names around 25 chars on macOS." >&2
-        echo "       try a shorter name." >&2
         return 1
     end
 
@@ -63,8 +70,7 @@ function agent --description "Spawn a Claude agent in a worktree + zellij sessio
     set -q _flag_debug; and echo "[debug] worktree_exists=$worktree_exists session_exists=$session_exists" >&2
 
     # Seed handling. -e/--seed always honoured. If neither AND it's a fresh
-    # spawn (no worktree, no session), open nvim for a multi-line prompt.
-    # Reconnect cases (worktree or session already there) skip the editor.
+    # spawn, open nvim for a multi-line prompt. Reconnect cases skip the editor.
     if test -n "$_flag_prompt"
         set _flag_seed (mktemp -t agent-prompt)
         printf "%s" $_flag_prompt > $_flag_seed
@@ -83,11 +89,8 @@ function agent --description "Spawn a Claude agent in a worktree + zellij sessio
 
     if test $worktree_exists -eq 0
         mkdir -p $worktrees_dir
-        # Drop any stale worktree registrations whose dirs no longer exist.
         git -C $repo_root worktree prune 2>/dev/null
 
-        # Branch off the repo's default branch (origin/HEAD), not whatever the
-        # user happens to be on right now.
         set -l base (git -C $repo_root symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null)
         if test -z "$base"
             for candidate in main master
@@ -106,9 +109,6 @@ function agent --description "Spawn a Claude agent in a worktree + zellij sessio
             set err_log /dev/null
         end
 
-        # Worktree is detached at the default branch (origin/master or origin/main).
-        # Claude is responsible for creating an appropriately-named branch off
-        # this point before making changes (instructed via the initial prompt).
         set -l add_status 1
         if test -n "$base"
             if git -C $repo_root worktree add --detach $worktree_path $base 2>$err_log
@@ -131,75 +131,102 @@ function agent --description "Spawn a Claude agent in a worktree + zellij sessio
         end
     end
 
-    set -l zj_cmd
+    # Build the command that runs in the meta-session pane. `zj` handles
+    # create-or-attach for the per-agent session.
+    set -l per_agent_cmd
     if test $session_exists -eq 1
-        set zj_cmd "zj $branch"
+        set per_agent_cmd "zj $branch"
     else
-        set -l branch_instruction "This worktree is checked out detached at the repo's default branch. Before making any changes, create a branch with `git checkout -b <kebab-case-name>` describing the task."
+        set -l branch_instruction "This worktree is checked out detached at the repo's default branch. Before making any changes, create a branch with \`git checkout -b <kebab-case-name>\` describing the task."
         if test -n "$_flag_seed" -a -f "$_flag_seed"
             set -l seed_path /tmp/agent-seed-$branch-(random).md
             cp $_flag_seed $seed_path
-            set -l meta "$branch_instruction Then read $seed_path for your task, and `rm $seed_path` before doing anything else."
+            set -l meta "$branch_instruction Then read $seed_path for your task, and \`rm $seed_path\` before doing anything else."
             set -l escaped (string escape -- $meta)
-            set zj_cmd "zj $branch -- claude --add-dir /tmp --permission-mode acceptEdits $escaped"
+            set per_agent_cmd "zj $branch -- claude --add-dir /tmp --permission-mode acceptEdits $escaped"
         else
             set -l escaped (string escape -- $branch_instruction)
-            set zj_cmd "zj $branch -- claude --permission-mode acceptEdits $escaped"
+            set per_agent_cmd "zj $branch -- claude --permission-mode acceptEdits $escaped"
         end
     end
 
-    set -q _flag_debug; and echo "[debug] zj_cmd: $zj_cmd" >&2
+    # Always cd into the worktree first; per-agent session inherits the cwd.
+    set -l safe_cwd (string escape -- $worktree_path)
+    set -l pane_cmd "cd $safe_cwd; and $per_agent_cmd"
+
+    set -q _flag_debug; and echo "[debug] pane_cmd: $pane_cmd" >&2
 
     if not _term_inside
-        echo "agent: not running inside a wrapped terminal; worktree at $worktree_path"
-        echo "       to start: cdw $branch; and $zj_cmd"
+        echo "agent: not running inside wezterm; worktree at $worktree_path"
+        echo "       to start manually: cdw $branch; and $per_agent_cmd"
         return 0
     end
 
-    set -l existing_pane (_term_pane_for_cwd $worktree_path)
-    if test -n "$existing_pane"
-        _term_focus $existing_pane
+    set -l current_pane (_term_current_pane_id)
+
+    # Pane already exists in the meta-session → focus, optionally inject prompt.
+    set -l existing_pane_id
+    if _agent_meta_exists
+        set existing_pane_id (_agent_meta_pane_id $branch)
+    end
+    if test -n "$existing_pane_id"
+        _agent_ensure_meta_tab >/dev/null
         if test -n "$_flag_seed" -a -f "$_flag_seed" -a $session_exists -eq 1
             _agent_inject_prompt $branch $_flag_seed
             echo "agent: sent prompt to existing $branch"
         else
-            echo "agent: reconnected to existing pane for $branch"
+            echo "agent: $branch already in agents tab (CMD+0 to view)"
+        end
+        if not set -q _flag_no_focus
+            _term_focus $current_pane
         end
         return 0
     end
 
-    set -l agents_tab_id (_term_agents_tab_id)
-    set -q _flag_debug; and echo "[debug] agents_tab_id='$agents_tab_id'" >&2
+    if _agent_meta_exists
+        # Spillover: place the new pane in the first meta-tab with room
+        # (<6 user panes). If all tabs are full, create a new tab with the
+        # agent as its initial pane.
+        set -l target_tab (_agent_meta_target_tab)
+        if test -n "$target_tab"
+            zellij --session agents action new-pane --tab-id $target_tab --name $branch --cwd $worktree_path -- fish -c $pane_cmd
+            or begin
+                echo "agent: failed to add pane to meta-session" >&2
+                return 1
+            end
+        else
+            zellij --session agents action new-tab --cwd $worktree_path -- fish -c $pane_cmd >/dev/null
+            or begin
+                echo "agent: failed to spawn new tab in meta-session" >&2
+                return 1
+            end
+            zellij --session agents action rename-pane $branch 2>/dev/null
+        end
 
-    set -l current_pane (_term_current_pane_id)
+        _agent_ensure_meta_tab >/dev/null
+    else
+        # Bootstrap meta-session via a wezterm tab.
+        set -l layout_file (mktemp -t agents-layout).kdl
+        _agent_write_meta_layout $layout_file $branch $pane_cmd
 
-    if test -z "$agents_tab_id"
-        set -l new_pane (_term_spawn_tab --title $agents_tab_title $worktree_path $zj_cmd)
+        set -q _flag_debug; and begin
+            echo "[debug] meta layout:" >&2
+            cat $layout_file >&2
+        end
+
+        set -l boot_cmd "zellij -s agents -n $layout_file; rm -f $layout_file"
+        set -l new_pane (_term_spawn_tab --title agents $HOME $boot_cmd)
         if test -z "$new_pane"
             echo "agent: failed to spawn agents tab" >&2
+            rm -f $layout_file
             return 1
         end
-        _term_record_agents_tab $new_pane
-        _term_emit_event agent-action pin-agents-tab
-    else
-        set -l count (_term_panes_in_tab $agents_tab_id)
-        if test $count -ge $max_agents
-            echo "agent: reached max $max_agents agents — \`agent-rm <name>\` first" >&2
-            return 1
-        end
-
-        set -q _flag_debug; and echo "[debug] split-largest in tab $agents_tab_id" >&2
-        _term_split_largest_in_tab $agents_tab_id $worktree_path $zj_cmd >/dev/null
-        or begin
-            echo "agent: split failed" >&2
-            return 1
-        end
+        _term_emit_event agents-tab-spawned $new_pane
     end
 
     if not set -q _flag_no_focus
         _term_focus $current_pane
     end
-
 
     if test $session_exists -eq 1
         echo "agent: reattached existing session $branch (CMD+0 to view)"

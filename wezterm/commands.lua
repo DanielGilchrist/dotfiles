@@ -1,5 +1,5 @@
 local wezterm = require("wezterm")
-local os_utils = require("utils.os")
+local notify = require("utils.notify")
 
 local M = {}
 
@@ -85,17 +85,6 @@ local function wait_for_text_for(pane, ...)
     else
       wezterm.sleep_ms(1000)
     end
-  end
-end
-
-local function notify(window, title, content)
-  -- idk why but I can't get `window:toast_notification` to work on mac for the life of me
-  if os_utils.system() == "macos" then
-    local q = '"'
-    local command = "display notification " .. q .. content .. q .. " with title " .. q .. title .. q
-    wezterm.run_child_process({ "osascript", "-e", command })
-  else
-    window:toast_notification(title, content, nil, 4000)
   end
 end
 

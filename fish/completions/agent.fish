@@ -14,5 +14,7 @@ complete -c agent -n '__fish_is_first_token' -a '(__agent_existing | sort -u)' -
 complete -c agent -s e -l prompt -d 'inline prompt' -r
 complete -c agent -l seed -d 'prompt from file' -F
 complete -c agent -l repo -d 'repo root' -x
+complete -c agent -l restore -d 'rebuild agents grid from live sessions'
+complete -c agent -l no-focus -d "don't refocus calling pane after spawn"
 complete -c agent -s d -l debug -d 'debug output'
 complete -c agent -s h -l help -d 'show help'
