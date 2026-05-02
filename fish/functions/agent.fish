@@ -221,7 +221,7 @@ function agent --description "Spawn a Claude agent in a worktree, as a pane in t
             rm -f $layout_file
             return 1
         end
-        _term_emit_event agent-action pin-agents-tab
+        _term_emit_event agents-tab-spawned $new_pane
     end
 
     if not set -q _flag_no_focus

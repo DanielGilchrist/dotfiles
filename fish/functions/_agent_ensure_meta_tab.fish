@@ -8,6 +8,6 @@ function _agent_ensure_meta_tab --description "Ensure a wezterm 'agents' tab exi
     set -l new_pane (_term_spawn_tab --title agents $HOME "zellij attach agents")
     test -z "$new_pane"; and return 1
 
-    _term_emit_event agent-action pin-agents-tab
+    _term_emit_event agents-tab-spawned $new_pane
     echo $new_pane
 end

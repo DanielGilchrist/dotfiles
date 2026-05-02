@@ -1,4 +1,5 @@
 local wezterm = require("wezterm")
+local notify = require("utils.notify")
 
 ---@class AgentsTabModule
 ---@field TITLE string
@@ -82,7 +83,7 @@ M.toggle = wezterm.action_callback(function(window)
     if meta_session_alive() then
       spawn_agents_tab(window)
     else
-      window:toast_notification("agent", "no agents — run `agent <name>` to spawn", nil, 2500)
+      notify(window, "agent", "no agents — run `agent <name>` to spawn")
     end
     return
   end
@@ -161,7 +162,7 @@ local function refuse(action, message)
   local msg = message or "agents tab — operation refused"
   return wezterm.action_callback(function(window, pane)
     if is_agents(window:active_tab()) then
-      window:toast_notification("agent", msg, nil, 2000)
+      notify(window, "agent", msg)
       return
     end
     window:perform_action(action, pane)
@@ -194,11 +195,28 @@ end
 
 M.register = function()
   wezterm.on("format-tab-title", format_tab_title)
-  wezterm.on("user-var-changed", function(window, pane, name, value)
-    if name ~= "agent-action" or value ~= "pin-agents-tab" then return end
-    local tab = pane:tab()
-    if tab then wezterm.GLOBAL.agents_tab_id = tab:tab_id() end
-    pin_with_retry(window)
+  -- Fish-side helpers emit `agents-tab-spawned=<pane_id>` from the *calling*
+  -- shell pane after spawning the agents tab via `wezterm cli spawn`. We can't
+  -- use `pane:tab()` from the event arg (that's the calling pane, not the new
+  -- one), so resolve the agents tab via the new pane's id.
+  wezterm.on("user-var-changed", function(window, _, name, value)
+    if name ~= "agents-tab-spawned" then return end
+    local target_pid = tonumber(value)
+    if not target_pid then return end
+
+    local function locate_and_pin()
+      for _, t in ipairs(window:mux_window():tabs()) do
+        for _, p in ipairs(t:panes()) do
+          if p:pane_id() == target_pid then
+            wezterm.GLOBAL.agents_tab_id = t:tab_id()
+            pin_to_zero(window, t)
+            return true
+          end
+        end
+      end
+      return false
+    end
+    if not locate_and_pin() then wezterm.time.call_after(0.3, locate_and_pin) end
   end)
   wezterm.on("gui-startup", function(cmd)
     -- gui-startup hands us mux objects, not a GUI window — so we can't reuse

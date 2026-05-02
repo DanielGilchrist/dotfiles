@@ -31,11 +31,15 @@ function zj --description "Start or attach to a zellij session in the current di
     end
 
     if zellij list-sessions -s 2>/dev/null | string match -q -- $name
-        # If a meta-session pane corresponds to this session, fullscreen it
-        # while we're attached so its render dimensions don't constrain us.
-        # Skip when attaching to the meta-session itself.
+        # External-attach auto-fullscreen: when `zj a8` is run from outside the
+        # meta-session (e.g. another wezterm tab), fullscreen the corresponding
+        # meta-pane so its dimensions don't constrain the new attacher's view.
+        # Skip when invoked from inside the meta-session itself — that's the
+        # meta-pane attaching to its own per-agent session, no fullscreen wanted.
         set -l meta_pane
-        if test "$name" != agents; and _agent_meta_exists
+        if test "$name" != agents
+            and test "$ZELLIJ_SESSION_NAME" != agents
+            and _agent_meta_exists
             set meta_pane (_agent_meta_pane_id $name)
             if test -n "$meta_pane"
                 zellij --session agents action toggle-fullscreen --pane-id $meta_pane 2>/dev/null

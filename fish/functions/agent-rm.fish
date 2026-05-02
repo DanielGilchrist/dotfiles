@@ -41,6 +41,17 @@ function agent-rm --description "Force-tear-down an agent: worktree + zellij ses
         for name in $all_names
             agent-rm $name >/dev/null 2>&1
         end
+        # Force-kill the meta-session too. Otherwise zellij's session
+        # serialization keeps it around and resurrects panes (with captured
+        # inner-zellij commands pointing at long-deleted /tmp layouts) on
+        # the next attach.
+        zellij delete-session --force agents 2>/dev/null
+        # Tear down the (now-dead) wezterm agents tab too.
+        if _term_inside
+            for p in (wezterm cli list --format json 2>/dev/null | jq -r '.[] | select(.tab_title == "agents") | .pane_id')
+                wezterm cli kill-pane --pane-id $p 2>/dev/null
+            end
+        end
         echo "agent-rm: removed "(count $all_names)" agents"
         return 0
     end
@@ -99,6 +110,7 @@ function agent-rm --description "Force-tear-down an agent: worktree + zellij ses
                 zellij --session agents action close-tab-by-id $parts[2] 2>/dev/null
             end
         end
+        _agent_consolidate
     end
 
     zellij delete-session --force $branch 2>/dev/null

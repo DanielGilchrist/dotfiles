@@ -37,7 +37,7 @@ function _agent_restore --description "Rebuild the agents grid: ensure each live
             echo "agent --restore: failed to spawn agents tab" >&2
             return 1
         end
-        _term_emit_event agent-action pin-agents-tab
+        _term_emit_event agents-tab-spawned $new_pane
         echo "agent --restore: rebuilt meta-session with "(count $branches)" agent(s)"
         return 0
     end
