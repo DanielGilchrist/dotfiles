@@ -84,11 +84,20 @@ function agent-rm --description "Force-tear-down an agent: worktree + zellij ses
         git -C $current_repo branch -D $branch 2>/dev/null
     end
 
-    # Close the meta-session pane first (so its `zellij attach` exits cleanly), then kill the per-agent session.
+    # Close the meta-session pane (so its `zellij attach` exits cleanly), then
+    # if its tab is now empty, close the tab. Per-agent session killed below.
     if _agent_meta_exists
-        set -l pane_id (_agent_meta_pane_id $branch)
-        if test -n "$pane_id"
-            zellij --session agents action close-pane --pane-id $pane_id 2>/dev/null
+        set -l info (zellij --session agents action list-panes --json 2>/dev/null \
+            | jq -r --arg n "$branch" '.[] | select(.is_plugin | not) | select(.title == $n) | "terminal_\(.id) \(.tab_id)"' \
+            | head -1)
+        if test -n "$info"
+            set -l parts (string split " " $info)
+            zellij --session agents action close-pane --pane-id $parts[1] 2>/dev/null
+            set -l remaining (zellij --session agents action list-panes --json 2>/dev/null \
+                | jq --argjson t $parts[2] '[.[] | select(.tab_id == $t and (.is_plugin | not))] | length')
+            if test "$remaining" = 0
+                zellij --session agents action close-tab-by-id $parts[2] 2>/dev/null
+            end
         end
     end
 

@@ -28,7 +28,6 @@ function agent --description "Spawn a Claude agent in a worktree, as a pane in t
     end
 
     set -l branch $argv[1]
-    set -l max_agents 6
 
     if test "$branch" = agents
         echo "agent: 'agents' is reserved (used for the meta-session)" >&2
@@ -185,16 +184,23 @@ function agent --description "Spawn a Claude agent in a worktree, as a pane in t
     end
 
     if _agent_meta_exists
-        set -l count (_agent_meta_pane_count)
-        if test "$count" -ge "$max_agents" 2>/dev/null
-            echo "agent: reached max $max_agents agents — \`agent-rm <name>\` first" >&2
-            return 1
-        end
-
-        zellij --session agents action new-pane --name $branch --cwd $worktree_path -- fish -c $pane_cmd
-        or begin
-            echo "agent: failed to add pane to meta-session" >&2
-            return 1
+        # Spillover: place the new pane in the first meta-tab with room
+        # (<6 user panes). If all tabs are full, create a new tab with the
+        # agent as its initial pane.
+        set -l target_tab (_agent_meta_target_tab)
+        if test -n "$target_tab"
+            zellij --session agents action new-pane --tab-id $target_tab --name $branch --cwd $worktree_path -- fish -c $pane_cmd
+            or begin
+                echo "agent: failed to add pane to meta-session" >&2
+                return 1
+            end
+        else
+            zellij --session agents action new-tab --cwd $worktree_path -- fish -c $pane_cmd >/dev/null
+            or begin
+                echo "agent: failed to spawn new tab in meta-session" >&2
+                return 1
+            end
+            zellij --session agents action rename-pane $branch 2>/dev/null
         end
 
         _agent_ensure_meta_tab >/dev/null
