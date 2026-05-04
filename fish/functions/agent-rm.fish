@@ -1,16 +1,18 @@
-function agent-rm --description "Force-tear-down an agent: worktree + zellij session + meta-session pane"
-    argparse --name=agent-rm 'h/help' 'a/all' -- $argv
+function agent-rm --description "Tear down an agent: worktree + zellij session + meta-session pane. Branches with commits are kept unless --force."
+    argparse --name=agent-rm 'h/help' 'a/all' 'f/force' -- $argv
     or return
 
     if set -q _flag_help
-        echo "usage: agent-rm [<branch-name>]"
-        echo "       agent-rm --all"
+        echo "usage: agent-rm [-f] [<branch-name>]"
+        echo "       agent-rm --all [-f]"
         echo ""
         echo "  no arg          — infer branch from current cwd (must be inside a worktree)"
         echo "  <branch-name>   — explicit"
-        echo "  -a, --all       — nuke every worktree + zellij session + meta-session pane (confirms first)"
+        echo "  -a, --all       — every agent (confirms first)"
+        echo "  -f, --force     — also delete branches with commits ahead of origin"
         echo ""
-        echo "Always force-removes. Worktree, branch, zellij session, meta-session pane all go."
+        echo "Worktree, zellij session, and meta-session pane always go. Branches with"
+        echo "commits ahead of the base are kept unless --force."
         return 0
     end
 
@@ -40,8 +42,10 @@ function agent-rm --description "Force-tear-down an agent: worktree + zellij ses
             return 1
         end
 
+        set -l forward_flags
+        set -q _flag_force; and set -a forward_flags --force
         for name in $all_names
-            agent-rm $name >/dev/null 2>&1
+            agent-rm $forward_flags $name >/dev/null 2>&1
         end
         # Force-kill the meta-session too. Otherwise zellij's session
         # serialization keeps it around and resurrects panes (with captured
@@ -83,18 +87,39 @@ function agent-rm --description "Force-tear-down an agent: worktree + zellij ses
         end
     end
 
+    # Discover candidate branches before tearing down: the branch checked out
+    # inside the worktree (whatever Claude named) plus the branch matching the
+    # agent name. Either may be empty / detached.
+    set -l candidate_branches
+    set -l main_repo
     if test -n "$worktree_path"
-        set -l main_repo (git -C $worktree_path worktree list --porcelain 2>/dev/null | head -1 | string replace -r '^worktree ' '')
+        set main_repo (git -C $worktree_path worktree list --porcelain 2>/dev/null | head -1 | string replace -r '^worktree ' '')
+        set -l in_worktree_branch (git -C $worktree_path symbolic-ref --quiet --short HEAD 2>/dev/null)
+        test -n "$in_worktree_branch"; and set -a candidate_branches $in_worktree_branch
+    end
+    set -a candidate_branches $branch
+
+    set -l target_repo $main_repo
+    test -z "$target_repo"; and set target_repo (git rev-parse --show-toplevel 2>/dev/null)
+
+    if test -n "$worktree_path"
         if test -n "$main_repo" -a -d "$main_repo"
             git -C $main_repo worktree remove --force $worktree_path 2>/dev/null
-            git -C $main_repo branch -D $branch 2>/dev/null
         end
         rm -rf $worktree_path 2>/dev/null
     end
 
-    set -l current_repo (git rev-parse --show-toplevel 2>/dev/null)
-    if test -n "$current_repo"
-        git -C $current_repo branch -D $branch 2>/dev/null
+    set -l kept_branches
+    if test -n "$target_repo"
+        for b in $candidate_branches
+            git -C $target_repo rev-parse --verify --quiet "refs/heads/$b" >/dev/null
+            or continue
+            if set -q _flag_force; or _agent_branch_clean $target_repo $b
+                git -C $target_repo branch -D $b 2>/dev/null
+            else
+                set -a kept_branches $b
+            end
+        end
     end
 
     # Close the meta-session pane (so its `zellij attach` exits cleanly), then
@@ -117,5 +142,9 @@ function agent-rm --description "Force-tear-down an agent: worktree + zellij ses
 
     zellij delete-session --force $branch 2>/dev/null
 
-    echo "agent-rm: removed $branch"
+    if test (count $kept_branches) -gt 0
+        echo "agent-rm: removed $branch (kept branch(es) with commits: "(string join ", " $kept_branches)" — re-run with --force to delete)"
+    else
+        echo "agent-rm: removed $branch"
+    end
 end
