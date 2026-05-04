@@ -1,5 +1,5 @@
 [package]
-name = "page-indicator"
+name = "agents-bar"
 edition.workspace = true
 version.workspace = true
 

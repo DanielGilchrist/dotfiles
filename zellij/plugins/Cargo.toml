@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["page-indicator"]
+members = ["agents-bar"]
 
 [workspace.package]
 edition = "2021"

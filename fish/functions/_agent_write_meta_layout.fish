@@ -1,4 +1,4 @@
-function _agent_write_meta_layout --description "Write a meta-session bootstrap layout: ≤6-pane 'agents' tabs, each with a page-indicator plugin pane on top + a 2-column row-major grid below."
+function _agent_write_meta_layout --description "Write a meta-session bootstrap layout: ≤6-pane 'agents' tabs, each with an agents-bar plugin pane on top + a 2-column row-major grid below."
     set -l file $argv[1]
     set -l entries $argv[2..-1]
 
@@ -10,7 +10,7 @@ function _agent_write_meta_layout --description "Write a meta-session bootstrap 
     set -l pair_count (math (count $entries) / 2)
     set -l tab_count (math --scale=0 "($pair_count + $per_tab - 1) / $per_tab")
 
-    set -l indicator "pane size=1 borderless=true { plugin location=\"file:$HOME/.config/zellij/plugins/dist/page-indicator.wasm\"; }"
+    set -l indicator "pane size=1 borderless=true { plugin location=\"file:$HOME/.config/zellij/plugins/dist/agents-bar.wasm\"; }"
 
     echo "layout {" > $file
 
