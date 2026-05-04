@@ -15,14 +15,16 @@ function agent-rm --description "Force-tear-down an agent: worktree + zellij ses
     end
 
     if set -q _flag_all
-        set -l branches
+        # Only operate on names with a worktree under ~/worktrees/ — that's
+        # how `agent` provisions them. Zellij sessions without a matching
+        # worktree are someone else's, leave them alone.
+        set -l all_names
         for d in (find $HOME/worktrees -mindepth 1 -maxdepth 2 -type d 2>/dev/null)
             if test -e "$d/.git"
-                set -a branches (basename $d)
+                set -a all_names (basename $d)
             end
         end
-        set -l sessions (zellij list-sessions -s 2>/dev/null | string match -v -- agents)
-        set -l all_names (printf '%s\n' $branches $sessions | sort -u)
+        set all_names (printf '%s\n' $all_names | sort -u)
         if test -z "$all_names"
             echo "agent-rm: nothing to remove"
             return 0
