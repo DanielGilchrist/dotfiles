@@ -137,15 +137,15 @@ function agent --description "Spawn a Claude agent in a worktree, as a pane in t
     if test $session_exists -eq 1
         set per_agent_cmd "zj $branch"
     else
-        set -l branch_instruction "This worktree is checked out detached at the repo's default branch. Before making any changes, create a branch with \`git checkout -b <kebab-case-name>\` describing the task."
         if test -n "$_flag_seed" -a -f "$_flag_seed"
             set -l seed_path /tmp/agent-seed-$branch-(random).md
             cp $_flag_seed $seed_path
-            set -l meta "$branch_instruction Then read $seed_path for your task, and \`rm $seed_path\` before doing anything else."
+            set -l meta "This worktree is detached at the repo's default branch. Before doing anything else, in order: (1) read $seed_path to understand your task, (2) create a branch with \`git checkout -b <kebab-case-name>\` named for the task, (3) \`rm $seed_path\`."
             set -l escaped (string escape -- $meta)
             set per_agent_cmd "zj $branch -- claude --add-dir /tmp --permission-mode acceptEdits $escaped"
         else
-            set -l escaped (string escape -- $branch_instruction)
+            set -l meta "This worktree is detached at the repo's default branch. Once you understand the task, create a branch with \`git checkout -b <kebab-case-name>\` named for it before making any changes."
+            set -l escaped (string escape -- $meta)
             set per_agent_cmd "zj $branch -- claude --permission-mode acceptEdits $escaped"
         end
     end
