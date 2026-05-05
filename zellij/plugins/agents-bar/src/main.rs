@@ -1,16 +1,24 @@
+use std::collections::{BTreeMap, HashSet};
 use zellij_tile::prelude::*;
 
 mod sections;
 mod theme;
 
 /// Per-agent state, surfaced as the dot in the tab strip and counted by the
-/// attention badge. More variants will be added as we wire up signals
-/// (e.g. an `Awaiting` for "claude wants permission" via hooks).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// attention badge.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum AgentStatus {
+    #[default]
     Ok,
-    Held,   // zellij's is_held — process paused awaiting user input
-    Exited, // process exited (Claude crashed or was killed)
+    Held,     // zellij's is_held — process paused
+    Exited,   // process exited
+    Awaiting, // claude-code Notification hook fired — needs user input
+}
+
+#[derive(Clone, Default)]
+pub struct Agent {
+    pub title: String,
+    pub status: AgentStatus, // base status from zellij; Awaiting is overlaid at render time
 }
 
 /// Shared state observed from zellij events. Sections read this to render.
@@ -19,19 +27,37 @@ pub struct Bar {
     pub plugin_id: u32,
     pub my_tab: Option<usize>, // 1-indexed position of the tab this plugin lives in
     pub total_tabs: usize,
-    pub agents_per_tab: Vec<Vec<AgentStatus>>, // index = tab position (0-based)
-    pub focused_title: Option<String>, // currently-focused terminal pane title in *this* tab
-    pub mode: InputMode,               // zellij input mode (Normal, Scroll, Locked, …)
-    pub accent: Option<PaletteColor>,  // active-pane border colour from the theme
+    pub agents_per_tab: Vec<Vec<Agent>>, // index = tab position (0-based)
+    pub focused_title: Option<String>,   // currently-focused terminal pane title in *this* tab
+    pub mode: InputMode,                 // zellij input mode (Normal, Scroll, Locked, …)
+    pub accent: Option<PaletteColor>,    // active-pane border colour from the theme
+    pub awaiting_titles: HashSet<String>, // populated by polling /tmp/agent-state-* via claude hooks
 }
 
 impl Bar {
     pub fn agent_count(&self) -> usize {
         self.agents_per_tab.iter().map(|t| t.len()).sum()
     }
+
+    /// Apply the awaiting overlay over the base status. `Awaiting` only
+    /// overrides `Ok` — Held / Exited still take precedence (a crashed
+    /// agent isn't waiting on the user).
+    pub fn effective_status(&self, agent: &Agent) -> AgentStatus {
+        if agent.status != AgentStatus::Ok {
+            return agent.status;
+        }
+        if self.awaiting_titles.contains(&agent.title) {
+            return AgentStatus::Awaiting;
+        }
+        AgentStatus::Ok
+    }
+
     pub fn attention_count(&self) -> usize {
-        self.agents_per_tab.iter().flatten()
-            .filter(|s| **s != AgentStatus::Ok).count()
+        self.agents_per_tab
+            .iter()
+            .flatten()
+            .filter(|a| self.effective_status(a) != AgentStatus::Ok)
+            .count()
     }
 }
 
@@ -40,12 +66,16 @@ register_plugin!(Bar);
 const SIDE_MARGIN: usize = 1;
 const SEP_VISIBLE: &str = " · ";
 
+/// Name of the pipe agent-state.sh sends on. Payload format: "<agent>\t<state>"
+/// where state is "awaiting" or "idle".
+const PIPE_NAME: &str = "agent-state";
+
 fn section_sep() -> String {
     format!(" {}\u{b7}{} ", theme::DIM, theme::NDIM)
 }
 
 impl ZellijPlugin for Bar {
-    fn load(&mut self, _: std::collections::BTreeMap<String, String>) {
+    fn load(&mut self, _: BTreeMap<String, String>) {
         request_permission(&[PermissionType::ReadApplicationState]);
         self.plugin_id = get_plugin_ids().plugin_id;
         subscribe(&[
@@ -53,6 +83,27 @@ impl ZellijPlugin for Bar {
             EventType::PaneUpdate,
             EventType::ModeUpdate,
         ]);
+    }
+
+    fn pipe(&mut self, msg: PipeMessage) -> bool {
+        if msg.name != PIPE_NAME {
+            return false;
+        }
+        let payload = match msg.payload {
+            Some(p) => p,
+            None => return false,
+        };
+        let (agent, state) = match payload.split_once('\t') {
+            Some(t) => t,
+            None => return false,
+        };
+        let state = state.trim();
+        let changed = match state {
+            "awaiting" => self.awaiting_titles.insert(agent.to_string()),
+            "idle" => self.awaiting_titles.remove(agent),
+            _ => false,
+        };
+        changed
     }
 
     fn update(&mut self, event: Event) -> bool {
@@ -66,22 +117,21 @@ impl ZellijPlugin for Bar {
                     .map(|(pos, _)| pos + 1);
 
                 let max_pos = manifest.panes.keys().max().copied().unwrap_or(0);
-                let mut buckets: Vec<Vec<(u32, AgentStatus)>> = vec![Vec::new(); max_pos + 1];
+                let mut buckets: Vec<Vec<(u32, Agent)>> = vec![Vec::new(); max_pos + 1];
                 for (pos, panes) in &manifest.panes {
                     for p in panes {
                         if p.is_plugin || p.is_suppressed { continue; }
                         let status = if p.exited { AgentStatus::Exited }
                             else if p.is_held { AgentStatus::Held }
                             else { AgentStatus::Ok };
-                        buckets[*pos].push((p.id, status));
+                        buckets[*pos].push((p.id, Agent { title: p.title.clone(), status }));
                     }
                 }
-                // Stable order within each tab by pane id.
                 self.agents_per_tab = buckets
                     .into_iter()
                     .map(|mut v| {
                         v.sort_by_key(|(id, _)| *id);
-                        v.into_iter().map(|(_, s)| s).collect()
+                        v.into_iter().map(|(_, a)| a).collect()
                     })
                     .collect();
 

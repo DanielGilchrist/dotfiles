@@ -163,6 +163,7 @@ function agent-rm --description "Tear down an agent: worktree + zellij session +
     end
 
     zellij delete-session --force $branch 2>/dev/null
+    rm -f /tmp/agent-state-$branch 2>/dev/null
 
     echo "agent-rm: removed $branch"
 end
