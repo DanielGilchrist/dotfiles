@@ -1,4 +1,4 @@
-function _agent_write_meta_layout --description "Write a meta-session bootstrap layout: one tab named 'agents' with one fish pane per branch, and a 2-column swap_tiled_layout for 1-6 panes."
+function _agent_write_meta_layout --description "Write a meta-session bootstrap layout: panes split across ≤6-pane 'agents' tabs, pre-structured as a 2-column row-major grid."
     set -l file $argv[1]
     set -l entries $argv[2..-1]
 
@@ -6,30 +6,76 @@ function _agent_write_meta_layout --description "Write a meta-session bootstrap 
     test (count $entries) -eq 0; and return 1
     test (math (count $entries) % 2) -ne 0; and return 1
 
+    set -l per_tab 6
+    set -l pair_count (math (count $entries) / 2)
+    set -l tab_count (math --scale=0 "($pair_count + $per_tab - 1) / $per_tab")
+
     echo "layout {" > $file
-    echo "    tab name=\"agents\" {" >> $file
 
     set -l first 1
-    for i in (seq 1 2 (count $entries))
-        set -l branch $entries[$i]
-        set -l cmd $entries[(math $i + 1)]
-        # Prepend a one-shot toggle-pane-frames to the first pane so the
-        # meta-session shows pane borders (active-pane highlight). Only the
-        # first pane needs it — the toggle is session-scoped and persists.
-        if test $first -eq 1
-            set cmd "zellij action toggle-pane-frames; and $cmd"
-            set first 0
+    for t in (seq 1 $tab_count)
+        set -l start (math "($t - 1) * $per_tab + 1")
+        set -l end (math "$t * $per_tab")
+        test $end -gt $pair_count; and set end $pair_count
+
+        # Collect this tab's branches + commands in arrival order. The first
+        # pane in the whole layout gets a one-shot toggle-pane-frames prepend
+        # so the meta-session shows pane borders.
+        set -l branches
+        set -l cmds
+        for i in (seq $start $end)
+            set -l b $entries[(math "($i - 1) * 2 + 1")]
+            set -l c $entries[(math "($i - 1) * 2 + 2")]
+            if test $first -eq 1
+                set c "zellij action toggle-pane-frames; and $c"
+                set first 0
+            end
+            set -a branches $b
+            set -a cmds $c
         end
-        set -l esc (string replace -a '\\' '\\\\' -- $cmd | string replace -a '"' '\\"')
-        echo "        pane name=\"$branch\" command=\"fish\" {" >> $file
-        echo "            args \"-c\" \"$esc\"" >> $file
-        echo "        }" >> $file
+
+        set -l n (count $branches)
+        echo "    tab name=\"agents\" {" >> $file
+
+        if test $n -eq 1
+            _agent_emit_pane $file $branches[1] $cmds[1] "        "
+        else
+            # Row-major 2-column grid: odd-indexed panes fill the left column,
+            # even-indexed fill the right. Visually:
+            #   A1 | A2
+            #   A3 | A4
+            #   A5 | A6
+            echo "        pane split_direction=\"vertical\" {" >> $file
+
+            set -l left_count (math --scale=0 "($n + 1) / 2")
+            set -l right_count (math --scale=0 "$n / 2")
+
+            # Left column: panes at positions 1, 3, 5...
+            echo "            pane split_direction=\"horizontal\" {" >> $file
+            for i in (seq 1 2 $n)
+                _agent_emit_pane $file $branches[$i] $cmds[$i] "                "
+            end
+            echo "            }" >> $file
+
+            # Right column.
+            if test $right_count -eq 1
+                _agent_emit_pane $file $branches[2] $cmds[2] "            "
+            else
+                echo "            pane split_direction=\"horizontal\" {" >> $file
+                for i in (seq 2 2 $n)
+                    _agent_emit_pane $file $branches[$i] $cmds[$i] "                "
+                end
+                echo "            }" >> $file
+            end
+
+            echo "        }" >> $file
+        end
+
+        echo "    }" >> $file
     end
 
-    echo "    }" >> $file
-
-    # 2-column tiled grid for 1-6 panes. Zellij swaps to the matching template
-    # automatically as panes are added/removed (auto_layout=true is default).
+    # Session-wide swap layouts keep tabs nicely tiled when panes are added
+    # or removed later. Templates 1-6 follow the same 2-column shape.
     echo "    swap_tiled_layout name=\"agents-grid\" {" >> $file
     echo "        tab max_panes=1 {" >> $file
     echo "            pane" >> $file
@@ -91,3 +137,4 @@ function _agent_write_meta_layout --description "Write a meta-session bootstrap 
     echo "    }" >> $file
     echo "}" >> $file
 end
+
