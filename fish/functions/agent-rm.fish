@@ -1,4 +1,4 @@
-function agent-rm --description "Tear down an agent: worktree + zellij session + meta-session pane. Branches with commits are kept unless --force."
+function agent-rm --description "Tear down an agent: worktree + zellij session + meta-session pane. Refuses if any in-flight branch still has unpushed/unmerged commits, unless --force."
     argparse --name=agent-rm 'h/help' 'a/all' 'f/force' -- $argv
     or return
 
@@ -9,10 +9,10 @@ function agent-rm --description "Tear down an agent: worktree + zellij session +
         echo "  no arg          — infer branch from current cwd (must be inside a worktree)"
         echo "  <branch-name>   — explicit"
         echo "  -a, --all       — every agent (confirms first)"
-        echo "  -f, --force     — also delete branches with commits ahead of origin"
+        echo "  -f, --force     — tear down even if the branch has unpushed/unmerged commits"
         echo ""
-        echo "Worktree, zellij session, and meta-session pane always go. Branches with"
-        echo "commits ahead of the base are kept unless --force."
+        echo "By default refuses to remove the agent if its branch has commits not yet on"
+        echo "origin or commits on origin that haven't been merged. Pass --force to override."
         return 0
     end
 
@@ -44,8 +44,14 @@ function agent-rm --description "Tear down an agent: worktree + zellij session +
 
         set -l forward_flags
         set -q _flag_force; and set -a forward_flags --force
+        set -l removed 0
+        set -l skipped 0
         for name in $all_names
-            agent-rm $forward_flags $name >/dev/null 2>&1
+            if agent-rm $forward_flags $name >/dev/null
+                set removed (math $removed + 1)
+            else
+                set skipped (math $skipped + 1)
+            end
         end
         # Force-kill the meta-session too. Otherwise zellij's session
         # serialization keeps it around and resurrects panes (with captured
@@ -58,7 +64,11 @@ function agent-rm --description "Tear down an agent: worktree + zellij session +
                 wezterm cli kill-pane --pane-id $p 2>/dev/null
             end
         end
-        echo "agent-rm: removed "(count $all_names)" agents"
+        if test $skipped -gt 0
+            echo "agent-rm: removed $removed agent(s), skipped $skipped (see --force)"
+        else
+            echo "agent-rm: removed $removed agent(s)"
+        end
         return 0
     end
 
@@ -102,6 +112,23 @@ function agent-rm --description "Tear down an agent: worktree + zellij session +
     set -l target_repo $main_repo
     test -z "$target_repo"; and set target_repo (git rev-parse --show-toplevel 2>/dev/null)
 
+    # Refuse upfront if any in-flight branch has unpushed/unmerged commits and
+    # --force wasn't passed. Tearing down the worktree first would leave the
+    # branch orphaned in the main repo with no obvious way back to it.
+    if not set -q _flag_force; and test -n "$target_repo"
+        set -l dirty
+        for b in $candidate_branches
+            git -C $target_repo rev-parse --verify --quiet "refs/heads/$b" >/dev/null
+            or continue
+            _agent_branch_clean $target_repo $b; and continue
+            set -a dirty $b
+        end
+        if test (count $dirty) -gt 0
+            echo "agent-rm: refusing to remove $branch — branch(es) with unpushed/unmerged commits: "(string join ", " $dirty)" — re-run with --force to discard" >&2
+            return 1
+        end
+    end
+
     if test -n "$worktree_path"
         if test -n "$main_repo" -a -d "$main_repo"
             git -C $main_repo worktree remove --force $worktree_path 2>/dev/null
@@ -109,16 +136,11 @@ function agent-rm --description "Tear down an agent: worktree + zellij session +
         rm -rf $worktree_path 2>/dev/null
     end
 
-    set -l kept_branches
     if test -n "$target_repo"
         for b in $candidate_branches
             git -C $target_repo rev-parse --verify --quiet "refs/heads/$b" >/dev/null
             or continue
-            if set -q _flag_force; or _agent_branch_clean $target_repo $b
-                git -C $target_repo branch -D $b 2>/dev/null
-            else
-                set -a kept_branches $b
-            end
+            git -C $target_repo branch -D $b 2>/dev/null
         end
     end
 
@@ -142,9 +164,5 @@ function agent-rm --description "Tear down an agent: worktree + zellij session +
 
     zellij delete-session --force $branch 2>/dev/null
 
-    if test (count $kept_branches) -gt 0
-        echo "agent-rm: removed $branch (kept branch(es) with commits: "(string join ", " $kept_branches)" — re-run with --force to delete)"
-    else
-        echo "agent-rm: removed $branch"
-    end
+    echo "agent-rm: removed $branch"
 end
