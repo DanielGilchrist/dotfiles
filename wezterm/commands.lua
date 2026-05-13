@@ -1,5 +1,6 @@
 local wezterm = require("wezterm")
 local notify = require("utils.notify")
+local agent_spawn = require("agent_spawn")
 
 local M = {}
 
@@ -244,6 +245,14 @@ M.register_commands = function()
       {
         brief = "[US] Open worktree tabs",
         action = wezterm.action_callback(open_worktree_selector()),
+      },
+      {
+        brief = "Spawn agent in repo",
+        action = wezterm.action_callback(agent_spawn.open),
+      },
+      {
+        brief = "Remove agent",
+        action = wezterm.action_callback(agent_spawn.remove),
       },
     }
   end)
