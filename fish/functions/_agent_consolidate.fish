@@ -66,4 +66,36 @@ function _agent_consolidate --description "Rebalance agent panes across meta-ses
     for t in $empty_tabs
         zellij --session agents action close-tab-by-id $t 2>/dev/null
     end
+
+    # Force each non-empty tab onto the `agents-grid` swap template and clean
+    # up any dirty state. `action new-pane` adds via split-largest and doesn't
+    # honour the template, so without this nudge the tab ends up non-uniform.
+    set -l current_tab (zellij --session agents action current-tab-info --json 2>/dev/null | jq -r '.tab_id // empty')
+
+    set -l final_tabs (zellij --session agents action list-panes --json 2>/dev/null | jq -r '
+        [.[] | select(.is_plugin | not) | .tab_id] | unique | .[]
+    ')
+    for t in $final_tabs
+        # current-tab-info reports on the focused tab only — briefly focus
+        # each so we can read its swap-layout state.
+        zellij --session agents action go-to-tab-by-id $t >/dev/null 2>&1
+        set -l info (zellij --session agents action current-tab-info --json 2>/dev/null)
+        set -l layout (printf '%s\n' $info | jq -r '.active_swap_layout_name // empty')
+        set -l dirty (printf '%s\n' $info | jq -r '.is_swap_layout_dirty // false')
+
+        if test "$layout" = agents-grid
+            # Already on the right template; if dirty, cycle off and back to
+            # force a clean re-tile (lands on agents-grid again because only
+            # two swap layouts exist: BASE and agents-grid).
+            if test "$dirty" = true
+                zellij --session agents action next-swap-layout --tab-id $t 2>/dev/null
+                zellij --session agents action next-swap-layout --tab-id $t 2>/dev/null
+            end
+        else
+            zellij --session agents action next-swap-layout --tab-id $t 2>/dev/null
+        end
+    end
+
+    # Restore the originally-focused tab.
+    test -n "$current_tab"; and zellij --session agents action go-to-tab-by-id $current_tab >/dev/null 2>&1
 end
