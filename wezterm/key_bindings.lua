@@ -6,6 +6,7 @@ local key_utils = require("utils.key")
 local os_utils = require("utils.os")
 local agents_tab = require("agents_tab")
 local agent_spawn = require("agent_spawn")
+local commands = require("commands")
 local worktree_picker = require("worktree_picker")
 
 ---@param mods string
@@ -163,6 +164,10 @@ config.keys = {
 
   -- Open a new shell tab in the currently-focused agent's worktree
   keybind(keys.COMMAND_SHIFT, "e", wezterm.action_callback(agent_spawn.edit_focused)),
+
+  -- Spawn the dev-server stack rooted at the focused agent's worktree.
+  -- Tears down the previous dev tab (tracked via wezterm.GLOBAL.dev_tab_id).
+  keybind(keys.COMMAND_SHIFT, "r", wezterm.action_callback(commands.open_work_in_focused_agent)),
 }
 
 config.key_tables = {

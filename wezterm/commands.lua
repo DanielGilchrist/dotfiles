@@ -130,8 +130,44 @@ local function handle_missing_cdt_command(pane)
   end
 end
 
-local function open_work_environment(region, cd_command)
-  return function(original_window, _original_pane, _line)
+---@param region string
+---@param cd_command string
+---@return string
+local function dev_tab_title(region, cd_command)
+  -- For `cd <path>` (worktree variant), use the directory name so the tab
+  -- title makes it obvious which worktree the stack is rooted in. For `cdt`
+  -- and other shell aliases, fall back to the region.
+  local path = cd_command:match("^cd%s+(.+)$")
+  if path then
+    path = path:gsub("^['\"]", ""):gsub("['\"]$", "")
+    local basename = path:match("([^/]+)/?$")
+    if basename and basename ~= "" then return "dev:" .. basename end
+  end
+  return "dev:" .. region
+end
+
+---Close the previously-spawned dev tab if it's still alive. We track it by
+---tab_id in wezterm.GLOBAL.dev_tab_id rather than scanning titles, so we don't
+---accidentally clobber a tab the user manually renamed to "dev".
+---@param window any wezterm Window
+local function close_existing_dev_tab(window)
+  local tab_id = wezterm.GLOBAL.dev_tab_id
+  if not tab_id then return end
+  for _, tab in ipairs(window:mux_window():tabs()) do
+    if tab:tab_id() == tab_id then
+      for _, pane in ipairs(tab:panes()) do
+        wezterm.run_child_process({ "/opt/homebrew/bin/wezterm", "cli", "kill-pane", "--pane-id", tostring(pane:pane_id()) })
+      end
+      break
+    end
+  end
+  wezterm.GLOBAL.dev_tab_id = nil
+end
+
+---@param original_window any
+---@param region string
+---@param cd_command string
+local function spawn_dev_tab(original_window, region, cd_command)
     local use_cdt = cd_command == commands.CDT
 
     local function setup_pane(pane)
@@ -140,7 +176,9 @@ local function open_work_environment(region, cd_command)
 
     local split_pane_with_setup = split_pane_with(setup_pane)
 
-    local _tab, server_pane, window = original_window:mux_window():spawn_tab({})
+    local new_tab, server_pane, window = original_window:mux_window():spawn_tab({})
+    new_tab:set_title(dev_tab_title(region, cd_command))
+    wezterm.GLOBAL.dev_tab_id = new_tab:tab_id()
 
     local gui_window = window:gui_window()
     require("utils.tab").move_to_first(gui_window, server_pane)
@@ -184,6 +222,23 @@ local function open_work_environment(region, cd_command)
     run_command(webpack_pane, commands.Webpack)
     run_command(console_pane, commands.Console)
     run_command(worker_pane, commands.Worker)
+end
+
+---Re-entrant wrapper around spawn_dev_tab. Refuses while a spawn is in flight
+---(open_work_environment yields at every wait_for_text, so a second key
+---trigger would otherwise race the first and write commands to dead panes).
+local function open_work_environment(region, cd_command)
+  return function(original_window, _original_pane, _line)
+    if wezterm.GLOBAL.dev_spawn_in_progress then
+      original_window:toast_notification("dev", "dev tab is already spawning — wait for it to finish", nil, 2500)
+      return
+    end
+
+    close_existing_dev_tab(original_window)
+    wezterm.GLOBAL.dev_spawn_in_progress = true
+    local ok, err = pcall(spawn_dev_tab, original_window, region, cd_command)
+    wezterm.GLOBAL.dev_spawn_in_progress = false
+    if not ok then error(err) end
   end
 end
 
@@ -225,6 +280,33 @@ local function open_worktree_selector()
       end),
     }), pane)
   end
+end
+
+---Single-quote a string for safe inclusion in a fish-shell command.
+---@param s string
+---@return string
+local function fish_quote(s)
+  return "'" .. s:gsub("'", "'\\''") .. "'"
+end
+
+---@param window any wezterm Window
+---@return string|nil
+local function focused_agent_worktree(window)
+  local fish = "/opt/homebrew/bin/fish"
+  local _, out = wezterm.run_child_process({ fish, "-c", "_agent_focused_worktree" })
+  if not out then return nil end
+  local cwd = out:gsub("%s+$", "")
+  if cwd == "" then
+    window:toast_notification("dev", "no focused agent", nil, 2000)
+    return nil
+  end
+  return cwd
+end
+
+M.open_work_in_focused_agent = function(window, pane)
+  local cwd = focused_agent_worktree(window)
+  if not cwd then return end
+  open_work_environment(regions.US, "cd " .. fish_quote(cwd))(window, pane)
 end
 
 M.register_commands = function()

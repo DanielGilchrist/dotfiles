@@ -179,18 +179,38 @@ M.split_horizontal = refuse(wezterm.action({ SplitHorizontal = { domain = "Curre
 M.split_vertical = refuse(wezterm.action({ SplitVertical = { domain = "CurrentPaneDomain" } }), SPLIT_MSG)
 M.split_right_35 = refuse(wezterm.action({ SplitPane = { direction = "Right", size = { Percent = 35 } } }), SPLIT_MSG)
 
+local function is_dev(tab)
+  local id = wezterm.GLOBAL.dev_tab_id
+  if type(id) ~= "number" or tab == nil then return false end
+  local tid = type(tab.tab_id) == "function" and tab:tab_id() or tab.tab_id
+  return tid == id
+end
+
 local function format_tab_title(tab, _, _, config)
   local title = tab.tab_title and tab.tab_title ~= "" and tab.tab_title
     or (tab.active_pane and tab.active_pane.title or "")
-  if not is_agents(tab) then return " " .. title .. " " end
 
-  local active = config.colors and config.colors.tab_bar and config.colors.tab_bar.active_tab or {}
-  return {
-    { Background = { Color = tab.is_active and (active.bg_color or "#CBE3B3") or "#E69875" } },
-    { Foreground = { Color = active.fg_color or "#171C1F" } },
-    { Attribute = { Intensity = "Bold" } },
-    { Text = " ✦ " .. (title ~= "" and title or M.TITLE) .. " " },
-  }
+  if is_agents(tab) then
+    local active = config.colors and config.colors.tab_bar and config.colors.tab_bar.active_tab or {}
+    return {
+      { Background = { Color = tab.is_active and (active.bg_color or "#CBE3B3") or "#E69875" } },
+      { Foreground = { Color = active.fg_color or "#171C1F" } },
+      { Attribute = { Intensity = "Bold" } },
+      { Text = " ✦ " .. (title ~= "" and title or M.TITLE) .. " " },
+    }
+  end
+
+  if is_dev(tab) then
+    local active = config.colors and config.colors.tab_bar and config.colors.tab_bar.active_tab or {}
+    return {
+      { Background = { Color = tab.is_active and (active.bg_color or "#CBE3B3") or "#DBBC7F" } },
+      { Foreground = { Color = active.fg_color or "#171C1F" } },
+      { Attribute = { Intensity = "Bold" } },
+      { Text = " ▸ " .. (title ~= "" and title or "dev") .. " " },
+    }
+  end
+
+  return " " .. title .. " "
 end
 
 M.register = function()
