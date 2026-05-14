@@ -146,12 +146,21 @@ M.edit_focused = function(window, pane)
     return
   end
 
-  -- Open $EDITOR (fallback nvim) in the worktree. When the editor exits, the
-  -- fish -c command finishes and the tab closes itself.
-  local cmd = "cd " .. fish_quote(cwd) ..
-    "; and if test -n \"$EDITOR\"; eval $EDITOR; else; nvim; end"
+  -- Spawn the editor directly with wezterm's cwd option — no shell wrapper
+  -- needed. wezterm records the spawn cwd on the pane, which the default tab
+  -- title format renders as "<editor> <cwd>".
+  -- Route through fish so the editor inherits the user's full env (PATH,
+  -- shell helpers, etc.) — wezterm's spawn env is too minimal for nvim
+  -- plugins that shell out to rg/fd/etc. `exec` replaces fish with the
+  -- editor so the pane process is the editor, not fish. `label` sets the
+  -- tab title up front so we don't see "fish" flash before exec.
+  local short_cwd = cwd:gsub("^" .. wezterm.home_dir, "~")
   window:perform_action(wezterm.action.SpawnCommandInNewTab({
-    args = { resolve_fish(), "-i", "-c", cmd },
+    label = "nvim " .. short_cwd,
+    args = {
+      resolve_fish(), "-i", "-c",
+      "set -q EDITOR; or set EDITOR nvim; cd " .. fish_quote(cwd) .. "; and exec $EDITOR",
+    },
   }), pane)
 end
 
