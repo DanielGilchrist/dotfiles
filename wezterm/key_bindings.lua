@@ -5,6 +5,7 @@ local wezterm = require("wezterm")
 local key_utils = require("utils.key")
 local os_utils = require("utils.os")
 local agents_tab = require("agents_tab")
+local agent_spawn = require("agent_spawn")
 local worktree_picker = require("worktree_picker")
 
 ---@param mods string
@@ -159,6 +160,9 @@ config.keys = {
   keybind(keys.COMMAND_SHIFT, "o", wezterm.action_callback(function(window, pane)
     worktree_picker.open(window, pane)
   end)),
+
+  -- Open a new shell tab in the currently-focused agent's worktree
+  keybind(keys.COMMAND_SHIFT, "e", wezterm.action_callback(agent_spawn.edit_focused)),
 }
 
 config.key_tables = {

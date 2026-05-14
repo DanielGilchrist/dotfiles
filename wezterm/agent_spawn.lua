@@ -7,6 +7,7 @@ local wezterm = require("wezterm")
 ---@class AgentSpawnModule
 ---@field open fun(window: Window, pane: Pane): nil
 ---@field remove fun(window: Window, pane: Pane): nil
+---@field edit_focused fun(window: Window, pane: Pane): nil
 local M = {}
 
 local REPOS_DIR = wezterm.home_dir .. "/Documents/repos"
@@ -129,6 +130,28 @@ M.remove = function(window, pane)
         args = { resolve_fish(), "-c", "agent-rm " .. fish_quote(branch) .. " --force" },
       }), inner_pane)
     end),
+  }), pane)
+end
+
+M.edit_focused = function(window, pane)
+  -- Ask zellij directly which agent pane is currently focused. The helper
+  -- cross-references `current-tab-info` (focused tab) with `list-panes`
+  -- (is_focused is per-tab in zellij 0.44, so we constrain by tab_id).
+  local _, out = wezterm.run_child_process({
+    resolve_fish(), "-c", "_agent_focused_worktree",
+  })
+  local cwd = out and out:gsub("%s+$", "") or ""
+  if cwd == "" then
+    window:toast_notification("agent", "no focused agent", nil, 2000)
+    return
+  end
+
+  -- Open $EDITOR (fallback nvim) in the worktree. When the editor exits, the
+  -- fish -c command finishes and the tab closes itself.
+  local cmd = "cd " .. fish_quote(cwd) ..
+    "; and if test -n \"$EDITOR\"; eval $EDITOR; else; nvim; end"
+  window:perform_action(wezterm.action.SpawnCommandInNewTab({
+    args = { resolve_fish(), "-i", "-c", cmd },
   }), pane)
 end
 
