@@ -132,6 +132,26 @@
           }
         ]
       }
+    ],
+    "Notification": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/.config/claude/hooks/agent-state.sh awaiting"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/.config/claude/hooks/agent-state.sh idle"
+          }
+        ]
+      }
     ]
   },
   "enabledPlugins": {

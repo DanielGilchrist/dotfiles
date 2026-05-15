@@ -42,6 +42,18 @@ function _agent_restore --description "Rebuild the agents grid: ensure each live
             return 1
         end
         _term_emit_event agents-tab-spawned $new_pane
+
+        # Toggle pane frames ON. The user's global config has `pane_frames false`,
+        # but agent panes need titles. Poll briefly until the session is ready
+        # to accept the action — zellij needs a moment after `-n <layout>`.
+        for i in (seq 1 20)
+            if _agent_meta_exists
+                zellij --session agents action toggle-pane-frames >/dev/null 2>&1
+                break
+            end
+            sleep 0.1
+        end
+
         # No consolidate here: the layout file places panes correctly, and
         # calling consolidate before zellij has actually started would race.
         echo "agent --restore: rebuilt meta-session with "(count $branches)" agent(s)"

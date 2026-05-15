@@ -148,13 +148,13 @@ function agent-rm --description "Tear down an agent: worktree + zellij session +
     # if its tab is now empty, close the tab. Per-agent session killed below.
     if _agent_meta_exists
         set -l info (zellij --session agents action list-panes --json 2>/dev/null \
-            | jq -r --arg n "$branch" '.[] | select(.is_plugin | not) | select(.title == $n) | "terminal_\(.id) \(.tab_id)"' \
+            | jq -r --arg n "$branch" '.[] | select(.is_plugin | not) | select(.title == $n) | "terminal_\(.id) \(.tab_id)"' 2>/dev/null \
             | head -1)
         if test -n "$info"
             set -l parts (string split " " $info)
             zellij --session agents action close-pane --pane-id $parts[1] 2>/dev/null
             set -l remaining (zellij --session agents action list-panes --json 2>/dev/null \
-                | jq --argjson t $parts[2] '[.[] | select(.tab_id == $t and (.is_plugin | not))] | length')
+                | jq --argjson t $parts[2] '[.[] | select(.tab_id == $t and (.is_plugin | not))] | length' 2>/dev/null)
             if test "$remaining" = 0
                 zellij --session agents action close-tab-by-id $parts[2] 2>/dev/null
             end
@@ -163,6 +163,7 @@ function agent-rm --description "Tear down an agent: worktree + zellij session +
     end
 
     zellij delete-session --force $branch 2>/dev/null
+    rm -f /tmp/agent-state-$branch 2>/dev/null
 
     echo "agent-rm: removed $branch"
 end
