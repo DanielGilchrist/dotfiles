@@ -98,6 +98,7 @@ install_package btop
 install_package rainfrog
 install_package arduino-cli
 install_package lua-language-server
+install_package kotlin-lsp-bin kotlin-lsp
 install_package difftastic difft
 install_package tree-sitter-cli tree-sitter
 
