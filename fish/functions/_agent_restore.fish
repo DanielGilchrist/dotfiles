@@ -15,10 +15,7 @@ function _agent_restore --description "Rebuild the agents grid: ensure each live
         # Build a layout file with one pane per live session and bootstrap the meta-session via a wezterm tab.
         set -l layout_file (mktemp -t agents-restore-layout).kdl
 
-        # Prepend a one-shot toggle-pane-frames to the first pane so the
-        # meta-session shows pane borders (session-scoped; persists).
         set -l layout_args
-        set -l first 1
         for b in $branches
             set -l wp (find $HOME/worktrees -mindepth 2 -maxdepth 2 -name $b -type d 2>/dev/null | head -1)
             set -l cmd
@@ -27,10 +24,6 @@ function _agent_restore --description "Rebuild the agents grid: ensure each live
                 set cmd "cd $safe_cwd; and zj $b"
             else
                 set cmd "zj $b"
-            end
-            if test $first -eq 1
-                set cmd "zellij action toggle-pane-frames; and $cmd"
-                set first 0
             end
             set -a layout_args $b $cmd
         end
@@ -49,6 +42,18 @@ function _agent_restore --description "Rebuild the agents grid: ensure each live
             return 1
         end
         _term_emit_event agents-tab-spawned $new_pane
+
+        # Toggle pane frames ON. The user's global config has `pane_frames false`,
+        # but agent panes need titles. Poll briefly until the session is ready
+        # to accept the action — zellij needs a moment after `-n <layout>`.
+        for i in (seq 1 20)
+            if _agent_meta_exists
+                zellij --session agents action toggle-pane-frames >/dev/null 2>&1
+                break
+            end
+            sleep 0.1
+        end
+
         # No consolidate here: the layout file places panes correctly, and
         # calling consolidate before zellij has actually started would race.
         echo "agent --restore: rebuilt meta-session with "(count $branches)" agent(s)"
