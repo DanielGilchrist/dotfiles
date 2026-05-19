@@ -165,6 +165,10 @@ config.keys = {
   -- Open a new shell tab in the currently-focused agent's worktree
   keybind(keys.COMMAND_SHIFT, "e", wezterm.action_callback(agent_spawn.edit_focused)),
 
+  -- Run agent-rm on the currently-focused agent (refuses if dirty; rerun with
+  -- --force manually if you really mean it).
+  keybind(keys.COMMAND_SHIFT, "x", wezterm.action_callback(agent_spawn.remove_focused)),
+
   -- Spawn the dev-server stack rooted at the focused agent's worktree.
   -- Tears down the previous dev tab (tracked via wezterm.GLOBAL.dev_tab_id).
   keybind(keys.COMMAND_SHIFT, "r", wezterm.action_callback(commands.open_work_in_focused_agent)),

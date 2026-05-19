@@ -8,7 +8,9 @@ local wezterm = require("wezterm")
 ---@field open fun(window: Window, pane: Pane): nil
 ---@field remove fun(window: Window, pane: Pane): nil
 ---@field edit_focused fun(window: Window, pane: Pane): nil
+---@field remove_focused fun(window: Window, pane: Pane): nil
 local M = {}
+
 
 local REPOS_DIR = wezterm.home_dir .. "/Documents/repos"
 
@@ -133,22 +135,25 @@ M.remove = function(window, pane)
   }), pane)
 end
 
-M.edit_focused = function(window, pane)
+---@param window any
+---@return string|nil cwd of the focused agent pane, or nil with a toast if none
+local function focused_worktree(window)
   -- Ask zellij directly which agent pane is currently focused. The helper
   -- cross-references `current-tab-info` (focused tab) with `list-panes`
   -- (is_focused is per-tab in zellij 0.44, so we constrain by tab_id).
-  local _, out = wezterm.run_child_process({
-    resolve_fish(), "-c", "_agent_focused_worktree",
-  })
+  local _, out = wezterm.run_child_process({ resolve_fish(), "-c", "_agent_focused_worktree" })
   local cwd = out and out:gsub("%s+$", "") or ""
   if cwd == "" then
     window:toast_notification("agent", "no focused agent", nil, 2000)
-    return
+    return nil
   end
+  return cwd
+end
 
-  -- Spawn the editor directly with wezterm's cwd option — no shell wrapper
-  -- needed. wezterm records the spawn cwd on the pane, which the default tab
-  -- title format renders as "<editor> <cwd>".
+M.edit_focused = function(window, pane)
+  local cwd = focused_worktree(window)
+  if not cwd then return end
+
   -- Route through fish so the editor inherits the user's full env (PATH,
   -- shell helpers, etc.) — wezterm's spawn env is too minimal for nvim
   -- plugins that shell out to rg/fd/etc. `exec` replaces fish with the
@@ -161,6 +166,20 @@ M.edit_focused = function(window, pane)
       resolve_fish(), "-i", "-c",
       "set -q EDITOR; or set EDITOR nvim; cd " .. fish_quote(cwd) .. "; and exec $EDITOR",
     },
+  }), pane)
+end
+
+M.remove_focused = function(window, pane)
+  local cwd = focused_worktree(window)
+  if not cwd then return end
+  local branch = cwd:match("([^/]+)/?$")
+  if not branch or branch == "" then return end
+
+  -- agent-rm without --force refuses on dirty branches; user can rerun with
+  -- --force from a regular pane if needed. Tab closes when the command exits.
+  window:perform_action(wezterm.action.SpawnCommandInNewTab({
+    label = "agent-rm " .. branch,
+    args = { resolve_fish(), "-i", "-c", "agent-rm " .. fish_quote(branch) },
   }), pane)
 end
 
