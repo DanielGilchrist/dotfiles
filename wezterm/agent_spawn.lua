@@ -9,6 +9,7 @@ local wezterm = require("wezterm")
 ---@field remove fun(window: Window, pane: Pane): nil
 ---@field edit_focused fun(window: Window, pane: Pane): nil
 ---@field remove_focused fun(window: Window, pane: Pane): nil
+---@field minimise_focused fun(window: Window, pane: Pane): nil
 local M = {}
 
 
@@ -181,6 +182,14 @@ M.remove_focused = function(window, pane)
     label = "agent-rm " .. branch,
     args = { resolve_fish(), "-i", "-c", "agent-rm " .. fish_quote(branch) },
   }), pane)
+end
+
+M.minimise_focused = function(_window, _pane)
+  -- Close the meta-session pane only. The per-agent zellij session keeps
+  -- running (zj <branch> just detaches a client). Bring back with
+  -- `agent --restore` for all or `agent <name>` for one. consolidate reflows
+  -- the remaining panes so the grid stays tidy.
+  wezterm.run_child_process({ resolve_fish(), "-c", "_agent_minimise_focused" })
 end
 
 return M
