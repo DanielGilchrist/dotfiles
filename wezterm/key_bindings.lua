@@ -173,6 +173,10 @@ config.keys = {
   -- zellij session stays alive; bring back with agent --restore or agent <name>.
   keybind(keys.COMMAND_SHIFT, "h", wezterm.action_callback(agent_spawn.minimise_focused)),
 
+  -- fzf-pick a minimised agent (one that's NOT currently in the agents tab),
+  -- live-preview its viewport, run `agent <name>` to bring it back.
+  keybind(keys.COMMAND_SHIFT, "s", wezterm.action_callback(agent_spawn.attach_picker)),
+
   -- Spawn the dev-server stack rooted at the focused agent's worktree.
   -- Tears down the previous dev tab (tracked via wezterm.GLOBAL.dev_tab_id).
   keybind(keys.COMMAND_SHIFT, "r", wezterm.action_callback(commands.open_work_in_focused_agent)),

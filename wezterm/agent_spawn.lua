@@ -10,6 +10,7 @@ local wezterm = require("wezterm")
 ---@field edit_focused fun(window: Window, pane: Pane): nil
 ---@field remove_focused fun(window: Window, pane: Pane): nil
 ---@field minimise_focused fun(window: Window, pane: Pane): nil
+---@field attach_picker fun(window: Window, pane: Pane): nil
 local M = {}
 
 
@@ -84,18 +85,25 @@ M.open = function(window, pane)
 
       repo_window:perform_action(wezterm.action.PromptInputLine({
         description = "agent name (kebab-case, ≤25 chars):",
-        action = wezterm.action_callback(function(name_window, name_pane, line)
+        action = wezterm.action_callback(function(name_window, _, line)
           if not line then return end
           local name = line:match("^%s*(.-)%s*$") or ""
           if name == "" then return end
+
+          -- Resolve a fresh active pane: the pane that started this flow may
+          -- have closed in between (PromptInputLine closes its own overlay
+          -- pane on submit, and the captured `repo_pane`/`name_pane` is often
+          -- stale by here — "pane id N is not valid" otherwise).
+          local target = name_window:active_pane()
+          if not target then return end
 
           name_window:perform_action(wezterm.action.SpawnCommandInNewTab({
             -- `-i` makes `status --is-interactive` true inside fish, which is
             -- what agent.fish checks before opening nvim for the seed prompt.
             args = { resolve_fish(), "-i", "-c", build_spawn_cmd(repo_path, name) },
-          }), name_pane)
+          }), target)
         end),
-      }), repo_pane)
+      }), repo_window:active_pane())
     end),
   }), pane)
 end
@@ -190,6 +198,19 @@ M.minimise_focused = function(_window, _pane)
   -- `agent --restore` for all or `agent <name>` for one. consolidate reflows
   -- the remaining panes so the grid stays tidy.
   wezterm.run_child_process({ resolve_fish(), "-c", "_agent_minimise_focused" })
+end
+
+M.attach_picker = function(window, pane)
+  -- Spawn a temporary tab that runs the fzf session picker with live preview
+  -- of each session's viewport. On pick, runs `agent <name>` against the
+  -- selected session (re-attaches if minimised, otherwise focuses).
+  window:perform_action(wezterm.action.SpawnCommandInNewTab({
+    label = "pick agent",
+    args = {
+      resolve_fish(), "-i", "-c",
+      "set -l picked (_agent_session_picker); test -n \"$picked\"; and agent $picked",
+    },
+  }), pane)
 end
 
 return M
