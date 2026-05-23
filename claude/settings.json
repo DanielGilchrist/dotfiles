@@ -159,7 +159,7 @@
     "rust-analyzer-lsp@claude-plugins-official": true,
     "lua-lsp@claude-plugins-official": true
   },
-  "effortLevel": "medium",
+  "effortLevel": "xhigh",
   "claudeMdExcludes": [
     "CLAUDE.md",
     ".claude/CLAUDE.md",
