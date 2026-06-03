@@ -1,10 +1,9 @@
 function _agent_session_picker --description "fzf-pick a per-agent zellij session that's currently NOT shown in the agents tab. Preview shows the session's current viewport."
-    # All live per-agent zellij sessions (long-form list-sessions, strip ANSI,
-    # drop EXITED, drop the meta-session itself).
-    set -l live (zellij list-sessions 2>/dev/null \
-        | sed 's/\x1b\[[0-9;]*m//g' \
-        | awk '!/EXITED/ {print $1}' \
-        | string match -v -- agents)
+    # `list-sessions` marks sessions EXITED when no client is currently
+    # attached, even if the server is alive. Use the short-form name list
+    # instead — it includes all server-running sessions regardless of
+    # attach state — then drop the meta-session itself.
+    set -l live (zellij list-sessions -s 2>/dev/null | string match -v -- agents)
 
     if test (count $live) -eq 0
         echo "agent: no per-agent sessions" >&2

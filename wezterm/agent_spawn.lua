@@ -209,7 +209,12 @@ M.attach_picker = function(window, pane)
     label = "pick agent",
     args = {
       resolve_fish(), "-i", "-c",
-      "set -l picked (_agent_session_picker); echo \"picked=[$picked]\"; test -n \"$picked\"; and fish -c \"agent $picked\" &; disown; echo press enter; read",
+      -- After picking, find the matching worktree and run `agent` from
+      -- inside it (agent.fish needs a git repo to resolve --repo). Run
+      -- synchronously so the picker tab stays alive for agent's mux ops
+      -- (refocus of the calling pane); a short sleep at the end lets the
+      -- mux flush before the tab tears down.
+      "set -l picked (_agent_session_picker); test -n \"$picked\"; and set -l wt (find $HOME/worktrees -mindepth 2 -maxdepth 2 -name $picked -type d 2>/dev/null | head -1); test -n \"$wt\"; and cd $wt; and agent $picked; sleep 0.5",
     },
   }), pane)
 end
