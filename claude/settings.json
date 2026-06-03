@@ -157,7 +157,8 @@
   "enabledPlugins": {
     "ruby-lsp@claude-plugins-official": true,
     "rust-analyzer-lsp@claude-plugins-official": true,
-    "lua-lsp@claude-plugins-official": true
+    "lua-lsp@claude-plugins-official": true,
+    "developer-tooling@tanda-plugins": true
   },
   "effortLevel": "xhigh",
   "claudeMdExcludes": [
