@@ -306,7 +306,22 @@ end
 M.open_work_in_focused_agent = function(window, pane)
   local cwd = focused_agent_worktree(window)
   if not cwd then return end
-  open_work_environment(regions.US, "cd " .. fish_quote(cwd))(window, pane)
+
+  window:perform_action(wezterm.action.InputSelector({
+    title = "Region for dev tabs",
+    choices = {
+      { label = "[US] (default)", id = regions.US },
+      { label = "[EU]",           id = regions.EU },
+      { label = "[APAC]",         id = regions.APAC },
+    },
+    fuzzy = true,
+    action = wezterm.action_callback(function(inner_window, _, region)
+      if not region then return end
+      local target = inner_window:active_pane()
+      if not target then return end
+      open_work_environment(region, "cd " .. fish_quote(cwd))(inner_window, target)
+    end),
+  }), pane)
 end
 
 M.register_commands = function()

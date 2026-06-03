@@ -202,13 +202,14 @@ end
 
 M.attach_picker = function(window, pane)
   -- Spawn a temporary tab that runs the fzf session picker with live preview
-  -- of each session's viewport. On pick, runs `agent <name>` against the
-  -- selected session (re-attaches if minimised, otherwise focuses).
+  -- of each session's viewport. On pick, fires `agent <name>` detached so
+  -- the picker tab can close immediately — otherwise the tab teardown races
+  -- agent's mux operations and the new pane never lands in the meta-session.
   window:perform_action(wezterm.action.SpawnCommandInNewTab({
     label = "pick agent",
     args = {
       resolve_fish(), "-i", "-c",
-      "set -l picked (_agent_session_picker); test -n \"$picked\"; and agent $picked",
+      "set -l picked (_agent_session_picker); echo \"picked=[$picked]\"; test -n \"$picked\"; and fish -c \"agent $picked\" &; disown; echo press enter; read",
     },
   }), pane)
 end

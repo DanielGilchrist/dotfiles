@@ -37,11 +37,15 @@ M.open = function(window, pane)
     title = "Select worktree",
     choices = list_worktrees(),
     fuzzy = true,
-    action = wezterm.action_callback(function(inner_window, inner_pane, id, _label)
+    action = wezterm.action_callback(function(inner_window, _, id)
       if not id then return end
+      -- The InputSelector overlay pane is torn down before this fires; use
+      -- the window's current active pane as the perform_action target.
+      local target = inner_window:active_pane()
+      if not target then return end
       inner_window:perform_action(
         wezterm.action.SpawnCommandInNewTab({ cwd = id }),
-        inner_pane
+        target
       )
     end),
   }), pane)
