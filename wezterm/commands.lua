@@ -134,24 +134,28 @@ end
 ---@param cd_command string
 ---@return string
 local function dev_tab_title(region, cd_command)
-  -- For `cd <path>` (worktree variant), use the directory name so the tab
-  -- title makes it obvious which worktree the stack is rooted in. For `cdt`
-  -- and other shell aliases, fall back to the region.
+  -- Always prefix with region so two dev tabs in different regions are
+  -- visually distinct. For `cd <path>` (worktree variant), append the
+  -- directory name so the title makes it obvious which worktree the stack
+  -- is rooted in.
   local path = cd_command:match("^cd%s+(.+)$")
   if path then
     path = path:gsub("^['\"]", ""):gsub("['\"]$", "")
     local basename = path:match("([^/]+)/?$")
-    if basename and basename ~= "" then return "dev:" .. basename end
+    if basename and basename ~= "" then return "dev:" .. region .. ":" .. basename end
   end
   return "dev:" .. region
 end
 
----Close the previously-spawned dev tab if it's still alive. We track it by
----tab_id in wezterm.GLOBAL.dev_tab_id rather than scanning titles, so we don't
----accidentally clobber a tab the user manually renamed to "dev".
+---Close the previously-spawned dev tab for <region> if it's still alive.
+---Tracked per-region via wezterm.GLOBAL.dev_tab_id_by_region so each region
+---gets its own dev tab — spawning a US tab won't tear down an existing EU
+---tab, and vice versa.
 ---@param window any wezterm Window
-local function close_existing_dev_tab(window)
-  local tab_id = wezterm.GLOBAL.dev_tab_id
+---@param region string
+local function close_existing_dev_tab(window, region)
+  local by_region = wezterm.GLOBAL.dev_tab_id_by_region or {}
+  local tab_id = by_region[region]
   if not tab_id then return end
   for _, tab in ipairs(window:mux_window():tabs()) do
     if tab:tab_id() == tab_id then
@@ -161,7 +165,8 @@ local function close_existing_dev_tab(window)
       break
     end
   end
-  wezterm.GLOBAL.dev_tab_id = nil
+  by_region[region] = nil
+  wezterm.GLOBAL.dev_tab_id_by_region = by_region
 end
 
 ---@param original_window any
@@ -178,7 +183,9 @@ local function spawn_dev_tab(original_window, region, cd_command)
 
     local new_tab, server_pane, window = original_window:mux_window():spawn_tab({})
     new_tab:set_title(dev_tab_title(region, cd_command))
-    wezterm.GLOBAL.dev_tab_id = new_tab:tab_id()
+    local by_region = wezterm.GLOBAL.dev_tab_id_by_region or {}
+    by_region[region] = new_tab:tab_id()
+    wezterm.GLOBAL.dev_tab_id_by_region = by_region
 
     local gui_window = window:gui_window()
     require("utils.tab").move_to_first(gui_window, server_pane)
@@ -224,20 +231,25 @@ local function spawn_dev_tab(original_window, region, cd_command)
     run_command(worker_pane, commands.Worker)
 end
 
----Re-entrant wrapper around spawn_dev_tab. Refuses while a spawn is in flight
----(open_work_environment yields at every wait_for_text, so a second key
----trigger would otherwise race the first and write commands to dead panes).
+---Re-entrant wrapper around spawn_dev_tab. Refuses while a spawn is in
+---flight for the same region (open_work_environment yields at every
+---wait_for_text, so two same-region spawns would race and clobber each
+---other's panes). Different regions can spawn in parallel.
 local function open_work_environment(region, cd_command)
   return function(original_window, _original_pane, _line)
-    if wezterm.GLOBAL.dev_spawn_in_progress then
-      original_window:toast_notification("dev", "dev tab is already spawning — wait for it to finish", nil, 2500)
+    local in_progress = wezterm.GLOBAL.dev_spawn_in_progress_by_region or {}
+    if in_progress[region] then
+      original_window:toast_notification("dev", "dev tab for " .. region .. " is already spawning — wait for it to finish", nil, 2500)
       return
     end
 
-    close_existing_dev_tab(original_window)
-    wezterm.GLOBAL.dev_spawn_in_progress = true
+    close_existing_dev_tab(original_window, region)
+    in_progress[region] = true
+    wezterm.GLOBAL.dev_spawn_in_progress_by_region = in_progress
     local ok, err = pcall(spawn_dev_tab, original_window, region, cd_command)
-    wezterm.GLOBAL.dev_spawn_in_progress = false
+    in_progress = wezterm.GLOBAL.dev_spawn_in_progress_by_region or {}
+    in_progress[region] = nil
+    wezterm.GLOBAL.dev_spawn_in_progress_by_region = in_progress
     if not ok then error(err) end
   end
 end
@@ -306,6 +318,14 @@ end
 M.open_work_in_focused_agent = function(window, pane)
   local cwd = focused_agent_worktree(window)
   if not cwd then return end
+
+  -- Dev-server commands (bin/dev, bin/tunnel, cdt) are payaus-only. Refuse
+  -- for worktrees under any other repo.
+  local repo = cwd:match("/worktrees/([^/]+)/[^/]+/?$")
+  if repo ~= "payaus" then
+    window:toast_notification("dev", "dev server is payaus-only (focused: " .. (repo or "?") .. ")", nil, 3000)
+    return
+  end
 
   window:perform_action(wezterm.action.InputSelector({
     title = "Region for dev tabs",
