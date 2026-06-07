@@ -15,6 +15,7 @@ return {
       { "<leader>u", group = "UI" },
       { "<leader>w", group = "What", icon = "󱍋" },
       { "<leader>wt", group = "the" },
+      { "<leader><Tab>", group = "Tabs" },
       { "<leader>-", icon = { icon = "󰤻", color = "blue" } },
       { "<leader>/", icon = { icon = "󱈇", color = "blue" } },
       { "<leader>|", icon = { icon = "󰤼", color = "blue" } },

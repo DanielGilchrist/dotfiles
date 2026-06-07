@@ -14,7 +14,9 @@ function M.list_sessions()
   local out = {}
   for line in (res.stdout or ""):gmatch("[^\n]+") do
     local trimmed = vim.trim(line)
-    if trimmed ~= "" then table.insert(out, trimmed) end
+    -- Hide the `agents` meta-session — it's a multi-pane viewport, not
+    -- something you want to attach to from inside nvim.
+    if trimmed ~= "" and trimmed ~= "agents" then table.insert(out, trimmed) end
   end
   return out
 end

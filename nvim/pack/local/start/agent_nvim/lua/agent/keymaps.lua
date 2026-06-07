@@ -14,14 +14,14 @@ function M.register(prefix)
   vim.keymap.set({ "n", "x" }, prefix, "", { desc = "+agent" })
 
   vim.keymap.set({ "n", "i", "t", "x" }, "<C-.>", function() agent().toggle() end, { desc = "agent: toggle active", silent = true })
+  vim.keymap.set({ "n", "i", "t", "x" }, "<C-,>", function() agent().toggle_composer() end, { desc = "agent: toggle composer", silent = true })
 
-  map("n", function() agent().new_agent() end, "new")
+  map("n", function() agent().new_agent() end, "new (worktree)")
+  map("s", function() agent().new_repo_session() end, "new (repo cwd)")
   map("o", function() agent().open_or_pick() end, "open/pick")
-  map("s", function() agent().send_file() end, "send file ref")
-  map("v", function() agent().send_visual() end, "send selection", "x")
+  map("v", function() agent().send_visual() end, "comment on selection", "x")
   map("p", function() agent().send_prompt() end, "prompt")
-  map("t", function() agent().switch_target() end, "switch target")
-  map("k", function() agent().kill_target() end, "kill target")
+  map("k", function() agent().kill_agent() end, "kill agent")
 end
 
 return M

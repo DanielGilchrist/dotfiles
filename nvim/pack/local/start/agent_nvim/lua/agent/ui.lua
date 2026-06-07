@@ -66,21 +66,93 @@ function M.new_prompt(on_submit)
   vim.cmd("startinsert")
 end
 
+local NEW_AGENT_LABEL = "✦ new agent (this worktree)"
+
+---Snacks picker over agent items with ANSI viewport preview per session
+---(via `_agent_session_dump`). Falls back to `vim.ui.select` if Snacks
+---isn't available — no preview, but the picker still works.
+---@param opts {title: string, items: {text: string, name?: string, is_new?: boolean}[], on_pick: fun(item?: {text: string, name?: string, is_new?: boolean})}
+local function pick_with_preview(opts)
+  if Snacks and Snacks.picker then
+    Snacks.picker.pick({
+      source = "agent_sessions",
+      title = opts.title,
+      items = opts.items,
+      format = function(item) return { { item.text } } end,
+      preview = function(ctx)
+        if not ctx.item.name then
+          ctx.preview:set_title(ctx.item.text)
+          ctx.preview:set_lines({})
+          return
+        end
+        ctx.preview:set_title(ctx.item.name)
+        return Snacks.picker.preview.cmd(
+          { "fish", "-c", "_agent_session_dump " .. vim.fn.shellescape(ctx.item.name) },
+          ctx
+        )
+      end,
+      confirm = function(picker, item)
+        picker:close()
+        vim.schedule(function() opts.on_pick(item) end)
+      end,
+    })
+    return
+  end
+
+  ---@type string[]
+  local labels = {}
+  for _, item in ipairs(opts.items) do table.insert(labels, item.text) end
+  vim.ui.select(labels, { prompt = opts.title }, function(_, idx)
+    opts.on_pick(idx and opts.items[idx] or nil)
+  end)
+end
+
 ---@param opts {include_new?: boolean, on_pick: fun(name: string|nil, is_new: boolean)}
 function M.pick_session(opts)
   local sessions = zellij.list_sessions()
-  ---@type string[]
-  local items = {}
-  if opts.include_new then table.insert(items, "✦ new agent (this worktree)") end
-  for _, s in ipairs(sessions) do table.insert(items, s) end
+  if #sessions == 0 and not opts.include_new then
+    opts.on_pick(nil, false)
+    return
+  end
 
-  vim.ui.select(items, { prompt = "agent session" }, function(choice, idx)
-    if not choice or not idx then return opts.on_pick(nil, false) end
-    if opts.include_new and idx == 1 then
-      return opts.on_pick(nil, true)
-    end
-    opts.on_pick(choice, false)
-  end)
+  ---@type {text: string, name: string|nil, is_new: boolean}[]
+  local items = {}
+  if opts.include_new then
+    table.insert(items, { text = NEW_AGENT_LABEL, is_new = true })
+  end
+  for _, s in ipairs(sessions) do
+    table.insert(items, { text = s, name = s, is_new = false })
+  end
+
+  pick_with_preview({
+    title = "agent session",
+    items = items,
+    on_pick = function(item)
+      if not item then return opts.on_pick(nil, false) end
+      opts.on_pick(item.name, item.is_new == true)
+    end,
+  })
+end
+
+---@param opts {current?: string, on_pick: fun(name?: string)}
+function M.pick_kill(opts)
+  local sessions = zellij.list_sessions()
+  if #sessions == 0 then opts.on_pick(nil) return end
+
+  ---@type {text: string, name: string}[]
+  local items = {}
+  if opts.current and vim.tbl_contains(sessions, opts.current) then
+    table.insert(items, { text = ("(current) %s"):format(opts.current), name = opts.current })
+  end
+  for _, s in ipairs(sessions) do
+    if s ~= opts.current then table.insert(items, { text = s, name = s }) end
+  end
+
+  pick_with_preview({
+    title = "kill agent",
+    items = items,
+    on_pick = function(item) opts.on_pick(item and item.name or nil) end,
+  })
 end
 
 return M

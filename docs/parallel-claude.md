@@ -111,21 +111,28 @@ non-fish shell, invoke via `fish -c '...'`.
    - Session exists, meta-pane exists → focuses; if `-e/--seed` is also
      provided, the prompt is injected into the running Claude.
 
-## Neovim keybinds (`agent_nvim` plugin, `<leader>z`)
+## Neovim keybinds (`agent_nvim` plugin, `<leader>a`)
 
 The neovim plugin talks to per-agent (Layer-1) sessions directly — it
-doesn't know or care about the meta-session.
+doesn't know or care about the meta-session. The `agents` meta-session
+is filtered out of pickers.
 
 | Key | Action |
 |---|---|
-| `<leader>zn` | New agent: prompt for name, then a multi-line prompt buffer. `<C-s>` submits. |
-| `<leader>zo` | Open/focus the agent for the current worktree. If none, picker over running sessions. |
-| `<leader>zs` | Send the current buffer's path as `@<abs-path>` to the targeted session. |
-| `<leader>zv` (visual) | Send visual selection. |
-| `<leader>zp` | Single-line prompt → submit. |
-| `<leader>zt` | Switch the buffer-local target session. |
-| `<leader>zk` | Force-kill the targeted session. |
-| `<C-.>` (n/i/t/x) | Toggle the active session's terminal. |
+| `<leader>an` | New worktree agent: name prompt → multi-line seed buffer (`<C-s>` submits) → `agent <name> --seed …`. |
+| `<leader>as` | New repo session: spawn / attach a claude session rooted at the current repo, named after the repo basename. No prompts. |
+| `<leader>ao` | Open/focus the agent for the current worktree. If none, picker over running sessions. |
+| `<leader>af` | Send the current buffer's path as `@<abs-path>` to the targeted session. |
+| `<leader>av` (visual) | Send visual selection. |
+| `<leader>ap` | Single-line prompt → submit. |
+| `<leader>ak` | Force-kill agent (picker) — runs `agent-rm --force` and closes its tab. |
+| `<C-.>` (n/i/t/x) | Toggle between the agent tab and wherever you were. |
+
+Each agent opens in its own nvim tab page with `tcd` set to the worktree
+cwd, a Snacks dashboard on the left, and the zellij attach terminal on
+the right. Your main work tab is unaffected. Switch between tabs with
+`gt`/`gT` or the `<leader><Tab>` group (`l` for a picker, `r` to rename,
+`n`/`p`/`x`/`t`/`o` for next/prev/close/new/only).
 
 ## Typical flow
 

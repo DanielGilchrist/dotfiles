@@ -82,6 +82,8 @@
       "Bash(false)",
       "Bash(rm /tmp/agent-seed-*)",
       "Bash(rm /tmp/seed-*)",
+      "Bash(trash /tmp/agent-seed-*)",
+      "Bash(trash /tmp/seed-*)",
       "Bash(git push*)",
       "Bash(* 2>/dev/null)",
       "Bash(* >/dev/null)",

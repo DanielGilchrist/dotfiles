@@ -15,7 +15,10 @@ return {
   },
   {
     "echasnovski/mini.tabline",
-    opts = { tabpage_section = "none" },
+    -- `tabpage_section = "right"` adds a compact tab-page indicator next to
+    -- the buffer tabline so multiple vim tabs are visible at a glance
+    -- (e.g. when agent_nvim opens an agent in its own tab page).
+    opts = { tabpage_section = "right" },
     config = function(_, opts)
       require("mini.tabline").setup(opts)
       set_tabline_highlights()
