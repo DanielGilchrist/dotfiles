@@ -65,7 +65,22 @@ keys.SHIFT_ALT = combine(keys.SHIFT, keys.ALT)
 config.keys = {
   keybind(keys.COMMAND_SHIFT, "r", "ReloadConfiguration"),
 
-  keybind(keys.COMMAND, "t", wezterm.action.SpawnTab("CurrentPaneDomain")),
+  keybind(keys.COMMAND, "t", wezterm.action_callback(function(window, pane)
+    -- On the agents tab, spawn the new tab in the focused agent's worktree
+    -- rather than the meta-session pane's cwd (which is just HOME).
+    -- Everywhere else, behave like the default SpawnTab.
+    local active = window:active_tab()
+    local on_agents = active and active:tab_id() == wezterm.GLOBAL.agents_tab_id
+    if on_agents then
+      local _, out = wezterm.run_child_process({ "/opt/homebrew/bin/fish", "-c", "_agent_focused_worktree" })
+      local cwd = out and out:gsub("%s+$", "") or ""
+      if cwd ~= "" then
+        window:perform_action(wezterm.action.SpawnCommandInNewTab({ cwd = cwd }), pane)
+        return
+      end
+    end
+    window:perform_action(wezterm.action.SpawnTab("CurrentPaneDomain"), pane)
+  end)),
   keybind(keys.COMMAND_SHIFT, "n", wezterm.action.SpawnWindow),
 
   keybind(keys.COMMAND_SHIFT, "f", wezterm.action_callback(function(window, pane)
