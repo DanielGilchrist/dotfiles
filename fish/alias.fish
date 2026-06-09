@@ -11,6 +11,7 @@ alias tanda_cli="$PERSONAL_DIR/tanda_cli/bin/tanda_cli"
 alias tcli=tanda_cli
 alias poke_search="$PERSONAL_DIR/poke_search/target/release/poke_search"
 alias pks=poke_search
+alias thefug="$PERSONAL_DIR/thefug/target/release/thefug"
 alias shoo="$PERSONAL_DIR/shoo/bin/shoo"
 alias ghp="shoo notification purge"
 alias linear="$PERSONAL_DIR/linear-tui/target/release/linear-tui"
