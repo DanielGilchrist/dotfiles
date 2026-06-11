@@ -99,8 +99,9 @@
       "WebSearch"
     ],
     "deny": [],
-    "defaultMode": "acceptEdits"
+    "defaultMode": "auto"
   },
+  "model": "claude-fable-5[1m]",
   "disabledMcpjsonServers": [
     "chrome-devtools"
   ],
@@ -182,6 +183,11 @@
         "-y",
         "@circleci/mcp-server-circleci@latest"
       ]
+    },
+    "sentry-server": {
+      "type": "http",
+      "url": "https://mcp.sentry.dev/mcp"
     }
-  }
+  },
+  "skipAutoPermissionPrompt": true
 }
