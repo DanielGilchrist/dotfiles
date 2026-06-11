@@ -315,18 +315,11 @@ local function focused_agent_worktree(window)
   return cwd
 end
 
-M.open_work_in_focused_agent = function(window, pane)
-  local cwd = focused_agent_worktree(window)
-  if not cwd then return end
-
-  -- Dev-server commands (bin/dev, bin/tunnel, cdt) are payaus-only. Refuse
-  -- for worktrees under any other repo.
-  local repo = cwd:match("/worktrees/([^/]+)/[^/]+/?$")
-  if repo ~= "payaus" then
-    window:toast_notification("dev", "dev server is payaus-only (focused: " .. (repo or "?") .. ")", nil, 3000)
-    return
-  end
-
+---Pop the region picker, then run open_work_environment with cd_command.
+---@param window any
+---@param pane any
+---@param cd_command string
+local function pick_region_and_spawn(window, pane, cd_command)
   window:perform_action(wezterm.action.InputSelector({
     title = "Region for dev tabs",
     choices = {
@@ -339,10 +332,48 @@ M.open_work_in_focused_agent = function(window, pane)
       if not region then return end
       local target = inner_window:active_pane()
       if not target then return end
-      open_work_environment(region, "cd " .. fish_quote(cwd))(inner_window, target)
+      open_work_environment(region, cd_command)(inner_window, target)
     end),
   }), pane)
 end
+
+M.open_work_in_focused_agent = function(window, pane)
+  local cwd = focused_agent_worktree(window)
+  if not cwd then return end
+
+  -- Dev-server commands (bin/dev, bin/tunnel, cdt) are payaus-only. Refuse
+  -- for worktrees under any other repo.
+  local repo = cwd:match("/worktrees/([^/]+)/[^/]+/?$")
+  if repo ~= "payaus" then
+    window:toast_notification("dev", "dev server is payaus-only (focused: " .. (repo or "?") .. ")", nil, 3000)
+    return
+  end
+
+  pick_region_and_spawn(window, pane, "cd " .. fish_quote(cwd))
+end
+
+-- Listen for `agent-spawn-dev=<cwd>` user-var (emitted by nvim) and trigger
+-- the same region-picker + spawn flow as CMD+Shift+R. If <cwd> is under
+-- ~/worktrees/<payaus>/* we cd into the worktree; otherwise we fall back
+-- to `cdt`. Other repos are refused (dev server is payaus-only).
+wezterm.on("user-var-changed", function(window, pane, name, value)
+  if name ~= "agent-spawn-dev" then return end
+  local cwd = value or ""
+  local home = wezterm.home_dir
+  local worktree_root = home .. "/worktrees/"
+  local cd_command
+  if cwd:sub(1, #worktree_root) == worktree_root then
+    local repo = cwd:match("/worktrees/([^/]+)/[^/]+/?$")
+    if repo ~= "payaus" then
+      window:toast_notification("dev", "dev server is payaus-only (got: " .. (repo or "?") .. ")", nil, 3000)
+      return
+    end
+    cd_command = "cd " .. fish_quote(cwd)
+  else
+    cd_command = commands.CDT
+  end
+  pick_region_and_spawn(window, pane, cd_command)
+end)
 
 M.register_commands = function()
   wezterm.on("augment-command-palette", function(_window, _pane)
