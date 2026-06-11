@@ -17,7 +17,6 @@ return {
       { "<leader>ap", desc = "prompt" },
       { "<leader>ak", desc = "kill agent" },
       { "<C-.>", mode = { "n", "i", "t", "x" }, desc = "agent: toggle" },
-      { "<C-,>", mode = { "n", "i", "t", "x" }, desc = "agent: toggle composer" },
     },
     cmd = { "AgentNew", "AgentNewSession", "AgentOpen", "AgentPrompt", "AgentKill" },
   }),

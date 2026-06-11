@@ -130,6 +130,37 @@ map("n", leader("mt"), function() playback("play-pause") end, { desc = "Toggle p
 map("n", leader("mf"), function() playback({ "seek", "10000" }) end, { desc = "Fast-forward 10s" })
 map("n", leader("mb"), function() playback({ "seek", "--", "-10000" }) end, { desc = "Rewind 10s" })
 
+-- Toggle zoom + focus on any terminal window in the current tab. From any
+-- window: jump to the first terminal, max it, drop into insert mode. Press
+-- again: rebalance the splits and restore focus to where you came from.
+local term_zoom_state = nil ---@type {prev_win: integer}|nil
+vim.keymap.set({ "n", "i", "t", "x" }, "<C-,>", function()
+  if term_zoom_state then
+    vim.cmd("stopinsert")
+    vim.cmd("wincmd =")
+    if term_zoom_state.prev_win and vim.api.nvim_win_is_valid(term_zoom_state.prev_win) then
+      vim.api.nvim_set_current_win(term_zoom_state.prev_win)
+    end
+    term_zoom_state = nil
+    return
+  end
+
+  local term_win
+  for _, win in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
+    if vim.bo[vim.api.nvim_win_get_buf(win)].buftype == "terminal" then
+      term_win = win
+      break
+    end
+  end
+  if not term_win then return end
+
+  term_zoom_state = { prev_win = vim.api.nvim_get_current_win() }
+  vim.api.nvim_set_current_win(term_win)
+  vim.cmd("resize")
+  vim.cmd("vertical resize")
+  vim.cmd("startinsert")
+end, { desc = "Toggle terminal zoom + focus", silent = true })
+
 local terminal_state = { last = nil }
 
 map("t", "<C-;>", function()

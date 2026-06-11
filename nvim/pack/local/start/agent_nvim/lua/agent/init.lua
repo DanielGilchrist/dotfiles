@@ -14,6 +14,7 @@ M.config = config
 ---on TabClosed so it can't go stale.
 ---@type table<integer, string>
 M.tab_agents = {}
+M.agent_terminals = {} ---@type table<string, table> Snacks terminal objects by agent name
 ---Most recently focused agent, used by `<C-.>` toggle and as a fallback
 ---send target from non-agent tabs.
 ---@type string|nil
@@ -96,6 +97,24 @@ function M.send_prompt()
   composer.show()
 end
 
+---Send a single-digit choice (1-9) + submit to the active agent. Covers
+---claude's Yes/No and broader multi-choice prompts uniformly.
+---@param n integer
+function M.send_choice(n) M.send_text(tostring(n), true) end
+
+---Spawn a dev-server tab in wezterm for the current tab's cwd. Wezterm
+---pops a region picker and runs the same `[REGION] Open work tabs` flow as
+---CMD+Shift+R. Worktrees under ~/worktrees/<repo>/* cd into the worktree;
+---other cwds fall back to `cdt`.
+function M.spawn_dev()
+  local cwd = vim.fn.getcwd()
+  local payload = vim.base64.encode(cwd)
+  -- OSC 1337 SetUserVar — wezterm fires `user-var-changed` with the decoded
+  -- value, where our commands.lua listener takes over.
+  io.stdout:write(("\27]1337;SetUserVar=agent-spawn-dev=%s\7"):format(payload))
+  io.stdout:flush()
+end
+
 function M.toggle_composer()
   composer.toggle()
 end
@@ -147,7 +166,16 @@ function M.attach_in_terminal(name, opts)
 
   if not needs_new_tab then
     M.last_attached = name
-    Snacks.terminal(cmd, { win = { position = "right" }, auto_close = false })
+    M.tab_agents[vim.api.nvim_get_current_tabpage()] = name
+    -- Use `Snacks.terminal.open` (not the callable shorthand which is
+    -- actually `toggle`) so calling this twice never hides what we just
+    -- opened. Reuse an existing handle if we already created one.
+    local existing = M.agent_terminals[name]
+    if existing and existing.buf and vim.api.nvim_buf_is_valid(existing.buf) then
+      if not existing:win_valid() then existing:show() end
+    else
+      M.agent_terminals[name] = Snacks.terminal.open(cmd, { win = { position = "right" }, auto_close = false })
+    end
     vim.schedule(function()
       vim.cmd("wincmd h")
       vim.cmd("stopinsert")
@@ -169,21 +197,30 @@ function M.attach_in_terminal(name, opts)
     })
   end
 
-  Snacks.terminal(cmd, { win = { position = "right" }, auto_close = false })
+  local existing = M.agent_terminals[name]
+  if existing and existing.buf and vim.api.nvim_buf_is_valid(existing.buf) then
+    if not existing:win_valid() then existing:show() end
+  else
+    M.agent_terminals[name] = Snacks.terminal.open(cmd, { win = { position = "right" }, auto_close = false })
+  end
   vim.schedule(function()
     vim.cmd("wincmd h")
     vim.cmd("stopinsert")
   end)
 end
 
----Toggle between the agent tab and wherever you were. If you're in an
----agent tab, jump back. If you're not and you have a last-attached agent
----with a live tab, jump to it. Otherwise fall through to the picker.
+---Hide/show the current tab's agent terminal. snacks.win:toggle() handles
+---the buf-preserving hide and the reopen, so we don't accidentally spawn
+---a duplicate shell. Outside an agent tab, fall back to last-attached or
+---the picker.
 function M.toggle()
-  if current_agent() then
-    vim.cmd("tabprevious")
+  local agent = current_agent()
+  local term = agent and M.agent_terminals[agent]
+  if term and term.buf and vim.api.nvim_buf_is_valid(term.buf) then
+    term:toggle()
     return
   end
+
   if M.last_attached then
     local tab = tab_for_agent(M.last_attached)
     if tab then
@@ -355,8 +392,10 @@ function M.kill_agent()
   end)
 end
 
+local agent_augroup = vim.api.nvim_create_augroup("agent_nvim_tabs", { clear = true })
+
 vim.api.nvim_create_autocmd("TabClosed", {
-  group = vim.api.nvim_create_augroup("agent_nvim_tabs", { clear = true }),
+  group = agent_augroup,
   callback = function(args)
     local tabid = tonumber(args.file) -- nvim 0.10+ passes the closed tab number
     if tabid then M.tab_agents[tabid] = nil end
@@ -364,6 +403,35 @@ vim.api.nvim_create_autocmd("TabClosed", {
     for id in pairs(M.tab_agents) do
       if not vim.api.nvim_tabpage_is_valid(id) then M.tab_agents[id] = nil end
     end
+  end,
+})
+
+-- If the user `:wq`s their way out and the only thing left in an agent tab
+-- is the terminal pane, close the terminal too (which closes the tab).
+-- Without this you get stranded on a fullscreen terminal with no way back
+-- to the editor.
+vim.api.nvim_create_autocmd("WinClosed", {
+  group = agent_augroup,
+  callback = function()
+    vim.schedule(function()
+      for tab, _ in pairs(M.tab_agents) do
+        if vim.api.nvim_tabpage_is_valid(tab) then
+          local term_wins, non_term = {}, 0
+          for _, win in ipairs(vim.api.nvim_tabpage_list_wins(tab)) do
+            if vim.bo[vim.api.nvim_win_get_buf(win)].buftype == "terminal" then
+              table.insert(term_wins, win)
+            else
+              non_term = non_term + 1
+            end
+          end
+          if non_term == 0 and #term_wins > 0 then
+            for _, win in ipairs(term_wins) do
+              pcall(vim.api.nvim_win_close, win, true)
+            end
+          end
+        end
+      end
+    end)
   end,
 })
 
