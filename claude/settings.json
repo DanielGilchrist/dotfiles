@@ -101,7 +101,7 @@
     "deny": [],
     "defaultMode": "auto"
   },
-  "model": "claude-fable-5[1m]",
+  "model": "opus[1m]",
   "disabledMcpjsonServers": [
     "chrome-devtools"
   ],
@@ -170,6 +170,7 @@
     ".claude/rules/**",
     "AGENTS.md"
   ],
+  "skipAutoPermissionPrompt": true,
   "defaultMode": "acceptEdits",
   "additionalDirectories": [
     "~/Documents/repos",
@@ -188,6 +189,5 @@
       "type": "http",
       "url": "https://mcp.sentry.dev/mcp"
     }
-  },
-  "skipAutoPermissionPrompt": true
+  }
 }
