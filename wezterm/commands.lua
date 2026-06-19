@@ -352,15 +352,19 @@ M.open_work_in_focused_agent = function(window, pane)
   pick_region_and_spawn(window, pane, "cd " .. fish_quote(cwd))
 end
 
--- Listen for `agent-spawn-dev=<cwd>` user-var (emitted by nvim) and trigger
--- the same region-picker + spawn flow as CMD+Shift+R. If <cwd> is under
+-- Listen for `agent-spawn-dev=<region>|<cwd>` (emitted by nvim with the
+-- region already chosen via vim.ui.select). If <cwd> is under
 -- ~/worktrees/<payaus>/* we cd into the worktree; otherwise we fall back
 -- to `cdt`. Other repos are refused (dev server is payaus-only).
 wezterm.on("user-var-changed", function(window, pane, name, value)
   if name ~= "agent-spawn-dev" then return end
-  local cwd = value or ""
-  local home = wezterm.home_dir
-  local worktree_root = home .. "/worktrees/"
+  local region, cwd = (value or ""):match("^([^|]+)|(.*)$")
+  if not region or not cwd then
+    window:toast_notification("dev", "agent-spawn-dev: malformed payload", nil, 3000)
+    return
+  end
+
+  local worktree_root = wezterm.home_dir .. "/worktrees/"
   local cd_command
   if cwd:sub(1, #worktree_root) == worktree_root then
     local repo = cwd:match("/worktrees/([^/]+)/[^/]+/?$")
@@ -372,7 +376,8 @@ wezterm.on("user-var-changed", function(window, pane, name, value)
   else
     cd_command = commands.CDT
   end
-  pick_region_and_spawn(window, pane, cd_command)
+
+  open_work_environment(region, cd_command)(window, pane)
 end)
 
 M.register_commands = function()

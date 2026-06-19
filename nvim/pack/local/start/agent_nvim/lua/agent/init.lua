@@ -108,11 +108,13 @@ function M.send_choice(n) M.send_text(tostring(n), true) end
 ---other cwds fall back to `cdt`.
 function M.spawn_dev()
   local cwd = vim.fn.getcwd()
-  local payload = vim.base64.encode(cwd)
-  -- OSC 1337 SetUserVar — wezterm fires `user-var-changed` with the decoded
-  -- value, where our commands.lua listener takes over.
-  io.stdout:write(("\27]1337;SetUserVar=agent-spawn-dev=%s\7"):format(payload))
-  io.stdout:flush()
+  vim.ui.select({ "us", "eu", "apac" }, { prompt = "Region for dev tabs:" }, function(region)
+    if not region then return end
+    -- Payload is `<region>|<cwd>` — wezterm's listener splits on the first
+    -- pipe and skips its own region picker since we pre-decided.
+    local payload = region .. "|" .. cwd
+    vim.system({ "fish", "-c", "_term_emit_event agent-spawn-dev " .. vim.fn.shellescape(payload) })
+  end)
 end
 
 function M.toggle_composer()
