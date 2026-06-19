@@ -144,8 +144,17 @@ function agent-rm --description "Tear down an agent: worktree + zellij session +
         end
     end
 
-    # Close the meta-session pane (so its `zellij attach` exits cleanly), then
-    # if its tab is now empty, close the tab. Per-agent session killed below.
+    # Kill the per-agent session FIRST so the meta-pane's `zellij attach`
+    # client exits on its own. Doing it after close-pane races with zellij's
+    # session-state cleanup and sometimes leaves a resurrection-candidate
+    # behind (the symptom: agent-rm needs a second invocation to fully
+    # clear). --force first kills the running server, then a follow-up
+    # plain delete-session sweeps any resurrection cache it left.
+    zellij delete-session --force $branch 2>/dev/null
+    zellij delete-session $branch 2>/dev/null
+
+    # Now clean up the meta-session pane (the `zellij attach` client there
+    # has already exited; we're just removing the empty pane).
     if _agent_meta_exists
         set -l info (zellij --session agents action list-panes --json 2>/dev/null \
             | jq -r --arg n "$branch" '.[] | select(.is_plugin | not) | select(.title == $n) | "terminal_\(.id) \(.tab_id)"' 2>/dev/null \
@@ -162,7 +171,6 @@ function agent-rm --description "Tear down an agent: worktree + zellij session +
         _agent_consolidate
     end
 
-    zellij delete-session --force $branch 2>/dev/null
     rm -f /tmp/agent-state-$branch 2>/dev/null
 
     echo "agent-rm: removed $branch"
