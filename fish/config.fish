@@ -42,5 +42,5 @@ set -gx tide_character_vi_icon_default "❯"
 
 export PATH="$HOME/.local/bin:$PATH"
 
-thefug init | source
+thefug init fish | source
 tanda_cli completions fish | source
