@@ -10,9 +10,18 @@ function _agent_write_meta_layout --description "Write a meta-session bootstrap 
     set -l pair_count (math (count $entries) / 2)
     set -l tab_count (math --scale=0 "($pair_count + $per_tab - 1) / $per_tab")
 
+    # `borderless=true` hides the pane frame. We can't easily make the
+    # plugin pane "unselectable" inline, but the layout's `focus=true` on
+    # the first agent pane below ensures focus starts there and doesn't
+    # land on the indicator (which would otherwise leak the wasm path
+    # into the wezterm tab title).
     set -l indicator "pane size=1 borderless=true { plugin location=\"file:$HOME/.config/zellij/plugins/dist/agents-bar.wasm\"; }"
 
     echo "layout {" > $file
+
+    # Track the very first agent pane across all tabs so we can mark it as
+    # the layout's initial focus (keeps focus off the indicator plugin).
+    set -l first_agent_emitted 0
 
     for t in (seq 1 $tab_count)
         set -l start (math "($t - 1) * $per_tab + 1")
@@ -34,7 +43,12 @@ function _agent_write_meta_layout --description "Write a meta-session bootstrap 
         echo "        $indicator" >> $file
 
         if test $n -eq 1
-            _agent_emit_pane $file $branches[1] $cmds[1] "        "
+            if test $first_agent_emitted -eq 0
+                _agent_emit_pane --focus $file $branches[1] $cmds[1] "        "
+                set first_agent_emitted 1
+            else
+                _agent_emit_pane $file $branches[1] $cmds[1] "        "
+            end
         else
             # Row-major 2-column grid: odd-indexed panes fill the left column,
             # even-indexed fill the right. Visually:
@@ -48,7 +62,12 @@ function _agent_write_meta_layout --description "Write a meta-session bootstrap 
             # Left column: panes at positions 1, 3, 5...
             echo "            pane split_direction=\"horizontal\" {" >> $file
             for i in (seq 1 2 $n)
-                _agent_emit_pane $file $branches[$i] $cmds[$i] "                "
+                if test $first_agent_emitted -eq 0
+                    _agent_emit_pane --focus $file $branches[$i] $cmds[$i] "                "
+                    set first_agent_emitted 1
+                else
+                    _agent_emit_pane $file $branches[$i] $cmds[$i] "                "
+                end
             end
             echo "            }" >> $file
 

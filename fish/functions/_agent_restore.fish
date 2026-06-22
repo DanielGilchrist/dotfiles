@@ -15,15 +15,25 @@ function _agent_restore --description "Rebuild the agents grid: ensure each live
         # Build a layout file with one pane per live session and bootstrap the meta-session via a wezterm tab.
         set -l layout_file (mktemp -t agents-restore-layout).kdl
 
+        # If the per-agent zellij session is gone (server didn't survive
+        # whatever — reboot, kill, etc.), the resurrection cache puts panes
+        # into a "Waiting to run" stub. Wipe that and pass `claude --continue`
+        # as the initial pane command so the agent picks up its latest
+        # conversation in the worktree automatically.
+        set -l claude_cmd "claude --continue --permission-mode acceptEdits"
+
         set -l layout_args
         for b in $branches
             set -l wp (find $HOME/worktrees -mindepth 2 -maxdepth 2 -name $b -type d 2>/dev/null | head -1)
+            # Drop any stale resurrection cache so `zj` creates fresh with
+            # claude as the first pane rather than resurrecting a stub.
+            set -l prep "zellij delete-session $b 2>/dev/null; or true"
             set -l cmd
             if test -n "$wp"
                 set -l safe_cwd (string escape -- $wp)
-                set cmd "cd $safe_cwd; and zj $b"
+                set cmd "cd $safe_cwd; and $prep; and zj $b -- $claude_cmd"
             else
-                set cmd "zj $b"
+                set cmd "$prep; and zj $b -- $claude_cmd"
             end
             set -a layout_args $b $cmd
         end
