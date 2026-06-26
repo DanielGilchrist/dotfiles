@@ -86,6 +86,7 @@ claude/telemetry/
 claude/todos/
 claude/image-cache/
 claude/.last-update-result.json
+claude/jobs
 
 # Misc
 arkrc

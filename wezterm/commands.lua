@@ -363,6 +363,7 @@ wezterm.on("user-var-changed", function(window, pane, name, value)
     window:toast_notification("dev", "agent-spawn-dev: malformed payload", nil, 3000)
     return
   end
+  window:toast_notification("dev", ("recv region=%s cwd=%s"):format(region, cwd), nil, 3000)
 
   local worktree_root = wezterm.home_dir .. "/worktrees/"
   local cd_command

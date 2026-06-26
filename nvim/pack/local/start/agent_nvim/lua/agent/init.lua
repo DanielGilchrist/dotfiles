@@ -110,10 +110,18 @@ function M.spawn_dev()
   local cwd = vim.fn.getcwd()
   vim.ui.select({ "us", "eu", "apac" }, { prompt = "Region for dev tabs:" }, function(region)
     if not region then return end
-    -- Payload is `<region>|<cwd>` — wezterm's listener splits on the first
-    -- pipe and skips its own region picker since we pre-decided.
-    local payload = region .. "|" .. cwd
-    vim.system({ "fish", "-c", "_term_emit_event agent-spawn-dev " .. vim.fn.shellescape(payload) })
+    -- Write the OSC to nvim's stderr channel — wezterm reads OSC sequences
+    -- from there. /dev/tty doesn't work when nvim has no ctty (e.g. spawned
+    -- via Snacks.terminal/jobstart), but `chansend(v:stderr, …)` does.
+    -- Pattern lifted from vim-oscyank.
+    local b64 = vim.base64.encode(region .. "|" .. cwd)
+    local osc = ("\27]1337;SetUserVar=agent-spawn-dev=%s\7"):format(b64)
+    local sent = vim.fn.chansend(vim.v.stderr, osc) > 0
+    if sent then
+      notify("spawn-dev: sent region=" .. region)
+    else
+      notify("spawn-dev: chansend to stderr failed", vim.log.levels.ERROR)
+    end
   end)
 end
 
