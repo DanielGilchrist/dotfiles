@@ -1,7 +1,7 @@
 .DS_STORE
 
 irb/irb_history
-shoo/config.yml
+shoo/
 youtube-tui
 tfenv
 swiftpm/
