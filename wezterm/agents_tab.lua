@@ -69,7 +69,9 @@ end
 local function pin_with_retry(window)
   local function try()
     local agents = find_agents(window)
-    if agents then pin_to_zero(window, agents); return true end
+    if agents then
+      pin_to_zero(window, agents); return true
+    end
     return false
   end
   if not try() then wezterm.time.call_after(0.3, try) end
@@ -102,7 +104,9 @@ M.toggle = wezterm.action_callback(function(window)
   local fallback
   for _, t in ipairs(window:mux_window():tabs()) do
     if not is_agents(t) then
-      if t:tab_id() == prev_id then t:activate(); return end
+      if t:tab_id() == prev_id then
+        t:activate(); return
+      end
       fallback = fallback or t
     end
   end
@@ -121,12 +125,14 @@ local function cycle(direction)
     local active_id = active and active:tab_id() or nil
     local current
     for i, t in ipairs(tabs) do
-      if t:tab_id() == active_id then current = i; break end
+      if t:tab_id() == active_id then
+        current = i; break
+      end
     end
 
     local target = current
-      and ((current - 1 + direction) % #tabs) + 1
-      or (direction > 0 and 1 or #tabs)
+        and ((current - 1 + direction) % #tabs) + 1
+        or (direction > 0 and 1 or #tabs)
     tabs[target]:activate()
   end)
 end
@@ -142,7 +148,9 @@ local function move(direction)
     local tabs = window:mux_window():tabs()
     local idx
     for i, t in ipairs(tabs) do
-      if t:tab_id() == active:tab_id() then idx = i - 1; break end
+      if t:tab_id() == active:tab_id() then
+        idx = i - 1; break
+      end
     end
     if not idx then return end
 
@@ -171,13 +179,12 @@ end
 
 M.refuse = refuse
 
-local CLOSE_MSG = "agents tab — use `agent-rm` to remove individual agents"
-local SPLIT_MSG = "agents tab — pane splits disabled (single zellij viewport)"
-M.close_pane = refuse(wezterm.action({ CloseCurrentPane = { confirm = false } }), CLOSE_MSG)
+local CLOSE_MSG = "agents tab - use `agent-rm` to remove individual agents"
+M.close_pane = wezterm.action({ CloseCurrentPane = { confirm = false } })
 M.close_tab = refuse(wezterm.action({ CloseCurrentTab = { confirm = false } }), CLOSE_MSG)
-M.split_horizontal = refuse(wezterm.action({ SplitHorizontal = { domain = "CurrentPaneDomain" } }), SPLIT_MSG)
-M.split_vertical = refuse(wezterm.action({ SplitVertical = { domain = "CurrentPaneDomain" } }), SPLIT_MSG)
-M.split_right_35 = refuse(wezterm.action({ SplitPane = { direction = "Right", size = { Percent = 35 } } }), SPLIT_MSG)
+M.split_horizontal = wezterm.action({ SplitHorizontal = { domain = "CurrentPaneDomain" } })
+M.split_vertical = wezterm.action({ SplitVertical = { domain = "CurrentPaneDomain" } })
+M.split_right_35 = wezterm.action({ SplitPane = { direction = "Right", size = { Percent = 35 } } })
 
 local function is_dev(tab)
   local id = wezterm.GLOBAL.dev_tab_id
@@ -188,7 +195,7 @@ end
 
 local function format_tab_title(tab, _, _, config)
   local title = tab.tab_title and tab.tab_title ~= "" and tab.tab_title
-    or (tab.active_pane and tab.active_pane.title or "")
+      or (tab.active_pane and tab.active_pane.title or "")
 
   if is_agents(tab) then
     local active = config.colors and config.colors.tab_bar and config.colors.tab_bar.active_tab or {}
