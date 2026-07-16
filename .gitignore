@@ -66,6 +66,7 @@ claude/.credentials.json
 claude/remote-settings.json
 claude/backups/
 claude/cache/
+claude/daemon/
 claude/debug/
 claude/downloads/
 claude/file-history/
