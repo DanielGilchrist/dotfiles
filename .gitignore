@@ -67,6 +67,7 @@ claude/remote-settings.json
 claude/backups/
 claude/cache/
 claude/daemon/
+claude/daemon*
 claude/debug/
 claude/downloads/
 claude/file-history/
@@ -74,6 +75,7 @@ claude/history.jsonl
 claude/ide/
 claude/mcp-needs-auth-cache.json
 claude/paste-cache/
+claude/plans
 claude/plugins/
 claude/policy-limits.json
 claude/projects/
