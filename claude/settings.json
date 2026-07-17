@@ -163,7 +163,7 @@
     "lua-lsp@claude-plugins-official": true,
     "developer-tooling@tanda-plugins": true
   },
-  "effortLevel": "xhigh",
+  "effortLevel": "medium",
   "claudeMdExcludes": [
     "CLAUDE.md",
     ".claude/CLAUDE.md",
