@@ -126,8 +126,8 @@ is filtered out of pickers.
 | `<leader>ap` | Single-line prompt → submit. |
 | `<leader>ak` | Force-kill agent (picker) — runs `agent-rm --force` and closes its tab. |
 | `<leader>ar` | **+review**: the review sub-group (all review keys live here). |
-| `<leader>arr` | Start / stop review. On start, pick a mode (working tree / branch / since a commit) → inline unified diff (unified.nvim). Prompts before discarding pending comments. |
-| `<leader>arf` | Fuzzy-pick a changed file (diff preview); `<CR>` opens it into the inline diff, `<a-m>` marks it reviewed in place. |
+| `<leader>arr` | Start / stop review. On start, pick a mode (working tree / branch / since a commit) → inline unified diff (unified.nvim), or resume a review left open from a previous session. Prompts before discarding pending comments. |
+| `<leader>arf` | Fuzzy-pick a changed file (diff preview); `<CR>` opens it into the inline diff, `<a-m>` marks it reviewed and jumps to the next file. |
 | `<leader>arm` | Mark / unmark the current file as reviewed (progress readout). Reviewed files show ✓ and sink to the bottom of the file picker. |
 | `<leader>arc` (n/x) | Add a comment on the current line / selection (review mode only). |
 | `<leader>arl` | Jump to a pending comment: picker with preview, opens the file into the diff at the comment. |
@@ -187,6 +187,12 @@ send comments straight to the running session.
 
 While a review is active the statusline shows `review N/M · K✎` (files
 marked reviewed out of changed, and pending comments).
+
+A review (base, comments, marked files) is saved on exit and restored per
+repo: if you close nvim mid-review, the next `<leader>arr` in that repo
+offers to resume it. Stopping a review clears its saved state. While the
+comment editor is open, the lines you're commenting on are highlighted in
+the buffer above (`config.review.editing_hl`).
 
 `config.review` (in `agent/config.lua`) tunes it: `base` (`"fork"` |
 `"head"`) sets which mode the picker preselects, `delivery` (`"file"` |

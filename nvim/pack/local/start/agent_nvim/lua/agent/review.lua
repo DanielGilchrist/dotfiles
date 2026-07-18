@@ -4,6 +4,7 @@ local ui = require("agent.ui")
 local M = {}
 
 local ns = vim.api.nvim_create_namespace("agent_review")
+local edit_ns = vim.api.nvim_create_namespace("agent_review_editing")
 
 ---@class ReviewComment
 ---@field id integer
@@ -23,6 +24,7 @@ M._next_id = 1
 M._base = nil ---@type string|nil
 M._total = 0
 M._active = false
+M._root = nil ---@type string|nil
 ---@type table<string, boolean>
 M.reviewed = {}
 
@@ -131,6 +133,48 @@ local function list_changed(root, base)
   return items
 end
 
+---@param root string
+---@return string
+local function state_path(root)
+  return vim.fn.stdpath("data") .. "/agent_review/" .. (root:gsub("[/\\]", "%%")) .. ".json"
+end
+
+---@param root string
+---@return table|nil
+local function read_state(root)
+  local fd = io.open(state_path(root), "r")
+  if not fd then return nil end
+  local raw = fd:read("*a")
+  fd:close()
+  local ok, data = pcall(vim.json.decode, raw)
+  if ok and type(data) == "table" then return data end
+  return nil
+end
+
+---@param root string
+local function clear_state(root)
+  pcall(vim.fn.delete, state_path(root))
+end
+
+---@param buf integer
+---@param s integer
+---@param e integer
+local function highlight_range(buf, s, e)
+  local last = vim.api.nvim_buf_line_count(buf) - 1
+  for l = s, e do
+    local row = math.min(l - 1, last)
+    pcall(vim.api.nvim_buf_set_extmark, buf, edit_ns, row, 0, {
+      line_hl_group = rcfg().editing_hl or "Visual",
+      priority = 20000,
+    })
+  end
+end
+
+---@param buf integer
+local function clear_highlight(buf)
+  pcall(vim.api.nvim_buf_clear_namespace, buf, edit_ns, 0, -1)
+end
+
 ---@param file string
 ---@param base string|nil
 ---@param pos? integer[]
@@ -181,6 +225,7 @@ end
 ---@param label string
 local function open_review(root, base, label)
   M._active = true
+  M._root = root
   M._base = base
   M._total = #list_changed(root, base)
   vim.cmd("Unified " .. base)
@@ -268,6 +313,21 @@ function M.start()
   local root = repo_root(vim.api.nvim_buf_get_name(0))
   if not root then return notify("not in a git repo", vim.log.levels.WARN) end
 
+  local saved = read_state(root)
+  if saved then
+    vim.ui.select({ "resume", "start fresh" }, {
+      prompt = ("Resume review? %d comment(s), %d file(s) marked"):format(#(saved.comments or {}), #(saved.reviewed or {})),
+    }, function(choice)
+      if choice == "resume" then
+        M.resume(root, saved)
+      elseif choice == "start fresh" then
+        clear_state(root)
+        M.pick_mode(root)
+      end
+    end)
+    return
+  end
+
   M.pick_mode(root)
 end
 
@@ -311,8 +371,10 @@ function M.changed_files(root, base)
     actions = {
       agent_toggle_reviewed = function(picker, item)
         if not item then return end
-        M.reviewed[item.file] = (not M.reviewed[item.file]) or nil
+        local now = not M.reviewed[item.file]
+        M.reviewed[item.file] = now or nil
         picker:refresh()
+        if now then picker.list:move(1) end
       end,
     },
     win = {
@@ -426,6 +488,7 @@ function M.add_comment(opts)
   local ft = vim.bo[buf].filetype
   local loc = e > s and ("%s:%d-%d"):format(relpath, s, e) or ("%s:%d"):format(relpath, s)
 
+  highlight_range(buf, s, e)
   ui.new_prompt(function(text)
     text = vim.trim(text)
     if text == "" then return end
@@ -445,7 +508,11 @@ function M.add_comment(opts)
     M.comments[#M.comments + 1] = c
     M._render(c)
     notify(("comment added (%d pending)"):format(#M.comments))
-  end, { title = (" review: %s   (<C-s> submit, q cancel) "):format(loc), split = true })
+  end, {
+    title = (" review: %s   (<C-s> submit, q cancel) "):format(loc),
+    split = true,
+    on_close = function() clear_highlight(buf) end,
+  })
 end
 
 ---@param c ReviewComment
@@ -480,13 +547,19 @@ function M.edit_comment()
     if c.bufnr == buf then
       local s = current_lnum(c)
       if line >= s and line <= s + c.nlines - 1 then
+        highlight_range(buf, s, s + c.nlines - 1)
         ui.new_prompt(function(text)
           text = vim.trim(text)
           if text == "" then return end
           c.text = text
           M._render(c)
           notify("comment updated")
-        end, { title = (" edit comment: %s   (<C-s> save, q cancel) "):format(c.relpath), initial = c.text, split = true })
+        end, {
+          title = (" edit comment: %s   (<C-s> save, q cancel) "):format(c.relpath),
+          initial = c.text,
+          split = true,
+          on_close = function() clear_highlight(buf) end,
+        })
         return
       end
     end
@@ -697,11 +770,72 @@ function M.submit()
   preview_send(#M.comments)
 end
 
+function M._save_state()
+  if not (M._active and M._root) then return end
+  local prefix = M._root .. "/"
+  ---@type string[]
+  local reviewed = {}
+  for file in pairs(M.reviewed) do
+    if vim.startswith(file, prefix) then reviewed[#reviewed + 1] = file:sub(#prefix + 1) end
+  end
+  ---@type table[]
+  local comments = {}
+  for _, c in ipairs(M.comments) do
+    comments[#comments + 1] = {
+      relpath = c.relpath, ft = c.ft, lnum = current_lnum(c),
+      nlines = c.nlines, code = c.code, text = c.text,
+    }
+  end
+  local path = state_path(M._root)
+  vim.fn.mkdir(vim.fn.fnamemodify(path, ":h"), "p")
+  local fd = io.open(path, "w")
+  if fd then
+    fd:write(vim.json.encode({ base = M._base, reviewed = reviewed, comments = comments }))
+    fd:close()
+  end
+end
+
+---@param root string
+---@param data table
+function M.resume(root, data)
+  M._active = true
+  M._root = root
+  M._base = data.base
+  M._total = #list_changed(root, data.base)
+  M.reviewed = {}
+  for _, rel in ipairs(data.reviewed or {}) do M.reviewed[root .. "/" .. rel] = true end
+  M.comments = {}
+  for _, s in ipairs(data.comments or {}) do
+    M.comments[#M.comments + 1] = {
+      id = M._next_id,
+      file = root .. "/" .. s.relpath,
+      relpath = s.relpath,
+      ft = s.ft,
+      lnum = s.lnum,
+      nlines = s.nlines,
+      code = s.code,
+      text = s.text,
+    }
+    M._next_id = M._next_id + 1
+  end
+  vim.cmd("Unified " .. data.base)
+  for _, c in ipairs(M.comments) do
+    local b = vim.fn.bufnr(c.file)
+    if b ~= -1 and vim.api.nvim_buf_is_loaded(b) then
+      c.bufnr = b
+      M._render(c)
+    end
+  end
+  notify(("resumed review (%d comment(s))"):format(#M.comments))
+end
+
 function M.reset()
   pcall(vim.cmd, "Unified reset")
+  if M._root then clear_state(M._root) end
   M._base = nil
   M._total = 0
   M._active = false
+  M._root = nil
   M.reviewed = {}
   M.clear()
   notify("review ended")
@@ -720,6 +854,11 @@ vim.api.nvim_create_autocmd("BufWinEnter", {
       end
     end
   end,
+})
+
+vim.api.nvim_create_autocmd("VimLeavePre", {
+  group = aug,
+  callback = function() M._save_state() end,
 })
 
 return M

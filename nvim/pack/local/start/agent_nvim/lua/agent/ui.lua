@@ -6,7 +6,7 @@ local zellij = require("agent.zellij")
 local M = {}
 
 ---@param on_submit fun(text: string)
----@param opts? {title?: string, initial?: string, split?: boolean, height?: integer}
+---@param opts? {title?: string, initial?: string, split?: boolean, height?: integer, on_close?: fun()}
 function M.new_prompt(on_submit, opts)
   opts = opts or {}
   local title = opts.title or " new agent prompt: <C-s> submit, q/<C-c> cancel "
@@ -21,12 +21,16 @@ function M.new_prompt(on_submit, opts)
 
   ---@type integer|nil
   local win_id
+  local closed = false
 
   local function close()
+    if closed then return end
+    closed = true
     if win_id and vim.api.nvim_win_is_valid(win_id) then
       vim.api.nvim_win_close(win_id, true)
     end
     win_id = nil
+    if opts.on_close then opts.on_close() end
   end
 
   local function submit()

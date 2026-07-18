@@ -24,6 +24,7 @@ local M = {
     icon = "▌",
     virt_hl = "Comment",
     range_hl = nil,
+    editing_hl = "Visual",
   },
 }
 
