@@ -11,7 +11,35 @@ end
 return {
   {
     "echasnovski/mini.statusline",
-    opts = {},
+    opts = {
+      content = {
+        active = function()
+          local S = require("mini.statusline")
+          local mode, mode_hl = S.section_mode({ trunc_width = 120 })
+          local git = S.section_git({ trunc_width = 40 })
+          local diff = S.section_diff({ trunc_width = 75 })
+          local diagnostics = S.section_diagnostics({ trunc_width = 75 })
+          local lsp = S.section_lsp({ trunc_width = 75 })
+          local filename = S.section_filename({ trunc_width = 140 })
+          local fileinfo = S.section_fileinfo({ trunc_width = 120 })
+          local location = S.section_location({ trunc_width = 75 })
+          local search = S.section_searchcount({ trunc_width = 75 })
+          local ok, review = pcall(function() return require("agent.review").status() end)
+          review = (ok and review) or ""
+
+          return S.combine_groups({
+            { hl = mode_hl, strings = { mode } },
+            { hl = "MiniStatuslineDevinfo", strings = { git, diff, diagnostics, lsp } },
+            "%<",
+            { hl = "MiniStatuslineFilename", strings = { filename } },
+            "%=",
+            { hl = "MiniStatuslineDevinfo", strings = { review } },
+            { hl = "MiniStatuslineFileinfo", strings = { fileinfo } },
+            { hl = mode_hl, strings = { search, location } },
+          })
+        end,
+      },
+    },
   },
   {
     "echasnovski/mini.tabline",

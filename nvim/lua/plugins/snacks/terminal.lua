@@ -14,23 +14,6 @@ local function open_terminal(opts)
   Snacks.terminal(nil, merged_opts)
 end
 
-local function find_sidekick_terminal(buf)
-  local ok, State = pcall(require, "sidekick.cli.state")
-  if not ok then
-    return nil
-  end
-
-  local states = State.get({ attached = true, terminal = true })
-  for _, state in ipairs(states) do
-    local terminal = state.terminal
-    if terminal and terminal.buf == buf then
-      return terminal
-    end
-  end
-
-  return nil
-end
-
 local function find_snacks_terminal(buf)
   for _, terminal in pairs(Snacks.terminal.list()) do
     if terminal.buf == buf then
@@ -43,25 +26,6 @@ end
 
 local function toggle_terminal_zoom()
   local buf = vim.api.nvim_get_current_buf()
-
-  local sidekick = find_sidekick_terminal(buf)
-  if sidekick then
-    if sidekick:is_open() then
-      sidekick:hide()
-    end
-
-    if sidekick.opts.layout == "float" then
-      sidekick.opts.layout = "right"
-    else
-      sidekick.opts.layout = "float"
-    end
-
-    vim.schedule(function()
-      sidekick:show()
-      sidekick:focus()
-    end)
-    return
-  end
 
   local snacks = find_snacks_terminal(buf)
   if snacks then

@@ -6,13 +6,19 @@ local zellij = require("agent.zellij")
 local M = {}
 
 ---@param on_submit fun(text: string)
-function M.new_prompt(on_submit)
+---@param opts? {title?: string, initial?: string, split?: boolean, height?: integer}
+function M.new_prompt(on_submit, opts)
+  opts = opts or {}
+  local title = opts.title or " new agent prompt: <C-s> submit, q/<C-c> cancel "
+
   local buf = vim.api.nvim_create_buf(false, true)
   vim.bo[buf].filetype = "markdown"
   vim.bo[buf].buftype = "nofile"
   vim.bo[buf].bufhidden = "wipe"
+  if opts.initial and opts.initial ~= "" then
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, vim.split(opts.initial, "\n", { plain = true }))
+  end
 
-  local has_snacks, Snacks = pcall(require, "snacks")
   ---@type integer|nil
   local win_id
 
@@ -30,33 +36,26 @@ function M.new_prompt(on_submit)
     if text ~= "" then on_submit(text) end
   end
 
-  if has_snacks and Snacks and Snacks.win then
-    local snacks_win = Snacks.win({
+  if opts.split then
+    vim.cmd("botright " .. (opts.height or 10) .. "split")
+    win_id = vim.api.nvim_get_current_win()
+    vim.api.nvim_win_set_buf(win_id, buf)
+    vim.wo[win_id].winbar = title
+    vim.wo[win_id].wrap = true
+    vim.wo[win_id].linebreak = true
+    vim.wo[win_id].number = false
+    vim.wo[win_id].relativenumber = false
+  else
+    win_id = require("snacks").win({
       buf = buf,
-      title = " new agent prompt — <C-s> submit, q/<C-c> cancel ",
+      title = title,
       width = 0.7,
       height = 0.5,
       border = "rounded",
-      keys = {
-        q = function() close() end,
-      },
+      keys = { q = function() close() end },
       bo = { filetype = "markdown" },
       wo = { wrap = true, linebreak = true, breakindent = true },
-    })
-    win_id = snacks_win.win
-  else
-    local width = math.floor(vim.o.columns * 0.7)
-    local height = math.floor(vim.o.lines * 0.5)
-    win_id = vim.api.nvim_open_win(buf, true, {
-      relative = "editor",
-      width = width,
-      height = height,
-      row = math.floor((vim.o.lines - height) / 2),
-      col = math.floor((vim.o.columns - width) / 2),
-      style = "minimal",
-      border = "rounded",
-      title = " new agent prompt — <C-s> submit, q/<C-c> cancel ",
-    })
+    }).win
   end
 
   local map_opts = { buffer = buf, nowait = true, silent = true }
@@ -69,42 +68,31 @@ end
 local NEW_AGENT_LABEL = "✦ new agent (this worktree)"
 
 ---Snacks picker over agent items with ANSI viewport preview per session
----(via `_agent_session_dump`). Falls back to `vim.ui.select` if Snacks
----isn't available — no preview, but the picker still works.
+---(via `_agent_session_dump`).
 ---@param opts {title: string, items: {text: string, name?: string, is_new?: boolean}[], on_pick: fun(item?: {text: string, name?: string, is_new?: boolean})}
 local function pick_with_preview(opts)
-  if Snacks and Snacks.picker then
-    Snacks.picker.pick({
-      source = "agent_sessions",
-      title = opts.title,
-      items = opts.items,
-      format = function(item) return { { item.text } } end,
-      preview = function(ctx)
-        if not ctx.item.name then
-          ctx.preview:set_title(ctx.item.text)
-          ctx.preview:set_lines({})
-          return
-        end
-        ctx.preview:set_title(ctx.item.name)
-        return Snacks.picker.preview.cmd(
-          { "fish", "-c", "_agent_session_dump " .. vim.fn.shellescape(ctx.item.name) },
-          ctx
-        )
-      end,
-      confirm = function(picker, item)
-        picker:close()
-        vim.schedule(function() opts.on_pick(item) end)
-      end,
-    })
-    return
-  end
-
-  ---@type string[]
-  local labels = {}
-  for _, item in ipairs(opts.items) do table.insert(labels, item.text) end
-  vim.ui.select(labels, { prompt = opts.title }, function(_, idx)
-    opts.on_pick(idx and opts.items[idx] or nil)
-  end)
+  Snacks.picker.pick({
+    source = "agent_sessions",
+    title = opts.title,
+    items = opts.items,
+    format = function(item) return { { item.text } } end,
+    preview = function(ctx)
+      if not ctx.item.name then
+        ctx.preview:set_title(ctx.item.text)
+        ctx.preview:set_lines({})
+        return
+      end
+      ctx.preview:set_title(ctx.item.name)
+      return Snacks.picker.preview.cmd(
+        { "fish", "-c", "_agent_session_dump " .. vim.fn.shellescape(ctx.item.name) },
+        ctx
+      )
+    end,
+    confirm = function(picker, item)
+      picker:close()
+      vim.schedule(function() opts.on_pick(item) end)
+    end,
+  })
 end
 
 ---@param opts {include_new?: boolean, on_pick: fun(name: string|nil, is_new: boolean)}

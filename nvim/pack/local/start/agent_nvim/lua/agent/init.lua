@@ -151,10 +151,6 @@ end
 ---@param name string
 ---@param opts? {cwd?: string, initial_cmd?: string}
 function M.attach_in_terminal(name, opts)
-  if not Snacks or not Snacks.terminal then
-    notify("Snacks.terminal not available", vim.log.levels.ERROR)
-    return
-  end
   opts = opts or {}
 
   local existing = tab_for_agent(name)

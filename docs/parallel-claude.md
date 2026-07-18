@@ -122,10 +122,19 @@ is filtered out of pickers.
 | `<leader>an` | New worktree agent: name prompt → multi-line seed buffer (`<C-s>` submits) → `agent <name> --seed …`. |
 | `<leader>as` | New repo session: spawn / attach a claude session rooted at the current repo, named after the repo basename. No prompts. |
 | `<leader>ao` | Open/focus the agent for the current worktree. If none, picker over running sessions. |
-| `<leader>af` | Send the current buffer's path as `@<abs-path>` to the targeted session. |
 | `<leader>av` (visual) | Send visual selection. |
 | `<leader>ap` | Single-line prompt → submit. |
 | `<leader>ak` | Force-kill agent (picker) — runs `agent-rm --force` and closes its tab. |
+| `<leader>ar` | **+review**: the review sub-group (all review keys live here). |
+| `<leader>arr` | Start / stop review. On start, pick a mode (working tree / branch / since a commit) → inline unified diff (unified.nvim). Prompts before discarding pending comments. |
+| `<leader>arf` | Fuzzy-pick a changed file (diff preview); `<CR>` opens it into the inline diff, `<a-m>` marks it reviewed in place. |
+| `<leader>arm` | Mark / unmark the current file as reviewed (progress readout). Reviewed files show ✓ and sink to the bottom of the file picker. |
+| `<leader>arc` (n/x) | Add a comment on the current line / selection (review mode only). |
+| `<leader>arl` | Jump to a pending comment: picker with preview, opens the file into the diff at the comment. |
+| `<leader>are` | Edit the comment under the cursor. |
+| `<leader>ard` | Delete the comment under the cursor. |
+| `<leader>ars` | Page through the pending comments (`]`/`[`), then `<C-s>` to send all to the active agent and clear. |
+| `]r` / `[r` | Jump to the next / previous change in the inline diff (review mode). |
 | `<C-.>` (n/i/t/x) | Toggle between the agent tab and wherever you were. |
 
 Each agent opens in its own nvim tab page with `tcd` set to the worktree
@@ -133,6 +142,55 @@ cwd, a Snacks dashboard on the left, and the zellij attach terminal on
 the right. Your main work tab is unaffected. Switch between tabs with
 `gt`/`gT` or the `<leader><Tab>` group (`l` for a picker, `r` to rename,
 `n`/`p`/`x`/`t`/`o` for next/prev/close/new/only).
+
+## Reviewing an agent's work
+
+The local, iterative alternative to the PR round-trip. Lives in
+`agent_nvim/lua/agent/review.lua`; you review on real, LSP-live buffers and
+send comments straight to the running session.
+
+1. Open the agent whose work you want to review (`<leader>ao` for a
+   worktree agent puts you in its tab, `tcd`'d into the worktree).
+2. `<leader>arr` starts review. It first asks which **mode**, i.e. what base
+   to diff your working tree against:
+   - **Working tree**: uncommitted changes only (base `HEAD`).
+   - **Branch**: everything since the fork point (`merge-base HEAD
+     origin/HEAD`); hidden on the trunk, where it's meaningless.
+   - **Since a commit…**: pick a commit from a log picker; shows everything
+     after it (to review one commit, pick its parent on a clean tree).
+   The default is preselected (from `config.review.base`), `<cr>` accepts.
+   It then renders an **inline unified diff** (unified.nvim) of the current
+   file vs that base: removed lines in red, added in green, in sequence,
+   GitHub-style, on the real syntax-highlighted buffer. (unified's own file
+   tree is disabled in `plugins/unified.lua`; `<leader>arf` is the file
+   navigator instead.) `<leader>arr` again stops review (prompts first if
+   comments are still pending, since it discards them).
+3. `<leader>arf` opens a snacks fuzzy picker over the changed files (with a
+   diff preview) as a nicer alternative to the tree; `<CR>` opens one into
+   the inline diff. `<leader>arm` (in a buffer) or `<a-m>` (inside the
+   picker) marks a file reviewed: it gets a ✓ and sinks to the bottom of the
+   picker (nothing is hidden), so the cursor always lands on the next
+   unreviewed file. Good for large reviews; marks clear when you stop.
+4. Read the code like normal: full LSP, jump to definition, edit, run.
+5. `<leader>arc` on a line (or over a visual selection) → type a note in the
+   floating editor. It's anchored with an extmark (tracks edits) and shown
+   as a gutter sign + virtual note. `<leader>arl` lists them, `<leader>are`
+   edits, and `<leader>ard` deletes the one under the cursor. `]r` / `[r`
+   jump between changes in the diff. Only allowed while review is active.
+6. `<leader>ars` opens a paginated preview: one comment per page, `]`/`[`
+   (or `<Tab>`/`<S-Tab>`) to move through them, `<C-s>` to send all, `q` to
+   cancel. On send it writes all comments (file:line + quoted code + note)
+   to `.agent-review.md` at the repo root, adds it to `.git/info/exclude`,
+   and tells the active agent to read it and work through each one. Comments
+   clear. (Set `config.review.delivery = "inline"` to push the markdown
+   straight into the prompt instead.)
+
+While a review is active the statusline shows `review N/M · K✎` (files
+marked reviewed out of changed, and pending comments).
+
+`config.review` (in `agent/config.lua`) tunes it: `base` (`"fork"` |
+`"head"`) sets which mode the picker preselects, `delivery` (`"file"` |
+`"inline"`), the sign/glyph/highlights, and `review_file`.
 
 ## Typical flow
 
