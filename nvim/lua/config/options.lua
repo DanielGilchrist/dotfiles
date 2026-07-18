@@ -1,5 +1,6 @@
 local opt = vim.opt
 
+opt.autoread = true
 opt.autowrite = true
 opt.clipboard = vim.env.SSH_TTY and "" or "unnamedplus"
 opt.cmdheight = 0

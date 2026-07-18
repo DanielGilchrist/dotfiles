@@ -1,7 +1,7 @@
 local autocmd = vim.api.nvim_create_autocmd
 
 -- Check if file changed outside Neovim
-autocmd({ "FocusGained", "TermClose", "TermLeave" }, {
+autocmd({ "FocusGained", "TermClose", "TermLeave", "WinEnter" }, {
   callback = function()
     if vim.o.buftype ~= "nofile" then vim.cmd("checktime") end
   end,
