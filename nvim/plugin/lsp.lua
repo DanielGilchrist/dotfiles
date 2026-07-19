@@ -139,6 +139,8 @@ vim.api.nvim_create_autocmd("LspAttach", {
       vim.b[buf].autoformat = not vim.b[buf].autoformat
       vim.notify("Autoformat (buffer): " .. (vim.b[buf].autoformat and "enabled" or "disabled"))
     end, "Toggle Autoformat (Buffer)")
+
+    require("utils.which_key").refresh_triggers(buf)
   end,
 })
 

@@ -29,6 +29,8 @@ return {
       map("n", "[H", function() gs.nav_hunk("first") end, "First Hunk")
       map("n", "<leader>gp", gs.preview_hunk, "Preview Hunk")
       map("n", "<leader>gb", function() gs.blame_line({ full = true }) end, "Blame Line")
+
+      require("utils.which_key").refresh_triggers(bufnr)
     end,
   },
 }
