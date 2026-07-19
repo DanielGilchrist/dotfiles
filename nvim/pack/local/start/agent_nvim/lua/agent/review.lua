@@ -123,13 +123,14 @@ local function list_changed(root, base)
   local tracked = git(root, { "diff", "--name-only", base }) or ""
   local untracked = git(root, { "ls-files", "--others", "--exclude-standard" }) or ""
   local seen, items = {}, {}
-  local function add(rel)
+  local function add(rel, is_untracked)
     rel = vim.trim(rel)
     if rel == "" or seen[rel] then return end
     seen[rel] = true
-    items[#items + 1] = { text = rel, file = root .. "/" .. rel }
+    items[#items + 1] = { text = rel, file = root .. "/" .. rel, untracked = is_untracked }
   end
-  for line in (tracked .. "\n" .. untracked):gmatch("[^\n]+") do add(line) end
+  for line in tracked:gmatch("[^\n]+") do add(line, false) end
+  for line in untracked:gmatch("[^\n]+") do add(line, true) end
   return items
 end
 
@@ -358,11 +359,14 @@ function M.changed_files(root, base)
       return { { "  " }, { item.text, "SnacksPickerFile" } }
     end,
     preview = function(ctx)
-      return Snacks.picker.preview.cmd(
-        { "git", "-C", root, "diff", base, "--", ctx.item.text },
-        ctx,
-        { ft = "diff" }
-      )
+      local cmd
+      if ctx.item.untracked then
+        cmd = { "sh", "-c", ("git -C %s diff --no-index -- /dev/null %s || true"):format(
+          vim.fn.shellescape(root), vim.fn.shellescape(ctx.item.text)) }
+      else
+        cmd = { "git", "-C", root, "diff", base, "--", ctx.item.text }
+      end
+      return Snacks.picker.preview.cmd(cmd, ctx, { ft = "diff" })
     end,
     confirm = function(picker, item)
       picker:close()
