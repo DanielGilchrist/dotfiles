@@ -181,9 +181,7 @@ map("n", "<C-;>", function()
   end
 end, { desc = "Toggle Terminal" })
 
--- Lazygit
 map("n", leader("gg"), function() Snacks.lazygit({ cwd = require("utils.path").root() }) end, { desc = "Lazygit" })
-
--- btop / tetris
 map("n", leader("ts"), function() Snacks.terminal.toggle("tetrigo") end, { desc = "Launch Tetris" })
 map("n", leader("bt"), function() Snacks.terminal.toggle("btop") end, { desc = "Launch btop" })
+map("n", leader("l"), function() Snacks.terminal.toggle("linear") end, { desc = "Launch Linear" })
