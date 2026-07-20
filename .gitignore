@@ -1,5 +1,6 @@
 .DS_STORE
 
+1Password
 irb/irb_history
 shoo/
 youtube-tui
@@ -61,6 +62,7 @@ cachyos*/
 cachyos-hello.json
 
 # claude
+claude/gh-pr-status-cache.json
 claude/.last-cleanup
 claude/.credentials.json
 claude/remote-settings.json
