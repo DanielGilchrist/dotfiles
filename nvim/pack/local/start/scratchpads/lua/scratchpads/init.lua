@@ -35,6 +35,15 @@ local function scratchpads_dir_not_created()
   return is.not_directory(scratchpads_dir)
 end
 
+-- Scratchpads are shared across nvim instances. A name with a live swapfile
+-- is likely open (unsaved) in another instance even if the file doesn't exist
+-- on disk yet, so treat it as taken to avoid E325 on `:edit`.
+local function swapfile_exists(filename)
+  local swap_dir = vim.fn.stdpath("state") .. "/swap/"
+  local encoded = vim.fn.fnamemodify(filename, ":p"):gsub("/", "%%")
+  return is.not_empty(vim.fn.glob(swap_dir .. encoded .. ".sw*"))
+end
+
 local function create_scratchpad(extension)
   if scratchpads_dir_not_created() then
     vim.fn.mkdir(scratchpads_dir, "p")
@@ -43,7 +52,7 @@ local function create_scratchpad(extension)
   local count = 1
   local filename = build_new_filename(count, extension)
 
-  while is.file_readable(filename) do
+  while is.file_readable(filename) or swapfile_exists(filename) do
     count = count + 1
     filename = build_new_filename(count, extension)
   end

@@ -5,7 +5,7 @@ local function add_ruby_deps_command(client, bufnr)
     local params = vim.lsp.util.make_text_document_params()
     local showAll = opts.args == "all"
 
-    client.request("rubyLsp/workspace/dependencies", params, function(error, result)
+    client:request("rubyLsp/workspace/dependencies", params, function(error, result)
       if error then
         print("Error showing deps: " .. error)
         return
@@ -54,6 +54,7 @@ return {
   cmd = lsp_utils.asdf_shim("ruby-lsp"),
   filetypes = { "ruby", "eruby" },
   root_markers = { "Gemfile", ".git" },
+  workspace_required = true,
   cmd_env = {
     RAILS_ENV = "test",
   },
