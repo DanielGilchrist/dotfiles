@@ -5,6 +5,7 @@ local wezterm = require("wezterm")
 local key_utils = require("utils.key")
 local os_utils = require("utils.os")
 local agents_tab = require("agents_tab")
+local dev_tabs = require("dev_tabs")
 local agent_spawn = require("agent_spawn")
 local commands = require("commands")
 local worktree_picker = require("worktree_picker")
@@ -63,7 +64,9 @@ keys.COMMAND_ALT = combine(keys.COMMAND, keys.ALT)
 keys.SHIFT_ALT = combine(keys.SHIFT, keys.ALT)
 
 config.keys = {
-  keybind(keys.COMMAND_SHIFT, "r", "ReloadConfiguration"),
+  -- CMD+Shift+R is taken by the dev-stack spawner below; CMD+, mirrors the
+  -- macOS settings convention. CTRL+Shift+R (wezterm default) also works.
+  keybind(keys.COMMAND, ",", "ReloadConfiguration"),
 
   keybind(keys.COMMAND, "t", wezterm.action_callback(function(window, pane)
     -- On the agents tab, spawn the new tab in the focused agent's worktree
@@ -169,6 +172,8 @@ config.keys = {
 
   -- Agents tab toggle (jump to agents / back to last tab)
   keybind(keys.COMMAND, "0", agents_tab.toggle),
+  -- Dev tab toggle (ring: last-visited dev tab → next dev tab → back)
+  keybind(keys.COMMAND, "9", dev_tabs.toggle),
   -- Pin the agents tab to position 0
   keybind(keys.COMMAND_SHIFT, "0", agents_tab.pin_to_zero),
 
@@ -193,7 +198,8 @@ config.keys = {
   keybind(keys.COMMAND_SHIFT, "s", wezterm.action_callback(agent_spawn.attach_picker)),
 
   -- Spawn the dev-server stack rooted at the focused agent's worktree.
-  -- Tears down the previous dev tab (tracked via wezterm.GLOBAL.dev_tab_id).
+  -- Tears down the previous dev tab for the same region (tracked via
+  -- wezterm.GLOBAL.dev_tab_id_by_region).
   keybind(keys.COMMAND_SHIFT, "r", wezterm.action_callback(commands.open_work_in_focused_agent)),
 }
 

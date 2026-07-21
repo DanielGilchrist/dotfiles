@@ -1,5 +1,6 @@
 local wezterm = require("wezterm")
 local notify = require("utils.notify")
+local dev_tabs = require("dev_tabs")
 
 ---@class AgentsTabModule
 ---@field TITLE string
@@ -186,13 +187,6 @@ M.split_horizontal = wezterm.action({ SplitHorizontal = { domain = "CurrentPaneD
 M.split_vertical = wezterm.action({ SplitVertical = { domain = "CurrentPaneDomain" } })
 M.split_right_35 = wezterm.action({ SplitPane = { direction = "Right", size = { Percent = 35 } } })
 
-local function is_dev(tab)
-  local id = wezterm.GLOBAL.dev_tab_id
-  if type(id) ~= "number" or tab == nil then return false end
-  local tid = type(tab.tab_id) == "function" and tab:tab_id() or tab.tab_id
-  return tid == id
-end
-
 local function format_tab_title(tab, _, _, config)
   local title = tab.tab_title and tab.tab_title ~= "" and tab.tab_title
       or (tab.active_pane and tab.active_pane.title or "")
@@ -207,7 +201,7 @@ local function format_tab_title(tab, _, _, config)
     }
   end
 
-  if is_dev(tab) then
+  if dev_tabs.is_dev(tab) then
     local active = config.colors and config.colors.tab_bar and config.colors.tab_bar.active_tab or {}
     return {
       { Background = { Color = tab.is_active and (active.bg_color or "#CBE3B3") or "#DBBC7F" } },
