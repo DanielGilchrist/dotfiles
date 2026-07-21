@@ -181,7 +181,19 @@ map("n", "<C-;>", function()
   end
 end, { desc = "Toggle Terminal" })
 
-map("n", leader("gg"), function() Snacks.lazygit({ cwd = require("utils.path").root() }) end, { desc = "Lazygit" })
+map("n", leader("gg"), function()
+  Snacks.lazygit({
+    cwd = require("utils.path").root(),
+    config = {
+      os = {
+        -- lazygit's nvim-remote preset uses --remote-tab, which opens files in a new tab page. --remote opens in the current window instead.
+        edit = 'nvim --server "$NVIM" --remote-send "q" && nvim --server "$NVIM" --remote {{filename}}',
+        editAtLine =
+        'nvim --server "$NVIM" --remote-send "q" && nvim --server "$NVIM" --remote {{filename}} && nvim --server "$NVIM" --remote-send ":{{line}}<CR>"',
+      },
+    },
+  })
+end, { desc = "Lazygit" })
 map("n", leader("ts"), function() Snacks.terminal.toggle("tetrigo") end, { desc = "Launch Tetris" })
 map("n", leader("bt"), function() Snacks.terminal.toggle("btop") end, { desc = "Launch btop" })
 map("n", leader("l"), function() Snacks.terminal.toggle("linear") end, { desc = "Launch Linear" })
