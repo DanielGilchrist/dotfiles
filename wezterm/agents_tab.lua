@@ -9,12 +9,9 @@ local dev_tabs = require("dev_tabs")
 ---@field cycle_right Action
 ---@field move_left Action
 ---@field move_right Action
----@field close_pane Action
----@field close_tab Action
 ---@field split_horizontal Action
 ---@field split_vertical Action
 ---@field split_right_35 Action
----@field refuse fun(action: Action, message: string|nil): Action
 ---@field pin_to_zero Action
 ---@field register fun(): nil
 local M = { TITLE = "agents" }
@@ -167,22 +164,6 @@ end
 M.move_left = move(-1)
 M.move_right = move(1)
 
-local function refuse(action, message)
-  local msg = message or "agents tab — operation refused"
-  return wezterm.action_callback(function(window, pane)
-    if is_agents(window:active_tab()) then
-      notify(window, "agent", msg)
-      return
-    end
-    window:perform_action(action, pane)
-  end)
-end
-
-M.refuse = refuse
-
-local CLOSE_MSG = "agents tab - use `agent-rm` to remove individual agents"
-M.close_pane = wezterm.action({ CloseCurrentPane = { confirm = false } })
-M.close_tab = refuse(wezterm.action({ CloseCurrentTab = { confirm = false } }), CLOSE_MSG)
 M.split_horizontal = wezterm.action({ SplitHorizontal = { domain = "CurrentPaneDomain" } })
 M.split_vertical = wezterm.action({ SplitVertical = { domain = "CurrentPaneDomain" } })
 M.split_right_35 = wezterm.action({ SplitPane = { direction = "Right", size = { Percent = 35 } } })

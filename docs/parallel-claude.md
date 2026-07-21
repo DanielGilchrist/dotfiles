@@ -31,7 +31,7 @@ from another wezterm tab or your phone. Same session, multiple viewers.
   so its layout survives wezterm restarts.
 - **Single `agents` wezterm tab** — one wezterm pane, running
   `zellij attach agents`. The grid lives inside zellij. `CMD+0` toggles
-  to/from this tab; `CMD+W` is refused inside it.
+  to/from this tab.
 - **Repo root resolves to the *main* worktree** so spawning from inside
   one agent's worktree does not nest under
   `~/worktrees/<branch>/<new-branch>`.
@@ -49,7 +49,7 @@ from another wezterm tab or your phone. Same session, multiple viewers.
 | `CMD+Left` / `CMD+Right` | Cycle tabs, skipping the agents tab |
 | `Shift+Alt+{` / `}` | Move tabs (refuses to move the agents tab) |
 | `CMD+Alt+h/j/k/l` (or arrows) | Wezterm pane navigation (outside the agents tab) |
-| `CMD+W` / `CMD+Shift+W` | Close pane / tab — refused on the agents tab |
+| `CMD+W` / `CMD+Shift+W` | Close pane / tab |
 
 ### Inside the agents tab (zellij's defaults)
 

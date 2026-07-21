@@ -68,22 +68,6 @@ config.keys = {
   -- macOS settings convention. CTRL+Shift+R (wezterm default) also works.
   keybind(keys.COMMAND, ",", "ReloadConfiguration"),
 
-  keybind(keys.COMMAND, "t", wezterm.action_callback(function(window, pane)
-    -- On the agents tab, spawn the new tab in the focused agent's worktree
-    -- rather than the meta-session pane's cwd (which is just HOME).
-    -- Everywhere else, behave like the default SpawnTab.
-    local active = window:active_tab()
-    local on_agents = active and active:tab_id() == wezterm.GLOBAL.agents_tab_id
-    if on_agents then
-      local _, out = wezterm.run_child_process({ "/opt/homebrew/bin/fish", "-c", "_agent_focused_worktree" })
-      local cwd = out and out:gsub("%s+$", "") or ""
-      if cwd ~= "" then
-        window:perform_action(wezterm.action.SpawnCommandInNewTab({ cwd = cwd }), pane)
-        return
-      end
-    end
-    window:perform_action(wezterm.action.SpawnTab("CurrentPaneDomain"), pane)
-  end)),
   keybind(keys.COMMAND_SHIFT, "n", wezterm.action.SpawnWindow),
 
   keybind(keys.COMMAND_SHIFT, "f", wezterm.action_callback(function(window, pane)
@@ -125,9 +109,8 @@ config.keys = {
     window:perform_action(wezterm.action({ ClearScrollback = "ScrollbackAndViewport" }), pane)
   end)),
 
-  -- CMD+W / CMD+Shift+W refuse to act on the agents tab. Use `agent-rm` to remove.
-  keybind(keys.COMMAND, "w", agents_tab.close_pane),
-  keybind(keys.COMMAND_SHIFT, "w", agents_tab.close_tab),
+  keybind(keys.COMMAND, "w", wezterm.action({ CloseCurrentPane = { confirm = false } })),
+  keybind(keys.COMMAND_SHIFT, "w", wezterm.action({ CloseCurrentTab = { confirm = false } })),
 
   keybind(keys.COMMAND, keys.ENTER, "ToggleFullScreen"),
   keybind(keys.SHIFT, keys.ENTER, wezterm.action({ SendString = "\x1b[13;2u" })),
