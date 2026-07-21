@@ -37,6 +37,7 @@ local commands = {
 ---@class (exact) Region
 ---@field APAC string
 ---@field EU string
+---@field US string
 
 ---@type Region
 local regions = {
@@ -45,21 +46,36 @@ local regions = {
   US = "us"
 }
 
+local server_success_patterns = { "Booting Puma", "Listening on http" }
+local server_failure_patterns = { "lease does not exist", "failed commit on ref", "Connection to devbox closed" }
+
+---@param func fun(pane: Pane)
+---@return fun(pane: Pane, direction: string, size?: number): Pane
 local function split_pane_with(func)
+  ---@param pane Pane
+  ---@param direction string
+  ---@param size? number
   return function(pane, direction, size)
     size = size == nil and 0.5 or size
     local new_pane = pane:split({ direction = direction, size = size })
+
     func(new_pane)
+
     return new_pane
   end
 end
 
-local function has_text(pane, ...)
-  local text = pane:get_logical_lines_as_text(pane:get_dimensions().scrollback_rows)
+---@param pane Pane
+---@return string
+local function pane_text(pane)
+  return pane:get_logical_lines_as_text(pane:get_dimensions().scrollback_rows)
+end
 
-  for i = 1, select("#", ...) do
-    local pattern = select(i, ...)
-
+---@param text string
+---@param patterns string[]
+---@return boolean
+local function find_any(text, patterns)
+  for _, pattern in ipairs(patterns) do
     if string.find(text, pattern) then
       return true
     end
@@ -68,10 +84,21 @@ local function has_text(pane, ...)
   return false
 end
 
+---@param pane Pane
+---@param ... string
+---@return boolean
+local function has_text(pane, ...)
+  return find_any(pane_text(pane), { ... })
+end
+
+---@param pane Pane
+---@param command string
 local function run_command(pane, command)
   pane:send_text(command .. "\n")
 end
 
+---@param pane Pane
+---@param ... string
 local function run_commands(pane, ...)
   local commands_table = { ... }
   local joined_command = table.concat(commands_table, " && ")
@@ -79,6 +106,8 @@ local function run_commands(pane, ...)
   run_command(pane, joined_command)
 end
 
+---@param pane Pane
+---@param ... string
 local function wait_for_text_for(pane, ...)
   while true do
     if has_text(pane, ...) then
@@ -89,14 +118,66 @@ local function wait_for_text_for(pane, ...)
   end
 end
 
+local retry_delay_ms = 2000
+
+---Run <command> and poll until a success or failure pattern shows up in
+---output produced *after* the command was sent (older scrollback — e.g. a
+---previous failed attempt — is ignored via the byte offset). On failure the
+---command is re-run until it succeeds or max_tries (default 1) is exhausted.
+---Returns true on success, false once every try has failed.
+---@param pane Pane
+---@param command string
+---@param success_patterns string[]
+---@param failure_patterns string[]
+---@param max_tries? integer
+---@return boolean
+local function run_command_and_wait(pane, command, success_patterns, failure_patterns, max_tries)
+  max_tries = max_tries or 1
+
+  for try = 1, max_tries do
+    if try > 1 then
+      wezterm.sleep_ms(retry_delay_ms)
+    end
+
+    local offset = #pane_text(pane)
+    run_command(pane, command)
+
+    while true do
+      local text = pane_text(pane):sub(offset + 1)
+
+      if find_any(text, success_patterns) then
+        return true
+      end
+
+      if find_any(text, failure_patterns) then
+        break
+      end
+
+      wezterm.sleep_ms(1000)
+    end
+  end
+
+  return false
+end
+
+---@param pane Pane
+---@return boolean
+local function start_server(pane)
+  return run_command_and_wait(pane, commands.Server, server_success_patterns, server_failure_patterns, 2)
+end
+
+---@param pane Pane
 local function clear(pane)
   pane:send_text("\x0c")
 end
 
+---@param pane Pane
+---@return boolean
 local function has_interrupted_system_call(pane)
   return has_text(pane, "cd: Interrupted system call")
 end
 
+---@param pane Pane
 local function buffered_cdt(pane)
   pane:send_text(commands.CDT)
   wezterm.sleep_ms(100)
@@ -107,10 +188,13 @@ local function wait_for_text()
   wezterm.sleep_ms(100)
 end
 
+---@param pane Pane
+---@param already_tried? boolean
+---@return boolean?
 local function handle_potential_interrupted_system_call_from_cdt(pane, already_tried)
   if has_interrupted_system_call(pane) then
     if already_tried then
-      notify(pane.window, "OpenWorkTabs", "Error! Can't continue due to issue with executing `cdt`")
+      notify(nil, "OpenWorkTabs", "Error! Can't continue due to issue with executing `cdt`")
       return true
     else
       clear(pane)
@@ -123,9 +207,11 @@ local function handle_potential_interrupted_system_call_from_cdt(pane, already_t
   end
 end
 
+---@param pane Pane
+---@return boolean?
 local function handle_missing_cdt_command(pane)
   if has_text(pane, "Unknown command") then
-    notify(pane.window, "OpenWorkTabs", "Error! Please set a `cdt` alias")
+    notify(nil, "OpenWorkTabs", "Error! Please set a `cdt` alias")
     return true
   end
 end
@@ -139,11 +225,13 @@ local function dev_tab_title(region, cd_command)
   -- directory name so the title makes it obvious which worktree the stack
   -- is rooted in.
   local path = cd_command:match("^cd%s+(.+)$")
+
   if path then
     path = path:gsub("^['\"]", ""):gsub("['\"]$", "")
     local basename = path:match("([^/]+)/?$")
     if basename and basename ~= "" then return "dev:" .. region .. ":" .. basename end
   end
+
   return "dev:" .. region
 end
 
@@ -151,111 +239,131 @@ end
 ---Tracked per-region via wezterm.GLOBAL.dev_tab_id_by_region so each region
 ---gets its own dev tab — spawning a US tab won't tear down an existing EU
 ---tab, and vice versa.
----@param window any wezterm Window
+---@param window Window
 ---@param region string
 local function close_existing_dev_tab(window, region)
   local by_region = wezterm.GLOBAL.dev_tab_id_by_region or {}
   local tab_id = by_region[region]
+
   if not tab_id then return end
+
   for _, tab in ipairs(window:mux_window():tabs()) do
     if tab:tab_id() == tab_id then
       for _, pane in ipairs(tab:panes()) do
         wezterm.run_child_process({ "/opt/homebrew/bin/wezterm", "cli", "kill-pane", "--pane-id", tostring(pane:pane_id()) })
       end
+
       break
     end
   end
+
   by_region[region] = nil
   wezterm.GLOBAL.dev_tab_id_by_region = by_region
 end
 
----@param original_window any
+---@param original_window Window
 ---@param region string
 ---@param cd_command string
 local function spawn_dev_tab(original_window, region, cd_command)
-    local use_cdt = cd_command == commands.CDT
+  local use_cdt = cd_command == commands.CDT
 
-    local function setup_pane(pane)
-      run_commands(pane, "export REGION=" .. region, cd_command)
+  local function setup_pane(pane)
+    run_commands(pane, "export REGION=" .. region, cd_command)
+  end
+
+  local split_pane_with_setup = split_pane_with(setup_pane)
+
+  local new_tab, server_pane, window = original_window:mux_window():spawn_tab({})
+  new_tab:set_title(dev_tab_title(region, cd_command))
+
+  local by_region = wezterm.GLOBAL.dev_tab_id_by_region or {}
+  by_region[region] = new_tab:tab_id()
+  wezterm.GLOBAL.dev_tab_id_by_region = by_region
+
+  local gui_window = window:gui_window()
+  require("utils.tab").move_to_first(gui_window, server_pane)
+
+  setup_pane(server_pane)
+  wait_for_text()
+
+  if use_cdt then
+    if handle_missing_cdt_command(server_pane) then
+      return
     end
 
-    local split_pane_with_setup = split_pane_with(setup_pane)
-
-    local new_tab, server_pane, window = original_window:mux_window():spawn_tab({})
-    new_tab:set_title(dev_tab_title(region, cd_command))
-    local by_region = wezterm.GLOBAL.dev_tab_id_by_region or {}
-    by_region[region] = new_tab:tab_id()
-    wezterm.GLOBAL.dev_tab_id_by_region = by_region
-
-    local gui_window = window:gui_window()
-    require("utils.tab").move_to_first(gui_window, server_pane)
-
-    setup_pane(server_pane)
-    wait_for_text()
-
-    if use_cdt then
-      if handle_missing_cdt_command(server_pane) then
-        return
-      end
-
-      if handle_potential_interrupted_system_call_from_cdt(server_pane) then
-        return
-      end
+    if handle_potential_interrupted_system_call_from_cdt(server_pane) then
+      return
     end
+  end
 
-    local console_pane = split_pane_with_setup(server_pane, pane_direction.Right)
-    local webpack_pane = split_pane_with_setup(console_pane, pane_direction.Bottom, 0.1)
-    local tunnel_pane = split_pane_with_setup(server_pane, pane_direction.Bottom, 0.1)
-    local worker_pane = split_pane_with_setup(server_pane, pane_direction.Bottom, 0.4)
+  local console_pane = split_pane_with_setup(server_pane, pane_direction.Right)
+  local webpack_pane = split_pane_with_setup(console_pane, pane_direction.Bottom, 0.1)
+  local tunnel_pane = split_pane_with_setup(server_pane, pane_direction.Bottom, 0.1)
+  local worker_pane = split_pane_with_setup(server_pane, pane_direction.Bottom, 0.4)
 
-    wait_for_text_for(tunnel_pane, "Welcome to fish")
+  wait_for_text_for(tunnel_pane, "Welcome to fish")
 
-    if region == regions.APAC or region == regions.EU then
-      run_command(tunnel_pane, commands.Start)
-      wait_for_text_for(tunnel_pane, "Your dev box", "is ready to be used")
-    end
+  if region == regions.APAC or region == regions.EU then
+    run_command(tunnel_pane, commands.Start)
+    wait_for_text_for(tunnel_pane, "Your dev box", "is ready to be used")
+  end
 
-    run_command(tunnel_pane, commands.Tunnel)
-    wait_for_text_for(tunnel_pane, "Enter your developer name:", "INFO: Ready!")
+  run_command(tunnel_pane, commands.Tunnel)
+  wait_for_text_for(tunnel_pane, "Enter your developer name:", "INFO: Ready!")
 
-    if has_text(tunnel_pane, "Enter your developer name:") then
-      run_command(tunnel_pane, "dangilchrist")
-      wait_for_text_for(tunnel_pane, "INFO: Ready!")
-    end
+  if has_text(tunnel_pane, "Enter your developer name:") then
+    run_command(tunnel_pane, "dangilchrist")
+    wait_for_text_for(tunnel_pane, "INFO: Ready!")
+  end
 
-    run_command(server_pane, commands.Server)
-    wait_for_text_for(server_pane, "Done in", "Running server at")
+  if not start_server(server_pane) then
+    notify(gui_window, "OpenWorkTabs", "Error! bin/dev server failed unexpectedly.")
+    return
+  end
 
-    run_command(webpack_pane, commands.Webpack)
-    run_command(console_pane, commands.Console)
-    run_command(worker_pane, commands.Worker)
+  run_command(webpack_pane, commands.Webpack)
+  run_command(console_pane, commands.Console)
+  run_command(worker_pane, commands.Worker)
 end
 
 ---Re-entrant wrapper around spawn_dev_tab. Refuses while a spawn is in
 ---flight for the same region (open_work_environment yields at every
 ---wait_for_text, so two same-region spawns would race and clobber each
 ---other's panes). Different regions can spawn in parallel.
+---@param region string
+---@param cd_command string
+---@return fun(original_window: Window, _original_pane?: Pane, _line?: string)
 local function open_work_environment(region, cd_command)
+  ---@param original_window Window
+  ---@param _original_pane? Pane
+  ---@param _line? string
   return function(original_window, _original_pane, _line)
     local in_progress = wezterm.GLOBAL.dev_spawn_in_progress_by_region or {}
+
     if in_progress[region] then
-      original_window:toast_notification("dev", "dev tab for " .. region .. " is already spawning — wait for it to finish", nil, 2500)
+      original_window:toast_notification("dev",
+        "dev tab for " .. region .. " is already spawning — wait for it to finish", nil, 2500)
       return
     end
 
     close_existing_dev_tab(original_window, region)
     in_progress[region] = true
     wezterm.GLOBAL.dev_spawn_in_progress_by_region = in_progress
+
     local ok, err = pcall(spawn_dev_tab, original_window, region, cd_command)
     in_progress = wezterm.GLOBAL.dev_spawn_in_progress_by_region or {}
     in_progress[region] = nil
+
     wezterm.GLOBAL.dev_spawn_in_progress_by_region = in_progress
+
     if not ok then error(err) end
   end
 end
 
+---@return { label: string, id: string }[]
 local function worktree_choices()
   local worktrees_dir = wezterm.home_dir .. "/worktrees"
+
   -- New layout: ~/worktrees/<repo>/<branch>. Find one level deep so we get
   -- every branch across every repo.
   local success, stdout, _stderr = wezterm.run_child_process({
@@ -267,6 +375,7 @@ local function worktree_choices()
   end
 
   local choices = {}
+
   for path in stdout:gmatch("[^\n]+") do
     local repo, branch = path:match("/worktrees/([^/]+)/([^/]+)$")
     if repo and branch then
@@ -277,7 +386,10 @@ local function worktree_choices()
   return choices
 end
 
+---@return fun(window: Window, pane: Pane)
 local function open_worktree_selector()
+  ---@param window Window
+  ---@param pane Pane
   return function(window, pane)
     window:perform_action(wezterm.action.InputSelector({
       title = "Select a worktree",
@@ -301,23 +413,27 @@ local function fish_quote(s)
   return "'" .. s:gsub("'", "'\\''") .. "'"
 end
 
----@param window any wezterm Window
----@return string|nil
+---@param window Window
+---@return string?
 local function focused_agent_worktree(window)
   local fish = "/opt/homebrew/bin/fish"
   local _, out = wezterm.run_child_process({ fish, "-c", "_agent_focused_worktree" })
+
   if not out then return nil end
+
   local cwd = out:gsub("%s+$", "")
+
   if cwd == "" then
     window:toast_notification("dev", "no focused agent", nil, 2000)
     return nil
   end
+
   return cwd
 end
 
 ---Pop the region picker, then run open_work_environment with cd_command.
----@param window any
----@param pane any
+---@param window Window
+---@param pane Pane
 ---@param cd_command string
 local function pick_region_and_spawn(window, pane, cd_command)
   window:perform_action(wezterm.action.InputSelector({
@@ -330,13 +446,17 @@ local function pick_region_and_spawn(window, pane, cd_command)
     fuzzy = true,
     action = wezterm.action_callback(function(inner_window, _, region)
       if not region then return end
+
       local target = inner_window:active_pane()
       if not target then return end
+
       open_work_environment(region, cd_command)(inner_window, target)
     end),
   }), pane)
 end
 
+---@param window Window
+---@param pane Pane
 M.open_work_in_focused_agent = function(window, pane)
   local cwd = focused_agent_worktree(window)
   if not cwd then return end
@@ -359,20 +479,25 @@ end
 wezterm.on("user-var-changed", function(window, pane, name, value)
   if name ~= "agent-spawn-dev" then return end
   local region, cwd = (value or ""):match("^([^|]+)|(.*)$")
+
   if not region or not cwd then
     window:toast_notification("dev", "agent-spawn-dev: malformed payload", nil, 3000)
     return
   end
+
   window:toast_notification("dev", ("recv region=%s cwd=%s"):format(region, cwd), nil, 3000)
 
   local worktree_root = wezterm.home_dir .. "/worktrees/"
   local cd_command
+
   if cwd:sub(1, #worktree_root) == worktree_root then
     local repo = cwd:match("/worktrees/([^/]+)/[^/]+/?$")
+
     if repo ~= "payaus" then
       window:toast_notification("dev", "dev server is payaus-only (got: " .. (repo or "?") .. ")", nil, 3000)
       return
     end
+
     cd_command = "cd " .. fish_quote(cwd)
   else
     cd_command = commands.CDT
