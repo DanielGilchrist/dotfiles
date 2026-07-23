@@ -82,13 +82,34 @@ local function repo_root(path)
 end
 
 ---@param root string
+---@return string[] remotes, "origin" first
+local function remotes(root)
+  local out = git(root, { "remote" })
+  local names = out and vim.split(out, "\n", { trimempty = true }) or {}
+  table.sort(names, function(a, b)
+    if a == "origin" or b == "origin" then return a == "origin" end
+    return a < b
+  end)
+  return names
+end
+
+---@param root string
 ---@return string base, string label
 local function fork_point(root)
-  local candidates = { "origin/HEAD", "@{upstream}", "origin/main", "origin/master", "main", "master" }
+  local candidates = {}
+  for _, remote in ipairs(remotes(root)) do
+    vim.list_extend(candidates, { remote .. "/HEAD", remote .. "/main", remote .. "/master" })
+  end
+  -- @{upstream} last: for a pushed branch it's the branch's own remote-tracking
+  -- ref, whose merge-base is just HEAD, so it must not shadow real candidates.
+  vim.list_extend(candidates, { "main", "master", "@{upstream}" })
   for _, ref in ipairs(candidates) do
     if git(root, { "rev-parse", "--verify", "--quiet", ref }) then
       local mb = git(root, { "merge-base", "HEAD", ref })
-      if mb and mb ~= "" then return mb, ref end
+      if mb and mb ~= "" then
+        local label = ref:match("/HEAD$") and git(root, { "rev-parse", "--abbrev-ref", ref }) or ref
+        return mb, label or ref
+      end
     end
   end
   return "HEAD", "HEAD"
@@ -100,8 +121,11 @@ local function is_trunk(root)
   local branch = git(root, { "rev-parse", "--abbrev-ref", "HEAD" })
   if not branch or branch == "HEAD" then return false end
   if branch == "main" or branch == "master" then return true end
-  local def = git(root, { "rev-parse", "--abbrev-ref", "origin/HEAD" })
-  return def ~= nil and branch == (def:gsub("^origin/", ""))
+  for _, remote in ipairs(remotes(root)) do
+    local def = git(root, { "rev-parse", "--abbrev-ref", remote .. "/HEAD" })
+    if def and branch == def:sub(#remote + 2) then return true end
+  end
+  return false
 end
 
 ---@param root string
