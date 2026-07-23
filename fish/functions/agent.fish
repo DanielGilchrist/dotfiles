@@ -1,5 +1,5 @@
 function agent --description "Spawn a Claude agent in a worktree, as a pane in the agents meta-session"
-    argparse --name=agent 'h/help' 'd/debug' 'e/prompt=' 'seed=' 'repo=' 'no-focus' 'restore' -- $argv
+    argparse --name=agent 'h/help' 'd/debug' 'e/prompt=' 'seed=' 'repo=' 'no-focus' 'restore' 'headless' -- $argv
     or return
 
     if set -q _flag_help
@@ -12,6 +12,7 @@ function agent --description "Spawn a Claude agent in a worktree, as a pane in t
         echo "  --repo <path>        — repo root (defaults to git rev-parse from cwd)"
         echo "  --restore            — rebuild the agents grid from live per-agent sessions"
         echo "  --no-focus           — don't refocus the calling pane after spawn"
+        echo "  --headless           — no agents-tab pane; prints 'headless_cwd:'/'headless_cmd:' for the caller to run"
         echo "  -d, --debug          — print spawn commands to stderr"
         return 0
     end
@@ -148,6 +149,14 @@ function agent --description "Spawn a Claude agent in a worktree, as a pane in t
             set -l escaped (string escape -- $meta)
             set per_agent_cmd "zj $branch -- claude --permission-mode acceptEdits $escaped"
         end
+    end
+
+    # Headless: skip the meta-session entirely — the caller (nvim) runs the
+    # session-creating command in its own terminal. Machine-readable output.
+    if set -q _flag_headless
+        echo "headless_cwd:$worktree_path"
+        echo "headless_cmd:$per_agent_cmd"
+        return 0
     end
 
     # Always cd into the worktree first; per-agent session inherits the cwd.

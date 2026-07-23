@@ -77,6 +77,7 @@ zellij.
 | `agent <name> --seed <file>` | Same but seed from a file. **Preferred for non-trivial prompts.** Seed file is copied to `/tmp/agent-seed-...`; Claude is told to read then `rm` it. |
 | `agent <name> --repo <path>` | Override the repo root (defaults to the main worktree). |
 | `agent <name> --no-focus` | Don't refocus the calling pane after spawn. |
+| `agent <name> --headless` | Create the worktree + seed but no agents-tab pane; prints `headless_cwd:`/`headless_cmd:` lines for the caller to run (used by nvim's `<leader>an`). `agent --restore` surfaces headless sessions in the agents tab later. |
 | `agent <name> --debug` (`-d`) | Print spawn commands and intermediate state to stderr. |
 | `agent --restore` | Rebuild the agents grid from live per-agent sessions. Adds a meta-session pane for any session missing one, and spawns the wezterm tab if it's not there. |
 | `agent --help` | Usage. |
@@ -119,7 +120,7 @@ is filtered out of pickers.
 
 | Key | Action |
 |---|---|
-| `<leader>an` | New worktree agent: name prompt → multi-line seed buffer (`<C-s>` submits) → `agent <name> --seed …`. |
+| `<leader>an` | New worktree agent: name prompt → multi-line seed buffer (`<C-s>` submits) → `agent <name> --seed … --headless`. The session runs in the nvim tab only (no agents-tab pane); `agent --restore` adds it to the grid later if wanted. |
 | `<leader>as` | New repo session: spawn / attach a claude session rooted at the current repo, named after the repo basename. No prompts. |
 | `<leader>ao` | Open/focus the agent for the current worktree. If none, picker over running sessions. |
 | `<leader>av` (visual) | Send visual selection. |

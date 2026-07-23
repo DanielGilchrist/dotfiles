@@ -145,11 +145,34 @@ local function build_attach_cmd(name, cwd, initial_cmd)
   return { "fish", "-c", fish_cmd }
 end
 
+---Open the agent terminal. Terminal-mode <C-h/j/k/l> window-nav maps are
+---buffer-local here — globally they'd shadow TUI apps' own bindings
+---(e.g. lazygit's move-commit keys).
+---@param cmd string[]
+local function open_agent_terminal(cmd)
+  return Snacks.terminal.open(cmd, {
+    win = {
+      position = "right",
+      on_buf = function(self)
+        for _, direction in ipairs({ "h", "j", "k", "l" }) do
+          vim.keymap.set(
+            "t",
+            "<C-" .. direction .. ">",
+            "<C-\\><C-n><C-w>" .. direction,
+            { buffer = self.buf, desc = "agent: go to window " .. direction }
+          )
+        end
+      end,
+    },
+    auto_close = false,
+  })
+end
+
 ---Open a tab page for the named agent: tab-local cwd, dashboard on the left,
 ---zellij attach terminal on the right. Idempotent — if a tab already exists
 ---for this agent, jump to it.
 ---@param name string
----@param opts? {cwd?: string, initial_cmd?: string}
+---@param opts? {cwd?: string, initial_cmd?: string, attach_cmd?: string[]}
 function M.attach_in_terminal(name, opts)
   opts = opts or {}
 
@@ -168,7 +191,7 @@ function M.attach_in_terminal(name, opts)
   local current_cwd = vim.fn.getcwd()
   local needs_new_tab = cwd ~= nil and cwd ~= current_cwd
 
-  local cmd = build_attach_cmd(name, opts.cwd, opts.initial_cmd)
+  local cmd = opts.attach_cmd or build_attach_cmd(name, opts.cwd, opts.initial_cmd)
 
   if not needs_new_tab then
     M.last_attached = name
@@ -180,7 +203,7 @@ function M.attach_in_terminal(name, opts)
     if existing and existing.buf and vim.api.nvim_buf_is_valid(existing.buf) then
       if not existing:win_valid() then existing:show() end
     else
-      M.agent_terminals[name] = Snacks.terminal.open(cmd, { win = { position = "right" }, auto_close = false })
+      M.agent_terminals[name] = open_agent_terminal(cmd)
     end
     vim.schedule(function()
       vim.cmd("wincmd h")
@@ -207,7 +230,7 @@ function M.attach_in_terminal(name, opts)
   if existing and existing.buf and vim.api.nvim_buf_is_valid(existing.buf) then
     if not existing:win_valid() then existing:show() end
   else
-    M.agent_terminals[name] = Snacks.terminal.open(cmd, { win = { position = "right" }, auto_close = false })
+    M.agent_terminals[name] = open_agent_terminal(cmd)
   end
   vim.schedule(function()
     vim.cmd("wincmd h")
@@ -267,8 +290,12 @@ function M.open_or_pick()
 end
 
 ---Spawn a worktree agent: prompts for a kebab-case name, opens a multi-line
----prompt buffer for the seed, then runs `agent <name> --seed <tmp>` which
----creates `~/worktrees/<repo>/<name>` and starts Claude in a zellij session.
+---prompt buffer for the seed, then runs `agent <name> --seed <tmp> --headless`
+---which creates `~/worktrees/<repo>/<name>` and prints the session command.
+---Headless: the zellij session is created by this nvim's own terminal rather
+---than an agents-tab pane, so nvim-spawned agents don't squish the grid (and
+---aren't constrained by its render size). `agent --restore` surfaces them in
+---the agents tab later if wanted.
 function M.new_agent()
   vim.ui.input({ prompt = "agent name (kebab-case): " }, function(name)
     if not name or vim.trim(name) == "" then return end
@@ -290,6 +317,7 @@ function M.new_agent()
         "fish", "-c",
         "agent " .. vim.fn.shellescape(name)
           .. " --seed " .. vim.fn.shellescape(tmp)
+          .. " --headless"
           .. (repo and (" --repo " .. vim.fn.shellescape(repo)) or ""),
       }
 
@@ -299,34 +327,20 @@ function M.new_agent()
             notify("agent spawn failed: " .. (out.stderr or ""), vim.log.levels.ERROR)
             return
           end
-          notify(vim.trim(out.stdout or "spawned"))
 
-          -- Trigger the pin-to-zero lua handler. Fish would do this via
-          -- printf to /dev/tty, but nvim's vim.system subprocess doesn't
-          -- have the right /dev/tty, so we emit the OSC from nvim itself —
-          -- nvim's stdout is the wezterm pane's tty, so wezterm picks it up.
-          local b64 = vim.fn.system({ "base64" }, "pin-agents-tab")
-          io.write("\27]1337;SetUserVar=agent-action=" .. vim.trim(b64) .. "\7")
-          io.flush()
+          local stdout = out.stdout or ""
+          local cwd = stdout:match("headless_cwd:([^\n]+)")
+          local agent_cmd = stdout:match("headless_cmd:([^\n]+)")
+          if not cwd or not agent_cmd then
+            notify("agent --headless gave no command:\n" .. stdout, vim.log.levels.ERROR)
+            return
+          end
 
-          -- Poll for up to 30s — the per-agent session is created lazily by
-          -- the meta-session pane's `zj` command, which can take a while.
-          local attempts = 0
-          local max_attempts = 150
-          local timer = vim.uv.new_timer()
-          assert(timer, "could not create timer")
-          timer:start(0, 200, vim.schedule_wrap(function()
-            attempts = attempts + 1
-            if zellij.session_exists(name) then
-              timer:stop()
-              timer:close()
-              M.attach_in_terminal(name)
-            elseif attempts > max_attempts then
-              timer:stop()
-              timer:close()
-              notify("session " .. name .. " never came up — check `zj` and the agents tab", vim.log.levels.WARN)
-            end
-          end))
+          notify("spawned " .. name .. " (headless — attach elsewhere with `agent " .. name .. "`)")
+          M.attach_in_terminal(name, {
+            cwd = cwd,
+            attach_cmd = { "fish", "-c", "cd " .. vim.fn.shellescape(cwd) .. "; and " .. agent_cmd },
+          })
         end)
       end)
     end)
