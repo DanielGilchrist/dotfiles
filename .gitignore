@@ -62,6 +62,7 @@ cachyos*/
 cachyos-hello.json
 
 # claude
+claude/chrome
 claude/gh-pr-status-cache.json
 claude/.last-cleanup
 claude/.credentials.json
