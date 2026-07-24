@@ -1,3 +1,4 @@
+local cmd = require("utils.cmd")
 local notify = require("utils.notify")
 local is = require("utils.is")
 
@@ -191,5 +192,100 @@ map("n", leader("gg"), function()
   })
 end, { desc = "Lazygit" })
 map("n", leader("ts"), function() Snacks.terminal.toggle("tetrigo") end, { desc = "Launch Tetris" })
+
+-- Rendered via snacks image (kitty graphics protocol) because nvim's terminal
+-- emulator strips sixel sequences, so img2sixel in a terminal buffer shows nothing.
+map("n", leader("tp"), function()
+  cmd.tanda_cli({ "clockin", "photo", "list", "-f", "valid" }, {
+    on_stdout = cmd.default_handler(function(data)
+      local photos = vim.tbl_filter(function(line) return vim.startswith(line, "/") end, data)
+      if #photos == 0 then
+        notify.warn("No clockin photos found")
+        return
+      end
+
+      local random_photo = function() return photos[math.random(#photos)] end
+      local advance ---@type fun()
+
+      local win = Snacks.win({
+        width = 44,
+        height = 22,
+        border = "rounded",
+        keys = {
+          q = "close",
+          n = { "n", function() advance() end, desc = "Next photo" },
+        },
+        bo = { buftype = "nofile", bufhidden = "wipe" },
+      })
+
+      local function photo_size_in_cells(photo)
+        local output = vim.fn.system({ "sips", "-g", "pixelWidth", "-g", "pixelHeight", photo })
+        local pixel_width = tonumber(output:match("pixelWidth: (%d+)"))
+        local pixel_height = tonumber(output:match("pixelHeight: (%d+)"))
+        if not (pixel_width and pixel_height) then return end
+
+        local terminal = Snacks.image.terminal.size()
+        local width = pixel_width / terminal.cell_width
+        local height = pixel_height / terminal.cell_height
+        local scale = math.min(80 / width, 30 / height, 1)
+
+        return math.max(math.floor(width * scale), 8), math.max(math.floor(height * scale), 4)
+      end
+
+      local function set_window_size(width, height)
+        vim.api.nvim_win_set_config(win.win, {
+          relative = "editor",
+          width = width,
+          height = height,
+          row = math.floor((vim.o.lines - height) / 2),
+          col = math.floor((vim.o.columns - width) / 2),
+        })
+      end
+
+      -- The sips estimate gets the aspect roughly right up front, but snacks
+      -- computes its own render grid (DPI + terminal scale), so we snap the
+      -- window to whatever it actually drew to keep the border tight.
+      local function show(photo)
+        local width, height = photo_size_in_cells(photo)
+        if width and height then
+          set_window_size(width, height)
+        end
+
+        Snacks.image.buf.attach(win.buf, {
+          src = photo,
+          on_update = vim.schedule_wrap(function(placement)
+            if not win:valid() then
+              return
+            end
+
+            local loc = placement:state().loc
+            set_window_size(loc.width, loc.height)
+          end),
+        })
+      end
+
+      local timer = vim.uv.new_timer()
+
+      local tick = vim.schedule_wrap(function()
+        if not win:valid() then
+          timer:stop()
+          timer:close()
+          return
+        end
+
+        show(random_photo())
+      end)
+
+      advance = function()
+        timer:stop()
+        show(random_photo())
+        timer:start(2000, 2000, tick)
+      end
+
+      show(random_photo())
+      timer:start(2000, 2000, tick)
+    end),
+  })
+end, { desc = "Clockin photo slideshow" })
 map("n", leader("bt"), function() Snacks.terminal.toggle("btop") end, { desc = "Launch btop" })
 map("n", leader("l"), function() Snacks.terminal.toggle("linear") end, { desc = "Launch Linear" })
