@@ -150,9 +150,6 @@ alt-shift-semicolon = 'mode service'
 # See: https://nikitabobko.github.io/AeroSpace/commands#fullscreen
 alt-shift-enter = 'fullscreen'
 
-# See: https://nikitabobko.github.io/AeroSpace/commands#layout
-alt-shift-space = 'layout floating'
-
 # Window navigation lives behind a leader so bare alt-h/j/k/l stays free
 # for zellij. alt-space gives one-shot (auto-exits after each action),
 # alt-cmd-space gives sustained (stays in mode until esc).
