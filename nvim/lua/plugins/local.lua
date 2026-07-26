@@ -21,6 +21,8 @@ return {
       { "<leader>arf", desc = "review: file picker" },
       { "<leader>arm", desc = "review: mark file reviewed" },
       { "<leader>arc", mode = { "n", "x" },                desc = "review: comment" },
+      { "<leader>arC", desc = "review: comment on whole file" },
+      { "<leader>arg", desc = "review: overview message" },
       { "<leader>arl", desc = "review: jump to comment" },
       { "<leader>are", desc = "review: edit comment" },
       { "<leader>ard", desc = "review: delete comment" },

@@ -17,6 +17,7 @@ local edit_ns = vim.api.nvim_create_namespace("agent_review_editing")
 ---@field nlines integer
 ---@field code string[]
 ---@field text string
+---@field file_level boolean|nil
 
 ---@type ReviewComment[]
 M.comments = {}
@@ -25,6 +26,7 @@ M._base = nil ---@type string|nil
 M._total = 0
 M._active = false
 M._root = nil ---@type string|nil
+M._message = nil ---@type string|nil
 ---@type table<string, boolean>
 M.reviewed = {}
 
@@ -460,10 +462,21 @@ function M._render(c)
   end
   local avail = math.max(width - #indent - 2, 20)
 
+  local body = c.file_level and ("(file) " .. c.text) or c.text
   ---@type table[]
   local virt = {}
-  for i, line in ipairs(wrap_text(c.text, avail)) do
+  for i, line in ipairs(wrap_text(body, avail)) do
     virt[#virt + 1] = { { (i == 1 and prefix or indent) .. line, cfg.virt_hl or "Comment" } }
+  end
+
+  if c.file_level then
+    c.extmark = vim.api.nvim_buf_set_extmark(c.bufnr, ns, 0, 0, {
+      sign_text = cfg.sign or "▌",
+      sign_hl_group = cfg.sign_hl or "DiagnosticInfo",
+      virt_lines = virt,
+      virt_lines_above = true,
+    })
+    return
   end
 
   local last = vim.api.nvim_buf_line_count(c.bufnr) - 1
@@ -488,7 +501,7 @@ local function current_lnum(c)
   return c.lnum
 end
 
----@param opts? {range?: integer[]}
+---@param opts? {range?: integer[], file_level?: boolean}
 function M.add_comment(opts)
   if not require_active() then return end
   opts = opts or {}
@@ -499,24 +512,29 @@ function M.add_comment(opts)
   local file = vim.api.nvim_buf_get_name(buf)
   if file == "" then return notify("buffer has no file path", vim.log.levels.WARN) end
 
-  local s, e
-  if opts.range then
-    s, e = opts.range[1], opts.range[2]
-    if s > e then s, e = e, s end
-  else
-    s, e = target_range()
-  end
-  if vim.bo[buf].modified then pcall(vim.cmd, "silent! update") end
-
   local root = repo_root(file)
   local relpath = vim.fn.fnamemodify(file, ":.")
   if root and vim.startswith(file, root .. "/") then relpath = file:sub(#root + 2) end
-
-  local code = vim.api.nvim_buf_get_lines(buf, s - 1, e, false)
   local ft = vim.bo[buf].filetype
-  local loc = e > s and ("%s:%d-%d"):format(relpath, s, e) or ("%s:%d"):format(relpath, s)
+  local file_level = opts.file_level or false
 
-  highlight_range(buf, s, e)
+  local s, e, code, loc
+  if file_level then
+    s, e, code = 1, 1, {}
+    loc = relpath .. " (whole file)"
+  else
+    if opts.range then
+      s, e = opts.range[1], opts.range[2]
+      if s > e then s, e = e, s end
+    else
+      s, e = target_range()
+    end
+    if vim.bo[buf].modified then pcall(vim.cmd, "silent! update") end
+    code = vim.api.nvim_buf_get_lines(buf, s - 1, e, false)
+    loc = e > s and ("%s:%d-%d"):format(relpath, s, e) or ("%s:%d"):format(relpath, s)
+    highlight_range(buf, s, e)
+  end
+
   ui.new_prompt(function(text)
     text = vim.trim(text)
     if text == "" then return end
@@ -531,6 +549,7 @@ function M.add_comment(opts)
       nlines = e - s + 1,
       code = code,
       text = text,
+      file_level = file_level or nil,
     }
     M._next_id = M._next_id + 1
     M.comments[#M.comments + 1] = c
@@ -539,7 +558,23 @@ function M.add_comment(opts)
   end, {
     title = (" review: %s   (<C-s> submit, q cancel) "):format(loc),
     split = true,
-    on_close = function() clear_highlight(buf) end,
+    on_close = function() if not file_level then clear_highlight(buf) end end,
+  })
+end
+
+function M.add_file_comment()
+  M.add_comment({ file_level = true })
+end
+
+function M.set_message()
+  if not require_active() then return end
+  ui.new_prompt(function(text)
+    M._message = vim.trim(text)
+    notify(M._message ~= "" and "review message set" or "review message cleared")
+  end, {
+    title = " review message   (<C-s> save, q cancel) ",
+    initial = M._message or "",
+    split = true,
   })
 end
 
@@ -609,8 +644,11 @@ function M.list()
   for _, c in ipairs(M.comments) do
     local ln = current_lnum(c)
     local first = vim.split(c.text, "\n", { plain = true })[1]
+    local label = c.file_level
+      and ("%s (file)  %s"):format(c.relpath, first)
+      or ("%s:%d  %s"):format(c.relpath, ln, first)
     items[#items + 1] = {
-      text = ("%s:%d  %s"):format(c.relpath, ln, first),
+      text = label,
       file = c.file,
       pos = { ln, 0 },
       comment = c,
@@ -624,9 +662,13 @@ function M.list()
     format = function(item) return { { item.text } } end,
     preview = function(ctx)
       local c = ctx.item.comment
-      local lines = { "# " .. c.relpath .. ":" .. current_lnum(c), "" }
-      vim.list_extend(lines, c.code)
-      lines[#lines + 1] = ""
+      local lines = c.file_level
+        and { "# " .. c.relpath .. " (whole file)", "" }
+        or { "# " .. c.relpath .. ":" .. current_lnum(c), "" }
+      if not c.file_level then
+        vim.list_extend(lines, c.code)
+        lines[#lines + 1] = ""
+      end
       lines[#lines + 1] = "── comment ──"
       vim.list_extend(lines, vim.split(c.text, "\n", { plain = true }))
       ctx.preview:set_lines(lines)
@@ -641,25 +683,35 @@ end
 
 ---@return string
 local function build_markdown()
-  local out = {
-    "# Review comments",
-    "",
-    "Notes on your recent changes. Please work through each one.",
-    "",
-  }
+  local out = { "# Review comments", "" }
+  if M._message and vim.trim(M._message) ~= "" then
+    out[#out + 1] = "## Overview"
+    out[#out + 1] = ""
+    vim.list_extend(out, vim.split(M._message, "\n", { plain = true }))
+    out[#out + 1] = ""
+  end
+  out[#out + 1] = "Notes on your recent changes. Please work through each one."
+  out[#out + 1] = ""
   for i, c in ipairs(M.comments) do
-    local ln = current_lnum(c)
-    local loc = c.nlines > 1
-      and ("%s:%d-%d"):format(c.relpath, ln, ln + c.nlines - 1)
-      or ("%s:%d"):format(c.relpath, ln)
-    out[#out + 1] = ("## %d. %s"):format(i, loc)
-    out[#out + 1] = ""
-    out[#out + 1] = "```" .. (c.ft or "")
-    vim.list_extend(out, c.code)
-    out[#out + 1] = "```"
-    out[#out + 1] = ""
-    vim.list_extend(out, vim.split(c.text, "\n", { plain = true }))
-    out[#out + 1] = ""
+    if c.file_level then
+      out[#out + 1] = ("## %d. %s (whole file)"):format(i, c.relpath)
+      out[#out + 1] = ""
+      vim.list_extend(out, vim.split(c.text, "\n", { plain = true }))
+      out[#out + 1] = ""
+    else
+      local ln = current_lnum(c)
+      local loc = c.nlines > 1
+        and ("%s:%d-%d"):format(c.relpath, ln, ln + c.nlines - 1)
+        or ("%s:%d"):format(c.relpath, ln)
+      out[#out + 1] = ("## %d. %s"):format(i, loc)
+      out[#out + 1] = ""
+      out[#out + 1] = "```" .. (c.ft or "")
+      vim.list_extend(out, c.code)
+      out[#out + 1] = "```"
+      out[#out + 1] = ""
+      vim.list_extend(out, vim.split(c.text, "\n", { plain = true }))
+      out[#out + 1] = ""
+    end
   end
   return table.concat(out, "\n")
 end
@@ -689,8 +741,8 @@ local function deliver(md, count)
 
   if cfg.delivery == "inline" then
     if agent.send_text(md, true) then
-      M.clear()
       notify(("sent %d comment(s) inline"):format(count))
+      M.reset()
     end
     return
   end
@@ -706,8 +758,8 @@ local function deliver(md, count)
 
   local msg = ("Read `%s` in the repo root. It lists my review comments on your recent changes. Work through each one, then delete the file."):format(fname)
   if agent.send_text(msg, true) then
-    M.clear()
     notify(("sent %d comment(s) → %s"):format(count, fname))
+    M.reset()
   end
 end
 
@@ -715,16 +767,27 @@ end
 local function preview_send(count)
   ---@type string[][]
   local pages = {}
+  if M._message and vim.trim(M._message) ~= "" then
+    local lines = { "# Overview message", "" }
+    vim.list_extend(lines, vim.split(M._message, "\n", { plain = true }))
+    pages[#pages + 1] = lines
+  end
   for _, c in ipairs(M.comments) do
-    local ln = current_lnum(c)
-    local loc = c.nlines > 1
-      and ("%s:%d-%d"):format(c.relpath, ln, ln + c.nlines - 1)
-      or ("%s:%d"):format(c.relpath, ln)
-    local lines = { "## " .. loc, "", "```" .. (c.ft or "") }
-    vim.list_extend(lines, c.code)
-    lines[#lines + 1] = "```"
-    lines[#lines + 1] = ""
-    vim.list_extend(lines, vim.split(c.text, "\n", { plain = true }))
+    local lines
+    if c.file_level then
+      lines = { "## " .. c.relpath .. " (whole file)", "" }
+      vim.list_extend(lines, vim.split(c.text, "\n", { plain = true }))
+    else
+      local ln = current_lnum(c)
+      local loc = c.nlines > 1
+        and ("%s:%d-%d"):format(c.relpath, ln, ln + c.nlines - 1)
+        or ("%s:%d"):format(c.relpath, ln)
+      lines = { "## " .. loc, "", "```" .. (c.ft or "") }
+      vim.list_extend(lines, c.code)
+      lines[#lines + 1] = "```"
+      lines[#lines + 1] = ""
+      vim.list_extend(lines, vim.split(c.text, "\n", { plain = true }))
+    end
     pages[#pages + 1] = lines
   end
   local total = #pages
@@ -794,7 +857,10 @@ end
 
 function M.submit()
   if not require_active() then return end
-  if #M.comments == 0 then return notify("no comments to send", vim.log.levels.WARN) end
+  local has_message = M._message ~= nil and vim.trim(M._message) ~= ""
+  if #M.comments == 0 and not has_message then
+    return notify("nothing to send (no comments or message)", vim.log.levels.WARN)
+  end
   preview_send(#M.comments)
 end
 
@@ -811,14 +877,14 @@ function M._save_state()
   for _, c in ipairs(M.comments) do
     comments[#comments + 1] = {
       relpath = c.relpath, ft = c.ft, lnum = current_lnum(c),
-      nlines = c.nlines, code = c.code, text = c.text,
+      nlines = c.nlines, code = c.code, text = c.text, file_level = c.file_level,
     }
   end
   local path = state_path(M._root)
   vim.fn.mkdir(vim.fn.fnamemodify(path, ":h"), "p")
   local fd = io.open(path, "w")
   if fd then
-    fd:write(vim.json.encode({ base = M._base, reviewed = reviewed, comments = comments }))
+    fd:write(vim.json.encode({ base = M._base, reviewed = reviewed, comments = comments, message = M._message }))
     fd:close()
   end
 end
@@ -832,6 +898,7 @@ function M.resume(root, data)
   M._total = #list_changed(root, data.base)
   M.reviewed = {}
   for _, rel in ipairs(data.reviewed or {}) do M.reviewed[root .. "/" .. rel] = true end
+  M._message = data.message
   M.comments = {}
   for _, s in ipairs(data.comments or {}) do
     M.comments[#M.comments + 1] = {
@@ -843,6 +910,7 @@ function M.resume(root, data)
       nlines = s.nlines,
       code = s.code,
       text = s.text,
+      file_level = s.file_level,
     }
     M._next_id = M._next_id + 1
   end
@@ -864,6 +932,7 @@ function M.reset()
   M._total = 0
   M._active = false
   M._root = nil
+  M._message = nil
   M.reviewed = {}
   M.clear()
   notify("review ended")

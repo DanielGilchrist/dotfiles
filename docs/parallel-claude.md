@@ -131,10 +131,12 @@ is filtered out of pickers.
 | `<leader>arf` | Fuzzy-pick a changed file (diff preview); `<CR>` opens it into the inline diff, `<a-m>` marks it reviewed and jumps to the next file. |
 | `<leader>arm` | Mark / unmark the current file as reviewed (progress readout). Reviewed files show ✓ and sink to the bottom of the file picker. |
 | `<leader>arc` (n/x) | Add a comment on the current line / selection (review mode only). |
+| `<leader>arC` | Add a whole-file comment (not anchored to a line) on the current buffer. |
+| `<leader>arg` | Write / edit an overview message for the whole review (prepended when sent). |
 | `<leader>arl` | Jump to a pending comment: picker with preview, opens the file into the diff at the comment. |
 | `<leader>are` | Edit the comment under the cursor. |
 | `<leader>ard` | Delete the comment under the cursor. |
-| `<leader>ars` | Page through the pending comments (`]`/`[`), then `<C-s>` to send all to the active agent and clear. |
+| `<leader>ars` | Page through the pending comments (`]`/`[`), then `<C-s>` to send all to the active agent. Sending ends the review. |
 | `]r` / `[r` | Jump to the next / previous change in the inline diff (review mode). |
 | `<C-.>` (n/i/t/x) | Toggle between the agent tab and wherever you were. |
 
@@ -175,16 +177,22 @@ send comments straight to the running session.
 4. Read the code like normal: full LSP, jump to definition, edit, run.
 5. `<leader>arc` on a line (or over a visual selection) → type a note in the
    floating editor. It's anchored with an extmark (tracks edits) and shown
-   as a gutter sign + virtual note. `<leader>arl` lists them, `<leader>are`
-   edits, and `<leader>ard` deletes the one under the cursor. `]r` / `[r`
-   jump between changes in the diff. Only allowed while review is active.
-6. `<leader>ars` opens a paginated preview: one comment per page, `]`/`[`
-   (or `<Tab>`/`<S-Tab>`) to move through them, `<C-s>` to send all, `q` to
-   cancel. On send it writes all comments (file:line + quoted code + note)
-   to `.agent-review.md` at the repo root, adds it to `.git/info/exclude`,
-   and tells the active agent to read it and work through each one. Comments
-   clear. (Set `config.review.delivery = "inline"` to push the markdown
-   straight into the prompt instead.)
+   as a gutter sign + virtual note. `<leader>arC` adds a whole-file comment
+   (not tied to a line, rendered as a header above line 1) for feedback about
+   the file as a whole. `<leader>arg` writes an overview message for the
+   review as a whole (prepended to what's sent). `<leader>arl` lists comments,
+   `<leader>are` edits, and `<leader>ard` deletes the one under the cursor.
+   `]r` / `[r` jump between changes in the diff. Only allowed while review is
+   active.
+6. `<leader>ars` opens a paginated preview: the overview message (if any) then
+   one comment per page, `]`/`[` (or `<Tab>`/`<S-Tab>`) to move through them,
+   `<C-s>` to send all, `q` to cancel. On send it writes the overview plus all
+   comments (file:line + quoted code + note; whole-file comments as headers)
+   to `.agent-review.md` at the repo root, adds it to `.git/info/exclude`, and
+   tells the active agent to read it and work through each one. Sending ends
+   the review (the diff closes and pending state clears). (Set
+   `config.review.delivery = "inline"` to push the markdown straight into the
+   prompt instead.)
 
 While a review is active the statusline shows `review N/M · K✎` (files
 marked reviewed out of changed, and pending comments).
