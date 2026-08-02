@@ -148,12 +148,26 @@ end
 local function list_changed(root, base)
   local tracked = git(root, { "diff", "--name-only", base }) or ""
   local untracked = git(root, { "ls-files", "--others", "--exclude-standard" }) or ""
+  local numstat = git(root, { "diff", "--numstat", base }) or ""
+  local stat = {}
+  for line in numstat:gmatch("[^\n]+") do
+    local a, d, rel = line:match("^(%S+)\t(%S+)\t(.+)$")
+    if rel then stat[vim.trim(rel)] = { add = tonumber(a) or 0, del = tonumber(d) or 0 } end
+  end
   local seen, items = {}, {}
   local function add(rel, is_untracked)
     rel = vim.trim(rel)
     if rel == "" or seen[rel] then return end
     seen[rel] = true
-    items[#items + 1] = { text = rel, file = root .. "/" .. rel, untracked = is_untracked }
+    local s = stat[rel]
+    local adds, dels = 0, 0
+    if s then
+      adds, dels = s.add, s.del
+    elseif is_untracked then
+      local ok, lines = pcall(vim.fn.readfile, root .. "/" .. rel)
+      if ok then adds = #lines end
+    end
+    items[#items + 1] = { text = rel, file = root .. "/" .. rel, untracked = is_untracked, add = adds, del = dels }
   end
   for line in tracked:gmatch("[^\n]+") do add(line, false) end
   for line in untracked:gmatch("[^\n]+") do add(line, true) end
@@ -202,18 +216,30 @@ local function clear_highlight(buf)
   pcall(vim.api.nvim_buf_clear_namespace, buf, edit_ns, 0, -1)
 end
 
+M._diffed = {}
+
+---@param buf integer
+local function ensure_diff(buf)
+  if not M._active then return end
+  if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
+  if M._diffed[buf] then return end
+  if vim.bo[buf].buftype ~= "" then return end
+  local file = vim.api.nvim_buf_get_name(buf)
+  if file == "" then return end
+  if M._root and not vim.startswith(file, M._root .. "/") then return end
+  M._diffed[buf] = true
+  pcall(function()
+    require("unified.diff").show(current_base() or "HEAD", buf)
+    require("unified.auto_refresh").setup(buf)
+  end)
+end
+
 ---@param file string
 ---@param base string|nil
 ---@param pos? integer[]
 local function open_in_diff(file, base, pos)
   vim.cmd("edit " .. vim.fn.fnameescape(file))
-  if M.is_active() then
-    local buf = vim.api.nvim_get_current_buf()
-    pcall(function()
-      require("unified.diff").show(base or current_base() or "HEAD", buf)
-      require("unified.auto_refresh").setup(buf)
-    end)
-  end
+  ensure_diff(vim.api.nvim_get_current_buf())
   if pos then pcall(vim.api.nvim_win_set_cursor, 0, pos) end
 end
 
@@ -254,8 +280,10 @@ local function open_review(root, base, label)
   M._active = true
   M._root = root
   M._base = base
+  M._diffed = {}
   M._total = #list_changed(root, base)
   vim.cmd("Unified " .. base)
+  M._diffed[vim.api.nvim_get_current_buf()] = true
   notify(("reviewing vs %s (%s)"):format(label, base:sub(1, 8)))
 end
 
@@ -370,19 +398,24 @@ function M.changed_files(root, base)
   M._total = #items
   if #items == 0 then return notify("no changes vs " .. base:sub(1, 8)) end
 
-  local ordered = {}
+  local ordered, tadd, tdel = {}, 0, 0
+  for _, it in ipairs(items) do
+    tadd, tdel = tadd + (it.add or 0), tdel + (it.del or 0)
+  end
   for _, it in ipairs(items) do if not M.reviewed[it.file] then ordered[#ordered + 1] = it end end
   for _, it in ipairs(items) do if M.reviewed[it.file] then ordered[#ordered + 1] = it end end
 
   Snacks.picker.pick({
     source = "agent_review_files",
-    title = "changed vs " .. base:sub(1, 8),
+    title = ("changed vs %s   +%d -%d"):format(base:sub(1, 8), tadd, tdel),
     items = ordered,
     format = function(item)
-      if M.reviewed[item.file] then
-        return { { "✓ ", "DiagnosticOk" }, { item.text, "Comment" } }
-      end
-      return { { "  " }, { item.text, "SnacksPickerFile" } }
+      local segs = M.reviewed[item.file]
+        and { { "✓ ", "DiagnosticOk" }, { item.text, "Comment" } }
+        or { { "  " }, { item.text, "SnacksPickerFile" } }
+      segs[#segs + 1] = { "  +" .. (item.add or 0), "Added" }
+      segs[#segs + 1] = { " -" .. (item.del or 0), "Removed" }
+      return segs
     end,
     preview = function(ctx)
       local cmd
@@ -895,6 +928,7 @@ function M.resume(root, data)
   M._active = true
   M._root = root
   M._base = data.base
+  M._diffed = {}
   M._total = #list_changed(root, data.base)
   M.reviewed = {}
   for _, rel in ipairs(data.reviewed or {}) do M.reviewed[root .. "/" .. rel] = true end
@@ -915,10 +949,12 @@ function M.resume(root, data)
     M._next_id = M._next_id + 1
   end
   vim.cmd("Unified " .. data.base)
+  M._diffed[vim.api.nvim_get_current_buf()] = true
   for _, c in ipairs(M.comments) do
     local b = vim.fn.bufnr(c.file)
     if b ~= -1 and vim.api.nvim_buf_is_loaded(b) then
       c.bufnr = b
+      ensure_diff(b)
       M._render(c)
     end
   end
@@ -933,6 +969,7 @@ function M.reset()
   M._active = false
   M._root = nil
   M._message = nil
+  M._diffed = {}
   M.reviewed = {}
   M.clear()
   notify("review ended")
@@ -944,6 +981,7 @@ vim.api.nvim_create_autocmd("BufWinEnter", {
   callback = function(args)
     local file = vim.api.nvim_buf_get_name(args.buf)
     if file == "" then return end
+    ensure_diff(args.buf)
     for _, c in ipairs(M.comments) do
       if c.file == file and not (c.bufnr and vim.api.nvim_buf_is_valid(c.bufnr) and c.extmark) then
         c.bufnr = args.buf
@@ -951,6 +989,11 @@ vim.api.nvim_create_autocmd("BufWinEnter", {
       end
     end
   end,
+})
+
+vim.api.nvim_create_autocmd("BufWipeout", {
+  group = aug,
+  callback = function(args) M._diffed[args.buf] = nil end,
 })
 
 vim.api.nvim_create_autocmd("VimLeavePre", {
