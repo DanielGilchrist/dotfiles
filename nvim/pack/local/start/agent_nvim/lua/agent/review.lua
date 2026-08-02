@@ -148,7 +148,7 @@ end
 local function list_changed(root, base)
   local tracked = git(root, { "diff", "--name-only", base }) or ""
   local untracked = git(root, { "ls-files", "--others", "--exclude-standard" }) or ""
-  local numstat = git(root, { "diff", "--numstat", base }) or ""
+  local numstat = git(root, { "diff", "--numstat", "--no-renames", base }) or ""
   local stat = {}
   for line in numstat:gmatch("[^\n]+") do
     local a, d, rel = line:match("^(%S+)\t(%S+)\t(.+)$")
