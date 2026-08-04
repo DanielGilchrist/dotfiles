@@ -129,6 +129,18 @@ function agent-rm --description "Tear down an agent: worktree + zellij session +
         end
     end
 
+    # Kill the per-agent session before anything touches the filesystem, for
+    # two reasons. It must precede close-pane below, or we race zellij's
+    # session-state cleanup and leave a resurrection candidate behind (the
+    # symptom: agent-rm needs a second invocation to fully clear). It must
+    # also precede the worktree removal, so the processes living in there
+    # (nvim, its LSP clients, entangler) die while their cwd still exists
+    # rather than being left holding a deleted directory. --force first kills
+    # the running server, then a follow-up plain delete-session sweeps any
+    # resurrection cache it left.
+    zellij delete-session --force $branch 2>/dev/null
+    zellij delete-session $branch 2>/dev/null
+
     if test -n "$worktree_path"
         if test -n "$main_repo" -a -d "$main_repo"
             git -C $main_repo worktree remove --force $worktree_path 2>/dev/null
@@ -136,6 +148,8 @@ function agent-rm --description "Tear down an agent: worktree + zellij session +
         rm -rf $worktree_path 2>/dev/null
     end
 
+    # After the worktree is gone: git refuses to delete a branch that's still
+    # checked out in one.
     if test -n "$target_repo"
         for b in $candidate_branches
             git -C $target_repo rev-parse --verify --quiet "refs/heads/$b" >/dev/null
@@ -143,15 +157,6 @@ function agent-rm --description "Tear down an agent: worktree + zellij session +
             git -C $target_repo branch -D $b 2>/dev/null
         end
     end
-
-    # Kill the per-agent session FIRST so the meta-pane's `zellij attach`
-    # client exits on its own. Doing it after close-pane races with zellij's
-    # session-state cleanup and sometimes leaves a resurrection-candidate
-    # behind (the symptom: agent-rm needs a second invocation to fully
-    # clear). --force first kills the running server, then a follow-up
-    # plain delete-session sweeps any resurrection cache it left.
-    zellij delete-session --force $branch 2>/dev/null
-    zellij delete-session $branch 2>/dev/null
 
     # Now clean up the meta-session pane (the `zellij attach` client there
     # has already exited; we're just removing the empty pane).
