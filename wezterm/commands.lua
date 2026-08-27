@@ -19,7 +19,7 @@ local pane_direction = {
 ---@field Console string
 ---@field Server string
 ---@field Start string
----@field Tunnel string
+---@field Syncer string
 ---@field Worker string
 ---@field Webpack string
 
@@ -29,7 +29,7 @@ local commands = {
   Console = "bin/dev console",
   Server = "bin/dev server",
   Start = "bin/dev start",
-  Tunnel = "bin/tunnel",
+  Syncer = "syncer",
   Worker = "bin/dev worker",
   Webpack = "bin/dev webpack",
 }
@@ -308,12 +308,12 @@ local function spawn_dev_tab(original_window, region, cd_command)
     wait_for_text_for(tunnel_pane, "Your dev box", "is ready to be used")
   end
 
-  run_command(tunnel_pane, commands.Tunnel)
-  wait_for_text_for(tunnel_pane, "Enter your developer name:", "INFO: Ready!")
+  run_command(tunnel_pane, commands.Syncer)
+  wait_for_text_for(tunnel_pane, "Enter your developer name:", "watching for changes")
 
   if has_text(tunnel_pane, "Enter your developer name:") then
     run_command(tunnel_pane, "dangilchrist")
-    wait_for_text_for(tunnel_pane, "INFO: Ready!")
+    wait_for_text_for(tunnel_pane, "watching for changes")
   end
 
   if not start_server(server_pane) then
@@ -461,8 +461,6 @@ M.open_work_in_focused_agent = function(window, pane)
   local cwd = focused_agent_worktree(window)
   if not cwd then return end
 
-  -- Dev-server commands (bin/dev, bin/tunnel, cdt) are payaus-only. Refuse
-  -- for worktrees under any other repo.
   local repo = cwd:match("/worktrees/([^/]+)/[^/]+/?$")
   if repo ~= "payaus" then
     window:toast_notification("dev", "dev server is payaus-only (focused: " .. (repo or "?") .. ")", nil, 3000)
