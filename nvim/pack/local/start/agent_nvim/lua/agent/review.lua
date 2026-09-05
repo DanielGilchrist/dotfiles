@@ -80,6 +80,7 @@ end
 ---@return string|nil
 local function repo_root(path)
   local dir = (path and path ~= "") and vim.fn.fnamemodify(path, ":h") or vim.fn.getcwd()
+  if vim.fn.isdirectory(dir) == 0 then dir = vim.fn.getcwd() end
   return git(dir, { "rev-parse", "--show-toplevel" })
 end
 

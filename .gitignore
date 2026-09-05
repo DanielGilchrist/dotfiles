@@ -93,6 +93,7 @@ claude/todos/
 claude/image-cache/
 claude/.last-update-result.json
 claude/jobs
+claude/remote-settings-consent.json
 
 # Misc
 arkrc
