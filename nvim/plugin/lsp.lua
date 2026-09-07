@@ -159,7 +159,7 @@ vim.lsp.enable({
   "rust_analyzer",
   "sorbet",
   "sourcekit",
-  "ts_ls",
+  "tsgo",
   "yamlls",
   "zls",
 })
