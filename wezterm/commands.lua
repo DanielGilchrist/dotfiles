@@ -68,7 +68,10 @@ end
 ---@param pane Pane
 ---@return string
 local function pane_text(pane)
-  return pane:get_logical_lines_as_text(pane:get_dimensions().scrollback_rows)
+  local ok, dims = pcall(pane.get_dimensions, pane)
+  if not ok or not dims then return "" end
+  local ok2, text = pcall(pane.get_logical_lines_as_text, pane, dims.scrollback_rows)
+  return ok2 and text or ""
 end
 
 ---@param text string
@@ -298,22 +301,22 @@ local function spawn_dev_tab(original_window, region, cd_command)
 
   local console_pane = split_pane_with_setup(server_pane, pane_direction.Right)
   local webpack_pane = split_pane_with_setup(console_pane, pane_direction.Bottom, 0.1)
-  local tunnel_pane = split_pane_with_setup(server_pane, pane_direction.Bottom, 0.1)
+  local syncer_pane = split_pane_with_setup(server_pane, pane_direction.Bottom, 0.1)
   local worker_pane = split_pane_with_setup(server_pane, pane_direction.Bottom, 0.4)
 
-  wait_for_text_for(tunnel_pane, "Welcome to fish")
+  wait_for_text_for(syncer_pane, "Welcome to fish")
 
   if region == regions.APAC or region == regions.EU then
-    run_command(tunnel_pane, commands.Start)
-    wait_for_text_for(tunnel_pane, "Your dev box", "is ready to be used")
+    run_command(syncer_pane, commands.Start)
+    wait_for_text_for(syncer_pane, "Your dev box", "is ready to be used")
   end
 
-  run_command(tunnel_pane, commands.Syncer)
-  wait_for_text_for(tunnel_pane, "Enter your developer name:", "watching for changes")
+  run_command(syncer_pane, commands.Syncer)
+  wait_for_text_for(syncer_pane, "Enter your developer name:", "watching for changes")
 
-  if has_text(tunnel_pane, "Enter your developer name:") then
-    run_command(tunnel_pane, "dangilchrist")
-    wait_for_text_for(tunnel_pane, "watching for changes")
+  if has_text(syncer_pane, "Enter your developer name:") then
+    run_command(syncer_pane, "dangilchrist")
+    wait_for_text_for(syncer_pane, "watching for changes")
   end
 
   if not start_server(server_pane) then
@@ -341,9 +344,27 @@ local function open_work_environment(region, cd_command)
     local in_progress = wezterm.GLOBAL.dev_spawn_in_progress_by_region or {}
 
     if in_progress[region] then
+      -- Stale-lock recovery: GLOBAL survives wezterm config reloads, so a
+      -- mid-spawn crash + reload can leave in_progress[region] = true
+      -- forever. If the tab we would have been spawning into no longer
+      -- exists in the mux, treat the lock as stale and clear it.
+      local by_region = wezterm.GLOBAL.dev_tab_id_by_region or {}
+      local tab_id = by_region[region]
+      local tab_alive = false
+      if tab_id then
+        for _, tab in ipairs(original_window:mux_window():tabs()) do
+          if tab:tab_id() == tab_id then tab_alive = true break end
+        end
+      end
+      if tab_alive then
+        original_window:toast_notification("dev",
+          "dev tab for " .. region .. " is already spawning — wait for it to finish", nil, 2500)
+        return
+      end
+      in_progress[region] = nil
+      wezterm.GLOBAL.dev_spawn_in_progress_by_region = in_progress
       original_window:toast_notification("dev",
-        "dev tab for " .. region .. " is already spawning — wait for it to finish", nil, 2500)
-      return
+        "cleared stale spawn lock for " .. region, nil, 2500)
     end
 
     close_existing_dev_tab(original_window, region)

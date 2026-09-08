@@ -7,11 +7,25 @@ local config = require("agent.config")
 ---@field session_cwd fun(name: string): string|nil
 local M = {}
 
+---Toplevel of whichever worktree cwd is inside — the correct root for
+---attaching a repo/worktree-local session (`<leader>as`), reviewing the
+---worktree's changes, etc.
 ---@return string|nil
 function M.repo_root()
   local res = vim.system({ "git", "rev-parse", "--show-toplevel" }, { text = true }):wait()
   if res.code ~= 0 then return nil end
   return vim.trim(res.stdout)
+end
+
+---MAIN worktree of the current repo — never a nested worktree. Use this
+---when provisioning a new worktree (`<leader>an`) so `agent` namespaces
+---under ~/worktrees/<repo>/<branch> instead of nesting under whichever
+---worktree we happened to spawn from.
+---@return string|nil
+function M.main_repo_root()
+  local res = vim.system({ "git", "worktree", "list", "--porcelain" }, { text = true }):wait()
+  if res.code ~= 0 then return nil end
+  return (res.stdout or ""):match("^worktree ([^\n]+)")
 end
 
 ---@return string|nil

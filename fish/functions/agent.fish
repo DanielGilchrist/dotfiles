@@ -48,15 +48,18 @@ function agent --description "Spawn a Claude agent in a worktree, as a pane in t
 
     set -l repo_root $_flag_repo
     if test -z "$repo_root"
-        # Resolve to the MAIN worktree, not whichever worktree we're currently
-        # inside — otherwise spawning from one agent's worktree creates nested
-        # worktrees under ~/worktrees/<branch-name>/<new-branch>.
         set repo_root (git worktree list --porcelain 2>/dev/null | head -1 | string replace -r '^worktree ' '')
     end
     if test -z "$repo_root"
         echo "agent: not in a git repo and --repo not given" >&2
         return 1
     end
+    # Belt and braces: whether the caller gave us --repo pointing at a
+    # worktree, or `git worktree list` here landed inside one, resolve to
+    # the actual main worktree of that repo. Otherwise we'd namespace under
+    # a worktree branch name and create nested worktrees.
+    set -l resolved_main (git -C $repo_root worktree list --porcelain 2>/dev/null | head -1 | string replace -r '^worktree ' '')
+    test -n "$resolved_main"; and set repo_root $resolved_main
     set -l repo_name (basename $repo_root)
 
     set -l worktrees_dir "$HOME/worktrees/$repo_name"

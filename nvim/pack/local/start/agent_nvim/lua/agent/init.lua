@@ -108,6 +108,10 @@ function M.send_choice(n) M.send_text(tostring(n), true) end
 ---other cwds fall back to `cdt`.
 function M.spawn_dev()
   local cwd = vim.fn.getcwd()
+  if vim.fn.executable(cwd .. "/bin/dev") ~= 1 then
+    notify("spawn-dev: no bin/dev in " .. cwd, vim.log.levels.WARN)
+    return
+  end
   vim.ui.select({ "us", "eu", "apac" }, { prompt = "Region for dev tabs:" }, function(region)
     if not region then return end
     -- Write the OSC to nvim's stderr channel — wezterm reads OSC sequences
@@ -311,7 +315,7 @@ function M.new_agent()
       fd:write(text)
       fd:close()
 
-      local repo = session.repo_root()
+      local repo = session.main_repo_root()
       ---@type string[]
       local cmd = {
         "fish", "-c",
