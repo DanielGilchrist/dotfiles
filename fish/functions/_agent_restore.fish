@@ -1,13 +1,45 @@
-function _agent_restore --description "Rebuild the agents grid: ensure each live per-agent session has a meta-session pane and a wezterm tab."
+function _agent_restore --description "agent restore — rebuild the agents grid from live per-agent sessions."
+    argparse --name='agent restore' 'h/help' 'include-hidden' -- $argv
+    or return
+
+    if set -q _flag_help
+        echo "usage: agent restore [--include-hidden]"
+        echo ""
+        echo "  --include-hidden  — clear the hidden list first (surface every live agent)"
+        return 0
+    end
+
     if not _term_inside
-        echo "agent --restore: not running inside wezterm" >&2
+        echo "agent restore: not running inside wezterm" >&2
         return 1
+    end
+
+    if set -q _flag_include_hidden
+        _agent_unhide_quiet --all
     end
 
     set -l branches (zellij list-sessions -s 2>/dev/null | string match -v -- agents)
 
+    set -l hidden (_agent_hidden_list)
+    set -l skipped 0
+    if test (count $hidden) -gt 0
+        set -l kept
+        for b in $branches
+            if contains -- $b $hidden
+                set skipped (math $skipped + 1)
+            else
+                set -a kept $b
+            end
+        end
+        set branches $kept
+    end
+
     if test (count $branches) -eq 0
-        echo "agent --restore: no per-agent sessions to restore"
+        if test $skipped -gt 0
+            echo "agent restore: nothing to restore ($skipped hidden — see agent restore --include-hidden)"
+        else
+            echo "agent restore: no per-agent sessions to restore"
+        end
         return 0
     end
 
@@ -48,7 +80,7 @@ function _agent_restore --description "Rebuild the agents grid: ensure each live
         set -l new_pane (_term_spawn_tab --title agents $HOME $boot_cmd)
         if test -z "$new_pane"
             rm -f $layout_file
-            echo "agent --restore: failed to spawn agents tab" >&2
+            echo "agent restore: failed to spawn agents tab" >&2
             return 1
         end
         _term_emit_event agents-tab-spawned $new_pane
@@ -66,7 +98,9 @@ function _agent_restore --description "Rebuild the agents grid: ensure each live
 
         # No consolidate here: the layout file places panes correctly, and
         # calling consolidate before zellij has actually started would race.
-        echo "agent --restore: rebuilt meta-session with "(count $branches)" agent(s)"
+        set -l msg "agent restore: rebuilt meta-session with "(count $branches)" agent(s)"
+        test $skipped -gt 0; and set msg "$msg ($skipped hidden)"
+        echo $msg
         return 0
     end
 
@@ -95,9 +129,11 @@ function _agent_restore --description "Rebuild the agents grid: ensure each live
     _agent_ensure_meta_tab >/dev/null
     _agent_consolidate
 
+    set -l skipped_suffix ""
+    test $skipped -gt 0; and set skipped_suffix " ($skipped hidden)"
     if test $added -eq 0
-        echo "agent --restore: meta-session in sync — no panes added"
+        echo "agent restore: meta-session in sync — no panes added$skipped_suffix"
     else
-        echo "agent --restore: added $added missing pane(s)"
+        echo "agent restore: added $added missing pane(s)$skipped_suffix"
     end
 end

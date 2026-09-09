@@ -83,7 +83,7 @@ M.toggle = wezterm.action_callback(function(window)
     if meta_session_alive() then
       spawn_agents_tab(window)
     else
-      notify(window, "agent", "no agents — run `agent <name>` to spawn")
+      notify(window, "agent", "no agents — run `agent attach <name>` to spawn")
     end
     return
   end

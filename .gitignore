@@ -9,6 +9,7 @@ swiftpm/
 mozilla
 .tool-versions
 rails-mcp
+homebrew
 
 # wtf?
 StardewValley/

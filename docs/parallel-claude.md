@@ -27,7 +27,7 @@ from another wezterm tab or your phone. Same session, multiple viewers.
   branch off that point — the spawn prompt instructs it to
   `git checkout -b <kebab-case-name>` before doing anything else.
 - **Meta-session is named `agents`** — the name is reserved (`agent` and
-  `agent-rm` refuse it). It serializes via `session_serialization true`,
+  `agent rm` refuse it). It serializes via `session_serialization true`,
   so its layout survives wezterm restarts.
 - **Single `agents` wezterm tab** — one wezterm pane, running
   `zellij attach agents`. The grid lives inside zellij. `CMD+0` toggles
@@ -70,22 +70,34 @@ zellij.
 
 ## Fish commands
 
+`agent` is a dispatcher. Bare `agent` = `agent ls`. Every subcommand takes
+`--help` for details.
+
 | Command | Description |
 |---|---|
-| `agent <name>` | Spawn an agent. Opens nvim for a multi-line prompt; `:wq` with content seeds Claude, `:q` empty cancels. **Interactive only.** |
-| `agent <name> -e "<prompt>"` | Same but seed inline. Best for short single-line prompts. |
-| `agent <name> --seed <file>` | Same but seed from a file. **Preferred for non-trivial prompts.** Seed file is copied to `/tmp/agent-seed-...`; Claude is told to read then `rm` it. |
-| `agent <name> --repo <path>` | Override the repo root (defaults to the main worktree). |
-| `agent <name> --no-focus` | Don't refocus the calling pane after spawn. |
-| `agent <name> --headless` | Create the worktree + seed but no agents-tab pane; prints `headless_cwd:`/`headless_cmd:` lines for the caller to run (used by nvim's `<leader>an`). `agent --restore` surfaces headless sessions in the agents tab later. |
-| `agent <name> --debug` (`-d`) | Print spawn commands and intermediate state to stderr. |
-| `agent --restore` | Rebuild the agents grid from live per-agent sessions. Adds a meta-session pane for any session missing one, and spawns the wezterm tab if it's not there. |
-| `agent --help` | Usage. |
-| `agent-rm <name>` | Force-tear-down: worktree + branch + zellij session + meta-session pane. Infers from cwd if omitted. |
-| `agent-rm --all` | Same, for every worktree + per-agent zellij session. Confirms first. |
+| `agent` / `agent ls` | List agents: live sessions, meta-pane state, hidden state, worktree path. |
+| `agent attach <name>` | Create-or-attach a per-agent session. Opens nvim for a multi-line prompt on first spawn; `:wq` seeds, `:q` empty cancels. **Interactive only in that case.** Un-hides if hidden. |
+| `agent attach <name> -e "<prompt>"` | Same but seed inline. Best for short single-line prompts. |
+| `agent attach <name> --seed <file>` | Same but seed from a file. **Preferred for non-trivial prompts.** Seed file is copied to `/tmp/agent-seed-...`; Claude is told to read then `rm` it. |
+| `agent attach <name> --repo <path>` | Override the repo root (defaults to the main worktree). |
+| `agent attach <name> --no-focus` | Don't refocus the calling pane after spawn. |
+| `agent attach <name> --headless` | Create the worktree + seed but no agents-tab pane; prints `headless_cwd:`/`headless_cmd:` lines for the caller (used by nvim's `<leader>an`). `agent restore` surfaces headless sessions later. |
+| `agent attach <name> -d` / `--debug` | Print spawn commands and intermediate state to stderr. |
+| `agent rm [<name>]` | Tear down worktree + branch + zellij session + meta-pane. Infers from cwd if omitted. Refuses on unpushed/unmerged commits. |
+| `agent rm --force [<name>]` | Same but discards commits. |
+| `agent rm --all [-f]` | Same, for every worktree + per-agent session. Confirms first. |
+| `agent hide [<name>]` | Persist the branch in the hidden list; close its meta-pane if present. Session + worktree left alone. |
+| `agent hide --list` | Print the hidden list. |
+| `agent restore` | Rebuild the agents grid from live per-agent sessions. Skips hidden. |
+| `agent restore --include-hidden` | Clear the hidden list, then rebuild. |
+| `agent merged [-v]` | List agents whose branch is clean (safe to `rm`). |
+| `agent reload-plugin [<name>]` | Rebuild + hot-reload a local zellij plugin (defaults to `agents-bar`). |
 | `zj` | List active zellij sessions. |
 | `zj <name>` | Attach (or create) a zellij session in cwd. If a meta-session pane corresponds to `<name>`, it's auto-fullscreened while you're attached so its render dimensions don't constrain you. |
 | `zj <name> -- <cmd> ...` | Same, but if creating, run `<cmd>` as the first pane. |
+
+To un-hide: `agent attach <name>` (attaches AND un-hides), or
+`agent restore --include-hidden` to bulk-clear.
 
 ## Spawning from an LLM (Claude Code's `Bash` tool, etc.)
 
@@ -94,21 +106,21 @@ non-fish shell, invoke via `fish -c '...'`.
 
 **Rules of thumb for LLM callers:**
 
-1. **Never use the bare form `agent <name>`** with no `-e`/`--seed`. It
-   opens nvim and blocks.
+1. **Never use `agent attach <name>` with no `-e`/`--seed` on a fresh spawn.**
+   It opens nvim and blocks.
 2. **For non-trivial prompts, write the seed to a file and pass `--seed
    <path>`.** Use `Write` to drop the seed at e.g.
    `/tmp/agent-seed-<name>.md`, then
-   `fish -c 'agent <name> --seed /tmp/agent-seed-<name>.md'`.
+   `fish -c 'agent attach <name> --seed /tmp/agent-seed-<name>.md'`.
 3. **Names must be kebab-case and ≤25 chars.** Longer names silently fail
    on macOS (zellij socket-name limit).
-4. **`agents` is reserved** as the meta-session name — `agent agents`
+4. **`agents` is reserved** as the meta-session name — `agent attach agents`
    errors.
 5. **Cap is 8 concurrent agents.**
-6. **Repeat-spawn semantics:**
+6. **Repeat-attach semantics:**
    - Worktree gone, session gone → fresh spawn.
    - Worktree exists, session gone → restart Claude in existing worktree.
-   - Session exists, no meta-pane → adds the pane.
+   - Session exists, no meta-pane → adds the pane (un-hides if hidden).
    - Session exists, meta-pane exists → focuses; if `-e/--seed` is also
      provided, the prompt is injected into the running Claude.
 
@@ -120,12 +132,12 @@ is filtered out of pickers.
 
 | Key | Action |
 |---|---|
-| `<leader>an` | New worktree agent: name prompt → multi-line seed buffer (`<C-s>` submits) → `agent <name> --seed … --headless`. The session runs in the nvim tab only (no agents-tab pane); `agent --restore` adds it to the grid later if wanted. |
+| `<leader>an` | New worktree agent: name prompt → multi-line seed buffer (`<C-s>` submits) → `agent attach <name> --seed … --headless`. The session runs in the nvim tab only (no agents-tab pane); `agent restore` adds it to the grid later if wanted. |
 | `<leader>as` | New repo session: spawn / attach a claude session rooted at the current repo, named after the repo basename. No prompts. |
 | `<leader>ao` | Open/focus the agent for the current worktree. If none, picker over running sessions. |
 | `<leader>av` (visual) | Send visual selection. |
 | `<leader>ap` | Single-line prompt → submit. |
-| `<leader>ak` | Force-kill agent (picker) — runs `agent-rm --force` and closes its tab. |
+| `<leader>ak` | Force-kill agent (picker) — runs `agent rm --force` and closes its tab. |
 | `<leader>ar` | **+review**: the review sub-group (all review keys live here). |
 | `<leader>arr` | Start / stop review. On start, pick a mode (working tree / branch / since a commit) → inline unified diff (unified.nvim), or resume a review left open from a previous session. Prompts before discarding pending comments. |
 | `<leader>arf` | Fuzzy-pick a changed file (diff preview); `<CR>` opens it into the inline diff, `<a-m>` marks it reviewed and jumps to the next file. |
@@ -217,7 +229,7 @@ the buffer above (`config.review.editing_hl`).
 3. Claude reads the seed, picks a sensible kebab-case branch, runs
    `git checkout -b`, removes the seed, and gets to work.
 4. `CMD+0` to watch; `CMD+0` again to return.
-5. `agent-rm <name>` when done.
+5. `agent rm <name>` when done.
 
 ## Restore semantics
 
@@ -226,7 +238,7 @@ serialization). On wezterm startup, the `gui-startup` hook checks for a
 live `agents` session and, if found, spawns a passive `agents` tab in
 the new window automatically — focus stays on the primary tab.
 
-`agent --restore` covers the rarer case where a meta-session pane was
+`agent restore` covers the rarer case where a meta-session pane was
 closed manually (zellij's pane-close) but its Layer-1 session is still
 alive: it diffs `zellij list-sessions` against meta-session panes and
 adds any missing. Also useful if you want to manually re-spawn the

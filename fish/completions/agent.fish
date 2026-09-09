@@ -1,20 +1,39 @@
 function __agent_existing
-    # Live zellij sessions
-    zellij list-sessions -s 2>/dev/null
-    # Existing worktree dirs (real git worktrees only)
-    for d in (find $HOME/worktrees -mindepth 1 -maxdepth 2 -type d 2>/dev/null)
-        if test -e "$d/.git"
-            basename $d
-        end
+    zellij list-sessions -s 2>/dev/null | string match -v -- agents
+    for d in (find $HOME/worktrees -mindepth 2 -maxdepth 2 -type d 2>/dev/null)
+        test -e "$d/.git"; and basename $d
     end
 end
 
+function __agent_second_token_is
+    set -l tokens (commandline -opc)
+    test (count $tokens) -ge 2; and test "$tokens[2]" = $argv[1]
+end
+
+set -l subs ls attach rm hide restore merged reload-plugin help
+
 complete -c agent -f
-complete -c agent -n '__fish_is_first_token' -a '(__agent_existing | sort -u)' -d 'agent'
-complete -c agent -s e -l prompt -d 'inline prompt' -r
-complete -c agent -l seed -d 'prompt from file' -F
-complete -c agent -l repo -d 'repo root' -x
-complete -c agent -l restore -d 'rebuild agents grid from live sessions'
-complete -c agent -l no-focus -d "don't refocus calling pane after spawn"
-complete -c agent -s d -l debug -d 'debug output'
-complete -c agent -s h -l help -d 'show help'
+
+complete -c agent -n '__fish_is_first_token' -a "$subs" -d subcommand
+
+for sub in attach rm hide
+    complete -c agent -n "__agent_second_token_is $sub" -a '(__agent_existing | sort -u)' -d agent
+end
+
+complete -c agent -n '__agent_second_token_is attach' -s e -l prompt -d 'inline prompt' -r
+complete -c agent -n '__agent_second_token_is attach' -l seed -d 'prompt from file' -F
+complete -c agent -n '__agent_second_token_is attach' -l repo -d 'repo root' -x
+complete -c agent -n '__agent_second_token_is attach' -l no-focus -d "don't refocus calling pane"
+complete -c agent -n '__agent_second_token_is attach' -l headless -d 'no meta-pane (nvim caller)'
+complete -c agent -n '__agent_second_token_is attach' -s d -l debug -d 'debug output'
+
+complete -c agent -n '__agent_second_token_is rm' -s a -l all -d 'every agent (confirms)'
+complete -c agent -n '__agent_second_token_is rm' -s f -l force -d 'discard unpushed/unmerged commits'
+
+complete -c agent -n '__agent_second_token_is hide' -s l -l list -d 'print hidden list'
+
+complete -c agent -n '__agent_second_token_is restore' -l include-hidden -d 'clear hidden list first'
+
+complete -c agent -n '__agent_second_token_is merged' -s v -l verbose -d 'annotate with reason'
+
+complete -c agent -n '__agent_second_token_is help' -f

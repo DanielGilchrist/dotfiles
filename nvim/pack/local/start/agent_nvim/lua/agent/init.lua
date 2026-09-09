@@ -319,7 +319,7 @@ function M.new_agent()
       ---@type string[]
       local cmd = {
         "fish", "-c",
-        "agent " .. vim.fn.shellescape(name)
+        "agent attach " .. vim.fn.shellescape(name)
           .. " --seed " .. vim.fn.shellescape(tmp)
           .. " --headless"
           .. (repo and (" --repo " .. vim.fn.shellescape(repo)) or ""),
@@ -336,11 +336,11 @@ function M.new_agent()
           local cwd = stdout:match("headless_cwd:([^\n]+)")
           local agent_cmd = stdout:match("headless_cmd:([^\n]+)")
           if not cwd or not agent_cmd then
-            notify("agent --headless gave no command:\n" .. stdout, vim.log.levels.ERROR)
+            notify("agent attach --headless gave no command:\n" .. stdout, vim.log.levels.ERROR)
             return
           end
 
-          notify("spawned " .. name .. " (headless — attach elsewhere with `agent " .. name .. "`)")
+          notify("spawned " .. name .. " (headless — attach elsewhere with `agent attach " .. name .. "`)")
           M.attach_in_terminal(name, {
             cwd = cwd,
             attach_cmd = { "fish", "-c", "cd " .. vim.fn.shellescape(cwd) .. "; and " .. agent_cmd },
@@ -372,11 +372,11 @@ function M.new_repo_session()
   M.attach_in_terminal(name, { cwd = repo, initial_cmd = "claude" })
 end
 
----Run `agent-rm --force <name>` to tear down worktree + session + branch
+---Run `agent rm --force <name>` to tear down worktree + session + branch
 ---and close the owning tab page if we have one.
 ---@param name string
 local function tear_down(name)
-  local cmd = { "fish", "-c", "agent-rm --force " .. vim.fn.shellescape(name) }
+  local cmd = { "fish", "-c", "agent rm --force " .. vim.fn.shellescape(name) }
   vim.system(cmd, { text = true }, function(out)
     vim.schedule(function()
       if out.code ~= 0 then

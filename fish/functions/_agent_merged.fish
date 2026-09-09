@@ -1,11 +1,11 @@
-function agent-merged --description "List agent worktrees whose branch is safe to remove (no commits ahead of base, or pushed + upstream deleted). Prints one name per line."
-    argparse --name=agent-merged 'h/help' 'v/verbose' -- $argv
+function _agent_merged --description "agent merged — list agent worktrees safe to remove (clean per _agent_branch_clean)."
+    argparse --name='agent merged' 'h/help' 'v/verbose' -- $argv
     or return
 
     if set -q _flag_help
-        echo "usage: agent-merged [-v]"
+        echo "usage: agent merged [-v]"
         echo ""
-        echo "Lists agents whose branch is clean per `_agent_branch_clean`:"
+        echo "Lists agents whose branch is clean per _agent_branch_clean:"
         echo "  - no commits ahead of the default base, OR"
         echo "  - was pushed to origin AND the remote branch no longer exists"
         echo "    (our org auto-deletes origin branches on merge)."
@@ -21,8 +21,6 @@ function agent-merged --description "List agent worktrees whose branch is safe t
         set -l main_repo (git -C $worktree worktree list --porcelain 2>/dev/null | head -1 | string replace -r '^worktree ' '')
         test -z "$main_repo"; and continue
 
-        # The branch checked out inside the worktree (may not match the
-        # worktree dir name — claude picks its own kebab-case names).
         set -l in_worktree_branch (git -C $worktree symbolic-ref --quiet --short HEAD 2>/dev/null)
         set -l candidates $in_worktree_branch $branch
         set candidates (printf '%s\n' $candidates | string match -rv '^$' | sort -u)

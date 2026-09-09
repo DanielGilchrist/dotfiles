@@ -17,7 +17,7 @@ hook. After editing any plugin source — or after a fresh clone — run:
 `wasm32-wasip1` target.
 
 To hot-reload a plugin in a running agents meta-session (preserves Claude
-state in per-agent panes): `agent-reload-plugin [<name>]` — defaults to
+state in per-agent panes): `agent reload-plugin [<name>]` — defaults to
 `agents-bar`. Internally calls `zellij action start-or-reload-plugin`.
 
 > **For LLMs**: if `dist/*.wasm` is missing or you've changed any source under

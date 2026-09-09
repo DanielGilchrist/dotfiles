@@ -72,7 +72,7 @@ local function build_spawn_cmd(repo_path, name)
   -- spawning into the meta-session and exits, taking this temporary tab with
   -- it. cd inside fish rather than trusting wezterm's --cwd (canonicalisation
   -- bug, wez/wezterm#4618).
-  return "cd " .. fish_quote(repo_path) .. "; and agent " .. fish_quote(name)
+  return "cd " .. fish_quote(repo_path) .. "; and agent attach " .. fish_quote(name)
 end
 
 M.open = function(window, pane)
@@ -138,7 +138,7 @@ M.remove = function(window, pane)
     action = wezterm.action_callback(function(inner_window, inner_pane, branch)
       if not branch then return end
       inner_window:perform_action(wezterm.action.SpawnCommandInNewTab({
-        args = { resolve_fish(), "-c", "agent-rm " .. fish_quote(branch) .. " --force" },
+        args = { resolve_fish(), "-c", "agent rm --force " .. fish_quote(branch) },
       }), inner_pane)
     end),
   }), pane)
@@ -184,11 +184,11 @@ M.remove_focused = function(window, pane)
   local branch = cwd:match("([^/]+)/?$")
   if not branch or branch == "" then return end
 
-  -- agent-rm without --force refuses on dirty branches; user can rerun with
+  -- agent rm without --force refuses on dirty branches; user can rerun with
   -- --force from a regular pane if needed. Tab closes when the command exits.
   window:perform_action(wezterm.action.SpawnCommandInNewTab({
-    label = "agent-rm " .. branch,
-    args = { resolve_fish(), "-i", "-c", "agent-rm " .. fish_quote(branch) },
+    label = "agent rm " .. branch,
+    args = { resolve_fish(), "-i", "-c", "agent rm " .. fish_quote(branch) },
   }), pane)
 end
 
