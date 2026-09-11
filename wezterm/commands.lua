@@ -19,7 +19,7 @@ local pane_direction = {
 ---@field Console string
 ---@field Server string
 ---@field Start string
----@field Syncer string
+---@field Tunnel string
 ---@field Worker string
 ---@field Webpack string
 
@@ -29,7 +29,7 @@ local commands = {
   Console = "bin/dev console",
   Server = "bin/dev server",
   Start = "bin/dev start",
-  Syncer = "syncer",
+  Tunnel = "bin/tunnel --experimental-syncer",
   Worker = "bin/dev worker",
   Webpack = "bin/dev webpack",
 }
@@ -301,22 +301,22 @@ local function spawn_dev_tab(original_window, region, cd_command)
 
   local console_pane = split_pane_with_setup(server_pane, pane_direction.Right)
   local webpack_pane = split_pane_with_setup(console_pane, pane_direction.Bottom, 0.1)
-  local syncer_pane = split_pane_with_setup(server_pane, pane_direction.Bottom, 0.1)
+  local tunnel_pane = split_pane_with_setup(server_pane, pane_direction.Bottom, 0.1)
   local worker_pane = split_pane_with_setup(server_pane, pane_direction.Bottom, 0.4)
 
-  wait_for_text_for(syncer_pane, "Welcome to fish")
+  wait_for_text_for(tunnel_pane, "Welcome to fish")
 
   if region == regions.APAC or region == regions.EU then
-    run_command(syncer_pane, commands.Start)
-    wait_for_text_for(syncer_pane, "Your dev box", "is ready to be used")
+    run_command(tunnel_pane, commands.Start)
+    wait_for_text_for(tunnel_pane, "Your dev box", "is ready to be used")
   end
 
-  run_command(syncer_pane, commands.Syncer)
-  wait_for_text_for(syncer_pane, "Enter your developer name:", "watching for changes")
+  run_command(tunnel_pane, commands.Tunnel)
+  wait_for_text_for(tunnel_pane, "Enter your developer name:", "watching for changes")
 
-  if has_text(syncer_pane, "Enter your developer name:") then
-    run_command(syncer_pane, "dangilchrist")
-    wait_for_text_for(syncer_pane, "watching for changes")
+  if has_text(tunnel_pane, "Enter your developer name:") then
+    run_command(tunnel_pane, "dangilchrist")
+    wait_for_text_for(tunnel_pane, "watching for changes")
   end
 
   if not start_server(server_pane) then
