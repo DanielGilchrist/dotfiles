@@ -125,6 +125,14 @@ install_brew_package arduino-cli
 install_brew_package lua-language-server
 install_brew_package jetbrains/utils/kotlin-lsp kotlin-lsp
 install_brew_package difftastic difft
+install_brew_package 1jehuang/mmdr/mmdr mmdr
+
+# Snacks looks for `mmdc` (the Node-based mermaid-cli) to render mermaid
+# diagrams. Point it at mmdr (native Rust, no Node runtime) instead. The
+# override in nvim's snacks.image config passes only mmdr-compatible args.
+if command_exists mmdr && ! command_exists mmdc; then
+  ln -sf "$(command -v mmdr)" "$(brew --prefix)/bin/mmdc"
+fi
 
 install_asdf_plugin ruby https://github.com/asdf-vm/asdf-ruby.git
 install_asdf_plugin crystal https://github.com/asdf-community/asdf-crystal.git

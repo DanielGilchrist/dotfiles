@@ -101,6 +101,11 @@ install_package lua-language-server
 install_package kotlin-lsp-bin kotlin-lsp
 install_package difftastic difft
 install_package tree-sitter-cli tree-sitter
+install_package mmdr-bin mmdr
+
+if command_exists mmdr && ! command_exists mmdc; then
+  ln -sf "$(command -v mmdr)" "$HOME/.local/bin/mmdc"
+fi
 
 # watchman is currently broken on Arch - upstream hasn't provided Linux binaries since April 2024
 # Uncomment if you want to try anyway:
