@@ -1,7 +1,0 @@
-[package]
-name = "agents-bar"
-edition.workspace = true
-version.workspace = true
-
-[dependencies]
-zellij-tile.workspace = true

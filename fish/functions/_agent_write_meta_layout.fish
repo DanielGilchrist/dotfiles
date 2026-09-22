@@ -1,4 +1,4 @@
-function _agent_write_meta_layout --description "Write a meta-session bootstrap layout: ≤6-pane 'agents' tabs, each with an agents-bar plugin pane on top + a 2-column row-major grid below."
+function _agent_write_meta_layout --description "Write a meta-session bootstrap layout: ≤6-pane 'agents' tabs, arranged as a 2-column row-major grid."
     set -l file $argv[1]
     set -l entries $argv[2..-1]
 
@@ -10,17 +10,8 @@ function _agent_write_meta_layout --description "Write a meta-session bootstrap 
     set -l pair_count (math (count $entries) / 2)
     set -l tab_count (math --scale=0 "($pair_count + $per_tab - 1) / $per_tab")
 
-    # `borderless=true` hides the pane frame. We can't easily make the
-    # plugin pane "unselectable" inline, but the layout's `focus=true` on
-    # the first agent pane below ensures focus starts there and doesn't
-    # land on the indicator (which would otherwise leak the wasm path
-    # into the wezterm tab title).
-    set -l indicator "pane size=1 borderless=true { plugin location=\"file:$HOME/.config/zellij/plugins/dist/agents-bar.wasm\"; }"
-
     echo "layout {" > $file
 
-    # Track the very first agent pane across all tabs so we can mark it as
-    # the layout's initial focus (keeps focus off the indicator plugin).
     set -l first_agent_emitted 0
 
     for t in (seq 1 $tab_count)
@@ -28,7 +19,6 @@ function _agent_write_meta_layout --description "Write a meta-session bootstrap 
         set -l end (math "$t * $per_tab")
         test $end -gt $pair_count; and set end $pair_count
 
-        # Collect this tab's branches + commands in arrival order.
         set -l branches
         set -l cmds
         for i in (seq $start $end)
@@ -40,7 +30,6 @@ function _agent_write_meta_layout --description "Write a meta-session bootstrap 
 
         set -l n (count $branches)
         echo "    tab name=\"agents\" {" >> $file
-        echo "        $indicator" >> $file
 
         if test $n -eq 1
             if test $first_agent_emitted -eq 0
@@ -59,7 +48,6 @@ function _agent_write_meta_layout --description "Write a meta-session bootstrap 
 
             set -l right_count (math --scale=0 "$n / 2")
 
-            # Left column: panes at positions 1, 3, 5...
             echo "            pane split_direction=\"horizontal\" {" >> $file
             for i in (seq 1 2 $n)
                 if test $first_agent_emitted -eq 0
@@ -71,7 +59,6 @@ function _agent_write_meta_layout --description "Write a meta-session bootstrap 
             end
             echo "            }" >> $file
 
-            # Right column.
             if test $right_count -eq 1
                 _agent_emit_pane $file $branches[2] $cmds[2] "            "
             else
@@ -89,22 +76,17 @@ function _agent_write_meta_layout --description "Write a meta-session bootstrap 
     end
 
     # Session-wide swap layouts re-tile a tab as agents are added/removed.
-    # max_panes counts ALL panes including the indicator, so values are
-    # (agent_count + 1). Each template starts with the indicator pane.
     echo "    swap_tiled_layout name=\"agents-grid\" {" >> $file
-    echo "        tab max_panes=2 {" >> $file
-    echo "            pane size=1" >> $file
+    echo "        tab max_panes=1 {" >> $file
     echo "            pane" >> $file
     echo "        }" >> $file
-    echo "        tab max_panes=3 {" >> $file
-    echo "            pane size=1" >> $file
+    echo "        tab max_panes=2 {" >> $file
     echo "            pane split_direction=\"vertical\" {" >> $file
     echo "                pane" >> $file
     echo "                pane" >> $file
     echo "            }" >> $file
     echo "        }" >> $file
-    echo "        tab max_panes=4 {" >> $file
-    echo "            pane size=1" >> $file
+    echo "        tab max_panes=3 {" >> $file
     echo "            pane split_direction=\"vertical\" {" >> $file
     echo "                pane split_direction=\"horizontal\" {" >> $file
     echo "                    pane" >> $file
@@ -113,10 +95,22 @@ function _agent_write_meta_layout --description "Write a meta-session bootstrap 
     echo "                pane" >> $file
     echo "            }" >> $file
     echo "        }" >> $file
-    echo "        tab max_panes=5 {" >> $file
-    echo "            pane size=1" >> $file
+    echo "        tab max_panes=4 {" >> $file
     echo "            pane split_direction=\"vertical\" {" >> $file
     echo "                pane split_direction=\"horizontal\" {" >> $file
+    echo "                    pane" >> $file
+    echo "                    pane" >> $file
+    echo "                }" >> $file
+    echo "                pane split_direction=\"horizontal\" {" >> $file
+    echo "                    pane" >> $file
+    echo "                    pane" >> $file
+    echo "                }" >> $file
+    echo "            }" >> $file
+    echo "        }" >> $file
+    echo "        tab max_panes=5 {" >> $file
+    echo "            pane split_direction=\"vertical\" {" >> $file
+    echo "                pane split_direction=\"horizontal\" {" >> $file
+    echo "                    pane" >> $file
     echo "                    pane" >> $file
     echo "                    pane" >> $file
     echo "                }" >> $file
@@ -127,21 +121,6 @@ function _agent_write_meta_layout --description "Write a meta-session bootstrap 
     echo "            }" >> $file
     echo "        }" >> $file
     echo "        tab max_panes=6 {" >> $file
-    echo "            pane size=1" >> $file
-    echo "            pane split_direction=\"vertical\" {" >> $file
-    echo "                pane split_direction=\"horizontal\" {" >> $file
-    echo "                    pane" >> $file
-    echo "                    pane" >> $file
-    echo "                    pane" >> $file
-    echo "                }" >> $file
-    echo "                pane split_direction=\"horizontal\" {" >> $file
-    echo "                    pane" >> $file
-    echo "                    pane" >> $file
-    echo "                }" >> $file
-    echo "            }" >> $file
-    echo "        }" >> $file
-    echo "        tab max_panes=7 {" >> $file
-    echo "            pane size=1" >> $file
     echo "            pane split_direction=\"vertical\" {" >> $file
     echo "                pane split_direction=\"horizontal\" {" >> $file
     echo "                    pane" >> $file

@@ -46,6 +46,13 @@ function _agent_consolidate --description "Rebalance agent panes across meta-ses
         set -l target $tab_ids[$target_idx]
 
         if test "$src_tab" != "$target"
+            set -l worktree (_agent_worktree_path $branch)
+            test -n "$worktree"; and set src_cwd $worktree
+            if not test -d "$src_cwd"
+                echo "agent: skipping $branch — no worktree on disk and its pane cwd $src_cwd is gone" >&2
+                set i (math $i + 1)
+                continue
+            end
             set -l safe_cwd (string escape -- $src_cwd)
             set -l pane_cmd "cd $safe_cwd; and zj $branch"
             zellij --session agents action new-pane --tab-id $target --name $branch --cwd $src_cwd -- fish -c $pane_cmd >/dev/null 2>&1

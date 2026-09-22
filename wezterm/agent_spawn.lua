@@ -7,6 +7,7 @@ local wezterm = require("wezterm")
 ---@class AgentSpawnModule
 ---@field open fun(window: Window, pane: Pane): nil
 ---@field remove fun(window: Window, pane: Pane): nil
+---@field focused_worktree fun(window: Window): string|nil
 ---@field edit_focused fun(window: Window, pane: Pane): nil
 ---@field remove_focused fun(window: Window, pane: Pane): nil
 ---@field minimise_focused fun(window: Window, pane: Pane): nil
@@ -145,22 +146,32 @@ M.remove = function(window, pane)
 end
 
 ---@param window any
----@return string|nil cwd of the focused agent pane, or nil with a toast if none
-local function focused_worktree(window)
-  -- Ask zellij directly which agent pane is currently focused. The helper
-  -- cross-references `current-tab-info` (focused tab) with `list-panes`
-  -- (is_focused is per-tab in zellij 0.44, so we constrain by tab_id).
-  local _, out = wezterm.run_child_process({ resolve_fish(), "-c", "_agent_focused_worktree" })
+---@return string|nil worktree dir of the focused agent pane, or nil with a toast if none
+M.focused_worktree = function(window)
+  -- Ask zellij which agent pane is focused (via `list-clients`), then
+  -- resolve its worktree from the pane title → ~/worktrees/<repo>/<name>.
+  -- The helper only returns directories that exist.
+  local ok, out = wezterm.run_child_process({ resolve_fish(), "-c", "_agent_focused_worktree" })
   local cwd = out and out:gsub("%s+$", "") or ""
-  if cwd == "" then
-    window:toast_notification("agent", "no focused agent", nil, 2000)
+  if not ok or cwd == "" then
+    window:toast_notification("agent", "no focused agent (or its worktree is gone)", nil, 3000)
     return nil
   end
   return cwd
 end
 
+---Fish snippet that `cd`s into <cwd> and falls back to an interactive shell
+---with the error visible when it can't, rather than letting the tab close
+---before anything is readable.
+---@param cwd string
+---@return string
+local function cd_or_shell(cwd)
+  local quoted = fish_quote(cwd)
+  return "cd " .. quoted .. "; or begin; echo 'agent: cannot cd into '" .. quoted .. "; exec fish -i; end"
+end
+
 M.edit_focused = function(window, pane)
-  local cwd = focused_worktree(window)
+  local cwd = M.focused_worktree(window)
   if not cwd then return end
 
   -- Route through fish so the editor inherits the user's full env (PATH,
@@ -173,13 +184,13 @@ M.edit_focused = function(window, pane)
     label = "nvim " .. short_cwd,
     args = {
       resolve_fish(), "-i", "-c",
-      "set -q EDITOR; or set EDITOR nvim; cd " .. fish_quote(cwd) .. "; and exec $EDITOR",
+      "set -q EDITOR; or set EDITOR nvim; " .. cd_or_shell(cwd) .. "; exec $EDITOR",
     },
   }), pane)
 end
 
 M.remove_focused = function(window, pane)
-  local cwd = focused_worktree(window)
+  local cwd = M.focused_worktree(window)
   if not cwd then return end
   local branch = cwd:match("([^/]+)/?$")
   if not branch or branch == "" then return end
@@ -195,14 +206,14 @@ end
 M.minimise_focused = function(_window, _pane)
   -- Close the meta-session pane only. The per-agent zellij session keeps
   -- running (zj <branch> just detaches a client). Bring back with
-  -- `agent --restore` for all or `agent <name>` for one. consolidate reflows
+  -- `agent restore` for all or `agent attach <name>` for one. consolidate reflows
   -- the remaining panes so the grid stays tidy.
   wezterm.run_child_process({ resolve_fish(), "-c", "_agent_minimise_focused" })
 end
 
 M.attach_picker = function(window, pane)
   -- Spawn a temporary tab that runs the fzf session picker with live preview
-  -- of each session's viewport. On pick, fires `agent <name>` detached so
+  -- of each session's viewport. On pick, fires `agent attach <name>` detached so
   -- the picker tab can close immediately — otherwise the tab teardown races
   -- agent's mux operations and the new pane never lands in the meta-session.
   window:perform_action(wezterm.action.SpawnCommandInNewTab({
@@ -214,7 +225,7 @@ M.attach_picker = function(window, pane)
       -- synchronously so the picker tab stays alive for agent's mux ops
       -- (refocus of the calling pane); a short sleep at the end lets the
       -- mux flush before the tab tears down.
-      "set -l picked (_agent_session_picker); test -n \"$picked\"; and set -l wt (find $HOME/worktrees -mindepth 2 -maxdepth 2 -name $picked -type d 2>/dev/null | head -1); test -n \"$wt\"; and cd $wt; and agent $picked; sleep 0.5",
+      "set -l picked (_agent_session_picker); test -n \"$picked\"; and set -l wt (_agent_worktree_path $picked); test -n \"$wt\"; and cd $wt; and agent attach $picked; sleep 0.5",
     },
   }), pane)
 end

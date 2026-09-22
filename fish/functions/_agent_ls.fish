@@ -42,7 +42,7 @@ function _agent_ls --description "agent ls — list agents (live per-agent zelli
             _agent_meta_pane_id $name >/dev/null 2>&1; and set meta yes; or set meta no
         end
 
-        set -l wp (find $HOME/worktrees -mindepth 2 -maxdepth 2 -name $name -type d 2>/dev/null | head -1)
+        set -l wp (_agent_worktree_path $name)
         test -z "$wp"; and set wp -
         set wp (string replace $HOME '~' -- $wp)
 

@@ -50,11 +50,36 @@ function _agent_attach --description "agent attach — create-or-attach a per-ag
     set -l worktrees_dir "$HOME/worktrees/$repo_name"
     set -l worktree_path "$worktrees_dir/$branch"
 
+    # Look for ANY worktree named <branch> across every repo namespace.
+    # `agent attach <name>` is an "I want that agent" verb, so if a
+    # worktree already exists — under this repo or another — prefer it
+    # over creating a duplicate. If multiple exist we refuse and force
+    # the caller to disambiguate (or `agent rm` the wrong ones).
+    set -l existing
+    for candidate in (find $HOME/worktrees -mindepth 2 -maxdepth 2 -name $branch -type d 2>/dev/null)
+        test -e "$candidate/.git"; and set -a existing $candidate
+    end
+
     set -l worktree_exists 0
-    test -d "$worktree_path"; and set worktree_exists 1
+    if test (count $existing) -gt 1
+        echo "agent attach: multiple worktrees named $branch — remove the duplicates first:" >&2
+        for p in $existing
+            echo "  $p" >&2
+        end
+        return 1
+    else if test (count $existing) -eq 1
+        set worktree_path $existing[1]
+        set worktrees_dir (dirname $existing[1])
+        set worktree_exists 1
+    end
 
     set -l session_exists 0
     zellij list-sessions -s 2>/dev/null | string match -q -- $branch; and set session_exists 1
+
+    if test $session_exists -eq 1 -a $worktree_exists -eq 0
+        echo "agent attach: session $branch is alive but its worktree is gone — its Claude is running in a deleted directory." >&2
+        echo "       creating a fresh worktree at $worktree_path and reattaching; run \`agent rm $branch\` first if you want a clean start." >&2
+    end
 
     if test $session_exists -eq 0; and test (string length -- $branch) -gt 20
         echo "agent attach: name too long ("(string length -- $branch)" chars) for a new session; zellij session names must be ≤ 20 chars." >&2
@@ -201,6 +226,12 @@ function _agent_attach --description "agent attach — create-or-attach a per-ag
 
         _agent_ensure_meta_tab >/dev/null
     else
+        # A prior failed bootstrap can leave a wezterm "agents" tab open with
+        # no live meta-session. Kill any such orphans so we don't stack tabs.
+        for p in (wezterm cli list --format json 2>/dev/null | jq -r '.[] | select(.tab_title == "agents") | .pane_id')
+            wezterm cli kill-pane --pane-id $p 2>/dev/null
+        end
+
         set -l layout_file (mktemp -t agents-layout).kdl
         _agent_write_meta_layout $layout_file $branch "zellij action toggle-pane-frames; and $pane_cmd"
 
@@ -209,7 +240,11 @@ function _agent_attach --description "agent attach — create-or-attach a per-ag
             cat $layout_file >&2
         end
 
-        set -l boot_cmd "zellij -s agents -n $layout_file; rm -f $layout_file"
+        # Clear any resurrection cache first — otherwise `zellij -s agents -n`
+        # refuses because a serialised session still exists on disk. On failure
+        # drop to fish so the wezterm tab doesn't disappear silently.
+        set -l err_log $layout_file.err
+        set -l boot_cmd "zellij delete-session agents 2>/dev/null; or true; zellij -s agents -n $layout_file 2> $err_log; or begin; echo 'zellij bootstrap failed — layout: '$layout_file' stderr: '$err_log; exec fish; end; rm -f $layout_file $err_log"
         set -l new_pane (_term_spawn_tab --title agents $HOME $boot_cmd)
         if test -z "$new_pane"
             echo "agent attach: failed to spawn agents tab" >&2

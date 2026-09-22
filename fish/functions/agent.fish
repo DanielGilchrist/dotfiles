@@ -1,4 +1,4 @@
-function agent --description "Parallel Claude agents in worktrees. Dispatcher for subcommands (attach/rm/hide/restore/merged/reload-plugin/ls)."
+function agent --description "Parallel Claude agents in worktrees. Dispatcher for subcommands (attach/rm/hide/restore/merged/ls)."
     if test (count $argv) -eq 0
         _agent_ls
         return $status
@@ -20,10 +20,10 @@ function agent --description "Parallel Claude agents in worktrees. Dispatcher fo
             _agent_hide $rest
         case restore
             _agent_restore $rest
+        case reset
+            _agent_reset $rest
         case merged
             _agent_merged $rest
-        case reload-plugin
-            _agent_reload_plugin $rest
         case help -h --help
             _agent_help
         case '*'

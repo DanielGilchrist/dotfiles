@@ -434,24 +434,6 @@ local function fish_quote(s)
   return "'" .. s:gsub("'", "'\\''") .. "'"
 end
 
----@param window Window
----@return string?
-local function focused_agent_worktree(window)
-  local fish = "/opt/homebrew/bin/fish"
-  local _, out = wezterm.run_child_process({ fish, "-c", "_agent_focused_worktree" })
-
-  if not out then return nil end
-
-  local cwd = out:gsub("%s+$", "")
-
-  if cwd == "" then
-    window:toast_notification("dev", "no focused agent", nil, 2000)
-    return nil
-  end
-
-  return cwd
-end
-
 ---Pop the region picker, then run open_work_environment with cd_command.
 ---@param window Window
 ---@param pane Pane
@@ -479,14 +461,15 @@ end
 ---@param window Window
 ---@param pane Pane
 M.open_work_in_focused_agent = function(window, pane)
-  local cwd = focused_agent_worktree(window)
+  local cwd = agent_spawn.focused_worktree(window)
   if not cwd then return end
 
-  local repo = cwd:match("/worktrees/([^/]+)/[^/]+/?$")
-  if repo ~= "payaus" then
-    window:toast_notification("dev", "dev server is payaus-only (focused: " .. (repo or "?") .. ")", nil, 3000)
+  local f = io.open(cwd .. "/bin/dev", "r")
+  if not f then
+    window:toast_notification("dev", "no bin/dev in " .. cwd, nil, 3000)
     return
   end
+  f:close()
 
   pick_region_and_spawn(window, pane, "cd " .. fish_quote(cwd))
 end
@@ -494,7 +477,7 @@ end
 -- Listen for `agent-spawn-dev=<region>|<cwd>` (emitted by nvim with the
 -- region already chosen via vim.ui.select). If <cwd> is under
 -- ~/worktrees/<payaus>/* we cd into the worktree; otherwise we fall back
--- to `cdt`. Other repos are refused (dev server is payaus-only).
+-- to `cdt`. Refuses cwds that don't have a bin/dev script.
 wezterm.on("user-var-changed", function(window, pane, name, value)
   if name ~= "agent-spawn-dev" then return end
   local region, cwd = (value or ""):match("^([^|]+)|(.*)$")
@@ -510,13 +493,12 @@ wezterm.on("user-var-changed", function(window, pane, name, value)
   local cd_command
 
   if cwd:sub(1, #worktree_root) == worktree_root then
-    local repo = cwd:match("/worktrees/([^/]+)/[^/]+/?$")
-
-    if repo ~= "payaus" then
-      window:toast_notification("dev", "dev server is payaus-only (got: " .. (repo or "?") .. ")", nil, 3000)
+    local f = io.open(cwd .. "/bin/dev", "r")
+    if not f then
+      window:toast_notification("dev", "no bin/dev in " .. cwd, nil, 3000)
       return
     end
-
+    f:close()
     cd_command = "cd " .. fish_quote(cwd)
   else
     cd_command = commands.CDT

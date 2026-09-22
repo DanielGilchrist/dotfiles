@@ -92,8 +92,8 @@ zellij.
 | `agent hide --list` | Print the hidden list. |
 | `agent restore` | Rebuild the agents grid from live per-agent sessions. Skips hidden. |
 | `agent restore --include-hidden` | Clear the hidden list, then rebuild. |
+| `agent reset` | Hide every live agent and kill the meta-session. Grid goes empty; per-agent sessions and worktrees are untouched. Un-hide with `agent attach <name>` or bulk with `agent restore --include-hidden`. |
 | `agent merged [-v]` | List agents whose branch is clean (safe to `rm`). |
-| `agent reload-plugin [<name>]` | Rebuild + hot-reload a local zellij plugin (defaults to `agents-bar`). |
 | `zj` | List active zellij sessions. |
 | `zj <name>` | Attach (or create) a zellij session in cwd. If a meta-session pane corresponds to `<name>`, it's auto-fullscreened while you're attached so its render dimensions don't constrain you. |
 | `zj <name> -- <cmd> ...` | Same, but if creating, run `<cmd>` as the first pane. |

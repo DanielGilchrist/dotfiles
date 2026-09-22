@@ -322,7 +322,7 @@ web_client {
 // 
 default_layout "compact"
 
-nested_session_handling "fullscreen"
+nested_session_handling "never"
 
 theme "everforest-dark"
  

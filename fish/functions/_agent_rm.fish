@@ -79,13 +79,7 @@ function _agent_rm --description "agent rm — tear down an agent (worktree + ze
         return 1
     end
 
-    set -l worktree_path
-    for candidate in (find $HOME/worktrees -mindepth 1 -maxdepth 2 -name $branch -type d 2>/dev/null)
-        if test -e "$candidate/.git"
-            set worktree_path $candidate
-            break
-        end
-    end
+    set -l worktree_path (_agent_worktree_path $branch)
 
     set -l candidate_branches
     set -l main_repo
@@ -121,6 +115,7 @@ function _agent_rm --description "agent rm — tear down an agent (worktree + ze
             git -C $main_repo worktree remove --force $worktree_path 2>/dev/null
         end
         rm -rf $worktree_path 2>/dev/null
+        rmdir (dirname $worktree_path) 2>/dev/null
     end
 
     if test -n "$target_repo"
@@ -147,7 +142,6 @@ function _agent_rm --description "agent rm — tear down an agent (worktree + ze
         _agent_consolidate
     end
 
-    rm -f /tmp/agent-state-$branch 2>/dev/null
     _agent_unhide_quiet $branch
 
     echo "agent rm: removed $branch"

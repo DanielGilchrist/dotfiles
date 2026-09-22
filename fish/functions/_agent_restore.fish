@@ -56,7 +56,7 @@ function _agent_restore --description "agent restore — rebuild the agents grid
 
         set -l layout_args
         for b in $branches
-            set -l wp (find $HOME/worktrees -mindepth 2 -maxdepth 2 -name $b -type d 2>/dev/null | head -1)
+            set -l wp (_agent_worktree_path $b)
             # Drop any stale resurrection cache so `zj` creates fresh with
             # claude as the first pane rather than resurrecting a stub.
             set -l prep "zellij delete-session $b 2>/dev/null; or true"
@@ -112,7 +112,7 @@ function _agent_restore --description "agent restore — rebuild the agents grid
             continue
         end
 
-        set -l wp (find $HOME/worktrees -mindepth 2 -maxdepth 2 -name $b -type d 2>/dev/null | head -1)
+        set -l wp (_agent_worktree_path $b)
         set -l cwd_args
         set -l pane_cmd "zj $b"
         if test -n "$wp"

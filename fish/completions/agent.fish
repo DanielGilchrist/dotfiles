@@ -10,7 +10,7 @@ function __agent_second_token_is
     test (count $tokens) -ge 2; and test "$tokens[2]" = $argv[1]
 end
 
-set -l subs ls attach checkout co rm hide restore merged reload-plugin help
+set -l subs ls attach checkout co rm hide restore reset merged help
 
 complete -c agent -f
 
