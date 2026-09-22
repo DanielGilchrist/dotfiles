@@ -52,7 +52,7 @@ function _agent_restore --description "agent restore — rebuild the agents grid
         # into a "Waiting to run" stub. Wipe that and pass `claude --continue`
         # as the initial pane command so the agent picks up its latest
         # conversation in the worktree automatically.
-        set -l claude_cmd "claude --continue --permission-mode acceptEdits"
+        set -l claude_cmd "claude --continue --permission-mode auto"
 
         set -l layout_args
         for b in $branches
