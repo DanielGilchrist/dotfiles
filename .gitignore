@@ -62,40 +62,11 @@ user-dirs.*
 cachyos*/
 cachyos-hello.json
 
-# claude
-claude/remote-settings-consent.json
-claude/chrome
-claude/gh-pr-status-cache.json
-claude/.last-cleanup
-claude/.credentials.json
-claude/remote-settings.json
-claude/backups/
-claude/cache/
-claude/daemon/
-claude/daemon*
-claude/debug/
-claude/downloads/
-claude/file-history/
-claude/history.jsonl
-claude/ide/
-claude/mcp-needs-auth-cache.json
-claude/paste-cache/
-claude/plans
-claude/plugins/
-claude/policy-limits.json
-claude/projects/
-claude/session-env/
-claude/sessions/
-claude/shell-snapshots/
-claude/stats-cache.json
-claude/statsig/
-claude/tasks/
-claude/telemetry/
-claude/todos/
-claude/image-cache/
-claude/.last-update-result.json
-claude/jobs
-claude/remote-settings-consent.json
+claude/*
+!claude/CLAUDE.md
+!claude/hooks/
+!claude/settings.json
+!claude/statusline-fish-tide.sh
 
 # Misc
 arkrc
