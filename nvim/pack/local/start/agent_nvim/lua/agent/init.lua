@@ -300,6 +300,69 @@ end
 ---than an agents-tab pane, so nvim-spawned agents don't squish the grid (and
 ---aren't constrained by its render size). `agent --restore` surfaces them in
 ---the agents tab later if wanted.
+---@param display_name string  what to call it in notifications
+---@param sub string  subcommand: "attach" or "checkout"
+---@param arg string   the primary arg (agent name for attach, branch for checkout)
+---@param extra_args string  additional args (e.g. --seed <path> or --no-prompt)
+local function spawn_headless(display_name, sub, arg, extra_args)
+  local repo = session.main_repo_root()
+  local cmd = {
+    "fish", "-c",
+    "agent " .. sub .. " " .. vim.fn.shellescape(arg)
+      .. " " .. extra_args
+      .. " --headless"
+      .. (repo and (" --repo " .. vim.fn.shellescape(repo)) or ""),
+  }
+
+  vim.system(cmd, { text = true }, function(out)
+    vim.schedule(function()
+      if out.code ~= 0 then
+        notify("agent spawn failed: " .. (out.stderr or ""), vim.log.levels.ERROR)
+        return
+      end
+
+      local stdout = out.stdout or ""
+      local cwd = stdout:match("headless_cwd:([^\n]+)")
+      local agent_cmd = stdout:match("headless_cmd:([^\n]+)")
+      if not cwd or not agent_cmd then
+        notify("agent " .. sub .. " --headless gave no command:\n" .. stdout, vim.log.levels.ERROR)
+        return
+      end
+
+      local name = cwd:match("([^/]+)/?$") or display_name
+      notify("spawned " .. name .. " (headless — attach elsewhere with `agent attach " .. name .. "`)")
+      M.attach_in_terminal(name, {
+        cwd = cwd,
+        attach_cmd = { "fish", "-c", "cd " .. vim.fn.shellescape(cwd) .. "; and " .. agent_cmd },
+      })
+    end)
+  end)
+end
+
+---Pick a branch (local or remote), then attach an existing worktree for it
+---or create one and spawn a bare (no-prompt) agent.
+function M.checkout_agent()
+  Snacks.picker.git_branches({
+    all = true,
+    confirm = function(picker, item)
+      picker:close()
+      if not (item and item.branch) then return end
+      local branch = (item.branch:gsub("^remotes/", ""):gsub("^origin/", ""))
+      spawn_headless(branch, "checkout", branch, "")
+    end,
+  })
+end
+
+---Spawn a worktree agent without any seed prompt. Prompts only for the name;
+---Claude starts with no initial message.
+function M.new_agent_no_prompt()
+  vim.ui.input({ prompt = "agent name (kebab-case, no prompt): " }, function(name)
+    if not name or vim.trim(name) == "" then return end
+    local n = vim.trim(name)
+    spawn_headless(n, "attach", n, "--no-prompt")
+  end)
+end
+
 function M.new_agent()
   vim.ui.input({ prompt = "agent name (kebab-case): " }, function(name)
     if not name or vim.trim(name) == "" then return end
@@ -315,38 +378,7 @@ function M.new_agent()
       fd:write(text)
       fd:close()
 
-      local repo = session.main_repo_root()
-      ---@type string[]
-      local cmd = {
-        "fish", "-c",
-        "agent attach " .. vim.fn.shellescape(name)
-          .. " --seed " .. vim.fn.shellescape(tmp)
-          .. " --headless"
-          .. (repo and (" --repo " .. vim.fn.shellescape(repo)) or ""),
-      }
-
-      vim.system(cmd, { text = true }, function(out)
-        vim.schedule(function()
-          if out.code ~= 0 then
-            notify("agent spawn failed: " .. (out.stderr or ""), vim.log.levels.ERROR)
-            return
-          end
-
-          local stdout = out.stdout or ""
-          local cwd = stdout:match("headless_cwd:([^\n]+)")
-          local agent_cmd = stdout:match("headless_cmd:([^\n]+)")
-          if not cwd or not agent_cmd then
-            notify("agent attach --headless gave no command:\n" .. stdout, vim.log.levels.ERROR)
-            return
-          end
-
-          notify("spawned " .. name .. " (headless — attach elsewhere with `agent attach " .. name .. "`)")
-          M.attach_in_terminal(name, {
-            cwd = cwd,
-            attach_cmd = { "fish", "-c", "cd " .. vim.fn.shellescape(cwd) .. "; and " .. agent_cmd },
-          })
-        end)
-      end)
+      spawn_headless(name, "attach", name, "--seed " .. vim.fn.shellescape(tmp))
     end)
   end)
 end

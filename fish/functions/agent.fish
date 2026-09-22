@@ -12,6 +12,8 @@ function agent --description "Parallel Claude agents in worktrees. Dispatcher fo
             _agent_ls $rest
         case attach
             _agent_attach $rest
+        case checkout co
+            _agent_checkout $rest
         case rm
             _agent_rm $rest
         case hide

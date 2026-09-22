@@ -81,8 +81,10 @@ zellij.
 | `agent attach <name> --seed <file>` | Same but seed from a file. **Preferred for non-trivial prompts.** Seed file is copied to `/tmp/agent-seed-...`; Claude is told to read then `rm` it. |
 | `agent attach <name> --repo <path>` | Override the repo root (defaults to the main worktree). |
 | `agent attach <name> --no-focus` | Don't refocus the calling pane after spawn. |
+| `agent attach <name> --no-prompt` | Fresh spawn without the nvim seed editor. Starts Claude with no initial prompt. |
 | `agent attach <name> --headless` | Create the worktree + seed but no agents-tab pane; prints `headless_cwd:`/`headless_cmd:` lines for the caller (used by nvim's `<leader>an`). `agent restore` surfaces headless sessions later. |
 | `agent attach <name> -d` / `--debug` | Print spawn commands and intermediate state to stderr. |
+| `agent checkout <branch>` / `agent co <branch>` | Attach the existing worktree for `<branch>`, else create one from the local branch (or `origin/<branch>`) and spawn a bare agent (no prompt). Session/worktree name is `<branch>` with `/` → `-`, capped at 20 chars. |
 | `agent rm [<name>]` | Tear down worktree + branch + zellij session + meta-pane. Infers from cwd if omitted. Refuses on unpushed/unmerged commits. |
 | `agent rm --force [<name>]` | Same but discards commits. |
 | `agent rm --all [-f]` | Same, for every worktree + per-agent session. Confirms first. |
@@ -112,7 +114,7 @@ non-fish shell, invoke via `fish -c '...'`.
    <path>`.** Use `Write` to drop the seed at e.g.
    `/tmp/agent-seed-<name>.md`, then
    `fish -c 'agent attach <name> --seed /tmp/agent-seed-<name>.md'`.
-3. **Names must be kebab-case and ≤25 chars.** Longer names silently fail
+3. **Names must be kebab-case and ≤20 chars.** Longer names silently fail
    on macOS (zellij socket-name limit).
 4. **`agents` is reserved** as the meta-session name — `agent attach agents`
    errors.
@@ -133,6 +135,8 @@ is filtered out of pickers.
 | Key | Action |
 |---|---|
 | `<leader>an` | New worktree agent: name prompt → multi-line seed buffer (`<C-s>` submits) → `agent attach <name> --seed … --headless`. The session runs in the nvim tab only (no agents-tab pane); `agent restore` adds it to the grid later if wanted. |
+| `<leader>aN` | Same as `<leader>an` but skips the seed buffer — Claude starts with no prompt. |
+| `<leader>ac` | Branch picker (local + remote). Attaches an existing worktree for the pick, or creates one and spawns a bare agent. |
 | `<leader>as` | New repo session: spawn / attach a claude session rooted at the current repo, named after the repo basename. No prompts. |
 | `<leader>ao` | Open/focus the agent for the current worktree. If none, picker over running sessions. |
 | `<leader>av` (visual) | Send visual selection. |
@@ -254,7 +258,7 @@ agents tab in a non-startup wezterm window.
   `--cwd`.
 - **Auto-pin to position 0** is best-effort (race with mux registration).
   If the agents tab lands at the wrong position, `CMD+Shift+0` pins it.
-- **Zellij session-name length** is capped at 25 chars on macOS by the
+- **Zellij session-name length** is capped at 20 chars on macOS by the
   unix socket path budget. `agent` rejects longer names upfront.
 - **Spawning from a non-interactive shell without `-e`/`--seed`** opens
   nvim and blocks forever. Always pass a seed when scripting.

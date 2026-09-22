@@ -1,5 +1,5 @@
 function _agent_attach --description "agent attach — create-or-attach a per-agent zellij session; add a meta-pane if inside wezterm."
-    argparse --name='agent attach' 'h/help' 'd/debug' 'e/prompt=' 'seed=' 'repo=' 'no-focus' 'headless' -- $argv
+    argparse --name='agent attach' 'h/help' 'd/debug' 'e/prompt=' 'seed=' 'repo=' 'no-focus' 'no-prompt' 'headless' -- $argv
     or return
 
     if set -q _flag_help
@@ -10,6 +10,7 @@ function _agent_attach --description "agent attach — create-or-attach a per-ag
         echo "  --seed <file>        — multi-line prompt from a file (same as -e)"
         echo "  --repo <path>        — repo root (defaults to git worktree list --porcelain from cwd)"
         echo "  --no-focus           — don't refocus the calling pane after spawn"
+        echo "  --no-prompt          — fresh spawn without opening the nvim editor for a seed (starts Claude with no prompt)"
         echo "  --headless           — no agents-tab pane; prints 'headless_cwd:'/'headless_cmd:' for the caller"
         echo "  -d, --debug          — print spawn commands to stderr"
         return 0
@@ -24,11 +25,6 @@ function _agent_attach --description "agent attach — create-or-attach a per-ag
 
     if test "$branch" = agents
         echo "agent attach: 'agents' is reserved (used for the meta-session)" >&2
-        return 1
-    end
-
-    if test (string length -- $branch) -gt 25
-        echo "agent attach: name too long ("(string length -- $branch)" chars); zellij caps session names around 25 chars on macOS." >&2
         return 1
     end
 
@@ -60,12 +56,17 @@ function _agent_attach --description "agent attach — create-or-attach a per-ag
     set -l session_exists 0
     zellij list-sessions -s 2>/dev/null | string match -q -- $branch; and set session_exists 1
 
+    if test $session_exists -eq 0; and test (string length -- $branch) -gt 20
+        echo "agent attach: name too long ("(string length -- $branch)" chars) for a new session; zellij session names must be ≤ 20 chars." >&2
+        return 1
+    end
+
     set -q _flag_debug; and echo "[debug] worktree_exists=$worktree_exists session_exists=$session_exists" >&2
 
     if test -n "$_flag_prompt"
         set _flag_seed (mktemp -t agent-prompt)
         printf "%s" $_flag_prompt > $_flag_seed
-    else if test -z "$_flag_seed" -a $worktree_exists -eq 0 -a $session_exists -eq 0; and status --is-interactive
+    else if test -z "$_flag_seed" -a $worktree_exists -eq 0 -a $session_exists -eq 0; and status --is-interactive; and not set -q _flag_no_prompt
         set -l editor_path /tmp/agent-prompt-$branch-(random).md
         touch $editor_path
         nvim $editor_path
@@ -132,6 +133,8 @@ function _agent_attach --description "agent attach — create-or-attach a per-ag
             set -l meta "This worktree is detached at the repo's default branch. Before doing anything else, in order: (1) read $seed_path to understand your task, (2) create a branch with \`git checkout -b <kebab-case-name>\` named for the task, (3) \`trash $seed_path\`."
             set -l escaped (string escape -- $meta)
             set per_agent_cmd "zj $branch -- claude --add-dir /tmp --permission-mode acceptEdits $escaped"
+        else if set -q _flag_no_prompt
+            set per_agent_cmd "zj $branch -- claude --permission-mode acceptEdits"
         else
             set -l meta "This worktree is detached at the repo's default branch. Once you understand the task, create a branch with \`git checkout -b <kebab-case-name>\` named for it before making any changes."
             set -l escaped (string escape -- $meta)

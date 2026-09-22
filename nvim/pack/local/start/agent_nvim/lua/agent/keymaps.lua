@@ -18,6 +18,8 @@ function M.register(prefix)
   vim.keymap.set({ "n", "i", "t", "x" }, "<C-.>", function() agent().toggle() end, { desc = "agent: toggle active", silent = true })
 
   map("n", function() agent().new_agent() end, "new (worktree)")
+  map("N", function() agent().new_agent_no_prompt() end, "new (worktree, no prompt)")
+  map("c", function() agent().checkout_agent() end, "checkout branch (attach or create worktree)")
   map("s", function() agent().new_repo_session() end, "new (repo cwd)")
   map("o", function() agent().open_or_pick() end, "open/pick")
   map("v", function() agent().send_visual() end, "comment on selection", "x")
