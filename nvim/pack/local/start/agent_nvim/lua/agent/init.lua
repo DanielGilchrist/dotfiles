@@ -276,7 +276,14 @@ function M.open_or_pick()
   end
 
   local resolved = session.resolve()
-  if resolved and zellij.session_exists(resolved) then
+  -- Only auto-attach when the resolved agent isn't already the one we're
+  -- looking at. Otherwise re-pressing <leader>ao from the same worktree
+  -- looks like a no-op — the user actually wanted the picker to switch.
+  local already_here = resolved
+    and (tab_for_agent(resolved) == vim.api.nvim_get_current_tabpage()
+      or M.tab_agents[vim.api.nvim_get_current_tabpage()] == resolved
+      or vim.fn.getcwd() == session.session_cwd(resolved))
+  if resolved and not already_here and zellij.session_exists(resolved) then
     M.attach_in_terminal(resolved)
     return
   end
