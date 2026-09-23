@@ -1,15 +1,23 @@
 local os_utils = {}
 
-function os_utils.system()
-	os = io.popen("uname"):read("*a"):gsub("\n", "")
+---@type "macos"|"linux"|"unknown"|nil
+local system
 
-	if os == "Darwin" then
-		return "macos"
-	elseif os == "Linux" then
-		return "linux"
+---@return "macos"|"linux"|"unknown"
+function os_utils.system()
+	if system then return system end
+
+	local uname = io.popen("uname"):read("*a"):gsub("\n", "")
+
+	if uname == "Darwin" then
+		system = "macos"
+	elseif uname == "Linux" then
+		system = "linux"
 	else
-		return "unknown"
+		system = "unknown"
 	end
+
+	return system
 end
 
 return os_utils

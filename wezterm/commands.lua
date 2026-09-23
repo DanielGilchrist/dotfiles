@@ -1,5 +1,8 @@
 local wezterm = require("wezterm")
 local notify = require("utils.notify")
+local path_utils = require("utils.path")
+local shell = require("utils.shell")
+local worktree = require("utils.worktree")
 local agent_spawn = require("agent_spawn")
 
 local M = {}
@@ -231,8 +234,8 @@ local function dev_tab_title(region, cd_command)
 
   if path then
     path = path:gsub("^['\"]", ""):gsub("['\"]$", "")
-    local basename = path:match("([^/]+)/?$")
-    if basename and basename ~= "" then return "dev:" .. region .. ":" .. basename end
+    local basename = path_utils.basename(path)
+    if basename ~= "" then return "dev:" .. region .. ":" .. basename end
   end
 
   return "dev:" .. region
@@ -253,7 +256,7 @@ local function close_existing_dev_tab(window, region)
   for _, tab in ipairs(window:mux_window():tabs()) do
     if tab:tab_id() == tab_id then
       for _, pane in ipairs(tab:panes()) do
-        wezterm.run_child_process({ "/opt/homebrew/bin/wezterm", "cli", "kill-pane", "--pane-id", tostring(pane:pane_id()) })
+        shell.run({ shell.which("wezterm", "/opt/homebrew/bin/wezterm"), "cli", "kill-pane", "--pane-id", tostring(pane:pane_id()) })
       end
 
       break
@@ -357,14 +360,12 @@ local function open_work_environment(region, cd_command)
         end
       end
       if tab_alive then
-        original_window:toast_notification("dev",
-          "dev tab for " .. region .. " is already spawning — wait for it to finish", nil, 2500)
+        notify(original_window, "dev", "dev tab for " .. region .. " is already spawning — wait for it to finish")
         return
       end
       in_progress[region] = nil
       wezterm.GLOBAL.dev_spawn_in_progress_by_region = in_progress
-      original_window:toast_notification("dev",
-        "cleared stale spawn lock for " .. region, nil, 2500)
+      notify(original_window, "dev", "cleared stale spawn lock for " .. region)
     end
 
     close_existing_dev_tab(original_window, region)
@@ -383,25 +384,11 @@ end
 
 ---@return { label: string, id: string }[]
 local function worktree_choices()
-  local worktrees_dir = wezterm.home_dir .. "/worktrees"
-
-  -- New layout: ~/worktrees/<repo>/<branch>. Find one level deep so we get
-  -- every branch across every repo.
-  local success, stdout, _stderr = wezterm.run_child_process({
-    "find", worktrees_dir, "-mindepth", "2", "-maxdepth", "2", "-type", "d",
-  })
-
-  if not success or stdout == "" then
-    return {}
-  end
-
   local choices = {}
 
-  for path in stdout:gmatch("[^\n]+") do
-    local repo, branch = path:match("/worktrees/([^/]+)/([^/]+)$")
-    if repo and branch then
-      table.insert(choices, { label = repo .. "/" .. branch, id = repo .. "/" .. branch })
-    end
+  for _, entry in ipairs(worktree.list()) do
+    local label = entry.repo .. "/" .. entry.branch
+    table.insert(choices, { label = label, id = label })
   end
 
   return choices
@@ -427,11 +414,14 @@ local function open_worktree_selector()
   end
 end
 
----Single-quote a string for safe inclusion in a fish-shell command.
----@param s string
----@return string
-local function fish_quote(s)
-  return "'" .. s:gsub("'", "'\\''") .. "'"
+---True if <cwd> has the dev-box wrapper script; notifies otherwise.
+---@param window Window
+---@param cwd string
+---@return boolean
+local function has_bin_dev(window, cwd)
+  if path_utils.file_exists(cwd .. "/bin/dev") then return true end
+  notify(window, "dev", "no bin/dev in " .. cwd)
+  return false
 end
 
 ---Pop the region picker, then run open_work_environment with cd_command.
@@ -463,15 +453,9 @@ end
 M.open_work_in_focused_agent = function(window, pane)
   local cwd = agent_spawn.focused_worktree(window)
   if not cwd then return end
+  if not has_bin_dev(window, cwd) then return end
 
-  local f = io.open(cwd .. "/bin/dev", "r")
-  if not f then
-    window:toast_notification("dev", "no bin/dev in " .. cwd, nil, 3000)
-    return
-  end
-  f:close()
-
-  pick_region_and_spawn(window, pane, "cd " .. fish_quote(cwd))
+  pick_region_and_spawn(window, pane, "cd " .. shell.quote(cwd))
 end
 
 -- Listen for `agent-spawn-dev=<region>|<cwd>` (emitted by nvim with the
@@ -483,23 +467,15 @@ wezterm.on("user-var-changed", function(window, pane, name, value)
   local region, cwd = (value or ""):match("^([^|]+)|(.*)$")
 
   if not region or not cwd then
-    window:toast_notification("dev", "agent-spawn-dev: malformed payload", nil, 3000)
+    notify(window, "dev", "agent-spawn-dev: malformed payload")
     return
   end
 
-  window:toast_notification("dev", ("recv region=%s cwd=%s"):format(region, cwd), nil, 3000)
-
-  local worktree_root = wezterm.home_dir .. "/worktrees/"
   local cd_command
 
-  if cwd:sub(1, #worktree_root) == worktree_root then
-    local f = io.open(cwd .. "/bin/dev", "r")
-    if not f then
-      window:toast_notification("dev", "no bin/dev in " .. cwd, nil, 3000)
-      return
-    end
-    f:close()
-    cd_command = "cd " .. fish_quote(cwd)
+  if worktree.contains(cwd) then
+    if not has_bin_dev(window, cwd) then return end
+    cd_command = "cd " .. shell.quote(cwd)
   else
     cd_command = commands.CDT
   end

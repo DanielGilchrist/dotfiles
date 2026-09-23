@@ -13,4 +13,10 @@ return {
   root = function(markers)
     return vim.fs.root(0, markers or { ".git" }) or vim.uv.cwd() or error("FAAAAAAAAAAH")
   end,
+  ---Last path segment, ignoring a trailing slash
+  ---@param path string
+  ---@return string
+  basename = function(path)
+    return vim.fs.basename((path:gsub("/+$", ""))) or ""
+  end,
 }

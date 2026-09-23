@@ -46,7 +46,7 @@ end
 ---@param value any
 ---@return boolean
 function M.empty_table(value)
-  return M.table(value) and vim.tbl_isempty(value) or (#value == 1 and value[1] == "")
+  return M.table(value) and (vim.tbl_isempty(value) or (#value == 1 and value[1] == ""))
 end
 
 ---Check if a value is empty (nil, empty string, or empty table)

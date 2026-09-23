@@ -3,6 +3,12 @@ local session = require("agent.session")
 local zellij = require("agent.zellij")
 local ui = require("agent.ui")
 local composer = require("agent.composer")
+local cmd_utils = require("utils.cmd")
+local file = require("utils.file")
+local is = require("utils.is")
+local path_utils = require("utils.path")
+local ui_utils = require("utils.ui")
+local notify = require("utils.notify").with_title("agent")
 
 ---@class Agent
 ---@field config AgentConfig
@@ -19,12 +25,6 @@ M.agent_terminals = {} ---@type table<string, table> Snacks terminal objects by 
 ---send target from non-agent tabs.
 ---@type string|nil
 M.last_attached = nil
-
----@param msg string
----@param level integer|nil
-local function notify(msg, level)
-  vim.notify(msg, level or vim.log.levels.INFO, { title = "agent" })
-end
 
 ---@param name string
 ---@return integer|nil tabid
@@ -48,11 +48,11 @@ end
 local function require_target(target)
   target = target or current_agent() or M.last_attached
   if not target then
-    notify("no agent to send to — attach one with <leader>ao or spawn with <leader>an", vim.log.levels.WARN)
+    notify.warn("no agent to send to — attach one with <leader>ao or spawn with <leader>an")
     return nil
   end
   if not zellij.session_exists(target) then
-    notify("session not running: " .. target, vim.log.levels.WARN)
+    notify.warn("session not running: " .. target)
     return nil
   end
   return target
@@ -66,7 +66,7 @@ function M.send_text(text, submit)
   local resolved = require_target(nil)
   if not resolved then return false end
   if not zellij.write_chars(resolved, text) then
-    notify("zellij write failed", vim.log.levels.ERROR)
+    notify.error("zellij write failed")
     return false
   end
   if submit then zellij.submit(resolved) end
@@ -78,14 +78,14 @@ end
 ---content we're pointing at.
 function M.send_visual()
   local path = vim.api.nvim_buf_get_name(0)
-  if path == "" then
-    notify("buffer has no file path", vim.log.levels.WARN)
+  if is.empty(path) then
+    notify.warn("buffer has no file path")
     return
   end
   local s = vim.api.nvim_buf_get_mark(0, "<")
   local e = vim.api.nvim_buf_get_mark(0, ">")
   if s[1] == 0 or e[1] == 0 then
-    notify("no visual selection", vim.log.levels.WARN)
+    notify.warn("no visual selection")
     return
   end
   if vim.bo.modified then pcall(vim.cmd, "silent! update") end
@@ -108,8 +108,8 @@ function M.send_choice(n) M.send_text(tostring(n), true) end
 ---other cwds fall back to `cdt`.
 function M.spawn_dev()
   local cwd = vim.fn.getcwd()
-  if vim.fn.executable(cwd .. "/bin/dev") ~= 1 then
-    notify("spawn-dev: no bin/dev in " .. cwd, vim.log.levels.WARN)
+  if not is.executable(cwd .. "/bin/dev") then
+    notify.warn("spawn-dev: no bin/dev in " .. cwd)
     return
   end
   vim.ui.select({ "us", "eu", "apac" }, { prompt = "Region for dev tabs:" }, function(region)
@@ -122,9 +122,9 @@ function M.spawn_dev()
     local osc = ("\27]1337;SetUserVar=agent-spawn-dev=%s\7"):format(b64)
     local sent = vim.fn.chansend(vim.v.stderr, osc) > 0
     if sent then
-      notify("spawn-dev: sent region=" .. region)
+      notify.info("spawn-dev: sent region=" .. region)
     else
-      notify("spawn-dev: chansend to stderr failed", vim.log.levels.ERROR)
+      notify.error("spawn-dev: chansend to stderr failed")
     end
   end)
 end
@@ -272,7 +272,7 @@ end
 function M.open_or_pick()
   local sessions = zellij.list_sessions()
   if #sessions == 0 then
-    notify("no zellij sessions running — <leader>an for a worktree agent, <leader>as for a repo session", vim.log.levels.WARN)
+    notify.warn("no zellij sessions running — <leader>an for a worktree agent, <leader>as for a repo session")
     return
   end
 
@@ -324,8 +324,8 @@ local function spawn_headless(display_name, sub, arg, extra_args)
 
   vim.system(cmd, { text = true }, function(out)
     vim.schedule(function()
-      if out.code ~= 0 then
-        notify("agent spawn failed: " .. (out.stderr or ""), vim.log.levels.ERROR)
+      if not cmd_utils.success(out.code) then
+        notify.error("agent spawn failed: " .. (out.stderr or ""))
         return
       end
 
@@ -333,12 +333,13 @@ local function spawn_headless(display_name, sub, arg, extra_args)
       local cwd = stdout:match("headless_cwd:([^\n]+)")
       local agent_cmd = stdout:match("headless_cmd:([^\n]+)")
       if not cwd or not agent_cmd then
-        notify("agent " .. sub .. " --headless gave no command:\n" .. stdout, vim.log.levels.ERROR)
+        notify.error("agent " .. sub .. " --headless gave no command:\n" .. stdout)
         return
       end
 
-      local name = cwd:match("([^/]+)/?$") or display_name
-      notify("spawned " .. name .. " (headless — attach elsewhere with `agent attach " .. name .. "`)")
+      local name = path_utils.basename(cwd)
+      if is.empty(name) then name = display_name end
+      notify.info("spawned " .. name .. " (headless — attach elsewhere with `agent attach " .. name .. "`)")
       M.attach_in_terminal(name, {
         cwd = cwd,
         attach_cmd = { "fish", "-c", "cd " .. vim.fn.shellescape(cwd) .. "; and " .. agent_cmd },
@@ -365,28 +366,25 @@ end
 ---Claude starts with no initial message.
 function M.new_agent_no_prompt()
   vim.ui.input({ prompt = "agent name (kebab-case, no prompt): " }, function(name)
-    if not name or vim.trim(name) == "" then return end
-    local n = vim.trim(name)
-    spawn_headless(n, "attach", n, "--no-prompt")
+    local trimmed = name and vim.trim(name)
+    if is.empty(trimmed) then return end
+    spawn_headless(trimmed, "attach", trimmed, "--no-prompt")
   end)
 end
 
 function M.new_agent()
   vim.ui.input({ prompt = "agent name (kebab-case): " }, function(name)
-    if not name or vim.trim(name) == "" then return end
-    name = vim.trim(name)
+    local trimmed = name and vim.trim(name)
+    if is.empty(trimmed) then return end
 
     ui.new_prompt(function(text)
       local tmp = vim.fn.tempname() .. ".md"
-      local fd = io.open(tmp, "w")
-      if not fd then
-        notify("could not write seed file", vim.log.levels.ERROR)
+      if not file.write(tmp, text) then
+        notify.error("could not write seed file")
         return
       end
-      fd:write(text)
-      fd:close()
 
-      spawn_headless(name, "attach", name, "--seed " .. vim.fn.shellescape(tmp))
+      spawn_headless(trimmed, "attach", trimmed, "--seed " .. vim.fn.shellescape(tmp))
     end)
   end)
 end
@@ -397,12 +395,12 @@ end
 function M.new_repo_session()
   local repo = session.repo_root()
   if not repo then
-    notify("not in a git repo", vim.log.levels.WARN)
+    notify.warn("not in a git repo")
     return
   end
-  local name = vim.fn.fnamemodify(repo, ":t")
-  if name == "" then
-    notify("could not derive session name from repo path", vim.log.levels.ERROR)
+  local name = path_utils.basename(repo)
+  if is.empty(name) then
+    notify.error("could not derive session name from repo path")
     return
   end
   if zellij.session_exists(name) then
@@ -419,11 +417,11 @@ local function tear_down(name)
   local cmd = { "fish", "-c", "agent rm --force " .. vim.fn.shellescape(name) }
   vim.system(cmd, { text = true }, function(out)
     vim.schedule(function()
-      if out.code ~= 0 then
-        notify("kill failed: " .. (out.stderr or out.stdout or ""), vim.log.levels.ERROR)
+      if not cmd_utils.success(out.code) then
+        notify.error("kill failed: " .. (out.stderr or out.stdout or ""))
         return
       end
-      notify(vim.trim(out.stdout or ("killed " .. name)))
+      notify.info(vim.trim(out.stdout or ("killed " .. name)))
       local tab = tab_for_agent(name)
       if tab then pcall(vim.api.nvim_command, ("tabclose " .. vim.api.nvim_tabpage_get_number(tab))) end
       M.tab_agents[tab or 0] = nil
@@ -435,7 +433,7 @@ end
 function M.kill_agent()
   local sessions = zellij.list_sessions()
   if #sessions == 0 then
-    notify("no agent sessions to kill", vim.log.levels.WARN)
+    notify.warn("no agent sessions to kill")
     return
   end
 
@@ -447,8 +445,8 @@ function M.kill_agent()
       current = current_agent() or session.resolve(),
       on_pick = function(name)
         if not name then return end
-        vim.ui.select({ "yes", "no" }, { prompt = "kill " .. name .. " (worktree + session + branch)?" }, function(confirm)
-          if confirm ~= "yes" then return end
+        ui_utils.confirm("kill " .. name .. " (worktree + session + branch)?", function(choice)
+          if choice ~= "Ok" then return end
           tear_down(name)
         end)
       end,

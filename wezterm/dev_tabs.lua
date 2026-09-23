@@ -1,5 +1,6 @@
 local wezterm = require("wezterm")
 local notify = require("utils.notify")
+local tab_utils = require("utils.tab")
 
 ---@class DevTabsModule
 ---@field is_dev fun(tab: MuxTab|TabInformation|nil): boolean
@@ -20,8 +21,7 @@ function M.is_dev(tab)
 
   if by_region == nil then return false end
 
-  -- MuxTab has :tab_id() but TabInformation has .tab_id (a number).
-  local tid = type(tab.tab_id) == "function" and tab:tab_id() or tab.tab_id
+  local tid = tab_utils.id(tab)
 
   for _, region in ipairs(REGIONS) do
     if tid == by_region[region] then return true end

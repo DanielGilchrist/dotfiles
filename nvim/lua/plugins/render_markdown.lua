@@ -1,3 +1,6 @@
+local cmd = require("utils.cmd")
+local notify = require("utils.notify")
+
 local function fence_at_cursor(buf, lang)
   local total = vim.api.nvim_buf_line_count(buf)
   local cur = vim.api.nvim_win_get_cursor(0)[1]
@@ -23,15 +26,15 @@ local function preview_mermaid()
   local buf = vim.api.nvim_get_current_buf()
   local src = fence_at_cursor(buf, "mermaid")
   if not src then
-    vim.notify("no mermaid fence at cursor", vim.log.levels.WARN)
+    notify.warn("no mermaid fence at cursor")
     return
   end
   local mmd = vim.fn.tempname() .. ".mmd"
   local png = vim.fn.tempname() .. ".png"
   vim.fn.writefile(vim.split(src, "\n"), mmd)
   local out = vim.system({ "mmdr", "-i", mmd, "-o", png, "-e", "png" }, { text = true }):wait()
-  if out.code ~= 0 then
-    vim.notify("mmdr failed: " .. (out.stderr or ""), vim.log.levels.ERROR)
+  if not cmd.success(out.code) then
+    notify.error("mmdr failed: " .. (out.stderr or ""))
     return
   end
 

@@ -19,7 +19,7 @@ local function validate_cli_opts(opts)
   error(string.format("`opts` must contain at least one of `on_stdout` or `onstderr`!"))
 end
 
-M = {}
+local M = {}
 
 ---Create a default handler that only calls the callback when data is not empty
 ---@param callback fun(data: any)

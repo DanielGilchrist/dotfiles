@@ -4,6 +4,7 @@
 -- the rename command below).
 
 local is = require("utils.is")
+local path = require("utils.path")
 
 local M = {}
 
@@ -15,17 +16,17 @@ function M.tab_label(tabnr)
   local explicit = vim.t[tabid].tabname
   if is.not_empty(explicit) then return explicit end
   local cwd = vim.fn.getcwd(-1, tabnr)
-  if is.not_empty(cwd) then return vim.fn.fnamemodify(cwd, ":t") end
+  if is.not_empty(cwd) then return path.basename(cwd) end
   return "[" .. tabnr .. "]"
 end
 
 ---Abbreviate a path the way fish's default `fish_title` does
 ---(`prompt_pwd -d 1 -D 1`): `~`-relative, every segment but the last cut to
 ---its first character. `~/worktrees/payaus/foo` → `~/w/p/foo`.
----@param path string
+---@param dir string
 ---@return string
-local function abbreviate(path)
-  local tilde = vim.fn.fnamemodify(path, ":~")
+local function abbreviate(dir)
+  local tilde = vim.fn.fnamemodify(dir, ":~")
   local segments = vim.split(tilde, "/", { plain = true })
   for i = 1, #segments - 1 do
     local segment = segments[i]
@@ -85,7 +86,7 @@ function M.rename()
   vim.ui.input({ prompt = ("rename tab %d: "):format(current), default = existing }, function(input)
     if input == nil then return end
     input = vim.trim(input)
-    vim.t.tabname = input ~= "" and input or nil
+    vim.t.tabname = is.not_empty(input) and input or nil
     M.refresh_title()
     vim.cmd("redrawtabline")
   end)

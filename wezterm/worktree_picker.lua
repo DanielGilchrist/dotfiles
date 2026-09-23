@@ -1,4 +1,5 @@
 local wezterm = require("wezterm")
+local worktree = require("utils.worktree")
 
 ---@class WorktreeChoice
 ---@field label string
@@ -8,26 +9,12 @@ local wezterm = require("wezterm")
 ---@field open fun(window: any, pane: any): nil
 local M = {}
 
-local WORKTREES_DIR = wezterm.home_dir .. "/worktrees"
-
 ---@return WorktreeChoice[]
 local function list_worktrees()
   ---@type WorktreeChoice[]
   local choices = {}
-  local _, out = wezterm.run_child_process({
-    "find", WORKTREES_DIR,
-    "-mindepth", "2", "-maxdepth", "2", "-type", "d",
-  })
-  if not out then return choices end
-
-  for path in out:gmatch("[^\n]+") do
-    local has_git = wezterm.run_child_process({ "test", "-e", path .. "/.git" })
-    if has_git then
-      local repo, branch = path:match("/worktrees/([^/]+)/([^/]+)$")
-      if repo and branch then
-        table.insert(choices, { label = repo .. "/" .. branch, id = path })
-      end
-    end
+  for _, entry in ipairs(worktree.list()) do
+    table.insert(choices, { label = entry.repo .. "/" .. entry.branch, id = entry.path })
   end
   return choices
 end

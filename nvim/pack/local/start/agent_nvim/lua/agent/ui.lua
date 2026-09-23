@@ -1,4 +1,5 @@
 local zellij = require("agent.zellij")
+local is = require("utils.is")
 
 ---@class AgentUI
 ---@field new_prompt fun(on_submit: fun(text: string)): nil
@@ -15,7 +16,7 @@ function M.new_prompt(on_submit, opts)
   vim.bo[buf].filetype = "markdown"
   vim.bo[buf].buftype = "nofile"
   vim.bo[buf].bufhidden = "wipe"
-  if opts.initial and opts.initial ~= "" then
+  if is.not_empty(opts.initial) then
     vim.api.nvim_buf_set_lines(buf, 0, -1, false, vim.split(opts.initial, "\n", { plain = true }))
   end
 
@@ -37,7 +38,7 @@ function M.new_prompt(on_submit, opts)
     local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
     local text = vim.trim(table.concat(lines, "\n"))
     close()
-    if text ~= "" then on_submit(text) end
+    if is.not_empty(text) then on_submit(text) end
   end
 
   if opts.split then

@@ -1,3 +1,5 @@
+local is = require("utils.is")
+
 local header = [[
 
  ███████╗██╗███████╗██╗  ██╗
@@ -25,11 +27,11 @@ local function session_buffers()
   local persistence = require("persistence")
   local session_file = persistence.current()
 
-  if vim.fn.filereadable(session_file) == 0 then
+  if not is.file_readable(session_file) then
     session_file = persistence.current({ branch = false })
   end
 
-  if vim.fn.filereadable(session_file) == 0 then
+  if not is.file_readable(session_file) then
     return {}
   end
 

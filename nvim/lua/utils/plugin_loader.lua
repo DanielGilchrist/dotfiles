@@ -1,4 +1,4 @@
-M = {}
+local M = {}
 
 ---Iterate through all Lua modules in a config directory
 ---@param dir_path string Relative path from lua/ directory (e.g. "plugins/lsp/servers")

@@ -1,4 +1,5 @@
 local config = require("agent.config")
+local cmd_utils = require("utils.cmd")
 local is = require("utils.is")
 
 ---@class AgentSession
@@ -14,7 +15,7 @@ local M = {}
 ---@return string|nil
 function M.repo_root()
   local res = vim.system({ "git", "rev-parse", "--show-toplevel" }, { text = true }):wait()
-  if res.code ~= 0 then return nil end
+  if not cmd_utils.success(res.code) then return nil end
   return vim.trim(res.stdout)
 end
 
@@ -25,7 +26,7 @@ end
 ---@return string|nil
 function M.main_repo_root()
   local res = vim.system({ "git", "worktree", "list", "--porcelain" }, { text = true }):wait()
-  if res.code ~= 0 then return nil end
+  if not cmd_utils.success(res.code) then return nil end
   return (res.stdout or ""):match("^worktree ([^\n]+)")
 end
 

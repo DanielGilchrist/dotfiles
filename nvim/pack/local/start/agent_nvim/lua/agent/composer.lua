@@ -2,6 +2,8 @@
 -- the window hides/shows it without losing what you've typed. Submitting
 -- (`<C-s>` or `:w`/`:wq`) sends the text to the active agent and clears.
 
+local is = require("utils.is")
+
 local M = {}
 
 local state = {
@@ -91,7 +93,7 @@ function M.append(text)
   local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
   local has_content = false
   for _, l in ipairs(lines) do
-    if vim.trim(l) ~= "" then has_content = true; break end
+    if is.not_empty(vim.trim(l)) then has_content = true; break end
   end
   local new_lines = vim.split(text, "\n", { plain = true })
   if has_content then
@@ -112,7 +114,7 @@ function M.submit(opts)
   if not state.buf or not vim.api.nvim_buf_is_valid(state.buf) then return end
   local lines = vim.api.nvim_buf_get_lines(state.buf, 0, -1, false)
   local text = vim.trim(table.concat(lines, "\n"))
-  if text == "" then
+  if is.empty(text) then
     if close then M.cancel() end
     return
   end

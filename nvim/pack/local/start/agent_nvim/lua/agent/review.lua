@@ -30,13 +30,19 @@ M._message = nil ---@type string|nil
 ---@type table<string, boolean>
 M.reviewed = {}
 
----@param msg string
----@param level integer|nil
-local function notify(msg, level)
-  vim.notify(msg, level or vim.log.levels.INFO, { title = "agent review" })
-end
+local cmd_utils = require("utils.cmd")
+local file_utils = require("utils.file")
+local is = require("utils.is")
+local path_utils = require("utils.path")
+local ui_utils = require("utils.ui")
+local notify = require("utils.notify").with_title("agent review")
 
 local function rcfg() return config.review or {} end
+
+---@return boolean
+local function has_message()
+  return M._message ~= nil and is.not_empty(vim.trim(M._message))
+end
 
 ---@param text string
 ---@param width integer
@@ -45,12 +51,12 @@ local function wrap_text(text, width)
   width = math.max(width, 20)
   local out = {}
   for _, para in ipairs(vim.split(text, "\n", { plain = true })) do
-    if para == "" then
+    if is.empty(para) then
       out[#out + 1] = ""
     else
       local line = ""
       for word in para:gmatch("%S+") do
-        if line == "" then
+        if is.empty(line) then
           line = word
         elseif #line + 1 + #word <= width then
           line = line .. " " .. word
@@ -59,7 +65,7 @@ local function wrap_text(text, width)
           line = word
         end
       end
-      if line ~= "" then out[#out + 1] = line end
+      if is.not_empty(line) then out[#out + 1] = line end
     end
   end
   return out
@@ -72,15 +78,15 @@ local function git(dir, args)
   local cmd = { "git", "-C", dir }
   vim.list_extend(cmd, args)
   local res = vim.system(cmd, { text = true }):wait()
-  if res.code ~= 0 then return nil end
+  if not cmd_utils.success(res.code) then return nil end
   return vim.trim(res.stdout or "")
 end
 
 ---@param path string|nil
 ---@return string|nil
 local function repo_root(path)
-  local dir = (path and path ~= "") and vim.fn.fnamemodify(path, ":h") or vim.fn.getcwd()
-  if vim.fn.isdirectory(dir) == 0 then dir = vim.fn.getcwd() end
+  local dir = is.not_empty(path) and vim.fn.fnamemodify(path, ":h") or vim.fn.getcwd()
+  if is.not_directory(dir) then dir = vim.fn.getcwd() end
   return git(dir, { "rev-parse", "--show-toplevel" })
 end
 
@@ -109,7 +115,7 @@ local function fork_point(root)
   for _, ref in ipairs(candidates) do
     if git(root, { "rev-parse", "--verify", "--quiet", ref }) then
       local mb = git(root, { "merge-base", "HEAD", ref })
-      if mb and mb ~= "" then
+      if is.not_empty(mb) then
         local label = ref:match("/HEAD$") and git(root, { "rev-parse", "--abbrev-ref", ref }) or ref
         return mb, label or ref
       end
@@ -158,7 +164,7 @@ local function list_changed(root, base)
   local seen, items = {}, {}
   local function add(rel, is_untracked)
     rel = vim.trim(rel)
-    if rel == "" or seen[rel] then return end
+    if is.empty(rel) or seen[rel] then return end
     seen[rel] = true
     local s = stat[rel]
     local adds, dels = 0, 0
@@ -184,12 +190,10 @@ end
 ---@param root string
 ---@return table|nil
 local function read_state(root)
-  local fd = io.open(state_path(root), "r")
-  if not fd then return nil end
-  local raw = fd:read("*a")
-  fd:close()
+  local raw = file_utils.read(state_path(root))
+  if not raw then return nil end
   local ok, data = pcall(vim.json.decode, raw)
-  if ok and type(data) == "table" then return data end
+  if ok and is.table(data) then return data end
   return nil
 end
 
@@ -224,9 +228,9 @@ local function ensure_diff(buf)
   if not M._active then return end
   if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
   if M._diffed[buf] then return end
-  if vim.bo[buf].buftype ~= "" then return end
+  if is.not_empty(vim.bo[buf].buftype) then return end
   local file = vim.api.nvim_buf_get_name(buf)
-  if file == "" then return end
+  if is.empty(file) then return end
   if M._root and not vim.startswith(file, M._root .. "/") then return end
   M._diffed[buf] = true
   pcall(function()
@@ -252,7 +256,7 @@ end
 ---@return boolean
 local function require_active()
   if M.is_active() then return true end
-  notify("no active review; run <leader>arr first", vim.log.levels.WARN)
+  notify.warn("no active review; run <leader>arr first")
   return false
 end
 
@@ -285,7 +289,7 @@ local function open_review(root, base, label)
   M._total = #list_changed(root, base)
   vim.cmd("Unified " .. base)
   M._diffed[vim.api.nvim_get_current_buf()] = true
-  notify(("reviewing vs %s (%s)"):format(label, base:sub(1, 8)))
+  notify.info(("reviewing vs %s (%s)"):format(label, base:sub(1, 8)))
 end
 
 ---@param root string
@@ -298,7 +302,7 @@ function M.pick_commit(root, cb)
     local sha = line:match("^(%S+)")
     if sha then items[#items + 1] = { text = line, sha = sha } end
   end
-  if #items == 0 then return notify("no commits to pick") end
+  if #items == 0 then return notify.info("no commits to pick") end
 
   Snacks.picker.pick({
     source = "agent_review_commits",
@@ -355,10 +359,8 @@ end
 function M.start()
   if M.is_active() then
     if #M.comments > 0 then
-      vim.ui.select({ "no", "yes" }, {
-        prompt = ("Exit review? %d pending comment(s) will be discarded."):format(#M.comments),
-      }, function(choice)
-        if choice == "yes" then M.reset() end
+      ui_utils.confirm(("Exit review? %d pending comment(s) will be discarded."):format(#M.comments), function(choice)
+        if choice == "Ok" then M.reset() end
       end)
     else
       M.reset()
@@ -367,7 +369,7 @@ function M.start()
   end
 
   local root = repo_root(vim.api.nvim_buf_get_name(0))
-  if not root then return notify("not in a git repo", vim.log.levels.WARN) end
+  if not root then return notify.warn("not in a git repo") end
 
   local saved = read_state(root)
   if saved then
@@ -392,12 +394,12 @@ end
 function M.changed_files(root, base)
   if not require_active() then return end
   root = root or repo_root(vim.api.nvim_buf_get_name(0))
-  if not root then return notify("not in a git repo", vim.log.levels.WARN) end
+  if not root then return notify.warn("not in a git repo") end
   base = base or current_base() or select(1, resolve_base(root))
 
   local items = list_changed(root, base)
   M._total = #items
-  if #items == 0 then return notify("no changes vs " .. base:sub(1, 8)) end
+  if #items == 0 then return notify.info("no changes vs " .. base:sub(1, 8)) end
 
   local ordered, tadd, tdel = {}, 0, 0
   for _, it in ipairs(items) do
@@ -451,8 +453,8 @@ end
 function M.toggle_reviewed()
   if not require_active() then return end
   local file = vim.api.nvim_buf_get_name(0)
-  if file == "" or vim.bo.buftype ~= "" then
-    return notify("not a reviewable file", vim.log.levels.WARN)
+  if is.empty(file) or is.not_empty(vim.bo.buftype) then
+    return notify.warn("not a reviewable file")
   end
   M.reviewed[file] = (not M.reviewed[file]) or nil
 
@@ -462,8 +464,8 @@ function M.toggle_reviewed()
   local done = 0
   for _ in pairs(M.reviewed) do done = done + 1 end
   local rel = (root and vim.startswith(file, root .. "/")) and file:sub(#root + 2)
-    or vim.fn.fnamemodify(file, ":t")
-  notify(("%s %s (%d/%d reviewed)"):format(M.reviewed[file] and "✓ marked" or "○ unmarked", rel, done, total))
+    or path_utils.basename(file)
+  notify.info(("%s %s (%d/%d reviewed)"):format(M.reviewed[file] and "✓ marked" or "○ unmarked", rel, done, total))
 end
 
 ---@return integer s, integer e
@@ -540,11 +542,11 @@ function M.add_comment(opts)
   if not require_active() then return end
   opts = opts or {}
   local buf = vim.api.nvim_get_current_buf()
-  if vim.bo[buf].buftype ~= "" then
-    return notify("can only comment on file buffers", vim.log.levels.WARN)
+  if is.not_empty(vim.bo[buf].buftype) then
+    return notify.warn("can only comment on file buffers")
   end
   local file = vim.api.nvim_buf_get_name(buf)
-  if file == "" then return notify("buffer has no file path", vim.log.levels.WARN) end
+  if is.empty(file) then return notify.warn("buffer has no file path") end
 
   local root = repo_root(file)
   local relpath = vim.fn.fnamemodify(file, ":.")
@@ -571,7 +573,7 @@ function M.add_comment(opts)
 
   ui.new_prompt(function(text)
     text = vim.trim(text)
-    if text == "" then return end
+    if is.empty(text) then return end
     ---@type ReviewComment
     local c = {
       id = M._next_id,
@@ -588,7 +590,7 @@ function M.add_comment(opts)
     M._next_id = M._next_id + 1
     M.comments[#M.comments + 1] = c
     M._render(c)
-    notify(("comment added (%d pending)"):format(#M.comments))
+    notify.info(("comment added (%d pending)"):format(#M.comments))
   end, {
     title = (" review: %s   (<C-s> submit, q cancel) "):format(loc),
     split = true,
@@ -604,7 +606,7 @@ function M.set_message()
   if not require_active() then return end
   ui.new_prompt(function(text)
     M._message = vim.trim(text)
-    notify(M._message ~= "" and "review message set" or "review message cleared")
+    notify.info(is.not_empty(M._message) and "review message set" or "review message cleared")
   end, {
     title = " review message   (<C-s> save, q cancel) ",
     initial = M._message or "",
@@ -629,11 +631,11 @@ function M.remove_at_cursor()
       if line >= s and line <= s + c.nlines - 1 then
         forget(c)
         table.remove(M.comments, i)
-        return notify(("comment removed (%d pending)"):format(#M.comments))
+        return notify.info(("comment removed (%d pending)"):format(#M.comments))
       end
     end
   end
-  notify("no comment under cursor")
+  notify.info("no comment under cursor")
 end
 
 function M.edit_comment()
@@ -647,10 +649,10 @@ function M.edit_comment()
         highlight_range(buf, s, s + c.nlines - 1)
         ui.new_prompt(function(text)
           text = vim.trim(text)
-          if text == "" then return end
+          if is.empty(text) then return end
           c.text = text
           M._render(c)
-          notify("comment updated")
+          notify.info("comment updated")
         end, {
           title = (" edit comment: %s   (<C-s> save, q cancel) "):format(c.relpath),
           initial = c.text,
@@ -661,7 +663,7 @@ function M.edit_comment()
       end
     end
   end
-  notify("no comment under cursor")
+  notify.info("no comment under cursor")
 end
 
 function M.clear()
@@ -671,7 +673,7 @@ end
 
 function M.list()
   if not require_active() then return end
-  if #M.comments == 0 then return notify("no pending comments") end
+  if #M.comments == 0 then return notify.info("no pending comments") end
 
   ---@type table[]
   local items = {}
@@ -718,7 +720,7 @@ end
 ---@return string
 local function build_markdown()
   local out = { "# Review comments", "" }
-  if M._message and vim.trim(M._message) ~= "" then
+  if has_message() then
     out[#out + 1] = "## Overview"
     out[#out + 1] = ""
     vim.list_extend(out, vim.split(M._message, "\n", { plain = true }))
@@ -756,15 +758,10 @@ local function add_local_exclude(root, entry)
   local rel = git(root, { "rev-parse", "--git-path", "info/exclude" })
   if not rel then return end
   local path = vim.startswith(rel, "/") and rel or (root .. "/" .. rel)
-  local f = io.open(path, "r")
-  if f then
-    for line in f:lines() do
-      if vim.trim(line) == entry then f:close() return end
-    end
-    f:close()
+  for line in (file_utils.read(path) or ""):gmatch("[^\n]*") do
+    if vim.trim(line) == entry then return end
   end
-  local a = io.open(path, "a")
-  if a then a:write("\n" .. entry .. "\n") a:close() end
+  file_utils.append(path, "\n" .. entry .. "\n")
 end
 
 ---@param md string
@@ -775,7 +772,7 @@ local function deliver(md, count)
 
   if cfg.delivery == "inline" then
     if agent.send_text(md, true) then
-      notify(("sent %d comment(s) inline"):format(count))
+      notify.info(("sent %d comment(s) inline"):format(count))
       M.reset()
     end
     return
@@ -784,15 +781,12 @@ local function deliver(md, count)
   local root = repo_root(vim.api.nvim_buf_get_name(0)) or vim.fn.getcwd()
   local fname = cfg.review_file or ".agent-review.md"
   local path = root .. "/" .. fname
-  local fd = io.open(path, "w")
-  if not fd then return notify("could not write " .. path, vim.log.levels.ERROR) end
-  fd:write(md)
-  fd:close()
+  if not file_utils.write(path, md) then return notify.error("could not write " .. path) end
   add_local_exclude(root, fname)
 
   local msg = ("Read `%s` in the repo root. It lists my review comments on your recent changes. Work through each one, then delete the file."):format(fname)
   if agent.send_text(msg, true) then
-    notify(("sent %d comment(s) → %s"):format(count, fname))
+    notify.info(("sent %d comment(s) → %s"):format(count, fname))
     M.reset()
   end
 end
@@ -801,7 +795,7 @@ end
 local function preview_send(count)
   ---@type string[][]
   local pages = {}
-  if M._message and vim.trim(M._message) ~= "" then
+  if has_message() then
     local lines = { "# Overview message", "" }
     vim.list_extend(lines, vim.split(M._message, "\n", { plain = true }))
     pages[#pages + 1] = lines
@@ -891,9 +885,8 @@ end
 
 function M.submit()
   if not require_active() then return end
-  local has_message = M._message ~= nil and vim.trim(M._message) ~= ""
-  if #M.comments == 0 and not has_message then
-    return notify("nothing to send (no comments or message)", vim.log.levels.WARN)
+  if #M.comments == 0 and not has_message() then
+    return notify.warn("nothing to send (no comments or message)")
   end
   preview_send(#M.comments)
 end
@@ -916,11 +909,7 @@ function M._save_state()
   end
   local path = state_path(M._root)
   vim.fn.mkdir(vim.fn.fnamemodify(path, ":h"), "p")
-  local fd = io.open(path, "w")
-  if fd then
-    fd:write(vim.json.encode({ base = M._base, reviewed = reviewed, comments = comments, message = M._message }))
-    fd:close()
-  end
+  file_utils.write(path, vim.json.encode({ base = M._base, reviewed = reviewed, comments = comments, message = M._message }))
 end
 
 ---@param root string
@@ -959,7 +948,7 @@ function M.resume(root, data)
       M._render(c)
     end
   end
-  notify(("resumed review (%d comment(s))"):format(#M.comments))
+  notify.info(("resumed review (%d comment(s))"):format(#M.comments))
 end
 
 function M.reset()
@@ -973,7 +962,7 @@ function M.reset()
   M._diffed = {}
   M.reviewed = {}
   M.clear()
-  notify("review ended")
+  notify.info("review ended")
 end
 
 local aug = vim.api.nvim_create_augroup("agent_review", { clear = true })
@@ -981,7 +970,7 @@ vim.api.nvim_create_autocmd("BufWinEnter", {
   group = aug,
   callback = function(args)
     local file = vim.api.nvim_buf_get_name(args.buf)
-    if file == "" then return end
+    if is.empty(file) then return end
     ensure_diff(args.buf)
     for _, c in ipairs(M.comments) do
       if c.file == file and not (c.bufnr and vim.api.nvim_buf_is_valid(c.bufnr) and c.extmark) then

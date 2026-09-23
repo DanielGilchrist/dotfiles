@@ -1,5 +1,6 @@
 local wezterm = require("wezterm")
 local notify = require("utils.notify")
+local tab_utils = require("utils.tab")
 local dev_tabs = require("dev_tabs")
 
 ---@class AgentsTabModule
@@ -21,10 +22,8 @@ local M = { TITLE = "agents" }
 -- Title is cosmetic — rename freely.
 local function is_agents(tab)
   local id = wezterm.GLOBAL.agents_tab_id
-  if type(id) ~= "number" or tab == nil then return false end
-  -- MuxTab has :tab_id(); TabInformation has .tab_id (a number).
-  local tid = type(tab.tab_id) == "function" and tab:tab_id() or tab.tab_id
-  return tid == id
+  if type(id) ~= "number" then return false end
+  return tab_utils.id(tab) == id
 end
 
 local function find_agents(window)
@@ -168,28 +167,34 @@ M.split_horizontal = wezterm.action({ SplitHorizontal = { domain = "CurrentPaneD
 M.split_vertical = wezterm.action({ SplitVertical = { domain = "CurrentPaneDomain" } })
 M.split_right_35 = wezterm.action({ SplitPane = { direction = "Right", size = { Percent = 35 } } })
 
+---Bold, coloured tab cell for the special tabs. Active tabs use the theme's
+---active colours; inactive ones take <inactive_bg> so they stay visible.
+---@param tab TabInformation
+---@param config table
+---@param glyph string
+---@param title string
+---@param inactive_bg string
+local function highlighted_title(tab, config, glyph, title, inactive_bg)
+  local colors = config.colors or {}
+  local active = colors.tab_bar and colors.tab_bar.active_tab or {}
+  return {
+    { Background = { Color = tab.is_active and (active.bg_color or "#CBE3B3") or inactive_bg } },
+    { Foreground = { Color = active.fg_color or "#171C1F" } },
+    { Attribute = { Intensity = "Bold" } },
+    { Text = " " .. glyph .. " " .. title .. " " },
+  }
+end
+
 local function format_tab_title(tab, _, _, config)
   local title = tab.tab_title and tab.tab_title ~= "" and tab.tab_title
       or (tab.active_pane and tab.active_pane.title or "")
 
   if is_agents(tab) then
-    local active = config.colors and config.colors.tab_bar and config.colors.tab_bar.active_tab or {}
-    return {
-      { Background = { Color = tab.is_active and (active.bg_color or "#CBE3B3") or "#E69875" } },
-      { Foreground = { Color = active.fg_color or "#171C1F" } },
-      { Attribute = { Intensity = "Bold" } },
-      { Text = " ✦ " .. (title ~= "" and title or M.TITLE) .. " " },
-    }
+    return highlighted_title(tab, config, "✦", title ~= "" and title or M.TITLE, "#E69875")
   end
 
   if dev_tabs.is_dev(tab) then
-    local active = config.colors and config.colors.tab_bar and config.colors.tab_bar.active_tab or {}
-    return {
-      { Background = { Color = tab.is_active and (active.bg_color or "#CBE3B3") or "#DBBC7F" } },
-      { Foreground = { Color = active.fg_color or "#171C1F" } },
-      { Attribute = { Intensity = "Bold" } },
-      { Text = " ▸ " .. (title ~= "" and title or "dev") .. " " },
-    }
+    return highlighted_title(tab, config, "▸", title ~= "" and title or "dev", "#DBBC7F")
   end
 
   return " " .. title .. " "
