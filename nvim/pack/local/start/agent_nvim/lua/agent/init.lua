@@ -222,6 +222,7 @@ function M.attach_in_terminal(name, opts)
   vim.t.tabname = name
   M.tab_agents[tabid] = name
   M.last_attached = name
+  require("config.tabs").refresh_title()
 
   if Snacks.dashboard then
     pcall(Snacks.dashboard, {

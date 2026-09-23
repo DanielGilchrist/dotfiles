@@ -1,4 +1,5 @@
 local config = require("agent.config")
+local is = require("utils.is")
 
 ---@class AgentSession
 ---@field resolve fun(): string|nil Auto-resolve session name for current cwd
@@ -49,14 +50,11 @@ function M.resolve()
   return M.cwd_branch()
 end
 
----Best-effort lookup of the on-disk cwd for a given zellij session name.
----For a worktree agent the session name is the branch and the cwd is
----`~/worktrees/<repo>/<branch>`. Returns nil if no matching worktree exists.
----Scans every immediate subdir (including dot-prefixed repo dirs like
----`~/worktrees/.config/…`, which `vim.fn.glob`'s `*` would miss).
 ---@param name string
 ---@return string|nil
-function M.session_cwd(name)
+local function worktree_cwd(name)
+  -- Scans every immediate subdir (including dot-prefixed repo dirs like
+  -- `~/worktrees/.config/…`, which `vim.fn.glob`'s `*` would miss).
   local handle = vim.uv.fs_scandir(config.worktrees_dir)
   if not handle then return nil end
   while true do
@@ -64,10 +62,21 @@ function M.session_cwd(name)
     if not entry then break end
     if t == "directory" then
       local candidate = config.worktrees_dir .. "/" .. entry .. "/" .. name
-      if vim.fn.isdirectory(candidate) == 1 then return candidate end
+      if is.directory(candidate) then return candidate end
     end
   end
   return nil
+end
+
+---Best-effort lookup of the on-disk cwd for a given zellij session name.
+---For a worktree agent the session name is the branch and the cwd is
+---`~/worktrees/<repo>/<branch>`. Repo sessions (`<leader>as`, named after
+---the repo basename) have no worktree, so fall back to the cwd zellij
+---reports for the session's own pane. Nil if neither resolves.
+---@param name string
+---@return string|nil
+function M.session_cwd(name)
+  return worktree_cwd(name) or require("agent.zellij").session_cwd(name)
 end
 
 return M

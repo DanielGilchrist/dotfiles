@@ -1,4 +1,5 @@
 local wezterm = require("wezterm")
+local notify = require("utils.notify")
 
 ---@class AgentSpawnChoice
 ---@field label string
@@ -154,7 +155,7 @@ M.focused_worktree = function(window)
   local ok, out = wezterm.run_child_process({ resolve_fish(), "-c", "_agent_focused_worktree" })
   local cwd = out and out:gsub("%s+$", "") or ""
   if not ok or cwd == "" then
-    window:toast_notification("agent", "no focused agent (or its worktree is gone)", nil, 3000)
+    notify(window, "agent", "no focused agent (or its worktree is gone)")
     return nil
   end
   return cwd
@@ -177,11 +178,10 @@ M.edit_focused = function(window, pane)
   -- Route through fish so the editor inherits the user's full env (PATH,
   -- shell helpers, etc.) — wezterm's spawn env is too minimal for nvim
   -- plugins that shell out to rg/fd/etc. `exec` replaces fish with the
-  -- editor so the pane process is the editor, not fish. `label` sets the
-  -- tab title up front so we don't see "fish" flash before exec.
-  local short_cwd = cwd:gsub("^" .. wezterm.home_dir, "~")
+  -- editor so the pane process is the editor, not fish. The tab title comes
+  -- from nvim itself (`title`/`titlestring` in config/tabs.lua) so it tracks
+  -- the active tab page — an explicit wezterm tab_title would stick.
   window:perform_action(wezterm.action.SpawnCommandInNewTab({
-    label = "nvim " .. short_cwd,
     args = {
       resolve_fish(), "-i", "-c",
       "set -q EDITOR; or set EDITOR nvim; " .. cd_or_shell(cwd) .. "; exec $EDITOR",
