@@ -348,8 +348,39 @@ local function map_scroll_keys(buf)
   map("<Space>", function() M.scroll(page()) end)
   map("gg", function() M.scroll_to("top") end)
   map("G", function() M.scroll_to("bottom") end)
+  map("<ScrollWheelDown>", function() M.scroll(3) end)
+  map("<ScrollWheelUp>", function() M.scroll(-3) end)
   map("q", M.close)
   map("<Esc>", M.close)
+end
+
+local WHEEL_KEYS = { ["<ScrollWheelDown>"] = 3, ["<ScrollWheelUp>"] = -3 }
+local WHEEL_MODES = { "n", "i" }
+
+---Split mode: the wheel scrolls whichever window is under the pointer while
+---focus stays in the source, so the source buffer gets expr mappings that
+---redirect wheel events over the preview and pass every other one through.
+---@param src_buf integer
+local function map_source_wheel(src_buf)
+  for lhs, lines in pairs(WHEEL_KEYS) do
+    vim.keymap.set(WHEEL_MODES, lhs, function()
+      if state and vim.fn.getmousepos().winid == state.preview_win then
+        M.scroll(lines)
+        return "<Ignore>"
+      end
+      return lhs
+    end, { buffer = src_buf, expr = true, silent = true })
+  end
+end
+
+---@param src_buf integer
+local function unmap_source_wheel(src_buf)
+  if not vim.api.nvim_buf_is_valid(src_buf) then return end
+  for lhs in pairs(WHEEL_KEYS) do
+    for _, mode in ipairs(WHEEL_MODES) do
+      pcall(vim.keymap.del, mode, lhs, { buffer = src_buf })
+    end
+  end
 end
 
 local function attach_autocmds()
@@ -456,6 +487,7 @@ function M.close()
   state = nil
   if closing.placement then closing.placement:close() end
   pcall(vim.api.nvim_del_augroup_by_id, closing.augroup)
+  if closing.mode == "split" then unmap_source_wheel(closing.src_buf) end
   if closing.float then
     if closing.float:valid() then closing.float:close() end
   elseif vim.api.nvim_win_is_valid(closing.preview_win) then
@@ -503,6 +535,7 @@ function M.open(mode)
   }
 
   map_scroll_keys(preview_buf)
+  if mode == "split" then map_source_wheel(src_buf) end
   attach_autocmds()
   render()
 end
