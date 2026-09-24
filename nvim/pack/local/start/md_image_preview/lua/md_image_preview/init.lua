@@ -46,6 +46,7 @@ local BACKGROUND = "#0d1117"
 local ASSETS = {
   ["marked.min.js"] = "https://cdn.jsdelivr.net/npm/marked@15/marked.min.js",
   ["github-markdown-dark.css"] = "https://cdn.jsdelivr.net/npm/github-markdown-css@5/github-markdown-dark.css",
+  ["mermaid.min.js"] = "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js",
 }
 local MAX_BODY_WIDTH = 1012
 local PADDING_X = 40
@@ -97,10 +98,21 @@ local function write_template()
     ),
     "</head><body><div class=\"markdown-body\" id=\"content\"></div>",
     ("<script src=\"file://%s/marked.min.js\"></script>"):format(CACHE_DIR),
+    ("<script src=\"file://%s/mermaid.min.js\"></script>"):format(CACHE_DIR),
     "<script>",
     "const content=document.getElementById('content');",
+    "mermaid.initialize({startOnLoad:false,theme:'dark',securityLevel:'loose'});",
     "window.__setWidth=(px)=>{document.body.style.width=px+'px'};",
-    "window.__render=(src)=>{content.innerHTML=marked.parse(src);",
+    "async function renderMermaid(){",
+    "  const blocks=[...content.querySelectorAll('pre > code.language-mermaid')];",
+    "  for(const code of blocks){",
+    "    const pre=code.parentElement;const source=code.textContent;",
+    "    const holder=document.createElement('pre');holder.className='mermaid';holder.textContent=source;",
+    "    pre.replaceWith(holder);",
+    "    try{await mermaid.run({nodes:[holder]})}catch(error){holder.textContent=source+'\\n\\n'+(error?.str||error?.message||JSON.stringify(error))}",
+    "  }",
+    "}",
+    "window.__render=async(src)=>{content.innerHTML=marked.parse(src);await renderMermaid();",
     "const headings=[...content.querySelectorAll('h1,h2,h3,h4,h5,h6')].map(h=>Math.round(h.getBoundingClientRect().top+window.scrollY));",
     "return JSON.stringify({height:content.offsetHeight,headings})};",
     "</script></body></html>",

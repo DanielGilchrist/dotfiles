@@ -186,6 +186,7 @@ function Chrome:set_content(markdown, cb)
   local encoded = vim.json.encode(markdown)
   self:send("Runtime.evaluate", {
     expression = "window.__render(" .. encoded .. ")",
+    awaitPromise = true,
     returnByValue = true,
   }, function(result, err)
     if err or not result or not result.result or not result.result.value then
