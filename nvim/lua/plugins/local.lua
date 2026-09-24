@@ -46,6 +46,13 @@ return {
   local_plugin("bundle_open", { cmd = "BundleOpen" }),
   local_plugin("lint_disable",
     { keys = { { "<leader>cD", function() require("lint_disable").disable_lint() end, desc = "Disable lint rule inline" } } }),
+  local_plugin("md_image_preview", {
+    cmd = { "MdPreviewToggle", "MdPreviewClose" },
+    keys = {
+      { "<leader>ump", function() require("md_image_preview").toggle("float") end, ft = "markdown", desc = "Markdown preview (fullscreen, read-only)" },
+      { "<leader>ums", function() require("md_image_preview").toggle("split") end, ft = "markdown", desc = "Markdown preview (live split)" },
+    },
+  }),
   local_plugin("scratchpads", { cmd = { "ScratchNew", "ScratchOpen", "ScratchRename", "ScratchRemove" } }),
   local_plugin("shoo", { cmd = "GHPurgeForce" }),
   local_plugin("srb_tc", { cmd = "SrbTc" }),
