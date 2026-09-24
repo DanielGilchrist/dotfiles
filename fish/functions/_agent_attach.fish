@@ -128,12 +128,12 @@ function _agent_attach --description "agent attach — create-or-attach a per-ag
 
         set -l add_status 1
         if test -n "$base"
-            if git -C $repo_root worktree add --detach $worktree_path $base 2>$err_log
+            if git -C $repo_root -c checkout.workers=8 -c checkout.thresholdForParallelism=100 worktree add --detach $worktree_path $base 2>$err_log
                 set add_status 0
             end
         end
         if test $add_status -ne 0
-            if git -C $repo_root worktree add --detach $worktree_path 2>$err_log
+            if git -C $repo_root -c checkout.workers=8 -c checkout.thresholdForParallelism=100 worktree add --detach $worktree_path 2>$err_log
                 set add_status 0
             end
         end

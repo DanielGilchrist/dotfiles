@@ -111,10 +111,18 @@ function _agent_rm --description "agent rm — tear down an agent (worktree + ze
     zellij delete-session $branch 2>/dev/null
 
     if test -n "$worktree_path"
-        if test -n "$main_repo" -a -d "$main_repo"
-            git -C $main_repo worktree remove --force $worktree_path 2>/dev/null
+        # Deleting ~40k files takes seconds; renaming the tree aside is instant
+        # on the same filesystem, so do that and let a detached rm finish it.
+        set -l trash (mktemp -d -t agent-trash)
+        if mv $worktree_path $trash/ 2>/dev/null
+            fish -c "rm -rf (string escape -- $trash)" >/dev/null 2>&1 &
+            disown
+        else
+            rm -rf $worktree_path 2>/dev/null
         end
-        rm -rf $worktree_path 2>/dev/null
+        if test -n "$main_repo" -a -d "$main_repo"
+            git -C $main_repo worktree prune 2>/dev/null
+        end
         rmdir (dirname $worktree_path) 2>/dev/null
     end
 
