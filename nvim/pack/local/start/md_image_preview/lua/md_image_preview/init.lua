@@ -362,7 +362,7 @@ local function attach_autocmds()
     callback = function() rerender() end,
   })
   if state.mode == "split" then
-    vim.api.nvim_create_autocmd({ "CursorMoved", "CursorMovedI" }, {
+    vim.api.nvim_create_autocmd({ "CursorMoved", "CursorMovedI", "WinScrolled" }, {
       group = state.augroup,
       buffer = state.src_buf,
       callback = function() follow() end,
