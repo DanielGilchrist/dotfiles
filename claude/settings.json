@@ -101,7 +101,6 @@
     "deny": [],
     "defaultMode": "auto"
   },
-  "model": "opus[1m]",
   "hooks": {
     "UserPromptSubmit": [
       {
@@ -163,5 +162,6 @@
       "type": "http",
       "url": "https://mcp.sentry.dev/mcp"
     }
-  }
+  },
+  "model": "opus"
 }
