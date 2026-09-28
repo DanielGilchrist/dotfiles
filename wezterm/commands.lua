@@ -32,7 +32,7 @@ local commands = {
   Console = "bin/dev console",
   Server = "bin/dev server",
   Start = "bin/dev start",
-  Tunnel = "bin/tunnel --experimental-syncer",
+  Tunnel = "bin/tunnel",
   Worker = "bin/dev worker",
   Webpack = "bin/dev webpack",
 }
@@ -256,7 +256,8 @@ local function close_existing_dev_tab(window, region)
   for _, tab in ipairs(window:mux_window():tabs()) do
     if tab:tab_id() == tab_id then
       for _, pane in ipairs(tab:panes()) do
-        shell.run({ shell.which("wezterm", "/opt/homebrew/bin/wezterm"), "cli", "kill-pane", "--pane-id", tostring(pane:pane_id()) })
+        shell.run({ shell.which("wezterm", "/opt/homebrew/bin/wezterm"), "cli", "kill-pane", "--pane-id", tostring(pane
+        :pane_id()) })
       end
 
       break
@@ -356,7 +357,10 @@ local function open_work_environment(region, cd_command)
       local tab_alive = false
       if tab_id then
         for _, tab in ipairs(original_window:mux_window():tabs()) do
-          if tab:tab_id() == tab_id then tab_alive = true break end
+          if tab:tab_id() == tab_id then
+            tab_alive = true
+            break
+          end
         end
       end
       if tab_alive then
