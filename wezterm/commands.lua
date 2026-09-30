@@ -280,6 +280,10 @@ local function spawn_dev_tab(original_window, region, cd_command)
 
   local split_pane_with_setup = split_pane_with(setup_pane)
 
+  -- spawn_tab activates the new tab; the rest of this function only needs
+  -- mux pane handles, so hand focus straight back to where the user was.
+  local previous_tab = original_window:active_tab()
+
   local new_tab, server_pane, window = original_window:mux_window():spawn_tab({})
   new_tab:set_title(dev_tab_title(region, cd_command))
 
@@ -289,6 +293,7 @@ local function spawn_dev_tab(original_window, region, cd_command)
 
   local gui_window = window:gui_window()
   require("utils.tab").move_to_first(gui_window, server_pane)
+  if previous_tab then previous_tab:activate() end
 
   setup_pane(server_pane)
   wait_for_text()
