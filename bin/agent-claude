@@ -7,6 +7,16 @@
 #
 # The largest transcript is resumed rather than the newest: a botched restart
 # leaves a tiny new conversation behind, and `--continue` would pick that.
+# An agent spawned from inside another Claude Code session (this tool run
+# from a Claude shell, an agent spawning an agent) inherits that session's
+# environment, and CLAUDE_CODE_CHILD_SESSION makes Claude treat the agent as
+# a child and silently stop writing its transcript. Every agent here is a
+# top-level session in its own right, so drop the inherited identity and
+# force persistence on regardless.
+set -e CLAUDE_CODE_CHILD_SESSION CLAUDECODE CLAUDE_CODE_SESSION_ID CLAUDE_CODE_SESSION_ATTENDED \
+    CLAUDE_CODE_MESSAGING_SOCKET CLAUDE_CODE_MESSAGING_TOKEN CLAUDE_PID CLAUDE_EFFORT
+set -gx CLAUDE_CODE_FORCE_SESSION_PERSISTENCE 1
+
 set -l slug (string replace -a / - -- (pwd -P))
 set -l transcripts $HOME/.claude/projects/$slug/*.jsonl
 

@@ -17,14 +17,26 @@ function M.id(tab)
   return tab.tab_id
 end
 
+-- Both tab objects are userdata that raise on unknown fields, so probe the
+-- method and the field under pcall rather than indexing them directly.
+---@param tab any
+---@param key string
+---@return any
+local function field(tab, key)
+  local ok, value = pcall(function() return tab[key] end)
+  if ok then return value end
+  return nil
+end
+
 ---Title for either object: MuxTab has `:get_title()`, TabInformation has
 ---`.tab_title`.
 ---@param tab any
 ---@return string
 function M.title(tab)
   if tab == nil then return "" end
-  if type(tab.get_title) == "function" then return tab:get_title() or "" end
-  return tab.tab_title or ""
+  local get_title = field(tab, "get_title")
+  if type(get_title) == "function" then return get_title(tab) or "" end
+  return field(tab, "tab_title") or ""
 end
 
 ---Find the leftmost index that's safe to move a freshly-spawned tab into,
