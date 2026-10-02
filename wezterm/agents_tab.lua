@@ -20,10 +20,29 @@ local M = { TITLE = "agents" }
 -- The agents tab is identified by its wezterm tab id, kept in wezterm.GLOBAL.
 -- Survives config reloads; resets on wezterm restart (gui-startup repopulates).
 -- Title is cosmetic — rename freely.
+---Title for either object wezterm hands out: MuxTab has `:get_title()`,
+---TabInformation has `.tab_title`.
+---@param tab any
+---@return string
+local function title_of(tab)
+  if tab == nil then return "" end
+  if type(tab.get_title) == "function" then return tab:get_title() or "" end
+  return tab.tab_title or ""
+end
+
+-- Registration normally arrives via the `agents-tab-spawned` user var, but
+-- that escape only works when the spawning shell has a tty. The spawned tab
+-- is always titled M.TITLE, so fall back to the title and adopt the id.
 local function is_agents(tab)
+  if tab == nil then return false end
   local id = wezterm.GLOBAL.agents_tab_id
-  if type(id) ~= "number" then return false end
-  return tab_utils.id(tab) == id
+  local tid = tab_utils.id(tab)
+  if type(id) == "number" and tid == id then return true end
+  if title_of(tab) == M.TITLE then
+    if type(id) ~= "number" then wezterm.GLOBAL.agents_tab_id = tid end
+    return true
+  end
+  return false
 end
 
 local function find_agents(window)

@@ -150,20 +150,20 @@ function _agent_attach --description "agent attach — create-or-attach a per-ag
 
     set -l per_agent_cmd
     if test $session_exists -eq 1
-        set per_agent_cmd "zj $branch"
+        set per_agent_cmd (_agent_pane_cmd $branch)
     else
         if test -n "$_flag_seed" -a -f "$_flag_seed"
             set -l seed_path /tmp/agent-seed-$branch-(random).md
             cp $_flag_seed $seed_path
             set -l meta "This worktree is detached at the repo's default branch. Before doing anything else, in order: (1) read $seed_path to understand your task, (2) create a branch with \`git checkout -b <kebab-case-name>\` named for the task, (3) \`trash $seed_path\`."
             set -l escaped (string escape -- $meta)
-            set per_agent_cmd "zj $branch -- claude --add-dir /tmp --permission-mode auto $escaped"
+            set per_agent_cmd (_agent_pane_cmd $branch --add-dir /tmp $escaped)
         else if set -q _flag_no_prompt
-            set per_agent_cmd "zj $branch -- claude --permission-mode auto"
+            set per_agent_cmd (_agent_pane_cmd $branch)
         else
             set -l meta "This worktree is detached at the repo's default branch. Once you understand the task, create a branch with \`git checkout -b <kebab-case-name>\` named for it before making any changes."
             set -l escaped (string escape -- $meta)
-            set per_agent_cmd "zj $branch -- claude --permission-mode auto $escaped"
+            set per_agent_cmd (_agent_pane_cmd $branch $escaped)
         end
     end
 

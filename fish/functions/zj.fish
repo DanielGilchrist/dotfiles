@@ -30,7 +30,13 @@ function zj --description "Start or attach to a zellij session in the current di
         return
     end
 
-    if zellij list-sessions -s 2>/dev/null | string match -q -- $name
+    # A session that died (reboot, server crash, force close) is listed as
+    # EXITED and `attach` resurrects its old pane commands. When the caller
+    # supplied a command, start fresh with that instead of the stale one.
+    if zellij list-sessions --no-formatting 2>/dev/null | string match -qr -- "^$name \\[.*EXITED"
+        and test (count $initial_cmd) -gt 0
+        zellij delete-session $name >/dev/null 2>&1
+    else if zellij list-sessions -s 2>/dev/null | string match -q -- $name
         # External-attach auto-fullscreen: when `zj a8` is run from outside the
         # meta-session (e.g. another wezterm tab), fullscreen the corresponding
         # meta-pane so its dimensions don't constrain the new attacher's view.

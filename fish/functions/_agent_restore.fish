@@ -49,11 +49,8 @@ function _agent_restore --description "agent restore — rebuild the agents grid
 
         # If the per-agent zellij session is gone (server didn't survive
         # whatever — reboot, kill, etc.), the resurrection cache puts panes
-        # into a "Waiting to run" stub. Wipe that and pass `claude --continue`
-        # as the initial pane command so the agent picks up its latest
-        # conversation in the worktree automatically.
-        set -l claude_cmd "claude --continue --permission-mode auto"
-
+        # into a "Waiting to run" stub. Wipe that so zj creates the session
+        # fresh; agent-claude then resumes the worktree's conversation.
         set -l layout_args
         for b in $branches
             set -l wp (_agent_worktree_path $b)
@@ -63,9 +60,9 @@ function _agent_restore --description "agent restore — rebuild the agents grid
             set -l cmd
             if test -n "$wp"
                 set -l safe_cwd (string escape -- $wp)
-                set cmd "cd $safe_cwd; and $prep; and zj $b -- $claude_cmd"
+                set cmd "cd $safe_cwd; and $prep; and "(_agent_pane_cmd $b)
             else
-                set cmd "$prep; and zj $b -- $claude_cmd"
+                set cmd "$prep; and "(_agent_pane_cmd $b)
             end
             set -a layout_args $b $cmd
         end
@@ -75,8 +72,16 @@ function _agent_restore --description "agent restore — rebuild the agents grid
         # Keep the layout file on disk for post-mortem if zellij refuses it.
         # Stderr is captured to a sibling log file. Drop to a shell on failure
         # instead of letting the wezterm tab disappear silently.
+        # A prior failed bootstrap can leave a wezterm "agents" tab open with
+        # no live meta-session. Kill any such orphans so we don't stack tabs.
+        for p in (wezterm cli list --format json 2>/dev/null | jq -r '.[] | select(.tab_title == "agents") | .pane_id')
+            wezterm cli kill-pane --pane-id $p 2>/dev/null
+        end
+
+        # Clear any resurrection cache first — otherwise `zellij -s agents -n`
+        # refuses because a dead serialised session still owns the name.
         set -l err_log $layout_file.err
-        set -l boot_cmd "zellij -s agents -n $layout_file 2> $err_log; or begin; echo 'zellij bootstrap failed — layout: '$layout_file' stderr: '$err_log; exec fish; end; rm -f $layout_file $err_log"
+        set -l boot_cmd "zellij delete-session agents 2>/dev/null; or true; zellij -s agents -n $layout_file 2> $err_log; or begin; echo 'zellij bootstrap failed — layout: '$layout_file' stderr: '$err_log; exec fish; end; rm -f $layout_file $err_log"
         set -l new_pane (_term_spawn_tab --title agents $HOME $boot_cmd)
         if test -z "$new_pane"
             rm -f $layout_file
@@ -114,11 +119,11 @@ function _agent_restore --description "agent restore — rebuild the agents grid
 
         set -l wp (_agent_worktree_path $b)
         set -l cwd_args
-        set -l pane_cmd "zj $b"
+        set -l pane_cmd (_agent_pane_cmd $b)
         if test -n "$wp"
             set cwd_args --cwd $wp
             set -l safe_cwd (string escape -- $wp)
-            set pane_cmd "cd $safe_cwd; and zj $b"
+            set pane_cmd "cd $safe_cwd; and "(_agent_pane_cmd $b)
         end
 
         zellij --session agents action new-pane --name $b $cwd_args -- fish -c $pane_cmd

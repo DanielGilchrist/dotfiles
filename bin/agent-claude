@@ -1,0 +1,22 @@
+#!/usr/bin/env fish
+# Pane command for agent sessions. Zellij stores a pane's original command and
+# re-runs it when it resurrects a dead session, which for a seeded agent means
+# a fresh Claude re-reading a seed file that is long gone. Going through this
+# wrapper instead makes a re-run resume the worktree's conversation when one
+# exists and only fall back to the original arguments on a true first start.
+#
+# The largest transcript is resumed rather than the newest: a botched restart
+# leaves a tiny new conversation behind, and `--continue` would pick that.
+set -l slug (string replace -a / - -- (pwd -P))
+set -l transcripts $HOME/.claude/projects/$slug/*.jsonl
+
+if test (count $transcripts) -gt 0
+    set -l largest (ls -S $transcripts | head -1)
+    set -l session_id (string replace -r '\.jsonl$' '' -- (basename $largest))
+    set -l mode_args
+    set -l index (contains -i -- --permission-mode $argv)
+    test -n "$index"; and set mode_args --permission-mode $argv[(math $index + 1)]
+    exec claude --resume $session_id $mode_args
+end
+
+exec claude $argv

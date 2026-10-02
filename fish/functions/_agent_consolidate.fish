@@ -54,7 +54,7 @@ function _agent_consolidate --description "Rebalance agent panes across meta-ses
                 continue
             end
             set -l safe_cwd (string escape -- $src_cwd)
-            set -l pane_cmd "cd $safe_cwd; and zj $branch"
+            set -l pane_cmd "cd $safe_cwd; and "(_agent_pane_cmd $branch)
             zellij --session agents action new-pane --tab-id $target --name $branch --cwd $src_cwd -- fish -c $pane_cmd >/dev/null 2>&1
             and zellij --session agents action close-pane --pane-id terminal_$src_id 2>/dev/null
         end
