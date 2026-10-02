@@ -165,6 +165,9 @@ config.keys = {
     worktree_picker.open(window, pane)
   end)),
 
+  -- Spawn a new agent: pick a repo, name it, write the seed prompt in nvim
+  keybind(keys.COMMAND_SHIFT, "a", wezterm.action_callback(agent_spawn.open)),
+
   -- Open a new shell tab in the currently-focused agent's worktree
   keybind(keys.COMMAND_SHIFT, "e", wezterm.action_callback(agent_spawn.edit_focused)),
 

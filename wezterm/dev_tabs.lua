@@ -9,6 +9,16 @@ local M = {}
 
 local REGIONS = { "apac", "eu", "us" }
 
+---@param list string[]
+---@param value string
+---@return boolean
+local function is_region(list, value)
+  for _, item in ipairs(list) do
+    if item == value then return true end
+  end
+  return false
+end
+
 ---Dev tabs are tracked per-region in wezterm.GLOBAL.dev_tab_id_by_region
 ---(populated by commands.spawn_dev_tab).
 function M.is_dev(tab)
@@ -17,14 +27,22 @@ function M.is_dev(tab)
   -- wezterm.GLOBAL wraps stored tables in a userdata proxy, so no type()
   -- check, and index by known region keys rather than trusting pairs() to
   -- iterate the proxy.
-  local by_region = wezterm.GLOBAL.dev_tab_id_by_region
-
-  if by_region == nil then return false end
-
+  local by_region = wezterm.GLOBAL.dev_tab_id_by_region or {}
   local tid = tab_utils.id(tab)
 
   for _, region in ipairs(REGIONS) do
     if tid == by_region[region] then return true end
+  end
+
+  -- GLOBAL does not survive a wezterm restart, but the title does: dev tabs
+  -- are always titled dev:<region>[:<worktree>]. Re-adopt the id from it.
+  local region = tab_utils.title(tab):match("^dev:(%w+)")
+  if region and is_region(REGIONS, region) then
+    if by_region[region] == nil then
+      by_region[region] = tid
+      wezterm.GLOBAL.dev_tab_id_by_region = by_region
+    end
+    return true
   end
 
   return false

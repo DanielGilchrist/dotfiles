@@ -1,4 +1,5 @@
 local wezterm = require("wezterm")
+local agents_tab = require("agents_tab")
 local notify = require("utils.notify")
 local path_utils = require("utils.path")
 local shell = require("utils.shell")
@@ -21,6 +22,9 @@ local M = {}
 ---Spawn a tab running <fish_cmd> through the user's fish so it inherits the
 ---full env (PATH, shell helpers). `-i` makes `status --is-interactive` true,
 ---which agent.fish checks before opening nvim for a seed prompt.
+---Spawn a tab for something the user interacts with (an editor, a picker).
+---Focus follows the new tab. Anything that merely runs to completion should
+---use run_background instead so the user never leaves the tab they were on.
 ---@param window Window
 ---@param pane Pane
 ---@param fish_cmd string
@@ -32,6 +36,21 @@ local function spawn_fish_tab(window, pane, fish_cmd, interactive)
   table.insert(args, fish_cmd)
 
   window:perform_action(wezterm.action.SpawnCommandInNewTab({ args = args }), pane)
+end
+
+---Run a fish command with no tab at all and report its last line of output
+---as a notification. Keeps the user on the tab they were on.
+---@param window Window
+---@param title string
+---@param fish_cmd string
+---@param pane? Pane when given, the command sees WEZTERM_PANE so agent.fish treats it as running inside wezterm
+local function run_background(window, title, fish_cmd, pane)
+  local args = { shell.fish(), "-c", fish_cmd }
+  if pane then args = { "env", "WEZTERM_PANE=" .. tostring(pane:pane_id()), table.unpack(args) } end
+  local ok, stdout, stderr = wezterm.run_child_process(args)
+  local output = shell.trim(ok and stdout or (stderr ~= "" and stderr or stdout))
+  local last_line = output:match("([^\n]*)$") or ""
+  notify(window, title, last_line ~= "" and last_line or (ok and "done" or "failed"))
 end
 
 ---@return AgentSpawnChoice[]
@@ -49,15 +68,22 @@ end
 
 ---@param repo_path string
 ---@param name string
+---@param with_prompt boolean
 ---@return string
-local function build_spawn_cmd(repo_path, name)
-  -- agent.fish opens nvim for the prompt when no -e/--seed is given and the
-  -- worktree doesn't yet exist. When :wq closes nvim, agent.fish finishes
-  -- spawning into the meta-session and exits, taking this temporary tab with
-  -- it. cd inside fish rather than trusting wezterm's --cwd (canonicalisation
-  -- bug, wez/wezterm#4618).
-  return "cd " .. shell.quote(repo_path) .. "; and agent attach " .. shell.quote(name)
+local function build_spawn_cmd(repo_path, name, with_prompt)
+  -- agent.fish opens nvim for the prompt when no -e/--seed/--no-prompt is
+  -- given and the worktree doesn't yet exist. When :wq closes nvim, agent.fish
+  -- finishes spawning into the meta-session and exits, taking the temporary
+  -- tab with it. --no-focus so it doesn't drag focus back to that tab; the
+  -- agents tab is focused instead once the pane is up. cd inside fish rather
+  -- than trusting wezterm's --cwd (canonicalisation bug, wez/wezterm#4618).
+  local flags = with_prompt and "" or " --no-prompt"
+  return "cd " .. shell.quote(repo_path) .. "; and agent attach " .. shell.quote(name) .. flags
+    .. " --no-focus; and _term_focus (_agent_meta_tab_pane)"
 end
+
+local SEED_WITHOUT = "No prompt (default) — start Claude bare"
+local SEED_WITH = "Write a seed prompt in nvim"
 
 M.open = function(window, pane)
   window:perform_action(wezterm.action.InputSelector({
@@ -81,7 +107,20 @@ M.open = function(window, pane)
           local target = name_window:active_pane()
           if not target then return end
 
-          spawn_fish_tab(name_window, target, build_spawn_cmd(repo_path, name), true)
+          name_window:perform_action(wezterm.action.InputSelector({
+            title = "Seed prompt for " .. name .. "?",
+            choices = { { label = SEED_WITHOUT, id = "none" }, { label = SEED_WITH, id = "prompt" } },
+            action = wezterm.action_callback(function(seed_window, seed_pane, seed_choice)
+              if not seed_choice then return end
+              if seed_choice == "prompt" then
+                -- nvim needs a real tab; the command refocuses the agents tab on exit.
+                spawn_fish_tab(seed_window, seed_pane, build_spawn_cmd(repo_path, name, true), true)
+                return
+              end
+              run_background(seed_window, "agent attach", build_spawn_cmd(repo_path, name, false), seed_pane)
+              agents_tab.focus(seed_window)
+            end),
+          }), target)
         end),
       }), repo_window:active_pane())
     end),
@@ -103,9 +142,9 @@ M.remove = function(window, pane)
     title = "Pick an agent to remove (--force)",
     choices = list_agents(),
     fuzzy = true,
-    action = wezterm.action_callback(function(inner_window, inner_pane, branch)
+    action = wezterm.action_callback(function(inner_window, _, branch)
       if not branch then return end
-      spawn_fish_tab(inner_window, inner_pane, "agent rm --force " .. shell.quote(branch))
+      run_background(inner_window, "agent rm", "agent rm --force " .. shell.quote(branch))
     end),
   }), pane)
 end
@@ -145,15 +184,15 @@ M.edit_focused = function(window, pane)
   spawn_fish_tab(window, pane, "set -q EDITOR; or set EDITOR nvim; " .. cd_or_shell(cwd) .. "; exec $EDITOR", true)
 end
 
-M.remove_focused = function(window, pane)
+M.remove_focused = function(window, _pane)
   local cwd = M.focused_worktree(window)
   if not cwd then return end
   local branch = path_utils.basename(cwd)
   if branch == "" then return end
 
-  -- agent rm without --force refuses on dirty branches; user can rerun with
-  -- --force from a regular pane if needed. Tab closes when the command exits.
-  spawn_fish_tab(window, pane, "agent rm " .. shell.quote(branch), true)
+  -- agent rm without --force refuses on dirty branches; the refusal arrives
+  -- as the notification and the user can rerun with --force from a shell.
+  run_background(window, "agent rm", "agent rm " .. shell.quote(branch))
 end
 
 M.minimise_focused = function(_window, _pane)

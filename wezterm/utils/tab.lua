@@ -2,6 +2,7 @@ local wezterm = require("wezterm")
 
 ---@class TabUtils
 ---@field id fun(tab: any): integer|nil
+---@field title fun(tab: any): string
 ---@field first_non_pinned_index fun(mux_window: any): integer
 ---@field move_to_first fun(gui_window: any, pane: any): nil
 local M = {}
@@ -14,6 +15,16 @@ function M.id(tab)
   if tab == nil then return nil end
   if type(tab.tab_id) == "function" then return tab:tab_id() end
   return tab.tab_id
+end
+
+---Title for either object: MuxTab has `:get_title()`, TabInformation has
+---`.tab_title`.
+---@param tab any
+---@return string
+function M.title(tab)
+  if tab == nil then return "" end
+  if type(tab.get_title) == "function" then return tab:get_title() or "" end
+  return tab.tab_title or ""
 end
 
 ---Find the leftmost index that's safe to move a freshly-spawned tab into,

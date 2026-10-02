@@ -20,16 +20,6 @@ local M = { TITLE = "agents" }
 -- The agents tab is identified by its wezterm tab id, kept in wezterm.GLOBAL.
 -- Survives config reloads; resets on wezterm restart (gui-startup repopulates).
 -- Title is cosmetic — rename freely.
----Title for either object wezterm hands out: MuxTab has `:get_title()`,
----TabInformation has `.tab_title`.
----@param tab any
----@return string
-local function title_of(tab)
-  if tab == nil then return "" end
-  if type(tab.get_title) == "function" then return tab:get_title() or "" end
-  return tab.tab_title or ""
-end
-
 -- Registration normally arrives via the `agents-tab-spawned` user var, but
 -- that escape only works when the spawning shell has a tty. The spawned tab
 -- is always titled M.TITLE, so fall back to the title and adopt the id.
@@ -38,7 +28,7 @@ local function is_agents(tab)
   local id = wezterm.GLOBAL.agents_tab_id
   local tid = tab_utils.id(tab)
   if type(id) == "number" and tid == id then return true end
-  if title_of(tab) == M.TITLE then
+  if tab_utils.title(tab) == M.TITLE then
     if type(id) ~= "number" then wezterm.GLOBAL.agents_tab_id = tid end
     return true
   end
@@ -51,6 +41,16 @@ local function find_agents(window)
   end
   wezterm.GLOBAL.agents_tab_id = nil -- stale; clear so callers can respawn
   return nil
+end
+
+---Activate the agents tab if it exists. Returns whether it did.
+---@param window Window
+---@return boolean
+function M.focus(window)
+  local agents = find_agents(window)
+  if not agents then return false end
+  agents:activate()
+  return true
 end
 
 -- macOS GUI apps don't inherit shell PATH; route through the user's login

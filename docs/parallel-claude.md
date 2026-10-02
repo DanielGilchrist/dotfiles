@@ -45,6 +45,7 @@ from another wezterm tab or your phone. Same session, multiple viewers.
 |---|---|
 | `CMD+0` | Toggle to/from the agents tab |
 | `CMD+Shift+0` | Pin agents tab to position 0 |
+| `CMD+Shift+A` | Spawn a new agent: repo picker → name → seed prompt in nvim |
 | `CMD+Shift+O` | Worktree picker — fuzzy over `~/worktrees/<repo>/<branch>` |
 | `CMD+Left` / `CMD+Right` | Cycle tabs, skipping the agents tab |
 | `Shift+Alt+{` / `}` | Move tabs (refuses to move the agents tab) |
