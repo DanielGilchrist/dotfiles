@@ -157,7 +157,7 @@ function _agent_attach --description "agent attach — create-or-attach a per-ag
             cp $_flag_seed $seed_path
             set -l meta "This worktree is detached at the repo's default branch. Before doing anything else, in order: (1) read $seed_path to understand your task, (2) create a branch with \`git checkout -b <kebab-case-name>\` named for the task, (3) \`trash $seed_path\`."
             set -l escaped (string escape -- $meta)
-            set per_agent_cmd (_agent_pane_cmd $branch --add-dir /tmp $escaped)
+            set per_agent_cmd (_agent_pane_cmd $branch $escaped)
         else if set -q _flag_no_prompt
             set per_agent_cmd (_agent_pane_cmd $branch)
         else

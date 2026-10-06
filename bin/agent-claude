@@ -20,8 +20,16 @@ set -gx CLAUDE_CODE_FORCE_SESSION_PERSISTENCE 1
 set -l slug (string replace -a / - -- (pwd -P))
 set -l transcripts $HOME/.claude/projects/$slug/*.jsonl
 
-if test (count $transcripts) -gt 0
-    set -l largest (ls -S $transcripts | head -1)
+# A transcript older than this worktree belongs to a previous agent that
+# used the same name; resuming it would swallow a fresh seed prompt.
+set -l worktree_born (stat -f %B (pwd -P))
+set -l current
+for transcript in $transcripts
+    test (stat -f %m $transcript) -ge $worktree_born; and set -a current $transcript
+end
+
+if test (count $current) -gt 0
+    set -l largest (ls -S $current | head -1)
     set -l session_id (string replace -r '\.jsonl$' '' -- (basename $largest))
     set -l mode_args
     set -l index (contains -i -- --permission-mode $argv)
