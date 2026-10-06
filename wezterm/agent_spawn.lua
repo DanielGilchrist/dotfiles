@@ -85,6 +85,9 @@ end
 local SEED_WITHOUT = "No prompt (default) — start Claude bare"
 local SEED_WITH = "Write a seed prompt in nvim"
 
+-- Every nested prompt targets the pane the flow started from. The pane a
+-- selector/prompt callback receives, and the window's active pane at that
+-- moment, is the overlay being torn down ("pane id N is not valid").
 M.open = function(window, pane)
   window:perform_action(wezterm.action.InputSelector({
     title = "Pick a repo for the new agent",
@@ -100,29 +103,22 @@ M.open = function(window, pane)
           local name = shell.trim(line):match("^%s*(.-)$")
           if name == "" then return end
 
-          -- Resolve a fresh active pane: the pane that started this flow may
-          -- have closed in between (PromptInputLine closes its own overlay
-          -- pane on submit, and the captured pane is often stale by here —
-          -- "pane id N is not valid" otherwise).
-          local target = name_window:active_pane()
-          if not target then return end
-
           name_window:perform_action(wezterm.action.InputSelector({
             title = "Seed prompt for " .. name .. "?",
             choices = { { label = SEED_WITHOUT, id = "none" }, { label = SEED_WITH, id = "prompt" } },
-            action = wezterm.action_callback(function(seed_window, seed_pane, seed_choice)
+            action = wezterm.action_callback(function(seed_window, _, seed_choice)
               if not seed_choice then return end
               if seed_choice == "prompt" then
                 -- nvim needs a real tab; the command refocuses the agents tab on exit.
-                spawn_fish_tab(seed_window, seed_pane, build_spawn_cmd(repo_path, name, true), true)
+                spawn_fish_tab(seed_window, pane, build_spawn_cmd(repo_path, name, true), true)
                 return
               end
-              run_background(seed_window, "agent attach", build_spawn_cmd(repo_path, name, false), seed_pane)
+              run_background(seed_window, "agent attach", build_spawn_cmd(repo_path, name, false), pane)
               agents_tab.focus(seed_window)
             end),
-          }), target)
+          }), pane)
         end),
-      }), repo_window:active_pane())
+      }), pane)
     end),
   }), pane)
 end
