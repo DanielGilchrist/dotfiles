@@ -65,6 +65,7 @@ local function new_scratchpad()
     { lang = "Ruby",       ext = ".rb" },
     { lang = "Crystal",    ext = ".cr" },
     { lang = "JavaScript", ext = ".js" },
+    { lang = "Markdown",   ext = ".md" },
     { lang = "SQL",        ext = ".sql" },
     { lang = "Text",       ext = ".txt" },
     { lang = "Bash",       ext = ".sh" },
