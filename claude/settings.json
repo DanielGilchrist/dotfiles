@@ -137,6 +137,7 @@
     "developer-tooling@tanda-plugins": true
   },
   "effortLevel": "medium",
+  "idleCompaction": false,
   "claudeMdExcludes": [
     "CLAUDE.md",
     ".claude/CLAUDE.md",
