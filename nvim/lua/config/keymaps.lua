@@ -99,14 +99,8 @@ map("n", leader("bc"), function()
 end, { desc = "Copy relative file path" })
 
 -- Spotify
-local function playback(command)
-  local cmd = { "spotify_player", "playback" }
-  if is.table(command) then
-    vim.list_extend(cmd, command)
-  else
-    table.insert(cmd, command)
-  end
-  vim.fn.jobstart(cmd, {
+local function playback(flag)
+  vim.fn.jobstart({ "spotatui", "playback", flag }, {
     stderr_buffered = true,
     on_stderr = function(_, data)
       local error_message = table.concat(data)
@@ -121,8 +115,8 @@ local function playback(command)
 end
 
 map("n", leader("mo"), function() Snacks.terminal.toggle("spotify") end, { desc = "Open spotify" })
-map("n", leader("mn"), function() playback("next") end, { desc = "Next song" })
-map("n", leader("mp"), function() playback("previous") end, { desc = "Previous song" })
+map("n", leader("mn"), function() playback("--next") end, { desc = "Next song" })
+map("n", leader("mp"), function() playback("--previous") end, { desc = "Previous song" })
 map("n", leader("mt"), function() playback("play-pause") end, { desc = "Toggle play/pause" })
 map("n", leader("mf"), function() playback({ "seek", "10000" }) end, { desc = "Fast-forward 10s" })
 map("n", leader("mb"), function() playback({ "seek", "--", "-10000" }) end, { desc = "Rewind 10s" })

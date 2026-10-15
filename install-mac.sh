@@ -111,7 +111,16 @@ install_brew_package lazygit
 install_brew_package zellij
 install_brew_package jq
 install_brew_package crystalline
-install_brew_package spotify_player
+
+if ! command_exists spotatui; then
+  echo "Installing spotatui..."
+  brew tap LargeModGames/spotatui
+  # Homebrew 6+ refuses third-party formulae until they are trusted
+  brew trust --formula LargeModGames/spotatui/spotatui 2>/dev/null || true
+  brew install LargeModGames/spotatui/spotatui
+else
+  echo "spotatui is already installed."
+fi
 install_brew_package watchman
 install_brew_package imagemagick magick
 install_brew_package ghostscript gs

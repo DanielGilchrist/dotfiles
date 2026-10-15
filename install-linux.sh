@@ -88,7 +88,7 @@ install_package lazygit
 install_package zellij
 install_package jq
 install_package crystalline-bin crystalline
-install_package spotify-player
+install_package spotatui-bin spotatui
 install_package imagemagick magick
 install_package ghostscript gs
 install_package opencode

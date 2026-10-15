@@ -1,0 +1,12 @@
+behavior:
+  seek_milliseconds: 10000
+  volume_increment: 10
+  volume_percent: 100
+  sidebar_position: left
+  playbar_position: top
+  playbar_height_rows: 6
+  enable_streaming: true
+  streaming_device_name: nvim
+  streaming_bitrate: 320
+  streaming_audio_cache: true
+  enable_global_song_count: false
