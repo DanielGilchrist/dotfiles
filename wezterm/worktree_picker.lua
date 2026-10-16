@@ -1,4 +1,5 @@
 local wezterm = require("wezterm")
+local shell = require("utils.shell")
 local worktree = require("utils.worktree")
 
 ---@class WorktreeChoice
@@ -26,13 +27,15 @@ M.open = function(window, pane)
     fuzzy = true,
     action = wezterm.action_callback(function(inner_window, _, id)
       if not id then return end
-      -- The InputSelector overlay pane is torn down before this fires; use
-      -- the window's current active pane as the perform_action target.
-      local target = inner_window:active_pane()
-      if not target then return end
+      -- The selector overlay is the active pane when this fires and is
+      -- already being torn down, so target the pane the picker opened from.
+      -- cd inside fish rather than trusting --cwd (wez/wezterm#4618).
+      local quoted = shell.quote(id)
       inner_window:perform_action(
-        wezterm.action.SpawnCommandInNewTab({ cwd = id }),
-        target
+        wezterm.action.SpawnCommandInNewTab({
+          args = { shell.fish(), "-i", "-c", "cd " .. quoted .. "; or echo 'cannot cd into '" .. quoted .. "; exec fish -i" },
+        }),
+        pane
       )
     end),
   }), pane)
