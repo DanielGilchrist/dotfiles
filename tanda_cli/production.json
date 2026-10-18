@@ -1,0 +1,43 @@
+{
+  "start_of_week": "saturday",
+  "treat_paid_breaks_as_unpaid": true,
+  "regular_hours": {
+    "641": [
+      {
+        "day_of_week": "Monday",
+        "start_time": "08:30",
+        "finish_time": "17:00",
+        "breaks": [],
+        "automatic_break_length": 30
+      },
+      {
+        "day_of_week": "Tuesday",
+        "start_time": "08:30",
+        "finish_time": "17:00",
+        "breaks": [],
+        "automatic_break_length": 30
+      },
+      {
+        "day_of_week": "Wednesday",
+        "start_time": "08:30",
+        "finish_time": "17:00",
+        "breaks": [],
+        "automatic_break_length": 30
+      },
+      {
+        "day_of_week": "Thursday",
+        "start_time": "08:30",
+        "finish_time": "17:00",
+        "breaks": [],
+        "automatic_break_length": 30
+      },
+      {
+        "day_of_week": "Friday",
+        "start_time": "08:30",
+        "finish_time": "17:00",
+        "breaks": [],
+        "automatic_break_length": 30
+      }
+    ]
+  }
+}
