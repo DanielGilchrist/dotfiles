@@ -17,6 +17,12 @@ function M.register(prefix)
 
   vim.keymap.set({ "n", "i", "t", "x" }, "<C-.>", function() agent().toggle() end, { desc = "agent: toggle active", silent = true })
 
+  -- Wezterm forwards Ctrl+Shift+X to nvim; in a terminal (zellij underneath)
+  -- hand it on as Ctrl+s e so zellij opens the pane's scrollback in an editor.
+  vim.keymap.set("t", "<C-S-x>", function()
+    vim.api.nvim_chan_send(vim.bo.channel, "\19e")
+  end, { desc = "agent: edit pane scrollback", silent = true })
+
   map("n", function() agent().new_agent() end, "new (worktree)")
   map("N", function() agent().new_agent_no_prompt() end, "new (worktree, no prompt)")
   map("c", function() agent().checkout_agent() end, "checkout branch (attach or create worktree)")

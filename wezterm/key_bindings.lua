@@ -18,6 +18,18 @@ local function keybind(mods, key, action)
   return { mods = mods, key = key, action = action }
 end
 
+---@param info table|nil LocalProcessInfo
+---@param needle string
+---@return boolean
+local function process_tree_has(info, needle)
+  if not info then return false end
+  if (info.name or ""):find(needle, 1, true) then return true end
+  for _, child in pairs(info.children or {}) do
+    if process_tree_has(child, needle) then return true end
+  end
+  return false
+end
+
 ---@param key1 string
 ---@param key2 string
 ---@return string
@@ -107,6 +119,29 @@ config.keys = {
     end
 
     window:perform_action(wezterm.action({ ClearScrollback = "ScrollbackAndViewport" }), pane)
+  end)),
+
+  -- One "give me this text in a vim buffer" key. Wezterm copy mode copies
+  -- the rendered screen, so over zellij it grabs pane borders and both
+  -- columns; dispatch by what the pane is running instead.
+  keybind(combine(keys.CTRL, keys.SHIFT), "x", wezterm.action_callback(function(window, pane)
+    local process_name = pane:get_foreground_process_name() or ""
+    -- The agents tab's zellij runs under the fish -c that bootstrapped it,
+    -- so the foreground process is fish; look through its children too.
+    if process_name:find("zellij") or process_tree_has(pane:get_foreground_process_info(), "zellij") then
+      -- Ctrl+s then e: scroll mode → EditScrollback (zellij/config.kdl).
+      window:perform_action(wezterm.action.Multiple({
+        wezterm.action.SendKey({ key = "s", mods = keys.CTRL }),
+        wezterm.action.SendKey({ key = "e" }),
+      }), pane)
+      return
+    end
+    if process_name:find("nvim") then
+      -- CSI u for Ctrl+Shift+x; nvim decodes it as <C-S-x> and decides.
+      window:perform_action(wezterm.action.SendString("\x1b[120;6u"), pane)
+      return
+    end
+    window:perform_action(wezterm.action.ActivateCopyMode, pane)
   end)),
 
   keybind(keys.COMMAND, "w", wezterm.action({ CloseCurrentPane = { confirm = false } })),

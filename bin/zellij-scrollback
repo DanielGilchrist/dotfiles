@@ -1,0 +1,7 @@
+#!/usr/bin/env fish
+# Zellij's scrollback_editor: nvim opened at the bottom, read-only, with Esc
+# (and q) closing it, so it feels like wezterm copy mode.
+exec nvim -R + \
+    -c 'nnoremap <buffer> <Esc> <Cmd>qa!<CR>' \
+    -c 'nnoremap <buffer> q <Cmd>qa!<CR>' \
+    $argv
