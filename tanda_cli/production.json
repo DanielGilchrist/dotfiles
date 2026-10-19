@@ -1,4 +1,5 @@
 {
+  "clockin_photo_path": "~/Pictures/clockin_photos",
   "start_of_week": "saturday",
   "treat_paid_breaks_as_unpaid": true,
   "regular_hours": {
