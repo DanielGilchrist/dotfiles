@@ -92,7 +92,7 @@ function _agent_restore --description "agent restore — rebuild the agents grid
         # Clear any resurrection cache first — otherwise `zellij -s agents -n`
         # refuses because a dead serialised session still owns the name.
         set -l err_log $layout_file.err
-        set -l boot_cmd "zellij delete-session agents 2>/dev/null; or true; zellij -s agents -n $layout_file options --session-serialization false 2> $err_log; or begin; echo 'zellij bootstrap failed — layout: '$layout_file' stderr: '$err_log; exec fish; end; rm -f $layout_file $err_log"
+        set -l boot_cmd "zellij delete-session agents 2>/dev/null; or true; zellij -s agents -n $layout_file options --session-serialization false --pane-frames true 2> $err_log; or begin; echo 'zellij bootstrap failed — layout: '$layout_file' stderr: '$err_log; exec fish; end; rm -f $layout_file $err_log"
         set -l new_pane (_term_spawn_tab --title agents $HOME $boot_cmd)
         if test -z "$new_pane"
             rm -f $layout_file
@@ -100,17 +100,6 @@ function _agent_restore --description "agent restore — rebuild the agents grid
             return 1
         end
         _term_emit_event agents-tab-spawned $new_pane
-
-        # Toggle pane frames ON. The user's global config has `pane_frames false`,
-        # but agent panes need titles. Poll briefly until the session is ready
-        # to accept the action — zellij needs a moment after `-n <layout>`.
-        for i in (seq 1 20)
-            if _agent_meta_exists
-                zellij --session agents action toggle-pane-frames >/dev/null 2>&1
-                break
-            end
-            sleep 0.1
-        end
 
         # No consolidate here: the layout file places panes correctly, and
         # calling consolidate before zellij has actually started would race.

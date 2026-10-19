@@ -238,7 +238,7 @@ function _agent_attach --description "agent attach — create-or-attach a per-ag
         end
 
         set -l layout_file (mktemp -t agents-layout).kdl
-        _agent_write_meta_layout $layout_file $branch "zellij action toggle-pane-frames; and $pane_cmd"
+        _agent_write_meta_layout $layout_file $branch $pane_cmd
 
         set -q _flag_debug; and begin
             echo "[debug] meta layout:" >&2
@@ -249,7 +249,7 @@ function _agent_attach --description "agent attach — create-or-attach a per-ag
         # refuses because a serialised session still exists on disk. On failure
         # drop to fish so the wezterm tab doesn't disappear silently.
         set -l err_log $layout_file.err
-        set -l boot_cmd "zellij delete-session agents 2>/dev/null; or true; zellij -s agents -n $layout_file options --session-serialization false 2> $err_log; or begin; echo 'zellij bootstrap failed — layout: '$layout_file' stderr: '$err_log; exec fish; end; rm -f $layout_file $err_log"
+        set -l boot_cmd "zellij delete-session agents 2>/dev/null; or true; zellij -s agents -n $layout_file options --session-serialization false --pane-frames true 2> $err_log; or begin; echo 'zellij bootstrap failed — layout: '$layout_file' stderr: '$err_log; exec fish; end; rm -f $layout_file $err_log"
         set -l new_pane (_term_spawn_tab --title agents $HOME $boot_cmd)
         if test -z "$new_pane"
             echo "agent attach: failed to spawn agents tab" >&2
