@@ -115,7 +115,11 @@ function _agent_rm --description "agent rm — tear down an agent (worktree + ze
         # on the same filesystem, so do that and let a detached rm finish it.
         set -l trash (mktemp -d -t agent-trash)
         if mv $worktree_path $trash/ 2>/dev/null
-            fish -c "rm -rf (string escape -- $trash)" >/dev/null 2>&1 &
+            # Editor LSPs (rubocop --lsp, sorbet) rooted in the worktree outlive
+            # it and recreate tmp/cache/bootsnap at the old absolute path, so
+            # sweep the path again once they've had a moment to do that.
+            set -l safe_path (string escape -- $worktree_path)
+            fish -c "rm -rf (string escape -- $trash); sleep 5; test -e $safe_path/.git; or rm -rf $safe_path" >/dev/null 2>&1 &
             disown
         else
             rm -rf $worktree_path 2>/dev/null

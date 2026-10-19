@@ -43,6 +43,17 @@ function _agent_restore --description "agent restore — rebuild the agents grid
         return 0
     end
 
+    # A meta-session resurrected from zellij's cache (reboot, then something
+    # attached it) is a grid of "Waiting to run" stubs: alive, but useless.
+    # Kill it and rebuild from the live per-agent sessions instead.
+    if _agent_meta_exists; and _agent_meta_resurrected
+        zellij kill-session agents >/dev/null 2>&1
+        for i in (seq 1 20)
+            _agent_meta_exists; or break
+            sleep 0.1
+        end
+    end
+
     if not _agent_meta_exists
         # Build a layout file with one pane per live session and bootstrap the meta-session via a wezterm tab.
         set -l layout_file (mktemp -t agents-restore-layout).kdl
@@ -81,7 +92,7 @@ function _agent_restore --description "agent restore — rebuild the agents grid
         # Clear any resurrection cache first — otherwise `zellij -s agents -n`
         # refuses because a dead serialised session still owns the name.
         set -l err_log $layout_file.err
-        set -l boot_cmd "zellij delete-session agents 2>/dev/null; or true; zellij -s agents -n $layout_file 2> $err_log; or begin; echo 'zellij bootstrap failed — layout: '$layout_file' stderr: '$err_log; exec fish; end; rm -f $layout_file $err_log"
+        set -l boot_cmd "zellij delete-session agents 2>/dev/null; or true; zellij -s agents -n $layout_file options --session-serialization false 2> $err_log; or begin; echo 'zellij bootstrap failed — layout: '$layout_file' stderr: '$err_log; exec fish; end; rm -f $layout_file $err_log"
         set -l new_pane (_term_spawn_tab --title agents $HOME $boot_cmd)
         if test -z "$new_pane"
             rm -f $layout_file

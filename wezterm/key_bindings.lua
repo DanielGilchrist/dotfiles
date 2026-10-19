@@ -175,8 +175,9 @@ config.keys = {
   -- --force manually if you really mean it).
   keybind(keys.COMMAND_SHIFT, "x", wezterm.action_callback(agent_spawn.remove_focused)),
 
-  -- Minimise the focused agent: close its meta-session pane only. Per-agent
-  -- zellij session stays alive; bring back with agent restore or agent attach <name>.
+  -- Hide the focused agent: close its meta-session pane and persist it in the
+  -- hidden list (agent restore skips it). Per-agent zellij session stays alive;
+  -- bring back with agent attach <name> or CMD+Shift+S.
   keybind(keys.COMMAND_SHIFT, "h", wezterm.action_callback(agent_spawn.minimise_focused)),
 
   -- fzf-pick a minimised agent (one that's NOT currently in the agents tab),

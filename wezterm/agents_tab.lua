@@ -57,10 +57,11 @@ end
 -- shell so its profile (which sources Homebrew etc.) sets PATH up first.
 local SHELL = os.getenv("SHELL") or "/bin/sh"
 
+-- `list-sessions` also lists dead sessions whose resurrection cache is on
+-- disk (EXITED), and attaching one of those resurrects a grid of "Waiting to
+-- run" stubs. Probe the server instead, same as _agent_meta_exists.
 local function meta_session_alive()
-  return wezterm.run_child_process({
-    SHELL, "-l", "-c", "zellij list-sessions -s | grep -q '^agents$'"
-  }) == true
+  return wezterm.run_child_process({ SHELL, "-l", "-c", "_agent_meta_exists" }) == true
 end
 
 -- MoveTab acts on the active tab, so we activate-move-restore.

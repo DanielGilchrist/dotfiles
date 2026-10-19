@@ -192,10 +192,10 @@ M.remove_focused = function(window, _pane)
 end
 
 M.minimise_focused = function(_window, _pane)
-  -- Close the meta-session pane only. The per-agent zellij session keeps
-  -- running (zj <branch> just detaches a client). Bring back with
-  -- `agent restore` for all or `agent attach <name>` for one. consolidate
-  -- reflows the remaining panes so the grid stays tidy.
+  -- Close the meta-session pane and add the agent to the hidden list, so
+  -- `agent restore` doesn't bring it back. The per-agent zellij session
+  -- keeps running (zj <branch> just detaches a client). Bring back with
+  -- `agent attach <name>` or `agent restore --include-hidden`.
   shell.run({ shell.fish(), "-c", "_agent_minimise_focused" })
 end
 

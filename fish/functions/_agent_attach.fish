@@ -107,6 +107,11 @@ function _agent_attach --description "agent attach — create-or-attach a per-ag
     if test $worktree_exists -eq 0
         mkdir -p $worktrees_dir
         git -C $repo_root worktree prune 2>/dev/null
+        # A leftover from a previous agent rm (tmp/cache written by a stray
+        # LSP after removal) makes `git worktree add` refuse the path.
+        if test -d $worktree_path; and not test -e $worktree_path/.git
+            rm -rf $worktree_path
+        end
 
         set -l base (git -C $repo_root symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null)
         if test -z "$base"
@@ -244,7 +249,7 @@ function _agent_attach --description "agent attach — create-or-attach a per-ag
         # refuses because a serialised session still exists on disk. On failure
         # drop to fish so the wezterm tab doesn't disappear silently.
         set -l err_log $layout_file.err
-        set -l boot_cmd "zellij delete-session agents 2>/dev/null; or true; zellij -s agents -n $layout_file 2> $err_log; or begin; echo 'zellij bootstrap failed — layout: '$layout_file' stderr: '$err_log; exec fish; end; rm -f $layout_file $err_log"
+        set -l boot_cmd "zellij delete-session agents 2>/dev/null; or true; zellij -s agents -n $layout_file options --session-serialization false 2> $err_log; or begin; echo 'zellij bootstrap failed — layout: '$layout_file' stderr: '$err_log; exec fish; end; rm -f $layout_file $err_log"
         set -l new_pane (_term_spawn_tab --title agents $HOME $boot_cmd)
         if test -z "$new_pane"
             echo "agent attach: failed to spawn agents tab" >&2

@@ -27,8 +27,10 @@ from another wezterm tab or your phone. Same session, multiple viewers.
   branch off that point — the spawn prompt instructs it to
   `git checkout -b <kebab-case-name>` before doing anything else.
 - **Meta-session is named `agents`** — the name is reserved (`agent` and
-  `agent rm` refuse it). It serializes via `session_serialization true`,
-  so its layout survives wezterm restarts.
+  `agent rm` refuse it). It is started with session serialization off: it
+  is a viewport, not state, so after a reboot it is simply gone and
+  `agent restore` rebuilds it from the per-agent sessions (which do
+  serialize; `zj` recreates them with the right command).
 - **Single `agents` wezterm tab** — one wezterm pane, running
   `zellij attach agents`. The grid lives inside zellij. `CMD+0` toggles
   to/from this tab.
@@ -46,7 +48,9 @@ from another wezterm tab or your phone. Same session, multiple viewers.
 | `CMD+0` | Toggle to/from the agents tab |
 | `CMD+Shift+0` | Pin agents tab to position 0 |
 | `CMD+Shift+A` | Spawn a new agent: repo picker → name → seed prompt in nvim |
-| `CMD+Shift+O` | Worktree picker — fuzzy over `~/worktrees/<repo>/<branch>` |
+| `CMD+Shift+O` | Worktree picker — opens a shell tab in a `~/worktrees/<repo>/<branch>` dir |
+| `CMD+Shift+H` | Hide the focused agent (closes its pane, adds it to the hidden list) |
+| `CMD+Shift+S` | Picker over hidden agents — attaches the pick back into the grid |
 | `CMD+Left` / `CMD+Right` | Cycle tabs, skipping the agents tab |
 | `Shift+Alt+{` / `}` | Move tabs (refuses to move the agents tab) |
 | `CMD+Alt+h/j/k/l` (or arrows) | Wezterm pane navigation (outside the agents tab) |
@@ -238,16 +242,18 @@ the buffer above (`config.review.editing_hl`).
 
 ## Restore semantics
 
-The meta-session itself persists across wezterm restarts (zellij
-serialization). On wezterm startup, the `gui-startup` hook checks for a
-live `agents` session and, if found, spawns a passive `agents` tab in
-the new window automatically — focus stays on the primary tab.
+The meta-session survives a wezterm restart (the zellij server keeps
+running) but not a reboot: it is started with serialization off, so there
+is nothing to resurrect. On wezterm startup, the `gui-startup` hook probes
+for a *live* `agents` server (not just a cached session name) and, if
+found, spawns a passive `agents` tab in the new window — focus stays on
+the primary tab.
 
-`agent restore` covers the rarer case where a meta-session pane was
-closed manually (zellij's pane-close) but its Layer-1 session is still
-alive: it diffs `zellij list-sessions` against meta-session panes and
-adds any missing. Also useful if you want to manually re-spawn the
-agents tab in a non-startup wezterm window.
+After a reboot, run `agent restore`: it rebuilds the grid from the
+per-agent sessions, skipping the hidden list. It also detects a
+meta-session that was resurrected from cache (panes held at "Waiting to
+run") and replaces it. When the meta-session is healthy it only diffs
+`zellij list-sessions` against the panes and adds what is missing.
 
 ## Caveats
 
