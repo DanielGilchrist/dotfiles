@@ -153,10 +153,15 @@ end
 ---buffer-local here — globally they'd shadow TUI apps' own bindings
 ---(e.g. lazygit's move-commit keys).
 ---@param cmd string[]
-local function open_agent_terminal(cmd)
+local function open_agent_terminal(name, cmd)
   return Snacks.terminal.open(cmd, {
     win = {
       position = "right",
+      -- The attach runs inside the terminal, so give zellij a beat to
+      -- connect before forcing the resize that makes claude fit this viewport.
+      on_win = function()
+        vim.defer_fn(function() zellij.nudge_resize(name) end, 500)
+      end,
       on_buf = function(self)
         for _, direction in ipairs({ "h", "j", "k", "l" }) do
           vim.keymap.set(
@@ -207,7 +212,7 @@ function M.attach_in_terminal(name, opts)
     if existing and existing.buf and vim.api.nvim_buf_is_valid(existing.buf) then
       if not existing:win_valid() then existing:show() end
     else
-      M.agent_terminals[name] = open_agent_terminal(cmd)
+      M.agent_terminals[name] = open_agent_terminal(name, cmd)
     end
     vim.schedule(function()
       vim.cmd("wincmd h")
@@ -235,7 +240,7 @@ function M.attach_in_terminal(name, opts)
   if existing and existing.buf and vim.api.nvim_buf_is_valid(existing.buf) then
     if not existing:win_valid() then existing:show() end
   else
-    M.agent_terminals[name] = open_agent_terminal(cmd)
+    M.agent_terminals[name] = open_agent_terminal(name, cmd)
   end
   vim.schedule(function()
     vim.cmd("wincmd h")

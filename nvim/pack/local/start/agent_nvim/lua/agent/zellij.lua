@@ -4,6 +4,7 @@ local is = require("utils.is")
 ---@class AgentZellij
 ---@field list_sessions fun(): string[]
 ---@field session_exists fun(name: string): boolean
+---@field nudge_resize fun(name: string): nil
 ---@field session_cwd fun(name: string): string|nil
 ---@field write_chars fun(name: string, text: string): boolean
 ---@field submit fun(name: string): boolean
@@ -63,6 +64,17 @@ end
 function M.submit(name)
   local res = vim.system({ "zellij", "--session", name, "action", "write", "13" }, { text = true }):wait()
   return cmd_utils.success(res.code)
+end
+
+---Force a real pty resize in the session: Claude Code only re-measures when
+---the pty dimensions change, so a session last sized by a smaller client
+---(a meta-session pane) stays boxed in a bigger terminal until it does.
+---@param name string
+function M.nudge_resize(name)
+  vim.system(
+    { "zellij", "--session", name, "action", "new-pane", "--direction", "right", "--close-on-exit", "--", "true" },
+    { text = true }
+  )
 end
 
 ---@param name string

@@ -47,6 +47,7 @@ function _agent_hide --description "agent hide — persist a branch in the hidde
         if test -n "$info"
             set -l parts (string split " " $info)
             zellij --session agents action close-pane --pane-id $parts[1] 2>/dev/null
+            _agent_nudge_clients $branch
             set -l remaining (zellij --session agents action list-panes --json 2>/dev/null \
                 | jq --argjson t $parts[2] '[.[] | select(.tab_id == $t and (.is_plugin | not))] | length' 2>/dev/null)
             if test "$remaining" = 0

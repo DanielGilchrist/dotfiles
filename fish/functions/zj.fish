@@ -58,6 +58,9 @@ function zj --description "Start or attach to a zellij session in the current di
         if test -n "$meta_pane"
             zellij --session agents action toggle-fullscreen --pane-id $meta_pane 2>/dev/null
         end
+        # Zellij sizes a session to its smallest client and doesn't always
+        # re-fit when that client leaves; poke whoever is still attached.
+        _agent_nudge_clients $name
         return $exit_status
     end
 
