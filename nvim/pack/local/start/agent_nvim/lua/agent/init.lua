@@ -365,18 +365,13 @@ end
 ---Spawn a worktree agent without any seed prompt. Prompts only for the name;
 ---Claude starts with no initial message.
 function M.new_agent_no_prompt()
-  vim.ui.input({ prompt = "agent name (kebab-case, no prompt): " }, function(name)
-    local trimmed = name and vim.trim(name)
-    if is.empty(trimmed) then return end
-    spawn_headless(trimmed, "attach", trimmed, "--no-prompt")
+  ui.agent_name("agent name (no prompt)", function(name)
+    spawn_headless(name, "attach", name, "--no-prompt")
   end)
 end
 
 function M.new_agent()
-  vim.ui.input({ prompt = "agent name (kebab-case): " }, function(name)
-    local trimmed = name and vim.trim(name)
-    if is.empty(trimmed) then return end
-
+  ui.agent_name("agent name", function(name)
     ui.new_prompt(function(text)
       local tmp = vim.fn.tempname() .. ".md"
       if not file.write(tmp, text) then
@@ -384,7 +379,7 @@ function M.new_agent()
         return
       end
 
-      spawn_headless(trimmed, "attach", trimmed, "--seed " .. vim.fn.shellescape(tmp))
+      spawn_headless(name, "attach", name, "--seed " .. vim.fn.shellescape(tmp))
     end)
   end)
 end

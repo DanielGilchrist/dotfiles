@@ -3,8 +3,74 @@ local is = require("utils.is")
 
 ---@class AgentUI
 ---@field new_prompt fun(on_submit: fun(text: string)): nil
+---@field agent_name fun(prompt: string, on_confirm: fun(name: string)): nil
 ---@field pick_session fun(opts: {include_new?: boolean, on_pick: fun(name: string|nil, is_new: boolean)}): nil
 local M = {}
+
+-- zellij session names are capped by the unix socket path budget on macOS;
+-- agent.fish rejects longer names, so refuse them before any prompt is written.
+local NAME_MAX = 20
+
+---@param name string
+---@return string|nil problem
+local function name_problem(name)
+  if name == "" then return nil end
+  if #name > NAME_MAX then return "too long (" .. #name .. "/" .. NAME_MAX .. ")" end
+  if name:find("[^%w%-]") then return "kebab-case only (a-z, 0-9, -)" end
+  if name == "agents" then return "'agents' is reserved" end
+  return nil
+end
+
+---Single-line agent-name input with the limit enforced as you type: the
+---title shows the count, the overflow and bad characters are highlighted,
+---and confirming an invalid name re-opens the input with the text kept.
+---@param prompt string
+---@param on_confirm fun(name: string)
+---@param default? string
+function M.agent_name(prompt, on_confirm, default)
+  local function title_for(name)
+    local problem = name_problem(name)
+    local hl = problem and "DiagnosticError" or "SnacksInputTitle"
+    return {
+      { " " .. prompt .. " ", "SnacksInputTitle" },
+      { problem or (#name .. "/" .. NAME_MAX), hl },
+      { " ", "SnacksInputTitle" },
+    }
+  end
+
+  local win
+  win = Snacks.input.input({
+    prompt = prompt,
+    default = default,
+    prompt_pos = false,
+    icon_pos = "left",
+    win = { title = title_for(default or ""), title_pos = "center" },
+    highlight = function(text)
+      local marks = {}
+      if #text > NAME_MAX then table.insert(marks, { NAME_MAX, #text, "DiagnosticUnderlineError" }) end
+      for start, stop in text:gmatch("()[^%w%-]+()") do
+        table.insert(marks, { start - 1, stop - 1, "DiagnosticUnderlineError" })
+      end
+      return marks
+    end,
+  }, function(value)
+    local name = value and vim.trim(value) or ""
+    if name == "" then return end
+    local problem = name_problem(name)
+    if problem then
+      vim.notify("agent name " .. problem, vim.log.levels.WARN, { title = "agent" })
+      M.agent_name(prompt, on_confirm, name)
+      return
+    end
+    on_confirm(name)
+  end)
+
+  win:on({ "TextChangedI", "TextChanged" }, function()
+    if not win:valid() then return end
+    win.opts.title = title_for(vim.trim(win:text()))
+    win:update()
+  end, { buf = true })
+end
 
 ---@param on_submit fun(text: string)
 ---@param opts? {title?: string, initial?: string, split?: boolean, height?: integer, on_close?: fun()}
