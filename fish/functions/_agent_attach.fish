@@ -35,21 +35,6 @@ function _agent_attach --description "agent attach — create-or-attach a per-ag
         return 1
     end
 
-    set -l repo_root $_flag_repo
-    if test -z "$repo_root"
-        set repo_root (git worktree list --porcelain 2>/dev/null | head -1 | string replace -r '^worktree ' '')
-    end
-    if test -z "$repo_root"
-        echo "agent attach: not in a git repo and --repo not given" >&2
-        return 1
-    end
-    set -l resolved_main (git -C $repo_root worktree list --porcelain 2>/dev/null | head -1 | string replace -r '^worktree ' '')
-    test -n "$resolved_main"; and set repo_root $resolved_main
-    set -l repo_name (basename $repo_root)
-
-    set -l worktrees_dir "$HOME/worktrees/$repo_name"
-    set -l worktree_path "$worktrees_dir/$branch"
-
     # Look for ANY worktree named <branch> across every repo namespace.
     # `agent attach <name>` is an "I want that agent" verb, so if a
     # worktree already exists — under this repo or another — prefer it
@@ -60,6 +45,7 @@ function _agent_attach --description "agent attach — create-or-attach a per-ag
         test -e "$candidate/.git"; and set -a existing $candidate
     end
 
+    set -l worktree_path
     set -l worktree_exists 0
     if test (count $existing) -gt 1
         echo "agent attach: multiple worktrees named $branch — remove the duplicates first:" >&2
@@ -69,16 +55,44 @@ function _agent_attach --description "agent attach — create-or-attach a per-ag
         return 1
     else if test (count $existing) -eq 1
         set worktree_path $existing[1]
-        set worktrees_dir (dirname $existing[1])
         set worktree_exists 1
     end
 
     set -l session_exists 0
     zellij list-sessions -s 2>/dev/null | string match -q -- $branch; and set session_exists 1
 
+    # Repo-root sessions (nvim's <leader>as) run Claude in the main checkout
+    # and never had a worktree, so reattach in place instead of creating one.
+    set -l repo_session 0
     if test $session_exists -eq 1 -a $worktree_exists -eq 0
-        echo "agent attach: session $branch is alive but its worktree is gone — its Claude is running in a deleted directory." >&2
-        echo "       creating a fresh worktree at $worktree_path and reattaching; run \`agent rm $branch\` first if you want a clean start." >&2
+        set -l session_cwd (_agent_session_cwd $branch)
+        if test -d "$session_cwd"; and not string match -q -- "$HOME/worktrees/*" $session_cwd
+            set worktree_path $session_cwd
+            set repo_session 1
+        end
+    end
+
+    set -l worktrees_dir
+    set -l repo_root
+    if test $worktree_exists -eq 0 -a $repo_session -eq 0
+        set repo_root $_flag_repo
+        if test -z "$repo_root"
+            set repo_root (git worktree list --porcelain 2>/dev/null | head -1 | string replace -r '^worktree ' '')
+        end
+        if test -z "$repo_root"
+            echo "agent attach: not in a git repo and --repo not given" >&2
+            return 1
+        end
+        set -l resolved_main (git -C $repo_root worktree list --porcelain 2>/dev/null | head -1 | string replace -r '^worktree ' '')
+        test -n "$resolved_main"; and set repo_root $resolved_main
+
+        set worktrees_dir "$HOME/worktrees/"(basename $repo_root)
+        set worktree_path "$worktrees_dir/$branch"
+
+        if test $session_exists -eq 1
+            echo "agent attach: session $branch is alive but its worktree is gone — its Claude is running in a deleted directory." >&2
+            echo "       creating a fresh worktree at $worktree_path and reattaching; run \`agent rm $branch\` first if you want a clean start." >&2
+        end
     end
 
     if test $session_exists -eq 0; and test (string length -- $branch) -gt 20
@@ -104,7 +118,7 @@ function _agent_attach --description "agent attach — create-or-attach a per-ag
         end
     end
 
-    if test $worktree_exists -eq 0
+    if test $worktree_exists -eq 0 -a $repo_session -eq 0
         mkdir -p $worktrees_dir
         git -C $repo_root worktree prune 2>/dev/null
         # A leftover from a previous agent rm (tmp/cache written by a stray

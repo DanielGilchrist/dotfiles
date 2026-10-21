@@ -206,15 +206,15 @@ M.attach_picker = function(window, pane)
   -- races agent's mux operations and the new pane never lands in the
   -- meta-session.
   --
-  -- After picking, find the matching worktree and run `agent` from inside
-  -- it (agent.fish needs a git repo to resolve --repo). Run synchronously so
-  -- the picker tab stays alive for agent's mux ops (refocus of the calling
-  -- pane); a short sleep at the end lets the mux flush before the tab tears
-  -- down.
+  -- After picking, cd into the matching worktree if there is one (repo-root
+  -- sessions have none; agent attach reattaches those in place). Run
+  -- synchronously so the picker tab stays alive for agent's mux ops (refocus
+  -- of the calling pane); a short sleep at the end lets the mux flush before
+  -- the tab tears down.
   spawn_fish_tab(
     window,
     pane,
-    "set -l picked (_agent_session_picker); test -n \"$picked\"; and set -l wt (_agent_worktree_path $picked); test -n \"$wt\"; and cd $wt; and agent attach $picked; sleep 0.5",
+    "set -l picked (_agent_session_picker); test -n \"$picked\"; or exit; set -l wt (_agent_worktree_path $picked); test -n \"$wt\"; and cd $wt; agent attach $picked; sleep 0.5",
     true
   )
 end
