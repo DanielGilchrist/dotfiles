@@ -101,6 +101,7 @@
     "deny": [],
     "defaultMode": "auto"
   },
+  "model": "opus",
   "hooks": {
     "UserPromptSubmit": [
       {
@@ -137,13 +138,13 @@
     "developer-tooling@tanda-plugins": true
   },
   "effortLevel": "medium",
-  "idleCompaction": false,
   "claudeMdExcludes": [
     "CLAUDE.md",
     ".claude/CLAUDE.md",
     ".claude/rules/**",
     "AGENTS.md"
   ],
+  "idleCompaction": false,
   "skipAutoPermissionPrompt": true,
   "defaultMode": "acceptEdits",
   "additionalDirectories": [
@@ -163,6 +164,5 @@
       "type": "http",
       "url": "https://mcp.sentry.dev/mcp"
     }
-  },
-  "model": "opus"
+  }
 }
