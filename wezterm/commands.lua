@@ -4,6 +4,7 @@ local path_utils = require("utils.path")
 local shell = require("utils.shell")
 local worktree = require("utils.worktree")
 local agent_spawn = require("agent_spawn")
+local tanda = require("tanda")
 
 local M = {}
 
@@ -494,7 +495,7 @@ end)
 
 M.register_commands = function()
   wezterm.on("augment-command-palette", function(_window, _pane)
-    return {
+    local entries = {
       {
         brief = "[APAC] Open work tabs",
         action = wezterm.action_callback(open_work_environment(regions.APAC, commands.CDT)),
@@ -520,6 +521,10 @@ M.register_commands = function()
         action = wezterm.action_callback(agent_spawn.remove),
       },
     }
+    for _, entry in ipairs(tanda.palette_entries()) do
+      table.insert(entries, entry)
+    end
+    return entries
   end)
 end
 
