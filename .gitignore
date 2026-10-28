@@ -79,3 +79,6 @@ bluedevilglobalrc
 
 spotatui/qobuz_credentials.yml
 spotatui/mcp.json
+
+# agent-tui
+agent-tui/target/

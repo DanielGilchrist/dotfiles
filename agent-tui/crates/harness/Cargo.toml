@@ -1,0 +1,13 @@
+[package]
+name = "agent-harness"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+agent-core.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

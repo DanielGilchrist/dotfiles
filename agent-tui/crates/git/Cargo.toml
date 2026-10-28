@@ -1,0 +1,13 @@
+[package]
+name = "agent-git"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+agent-core.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -1,0 +1,15 @@
+[package]
+name = "agent-zellij"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+agent-core.workspace = true
+nix.workspace = true
+serde_json.workspace = true
+sysinfo.workspace = true
+tempfile.workspace = true
+
+
+[lints]
+workspace = true

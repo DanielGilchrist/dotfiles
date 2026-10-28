@@ -1,0 +1,15 @@
+[package]
+name = "agent-term"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+agent-core.workspace = true
+crossterm.workspace = true
+portable-pty.workspace = true
+ratatui.workspace = true
+tui-term.workspace = true
+vt100.workspace = true
+
+[lints]
+workspace = true

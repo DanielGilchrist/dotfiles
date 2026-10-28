@@ -1,0 +1,17 @@
+[package]
+name = "agent-tui"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+agent-core.workspace = true
+agent-term.workspace = true
+anyhow.workspace = true
+crossterm.workspace = true
+ratatui.workspace = true
+shell-words.workspace = true
+tempfile.workspace = true
+unicode-width.workspace = true
+
+[lints]
+workspace = true
