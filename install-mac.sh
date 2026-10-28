@@ -173,6 +173,9 @@ else
   echo "youtube-tui is already installed."
 fi
 
+echo "Installing agent..."
+"$CONFIG_DIR/agent-tui/install.sh"
+
 if ! grep -q fish /etc/shells; then
   echo "Adding fish to /etc/shells..."
   echo "$(which fish)" | sudo tee -a /etc/shells

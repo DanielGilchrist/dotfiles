@@ -1,5 +1,4 @@
 local wezterm = require("wezterm")
-local notify = require("utils.notify")
 local tab_utils = require("utils.tab")
 local dev_tabs = require("dev_tabs")
 
@@ -17,12 +16,9 @@ local dev_tabs = require("dev_tabs")
 ---@field register fun(): nil
 local M = { TITLE = "agents" }
 
--- The agents tab is identified by its wezterm tab id, kept in wezterm.GLOBAL.
--- Survives config reloads; resets on wezterm restart (gui-startup repopulates).
--- Title is cosmetic — rename freely.
--- Registration normally arrives via the `agents-tab-spawned` user var, but
--- that escape only works when the spawning shell has a tty. The spawned tab
--- is always titled M.TITLE, so fall back to the title and adopt the id.
+-- The agents tab runs the `agent` TUI. It is identified by its wezterm tab
+-- id, kept in wezterm.GLOBAL, which survives config reloads but not a
+-- wezterm restart, so fall back to the title and adopt the id.
 local function is_agents(tab)
   if tab == nil then return false end
   local id = wezterm.GLOBAL.agents_tab_id
@@ -39,30 +35,27 @@ local function find_agents(window)
   for _, t in ipairs(window:mux_window():tabs()) do
     if is_agents(t) then return t end
   end
-  wezterm.GLOBAL.agents_tab_id = nil -- stale; clear so callers can respawn
   return nil
 end
 
----Activate the agents tab if it exists. Returns whether it did.
----@param window Window
----@return boolean
-function M.focus(window)
-  local agents = find_agents(window)
-  if not agents then return false end
-  agents:activate()
-  return true
+---The agents tab in any window, so a second window reuses the running TUI.
+---@return MuxTab|nil
+local function find_agents_anywhere(window)
+  local here = find_agents(window)
+  if here then return here end
+  for _, mux_window in ipairs(wezterm.mux.all_windows()) do
+    for _, t in ipairs(mux_window:tabs()) do
+      if is_agents(t) then return t end
+    end
+  end
+  wezterm.GLOBAL.agents_tab_id = nil
+  return nil
 end
 
 -- macOS GUI apps don't inherit shell PATH; route through the user's login
--- shell so its profile (which sources Homebrew etc.) sets PATH up first.
+-- shell so its profile (which sources Homebrew etc.) sets PATH up for the
+-- TUI and the zellij, git and harness processes it runs.
 local SHELL = os.getenv("SHELL") or "/bin/sh"
-
--- `list-sessions` also lists dead sessions whose resurrection cache is on
--- disk (EXITED), and attaching one of those resurrects a grid of "Waiting to
--- run" stubs. Probe the server instead, same as _agent_meta_exists.
-local function meta_session_alive()
-  return wezterm.run_child_process({ SHELL, "-l", "-c", "_agent_meta_exists" }) == true
-end
 
 -- MoveTab acts on the active tab, so we activate-move-restore.
 local function pin_to_zero(window, tab)
@@ -74,12 +67,25 @@ end
 
 local function spawn_agents_tab(window)
   local tab = window:mux_window():spawn_tab({
-    args = { SHELL, "-l", "-c", "exec zellij attach agents" },
+    args = { SHELL, "-l", "-c", "exec agent" },
   })
-  if not tab then return end
+  if not tab then return nil end
   wezterm.GLOBAL.agents_tab_id = tab:tab_id()
   tab:set_title(M.TITLE)
   pin_to_zero(window, tab)
+  return tab
+end
+
+---Activate the agents tab, starting the TUI if it isn't running.
+---@param window Window
+function M.focus(window)
+  local agents = find_agents_anywhere(window) or spawn_agents_tab(window)
+  if not agents then return end
+  local active = window:active_tab()
+  if active and active:tab_id() ~= agents:tab_id() then wezterm.GLOBAL.agent_prev_tab = active:tab_id() end
+  agents:activate()
+  local gui = agents:window():gui_window()
+  if gui then gui:focus() end
 end
 
 -- Find + pin, with one retry for the spawn → mux-registration race.
@@ -98,21 +104,9 @@ M.pin_to_zero = wezterm.action_callback(pin_with_retry)
 
 M.toggle = wezterm.action_callback(function(window)
   local agents = find_agents(window)
-  if not agents then
-    if meta_session_alive() then
-      spawn_agents_tab(window)
-    else
-      notify(window, "agent", "no agents — run `agent attach <name>` to spawn")
-    end
-    return
-  end
-
   local active = window:active_tab()
-  if not active then return end
-
-  if active:tab_id() ~= agents:tab_id() then
-    wezterm.GLOBAL.agent_prev_tab = active:tab_id()
-    agents:activate()
+  if not agents or not active or active:tab_id() ~= agents:tab_id() then
+    M.focus(window)
     return
   end
 
@@ -222,50 +216,6 @@ end
 
 M.register = function()
   wezterm.on("format-tab-title", format_tab_title)
-  -- Fish-side helpers emit `agents-tab-spawned=<pane_id>` from the *calling*
-  -- shell pane after spawning the agents tab via `wezterm cli spawn`. We can't
-  -- use `pane:tab()` from the event arg (that's the calling pane, not the new
-  -- one), so resolve the agents tab via the new pane's id.
-  wezterm.on("user-var-changed", function(window, _, name, value)
-    if name ~= "agents-tab-spawned" then return end
-    local target_pid = tonumber(value)
-    if not target_pid then return end
-
-    local function locate_and_pin()
-      for _, t in ipairs(window:mux_window():tabs()) do
-        for _, p in ipairs(t:panes()) do
-          if p:pane_id() == target_pid then
-            wezterm.GLOBAL.agents_tab_id = t:tab_id()
-            pin_to_zero(window, t)
-            return true
-          end
-        end
-      end
-      return false
-    end
-    if not locate_and_pin() then wezterm.time.call_after(0.3, locate_and_pin) end
-  end)
-  wezterm.on("gui-startup", function(cmd)
-    -- gui-startup hands us mux objects, not a GUI window — so we can't reuse
-    -- spawn_agents_tab here (it relies on perform_action). Instead, when the
-    -- meta-session is alive, make the agents tab the window's *initial* tab
-    -- (no MoveTab needed), then add the user's primary tab on top.
-    if not meta_session_alive() then
-      wezterm.mux.spawn_window(cmd or {})
-      return
-    end
-    local agents_tab, _, mux_win = wezterm.mux.spawn_window({
-      args = { SHELL, "-l", "-c", "exec zellij attach agents" },
-    })
-    if not agents_tab then
-      wezterm.mux.spawn_window(cmd or {})
-      return
-    end
-    wezterm.GLOBAL.agents_tab_id = agents_tab:tab_id()
-    agents_tab:set_title(M.TITLE)
-    local primary = mux_win:spawn_tab(cmd or {})
-    if primary then primary:activate() end
-  end)
 end
 
 return M

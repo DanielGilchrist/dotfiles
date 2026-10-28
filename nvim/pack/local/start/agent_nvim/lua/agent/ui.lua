@@ -8,7 +8,7 @@ local is = require("utils.is")
 local M = {}
 
 -- zellij session names are capped by the unix socket path budget on macOS;
--- agent.fish rejects longer names, so refuse them before any prompt is written.
+-- `agent` rejects longer names, so refuse them before any prompt is written.
 local NAME_MAX = 20
 
 ---@param name string
@@ -139,7 +139,7 @@ end
 local NEW_AGENT_LABEL = "✦ new agent (this worktree)"
 
 ---Snacks picker over agent items with ANSI viewport preview per session
----(via `_agent_session_dump`).
+---(via `agent dump`).
 ---@param opts {title: string, items: {text: string, name?: string, is_new?: boolean}[], on_pick: fun(item?: {text: string, name?: string, is_new?: boolean})}
 local function pick_with_preview(opts)
   Snacks.picker.pick({
@@ -155,7 +155,7 @@ local function pick_with_preview(opts)
       end
       ctx.preview:set_title(ctx.item.name)
       return Snacks.picker.preview.cmd(
-        { "fish", "-c", "_agent_session_dump " .. vim.fn.shellescape(ctx.item.name) },
+        { "agent", "dump", ctx.item.name },
         ctx
       )
     end,

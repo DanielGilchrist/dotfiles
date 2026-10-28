@@ -133,20 +133,12 @@ function M.toggle_composer()
   composer.toggle()
 end
 
----Build the zellij command. When `initial_cmd` is supplied and the session
----doesn't yet exist, `zj` creates it with that command as the first pane;
----otherwise we just attach.
+---Attach to an existing session. New sessions are created by the `agent`
+---binary (see `spawn_headless`), which hands back the command to run here.
 ---@param name string
----@param cwd string|nil
----@param initial_cmd string|nil
 ---@return string[]
-local function build_attach_cmd(name, cwd, initial_cmd)
-  if not cwd and not initial_cmd then return { "zellij", "attach", name } end
-  local fish_cmd = ""
-  if cwd then fish_cmd = "cd " .. vim.fn.shellescape(cwd) .. "; " end
-  fish_cmd = fish_cmd .. "zj " .. vim.fn.shellescape(name)
-  if initial_cmd then fish_cmd = fish_cmd .. " -- " .. initial_cmd end
-  return { "fish", "-c", fish_cmd }
+local function build_attach_cmd(name)
+  return { "zellij", "attach", name }
 end
 
 ---Open the agent terminal. Terminal-mode <C-h/j/k/l> window-nav maps are
@@ -181,7 +173,7 @@ end
 ---zellij attach terminal on the right. Idempotent — if a tab already exists
 ---for this agent, jump to it.
 ---@param name string
----@param opts? {cwd?: string, initial_cmd?: string, attach_cmd?: string[]}
+---@param opts? {cwd?: string, attach_cmd?: string[]}
 function M.attach_in_terminal(name, opts)
   opts = opts or {}
 
@@ -200,7 +192,7 @@ function M.attach_in_terminal(name, opts)
   local current_cwd = vim.fn.getcwd()
   local needs_new_tab = cwd ~= nil and cwd ~= current_cwd
 
-  local cmd = opts.attach_cmd or build_attach_cmd(name, opts.cwd, opts.initial_cmd)
+  local cmd = opts.attach_cmd or build_attach_cmd(name)
 
   if not needs_new_tab then
     M.last_attached = name
@@ -306,26 +298,17 @@ function M.open_or_pick()
   })
 end
 
----Spawn a worktree agent: prompts for a kebab-case name, opens a multi-line
----prompt buffer for the seed, then runs `agent <name> --seed <tmp> --headless`
----which creates `~/worktrees/<repo>/<name>` and prints the session command.
----Headless: the zellij session is created by this nvim's own terminal rather
----than an agents-tab pane, so nvim-spawned agents don't squish the grid (and
----aren't constrained by its render size). `agent --restore` surfaces them in
----the agents tab later if wanted.
----@param display_name string  what to call it in notifications
----@param sub string  subcommand: "attach" or "checkout"
----@param arg string   the primary arg (agent name for attach, branch for checkout)
----@param extra_args string  additional args (e.g. --seed <path> or --no-prompt)
-local function spawn_headless(display_name, sub, arg, extra_args)
+---Run `agent <sub> … --headless`, which prepares the agent (worktree,
+---record, session layout) and prints the session, its cwd and command; the
+---session itself starts in this nvim's own terminal. The agent also shows
+---up in the `agent` TUI.
+---@param sub string  subcommand: "attach", "checkout" or "repo"
+---@param args string[]  its arguments (e.g. { name, "--seed", path })
+local function spawn_headless(sub, args)
   local repo = session.main_repo_root()
-  local cmd = {
-    "fish", "-c",
-    "agent " .. sub .. " " .. vim.fn.shellescape(arg)
-      .. " " .. extra_args
-      .. " --headless"
-      .. (repo and (" --repo " .. vim.fn.shellescape(repo)) or ""),
-  }
+  local cmd = vim.list_extend({ "agent", sub }, args)
+  table.insert(cmd, "--headless")
+  if repo then vim.list_extend(cmd, { "--repo", repo }) end
 
   vim.system(cmd, { text = true }, function(out)
     vim.schedule(function()
@@ -335,16 +318,15 @@ local function spawn_headless(display_name, sub, arg, extra_args)
       end
 
       local stdout = out.stdout or ""
+      local name = stdout:match("headless_session:([^\n]+)")
       local cwd = stdout:match("headless_cwd:([^\n]+)")
       local agent_cmd = stdout:match("headless_cmd:([^\n]+)")
-      if not cwd or not agent_cmd then
+      if not name or not cwd or not agent_cmd then
         notify.error("agent " .. sub .. " --headless gave no command:\n" .. stdout)
         return
       end
 
-      local name = path_utils.basename(cwd)
-      if is.empty(name) then name = display_name end
-      notify.info("spawned " .. name .. " (headless — attach elsewhere with `agent attach " .. name .. "`)")
+      notify.info("spawned " .. name .. " (also in the `agent` TUI)")
       M.attach_in_terminal(name, {
         cwd = cwd,
         attach_cmd = { "fish", "-c", "cd " .. vim.fn.shellescape(cwd) .. "; and " .. agent_cmd },
@@ -362,7 +344,7 @@ function M.checkout_agent()
       picker:close()
       if not (item and item.branch) then return end
       local branch = (item.branch:gsub("^remotes/", ""):gsub("^origin/", ""))
-      spawn_headless(branch, "checkout", branch, "")
+      spawn_headless("checkout", { branch })
     end,
   })
 end
@@ -371,7 +353,7 @@ end
 ---Claude starts with no initial message.
 function M.new_agent_no_prompt()
   ui.agent_name("agent name (no prompt)", function(name)
-    spawn_headless(name, "attach", name, "--no-prompt")
+    spawn_headless("attach", { name, "--no-prompt" })
   end)
 end
 
@@ -384,37 +366,27 @@ function M.new_agent()
         return
       end
 
-      spawn_headless(name, "attach", name, "--seed " .. vim.fn.shellescape(tmp))
+      spawn_headless("attach", { name, "--seed", tmp })
     end)
   end)
 end
 
----Spawn (or attach to) a claude session rooted at the current repo. No
----worktree, no prompts — session name defaults to the repo basename so
----it's idempotent and discoverable from mobile.
+---Spawn (or attach to) the agent session for the current repo's main
+---checkout. No worktree, no prompts; `agent repo` names it after the repo so
+---it's idempotent and discoverable from the TUI and mobile.
 function M.new_repo_session()
-  local repo = session.repo_root()
-  if not repo then
+  if not session.repo_root() then
     notify.warn("not in a git repo")
     return
   end
-  local name = path_utils.basename(repo)
-  if is.empty(name) then
-    notify.error("could not derive session name from repo path")
-    return
-  end
-  if zellij.session_exists(name) then
-    M.attach_in_terminal(name, { cwd = repo })
-    return
-  end
-  M.attach_in_terminal(name, { cwd = repo, initial_cmd = "claude" })
+  spawn_headless("repo", {})
 end
 
 ---Run `agent rm --force <name>` to tear down worktree + session + branch
 ---and close the owning tab page if we have one.
 ---@param name string
 local function tear_down(name)
-  local cmd = { "fish", "-c", "agent rm --force " .. vim.fn.shellescape(name) }
+  local cmd = { "agent", "rm", "--force", name }
   vim.system(cmd, { text = true }, function(out)
     vim.schedule(function()
       if not cmd_utils.success(out.code) then

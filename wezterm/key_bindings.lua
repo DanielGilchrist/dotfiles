@@ -6,7 +6,6 @@ local key_utils = require("utils.key")
 local os_utils = require("utils.os")
 local agents_tab = require("agents_tab")
 local dev_tabs = require("dev_tabs")
-local agent_spawn = require("agent_spawn")
 local commands = require("commands")
 local worktree_picker = require("worktree_picker")
 
@@ -107,7 +106,7 @@ config.keys = {
     os.remove(name)
   end)),
 
-  -- Pane splits — refused on the agents tab (only one wezterm pane there: the meta-session viewport).
+  -- Pane splits
   keybind(keys.COMMAND, "d", agents_tab.split_horizontal),
   keybind(keys.COMMAND, "s", agents_tab.split_right_35),
   keybind(keys.COMMAND_SHIFT, "d", agents_tab.split_vertical),
@@ -126,8 +125,8 @@ config.keys = {
   -- columns; dispatch by what the pane is running instead.
   keybind(combine(keys.CTRL, keys.SHIFT), "x", wezterm.action_callback(function(window, pane)
     local process_name = pane:get_foreground_process_name() or ""
-    -- The agents tab's zellij runs under the fish -c that bootstrapped it,
-    -- so the foreground process is fish; look through its children too.
+    -- zellij may run under a shell or the `agent` TUI, so look through the
+    -- foreground process's children too.
     if process_name:find("zellij") or process_tree_has(pane:get_foreground_process_info(), "zellij") then
       -- Ctrl+s then e: scroll mode → EditScrollback (zellij/config.kdl).
       window:perform_action(wezterm.action.Multiple({
@@ -188,7 +187,7 @@ config.keys = {
     until_unknown = true,
   })),
 
-  -- Agents tab toggle (jump to agents / back to last tab)
+  -- Agents tab toggle (jump to the `agent` TUI, starting it if needed / back to last tab)
   keybind(keys.COMMAND, "0", agents_tab.toggle),
   -- Dev tab toggle (ring: last-visited dev tab → next dev tab → back)
   keybind(keys.COMMAND, "9", dev_tabs.toggle),
@@ -199,30 +198,6 @@ config.keys = {
   keybind(keys.COMMAND_SHIFT, "o", wezterm.action_callback(function(window, pane)
     worktree_picker.open(window, pane)
   end)),
-
-  -- Spawn a new agent: pick a repo, name it, write the seed prompt in nvim
-  keybind(keys.COMMAND_SHIFT, "a", wezterm.action_callback(agent_spawn.open)),
-
-  -- Open a new shell tab in the currently-focused agent's worktree
-  keybind(keys.COMMAND_SHIFT, "e", wezterm.action_callback(agent_spawn.edit_focused)),
-
-  -- Run `agent rm` on the currently-focused agent (refuses if dirty; rerun with
-  -- --force manually if you really mean it).
-  keybind(keys.COMMAND_SHIFT, "x", wezterm.action_callback(agent_spawn.remove_focused)),
-
-  -- Hide the focused agent: close its meta-session pane and persist it in the
-  -- hidden list (agent restore skips it). Per-agent zellij session stays alive;
-  -- bring back with agent attach <name> or CMD+Shift+S.
-  keybind(keys.COMMAND_SHIFT, "h", wezterm.action_callback(agent_spawn.minimise_focused)),
-
-  -- fzf-pick a minimised agent (one that's NOT currently in the agents tab),
-  -- live-preview its viewport, run `agent attach <name>` to bring it back.
-  keybind(keys.COMMAND_SHIFT, "s", wezterm.action_callback(agent_spawn.attach_picker)),
-
-  -- Spawn the dev-server stack rooted at the focused agent's worktree.
-  -- Tears down the previous dev tab for the same region (tracked via
-  -- wezterm.GLOBAL.dev_tab_id_by_region).
-  keybind(keys.COMMAND_SHIFT, "r", wezterm.action_callback(commands.open_work_in_focused_agent)),
 }
 
 config.key_tables = {

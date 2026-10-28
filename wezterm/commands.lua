@@ -3,7 +3,6 @@ local notify = require("utils.notify")
 local path_utils = require("utils.path")
 local shell = require("utils.shell")
 local worktree = require("utils.worktree")
-local agent_spawn = require("agent_spawn")
 local tanda = require("tanda")
 
 local M = {}
@@ -458,25 +457,17 @@ local function pick_region_and_spawn(window, pane, cd_command)
   }), pane)
 end
 
----@param window Window
----@param pane Pane
-M.open_work_in_focused_agent = function(window, pane)
-  local cwd = agent_spawn.focused_worktree(window)
-  if not cwd then return end
-  if not has_bin_dev(window, cwd) then return end
-
-  pick_region_and_spawn(window, pane, "cd " .. shell.quote(cwd))
-end
-
--- Listen for `agent-spawn-dev=<region>|<cwd>` (emitted by nvim with the
--- region already chosen via vim.ui.select). If <cwd> is under
--- ~/worktrees/<payaus>/* we cd into the worktree; otherwise we fall back
--- to `cdt`. Refuses cwds that don't have a bin/dev script.
+-- Listen for `agent-spawn-dev=<region>|<cwd>` (nvim, which asks for the
+-- region itself) or `agent-spawn-dev=<cwd>` (an `agent` TUI action), which
+-- asks for the region here. If <cwd> is under ~/worktrees/<payaus>/* we cd
+-- into the worktree; otherwise we fall back to `cdt`. Refuses cwds that
+-- don't have a bin/dev script.
 wezterm.on("user-var-changed", function(window, pane, name, value)
   if name ~= "agent-spawn-dev" then return end
-  local region, cwd = (value or ""):match("^([^|]+)|(.*)$")
+  local region, cwd = (value or ""):match("^([^|/]+)|(.*)$")
+  cwd = cwd or value
 
-  if not region or not cwd then
+  if not cwd or cwd == "" then
     notify(window, "dev", "agent-spawn-dev: malformed payload")
     return
   end
@@ -490,7 +481,11 @@ wezterm.on("user-var-changed", function(window, pane, name, value)
     cd_command = commands.CDT
   end
 
-  open_work_environment(region, cd_command)(window, pane)
+  if region then
+    open_work_environment(region, cd_command)(window, pane)
+  else
+    pick_region_and_spawn(window, pane, cd_command)
+  end
 end)
 
 M.register_commands = function()
@@ -511,14 +506,6 @@ M.register_commands = function()
       {
         brief = "[US] Open worktree tabs",
         action = wezterm.action_callback(open_worktree_selector()),
-      },
-      {
-        brief = "Spawn agent in repo",
-        action = wezterm.action_callback(agent_spawn.open),
-      },
-      {
-        brief = "Remove agent",
-        action = wezterm.action_callback(agent_spawn.remove),
       },
     }
     for _, entry in ipairs(tanda.palette_entries()) do

@@ -37,30 +37,13 @@ function zj --description "Start or attach to a zellij session in the current di
         and test (count $initial_cmd) -gt 0
         zellij delete-session $name >/dev/null 2>&1
     else if zellij list-sessions -s 2>/dev/null | string match -q -- $name
-        # External-attach auto-fullscreen: when `zj a8` is run from outside the
-        # meta-session (e.g. another wezterm tab), fullscreen the corresponding
-        # meta-pane so its dimensions don't constrain the new attacher's view.
-        # Skip when invoked from inside the meta-session itself — that's the
-        # meta-pane attaching to its own per-agent session, no fullscreen wanted.
-        set -l meta_pane
-        if test "$name" != agents
-            and test "$ZELLIJ_SESSION_NAME" != agents
-            and _agent_meta_exists
-            set meta_pane (_agent_meta_pane_id $name)
-            if test -n "$meta_pane"
-                zellij --session agents action toggle-fullscreen --pane-id $meta_pane 2>/dev/null
-            end
-        end
-
         zellij attach $name
         set -l exit_status $status
-
-        if test -n "$meta_pane"
-            zellij --session agents action toggle-fullscreen --pane-id $meta_pane 2>/dev/null
-        end
         # Zellij sizes a session to its smallest client and doesn't always
-        # re-fit when that client leaves; poke whoever is still attached.
-        _agent_nudge_clients $name
+        # re-fit when that client leaves. TUIs like Claude Code only reflow
+        # when the pty size really changes, so briefly split the pane.
+        pkill -WINCH -f "^zellij attach $name\$" 2>/dev/null
+        zellij --session $name action new-pane --direction right --close-on-exit -- true >/dev/null 2>&1
         return $exit_status
     end
 

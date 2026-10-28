@@ -1,155 +1,159 @@
-# Parallel Claude agents — workflow & keybinds
+# Parallel agents: workflow & keybinds
 
-How this dotfiles repo wires up parallel Claude Code agents in worktrees,
-surfaced through a single zellij meta-session that wezterm renders in a
-dedicated tab.
+One Rust binary, `agent` (source in `~/.config/agent-tui`), runs coding
+agents (Claude Code today, with pluggable harnesses) in git worktrees, one
+zellij session per agent. Bare `agent` opens a TUI that lists every agent
+by repo and embeds the selected one. The subcommands are for scripts,
+nvim and wezterm.
 
-## Architecture
-
-Two layers of zellij sessions:
-
-- **Layer 1 — per-agent sessions.** One zellij session per agent, named
-  after the worktree (`payroll-fix`, etc.). Claude actually runs here. SSH-
-  resumable, survives wezterm/laptop restarts. This is the persistence layer.
-- **Layer 2 — `agents` meta-session.** A single zellij session whose only
-  job is to be a multi-pane viewport. Each pane runs `zj <branch>` against
-  a Layer-1 session. Wezterm renders this meta-session as a single pane in
-  the agents tab.
-
-Zellij multi-attach is mirror-mode: a Layer-1 session can be attached
-simultaneously by the meta-session pane *and* by you running `zj <branch>`
-from another wezterm tab or your phone. Same session, multiple viewers.
+Install or update it with `~/.config/agent-tui/install.sh`, which builds
+it into `~/.local/bin/agent`. Session layouts record that path, so keep it.
 
 ## Concepts
 
 - **Worktree per agent** at `~/worktrees/<repo>/<name>`, checked out
-  detached at `origin/HEAD`. Claude is responsible for creating its own
-  branch off that point — the spawn prompt instructs it to
-  `git checkout -b <kebab-case-name>` before doing anything else.
-- **Meta-session is named `agents`** — the name is reserved (`agent` and
-  `agent rm` refuse it). It is started with session serialization off: it
-  is a viewport, not state, so after a reboot it is simply gone and
-  `agent restore` rebuilds it from the per-agent sessions (which do
-  serialize; `zj` recreates them with the right command).
-- **Single `agents` wezterm tab** — one wezterm pane, running
-  `zellij attach agents`. The grid lives inside zellij. `CMD+0` toggles
-  to/from this tab.
-- **Repo root resolves to the *main* worktree** so spawning from inside
-  one agent's worktree does not nest under
-  `~/worktrees/<branch>/<new-branch>`.
-- **Cap is 8 concurrent agents.** Spawning the 9th errors.
+  detached at `origin/HEAD`. The agent creates its own branch: the first
+  prompt tells it to `git checkout -b <kebab-case-name>` first.
+- **Zellij session per agent**, named after the worktree. Sessions persist
+  across terminal and laptop restarts and can be attached from anywhere
+  (`zellij attach <name>`, another tab, a phone over SSH). After a reboot
+  they show as exited. Selecting one in the TUI resurrects it, resuming the
+  harness's last conversation.
+- **Repo sessions**: `agent repo` runs an agent in the repo's main checkout
+  (no worktree), named after the repo.
+- **Names** are ≤20 chars of `[A-Za-z0-9._-]` (the zellij socket path limit
+  on macOS). `agents` is reserved.
+- **State** lives in `~/.local/state/agent`: per-agent records (harness,
+  undelivered first prompt), pins, zellij layouts and the TUI's last
+  selection.
 
-## Keybinds
+## The TUI
 
-### Wezterm (everywhere except the agents tab pane content)
+`agent` (or `agent tui`). Two modes: NAV moves around the list, AGENT
+types into the embedded session. `?` shows every key.
 
 | Key | Action |
 |---|---|
-| `CMD+0` | Toggle to/from the agents tab |
-| `CMD+Shift+0` | Pin agents tab to position 0 |
-| `CMD+Shift+A` | Spawn a new agent: repo picker → name → seed prompt in nvim |
-| `CMD+Shift+O` | Worktree picker — opens a shell tab in a `~/worktrees/<repo>/<branch>` dir |
-| `CMD+Shift+H` | Hide the focused agent (closes its pane, adds it to the hidden list) |
-| `CMD+Shift+S` | Picker over hidden agents — attaches the pick back into the grid |
+| `⏎` / `l` | Attach the selected agent (resurrect or start it if needed) |
+| `⌃\` | Back to NAV from an agent. Twice goes to the previous agent |
+| `j k g G`, `[ ]` | Move, previous / next repo |
+| `Space` / `/` | Switcher (fuzzy), `⌃N ⌃P` to move |
+| `1`-`9`, `m` | Jump to a pinned agent, pin / unpin |
+| `n` | New agent form: prompt (`⌃E` edits it in $EDITOR), name (suggested from the prompt or a Linear/GitHub link), repo |
+| `o` | Open the agent's worktree in $EDITOR |
+| `d` / `D` | Kill the session / remove session, worktree and branch (confirms, lists anything that would be lost) |
+| `x` | Run a configured action on the selected agent (see below) |
+| `q` | Quit (agents keep running) |
+
+### Actions
+
+Actions live in `~/.config/agent/config.toml`. They see the agent only
+through the `{name}`, `{path}` (its checkout) and `{repo}` (main checkout)
+placeholders in their arguments, and `{{`/`}}` are literal braces. Each one
+does one of these:
+
+- `run`: starts a command (an argv with no shell) detached, with failures
+  shown in the status bar.
+- `interactive`: hands the TUI's terminal to a command until it exits.
+- `terminal_event`: sends the terminal a user variable (`OSC 1337
+  SetUserVar`) for its config to handle.
+
+
+```toml
+[[action]]
+key = "s"
+label = "dev server"
+terminal_event = { name = "agent-spawn-dev", value = "{path}" }
+
+[[action]]
+key = "g"
+label = "lazygit"
+interactive = ["lazygit"]
+cwd = "{path}"
+```
+
+Commands run in `cwd` if it's set, otherwise in the directory `agent` was
+started in.
+
+The key that leaves an agent lives in the same file. It must be `ctrl-`
+plus a letter or one of `\ ] ^ _`:
+
+```toml
+[keys]
+nav = "ctrl-\\"
+``` Keys are one printable character (`Esc` closes
+the overlay). The config is checked at startup, and mistakes stop `agent` with
+the reason.
+
+## Wezterm
+
+| Key | Action |
+|---|---|
+| `CMD+0` | Toggle the agents tab (runs the TUI, started on first use) |
+| `CMD+Shift+0` | Pin the agents tab to position 0 |
+| `CMD+Shift+O` | Worktree picker: a shell tab in a `~/worktrees/<repo>/<branch>` dir |
 | `CMD+Left` / `CMD+Right` | Cycle tabs, skipping the agents tab |
-| `Shift+Alt+{` / `}` | Move tabs (refuses to move the agents tab) |
-| `CMD+Alt+h/j/k/l` (or arrows) | Wezterm pane navigation (outside the agents tab) |
-| `CMD+W` / `CMD+Shift+W` | Close pane / tab |
+| `Shift+Alt+{` / `}` | Move tabs (the agents tab stays put) |
 
-### Inside the agents tab (zellij's defaults)
+## Commands
 
-The agents tab content is a zellij session, so it uses zellij keys, not
-wezterm keys. The `~/.config/zellij/config.kdl` defaults apply:
-
-| Key | Action |
-|---|---|
-| `Alt+h/j/k/l` (or arrows) | Move focus between agents |
-| `Alt+f` | Toggle floating panes (rarely useful here) |
-| `Ctrl+n` then `h/j/k/l` | Resize-mode |
-| `Ctrl+g` | Toggle locked mode |
-| `Ctrl+o` then `d` | Detach the meta-session |
-
-The wezterm `CMD+...` bindings still work as expected for tab-level
-operations (`CMD+0`, `CMD+T`, etc.) — they fire before keystrokes reach
-zellij.
-
-## Fish commands
-
-`agent` is a dispatcher. Bare `agent` = `agent ls`. Every subcommand takes
-`--help` for details.
+`agent <cmd> --help` has the details. Fish completions come from
+`agent completions fish`.
 
 | Command | Description |
 |---|---|
-| `agent` / `agent ls` | List agents: live sessions, meta-pane state, hidden state, worktree path. |
-| `agent attach <name>` | Create-or-attach a per-agent session. Opens nvim for a multi-line prompt on first spawn; `:wq` seeds, `:q` empty cancels. **Interactive only in that case.** Un-hides if hidden. |
-| `agent attach <name> -e "<prompt>"` | Same but seed inline. Best for short single-line prompts. |
-| `agent attach <name> --seed <file>` | Same but seed from a file. **Preferred for non-trivial prompts.** Seed file is copied to `/tmp/agent-seed-...`; Claude is told to read then `rm` it. |
-| `agent attach <name> --repo <path>` | Override the repo root (defaults to the main worktree). |
-| `agent attach <name> --no-focus` | Don't refocus the calling pane after spawn. |
-| `agent attach <name> --no-prompt` | Fresh spawn without the nvim seed editor. Starts Claude with no initial prompt. |
-| `agent attach <name> --headless` | Create the worktree + seed but no agents-tab pane; prints `headless_cwd:`/`headless_cmd:` lines for the caller (used by nvim's `<leader>an`). `agent restore` surfaces headless sessions later. |
-| `agent attach <name> -d` / `--debug` | Print spawn commands and intermediate state to stderr. |
-| `agent checkout <branch>` / `agent co <branch>` | Attach the existing worktree for `<branch>`, else create one from the local branch (or `origin/<branch>`) and spawn a bare agent (no prompt). Session/worktree name is `<branch>` with `/` → `-`, capped at 20 chars. |
-| `agent rm [<name>]` | Tear down worktree + branch + zellij session + meta-pane. Infers from cwd if omitted. Refuses on unpushed/unmerged commits. |
-| `agent rm --force [<name>]` | Same but discards commits. |
-| `agent rm --all [-f]` | Same, for every worktree + per-agent session. Confirms first. |
-| `agent hide [<name>]` | Persist the branch in the hidden list; close its meta-pane if present. Session + worktree left alone. |
-| `agent hide --list` | Print the hidden list. |
-| `agent restore` | Rebuild the agents grid from live per-agent sessions. Skips hidden. |
-| `agent restore --include-hidden` | Clear the hidden list, then rebuild. |
-| `agent reset` | Hide every live agent and kill the meta-session. Grid goes empty; per-agent sessions and worktrees are untouched. Un-hide with `agent attach <name>` or bulk with `agent restore --include-hidden`. |
-| `agent merged [-v]` | List agents whose branch is clean (safe to `rm`). |
-| `zj` | List active zellij sessions. |
-| `zj <name>` | Attach (or create) a zellij session in cwd. If a meta-session pane corresponds to `<name>`, it's auto-fullscreened while you're attached so its render dimensions don't constrain you. |
-| `zj <name> -- <cmd> ...` | Same, but if creating, run `<cmd>` as the first pane. |
-
-To un-hide: `agent attach <name>` (attaches AND un-hides), or
-`agent restore --include-hidden` to bulk-clear.
+| `agent attach <name>` | Create or attach the agent. A new one asks for its first prompt in $EDITOR when interactive. Without a terminal (scripts, an LLM's shell) it starts the session detached instead of attaching. |
+| `agent attach <name> -e "<prompt>"` | Same, with the prompt inline. If the agent is running, the prompt is typed into it. |
+| `agent attach <name> --seed <file>` | Same, prompt from a file. Preferred for non-trivial prompts. |
+| `agent attach <name> --no-prompt` | Start without a prompt. |
+| `agent attach <name> --repo <path>` | Repo for a new worktree (default: the one containing the cwd). |
+| `agent attach … --headless` | Prepare everything but print `headless_session:`, `headless_cwd:` and `headless_cmd:` (fish-quoted) instead of attaching. |
+| `agent checkout <branch>` / `agent co` | Attach the worktree for a branch, creating it from the local or `origin/` branch. Name is the branch with `/` → `-`. |
+| `agent repo` | Attach or start the repo session. |
+| `agent rm [<name>]` | Remove session, worktree and branch (name inferred from the cwd). Refuses if anything would be lost: uncommitted files, unpushed or unmerged commits. Run from inside the agent's own session, it finishes in the background. |
+| `agent rm --force [<name>]` | Same, discarding work. |
+| `agent rm --all [-f]` | Every agent worktree. Confirms first. |
+| `agent ls` | Agents by repo with their state. |
+| `agent merged` | Worktrees whose branch can be removed without losing work. |
+| `agent prompt <name> <text>` / `--file` | Type a prompt into a running agent and submit it. |
+| `agent dump <name>` | Print an agent's screen with ANSI styling. |
+| `agent pin [<name>]` / `agent unpin` | Pin to the top of the TUI and a `1`-`9` slot. |
+| `agent --harness <id> …` | Harness for new agents (default `claude`, and `$AGENT_CLAUDE` overrides its program). |
 
 ## Spawning from an LLM (Claude Code's `Bash` tool, etc.)
 
-These functions are **fish functions, not binaries**. From bash or any
-non-fish shell, invoke via `fish -c '...'`.
+`agent` is a binary on PATH, so call it from any shell.
 
-**Rules of thumb for LLM callers:**
-
-1. **Never use `agent attach <name>` with no `-e`/`--seed` on a fresh spawn.**
-   It opens nvim and blocks.
-2. **For non-trivial prompts, write the seed to a file and pass `--seed
-   <path>`.** Use `Write` to drop the seed at e.g.
-   `/tmp/agent-seed-<name>.md`, then
-   `fish -c 'agent attach <name> --seed /tmp/agent-seed-<name>.md'`.
-3. **Names must be kebab-case and ≤20 chars.** Longer names silently fail
-   on macOS (zellij socket-name limit).
-4. **`agents` is reserved** as the meta-session name — `agent attach agents`
-   errors.
-5. **Cap is 8 concurrent agents.**
-6. **Repeat-attach semantics:**
-   - Worktree gone, session gone → fresh spawn.
-   - Worktree exists, session gone → restart Claude in existing worktree.
-   - Session exists, no meta-pane → adds the pane (un-hides if hidden).
-   - Session exists, meta-pane exists → focuses; if `-e/--seed` is also
-     provided, the prompt is injected into the running Claude.
+1. **Pass `-e`, `--seed` or `--no-prompt`** on a fresh spawn. Without a
+   terminal, `agent attach` starts the session detached, prints
+   `agent: <name> is running` and returns.
+2. **For non-trivial prompts, write the seed to a file and pass `--seed`**,
+   e.g. `/tmp/agent-seed-<name>.md`, then
+   `agent attach <name> --seed /tmp/agent-seed-<name>.md`. Don't pass
+   `--headless`: it only prepares the session for the caller to run.
+3. **Names must fit the rules above.** `agent` rejects others with the reason.
+4. **Repeat-attach semantics:** a running agent gets `-e`/`--seed` typed
+   into it, an exited session is resurrected, and an idle worktree gets a
+   new session.
 
 ## Neovim keybinds (`agent_nvim` plugin, `<leader>a`)
 
-The neovim plugin talks to per-agent (Layer-1) sessions directly — it
-doesn't know or care about the meta-session. The `agents` meta-session
-is filtered out of pickers.
+The neovim plugin runs the `agent` binary for spawning, removing and
+previews, and attaches to the zellij sessions directly.
 
 | Key | Action |
 |---|---|
-| `<leader>an` | New worktree agent: name prompt → multi-line seed buffer (`<C-s>` submits) → `agent attach <name> --seed … --headless`. The session runs in the nvim tab only (no agents-tab pane); `agent restore` adds it to the grid later if wanted. |
-| `<leader>aN` | Same as `<leader>an` but skips the seed buffer — Claude starts with no prompt. |
+| `<leader>an` | New worktree agent: name prompt → multi-line seed buffer (`<C-s>` submits) → `agent attach <name> --seed … --headless`. The session runs in an nvim tab and also shows up in the TUI. |
+| `<leader>aN` | Same as `<leader>an` but skips the seed buffer, so Claude starts with no prompt. |
 | `<leader>ac` | Branch picker (local + remote). Attaches an existing worktree for the pick, or creates one and spawns a bare agent. |
-| `<leader>as` | New repo session: spawn / attach a claude session rooted at the current repo, named after the repo basename. No prompts. |
+| `<leader>as` | Repo session: `agent repo --headless`, an agent in the repo's main checkout named after the repo. No prompts. |
 | `<leader>ao` | Open/focus the agent for the current worktree. If none, picker over running sessions. |
 | `<leader>av` (visual) | Send visual selection. |
 | `<leader>ap` | Single-line prompt → submit. |
-| `<leader>ak` | Force-kill agent (picker) — runs `agent rm --force` and closes its tab. |
+| `<leader>ak` | Force-remove agent (picker): runs `agent rm --force` and closes its tab. |
 | `<leader>ar` | **+review**: the review sub-group (all review keys live here). |
 | `<leader>arr` | Start / stop review. On start, pick a mode (working tree / branch / since a commit) → inline unified diff (unified.nvim), or resume a review left open from a previous session. Prompts before discarding pending comments. |
-| `<leader>arf` | Fuzzy-pick a changed file (diff preview); `<CR>` opens it into the inline diff, `<a-m>` marks it reviewed and jumps to the next file. |
+| `<leader>arf` | Fuzzy-pick a changed file (diff preview). `<CR>` opens it into the inline diff, `<a-m>` marks it reviewed and jumps to the next file. |
 | `<leader>arm` | Mark / unmark the current file as reviewed (progress readout). Reviewed files show ✓ and sink to the bottom of the file picker. |
 | `<leader>arc` (n/x) | Add a comment on the current line / selection (review mode only). |
 | `<leader>arC` | Add a whole-file comment (not anchored to a line) on the current buffer. |
@@ -170,7 +174,7 @@ the right. Your main work tab is unaffected. Switch between tabs with
 ## Reviewing an agent's work
 
 The local, iterative alternative to the PR round-trip. Lives in
-`agent_nvim/lua/agent/review.lua`; you review on real, LSP-live buffers and
+`agent_nvim/lua/agent/review.lua`. You review on real, LSP-live buffers and
 send comments straight to the running session.
 
 1. Open the agent whose work you want to review (`<leader>ao` for a
@@ -179,22 +183,22 @@ send comments straight to the running session.
    to diff your working tree against:
    - **Working tree**: uncommitted changes only (base `HEAD`).
    - **Branch**: everything since the fork point (`merge-base HEAD
-     origin/HEAD`); hidden on the trunk, where it's meaningless.
-   - **Since a commit…**: pick a commit from a log picker; shows everything
+     origin/HEAD`), hidden on the trunk, where it's meaningless.
+   - **Since a commit…**: pick a commit from a log picker to see everything
      after it (to review one commit, pick its parent on a clean tree).
    The default is preselected (from `config.review.base`), `<cr>` accepts.
    It then renders an **inline unified diff** (unified.nvim) of the current
    file vs that base: removed lines in red, added in green, in sequence,
    GitHub-style, on the real syntax-highlighted buffer. (unified's own file
-   tree is disabled in `plugins/unified.lua`; `<leader>arf` is the file
+   tree is disabled in `plugins/unified.lua`, and `<leader>arf` is the file
    navigator instead.) `<leader>arr` again stops review (prompts first if
    comments are still pending, since it discards them).
 3. `<leader>arf` opens a snacks fuzzy picker over the changed files (with a
-   diff preview) as a nicer alternative to the tree; `<CR>` opens one into
+   diff preview) as a nicer alternative to the tree. `<CR>` opens one into
    the inline diff. `<leader>arm` (in a buffer) or `<a-m>` (inside the
    picker) marks a file reviewed: it gets a ✓ and sinks to the bottom of the
    picker (nothing is hidden), so the cursor always lands on the next
-   unreviewed file. Good for large reviews; marks clear when you stop.
+   unreviewed file. Good for large reviews. Marks clear when you stop.
 4. Read the code like normal: full LSP, jump to definition, edit, run.
 5. `<leader>arc` on a line (or over a visual selection) → type a note in the
    floating editor. It's anchored with an extmark (tracks edits) and shown
@@ -208,7 +212,7 @@ send comments straight to the running session.
 6. `<leader>ars` opens a paginated preview: the overview message (if any) then
    one comment per page, `]`/`[` (or `<Tab>`/`<S-Tab>`) to move through them,
    `<C-s>` to send all, `q` to cancel. On send it writes the overview plus all
-   comments (file:line + quoted code + note; whole-file comments as headers)
+   comments (file:line + quoted code + note, with whole-file comments as headers)
    to `.agent-review.md` at the repo root, adds it to `.git/info/exclude`, and
    tells the active agent to read it and work through each one. Sending ends
    the review (the diff closes and pending state clears). (Set
@@ -230,42 +234,10 @@ the buffer above (`config.review.editing_hl`).
 
 ## Typical flow
 
-1. From any nvim instance: `<leader>zn` → name → multi-line prompt → `<C-s>`.
-2. `agent.fish` resolves the main repo root, creates
-   `~/worktrees/<repo>/<name>` detached at `origin/HEAD`, ensures the
-   `agents` meta-session exists, and adds a pane to it that runs
-   `zj <name> -- claude ...`.
-3. Claude reads the seed, picks a sensible kebab-case branch, runs
-   `git checkout -b`, removes the seed, and gets to work.
-4. `CMD+0` to watch; `CMD+0` again to return.
-5. `agent rm <name>` when done.
-
-## Restore semantics
-
-The meta-session survives a wezterm restart (the zellij server keeps
-running) but not a reboot: it is started with serialization off, so there
-is nothing to resurrect. On wezterm startup, the `gui-startup` hook probes
-for a *live* `agents` server (not just a cached session name) and, if
-found, spawns a passive `agents` tab in the new window — focus stays on
-the primary tab.
-
-After a reboot, run `agent restore`: it rebuilds the grid from the
-per-agent sessions, skipping the hidden list. It also detects a
-meta-session that was resurrected from cache (panes held at "Waiting to
-run") and replaces it. When the meta-session is healthy it only diffs
-`zellij list-sessions` against the panes and adds what is missing.
-
-## Caveats
-
-- **MCP prompts**: `disabledMcpjsonServers` in `claude/settings.json`
-  silences known project MCP servers. Add new ones there as you encounter
-  them.
-- **Wezterm `--cwd` is unreliable** (wez/wezterm#4618 canonicalization).
-  The agent helpers `cd` inside the spawned shell instead of trusting
-  `--cwd`.
-- **Auto-pin to position 0** is best-effort (race with mux registration).
-  If the agents tab lands at the wrong position, `CMD+Shift+0` pins it.
-- **Zellij session-name length** is capped at 20 chars on macOS by the
-  unix socket path budget. `agent` rejects longer names upfront.
-- **Spawning from a non-interactive shell without `-e`/`--seed`** opens
-  nvim and blocks forever. Always pass a seed when scripting.
+1. `CMD+Shift+A` (or `n` in the TUI, or `<leader>an` in nvim) → prompt →
+   name (suggested) → repo.
+2. `agent` creates `~/worktrees/<repo>/<name>` detached at `origin/HEAD`,
+   writes the session layout and starts the harness with the prompt.
+3. The agent picks a branch name, runs `git checkout -b` and gets to work.
+4. `CMD+0` to watch it in the TUI, and `CMD+0` again to return.
+5. `D` in the TUI (or `agent rm <name>`) when done.
