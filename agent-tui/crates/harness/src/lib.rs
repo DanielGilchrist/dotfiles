@@ -11,6 +11,7 @@ use agent_core::ports::{
 use agent_core::process::LaunchSpec;
 
 const ASK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 /// The hook events that move an agent's state. Notification only matters
 /// for questions: permission prompts arrive as `PermissionRequest` with more
 /// detail, and `idle_prompt` fires while background work still runs.
@@ -53,20 +54,80 @@ pub struct Claude {
     /// The model for one-off questions.
     quick_model: String,
     projects: PathBuf,
+    /// Where Claude Code registers its live sessions, one JSON per process.
+    sessions: PathBuf,
     permission_mode: String,
     add_dirs: Vec<PathBuf>,
 }
 
+/// A live Claude Code process, as its registry entry records it.
+#[derive(serde::Deserialize)]
+struct Registered {
+    pid: i32,
+    #[serde(rename = "sessionId")]
+    session_id: String,
+}
+
 impl Claude {
     pub fn new(home: &Path) -> Self {
+        Self::with_program(
+            home,
+            std::env::var_os("AGENT_CLAUDE").unwrap_or_else(|| "claude".into()),
+        )
+    }
+
+    fn with_program(home: &Path, program: OsString) -> Self {
         Self {
             id: "claude".parse().expect("valid id"),
-            program: std::env::var_os("AGENT_CLAUDE").unwrap_or_else(|| "claude".into()),
+            program,
             quick_model: "haiku".into(),
             projects: home.join(".claude/projects"),
+            sessions: home.join(".claude/sessions"),
             permission_mode: "auto".into(),
             add_dirs: vec![PathBuf::from("/tmp")],
         }
+    }
+
+    /// Whether the conversation `id` is still running as a background
+    /// session: Claude Code keeps a session alive when its terminal goes,
+    /// and `--resume` refuses one that's alive. A registry entry whose
+    /// process is gone doesn't count.
+    fn in_background(&self, id: &str) -> io::Result<bool> {
+        let entries = match std::fs::read_dir(&self.sessions) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e),
+        };
+        for entry in entries {
+            let path = entry?.path();
+            if path.extension().is_none_or(|e| e != "json") {
+                continue;
+            }
+            let Ok(registered) =
+                serde_json::from_str::<Registered>(&std::fs::read_to_string(&path)?)
+            else {
+                continue;
+            };
+            if registered.session_id == id && process_alive(registered.pid) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Stops the background session `id` so it can be resumed with a
+    /// prompt, which `attach` can't carry.
+    fn stop(&self, id: &str) -> Result<(), HarnessError> {
+        let mut cmd = std::process::Command::new(&self.program);
+        cmd.args(["stop", id]).stdin(std::process::Stdio::null());
+        for key in INHERITED_SESSION_ENV {
+            cmd.env_remove(key);
+        }
+        agent_core::process::output_within(&mut cmd, STOP_TIMEOUT).map_err(|e| HarnessError {
+            context: format!("stopping background session {id}"),
+            source: io::Error::other(e),
+        })?;
+        Ok(())
     }
 
     /// Claude Code stores transcripts under the working directory with every
@@ -114,7 +175,7 @@ impl Claude {
             .map(|(path, meta)| Ok((meta.modified()?, path)))
             .collect::<io::Result<_>>()?;
         recent.retain(|(modified, _)| *modified >= born);
-        recent.sort_by(|a, b| b.0.cmp(&a.0));
+        recent.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
         for (_, path) in recent {
             if !has_user_turn(&path)? {
                 continue;
@@ -145,6 +206,25 @@ impl Harness for Claude {
             context: "looking for a conversation to resume".into(),
             source,
         })?;
+
+        if let Some(id) = &resume
+            && self.in_background(id).map_err(|source| HarnessError {
+                context: "reading Claude's session registry".into(),
+                source,
+            })?
+        {
+            match ctx.bootstrap {
+                // Reattaching keeps everything the session had, hooks
+                // included, since this harness launched it.
+                None => {
+                    return Ok(LaunchSpec::new(&self.program)
+                        .cwd(&workdir)
+                        .env_remove(INHERITED_SESSION_ENV.iter().copied())
+                        .args(["attach".to_string(), id.clone()]));
+                }
+                Some(_) => self.stop(id)?,
+            }
+        }
 
         let mut spec = LaunchSpec::new(&self.program)
             .cwd(&workdir)
@@ -242,6 +322,10 @@ impl Harnesses for Registry {
     fn all(&self) -> Vec<&dyn Harness> {
         vec![&self.claude]
     }
+}
+
+fn process_alive(pid: i32) -> bool {
+    nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
 }
 
 /// Whether the user has said anything in the transcript at `path`. The
@@ -442,7 +526,7 @@ mod tests {
     fn launches_fresh_with_the_bootstrap_then_resumes_the_newest_spoken_transcript() {
         let home = tempfile::tempdir().expect("a temp dir");
         let work = tempfile::tempdir().expect("a temp dir");
-        let claude = Claude::new(home.path());
+        let claude = Claude::with_program(home.path(), "/usr/bin/true".into());
 
         let go: Prompt = "--go".parse().expect("parses");
         let session = "fix".parse().expect("parses");
@@ -490,6 +574,35 @@ mod tests {
             args[args.len() - 2..],
             ["--resume", "after-clear"],
             "the newest the user spoke in, not the largest or the empty newer one"
+        );
+
+        // A session Claude Code kept running in the background is attached
+        // to, unless there's a prompt to deliver, which attach can't carry.
+        let sessions = home.path().join(".claude/sessions");
+        std::fs::create_dir_all(&sessions).expect("creates");
+        let register = |file: &str, pid: u32| {
+            std::fs::write(
+                sessions.join(file),
+                format!(r#"{{"pid":{pid},"sessionId":"after-clear","cwd":"x"}}"#),
+            )
+            .expect("writes");
+        };
+        register("dead.json", 999_999_999);
+        let args = claude.launch(&ctx(None)).expect("succeeds");
+        assert_eq!(
+            args.arguments()[args.arguments().len() - 2..],
+            ["--resume", "after-clear"],
+            "a registry entry whose process is gone doesn't count"
+        );
+        register("alive.json", std::process::id());
+        let attached = claude.launch(&ctx(None)).expect("succeeds");
+        assert_eq!(attached.arguments(), ["attach", "after-clear"]);
+        let stopped = claude.launch(&ctx(Some(&go))).expect("succeeds");
+        let args = stopped.arguments();
+        assert_eq!(
+            args[args.len() - 4..],
+            ["--resume", "after-clear", "--", "--go"],
+            "with a prompt the background session is stopped and resumed"
         );
     }
 

@@ -2,8 +2,10 @@
 # Moves ~/Documents/repos to ~/repos and points every per-machine record at
 # the new place. Safe to rerun: each step skips what's already done.
 #
-# Run it with no Claude Code sessions open (they rewrite ~/.claude.json on
-# exit) and no zellij sessions for the moved repos (their cwd is baked in).
+# Run it from a plain shell, not inside a Claude Code session, and with no
+# zellij sessions for the moved repos (their cwd is baked in). Background
+# Claude sessions are stopped first, since they hold the old cwd and
+# rewrite ~/.claude.json.
 
 set -l old "$HOME/Documents/repos"
 set -l new "$HOME/repos"
@@ -12,6 +14,16 @@ set -l new_slug (string replace -a / - "$new")
 
 function step
     echo (set_color cyan)"==> $argv"(set_color normal)
+end
+
+step "Stopping background Claude Code sessions"
+# A session outlives its terminal, holds its cwd, and rewrites
+# ~/.claude.json, so none may be running while paths change.
+for f in $HOME/.claude/sessions/*.json
+    test -f $f; or continue
+    set -l id (python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["sessionId"])' $f 2>/dev/null)
+    test -n "$id"; or continue
+    claude stop $id >/dev/null 2>&1; and echo "  stopped $id"
 end
 
 step "Moving repos"
