@@ -1,5 +1,5 @@
-//! The user's config file: actions, the key that leaves the agent, and
-//! where repos can be found.
+//! The user's config file: actions, the key that leaves the agent, where
+//! repos can be found and the colours.
 //!
 //! ```toml
 //! [keys]
@@ -7,6 +7,9 @@
 //!
 //! [repos]
 //! dirs = ["~/repos", "~/.config"]
+//!
+//! [theme]
+//! accent = "#89b4fa"
 //! ```
 
 use std::fmt;
@@ -16,6 +19,7 @@ use serde::Deserialize;
 
 use crate::actions::{Actions, RawAction};
 use crate::paths::{self, Typed};
+use crate::theme::{RawTheme, Theme, ThemeError};
 
 /// A control chord a terminal can send on its own: Ctrl with a letter or
 /// one of `\ ] ^ _`. Everything else would reach the TUI as plain text or
@@ -107,6 +111,7 @@ pub struct Config {
     pub actions: Actions,
     pub keys: Keys,
     pub sources: Sources,
+    pub theme: Theme,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -126,6 +131,8 @@ pub enum ConfigError {
     },
     #[error("repos.dirs: {path:?} {reason}")]
     Source { path: String, reason: SourceError },
+    #[error(transparent)]
+    Theme(#[from] ThemeError),
 }
 
 /// Why a `[repos] dirs` entry can't be used.
@@ -148,6 +155,8 @@ struct RawConfig {
     keys: RawKeys,
     #[serde(default)]
     repos: RawRepos,
+    #[serde(default)]
+    theme: RawTheme,
 }
 
 #[derive(Deserialize, Default)]
@@ -210,6 +219,7 @@ impl std::str::FromStr for Config {
             actions: Actions::parse(raw.action)?,
             keys: raw.keys.parse()?,
             sources: raw.repos.parse()?,
+            theme: raw.theme.parse()?,
         })
     }
 }
@@ -232,6 +242,21 @@ mod tests {
         assert!(err("[keys]\nnav = 'ctrl-space'").contains("isn't a control key"));
         assert!(err("[keys]\nnav = 'alt-x'").contains("isn't a control key"));
         assert!(err("[keys]\nnav_sustained = 'ctrl-]'").contains("unknown field"));
+    }
+
+    #[test]
+    fn theme_errors_name_the_field() {
+        let err = "[theme]\naccent = 'mauve'"
+            .parse::<Config>()
+            .expect_err("fails");
+        assert!(
+            err.to_string()
+                .starts_with("theme.accent: \"mauve\" isn't a colour")
+        );
+        let err = "[theme]\nborder = 'cyan'"
+            .parse::<Config>()
+            .expect_err("fails");
+        assert!(err.to_string().contains("unknown field"));
     }
 
     #[test]

@@ -13,14 +13,15 @@ use agent_core::names::SessionName;
 use agent_core::ports::{DiffStat, Lines, Readiness, WorktreeFacts};
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use unicode_width::UnicodeWidthStr;
 
 use super::{
-    ACCENT, NAME_MIN, ago, bold, dim, fit, glyph, justify, line_width, name_style, panel, scroll,
-    sidebar_count, sidebar_focused, sidebar_title, spinner, truncate_end, truncate_start, wrap,
+    NAME_MIN, accent, ago, bold, dim, error, fit, glyph, justify, line_width, name_style, palette,
+    panel, scroll, sidebar_count, sidebar_focused, sidebar_title, spinner, success, truncate_end,
+    truncate_start, warning, wrap,
 };
 use crate::model::{
     AgentStatus, Cursor, Doing, Extent, Failure, Fold, ListScroll, Model, Panel as Focused, Place,
@@ -429,7 +430,7 @@ impl<'m> Deck<'m> {
             .and_then(|c| c.sharing(entry.name()))
             .is_some()
         {
-            markers.push(Span::styled("⇄", Style::new().fg(Color::Yellow)));
+            markers.push(Span::styled("⇄", warning()));
         }
         let right = |repo: &Option<String>, time: &[Span<'static>]| {
             let mut right: Vec<Span<'static>> = repo
@@ -633,12 +634,9 @@ fn time_in_state(status: &AgentStatus, now: SystemTime) -> Vec<Span<'static>> {
             ..
         } => vec![
             Span::styled(ago(*since, now), dim()),
-            Span::styled("?", Style::new().fg(Color::Yellow)),
+            Span::styled("?", warning()),
         ],
-        AgentStatus::Asking { since, .. } => vec![Span::styled(
-            ago(*since, now),
-            Style::new().fg(Color::Yellow),
-        )],
+        AgentStatus::Asking { since, .. } => vec![Span::styled(ago(*since, now), warning())],
         AgentStatus::Working {
             since,
             pulse: Pulse::Steady,
@@ -794,8 +792,8 @@ fn changes(
         (None, _) => (0, rows.saturating_sub(1)),
     };
     let shown = &changed[first..(first + listed).min(changed.len())];
-    let green = Style::new().fg(Color::Green);
-    let red = Style::new().fg(Color::Red);
+    let green = success();
+    let red = error();
     let columns: Vec<(Span<'static>, String)> = shown
         .iter()
         .map(|change| match change.lines {
@@ -817,7 +815,7 @@ fn changes(
         .map(|(i, (change, (added, removed)))| {
             let mut right = Vec::new();
             if shared.contains_key(&change.path) {
-                right.push(Span::styled("∩ ", Style::new().fg(Color::Yellow)));
+                right.push(Span::styled("∩ ", warning()));
             } else if any_shared {
                 right.push(Span::raw("  "));
             }
@@ -832,7 +830,7 @@ fn changes(
             let path = tail(&change.path.to_string_lossy(), room);
             let mut line = justify(vec![Span::raw(path)], right, width);
             let gutter = match cursor {
-                Some(file) if file == first + i => Span::styled("▌", Style::new().fg(ACCENT)),
+                Some(file) if file == first + i => Span::styled("▌", accent()),
                 _ => Span::raw(" "),
             };
             line.spans.insert(0, gutter);
@@ -1058,7 +1056,7 @@ fn list(deck: &Deck<'_>, snapshot: &Snapshot, rows: &[Row], cursor: Option<&Curs
         };
         let start = list.lines.len();
         let gutter = match (selected, focused) {
-            (true, true) => Span::styled("▌", Style::new().fg(ACCENT)),
+            (true, true) => Span::styled("▌", accent()),
             (true, false) => Span::styled("▌", dim()),
             (false, _) => Span::raw(" "),
         };
@@ -1850,7 +1848,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, m: &mut Model, area: Rect, border: Sty
     if let Some((Panel { area, lines }, changes)) = laid.changes {
         let (added, removed) = counts(changes.diff.added, changes.diff.removed);
         let mut title = vec![Span::raw("[3] "), Span::styled("Changes", bold())];
-        for (count, colour) in [(added, Color::Green), (removed, Color::Red)] {
+        for (count, colour) in [(added, palette().success), (removed, palette().error)] {
             if !count.is_empty() {
                 title.push(Span::raw(" "));
                 title.push(Span::styled(count, Style::new().fg(colour)));
@@ -1858,16 +1856,10 @@ pub(super) fn draw(frame: &mut Frame<'_>, m: &mut Model, area: Rect, border: Sty
         }
         if changes.shared > 0 {
             title.push(Span::raw("  "));
-            title.push(Span::styled(
-                format!("∩ {}", changes.shared),
-                Style::new().fg(Color::Yellow),
-            ));
+            title.push(Span::styled(format!("∩ {}", changes.shared), warning()));
         }
         let with = changes.with.map_or_else(Vec::new, |with| {
-            vec![
-                Span::styled("∩ ", Style::new().fg(Color::Yellow)),
-                Span::styled(with, dim()),
-            ]
+            vec![Span::styled("∩ ", warning()), Span::styled(with, dim())]
         });
         // Who else sits beside the title when the widest it can get fits
         // there whole, else in the corner, which then never shows a
@@ -1921,16 +1913,16 @@ fn pad_title(mut spans: Vec<Span<'static>>) -> Vec<Span<'static>> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
 
     use agent_core::activity::State;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
-    use ratatui::style::Modifier;
+    use ratatui::style::{Color, Modifier};
 
     use super::*;
     use crate::fixtures::{fleet, name, reported};
-    use crate::model::{Group, Pane, View};
+    use crate::model::{Group, Overlay, Pane, View};
 
     const SIZES: [(u16, u16); 3] = [(200, 50), (100, 30), (80, 24)];
     const FLEETS: [usize; 5] = [0, 1, 2, 8, 20];
@@ -2650,6 +2642,53 @@ mod tests {
             !lines.iter().any(|l| l.contains("more")),
             "a count row that costs the tree isn't worth it"
         );
+    }
+
+    #[test]
+    fn every_colour_comes_from_the_palette() {
+        let palette = crate::palette::Palette {
+            accent: Color::Rgb(1, 1, 1),
+            dim: crate::palette::Secondary::Colour(Color::Rgb(2, 2, 2)),
+            warning: Color::Rgb(3, 3, 3),
+            error: Color::Rgb(4, 4, 4),
+            success: Color::Rgb(5, 5, 5),
+        };
+        let ours = [1, 2, 3, 4, 5].map(|n| Some(Color::Rgb(n, n, n)));
+        for size in SIZES {
+            for (panel, overlay) in [
+                (Focused::Agents, Overlay::None),
+                (Focused::Agent { offset: 0 }, Overlay::None),
+                (Focused::Agents, Overlay::Help),
+            ] {
+                let mut m = fleet(8);
+                m.palette = palette;
+                m.panel = panel;
+                m.overlay = overlay;
+                m.error("failed".to_string());
+                let terminal = render(&mut m, size);
+                let buffer = terminal.backend().buffer();
+                let mut used = HashSet::new();
+                for cell in buffer.content() {
+                    assert!(
+                        !cell.modifier.contains(Modifier::DIM),
+                        "{:?} is DIM at {size:?}",
+                        cell.symbol()
+                    );
+                    if cell.fg != Color::Reset {
+                        assert!(
+                            ours.contains(&Some(cell.fg)),
+                            "{:?} is {:?} at {size:?}",
+                            cell.symbol(),
+                            cell.fg
+                        );
+                        used.insert(cell.fg);
+                    }
+                }
+                for (n, role) in [(1, "accent"), (2, "dim"), (3, "warning"), (4, "error")] {
+                    assert!(used.contains(&Color::Rgb(n, n, n)), "no {role} at {size:?}");
+                }
+            }
+        }
     }
 
     #[test]

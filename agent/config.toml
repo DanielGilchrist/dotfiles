@@ -32,3 +32,11 @@ cwd = "{path}"
 # entry is a repo or a directory of repos.
 [repos]
 dirs = ["~/repos/TandaHQ", "~/repos/DanielGilchrist"]
+
+# evergarden, from nvim's MatchParen, Comment and Diagnostic* groups.
+[theme]
+accent = "#f7a182"
+dim = "#839e9a"
+warning = "#f5d098"
+error = "#f57f82"
+success = "#cbe3b3"
