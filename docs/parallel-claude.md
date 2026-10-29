@@ -59,7 +59,7 @@ types into the embedded session. `?` shows every key.
 |---|---|
 | `⏎` / `l` | Attach the selected agent (resurrect or start it if needed) |
 | `⌃\` | Back to NAV from an agent. Twice goes to the previous agent |
-| `1` `2` `3` | Focus the Agents, turn and Changes panels. Focusing [2] or [3] expands it only as far as its content needs: from the other lower panel's spare rows first, then the list, and only then does the other panel collapse to its title line. From [2] or [3], `Esc` goes back to Agents |
+| `1` `2` `3` | Focus the Agents, turn and Changes panels. Focusing [2] or [3] expands it only as far as its content needs: from the other lower panel's spare rows first, then the list, and only then does the other panel collapse to its title line (at the smallest sizes the collapse can leave it a few blank rows). From [2] or [3], `Esc` goes back to Agents |
 | `j k g G`, `[ ]` | Move in the focused panel, previous / next repo |
 | `⌃D ⌃U` | Half a page in the focused panel, handy in Changes |
 | `Space` / `/` | Switcher (fuzzy), `⌃N ⌃P` to move |

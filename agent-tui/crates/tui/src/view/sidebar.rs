@@ -1142,20 +1142,27 @@ fn lay_out(m: &Model, area: Rect) -> Option<Laid> {
     };
 
     // What the lower panels need decides how far the list gives way, so
-    // it's known before the list is windowed.
-    let lower = selection
-        .filter(|_| rest >= 3)
-        .map(|(repo, entry)| (repo, entry, needs(&deck, repo, entry, list.card, rest)));
+    // it's known before the list is windowed. The room under the list is
+    // decided here, once, and carried in the type.
+    let lower = selection.and_then(|(repo, entry)| {
+        let room = LowerRoom::of(rest)?;
+        Some((
+            repo,
+            entry,
+            room,
+            needs(&deck, repo, entry, list.card, room),
+        ))
+    });
     let (list_rows, geometry) = match &lower {
         None => (visible, None),
-        Some((_, _, needs)) => {
+        Some((_, _, room, needs)) => {
             let geometry = split(
                 Column {
                     list: visible,
-                    lower: rest,
+                    lower: *room,
                 },
-                needs.shape(),
-                Focus::of(m.panel, needs),
+                needs.shape(*room),
+                Focus::of(m.panel, &needs.shape(*room)),
             );
             (geometry.list, Some(geometry))
         }
@@ -1180,14 +1187,14 @@ fn lay_out(m: &Model, area: Rect) -> Option<Laid> {
         .zip(list.selected.map(|r| r.start.saturating_sub(offset)));
 
     let (agent, changes, focus, turn, work_room) = match (lower, geometry) {
-        (Some((repo, entry, needs)), Some(geometry)) => {
+        (Some((repo, entry, room, needs)), Some(geometry)) => {
             let below = Rect::new(
                 area.x,
                 area.y + u16::try_from(list_rows + 2).unwrap_or(u16::MAX),
                 area.width,
                 u16::try_from(height - list_rows - 2).unwrap_or(u16::MAX),
             );
-            let room = needs.room;
+            let room = room.work_room();
             let below = lower_panels(&deck, repo, entry, needs, geometry, below);
             (
                 Some(below.agent),
@@ -1243,29 +1250,24 @@ fn more_row(hidden: NonZeroUsize, width: usize) -> Line<'static> {
 struct Needs<'m> {
     detail: Detail,
     work: Option<Work<'m>>,
-    /// Whether the column had room for [3] at all.
-    room: WorkRoom,
-    /// Rows inside [2] and [3] together when [3] exists: the rows under
-    /// the list less both borders, which the [3] gate makes at least 5.
-    inside: usize,
 }
 
 impl Needs<'_> {
-    fn shape(&self) -> Shape {
+    fn shape(&self, room: LowerRoom) -> Shape {
         let turn = fill_all(&self.detail.items).len();
-        let work = self.work.as_ref().map(|work| {
-            let need = match work {
-                Work::Facts { facts, head } => usize::from(head.is_some()) + facts.changed.len(),
-                Work::Unreadable(_) => 1,
-            };
-            WorkShape {
-                need,
-                // As a sibling, [3] keeps the lesser of its content and the
-                // floor, so it neither holds blank rows nor loses files.
-                min: need.min(CHANGES_MIN + READINESS_ROW),
-                inside: self.inside,
+        let work = match (&self.work, room) {
+            (Some(work), LowerRoom::Both { inside }) => {
+                let (files, need) = match work {
+                    Work::Facts { facts, head } => (
+                        facts.changed.len(),
+                        usize::from(head.is_some()) + facts.changed.len(),
+                    ),
+                    Work::Unreadable(_) => (0, 1),
+                };
+                Some(WorkShape::of(files, need, inside))
             }
-        });
+            (None, _) | (Some(_), LowerRoom::TurnOnly { .. }) => None,
+        };
         Shape { turn, work }
     }
 }
@@ -1280,44 +1282,85 @@ struct Shape {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct WorkShape {
+    /// Files the cursor can move over.
+    files: usize,
     need: usize,
+    /// As a sibling, [3] keeps the lesser of its content and the floor,
+    /// so the floor never holds blank rows and [3] never loses files.
+    /// Never more than `need`, and never the whole room.
     min: usize,
-    /// Rows inside both lower panels together, at least `min + 1`.
-    inside: usize,
 }
 
-/// The list's unfocused rows inside its border and the rows under it,
-/// which `lay_out` only hands down when there are at least 3.
+impl WorkShape {
+    fn of(files: usize, need: usize, inside: NonZeroUsize) -> Self {
+        Self {
+            files,
+            need,
+            min: need.min(CHANGES_MIN + READINESS_ROW).min(inside.get() - 1),
+        }
+    }
+}
+
+/// The rows under the list: enough for a [2] (at least 3), and with
+/// [`WORK_LEAST`] enough for a [3] beside it. `inside` is what's left for
+/// content once the borders are taken.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LowerRoom {
+    TurnOnly { inside: NonZeroUsize },
+    Both { inside: NonZeroUsize },
+}
+
+/// Rows under the list that fit [3] with its floor and readiness row,
+/// [2] with one row, and both borders.
+const WORK_LEAST: usize = 2 + 1 + CHANGES_MIN + READINESS_ROW + 2;
+
+impl LowerRoom {
+    /// None when `rows` can't hold a panel at all.
+    fn of(rows: usize) -> Option<Self> {
+        if rows >= WORK_LEAST {
+            NonZeroUsize::new(rows - 4).map(|inside| Self::Both { inside })
+        } else {
+            NonZeroUsize::new(rows.checked_sub(2)?).map(|inside| Self::TurnOnly { inside })
+        }
+    }
+
+    fn work_room(self) -> WorkRoom {
+        match self {
+            Self::Both { .. } => WorkRoom::Fits,
+            Self::TurnOnly { .. } => WorkRoom::TooShort,
+        }
+    }
+}
+
+/// The list's unfocused rows inside its border and the room under it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Column {
     list: usize,
-    lower: usize,
+    lower: LowerRoom,
 }
 
-/// Which lower panel has the keys, if any.
+/// Which lower panel has the keys, if any, and where its cursor is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Focus {
     Neither,
-    Turn,
-    Work,
+    Turn { offset: usize },
+    Work { file: usize },
 }
 
 impl Focus {
     /// [3] can only be focused while it has files to move through.
-    fn of(panel: Focused, needs: &Needs<'_>) -> Self {
-        match (panel, &needs.work) {
-            (Focused::Agent { .. }, _) => Self::Turn,
-            (Focused::Changes { .. }, Some(Work::Facts { facts, .. }))
-                if !facts.changed.is_empty() =>
-            {
-                Self::Work
-            }
+    fn of(panel: Focused, shape: &Shape) -> Self {
+        match (panel, shape.work) {
+            (Focused::Agent { offset }, _) => Self::Turn { offset },
+            (Focused::Changes { file }, Some(work)) if work.files > 0 => Self::Work {
+                file: file.min(work.files - 1),
+            },
             (Focused::Changes { .. } | Focused::Agents, _) => Self::Neither,
         }
     }
 }
 
-/// A panel that gave rows to its focused sibling: what it has left inside
+/// A panel beside a focused one, or an unfocused [2]: what it has inside
 /// its border, or that it's down to its title line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Sibling {
@@ -1326,33 +1369,56 @@ enum Sibling {
 }
 
 impl Sibling {
+    fn of(rows: usize) -> Self {
+        match rows {
+            0 => Self::Collapsed,
+            rows => Self::Inside(rows),
+        }
+    }
+
     fn height(self) -> usize {
         match self {
             Self::Inside(rows) => rows + 2,
             Self::Collapsed => 1,
         }
     }
+
+    fn inside(self) -> usize {
+        match self {
+            Self::Inside(rows) => rows,
+            Self::Collapsed => 0,
+        }
+    }
 }
 
 /// How [2] and [3] share the rows under the list, in rows inside their
-/// borders. The pairing is in the type: a collapsed panel only exists
-/// beside a focused one.
+/// borders, and which has the keys. The pairing is in the type: a
+/// collapsed [3] only exists beside a focused [2], and the cursor travels
+/// with the focus so nothing downstream reads it from the model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Lower {
-    /// Neither focused, or the focused one already fits.
-    Stacked { turn: usize, work: Option<usize> },
-    /// [2] focused and grown.
-    TurnTook { turn: usize, work: Sibling },
-    /// [3] focused and grown.
-    WorkTook { turn: Sibling, work: usize },
+    /// Neither focused. An empty [2] is down to its title line.
+    Stacked { turn: Sibling, work: Option<usize> },
+    /// [2] focused, scrolled to `offset`.
+    TurnFocused {
+        offset: usize,
+        turn: usize,
+        work: Option<Sibling>,
+    },
+    /// [3] focused, the cursor on `file`.
+    WorkFocused {
+        file: usize,
+        turn: Sibling,
+        work: usize,
+    },
 }
 
 impl Lower {
     /// [2]'s height with its border.
     fn turn_height(self) -> usize {
         match self {
-            Self::Stacked { turn, .. } | Self::TurnTook { turn, .. } => turn + 2,
-            Self::WorkTook { turn, .. } => turn.height(),
+            Self::Stacked { turn, .. } | Self::WorkFocused { turn, .. } => turn.height(),
+            Self::TurnFocused { turn, .. } => turn + 2,
         }
     }
 
@@ -1361,8 +1427,8 @@ impl Lower {
     fn work_height(self) -> Option<usize> {
         match self {
             Self::Stacked { work, .. } => work.map(|rows| rows + 2),
-            Self::TurnTook { work, .. } => Some(work.height()),
-            Self::WorkTook { work, .. } => Some(work + 2),
+            Self::TurnFocused { work, .. } => work.map(Sibling::height),
+            Self::WorkFocused { work, .. } => Some(work + 2),
         }
     }
 }
@@ -1383,69 +1449,115 @@ struct Geometry {
 /// nothing while its content fits. When it doesn't, the panel takes
 /// exactly the deficit: first the sibling's rows above its minimum, then
 /// the list's above [`LIST_MIN`], then the sibling collapses to its title
-/// line, rows that frees beyond the deficit going back to the list. Past
-/// that the panel scrolls.
+/// line, rows that frees beyond the deficit going back to the list. With
+/// the list already at its minimum the surplus stays with the focused
+/// panel. Past that the panel scrolls.
 fn split(column: Column, shape: Shape, focus: Focus) -> Geometry {
-    let Some(work) = shape.work else {
-        let turn = column.lower - 2;
-        let (list, turn) = match focus {
-            Focus::Turn if shape.turn > turn => {
-                let from_list =
-                    (shape.turn - turn).min(column.list.saturating_sub(usize::from(LIST_MIN)));
-                (column.list - from_list, turn + from_list)
-            }
-            Focus::Turn | Focus::Work | Focus::Neither => (column.list, turn),
-        };
-        return Geometry {
-            list,
-            lower: Lower::Stacked { turn, work: None },
-        };
+    let (inside, work) = match (column.lower, shape.work) {
+        (LowerRoom::Both { inside }, Some(work)) => (inside.get(), work),
+        // No [3] to draw, so its border rows are [2]'s too. Focus on a [3]
+        // there is nothing, so it reads as no focus.
+        (LowerRoom::Both { inside }, None) | (LowerRoom::TurnOnly { inside }, _) => {
+            let inside = match column.lower {
+                LowerRoom::Both { .. } => inside.get() + 2,
+                LowerRoom::TurnOnly { .. } => inside.get(),
+            };
+            let (list, turn) = match focus {
+                Focus::Turn { .. } if shape.turn > inside => {
+                    let from_list = (shape.turn - inside)
+                        .min(column.list.saturating_sub(usize::from(LIST_MIN)));
+                    (column.list - from_list, inside + from_list)
+                }
+                Focus::Turn { .. } | Focus::Work { .. } | Focus::Neither => (column.list, inside),
+            };
+            let lower = match focus {
+                Focus::Turn { offset } => Lower::TurnFocused {
+                    offset,
+                    turn,
+                    work: None,
+                },
+                // Alone, [2] keeps the column even with nothing to say.
+                Focus::Work { .. } | Focus::Neither => Lower::Stacked {
+                    turn: Sibling::Inside(turn),
+                    work: None,
+                },
+            };
+            return Geometry { list, lower };
+        }
     };
-    let inside = work.inside;
     let share = inside.div_ceil(3).max(DETAIL_MIN).min(inside - work.min);
     // Rows [3] has no files for: none when it has more than fit.
-    let spare = inside.saturating_sub(work.need.max(work.min));
+    let spare = inside.saturating_sub(work.need);
     let turn = shape.turn.min(share.max(spare));
-    let stacked = Geometry {
-        list: column.list,
-        lower: Lower::Stacked {
-            turn,
-            work: Some(inside - turn),
-        },
+    let took = match focus {
+        Focus::Neither => {
+            // An empty [2] is its title line, and [3] gets the border
+            // row that frees.
+            let turn = Sibling::of(turn);
+            return Geometry {
+                list: column.list,
+                lower: Lower::Stacked {
+                    turn,
+                    work: Some(inside - turn.inside() + usize::from(turn == Sibling::Collapsed)),
+                },
+            };
+        }
+        Focus::Turn { offset } => Took::Turn { offset },
+        Focus::Work { file } => Took::Work { file },
     };
-    let (need, have, sibling_min) = match focus {
-        Focus::Neither => return stacked,
-        Focus::Turn => (shape.turn, turn, work.min),
-        Focus::Work => (work.need, inside - turn, DETAIL_MIN.min(turn)),
-    };
-    if need <= have {
-        return stacked;
+    // [3] focused beside an empty [2]: the title line stays and only the
+    // list can give rows, so nothing moves while the files fit.
+    if let (Took::Work { file }, Sibling::Collapsed) = (took, Sibling::of(turn)) {
+        let have = inside + 1;
+        let from_list = work
+            .need
+            .saturating_sub(have)
+            .min(column.list.saturating_sub(usize::from(LIST_MIN)));
+        return Geometry {
+            list: column.list - from_list,
+            lower: Lower::WorkFocused {
+                file,
+                turn: Sibling::Collapsed,
+                work: have + from_list,
+            },
+        };
     }
-    let sibling = inside - have;
-    let mut deficit = need - have;
-    let from_sibling = deficit.min(sibling - sibling_min);
-    deficit -= from_sibling;
-    let from_list = deficit.min(column.list.saturating_sub(usize::from(LIST_MIN)));
-    deficit -= from_list;
-    let mut list = column.list - from_list;
-    let mut focused = have + from_sibling + from_list;
-    let left = sibling - from_sibling;
-    let sibling = if deficit > 0 {
-        // The sibling's rows and one of its border rows come free.
-        focused += left + 1;
-        let back = focused.saturating_sub(need).min(column.list - list);
-        list += back;
-        focused -= back;
-        Sibling::Collapsed
-    } else {
-        Sibling::Inside(left)
+    let (need, have, sibling_min) = match took {
+        Took::Turn { .. } => (shape.turn, turn, work.min),
+        Took::Work { .. } => (work.need, inside - turn, DETAIL_MIN.min(turn)),
     };
-    let lower = match focus {
-        Focus::Turn => Lower::TurnTook {
+    let sibling = inside - have;
+    let (list, focused, sibling) = if need <= have {
+        (column.list, have, Sibling::Inside(sibling))
+    } else {
+        let mut deficit = need - have;
+        let from_sibling = deficit.min(sibling - sibling_min);
+        deficit -= from_sibling;
+        let from_list = deficit.min(column.list.saturating_sub(usize::from(LIST_MIN)));
+        deficit -= from_list;
+        let mut list = column.list - from_list;
+        let mut focused = have + from_sibling + from_list;
+        let left = sibling - from_sibling;
+        let sibling = if deficit > 0 {
+            // The sibling's rows and one of its border rows come free.
+            focused += left + 1;
+            let back = focused.saturating_sub(need).min(column.list - list);
+            list += back;
+            focused -= back;
+            Sibling::Collapsed
+        } else {
+            Sibling::Inside(left)
+        };
+        (list, focused, sibling)
+    };
+    let lower = match took {
+        Took::Turn { offset } => Lower::TurnFocused {
+            offset,
             turn: focused,
-            work: sibling,
+            work: Some(sibling),
         },
-        Focus::Work | Focus::Neither => Lower::WorkTook {
+        Took::Work { file } => Lower::WorkFocused {
+            file,
             turn: sibling,
             work: focused,
         },
@@ -1453,10 +1565,23 @@ fn split(column: Column, shape: Shape, focus: Focus) -> Geometry {
     Geometry { list, lower }
 }
 
-/// What the selected agent's panels have to say, and whether the column
-/// (`rows` under the list) has room for [3]. Too short for it, the one
-/// thing worth knowing about the work goes in [2] instead.
-fn needs<'m>(deck: &Deck<'m>, repo: &Repo, entry: &Entry, card: Shown, rows: usize) -> Needs<'m> {
+/// A focused lower panel, once "neither" has been answered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Took {
+    Turn { offset: usize },
+    Work { file: usize },
+}
+
+/// What the selected agent's panels have to say, given the room under the
+/// list. Too short for [3], the one thing worth knowing about the work
+/// goes in [2] instead.
+fn needs<'m>(
+    deck: &Deck<'m>,
+    repo: &Repo,
+    entry: &Entry,
+    card: Shown,
+    room: LowerRoom,
+) -> Needs<'m> {
     let m = deck.m;
     let mut detail = deck.detail(repo, entry, card);
     let status = m.status(entry);
@@ -1469,29 +1594,20 @@ fn needs<'m>(deck: &Deck<'m>, repo: &Repo, entry: &Entry, card: Shown, rows: usi
         Some(Err(e)) => Some(Work::Unreadable(format!("git: {}", first_line(e).0))),
         None => None,
     };
-    // [3] needs its floor plus a readiness row, [2] its minimum, and both
-    // their borders.
-    let least = 2 + DETAIL_MIN.min(1) + CHANGES_MIN + READINESS_ROW + 2;
-    let (room, inside) = if rows >= least {
-        (WorkRoom::Fits, rows - 4)
-    } else {
-        (WorkRoom::TooShort, 0)
-    };
-    if let (WorkRoom::TooShort, Some(Work::Unreadable(text))) = (room, &work) {
+    let work_room = room.work_room();
+    if let (WorkRoom::TooShort, Some(Work::Unreadable(text))) = (work_room, &work) {
         let line = Line::styled(truncate_end(text, deck.content), dim());
         detail.items.push(Item::fixed(Order::Work, vec![line]));
     }
     Needs {
         detail,
-        work: work.filter(|_| room == WorkRoom::Fits),
-        room,
-        inside,
+        work: work.filter(|_| work_room == WorkRoom::Fits),
     }
 }
 
-/// [2] and [3] drawn into `area` as `geometry` shares it, with the focus
-/// clamped to what they show. Unfocused, [2]'s last row says what it's
-/// hiding. Focused, it scrolls.
+/// [2] and [3] drawn into `area` as `geometry` shares it. Everything
+/// about focus and cursors comes from the geometry. Unfocused, [2]'s last
+/// row says what it's hiding. Focused, it scrolls.
 fn lower_panels(
     deck: &Deck<'_>,
     repo: &Repo,
@@ -1500,7 +1616,6 @@ fn lower_panels(
     geometry: Geometry,
     area: Rect,
 ) -> Below {
-    let m = deck.m;
     let at = |y: usize, height: usize| {
         Rect::new(
             area.x,
@@ -1510,21 +1625,33 @@ fn lower_panels(
         )
     };
     let Needs { detail, work, .. } = needs;
-    let file = match (m.panel, &work) {
-        (Focused::Changes { file }, Some(Work::Facts { facts, .. }))
-            if !facts.changed.is_empty() =>
-        {
-            Some(file.min(facts.changed.len() - 1))
-        }
-        _ => None,
-    };
     let all = fill_all(&detail.items);
-    let (filled, focus, turn) = match (m.panel, file, geometry.lower) {
-        (
-            Focused::Agent { offset },
-            _,
-            Lower::Stacked { turn: inside, .. } | Lower::TurnTook { turn: inside, .. },
-        ) => {
+    let unfocused = |inside: usize, focus: Focused| {
+        let whole = fill(&detail.items, inside);
+        match NonZeroUsize::new(all.len().saturating_sub(whole.len())) {
+            None => (whole, focus, Turn::Whole),
+            // The count takes the last row, so items keep their priority
+            // and a fixed item is never shown in part. When the count
+            // would cost more than its own row (a fixed item that fit no
+            // longer does), the whole items show without one.
+            Some(beyond) => {
+                let mut shown = fill(&detail.items, inside.saturating_sub(1));
+                if whole.len() > shown.len() + 1 {
+                    (whole, focus, Turn::Hidden(beyond))
+                } else {
+                    let hidden = beyond.saturating_add(whole.len().saturating_sub(shown.len()));
+                    shown.push(more_row(hidden, deck.content));
+                    (shown, focus, Turn::Hidden(hidden))
+                }
+            }
+        }
+    };
+    let (filled, focus, turn, file) = match geometry.lower {
+        Lower::TurnFocused {
+            offset,
+            turn: inside,
+            ..
+        } => {
             let offset = offset.min(all.len().saturating_sub(inside));
             let shown: Vec<Line<'static>> = all.iter().skip(offset).take(inside).cloned().collect();
             let turn = if all.len() <= inside {
@@ -1536,64 +1663,37 @@ fn lower_panels(
                     total: all.len(),
                 }
             };
-            (shown, Focused::Agent { offset }, turn)
+            (shown, Focused::Agent { offset }, turn, None)
         }
         // Collapsed to its title line, so everything it had is hidden.
-        (
-            _,
-            Some(file),
-            Lower::WorkTook {
-                turn: Sibling::Collapsed,
-                ..
-            },
-        ) => (
+        Lower::WorkFocused {
+            file,
+            turn: Sibling::Collapsed,
+            ..
+        } => (
             Vec::new(),
             Focused::Changes { file },
             NonZeroUsize::new(all.len()).map_or(Turn::Whole, Turn::Hidden),
+            Some(file),
         ),
-        (_, file, lower) => {
-            let inside = match lower {
-                Lower::Stacked { turn, .. }
-                | Lower::TurnTook { turn, .. }
-                | Lower::WorkTook {
-                    turn: Sibling::Inside(turn),
-                    ..
-                } => turn,
-                Lower::WorkTook {
-                    turn: Sibling::Collapsed,
-                    ..
-                } => 0,
-            };
-            let focus = match file {
-                Some(file) => Focused::Changes { file },
-                None => Focused::Agents,
-            };
-            let whole = fill(&detail.items, inside);
-            match NonZeroUsize::new(all.len().saturating_sub(whole.len())) {
-                None => (whole, focus, Turn::Whole),
-                // The count takes the last row, so items keep their
-                // priority and a fixed item is never shown in part. When
-                // the count would cost more than its own row (a fixed
-                // item that fit no longer does), the whole items show
-                // without one.
-                Some(beyond) => {
-                    let mut shown = fill(&detail.items, inside.saturating_sub(1));
-                    if whole.len() > shown.len() + 1 {
-                        (whole, focus, Turn::Hidden(beyond))
-                    } else {
-                        let hidden = beyond.saturating_add(whole.len().saturating_sub(shown.len()));
-                        shown.push(more_row(hidden, deck.content));
-                        (shown, focus, Turn::Hidden(hidden))
-                    }
-                }
-            }
+        Lower::WorkFocused {
+            file,
+            turn: Sibling::Inside(inside),
+            ..
+        } => {
+            let (filled, focus, turn) = unfocused(inside, Focused::Changes { file });
+            (filled, focus, turn, Some(file))
+        }
+        Lower::Stacked { turn, .. } => {
+            let (filled, focus, turn) = unfocused(turn.inside(), Focused::Agents);
+            (filled, focus, turn, None)
         }
     };
     let turn_height = geometry.lower.turn_height();
     let work_rows = match geometry.lower {
         Lower::Stacked { work, .. } => work.map(Sibling::Inside),
-        Lower::TurnTook { work, .. } => Some(work),
-        Lower::WorkTook { work, .. } => Some(Sibling::Inside(work)),
+        Lower::TurnFocused { work, .. } => work,
+        Lower::WorkFocused { work, .. } => Some(Sibling::Inside(work)),
     };
     let changes = work.zip(work_rows).map(|(work, rows)| {
         let area = at(turn_height, rows.height());
@@ -1606,6 +1706,7 @@ fn lower_panels(
                 let lines = head.into_iter().chain(changes.lines.clone()).collect();
                 (Panel { area, lines }, changes)
             }
+            // Only beside a focused [2], so no cursor to name.
             (Work::Facts { facts, .. }, Sibling::Collapsed) => {
                 let shared = deck.overlaps(repo, entry);
                 (
@@ -1613,7 +1714,7 @@ fn lower_panels(
                         area,
                         lines: Vec::new(),
                     },
-                    summary(facts, &shared, file),
+                    summary(facts, &shared, None),
                 )
             }
             (Work::Unreadable(text), rows) => (
@@ -2104,11 +2205,22 @@ mod tests {
                     let context = format!("{size:?}, {agents} agents, {view:?}, {panel:?}");
                     let laid = laid(&mut m, size);
                     let column = column(&m, size);
+                    let focused_lower = match laid.focus {
+                        Focused::Agents => None,
+                        Focused::Agent { .. } => Some(1),
+                        Focused::Changes { .. } => Some(2),
+                    };
                     let mut panels = vec![&laid.list];
                     panels.extend(laid.agent.as_ref().map(|(p, _)| p));
                     panels.extend(laid.changes.as_ref().map(|(p, _)| p));
                     let mut y = column.y;
-                    for panel in panels {
+                    for (i, panel) in panels.into_iter().enumerate() {
+                        let may_collapse = i > 0 && focused_lower != Some(i);
+                        assert!(
+                            may_collapse || panel.area.height >= 2,
+                            "{context}: panel {i} is {} tall",
+                            panel.area.height
+                        );
                         assert_eq!(panel.area.y, y, "{context}: panels stack");
                         let collapsed = panel.area.height == 1 && panel.lines.is_empty();
                         assert!(
@@ -2606,80 +2718,105 @@ mod tests {
         };
         let column = |rows: usize, list: usize| Column {
             list,
-            lower: rows - list - 2,
+            lower: LowerRoom::of(rows - list - 2).expect("room for a panel"),
         };
-        let shaped = |col: Column, turn: usize, work: Option<(usize, usize)>| Shape {
+        let shaped = |col: Column, turn: usize, need: Option<usize>| Shape {
             turn,
-            work: work.map(|(need, min)| WorkShape {
-                need,
-                min,
-                inside: col.lower - 4,
+            work: need.map(|need| {
+                match col.lower {
+                    LowerRoom::Both { inside } => Some(WorkShape::of(need, need, inside)),
+                    LowerRoom::TurnOnly { .. } => None,
+                }
+                .expect("the column has room for [3]")
             }),
         };
+        let turn = |offset| Focus::Turn { offset };
+        let work = Focus::Work { file: 0 };
         let tall = column(69, 12);
-        let x = shaped(tall, 5, Some((143, 4)));
+        let x = shaped(tall, 5, Some(143));
         assert_eq!(heights(split(tall, x, Focus::Neither)), (14, 7, 48));
         assert_eq!(
-            heights(split(tall, x, Focus::Turn)),
+            heights(split(tall, x, turn(0))),
             (14, 7, 48),
             "fits, nothing moves"
         );
-        let long = shaped(tall, 40, Some((143, 4)));
+        let long = shaped(tall, 40, Some(143));
         assert_eq!(heights(split(tall, long, Focus::Neither)), (14, 19, 36));
         assert_eq!(
-            heights(split(tall, long, Focus::Turn)),
+            heights(split(tall, long, turn(0))),
             (14, 42, 13),
             "takes from [3] only"
         );
-        let longer = shaped(tall, 70, Some((143, 4)));
+        let longer = shaped(tall, 70, Some(143));
         assert_eq!(
-            heights(split(tall, longer, Focus::Turn)),
+            heights(split(tall, longer, turn(0))),
             (5, 63, 1),
             "then [1], then collapses [3]"
         );
-        assert_eq!(heights(split(tall, x, Focus::Work)), (5, 1, 63));
-        let few = shaped(tall, 5, Some((38, 4)));
+        assert_eq!(heights(split(tall, x, work)), (5, 1, 63));
+        let few = shaped(tall, 5, Some(38));
         assert_eq!(
-            heights(split(tall, few, Focus::Work)),
+            heights(split(tall, few, work)),
             (14, 7, 48),
             "37 files already fit"
         );
 
         let small = column(23, 9);
-        let x = shaped(small, 5, Some((143, 4)));
+        let x = shaped(small, 5, Some(143));
         assert_eq!(heights(split(small, x, Focus::Neither)), (11, 6, 6));
         assert_eq!(
-            heights(split(small, x, Focus::Turn)),
+            heights(split(small, x, turn(0))),
             (10, 7, 6),
             "one row from [1]"
         );
-        let twelve = shaped(small, 12, Some((143, 4)));
+        let twelve = shaped(small, 12, Some(143));
         assert_eq!(
-            heights(split(small, twelve, Focus::Turn)),
+            heights(split(small, twelve, turn(0))),
             (8, 14, 1),
             "collapse gives rows back to [1]"
         );
-        assert_eq!(heights(split(small, x, Focus::Work)), (5, 1, 17));
-        let five = shaped(small, 5, Some((6, 4)));
-        assert_eq!(heights(split(small, five, Focus::Work)), (9, 6, 8));
-        let two = shaped(small, 9, Some((2, 2)));
+        assert_eq!(heights(split(small, x, work)), (5, 1, 17));
+        let five = shaped(small, 5, Some(6));
+        assert_eq!(heights(split(small, five, work)), (9, 6, 8));
+        let two = shaped(small, 9, Some(2));
         assert_eq!(
             heights(split(small, two, Focus::Neither)),
             (11, 8, 4),
             "[3] keeps only what it has, so [2] gets the rest"
         );
+        let empty = shaped(small, 0, Some(143));
+        assert_eq!(
+            heights(split(small, empty, Focus::Neither)),
+            (11, 1, 11),
+            "an empty [2] is its title line"
+        );
+        assert_eq!(
+            heights(split(small, empty, work)),
+            (5, 1, 17),
+            "focused [3] beside it takes from the list only"
+        );
+        let empty_fits = shaped(small, 0, Some(6));
+        assert_eq!(
+            heights(split(small, empty_fits, work)),
+            heights(split(small, empty_fits, Focus::Neither)),
+            "and moves nothing while the files fit"
+        );
 
         let tiny = column(15, 3);
-        let x = shaped(tiny, 5, Some((143, 4)));
+        let x = shaped(tiny, 5, Some(143));
         assert_eq!(heights(split(tiny, x, Focus::Neither)), (5, 4, 6));
-        assert_eq!(heights(split(tiny, x, Focus::Turn)), (5, 9, 1));
-        assert_eq!(heights(split(tiny, x, Focus::Work)), (5, 1, 9));
+        assert_eq!(
+            heights(split(tiny, x, turn(0))),
+            (5, 9, 1),
+            "the list is at its minimum, so the surplus stays with [2]"
+        );
+        assert_eq!(heights(split(tiny, x, work)), (5, 1, 9));
 
         let alone = shaped(tall, 30, None);
         assert_eq!(heights(split(tall, alone, Focus::Neither)), (14, 55, 0));
         let alone = shaped(small, 30, None);
         assert_eq!(
-            heights(split(small, alone, Focus::Turn)),
+            heights(split(small, alone, turn(0))),
             (5, 18, 0),
             "no [3]: only [1] gives way"
         );
@@ -2694,8 +2831,15 @@ mod tests {
         let list_height = unfocused.list.area.height;
         let turn_height = unfocused.agent.as_ref().expect("[2] shows").0.area.height;
         let (work, changes) = unfocused.changes.as_ref().expect("[3] shows");
-        let hidden = changes.diff.files + 1 - (usize::from(work.area.height) - 2);
-        assert!(hidden > 0, "the fixture needs [3] to be short of rows");
+        let head = usize::from(
+            texts(&work.lines)
+                .first()
+                .is_some_and(|l| l.contains("ready")),
+        );
+        let hidden = (changes.diff.files + head)
+            .checked_sub(usize::from(work.area.height) - 2)
+            .filter(|hidden| *hidden > 0)
+            .expect("the fixture leaves [3] short of rows");
 
         m.panel = Focused::Changes { file: 0 };
         let focused = laid(&mut m, (80, 24));
