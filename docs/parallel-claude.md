@@ -13,7 +13,9 @@ it into `~/.local/bin/agent`. Session layouts record that path, so keep it.
 
 - **Worktree per agent** at `~/worktrees/<repo>/<name>`, checked out
   detached at `origin/HEAD`. The agent creates its own branch: the first
-  prompt tells it to `git checkout -b <kebab-case-name>` first.
+  prompt tells it to `git checkout -b <kebab-case-name>` first. While git
+  is still checking the files out the worktree isn't listed, so a big repo
+  takes a moment to appear.
 - **Zellij session per agent**, named after the worktree. Sessions persist
   across terminal and laptop restarts and can be attached from anywhere
   (`zellij attach <name>`, another tab, a phone over SSH). After a reboot

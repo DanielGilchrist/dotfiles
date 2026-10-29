@@ -106,10 +106,13 @@ fn parse_worktrees(porcelain: &str) -> Result<Vec<Worktree>, String> {
     porcelain
         .split("\n\n")
         .filter(|block| !block.trim().is_empty())
+        // `locked initializing` is what `git worktree add` holds while it
+        // checks the files out (builtin/worktree.c, add_worktree), so a
+        // worktree still appearing is not one yet.
         .filter(|block| {
             !block
                 .lines()
-                .any(|l| l == "bare" || l.starts_with("prunable"))
+                .any(|l| l == "bare" || l.starts_with("prunable") || l == "locked initializing")
         })
         .map(|block| {
             let mut path = None;
@@ -440,14 +443,21 @@ mod tests {
     fn porcelain_parses_branches_detached_and_skips_prunable() {
         let porcelain = "worktree /src/api\nHEAD abc\nbranch refs/heads/main\n\n\
                          worktree /w/api/fix\nHEAD def\ndetached\n\n\
-                         worktree /w/api/gone\nHEAD 123\nprunable gitdir file points to non-existent location\n\n";
+                         worktree /w/api/gone\nHEAD 123\nprunable gitdir file points to non-existent location\n\n\
+                         worktree /w/api/new\nHEAD 456\ndetached\nlocked initializing\n\n\
+                         worktree /w/api/held\nHEAD 789\ndetached\nlocked by hand\n\n";
         let worktrees = parse_repo_worktrees(porcelain).expect("succeeds");
         assert_eq!(
             worktrees.main.head,
             Head::Branch("main".parse().expect("parses"))
         );
-        assert_eq!(worktrees.linked.len(), 1);
+        assert_eq!(
+            worktrees.linked.len(),
+            2,
+            "one still being created is skipped, one locked by hand stays"
+        );
         assert_eq!(worktrees.linked[0].head, Head::Detached);
+        assert_eq!(worktrees.linked[1].path, Path::new("/w/api/held"));
     }
 
     #[test]

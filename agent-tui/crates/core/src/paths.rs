@@ -128,11 +128,46 @@ impl AgentWorktree {
         &self.name
     }
 
-    /// Whether a checkout is there: a worktree's `.git` file. A directory
-    /// left behind by a removal isn't an agent.
+    /// Whether a checkout is there: a worktree's `.git` file, and git no
+    /// longer holding the worktree while it checks the files out.
     pub fn checked_out(&self) -> bool {
-        self.path.join(".git").exists()
+        self.checkout() == Checkout::Ready
     }
+
+    /// What's at the worktree's path.
+    pub fn checkout(&self) -> Checkout {
+        let Ok(dot_git) = std::fs::read_to_string(self.path.join(".git")) else {
+            return Checkout::Gone;
+        };
+        // `git worktree add` writes `locked` with this reason into the
+        // worktree's admin dir while it checks the files out
+        // (builtin/worktree.c, add_worktree), so the directory fills in
+        // behind a `.git` file that's already there.
+        let gitdir = dot_git
+            .lines()
+            .find_map(|line| line.strip_prefix("gitdir: "))
+            .map(|dir| PathBuf::from(dir.trim()));
+        let initialising = gitdir.is_some_and(|dir| {
+            std::fs::read_to_string(dir.join("locked"))
+                .is_ok_and(|reason| reason.trim() == "initializing")
+        });
+        if initialising {
+            Checkout::Initialising
+        } else {
+            Checkout::Ready
+        }
+    }
+}
+
+/// What an agent worktree's directory holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Checkout {
+    /// A finished checkout.
+    Ready,
+    /// `git worktree add` is still filling it in.
+    Initialising,
+    /// No `.git`: a directory left behind by a removal.
+    Gone,
 }
 
 /// Where agent worktrees live on disk.
@@ -218,9 +253,10 @@ impl Layout {
             }
             for agent in std::fs::read_dir(repo.path())? {
                 let path = agent?.path();
-                if path.join(".git").exists() {
-                    found.extend(self.worktree_at(&path));
-                }
+                found.extend(
+                    self.worktree_at(&path)
+                        .filter(|wt| wt.checkout() == Checkout::Ready),
+                );
             }
         }
         found.sort_by(|a, b| a.path.cmp(&b.path));
@@ -284,6 +320,26 @@ mod tests {
             .expect("succeeds");
         assert_eq!(wt.path(), Path::new("/w/api/fix"));
         assert_eq!(wt.name().as_str(), "fix");
+    }
+
+    #[test]
+    fn a_worktree_git_is_still_creating_isnt_scanned() {
+        let tmp = tempfile::tempdir().expect("a temp dir");
+        let layout = Layout::new(tmp.path().join("w")).expect("absolute");
+        let admin = tmp.path().join("repo/.git/worktrees/new");
+        std::fs::create_dir_all(&admin).expect("creates");
+        let new = layout.root().join("api/new");
+        std::fs::create_dir_all(&new).expect("creates");
+        std::fs::write(new.join(".git"), format!("gitdir: {}\n", admin.display())).expect("writes");
+        std::fs::write(admin.join("locked"), "initializing").expect("writes");
+        let wt = layout.worktree_at(&new).expect("an agent worktree");
+        assert_eq!(wt.checkout(), Checkout::Initialising);
+        assert!(layout.scan().expect("scans").is_empty(), "not listed yet");
+        std::fs::remove_file(admin.join("locked")).expect("removes");
+        assert_eq!(wt.checkout(), Checkout::Ready);
+        assert_eq!(layout.scan().expect("scans").len(), 1);
+        std::fs::remove_file(new.join(".git")).expect("removes");
+        assert_eq!(wt.checkout(), Checkout::Gone);
     }
 
     #[test]
