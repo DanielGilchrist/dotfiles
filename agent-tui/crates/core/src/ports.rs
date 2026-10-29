@@ -23,15 +23,54 @@ pub struct RepoWorktrees {
 }
 
 /// A worktree's work since it forked from the default branch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct Progress {
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WorktreeFacts {
     /// Commits on top of the fork point.
     pub ahead: usize,
-    /// Committed and uncommitted changes since the fork point.
-    pub diff: DiffStat,
+    /// Commits on the default branch since the fork point.
+    pub behind: usize,
+    /// Committed, uncommitted and untracked changes since the fork point.
+    pub changed: Vec<Change>,
+    /// Modified, staged and untracked files.
+    pub dirty: usize,
 }
 
-/// `git diff --shortstat`'s three numbers.
+/// A file changed since the fork point.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Change {
+    pub path: PathBuf,
+    pub lines: Lines,
+}
+
+/// How a changed file's lines changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Lines {
+    Counted {
+        added: usize,
+        removed: usize,
+    },
+    Binary,
+    /// A new file git isn't tracking yet.
+    Untracked,
+}
+
+impl WorktreeFacts {
+    pub fn diff(&self) -> DiffStat {
+        let counted = || {
+            self.changed.iter().filter_map(|c| match c.lines {
+                Lines::Counted { added, removed } => Some((added, removed)),
+                Lines::Binary | Lines::Untracked => None,
+            })
+        };
+        DiffStat {
+            files: self.changed.len(),
+            added: counted().map(|(added, _)| added).sum(),
+            removed: counted().map(|(_, removed)| removed).sum(),
+        }
+    }
+}
+
+/// Lines changed across a worktree's files.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DiffStat {
     pub files: usize,
@@ -129,8 +168,9 @@ pub trait Vcs: Send + Sync {
     /// remote ref (work on a detached HEAD).
     fn unreachable_commits(&self, worktree: &Path) -> Result<usize, CommandError>;
     fn delete_branch(&self, repo: &RepoRoot, branch: LocalBranch) -> Result<(), CommandError>;
-    /// How far a worktree has come since it forked from the default branch.
-    fn progress(&self, worktree: &Path) -> Result<Progress, CommandError>;
+    /// What a worktree has done since it forked from the default branch,
+    /// without taking locks the agent working in it might need.
+    fn facts(&self, worktree: &Path) -> Result<WorktreeFacts, CommandError>;
 }
 
 /// Where a live session's terminal is, when the host could tell.

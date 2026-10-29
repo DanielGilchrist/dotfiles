@@ -1,6 +1,7 @@
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::mpsc::{self, Sender};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 
 use agent_core::actions::CommandLine;
@@ -8,13 +9,16 @@ use agent_core::activity::Activity;
 use agent_core::model::{Removable, Running, Snapshot, Startable};
 use agent_core::names::{AgentName, Prompt, SessionName};
 use agent_core::ops::{self, Approved, Backend, Launch, RemovalPlan, Removed};
-use agent_core::ports::{ClientId, HarnessId, HostError, Progress};
+use agent_core::ports::{ClientId, HarnessId, HostError, WorktreeFacts};
 use crossterm::event::{KeyEvent, MouseEvent};
 
 use crate::model::{Launchable, RepoChoice, Ticket};
 
 /// How much of a failed action's stderr is read for its last line.
 const STDERR_TAIL: u64 = 64 * 1024;
+
+/// Threads reading git facts, so a slow repo holds up only its own agents.
+const INSPECTORS: usize = 2;
 
 /// How often the refresh thread checks what agents reported through hooks.
 const ACTIVITY_POLL: std::time::Duration = std::time::Duration::from_millis(500);
@@ -51,18 +55,11 @@ pub enum Msg {
     Focus(crate::model::TerminalFocus),
     /// What every agent's harness last reported, when it changed.
     Activities(HashMap<SessionName, Activity>),
-    /// Git facts about an agent's worktree, for the peek.
+    /// Git facts about an agent's worktree.
     Inspected {
         name: SessionName,
-        facts: Result<Facts, String>,
+        facts: Result<WorktreeFacts, String>,
     },
-}
-
-/// An agent's worktree as the peek shows it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Facts {
-    pub progress: Progress,
-    pub dirty: usize,
 }
 
 pub enum Outcome {
@@ -123,11 +120,6 @@ pub enum Job {
     },
     /// The user saw an agent's finished turn.
     Acknowledge(SessionName),
-    /// Read git facts about an agent's worktree; runs on its own thread.
-    Inspect {
-        name: SessionName,
-        worktree: std::path::PathBuf,
-    },
     /// Start a configured action's process; a failure is reported when it exits.
     Run {
         label: String,
@@ -151,7 +143,6 @@ impl Job {
             | Self::SuggestName { .. }
             | Self::TakeOver { .. }
             | Self::Acknowledge(_)
-            | Self::Inspect { .. }
             | Self::Run { .. } => false,
         }
     }
@@ -174,8 +165,16 @@ pub fn describe(e: &(dyn std::error::Error + 'static)) -> String {
 
 pub struct Workers {
     pub jobs: Sender<Job>,
+    inspector: Arc<Inspector>,
     pub refresh: Sender<()>,
     worker: Option<JoinHandle<()>>,
+}
+
+impl Workers {
+    /// Asks for git facts about an agent's worktree.
+    pub fn inspect(&self, name: SessionName, worktree: PathBuf) {
+        self.inspector.request(name, worktree);
+    }
 }
 
 impl Drop for Workers {
@@ -187,6 +186,80 @@ impl Drop for Workers {
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
+    }
+}
+
+/// Reads git facts on [`INSPECTORS`] threads, one request per agent at a
+/// time. A request for an agent already being read waits its turn, so the
+/// answer reflects its latest state.
+struct Inspector {
+    queue: Mutex<Inspections>,
+    ready: Condvar,
+}
+
+#[derive(Default)]
+struct Inspections {
+    waiting: Vec<(SessionName, PathBuf)>,
+    reading: HashSet<SessionName>,
+}
+
+impl Inspector {
+    fn spawn(backend: &Arc<Backend>, msgs: &Sender<Msg>) -> Arc<Self> {
+        let inspector = Arc::new(Self {
+            queue: Mutex::new(Inspections::default()),
+            ready: Condvar::new(),
+        });
+        for _ in 0..INSPECTORS {
+            let inspector = Arc::clone(&inspector);
+            let backend = Arc::clone(backend);
+            let msgs = msgs.clone();
+            thread::spawn(move || {
+                loop {
+                    let (name, worktree) = inspector.next();
+                    let facts = backend.vcs.facts(&worktree).map_err(|e| describe(&e));
+                    inspector.done(&name);
+                    if msgs.send(Msg::Inspected { name, facts }).is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+        inspector
+    }
+
+    fn request(&self, name: SessionName, worktree: PathBuf) {
+        let mut queue = self.queue.lock().expect("inspections lock");
+        match queue.waiting.iter_mut().find(|(n, _)| *n == name) {
+            Some(waiting) => waiting.1 = worktree,
+            None => queue.waiting.push((name, worktree)),
+        }
+        self.ready.notify_one();
+    }
+
+    /// The oldest request for an agent that isn't being read.
+    fn next(&self) -> (SessionName, PathBuf) {
+        let mut queue = self.queue.lock().expect("inspections lock");
+        loop {
+            let free = queue
+                .waiting
+                .iter()
+                .position(|(name, _)| !queue.reading.contains(name));
+            if let Some(at) = free {
+                let (name, worktree) = queue.waiting.remove(at);
+                queue.reading.insert(name.clone());
+                return (name, worktree);
+            }
+            queue = self.ready.wait(queue).expect("inspections lock");
+        }
+    }
+
+    fn done(&self, name: &SessionName) {
+        self.queue
+            .lock()
+            .expect("inspections lock")
+            .reading
+            .remove(name);
+        self.ready.notify_all();
     }
 }
 
@@ -222,6 +295,7 @@ pub fn spawn(backend: Arc<Backend>, msgs: Sender<Msg>) -> Workers {
         });
     }
 
+    let inspector = Inspector::spawn(&backend, &msgs);
     let (jobs, rx) = mpsc::channel::<Job>();
     let after = refresh.clone();
     let worker = thread::spawn(move || {
@@ -239,6 +313,7 @@ pub fn spawn(backend: Arc<Backend>, msgs: Sender<Msg>) -> Workers {
     });
     Workers {
         jobs,
+        inspector,
         refresh,
         worker: Some(worker),
     }
@@ -373,24 +448,6 @@ fn run(backend: &Arc<Backend>, job: Job, msgs: &Sender<Msg>) -> Option<Msg> {
             Ok(()) => return None,
             Err(e) => Msg::Done(Err(describe(&e))),
         },
-        Job::Inspect { name, worktree } => {
-            let backend = Arc::clone(backend);
-            let msgs = msgs.clone();
-            thread::spawn(move || {
-                let vcs = &backend.vcs;
-                let facts = vcs
-                    .progress(&worktree)
-                    .and_then(|progress| {
-                        Ok(Facts {
-                            progress,
-                            dirty: vcs.dirty_files(&worktree)?,
-                        })
-                    })
-                    .map_err(|e| describe(&e));
-                let _ = msgs.send(Msg::Inspected { name, facts });
-            });
-            return None;
-        }
         Job::Kill(running) => Msg::Done(
             ops::kill(svc, &running)
                 .map(|()| Outcome::Killed(running.name().clone()))

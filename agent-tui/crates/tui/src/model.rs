@@ -12,11 +12,9 @@ use agent_core::model::{
 use agent_core::names::{AgentName, Prompt, SessionName};
 use agent_core::ops::{Approved, Hazardous, RemovalPlan};
 use agent_core::paths::RepoRoot;
-use agent_core::ports::HarnessId;
+use agent_core::ports::{HarnessId, WorktreeFacts};
 use agent_term::{Emulator, Terminal};
 use ratatui::layout::Rect;
-
-use crate::worker::Facts;
 
 pub const PREVIEW_DEBOUNCE: Duration = Duration::from_millis(150);
 pub const INFO_TTL: Duration = Duration::from_secs(4);
@@ -268,6 +266,14 @@ pub enum AgentStatus {
         summary: Option<String>,
         since: SystemTime,
     },
+}
+
+/// When an agent's git facts were asked for, and how many events it had
+/// reported then.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Inspection {
+    pub events: Option<u64>,
+    pub at: Instant,
 }
 
 /// What a working agent is busy with.
@@ -625,11 +631,10 @@ pub struct Model {
     pub activities: Option<HashMap<SessionName, Activity>>,
     /// The clock for this frame, so every row, count and title agrees.
     pub now: SystemTime,
-    /// Git facts for the agent the peek shows, and when they were asked for.
-    pub facts: Option<(SessionName, Facts)>,
-    pub inspected: Option<(SessionName, Instant)>,
-    /// When the peek's facts should be asked for again.
-    pub inspect_due: Option<Instant>,
+    /// Each agent's git facts, or why they couldn't be read, as last read.
+    pub facts: HashMap<SessionName, Result<WorktreeFacts, String>>,
+    /// When each agent's facts were last asked for.
+    pub inspections: HashMap<SessionName, Inspection>,
     /// The finished turn last marked seen, so it's marked once.
     pub acknowledged: Option<(SessionName, u64)>,
     pub last_bell: Option<Instant>,
@@ -667,9 +672,8 @@ impl Model {
             keys: Keys::default(),
             activities: None,
             now: SystemTime::now(),
-            facts: None,
-            inspected: None,
-            inspect_due: None,
+            facts: HashMap::new(),
+            inspections: HashMap::new(),
             acknowledged: None,
             last_bell: None,
             bell_due: None,

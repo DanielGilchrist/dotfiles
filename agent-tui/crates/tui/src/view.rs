@@ -1614,8 +1614,14 @@ fn peek(m: &Model, width: usize) -> Option<Peek> {
             Line::from(fit(vec![Span::styled(format!("› {prompt}"), dim())], width)),
         ));
     }
-    if let Some((_, facts)) = m.facts.as_ref().filter(|(name, _)| name == entry.name()) {
-        let diff = facts.progress.diff;
+    if let Some(Err(e)) = m.facts.get(entry.name()) {
+        lines.push((
+            4,
+            Line::from(fit(vec![Span::styled(format!("git: {e}"), dim())], width)),
+        ));
+    }
+    if let Some(Ok(facts)) = m.facts.get(entry.name()) {
+        let diff = facts.diff();
         let changes = match diff.files {
             0 => vec![Span::styled("no changes", dim())],
             files => vec![
@@ -1630,8 +1636,11 @@ fn peek(m: &Model, width: usize) -> Option<Peek> {
         };
         lines.push((4, Line::from(changes)));
         let mut git = Vec::new();
-        if facts.progress.ahead > 0 {
-            git.push(format!("↑{}", facts.progress.ahead));
+        if facts.ahead > 0 {
+            git.push(format!("↑{}", facts.ahead));
+        }
+        if facts.behind > 0 {
+            git.push(format!("↓{}", facts.behind));
         }
         if facts.dirty > 0 {
             git.push(format!("{} uncommitted", facts.dirty));

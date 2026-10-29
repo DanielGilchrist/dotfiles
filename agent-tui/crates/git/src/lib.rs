@@ -8,7 +8,8 @@ use agent_core::model::{Head, Worktree};
 use agent_core::names::BranchName;
 use agent_core::paths::{AgentWorktree, RepoRoot};
 use agent_core::ports::{
-    BranchState, DiffStat, LocalBranch, Progress, RemoteBranch, RepoWorktrees, Vcs, WorktreeStart,
+    BranchState, Change, Lines, LocalBranch, RemoteBranch, RepoWorktrees, Vcs, WorktreeFacts,
+    WorktreeStart,
 };
 use agent_core::process::{self, CommandError};
 
@@ -33,11 +34,46 @@ fn custom_ssh() -> bool {
 
 fn git(dir: &Path) -> Command {
     let mut cmd = process::quiet("git");
-    cmd.env("GIT_TERMINAL_PROMPT", "0").arg("-C").arg(dir);
+    cmd.env("GIT_TERMINAL_PROMPT", "0")
+        .arg("-C")
+        .arg(dir)
+        .arg("--no-optional-locks");
     if !custom_ssh() {
         cmd.env("GIT_SSH_COMMAND", "ssh -oBatchMode=yes");
     }
     cmd
+}
+
+/// `git diff --numstat -z` output: `added\tremoved\tpath\0` per file, with
+/// `-` counts for binary files.
+fn parse_numstat(out: &str) -> Vec<Change> {
+    out.split('\0')
+        .filter_map(|entry| {
+            let mut fields = entry.splitn(3, '\t');
+            let added = fields.next()?;
+            let removed = fields.next()?;
+            let path = fields.next().filter(|p| !p.is_empty())?;
+            let lines = match (added.parse(), removed.parse()) {
+                (Ok(added), Ok(removed)) => Lines::Counted { added, removed },
+                _ => Lines::Binary,
+            };
+            Some(Change {
+                path: PathBuf::from(path),
+                lines,
+            })
+        })
+        .collect()
+}
+
+/// `git status --porcelain=v1 -z --no-renames` output: `XY path\0` per
+/// file.
+fn parse_status(out: &str) -> Vec<(String, PathBuf)> {
+    out.split('\0')
+        .filter_map(|entry| {
+            let (code, path) = (entry.get(..2)?, entry.get(3..)?);
+            (!path.is_empty()).then(|| (code.to_string(), PathBuf::from(path)))
+        })
+        .collect()
 }
 
 fn parse_error(cmd: &Command, detail: impl Into<String>) -> CommandError {
@@ -106,22 +142,26 @@ impl Git {
     }
 
     /// `git diff --shortstat` of the working tree against `since`.
-    fn shortstat(dir: &Path, since: &str) -> Result<DiffStat, CommandError> {
+    /// Lines changed per file since `since`, committed or not.
+    fn numstat(dir: &Path, since: &str) -> Result<Vec<Change>, CommandError> {
         let mut cmd = git(dir);
-        cmd.args(["diff", "--shortstat", since]);
+        cmd.args(["diff", "--numstat", "--no-renames", "-z", since]);
         let out = process::run(&mut cmd)?;
-        let number = |unit: &str| {
-            out.split(',')
-                .find(|part| part.contains(unit))
-                .and_then(|part| part.split_whitespace().next())
-                .and_then(|n| n.parse().ok())
-                .unwrap_or(0)
-        };
-        Ok(DiffStat {
-            files: number("file"),
-            added: number("insertion"),
-            removed: number("deletion"),
-        })
+        Ok(parse_numstat(&out))
+    }
+
+    /// Every modified, staged and untracked file, as `status` codes and
+    /// paths.
+    fn status(dir: &Path) -> Result<Vec<(String, PathBuf)>, CommandError> {
+        let mut cmd = git(dir);
+        cmd.args([
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--no-renames",
+            "--untracked-files=all",
+        ]);
+        Ok(parse_status(&process::run(&mut cmd)?))
     }
 
     fn count(dir: &Path, range: &[&str]) -> Result<usize, CommandError> {
@@ -334,29 +374,56 @@ impl Vcs for Git {
     }
 
     fn dirty_files(&self, worktree: &Path) -> Result<usize, CommandError> {
-        let mut cmd = git(worktree);
-        cmd.args(["status", "--porcelain=v1", "-z", "--untracked-files=all"]);
-        let out = process::run(&mut cmd)?;
-        Ok(out.split('\0').filter(|entry| entry.len() > 3).count())
+        Ok(Self::status(worktree)?.len())
     }
 
     fn unreachable_commits(&self, worktree: &Path) -> Result<usize, CommandError> {
         Self::count(worktree, &["HEAD", "--not", "--branches", "--remotes"])
     }
 
-    fn progress(&self, worktree: &Path) -> Result<Progress, CommandError> {
+    fn facts(&self, worktree: &Path) -> Result<WorktreeFacts, CommandError> {
+        let status = Self::status(worktree)?;
+        let untracked = status
+            .iter()
+            .filter(|(code, _)| code == "??")
+            .map(|(_, path)| Change {
+                path: path.clone(),
+                lines: Lines::Untracked,
+            });
+        let dirty = status.len();
         let Some(base) = Self::default_base(worktree)? else {
-            return Ok(Progress {
-                ahead: 0,
-                diff: Self::shortstat(worktree, "HEAD")?,
+            let mut changed = Self::numstat(worktree, "HEAD")?;
+            changed.extend(untracked);
+            return Ok(WorktreeFacts {
+                changed,
+                dirty,
+                ..WorktreeFacts::default()
             });
         };
         let mut cmd = git(worktree);
         cmd.args(["merge-base", "HEAD", &base]);
         let fork = process::run(&mut cmd)?.trim().to_string();
-        Ok(Progress {
-            ahead: Self::count(worktree, &[&format!("{fork}..HEAD")])?,
-            diff: Self::shortstat(worktree, &fork)?,
+        let mut cmd = git(worktree);
+        cmd.args([
+            "rev-list",
+            "--left-right",
+            "--count",
+            &format!("{base}...HEAD"),
+        ]);
+        let counts = process::run(&mut cmd)?;
+        let (behind, ahead) = counts
+            .split_once('\t')
+            .and_then(|(behind, ahead)| {
+                Some((behind.trim().parse().ok()?, ahead.trim().parse().ok()?))
+            })
+            .ok_or_else(|| parse_error(&cmd, format!("expected two counts, got {counts:?}")))?;
+        let mut changed = Self::numstat(worktree, &fork)?;
+        changed.extend(untracked);
+        Ok(WorktreeFacts {
+            ahead,
+            behind,
+            changed,
+            dirty,
         })
     }
 
@@ -434,7 +501,7 @@ mod tests {
     }
 
     #[test]
-    fn progress_counts_commits_and_changes_since_the_fork() {
+    fn facts_count_commits_both_ways_and_changes_since_the_fork() {
         let tmp = tempfile::tempdir().unwrap();
         let origin = tmp.path().join("origin");
         let work = tmp.path().join("work");
@@ -463,16 +530,51 @@ mod tests {
         git(&work, &["add", "a.txt"]);
         git(&work, &["commit", "-q", "-m", "a"]);
         std::fs::write(work.join("a.txt"), "one\n").unwrap();
-        let progress = Git.progress(&work).unwrap();
-        assert_eq!(progress.ahead, 1);
+        git(
+            &origin,
+            &["commit", "-q", "--allow-empty", "-m", "upstream"],
+        );
+        git(&work, &["fetch", "-q"]);
+        let facts = Git.facts(&work).unwrap();
+        assert_eq!((facts.ahead, facts.behind, facts.dirty), (1, 1, 1));
+        std::fs::write(work.join("new.txt"), "x\n").unwrap();
+        let facts = Git.facts(&work).unwrap();
         assert_eq!(
-            progress.diff,
-            DiffStat {
-                files: 1,
-                added: 1,
-                removed: 0
-            },
-            "uncommitted edits count too"
+            facts.changed,
+            [
+                Change {
+                    path: "a.txt".into(),
+                    lines: Lines::Counted {
+                        added: 1,
+                        removed: 0
+                    }
+                },
+                Change {
+                    path: "new.txt".into(),
+                    lines: Lines::Untracked
+                },
+            ],
+            "uncommitted and untracked work counts too"
+        );
+    }
+
+    #[test]
+    fn numstat_reads_binary_files_and_odd_paths() {
+        assert_eq!(
+            parse_numstat("3\t1\tsrc/a b.rs\0-\t-\tlogo.png\0"),
+            [
+                Change {
+                    path: "src/a b.rs".into(),
+                    lines: Lines::Counted {
+                        added: 3,
+                        removed: 1
+                    }
+                },
+                Change {
+                    path: "logo.png".into(),
+                    lines: Lines::Binary
+                },
+            ]
         );
     }
 

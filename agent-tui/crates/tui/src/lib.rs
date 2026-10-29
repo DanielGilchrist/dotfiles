@@ -318,6 +318,7 @@ impl Runtime {
             match effect {
                 Effect::Quit => return Ok(Flow::Quit),
                 Effect::Job(job) => self.send(job)?,
+                Effect::Inspect { name, worktree } => self.workers.inspect(name, worktree),
                 Effect::Attach {
                     name,
                     intent,

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
@@ -16,9 +16,9 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent
 use ratatui::layout::Position;
 
 use crate::model::{
-    Answer, Chord, Confirm, Cursor, Edge, Enter, Field, Focus, Follow, INFO_TTL, Intent, Mode,
-    Model, NamingState, NewAgent, Overlay, Pane, Phase, Query, Reach, StatusKind, Submission,
-    TerminalFocus, Ticket, View, fuzzy_match, repo_matches,
+    Answer, Chord, Confirm, Cursor, Edge, Enter, Field, Focus, Follow, INFO_TTL, Inspection,
+    Intent, Mode, Model, NamingState, NewAgent, Overlay, Pane, Phase, Query, Reach, StatusKind,
+    Submission, TerminalFocus, Ticket, View, fuzzy_match, repo_matches,
 };
 use crate::worker::{Job, Msg, Outcome};
 
@@ -30,11 +30,18 @@ const BELL_EVERY: Duration = Duration::from_secs(10);
 /// A turn this long rings when it finishes; shorter ones you were probably
 /// watching.
 const LONG_TURN: Duration = Duration::from_secs(30);
-/// The peek's git facts refresh on its agent's activity, at most this often.
+/// An agent's git facts refresh on its activity, at most this often.
 const REINSPECT_AFTER: Duration = Duration::from_secs(3);
+/// And this often whatever it does.
+const SLOW_REFRESH: Duration = Duration::from_secs(30);
 
 pub enum Effect {
     Job(Job),
+    /// Read git facts about an agent's worktree.
+    Inspect {
+        name: SessionName,
+        worktree: PathBuf,
+    },
     /// Attach to an existing session (resurrecting it if it exited).
     Attach {
         name: SessionName,
@@ -118,6 +125,7 @@ pub fn update(m: &mut Model, msg: Msg) -> Vec<Effect> {
         Msg::Resize => Vec::new(),
         Msg::Snapshot(Ok((snapshot, warnings))) => {
             m.load(snapshot);
+            forget_gone(m);
             if !warnings.is_empty() && warnings != m.last_warnings {
                 let more = if warnings.len() > 1 {
                     format!(" (+{} more in `agent ls`)", warnings.len() - 1)
@@ -167,9 +175,8 @@ pub fn update(m: &mut Model, msg: Msg) -> Vec<Effect> {
             Vec::new()
         }
         Msg::Inspected { name, facts } => {
-            match facts {
-                Ok(facts) => m.facts = Some((name, facts)),
-                Err(e) => m.error(e),
+            if m.inspections.contains_key(&name) {
+                m.facts.insert(name, facts);
             }
             Vec::new()
         }
@@ -225,7 +232,7 @@ pub fn tick(m: &mut Model) -> Vec<Effect> {
     effects.extend(bell(m));
     effects.extend(acknowledge(m, SEEN_AFTER).map(Effect::Job));
     effects.extend(preview(m));
-    effects.extend(inspect(m).map(Effect::Job));
+    effects.extend(inspect(m));
     effects
 }
 
@@ -317,23 +324,11 @@ fn report(m: &mut Model, outcome: Outcome) {
 }
 
 /// New reports from the agents: queue a bell if one newly needs the user,
-/// refresh the peek's git facts if its agent did something, and move the
-/// cursor off a Needs you row that's gone.
+/// and move the cursor off a Needs you row that's gone.
 fn on_activities(m: &mut Model, activities: HashMap<SessionName, Activity>) -> Vec<Effect> {
     if newly_waiting(m, &activities) {
         let allowed = m.last_bell.map_or_else(Instant::now, |at| at + BELL_EVERY);
         m.bell_due = Some(m.bell_due.map_or(allowed, |due| due.min(allowed)));
-    }
-    let target = m.peek_target().map(|e| e.name().clone());
-    let events = |all: Option<&HashMap<SessionName, Activity>>| {
-        target.as_ref().and_then(|t| all?.get(t)).map(|a| a.events)
-    };
-    if events(m.activities.as_ref()) != events(Some(&activities)) {
-        let allowed = m
-            .inspected
-            .as_ref()
-            .map_or_else(Instant::now, |(_, at)| *at + REINSPECT_AFTER);
-        m.inspect_due = Some(allowed);
     }
     m.activities = Some(activities);
     m.revalidate();
@@ -362,20 +357,48 @@ fn acknowledge(m: &mut Model, after: Duration) -> Option<Job> {
     Some(Job::Acknowledge(c.name.clone()))
 }
 
-/// Asks for git facts about the peek's agent when it changed, or when its
-/// agent's activity made a refresh due.
-fn inspect(m: &mut Model) -> Option<Job> {
-    let entry = m.peek_target()?;
-    let name = entry.name().clone();
-    let worktree = entry.path()?.to_path_buf();
-    let same = matches!(&m.inspected, Some((n, _)) if *n == name);
-    let due = m.inspect_due.is_some_and(|at| Instant::now() >= at);
-    if same && !due {
-        return None;
-    }
-    m.inspected = Some((name.clone(), Instant::now()));
-    m.inspect_due = None;
-    Some(Job::Inspect { name, worktree })
+/// Drops what's known about entries that are no longer in the snapshot.
+fn forget_gone(m: &mut Model) {
+    let Some(snapshot) = m.snapshot() else {
+        return;
+    };
+    let known: HashSet<SessionName> = snapshot.entries().map(|(_, e)| e.name().clone()).collect();
+    m.inspections.retain(|name, _| known.contains(name));
+    m.facts.retain(|name, _| known.contains(name));
+}
+
+/// Asks for git facts about every agent with a checkout: soon after it
+/// reports something, and every [`SLOW_REFRESH`] regardless, since the
+/// user's own edits fire no hook. A checkout git can't read is only retried
+/// at the slow pace.
+fn inspect(m: &mut Model) -> Vec<Effect> {
+    let Some(snapshot) = m.snapshot() else {
+        return Vec::new();
+    };
+    let now = Instant::now();
+    let due: Vec<_> = snapshot
+        .entries()
+        .filter(|(_, e)| e.head().is_some())
+        .filter_map(|(_, entry)| {
+            let events = m.activity(entry.name()).map(|a| a.events);
+            let failing = matches!(m.facts.get(entry.name()), Some(Err(_)));
+            let due = m.inspections.get(entry.name()).is_none_or(|last| {
+                now >= last.at + SLOW_REFRESH
+                    || (!failing && last.events != events && now >= last.at + REINSPECT_AFTER)
+            });
+            if !due {
+                return None;
+            }
+            Some((entry.name().clone(), entry.path()?.to_path_buf(), events))
+        })
+        .collect();
+    due.into_iter()
+        .map(|(name, worktree, events)| {
+            m.inspections
+                .insert(name.clone(), Inspection { events, at: now });
+            Effect::Inspect { name, worktree }
+        })
+        .collect()
 }
 
 /// Rings the queued bell once the rate limit allows.
@@ -1747,6 +1770,45 @@ mod tests {
             Msg::Snapshot(Ok((snapshot(sessions, &[]), Vec::new()))),
         );
         m
+    }
+
+    #[test]
+    fn every_checkout_is_inspected_and_again_soon_after_its_agent_reports() {
+        let mut m = two_live();
+        let inspected = |m: &mut Model| {
+            let mut names: Vec<String> = tick(m)
+                .into_iter()
+                .filter_map(|e| match e {
+                    Effect::Inspect { name, .. } => Some(name.to_string()),
+                    _ => None,
+                })
+                .collect();
+            names.sort();
+            names
+        };
+        let earlier = |m: &mut Model, secs| {
+            for last in m.inspections.values_mut() {
+                last.at -= Duration::from_secs(secs);
+            }
+        };
+        assert_eq!(inspected(&mut m), ["api", "fix", "idle", "web"]);
+        assert_eq!(inspected(&mut m), [""; 0]);
+        m.activities
+            .get_or_insert_default()
+            .insert(name("fix"), reported(agent_core::activity::State::Idle, 0));
+        assert_eq!(
+            inspected(&mut m),
+            [""; 0],
+            "not straight after the last read"
+        );
+        earlier(&mut m, 5);
+        assert_eq!(inspected(&mut m), ["fix"]);
+        earlier(&mut m, 31);
+        assert_eq!(
+            inspected(&mut m),
+            ["api", "fix", "idle", "web"],
+            "edits outside hooks are picked up"
+        );
     }
 
     #[test]

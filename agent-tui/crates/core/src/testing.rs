@@ -12,8 +12,8 @@ use crate::names::{BranchName, Prompt, SessionName};
 use crate::paths::{AgentWorktree, RepoRoot};
 use crate::ports::{
     AgentRecord, BranchState, ClientControl, Harness, HarnessError, HarnessId, Harnesses,
-    HostError, LaunchCtx, LocalBranch, PaneCommand, PendingPrompt, Progress, RemoteBranch,
-    RepoWorktrees, Seen, SessionHost, SessionInfo, SessionStatus, Store, StoreError, Vcs,
+    HostError, LaunchCtx, LocalBranch, PaneCommand, PendingPrompt, RemoteBranch, RepoWorktrees,
+    Seen, SessionHost, SessionInfo, SessionStatus, Store, StoreError, Vcs, WorktreeFacts,
     WorktreeStart,
 };
 use crate::process::{CommandError, LaunchSpec};
@@ -147,8 +147,8 @@ impl Vcs for FakeVcs {
             .unwrap_or(0))
     }
 
-    fn progress(&self, _: &Path) -> Result<Progress, CommandError> {
-        Ok(Progress::default())
+    fn facts(&self, _: &Path) -> Result<WorktreeFacts, CommandError> {
+        Ok(WorktreeFacts::default())
     }
 
     fn delete_branch(&self, _: &RepoRoot, branch: LocalBranch) -> Result<(), CommandError> {
