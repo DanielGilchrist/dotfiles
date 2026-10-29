@@ -8,7 +8,7 @@
 # nav = "ctrl-\\"  # leaves the agent for NAV (default)
 
 [[action]]
-key = "s"
+key = "d"
 label = "dev server"
 # wezterm/commands.lua handles this: pick a region, then open the dev tabs.
 terminal_event = { name = "agent-spawn-dev", value = "{path}" }

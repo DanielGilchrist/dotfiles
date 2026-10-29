@@ -103,7 +103,7 @@ does one of these:
 
 ```toml
 [[action]]
-key = "s"
+key = "d"
 label = "dev server"
 terminal_event = { name = "agent-spawn-dev", value = "{path}" }
 
