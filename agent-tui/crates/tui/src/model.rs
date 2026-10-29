@@ -45,6 +45,15 @@ pub enum WorkRoom {
     Hidden,
 }
 
+/// What a move past the end of a list does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Wrap {
+    /// Continues from the other end.
+    Around,
+    /// Stops at the end.
+    Clamp,
+}
+
 /// What [2] has beyond its rows, as last drawn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Turn {
@@ -724,6 +733,9 @@ pub struct Areas {
     /// Inside the sidebar's border, empty while it's hidden.
     pub sidebar: Rect,
     pub rows: Vec<(u16, Cursor)>,
+    /// Rows inside the panel the keys go to, as last drawn, so a half-page
+    /// move knows how far that is.
+    pub page: usize,
 }
 
 /// Where the sidebar list was scrolled to, and where the selection sat on
@@ -899,10 +911,20 @@ impl Model {
     /// Moves within the focused panel: the selection in [1], the scroll in
     /// [2], the file cursor in [3]. [2] is clamped when it's drawn, since
     /// only the view knows how long it is.
+    /// One row at a time wraps around the list. A page at a time stops at
+    /// the ends, since it's for reading through, not cycling.
     pub fn move_in_panel(&mut self, delta: isize) {
+        self.move_in_panel_by(delta, Wrap::Around);
+    }
+
+    pub fn page_in_panel(&mut self, delta: isize) {
+        self.move_in_panel_by(delta, Wrap::Clamp);
+    }
+
+    fn move_in_panel_by(&mut self, delta: isize, wrap: Wrap) {
         self.panel = match self.panel {
             Panel::Agents => {
-                self.move_cursor(delta);
+                self.move_cursor_by(delta, wrap);
                 Panel::Agents
             }
             Panel::Agent { offset } => Panel::Agent {
@@ -914,6 +936,13 @@ impl Model {
                     .min(self.changes().len().saturating_sub(1)),
             },
         };
+    }
+
+    /// Half the focused panel's rows, at least one.
+    pub fn half_page(&self) -> isize {
+        isize::try_from(self.areas.page / 2)
+            .unwrap_or(isize::MAX)
+            .max(1)
     }
 
     pub fn panel_to_edge(&mut self, edge: Edge) {
@@ -1433,7 +1462,8 @@ impl Model {
         self.preview_at = Some(Instant::now() + PREVIEW_DEBOUNCE);
     }
 
-    pub fn move_cursor(&mut self, delta: isize) {
+    /// Moves the selection `delta` rows, past the ends as `wrap` says.
+    pub fn move_cursor_by(&mut self, delta: isize, wrap: Wrap) {
         let items = self.items();
         if items.is_empty() {
             return;
@@ -1442,9 +1472,13 @@ impl Model {
             .cursor()
             .and_then(|c| items.iter().position(|i| i == c))
             .unwrap_or(0);
-        let next = current
-            .checked_add_signed(delta)
-            .map_or(items.len() - 1, |n| n % items.len());
+        let last = items.len() - 1;
+        let next = match wrap {
+            Wrap::Around => current
+                .checked_add_signed(delta)
+                .map_or(last, |n| n % items.len()),
+            Wrap::Clamp => current.saturating_add_signed(delta).min(last),
+        };
         self.set_cursor(items[next].clone());
     }
 

@@ -53,6 +53,7 @@ types into the embedded session. `?` shows every key.
 | `⌃\` | Back to NAV from an agent. Twice goes to the previous agent |
 | `1` `2` `3` | Focus the Agents, turn and Changes panels. Focusing [2] or [3] expands it and shrinks the others, lazygit-style. From [2] or [3], `Esc` goes back to Agents |
 | `j k g G`, `[ ]` | Move in the focused panel, previous / next repo |
+| `⌃D ⌃U` | Half a page in the focused panel, handy in Changes |
 | `Space` / `/` | Switcher (fuzzy), `⌃N ⌃P` to move |
 | `m` | Pin / unpin (pinned agents get their own group) |
 | `n` | New agent form: prompt (`⌃E` edits it in $EDITOR), name (suggested from the prompt or a Linear/GitHub link), repo (listed, from the catalogue, or a path) |

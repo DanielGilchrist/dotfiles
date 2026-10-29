@@ -650,6 +650,10 @@ fn on_nav_key(m: &mut Model, key: KeyEvent) -> Vec<Effect> {
             (_, Some(entry)) => return activate(m, entry.name()),
             _ => {}
         },
+        KeyCode::Char('d') if ctrl(&key, 'd') => m.page_in_panel(m.half_page()),
+        KeyCode::Char('u') if ctrl(&key, 'u') => m.page_in_panel(-m.half_page()),
+        KeyCode::PageDown => m.page_in_panel(m.half_page() * 2),
+        KeyCode::PageUp => m.page_in_panel(-m.half_page() * 2),
         KeyCode::Char('j') | KeyCode::Down => m.move_in_panel(1),
         KeyCode::Char('k') | KeyCode::Up => m.move_in_panel(-1),
         KeyCode::Char('g') | KeyCode::Home => m.panel_to_edge(Edge::First),
@@ -1366,6 +1370,40 @@ mod tests {
             ));
         }
         assemble(&obs, &Layout::new("/w".into()).expect("absolute"), &[]).0
+    }
+
+    #[test]
+    fn ctrl_d_and_ctrl_u_move_half_a_page_in_the_focused_panel() {
+        let mut m = model(&[]);
+        m.areas.page = 6;
+        let selected_before = selected(&m);
+        update(
+            &mut m,
+            Msg::Key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL)),
+        );
+        assert_ne!(selected(&m), selected_before, "moves the selection in [1]");
+        assert_eq!(
+            selected(&m).as_deref(),
+            Some("idle"),
+            "stops at the end rather than wrapping"
+        );
+        m.panel = Panel::Agent { offset: 0 };
+        update(
+            &mut m,
+            Msg::Key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL)),
+        );
+        assert_eq!(m.panel, Panel::Agent { offset: 3 });
+        update(
+            &mut m,
+            Msg::Key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL)),
+        );
+        assert_eq!(m.panel, Panel::Agent { offset: 0 });
+        m.areas.page = 1;
+        update(
+            &mut m,
+            Msg::Key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL)),
+        );
+        assert_eq!(m.panel, Panel::Agent { offset: 1 }, "at least one row");
     }
 
     #[test]

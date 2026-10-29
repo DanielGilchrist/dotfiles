@@ -45,6 +45,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
             ("Esc i", "back to [1], then to the agent"),
             ("1 2 3", "focus agents, turn, changes"),
             ("j k", "move, or scroll [2] [3]"),
+            ("⌃D ⌃U", "half a page"),
             ("g G", "first / last"),
             ("[ ]", "previous / next repo"),
             ("Space /", "switch agent"),

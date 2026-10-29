@@ -163,6 +163,7 @@ NAV:
 | `⏎` / `l` | AGENT on the selected agent (starts or resurrects as needed) |
 | `1` / `2` / `3` | focus [1] the fleet, [2] the turn, [3] Changes. Focusing [2] shows all of it, which the footer offers as `2 read` while rows are hidden |
 | `j`/`k`, `g`/`G` | move the selection in [1], scroll [2], move the file cursor in [3] |
+| `⌃D`/`⌃U`, `PgDn`/`PgUp` | the same, half a page or a page at a time, measured on the focused panel as last drawn |
 | `[` / `]` | previous / next repo |
 | `p` | repo picker: focus a listed repo, or add one from the catalogue or by path |
 | `Space` / `/` | switcher |

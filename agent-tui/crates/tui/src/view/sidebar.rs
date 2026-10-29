@@ -1504,6 +1504,18 @@ pub(super) fn draw(frame: &mut Frame<'_>, m: &mut Model, area: Rect, border: Sty
             None => return,
         }
     };
+    m.areas.page = match laid.focus {
+        Focused::Agents => usize::from(laid.list.area.height),
+        Focused::Agent { .. } => laid
+            .agent
+            .as_ref()
+            .map_or(0, |(p, _)| usize::from(p.area.height)),
+        Focused::Changes { .. } => laid
+            .changes
+            .as_ref()
+            .map_or(0, |(p, _)| usize::from(p.area.height)),
+    }
+    .saturating_sub(2);
     let list = panel(title, corner, style_of(agents), nav && agents);
     frame.render_widget(Paragraph::new(laid.list.lines).block(list), laid.list.area);
     if let Some((Panel { area, lines }, detail)) = laid.agent {
@@ -1922,7 +1934,7 @@ mod tests {
                 render(&mut m, size);
                 for _ in 0..agents.min(12) {
                     let before = heights(&m);
-                    m.move_cursor(1);
+                    m.move_in_panel(1);
                     render(&mut m, size);
                     for (cursor, height) in &heights(&m) {
                         if let Some(was) = before.get(cursor) {
