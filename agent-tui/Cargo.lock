@@ -46,6 +46,8 @@ name = "agent-harness"
 version = "0.1.0"
 dependencies = [
  "agent-core",
+ "nix 0.31.3",
+ "serde",
  "serde_json",
  "shell-words",
  "tempfile",
