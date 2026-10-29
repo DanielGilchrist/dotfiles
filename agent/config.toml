@@ -14,6 +14,14 @@ label = "dev server"
 terminal_event = { name = "agent-spawn-dev", value = "{path}" }
 
 [[action]]
+key = "o"
+label = "open PR"
+# gh finds the PR from the checkout's branch; with none, its error lands
+# in the status bar.
+run = ["gh", "pr", "view", "--web"]
+cwd = "{path}"
+
+[[action]]
 key = "g"
 label = "lazygit"
 # Takes over the TUI's terminal until lazygit quits.
