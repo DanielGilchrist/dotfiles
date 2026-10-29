@@ -16,6 +16,8 @@ use agent_core::ports::{Change, HarnessId, WorktreeFacts};
 use agent_term::{Emulator, Terminal};
 use ratatui::layout::Rect;
 
+use crate::palette::Palette;
+
 pub const PREVIEW_DEBOUNCE: Duration = Duration::from_millis(150);
 pub const INFO_TTL: Duration = Duration::from_secs(4);
 
@@ -837,6 +839,7 @@ pub struct Model {
     next_ticket: u64,
     pub actions: Actions,
     pub keys: Keys,
+    pub palette: Palette,
     /// Repos found under `[repos] dirs`, by name, for the pickers to offer
     /// beyond the snapshot.
     pub catalogue: Vec<RepoRoot>,
@@ -893,6 +896,7 @@ impl Model {
             next_ticket: 0,
             actions: Actions::default(),
             keys: Keys::default(),
+            palette: Palette::DEFAULT,
             catalogue: Vec::new(),
             catalogue_warnings: Vec::new(),
             snapshots: 0,

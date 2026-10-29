@@ -8,6 +8,7 @@ agent-core.workspace = true
 agent-term.workspace = true
 anyhow.workspace = true
 crossterm.workspace = true
+nix = { workspace = true, features = ["poll"] }
 ratatui.workspace = true
 shell-words.workspace = true
 tempfile.workspace = true

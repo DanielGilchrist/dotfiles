@@ -10,7 +10,7 @@ Distilled from two research briefs (interaction, visual) on lazygit, helix, k9s,
 4. **Escaping is free to undo.** `Esc` in NAV returns to the agent you left.
 5. **Attention is a per-agent flag plus a jump key** (tmux `#`/`!` flags, `next-window -a`). Source: hooks the harness is launched with (Claude: `--settings` carrying `UserPromptSubmit`, `PreToolUse`/`PostToolUse`, `PermissionRequest`, `Stop`, `StopFailure`, `SessionEnd`), reported through `agent event` into the state dir. `idle_prompt` is ignored because it fires while background work still runs.
 6. **Confirmation strength matches what is lost.** One vocabulary: `y` confirms, `Y` confirms data loss, `Esc`/`n` cancels.
-7. **Respect the user's palette.** Named ANSI colours only, `Color::Reset` backgrounds, `DIM` (not `DarkGray`) for secondary text, because brblack is the background in Solarized.
+7. **Respect the user's palette.** Colours are roles, and each defaults to a named ANSI colour: accent Cyan, warning Yellow, error Red, success Green. This doc names them by their defaults. `Color::Reset` backgrounds. Secondary text (DIM in this doc) is the terminal's foreground blended into its background, read with `OSC 10`/`OSC 11` at startup before the input thread reads the tty. The blend starts halfway and takes more foreground until it reaches 3:1 contrast with the background, since halfway is barely readable on light themes and Solarized. It falls back to the `DIM` attribute when `COLORTERM` doesn't promise 24-bit colour or the terminal doesn't answer within a second (locally it answers in milliseconds, and the wait ends there). It is read once, so a theme change needs a restart. Never `DarkGray`, because brblack is the background in Solarized. `[theme]` (owner) overrides any role with an ANSI name, `#rrggbb` or `default`, and `dim` also takes `faint`. `NO_COLOR` drops every colour.
 8. **Selection never depends on span colours.** No `REVERSED`, no background fill: a 1-column `▌` gutter (Cyan when the list has focus, DIM otherwise) plus a BOLD name.
 9. **Whitespace and single rules over boxes.** Boxes only for overlays.
 10. **Colour encodes state and is never alone**: every state has a distinct glyph, so it reads with `NO_COLOR` or a monochrome theme. No Nerd Font dependency.
@@ -49,7 +49,7 @@ Distilled from two research briefs (interaction, visual) on lazygit, helix, k9s,
 | shared with another client | `⇄` in the right column | Yellow |
 | a file another agent changed too | `∩` before its counts in [3] | Yellow |
 
-Never `✗`/`×` for exited (reads as "close"). Rows show the time in state right-aligned (`38s` `4m` `2h` `3d`) for working, asking, failed and done, and since the turn ended for delegating. Green means only `✓`.
+Never `✗`/`×` for exited (reads as "close"). Rows show the time in state right-aligned (`38s` `4m` `2h` `3d`) for working, asking, failed and done, and since the turn ended for delegating. Green means only `✓` and added lines.
 
 ## Attention
 

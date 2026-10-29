@@ -1,4 +1,5 @@
 mod model;
+mod palette;
 mod update;
 mod view;
 mod worker;
@@ -32,6 +33,7 @@ use ratatui::DefaultTerminal;
 use ratatui::layout::Rect;
 
 use model::{Connection, Intent, Mode, Model, Pane, TerminalFocus, Ticket};
+use palette::{Colours, Palette};
 use update::{Effect, Open};
 use worker::{Job, Msg, Workers};
 
@@ -435,13 +437,21 @@ pub fn run(options: Options) -> Result<()> {
         .with_context(|| format!("unknown harness {}", options.harness))?
         .label()
         .to_string();
+    let colours = Colours::from_env();
+    let backdrop = palette::backdrop(&options.config.theme, colours);
+    let palette = Palette::resolve(&options.config.theme, backdrop, colours);
     let _guard = ScreenGuard::enter()?;
     let mut terminal =
         ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stdout()))?;
-    event_loop(&mut terminal, options, label)
+    event_loop(&mut terminal, options, label, palette)
 }
 
-fn event_loop(terminal: &mut DefaultTerminal, options: Options, label: String) -> Result<()> {
+fn event_loop(
+    terminal: &mut DefaultTerminal,
+    options: Options,
+    label: String,
+    palette: Palette,
+) -> Result<()> {
     let (msgs, inbox) = mpsc::channel();
     let (input, input_ctl) = mpsc::channel();
     spawn_input(msgs.clone(), input_ctl);
@@ -473,6 +483,7 @@ fn event_loop(terminal: &mut DefaultTerminal, options: Options, label: String) -
         .map(model::Follow::Restored);
     m.actions = options.config.actions;
     m.keys = options.config.keys;
+    m.palette = palette;
     let mut last_refresh = Instant::now();
     let mut last_selection = None;
     let mut last_title = String::new();

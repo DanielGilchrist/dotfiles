@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::path::Path;
 use std::time::SystemTime;
 
@@ -19,6 +20,7 @@ use crate::model::{
     Proposal, Pulse, Query, Reach, RepoInput, Row, StatusKind, Submission, Turn, View, Waiting,
     WorkRoom, fuzzy_match, invalid_chars, repo_matches,
 };
+use crate::palette::Palette;
 use crate::update::{Pick, Picks, Unusable, picker_matches, switcher_matches};
 
 mod sidebar;
@@ -27,7 +29,6 @@ const SIDEBAR_MAX: u16 = 48;
 const SIDEBAR_MIN: u16 = 28;
 /// The sidebar's share of the width, in percent, between the bounds above.
 const SIDEBAR_SHARE: u32 = 24;
-const ACCENT: Color = Color::Cyan;
 
 const TASK_ROWS: usize = 6;
 const SPINNER: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
@@ -88,8 +89,35 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
     ),
 ];
 
+thread_local! {
+    /// Set from the model at the start of each draw. Styles are chosen deep
+    /// in helpers that only see what they draw, and tests draw on their own
+    /// threads.
+    static PALETTE: Cell<Palette> = const { Cell::new(Palette::DEFAULT) };
+}
+
+fn palette() -> Palette {
+    PALETTE.get()
+}
+
 fn dim() -> Style {
-    Style::new().add_modifier(Modifier::DIM)
+    palette().dim.style()
+}
+
+fn accent() -> Style {
+    Style::new().fg(palette().accent)
+}
+
+fn warning() -> Style {
+    Style::new().fg(palette().warning)
+}
+
+fn error() -> Style {
+    Style::new().fg(palette().error)
+}
+
+fn success() -> Style {
+    Style::new().fg(palette().success)
 }
 
 fn bold() -> Style {
@@ -188,18 +216,9 @@ fn glyph(status: &AgentStatus) -> Span<'static> {
             pulse: Pulse::Stale,
             ..
         } => Span::styled(SPINNER[0], dim()),
-        AgentStatus::Asking { .. } => Span::styled(
-            "◆",
-            Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-        ),
-        AgentStatus::Failed { .. } => Span::styled(
-            "!",
-            Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
-        ),
-        AgentStatus::Done { .. } => Span::styled(
-            "✓",
-            Style::new().fg(Color::Green).add_modifier(Modifier::BOLD),
-        ),
+        AgentStatus::Asking { .. } => Span::styled("◆", warning().add_modifier(Modifier::BOLD)),
+        AgentStatus::Failed { .. } => Span::styled("!", error().add_modifier(Modifier::BOLD)),
+        AgentStatus::Done { .. } => Span::styled("✓", success().add_modifier(Modifier::BOLD)),
     }
 }
 
@@ -262,7 +281,7 @@ fn badge(text: &'static str) -> Span<'static> {
     Span::styled(
         text,
         Style::new()
-            .fg(ACCENT)
+            .fg(palette().accent)
             .add_modifier(Modifier::REVERSED | Modifier::BOLD),
     )
 }
@@ -281,6 +300,7 @@ fn display_path(path: &Path) -> String {
 /// agent's terminal) with the focused one's border in Cyan, over a one-line
 /// status bar carrying the mode badge and context hints.
 pub fn draw(frame: &mut Frame<'_>, m: &mut Model) {
+    PALETTE.set(m.palette);
     let [body, footer] =
         Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(frame.area());
     let borders = 2;
@@ -337,7 +357,7 @@ fn sidebar_focused(m: &Model) -> bool {
 /// Border styles for the sidebar and pane: Cyan on the panel keys go to,
 /// DIM elsewhere and while an overlay has the keys.
 fn focus_styles(m: &Model) -> (Style, Style) {
-    let accent = Style::new().fg(ACCENT);
+    let accent = accent();
     match m.focus() {
         Focus::Agent(_) => (dim(), accent),
         Focus::Nav(_) => (accent, dim()),
@@ -359,7 +379,7 @@ fn panel<'a>(
             .iter_mut()
             .filter(|s| !s.style.add_modifier.contains(Modifier::DIM) && s.style.fg.is_none())
         {
-            span.style = span.style.fg(ACCENT);
+            span.style = span.style.fg(palette().accent);
         }
     }
     if !title.is_empty() {
@@ -479,7 +499,7 @@ fn pane_title(m: &Model, width: usize) -> (Vec<Span<'static>>, Vec<Span<'static>
         };
         vec![Span::styled(
             format!("⇄ {others} other {clients} · ⏎ take over"),
-            Style::new().fg(Color::Yellow),
+            warning(),
         )]
     } else {
         let path = entry
@@ -632,9 +652,9 @@ fn draw_status_bar(frame: &mut Frame<'_>, m: &Model, area: Rect) {
     let mut counts: Vec<Span<'static>> = Vec::new();
     for (kind, n) in m.attention().parts() {
         let colour = match kind {
-            Waiting::Asking => Color::Yellow,
-            Waiting::Failed => Color::Red,
-            Waiting::Done => Color::Green,
+            Waiting::Asking => palette().warning,
+            Waiting::Failed => palette().error,
+            Waiting::Done => palette().success,
         };
         counts.extend([
             Span::styled(
@@ -678,7 +698,7 @@ fn draw_status_bar(frame: &mut Frame<'_>, m: &Model, area: Rect) {
     let mut status = match &m.status {
         Some(status) if room_for_status > 0 => {
             let style = if status.kind == StatusKind::Error {
-                Style::new().fg(Color::Red)
+                error()
             } else {
                 Style::new()
             };
@@ -752,7 +772,7 @@ fn highlighted<'a>(text: &'a str, query: &str, base: Style) -> Vec<Span<'a>> {
     text.char_indices()
         .map(|(i, c)| {
             let style = if matched.contains(&i) {
-                base.add_modifier(Modifier::BOLD).fg(ACCENT)
+                base.add_modifier(Modifier::BOLD).fg(palette().accent)
             } else {
                 base
             };
@@ -796,7 +816,7 @@ fn draw_query_list(
     let list = list.inner(ratatui::layout::Margin::new(1, 0));
     let room = usize::from(input.width).saturating_sub(" › ".width() + 1);
     let prompt = Line::from(vec![
-        Span::styled(" › ", Style::new().fg(ACCENT)),
+        Span::styled(" › ", accent()),
         Span::raw(truncate_start(&query.text, room)),
         Span::styled("█", dim()),
     ]);
@@ -815,7 +835,7 @@ fn draw_query_list(
         .take(height)
         .map(|(i, (left, right))| {
             let gutter = if marked == Some(i) {
-                Span::styled("▌", Style::new().fg(ACCENT))
+                Span::styled("▌", accent())
             } else {
                 Span::raw(" ")
             };
@@ -913,10 +933,7 @@ fn draw_picker(frame: &mut Frame<'_>, m: &Model, query: &Query) {
                 Unusable::UserHome => "~user paths aren't supported",
                 Unusable::NoHome => "~ needs HOME set",
             };
-            items.push((
-                vec![Span::styled(text, Style::new().fg(Color::Red))],
-                Vec::new(),
-            ));
+            items.push((vec![Span::styled(text, error())], Vec::new()));
         }
     }
     draw_query_list(frame, "Repos", verb, query, items);
@@ -963,8 +980,8 @@ fn spinner() -> &'static str {
 }
 
 fn draw_new(frame: &mut Frame<'_>, m: &Model, form: &NewAgent) {
-    let red = Style::new().fg(Color::Red);
-    let yellow = Style::new().fg(Color::Yellow);
+    let red = error();
+    let yellow = warning();
     let max = agent_core::names::MAX_SESSION_LEN;
     let width = 64.min(frame.area().width.saturating_sub(4));
     let inner = usize::from(width).saturating_sub(4);
@@ -1095,7 +1112,7 @@ impl Fields {
 
     fn label(&self, field: Field, text: &'static str) -> Span<'static> {
         let style = if self.focus == Some(field) {
-            Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)
+            accent().add_modifier(Modifier::BOLD)
         } else {
             dim()
         };
@@ -1161,7 +1178,7 @@ fn repo_line(
     fields: &Fields,
     inner: usize,
 ) -> Line<'static> {
-    let red = Style::new().fg(Color::Red);
+    let red = error();
     let attaching = matches!(
         &derived.submission,
         Submission::Ready(
@@ -1275,8 +1292,8 @@ fn form_keys<'a>(form: &'a NewAgent, derived: &Derived, room: usize) -> Vec<Span
 }
 
 fn draw_confirm(frame: &mut Frame<'_>, confirm: &Confirm) {
-    let warn = Style::new().fg(Color::Yellow);
-    let danger = Style::new().fg(Color::Red);
+    let warn = warning();
+    let danger = error();
     let destructive = |key: &'static str, desc: &'static str| {
         vec![
             Span::styled(key, danger.add_modifier(Modifier::BOLD)),
@@ -1379,7 +1396,7 @@ fn draw_planning(frame: &mut Frame<'_>, name: &SessionName) {
     let block = overlay_block(
         &format!("Remove {name}"),
         hints(&[("Esc", "cancel")]),
-        Style::new().fg(Color::Yellow),
+        warning(),
     );
     frame.render_widget(Paragraph::new(line).block(block), area);
 }
@@ -1429,7 +1446,7 @@ fn draw_reply(frame: &mut Frame<'_>, to: &SessionName, text: &str) {
     frame.render_widget(block, area);
     let room = usize::from(inner.width).saturating_sub(4);
     let line = Line::from(vec![
-        Span::styled(" › ", Style::new().fg(ACCENT)),
+        Span::styled(" › ", accent()),
         Span::raw(truncate_start(text, room)),
         Span::styled("█", dim()),
     ]);

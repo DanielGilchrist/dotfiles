@@ -83,6 +83,7 @@ dependencies = [
  "agent-term",
  "anyhow",
  "crossterm",
+ "nix 0.31.3",
  "ratatui",
  "shell-words",
  "tempfile",

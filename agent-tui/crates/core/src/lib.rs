@@ -11,3 +11,4 @@ pub mod ports;
 pub mod process;
 #[cfg(test)]
 mod testing;
+pub mod theme;

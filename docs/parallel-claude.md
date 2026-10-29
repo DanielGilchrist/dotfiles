@@ -142,6 +142,28 @@ nav = "ctrl-\\"
 the overlay). The config is checked at startup, and mistakes stop `agent` with
 the reason.
 
+### Theme
+
+Colours follow the terminal's palette: the defaults are its ANSI cyan,
+yellow, red and green. Secondary text is your foreground blended into your
+background, which `agent` asks the terminal for at startup (`OSC 10`/`OSC
+11`), with enough foreground to stay readable on light themes. It's asked
+once, so restart `agent` after changing theme. A terminal that doesn't
+answer, or doesn't set `COLORTERM=truecolor`, gets its faint attribute
+instead. `[theme]` overrides any role with `#rrggbb`, `default` (the
+terminal's foreground) or an ANSI name (`cyan`, `bright-blue`):
+
+```toml
+[theme]
+accent = "#89b4fa"   # focused borders and titles, the selection, badges
+dim = "#6c7086"      # secondary text, or "faint" for the terminal's own
+warning = "yellow"   # asking you, shared terminals, files others changed
+error = "red"        # failures, errors, removed lines
+success = "green"    # finished turns, added lines
+```
+
+`NO_COLOR` turns every colour off, whatever `[theme]` says.
+
 ## Wezterm
 
 | Key | Action |
