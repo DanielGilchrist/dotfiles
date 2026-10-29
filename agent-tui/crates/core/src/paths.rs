@@ -128,44 +128,52 @@ impl AgentWorktree {
         &self.name
     }
 
-    /// Whether a checkout is there: a worktree's `.git` file, and git no
-    /// longer holding the worktree while it checks the files out.
-    pub fn checked_out(&self) -> bool {
-        self.checkout() == Checkout::Ready
-    }
-
     /// What's at the worktree's path.
-    pub fn checkout(&self) -> Checkout {
-        let Ok(dot_git) = std::fs::read_to_string(self.path.join(".git")) else {
-            return Checkout::Gone;
+    pub fn state(&self) -> WorktreeState {
+        let dot_git = self.path.join(".git");
+        if dot_git.is_dir() {
+            // A clone placed under the worktrees root rather than a linked
+            // worktree. It's a checkout all the same.
+            return WorktreeState::Ready;
+        }
+        let Ok(link) = std::fs::read_to_string(&dot_git) else {
+            return WorktreeState::Gone;
         };
-        // `git worktree add` writes `locked` with this reason into the
-        // worktree's admin dir while it checks the files out
-        // (builtin/worktree.c, add_worktree), so the directory fills in
-        // behind a `.git` file that's already there.
-        let gitdir = dot_git
+        let Some(admin) = link
             .lines()
             .find_map(|line| line.strip_prefix("gitdir: "))
-            .map(|dir| PathBuf::from(dir.trim()));
-        let initialising = gitdir.is_some_and(|dir| {
-            std::fs::read_to_string(dir.join("locked"))
-                .is_ok_and(|reason| reason.trim() == "initializing")
-        });
+            .map(|dir| self.path.join(dir.trim()))
+        else {
+            return WorktreeState::Unlinked;
+        };
+        if !admin.is_dir() {
+            return WorktreeState::Unlinked;
+        }
+        // `git worktree add` writes `locked` with this reason into the
+        // admin dir while it checks the files out (builtin/worktree.c,
+        // add_worktree), so the directory fills in behind a `.git` file
+        // that's already there. The reason is translated, so this holds
+        // for adds run under the C locale, which `agent`'s own are.
+        let initialising = std::fs::read_to_string(admin.join("locked"))
+            .is_ok_and(|reason| reason.trim() == "initializing");
         if initialising {
-            Checkout::Initialising
+            WorktreeState::Initialising
         } else {
-            Checkout::Ready
+            WorktreeState::Ready
         }
     }
 }
 
 /// What an agent worktree's directory holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Checkout {
+pub enum WorktreeState {
     /// A finished checkout.
     Ready,
     /// `git worktree add` is still filling it in.
     Initialising,
+    /// A `.git` file whose admin dir is gone: pruned, or the repo moved
+    /// without a repair.
+    Unlinked,
     /// No `.git`: a directory left behind by a removal.
     Gone,
 }
@@ -215,9 +223,12 @@ impl Layout {
         self.enclosing(path).filter(|wt| wt.path == path)
     }
 
-    /// The agent worktree containing `path` whose checkout is still there.
-    pub fn enclosing_checkout(&self, path: &Path) -> Option<AgentWorktree> {
-        self.enclosing(path).filter(AgentWorktree::checked_out)
+    /// The agent worktree containing `path`, with what's there.
+    pub fn enclosing_state(&self, path: &Path) -> Option<(AgentWorktree, WorktreeState)> {
+        self.enclosing(path).map(|wt| {
+            let state = wt.state();
+            (wt, state)
+        })
     }
 
     /// The agent worktree containing `path` (or equal to it), by its path
@@ -239,7 +250,20 @@ impl Layout {
         })
     }
 
+    /// Every agent worktree that's there: finished, or unlinked from a
+    /// moved repo, which is still the agent's directory to list, attach
+    /// and remove. One git is still creating isn't listed yet.
     pub fn scan(&self) -> io::Result<Vec<AgentWorktree>> {
+        Ok(self
+            .scan_states()?
+            .into_iter()
+            .filter(|(_, state)| matches!(state, WorktreeState::Ready | WorktreeState::Unlinked))
+            .map(|(wt, _)| wt)
+            .collect())
+    }
+
+    /// Every directory shaped like an agent worktree, with what's there.
+    pub fn scan_states(&self) -> io::Result<Vec<(AgentWorktree, WorktreeState)>> {
         let repos = match std::fs::read_dir(&self.root) {
             Ok(repos) => repos,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -253,21 +277,22 @@ impl Layout {
             }
             for agent in std::fs::read_dir(repo.path())? {
                 let path = agent?.path();
-                found.extend(
-                    self.worktree_at(&path)
-                        .filter(|wt| wt.checkout() == Checkout::Ready),
-                );
+                found.extend(self.worktree_at(&path).map(|wt| {
+                    let state = wt.state();
+                    (wt, state)
+                }));
             }
         }
-        found.sort_by(|a, b| a.path.cmp(&b.path));
+        found.sort_by(|a, b| a.0.path.cmp(&b.0.path));
         Ok(found)
     }
 
-    pub fn named(&self, name: &AgentName) -> io::Result<Vec<AgentWorktree>> {
+    /// Every directory named `name` under any repo, with what's there.
+    pub fn named(&self, name: &AgentName) -> io::Result<Vec<(AgentWorktree, WorktreeState)>> {
         Ok(self
-            .scan()?
+            .scan_states()?
             .into_iter()
-            .filter(|wt| &wt.name == name)
+            .filter(|(wt, _)| &wt.name == name)
             .collect())
     }
 
@@ -330,16 +355,45 @@ mod tests {
         std::fs::create_dir_all(&admin).expect("creates");
         let new = layout.root().join("api/new");
         std::fs::create_dir_all(&new).expect("creates");
-        std::fs::write(new.join(".git"), format!("gitdir: {}\n", admin.display())).expect("writes");
-        std::fs::write(admin.join("locked"), "initializing").expect("writes");
+        let link = |gitdir: &str| {
+            std::fs::write(new.join(".git"), format!("gitdir: {gitdir}\n")).expect("writes");
+        };
+        link(&admin.display().to_string());
+        std::fs::write(admin.join("locked"), "initializing\n").expect("writes");
         let wt = layout.worktree_at(&new).expect("an agent worktree");
-        assert_eq!(wt.checkout(), Checkout::Initialising);
+        assert_eq!(wt.state(), WorktreeState::Initialising);
         assert!(layout.scan().expect("scans").is_empty(), "not listed yet");
+        assert_eq!(
+            layout
+                .named(&"new".parse().expect("parses"))
+                .expect("scans"),
+            vec![(wt.clone(), WorktreeState::Initialising)],
+            "but findable by name, with its state"
+        );
+
+        // A relative gitdir, as `--relative-paths` writes, resolves from
+        // the worktree.
+        link("../../../repo/.git/worktrees/new");
+        assert_eq!(wt.state(), WorktreeState::Initialising);
+
+        std::fs::write(admin.join("locked"), "added with --lock\n").expect("writes");
+        assert_eq!(wt.state(), WorktreeState::Ready, "other locks don't count");
+        std::fs::write(admin.join("locked"), "").expect("writes");
+        assert_eq!(wt.state(), WorktreeState::Ready);
         std::fs::remove_file(admin.join("locked")).expect("removes");
-        assert_eq!(wt.checkout(), Checkout::Ready);
+        assert_eq!(wt.state(), WorktreeState::Ready);
         assert_eq!(layout.scan().expect("scans").len(), 1);
+
+        std::fs::remove_dir_all(&admin).expect("removes");
+        assert_eq!(wt.state(), WorktreeState::Unlinked, "the admin dir is gone");
         std::fs::remove_file(new.join(".git")).expect("removes");
-        assert_eq!(wt.checkout(), Checkout::Gone);
+        assert_eq!(wt.state(), WorktreeState::Gone);
+        std::fs::create_dir(new.join(".git")).expect("creates");
+        assert_eq!(
+            wt.state(),
+            WorktreeState::Ready,
+            "a clone is a checkout too"
+        );
     }
 
     #[test]

@@ -7,7 +7,7 @@ use std::process::{Command, Stdio};
 use crate::discover::{self, Warning};
 use crate::model::{Presence, Removable, Running, Snapshot, Startable};
 use crate::names::{AgentName, BranchName, InvalidPrompt, NameError, Prompt, SessionName};
-use crate::paths::{AgentWorktree, Layout, PathError, RepoRoot, TrashSlot};
+use crate::paths::{AgentWorktree, Layout, PathError, RepoRoot, TrashSlot, WorktreeState};
 use crate::ports::{
     AgentRecord, BranchState, Harness, HarnessError, HarnessId, Harnesses, HostError, LaunchCtx,
     Listing, PaneCommand, PendingPrompt, SessionHost, SessionInfo, SessionStatus, Store,
@@ -44,6 +44,8 @@ pub enum Error {
     },
     #[error("no agent or session named {0}")]
     NotFound(SessionName),
+    #[error("{0} is still being created. Try again in a moment")]
+    Creating(AgentName),
     #[error("not inside a git repository (pass --repo)")]
     NoRepo,
     #[error("{0} is not inside a git repository")]
@@ -215,19 +217,30 @@ fn find_session(svc: Services<'_>, name: &SessionName) -> Result<Option<SessionI
 }
 
 /// The one agent worktree named `name`, if any.
+/// One git is still creating is an error rather than absent, so nothing
+/// tries to start or replace it. An unlinked one is still the agent's,
+/// and an empty directory counts as absent.
 fn find_worktree(svc: Services<'_>, name: &AgentName) -> Result<Option<AgentWorktree>> {
-    let mut found = svc.layout.named(name).map_err(io_error(format!(
+    let found = svc.layout.named(name).map_err(io_error(format!(
         "scanning {}",
         svc.layout.root().display()
     )))?;
-    if found.len() > 1 {
-        let paths = found.iter().map(|wt| wt.path().to_path_buf()).collect();
+    let mut ready: Vec<AgentWorktree> = Vec::new();
+    for (wt, state) in found {
+        match state {
+            WorktreeState::Ready | WorktreeState::Unlinked => ready.push(wt),
+            WorktreeState::Initialising => return Err(Error::Creating(name.clone())),
+            WorktreeState::Gone => {}
+        }
+    }
+    if ready.len() > 1 {
+        let paths = ready.iter().map(|wt| wt.path().to_path_buf()).collect();
         return Err(Error::Ambiguous {
             name: name.clone(),
             paths,
         });
     }
-    Ok(found.pop())
+    Ok(ready.pop())
 }
 
 pub(crate) struct AttachFacts<'a> {
@@ -487,6 +500,8 @@ pub fn execute(
                 delivery,
             })
         }
+        // The session is live while git checks the files out again, so the
+        // TUI lists it as an orphan until the next refresh after this.
         Plan::Recreate { worktree, repo } => {
             create_worktree(svc, &repo, &worktree, &WorktreeStart::DefaultBase)?;
             let delivery = deliver(svc, &session, task)?;
@@ -588,11 +603,15 @@ pub fn attach_here(
     worktree: &AgentWorktree,
     harness: &dyn Harness,
 ) -> Result<Launch> {
-    if !worktree.checked_out() {
-        return Err(Error::WorktreeGone {
-            name: worktree.name().session(),
-            path: worktree.path().to_path_buf(),
-        });
+    match worktree.state() {
+        WorktreeState::Ready => {}
+        WorktreeState::Initialising => return Err(Error::Creating(worktree.name().clone())),
+        WorktreeState::Unlinked | WorktreeState::Gone => {
+            return Err(Error::WorktreeGone {
+                name: worktree.name().session(),
+                path: worktree.path().to_path_buf(),
+            });
+        }
     }
     let session = find_session(svc, &worktree.name().session())?;
     let plan = plan_attach(&AttachFacts {

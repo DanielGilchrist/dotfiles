@@ -2761,6 +2761,35 @@ mod tests {
             "37 files already fit"
         );
 
+        let alone = shaped(tall, 30, None);
+        assert_eq!(heights(split(tall, alone, Focus::Neither)), (14, 55, 0));
+    }
+
+    #[test]
+    fn the_split_follows_content_and_focus_at_small_sizes() {
+        let heights = |g: Geometry| {
+            (
+                g.list + 2,
+                g.lower.turn_height(),
+                g.lower.work_height().unwrap_or(0),
+            )
+        };
+        let column = |rows: usize, list: usize| Column {
+            list,
+            lower: LowerRoom::of(rows - list - 2).expect("room for a panel"),
+        };
+        let shaped = |col: Column, turn: usize, need: Option<usize>| Shape {
+            turn,
+            work: need.map(|need| {
+                match col.lower {
+                    LowerRoom::Both { inside } => Some(WorkShape::of(need, need, inside)),
+                    LowerRoom::TurnOnly { .. } => None,
+                }
+                .expect("the column has room for [3]")
+            }),
+        };
+        let turn = |offset| Focus::Turn { offset };
+        let work = Focus::Work { file: 0 };
         let small = column(23, 9);
         let x = shaped(small, 5, Some(143));
         assert_eq!(heights(split(small, x, Focus::Neither)), (11, 6, 6));
@@ -2812,8 +2841,6 @@ mod tests {
         );
         assert_eq!(heights(split(tiny, x, work)), (5, 1, 9));
 
-        let alone = shaped(tall, 30, None);
-        assert_eq!(heights(split(tall, alone, Focus::Neither)), (14, 55, 0));
         let alone = shaped(small, 30, None);
         assert_eq!(
             heights(split(small, alone, turn(0))),

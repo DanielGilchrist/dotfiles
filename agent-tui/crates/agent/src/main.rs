@@ -9,7 +9,7 @@ use agent_core::config::Config;
 use agent_core::model::Presence;
 use agent_core::names::{AgentName, BranchName, Prompt, SessionName};
 use agent_core::ops::{self, Backend, Consent, Delivery, Launch, Removed, Services};
-use agent_core::paths::{self, Layout, RepoRoot};
+use agent_core::paths::{self, Layout, RepoRoot, WorktreeState};
 use agent_core::ports::{Harness, HarnessId, Listing, Unlisting};
 use agent_git::Git;
 use agent_harness::Registry;
@@ -203,7 +203,9 @@ fn repo_session(
     frontend: Frontend,
     harness: &dyn Harness,
 ) -> Result<()> {
-    if let Some(worktree) = svc.layout.enclosing_checkout(&cwd()?) {
+    if let Some((worktree, WorktreeState::Ready | WorktreeState::Initialising)) =
+        svc.layout.enclosing_state(&cwd()?)
+    {
         if repo.is_some() {
             eprintln!(
                 "agent repo: inside {}'s worktree, so --repo is ignored",

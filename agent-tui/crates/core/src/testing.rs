@@ -115,7 +115,17 @@ impl Vcs for FakeVcs {
         _: &WorktreeStart,
     ) -> Result<(), CommandError> {
         std::fs::create_dir_all(at.path()).expect("creates");
-        std::fs::write(at.path().join(".git"), "gitdir: fake").expect("writes");
+        let admin = self
+            .root
+            .path()
+            .join(".git/worktrees")
+            .join(at.name().as_str());
+        std::fs::create_dir_all(&admin).expect("creates");
+        std::fs::write(
+            at.path().join(".git"),
+            format!("gitdir: {}\n", admin.display()),
+        )
+        .expect("writes");
         self.set_head(at.path(), Head::Detached);
         Ok(())
     }

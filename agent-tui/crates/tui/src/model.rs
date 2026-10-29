@@ -790,6 +790,10 @@ pub struct Model {
     pub work_room: WorkRoom,
     /// An agent to select once a refresh shows it.
     pub follow: Option<Follow>,
+    /// Agents the form is launching, by the launch's ticket. A new
+    /// worktree shows up before its session has started, and a second
+    /// start from `⏎` would race the first and skip its prompt.
+    pub launching: Vec<(Ticket, SessionName)>,
     next_ticket: u64,
     pub actions: Actions,
     pub keys: Keys,
@@ -844,6 +848,7 @@ impl Model {
             turn: Turn::Whole,
             work_room: WorkRoom::Fits,
             follow: None,
+            launching: Vec::new(),
             next_ticket: 0,
             actions: Actions::default(),
             keys: Keys::default(),
