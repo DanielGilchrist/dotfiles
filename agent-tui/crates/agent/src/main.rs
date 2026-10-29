@@ -115,7 +115,7 @@ enum Cmd {
         #[arg(long)]
         file: Option<PathBuf>,
     },
-    /// Pin an agent to the top of the TUI and a 1-9 slot (inferred from the cwd)
+    /// Pin an agent to the top of the TUI (inferred from the cwd)
     Pin { name: Option<SessionName> },
     /// Unpin an agent
     Unpin { name: Option<SessionName> },
@@ -454,9 +454,7 @@ fn ls(svc: Services<'_>) -> Result<()> {
                 None => "idle",
             };
             let pin = match e.pin() {
-                Some(pin) => pin
-                    .slot()
-                    .map_or_else(|| "*".to_string(), |s| s.get().to_string()),
+                Some(_) => "pinned".to_string(),
                 None => String::new(),
             };
             let path = e

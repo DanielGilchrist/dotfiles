@@ -477,6 +477,14 @@ impl Activity {
         self.asks.clear();
     }
 
+    /// Its turn is over with nothing running and nothing asked, so nothing
+    /// can open a prompt that typed text would answer.
+    pub fn at_rest(&self) -> bool {
+        matches!(self.state, State::Idle | State::Done { .. })
+            && self.asks.is_empty()
+            && self.subagents.is_empty()
+    }
+
     /// The question that's waited longest, if any.
     pub fn waiting(&self) -> Option<&Ask> {
         self.asks.first()
@@ -1087,5 +1095,27 @@ mod tests {
                 "{json}"
             );
         }
+    }
+
+    #[test]
+    fn only_a_finished_turn_with_nothing_running_is_at_rest() {
+        assert!(run(vec![(0, main(finished(&[])))]).at_rest());
+        assert!(!run(vec![(0, main(user("go")))]).at_rest(), "working");
+        assert!(
+            !run(vec![
+                (0, sub("a", launched("t"))),
+                (1, main(finished(&["a"])))
+            ])
+            .at_rest(),
+            "delegating"
+        );
+        assert!(
+            !run(vec![
+                (0, main(finished(&[]))),
+                (1, main(asked("Which DB?")))
+            ])
+            .at_rest(),
+            "asking"
+        );
     }
 }

@@ -15,9 +15,9 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::model::{
     AgentStatus, Blocked, Confirm, Derived, Enter, Field, Focus, Launchable, Load, Model,
-    NameCheck, NameSource, NamingState, NewAgent, OfferEffect, Overlay, Pane, Phase, Proposal,
-    Pulse, Query, Reach, RepoInput, StatusKind, Submission, View, Waiting, fuzzy_match,
-    invalid_chars, repo_matches,
+    NameCheck, NameSource, NamingState, NewAgent, OfferEffect, Overlay, Pane, Panel, Phase,
+    Proposal, Pulse, Query, Reach, RepoInput, Row, StatusKind, Submission, View, Waiting,
+    fuzzy_match, invalid_chars, repo_matches,
 };
 use crate::update::{picker_matches, switcher_matches};
 
@@ -42,17 +42,17 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
         " NAV ",
         &[
             ("⏎ l", "attach, resurrect or start"),
-            ("Esc i", "back to the current agent"),
-            ("j k", "move"),
+            ("Esc i", "back to [1], then to the agent"),
+            ("1 2 3", "focus agents, agent, changes"),
+            ("j k", "move, or scroll [2] [3]"),
             ("g G", "first / last"),
             ("[ ]", "previous / next repo"),
             ("Space /", "switch agent"),
             ("p", "pick repo"),
             ("Tab", "focus ↔ overview"),
-            ("1-9", "pinned agents"),
             ("m", "pin / unpin"),
             ("n", "new agent"),
-            ("o", "open in $EDITOR"),
+            ("e", "open in $EDITOR, the file in [3]"),
             ("r", "reply without attaching"),
             ("d", "kill session"),
             ("D", "remove with worktree and branch"),
@@ -289,24 +289,10 @@ pub fn draw(frame: &mut Frame<'_>, m: &mut Model) {
         Layout::horizontal([Constraint::Length(sidebar_width), Constraint::Min(0)]).areas(body);
     let (sidebar_style, pane_style) = focus_styles(m);
 
-    // Overview's folds depend on the sidebar's height, so it's measured
-    // before anything asks for the rows.
-    m.areas.sidebar = if sidebar_width > 0 {
-        Block::bordered().inner(left)
-    } else {
-        Rect::default()
-    };
     if sidebar_width > 0 {
-        let title = fit(sidebar_title(m), usize::from(left.width).saturating_sub(4));
-        let sidebar = panel(
-            title,
-            sidebar_count(m, sidebar_style),
-            sidebar_style,
-            sidebar_focused(m),
-        );
-        frame.render_widget(sidebar, left);
-        let area = m.areas.sidebar;
-        sidebar::draw(frame, m, area);
+        sidebar::draw(frame, m, left, sidebar_style);
+    } else {
+        m.areas.sidebar = Rect::default();
     }
 
     let (title, path) = pane_title(m, usize::from(right.width));
@@ -382,21 +368,31 @@ fn panel<'a>(
 
 fn sidebar_title(m: &Model) -> Vec<Span<'static>> {
     match (m.snapshot(), m.view, m.selected()) {
-        (None, _, _) => vec![Span::styled("Loading…", dim())],
+        (None, _, _) => vec![Span::raw("[1] "), Span::styled("Loading…", dim())],
         (Some(_), View::Focus, Some((repo, _))) => {
-            vec![Span::styled(repo.name().into_owned(), bold())]
+            vec![
+                Span::raw("[1] "),
+                Span::styled(repo.name().into_owned(), bold()),
+            ]
         }
-        (Some(_), View::Focus, None) => vec![Span::styled("Agents", bold())],
-        (Some(_), View::Overview, _) => vec![Span::styled("All repos", bold())],
+        (Some(_), View::Focus, None) | (Some(_), View::Overview, _) => {
+            vec![Span::raw("[1] "), Span::styled("Agents", bold())]
+        }
     }
 }
 
 /// `3 of 7`: where the selection is in the list, in the border's colour.
+/// Agents listed from other repos count, though they can't be selected.
 fn sidebar_count(m: &Model, border: Style) -> Vec<Span<'static>> {
     let items = m.items();
+    let elsewhere = m
+        .rows()
+        .iter()
+        .filter(|r| matches!(r, Row::Elsewhere(_)))
+        .count();
     match m.cursor().and_then(|c| items.iter().position(|i| i == c)) {
         Some(i) => vec![Span::styled(
-            format!("{} of {}", i + 1, items.len()),
+            format!("{} of {}", i + 1, items.len() + elsewhere),
             border,
         )],
         None => Vec::new(),
@@ -541,7 +537,15 @@ fn draw_status_bar(frame: &mut Frame<'_>, m: &Model, area: Rect) {
     } else {
         let selected = m.selected();
         let entry = selected.and_then(|(_, e)| e);
+        match m.panel {
+            Panel::Changes { .. } => {
+                hints.extend([ranked("e", "edit file", 8), ranked("Esc", "agents", 7)]);
+            }
+            Panel::Agent { .. } => hints.push(ranked("Esc", "agents", 7)),
+            Panel::Agents => {}
+        }
         match (selected, entry.map(|e| m.reach(e))) {
+            _ if matches!(m.panel, Panel::Changes { .. }) => {}
             (Some((_, None)), _) => hints.push(ranked("⏎", "focus", 7)),
             (
                 _,
@@ -789,12 +793,6 @@ fn draw_switcher(frame: &mut Frame<'_>, m: &Model, query: &Query) {
                 }
             } else if repo.name() != entry.name().as_str() {
                 right.push(Span::styled(repo.name().into_owned(), dim()));
-            }
-            if let Some(slot) = entry.pin().and_then(agent_core::model::Pin::slot) {
-                if !right.is_empty() {
-                    right.push(Span::raw(" "));
-                }
-                right.push(Span::styled(slot.get().to_string(), dim()));
             }
             (left, right)
         })

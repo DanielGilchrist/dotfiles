@@ -26,10 +26,10 @@ Distilled from two research briefs (interaction, visual) on lazygit, helix, k9s,
   NAV    ⏎ attach  Space switch  d kill  D remove  m pin  Tab overview  ? keys      killed foo
 ```
 
-- Two rounded panels, like lazygit: the agent list and the selected agent's terminal. Each has its title in the top border and its metadata in the bottom-right corner (`N of M` for the list, the path or a Yellow `⇄ shared · ⏎ take over` for the terminal).
-- The panel keys go to has a Cyan border (the list in NAV, the terminal in AGENT). The other is DIM, and both are DIM while an overlay has the keys. The owner rejected free-floating rules and a titles-in-rules frame. Borders belong to panels.
-- Sidebar panel: 24% of the width, clamped to 28-48 inner columns, plus its border. It's hidden below 60 columns so the agent keeps every column (Space still switches). Rows keep one column of inner padding on both edges. The terminal panel has one column of horizontal padding so the agent's own full-width rules don't fuse with our border.
-- List title: the scope BOLD (`heucristic` or `All repos`). Position lives only in the `N of M` corner, in the border's colour and tucked against it (`1 of 3─╯`). The focused panel's title takes the Cyan accent, as lazygit's active title does. Terminal title: the identifier BOLD (Cyan when focused): `repo / agent` with the repo and `/` DIM, or for a main checkout `repo` BOLD + ` branch` DIM.
+- Rounded panels, like lazygit: the sidebar's three (see Sidebar) and the selected agent's terminal. Each has its title in the top border and its metadata in the bottom-right corner (`N of M` for the list, the path or a Yellow `⇄ shared · ⏎ take over` for the terminal).
+- The panel keys go to has a Cyan border (the focused sidebar panel in NAV, the terminal in AGENT). The others are DIM, and all are DIM while an overlay has the keys. The owner rejected free-floating rules and a titles-in-rules frame. Borders belong to panels.
+- Sidebar: 24% of the width, clamped to 28-48 inner columns, plus its border. It's hidden below 60 columns so the agent keeps every column (Space still switches). Rows keep one column of inner padding on both edges. The terminal panel has one column of horizontal padding so the agent's own full-width rules don't fuse with our border.
+- List title: `[1]` and the scope BOLD (`heucristic` in Focus, `Agents` in Overview). Position lives only in the `N of M` corner, in the border's colour and tucked against it (`1 of 3─╯`). The focused panel's title takes the Cyan accent, as lazygit's active title does. Terminal title: the identifier BOLD (Cyan when focused): `repo / agent` with the repo and `/` DIM, or for a main checkout `repo` BOLD + ` branch` DIM.
 - Status bar (one row, no border, the owner's "modern neovim-ish bottom nav"): the mode badge (`  NAV  ` / ` AGENT `, seven columns, Cyan reversed. Cyan always means "keys go here", and Yellow is reserved for attention and warnings), then up to 7 context hints (key default fg, description DIM), then the status message right-aligned (errors Red and sticky until the next key, info expiring after ~4s). Hints drop least important first (`x`, `D`, `d`, `m`, `n`, `Tab`, `Space`, `⏎`, while `? keys` always stays). The status is cut to fit rather than pushing hints out, so the row never jitters. In AGENT the hints are `⌃\ nav  ⌃\ ⌃\ previous`, naming the configured key (plus the attention count once status exists). Hints never offer actions that are invalid for the selection.
 - Key names, everywhere (status bar, overlays, help): `⏎`, `Esc`, `Space`, `Tab`, and the configured escape key, as in `⌃\`. Help sections are named after the modes: `AGENT`, `NAV`.
 - Render the pty cursor only in AGENT.
@@ -46,7 +46,6 @@ Distilled from two research briefs (interaction, visual) on lazygit, helix, k9s,
 | idle, seen, or a harness without hooks | `●` | default |
 | exited (resurrectable) | `○` | DIM, name DIM |
 | no session | `·` | DIM, name DIM |
-| pinned | slot digit `1`-`9` in the right column, `*` beyond nine | DIM |
 | shared with another client | `⇄` in the right column | Yellow |
 
 Never `✗`/`×` for exited (reads as "close"). Rows show the time in state right-aligned (`38s` `4m` `2h` `3d`) for working, asking, failed and done, and since the turn ended for delegating. Green means only `✓`.
@@ -60,9 +59,44 @@ Never `✗`/`×` for exited (reads as "close"). Rows show the time in state righ
 - Status bar: at the far right, `a ◆ n  ! n  ✓ n` (`⌃\ a …` in AGENT), never cut, hidden at zero. It counts what `a` would visit, so the agent being typed into isn't counted. It shows and hides as one block at the edge, so the hints never shift. The terminal title (OSC 2) carries the same counts first: `◆2 ✓1 · agent`.
 - One bell when an agent other than the one being typed into starts asking, fails, or finishes a turn of 30s or more. At most one per 10s.
 
-## Sidebar
+## Sidebar (owner: lazygit-style panels)
 
-One panel: the list of cards, then detail blocks in the rows directly under it. Leftover rows at the bottom stay blank. Below an inner width of 36 the short forms apply.
+```
+╭ [1] Agents ────────────────╮
+│ ▾ Needs you                │
+│   ◆ heucristic0         4m │
+│     Bash: pnpm test --fil… │
+│   ! rate-limit-1        2m │
+│     rate limited           │
+│   ✓ auth-refresh-2     12m │
+│     Added token refresh w… │
+│ ▾ agent-tui0               │
+│▌  ⠦ agent-tui0         10s │
+│   ● docs-sweep-6           │
+│   ○ leave-request-7        │
+│ ▾ heucristic0              │
+│   ⠦ obs-layout-4 ↳3     3m │
+│   ⠦ payroll-fix-3      38s │
+╰─────────────────── 5 of 10─╯
+╭ [2] agent-tui0 ────────────╮
+│ ⠦ thinking             10s │
+│ overlap 5 files · docs-sw… │
+│ 1 uncommitted · ↑2         │
+│ › go                       │
+╰────────────────────────────╯
+╭ [3] Changes +86 −3 ────────╮
+│ src/triage/flow.ts   +9 −3 │
+│ triage/flow.test.ts +75    │
+│ src/shared/types.ts  +2    │
+│ assets/logo.png     bin    │
+│ notes/plan.md       new    │
+╰────────────────────────────╯
+```
+
+Three panels stacked: [1] the agents, [2] the selected agent, [3] the files it changed. `1` `2` `3` focus them (see Keymap). Selecting another agent, or a panel that isn't shown, puts the focus back on [1]. The focused panel takes the Cyan border and title while the sidebar has the keys, and the others are DIM. Below an inner width of 36 the short forms apply.
+
+- [1] is sized to its rows, at most what leaves [2] 4 rows and [3] 3 inside their borders, and scrolls past that. [3]'s rows are kept even for an agent with no changes, so the selection never changes how much room the list has. Its corner shows `N of M`, counting the agents Focus lists from other repos.
+- [2] is sized to what it says, and [3] takes the rest. Without changes [3] is hidden and [2] takes the rest. With no agent selected (a repo row), [1] takes the whole column.
 
 ### Cards
 
@@ -71,34 +105,40 @@ One panel: the list of cards, then detail blocks in the rows directly under it. 
 ▌  Bash: pnpm test --filter triage
 ```
 
-- Line 1: gutter, glyph, name, then on the right the repo (DIM, only in Needs you and Pinned, and not in the short form), the time in state, the pin and `⇄`. The right side never truncates, and the name yields down to 8 columns.
+- Line 1: gutter, glyph, name, then on the right the repo (DIM, only in Needs you and Pinned, and not in the short form), the time in state and `⇄`. The right side never truncates, and the name yields down to 8 columns.
+- Cards under a `▾` header (a repo, Needs you, Pinned) are indented 2.
 - Line 2, indented under the name, cut with `…`: the question (default fg), the failure (`rate limited`, `overloaded`, `billing limit`, or the reason's first line), the tool and its target (a path keeps its end, `Edit  …/payroll/calc.ts`, and in the short form only its basename), `thinking`, `↳3 subagents · quiet 22s`, `handing back`, or the first line of the last message with markdown stripped. All DIM except the question. Settled agents (idle, exited, no session) have no line 2.
 - Selection never changes a card's height, and the gutter covers both lines.
 
 ### Tier
 
-Which cards get a line 2, worked out from the list at its tallest (every repo open, Needs you's header reserved, pinned agents counted twice) and the agents with a session, so state changes never change it. The list leaves the detail at least 6 rows: line 2 for every agent that isn't settled when that fits, else for the first agents `a` would visit while rows remain, else for none.
+Which cards get a line 2, worked out from the list at its tallest (every repo open, Needs you's header reserved, pinned agents counted twice) and the agents with a session, so state changes never change it: line 2 for every agent that isn't settled when that fits [1], else for the first agents `a` would visit while rows remain, else for none.
 
-### Detail
+### [2] The agent
 
-- Blocks start on the row right after the list: the selection's first, then every other agent that isn't settled, in list order.
-- Header: `◆ triage-flow ──── heucristic  4m`, glyph as its state, name BOLD, rule and right side DIM. The right side says `in pane` when the pane shows the agent. Otherwise it names the repo only in Overview and only when the name doesn't already say it, and the time only when the agent's card isn't on screen.
+- Title: `[2]` and the agent BOLD. On the right of the top border, `in pane` when the pane shows it, else its repo when the name doesn't already say it.
 - Items, in display and priority order:
-  - The lead: all of line 2, up to 3 lines, when the card cut or hid it and the agent isn't in the pane. Delegating has none, since the tree says more.
-  - `overlap flow.ts · auth-refresh-2 +2`: a file another agent in the same repo changed too, the file name Yellow and the rest DIM. Agents are counted rather than listed, so the file name is never what gets cut. Up to 2 lines, else one for all of them: `overlap 5 files · docs-sweep-6 +2`.
+  - The state line: glyph, what it's doing, the time in state on the right. Left out when the selected card's line 2 already says it whole.
+  - The lead: all of the question or last message, up to 3 lines, when the state line shows and cut it and the agent isn't in the pane.
   - The subagent tree: `├ ⠹ description  kind  4m`, the last on `└`.
+  - `overlap flow.ts · auth-refresh-2 +2`: a file another agent in the same repo changed too, the file name Yellow and the rest DIM. Agents are counted rather than listed, so the file name is never what gets cut. Up to 2 lines, else one for all of them: `overlap 5 files · docs-sweep-6 +2`.
   - Readiness, counts only: `2 uncommitted · ↑2`, `behind 2 · ↑3`, `ready ↑1` or `nothing ahead` (arrows DIM), or why git couldn't be read. A main checkout shows it only with uncommitted files, and an agent worktree shows `nothing ahead` only once it's done.
-  - `changed 3 files  +86 −3`, then the files in numstat order with their counts in columns, up to 5 (3 in other blocks), then `+2 more`. Short of rows it lists fewer before it goes.
-  - `› ` and the last prompt (DIM), up to 2 lines (1 in other blocks).
-- The selection's block gives each item its rows in priority order, shrinking an item to the rows left before skipping it, and stops at the first that can't show at all, so a lower item never takes rows from a higher one. Its header shows only with an item. Other blocks start only once the selection shows everything up to its caps. They follow in list order, each starting only if its header and first item fit, and the first item that has to shrink ends the detail, so later blocks never jump ahead of earlier ones. Rows still spare let the selection's lead, files and prompt grow past their caps.
+  - `› ` and the last prompt (DIM), up to 2 lines.
+- Each item gets its rows in priority order, shrinking to the rows left before it's skipped, and the first that can't show at all ends the panel, so a lower item never takes rows from a higher one. Rows [3] doesn't need for its files let the lead and prompt grow past their caps. Focused, it shows everything and `j`/`k` scroll it.
+
+### [3] Changes
+
+- Title: `[3] Changes` then the totals (`+` Green, `−` Red).
+- A row per file in numstat order, counts right-aligned in columns. Paths keep their last 3 components (`core/src/activity.rs`), fewer while they don't fit, so the prefix every file shares goes first.
+- Unfocused, the last row says `+k more` when they don't all fit. Focused, a Cyan `▌` marks the file under the cursor, the rows scroll to keep it in view, and the corner says where it is.
 
 Context % and cost from the harness are planned and not shown yet.
 
 ## Views
 
 - **Focus** (default): one repo, no per-repo header rows. The main checkout is labelled by its branch, never `(root)`.
-- **Overview**: an accordion. Repo rows are selectable items with `▸`/`▾` (DIM) and collapsed repo rows show right-aligned nonzero counts of settled agents in `● ○` order (waiting agents are counted under Needs you, and open repos show none), each glyph a space before its number and pairs two spaces apart (`● 1  ○ 2`) (idle `·` worktrees are not counted). Every repo is open when the whole list fits with one-line cards. Otherwise the repos furthest from the selection close first, and the repo holding the selection always stays open. Like the tier, this counts every place an agent could be listed, so agents changing state never open or close a repo. A repo whose agents are all under Needs you has no row. Cards aren't indented, since line 2 sits under the name. An agent under Needs you isn't listed again under its repo, and the selection follows an agent as it moves between them, keeping its screen row when the list scrolls. A repo whose only entry is its main checkout collapses to one row.
-- **Pinned (owner)**: pinned agents sort first. In Overview they form a `▾ Pinned` group (DIM) above the repos. In Focus they sort to the top of their repo, and in the switcher they come first. Pins get slots `1`-`9`.
+- **Overview**: an accordion. Repo rows are selectable items with `▸`/`▾` (DIM) and collapsed repo rows show right-aligned nonzero counts of settled agents in `● ○` order (waiting agents are counted under Needs you, and open repos show none), each glyph a space before its number and pairs two spaces apart (`● 1  ○ 2`) (idle `·` worktrees are not counted). Every repo is open when the whole list fits with one-line cards. Otherwise the repos furthest from the selection close first, and the repo holding the selection always stays open. Like the tier, this counts every place an agent could be listed, so agents changing state never open or close a repo. A repo whose agents are all under Needs you has no row. Cards are indented under the repo, and line 2 sits under the name. An agent under Needs you isn't listed again under its repo, and the selection follows an agent as it moves between them, keeping its screen row when the list scrolls. A repo whose only entry is its main checkout collapses to one row.
+- **Pinned (owner)**: pinned agents sort first. In Overview they form a `▾ Pinned` group (DIM) above the repos. In Focus they sort to the top of their repo, and in the switcher they come first.
 - **Hiding is removed (owner).**
 
 ## Keymap
@@ -109,19 +149,19 @@ NAV:
 
 | key | action |
 |---|---|
-| `Esc` / `i` | back to AGENT on the current agent |
+| `Esc` / `i` | back to [1] from [2] or [3], else to AGENT on the current agent |
 | `⏎` / `l` | AGENT on the selected agent (starts or resurrects as needed) |
-| `j`/`k`, `g`/`G` | move |
+| `1` / `2` / `3` | focus [1] Agents, [2] the agent, [3] Changes |
+| `j`/`k`, `g`/`G` | move the selection in [1], scroll [2], move the file cursor in [3] |
 | `[` / `]` | previous / next repo |
 | `p` | repo picker |
 | `Space` / `/` | switcher |
 | `Tab` | Focus ↔ Overview |
-| `1`-`9` | pinned slots |
 | `m` | pin / unpin |
 | `a` | next agent that needs you (see Attention) |
 | `n` | start an agent in the selected idle worktree |
-| `o` | open the checkout in `$EDITOR` |
-| `r` | reply to the agent without attaching: a one-line box sends it as a prompt. Only offered while the agent reports its state and shows no prompt, where typed text would pick a menu option, and checked again on `⏎` |
+| `e` | open the checkout in `$EDITOR`, or in [3] the file under the cursor (`⏎` too) |
+| `r` | reply to the agent without attaching: a one-line box sends it as a prompt. Only offered once the agent's turn is over with no question open and no subagents running, since while it works a permission prompt can open before its report arrives and typed text would pick a menu option. Checked again on `⏎` and just before typing |
 | `d` | kill session, **with confirmation (owner)**: `y` or `⏎`, since it can be resurrected |
 | `D` | remove session, worktree and branch (confirmation, or `Y` if commits would be lost) |
 | `x` | actions overlay ("Run on <agent>"): the configured actions, one key each. `Esc` closes |
@@ -130,7 +170,7 @@ NAV:
 
 ## Overlays
 
-- **Switcher**: input focused on open. Index 0 is the previous agent, then pins, then MRU, then the rest. It never lists the TUI's own session. Rows use the Overview grammar: a main checkout reads `repo branch` (branch DIM) with nothing on the right. Other agents show their repo on the right (DIM), then the pin slot. Age arrives with status. `Ctrl+n`/`Ctrl+p`/`Ctrl+\` move, `⏎` switches into AGENT, and `Esc` returns unchanged. Rows: glyph, `agent`, repo DIM, age DIM. Matched characters BOLD Cyan. Rounded DIM border, BOLD title, hints in the bottom border.
+- **Switcher**: input focused on open. Index 0 is the previous agent, then pins, then MRU, then the rest. It never lists the TUI's own session. Rows use the Overview grammar: a main checkout reads `repo branch` (branch DIM) with nothing on the right. Other agents show their repo on the right (DIM). Age arrives with status. `Ctrl+n`/`Ctrl+p`/`Ctrl+\` move, `⏎` switches into AGENT, and `Esc` returns unchanged. Rows: glyph, `agent`, repo DIM, age DIM. Matched characters BOLD Cyan. Rounded DIM border, BOLD title, hints in the bottom border.
 - **Confirm**: sized to its content, with two short lines and hints in the bottom border padded by one space each side, the confirming key first and always BOLD Red (it must differ from the border), alternatives after it (`── Y discard and remove  k kill only  n/Esc cancel ─╯`). Border Yellow, Red when data would be lost, and the destructive key BOLD Red. Unmerged work lists the commit count per branch.
 - **Help**: the full keymap. Section headers are the same reversed-Cyan badges as the footer (`AGENT`, `NAV`). Keys and descriptions in default fg (DIM is unreadable on some themes at this density). Sized to fit 80x24, in two columns when the terminal is short.
 

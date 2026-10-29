@@ -12,7 +12,7 @@ use agent_core::model::{
 use agent_core::names::{AgentName, Prompt, SessionName};
 use agent_core::ops::{Approved, Hazardous, RemovalPlan};
 use agent_core::paths::RepoRoot;
-use agent_core::ports::{HarnessId, WorktreeFacts};
+use agent_core::ports::{Change, HarnessId, WorktreeFacts};
 use agent_term::{Emulator, Terminal};
 use ratatui::layout::Rect;
 
@@ -23,6 +23,17 @@ pub const INFO_TTL: Duration = Duration::from_secs(4);
 pub const NAMING_DEBOUNCE: Duration = Duration::from_millis(900);
 /// Prompts this short are named from their words; asking isn't worth it.
 const NAMING_MIN_WORDS: usize = 3;
+
+/// The sidebar panel `j`/`k` act on in NAV, and how far it has moved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Panel {
+    /// [1]: they move the selection.
+    Agents,
+    /// [2]: they scroll the selected agent's details down `offset` rows.
+    Agent { offset: usize },
+    /// [3]: they move the cursor over the selected agent's changed files.
+    Changes { file: usize },
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum View {
@@ -729,6 +740,7 @@ pub struct Model {
     pub last_warnings: Vec<String>,
     pub chord: Chord,
     pub scroll: ListScroll,
+    pub panel: Panel,
     /// An agent to select once a refresh shows it.
     pub follow: Option<Follow>,
     next_ticket: u64,
@@ -774,6 +786,7 @@ impl Model {
             last_warnings: Vec::new(),
             chord: Chord::Idle,
             scroll: ListScroll::default(),
+            panel: Panel::Agents,
             follow: None,
             next_ticket: 0,
             actions: Actions::default(),
@@ -826,6 +839,61 @@ impl Model {
 
     pub fn selected_entry(&self) -> Option<&Entry> {
         self.selected().and_then(|(_, e)| e)
+    }
+
+    /// The selected agent's changed files, as last read.
+    pub fn changes(&self) -> &[Change] {
+        match self.selected_entry().and_then(|e| self.facts.get(e.name())) {
+            Some(Ok(facts)) => &facts.changed,
+            Some(Err(_)) | None => &[],
+        }
+    }
+
+    /// Moves within the focused panel: the selection in [1], the scroll in
+    /// [2], the file cursor in [3]. [2] is clamped when it's drawn, since
+    /// only the view knows how long it is.
+    pub fn move_in_panel(&mut self, delta: isize) {
+        self.panel = match self.panel {
+            Panel::Agents => {
+                self.move_cursor(delta);
+                Panel::Agents
+            }
+            Panel::Agent { offset } => Panel::Agent {
+                offset: offset.saturating_add_signed(delta),
+            },
+            Panel::Changes { file } => Panel::Changes {
+                file: file
+                    .saturating_add_signed(delta)
+                    .min(self.changes().len().saturating_sub(1)),
+            },
+        };
+    }
+
+    pub fn panel_to_edge(&mut self, edge: Edge) {
+        self.panel = match (self.panel, edge) {
+            (Panel::Agents, _) => {
+                self.move_to_edge(edge);
+                Panel::Agents
+            }
+            (Panel::Agent { .. }, Edge::First) => Panel::Agent { offset: 0 },
+            (Panel::Agent { .. }, Edge::Last) => Panel::Agent { offset: usize::MAX },
+            (Panel::Changes { .. }, Edge::First) => Panel::Changes { file: 0 },
+            (Panel::Changes { .. }, Edge::Last) => Panel::Changes {
+                file: self.changes().len().saturating_sub(1),
+            },
+        };
+    }
+
+    /// The selected agent's checkout and the file under [3]'s cursor in it.
+    pub fn file_under_cursor(&self) -> Option<(PathBuf, PathBuf)> {
+        let Panel::Changes { file } = self.panel else {
+            return None;
+        };
+        let root = self.selected_entry()?.path()?;
+        let changes = self.changes();
+        changes
+            .get(file.min(changes.len().saturating_sub(1)))
+            .map(|c| (root.to_path_buf(), c.path.clone()))
     }
 
     pub fn activity(&self, name: &SessionName) -> Option<&Activity> {
@@ -882,8 +950,9 @@ impl Model {
         }
     }
 
-    /// The agent `r` can type a reply into: live, reporting its state, and
-    /// showing no prompt, where typed text would pick a menu option.
+    /// The agent `r` can type a reply into: live and at rest. While it works,
+    /// a permission prompt can open before its report arrives, and typed
+    /// text would pick a menu option.
     pub fn replyable<'a>(&self, entry: &'a Entry) -> Option<&'a SessionName> {
         let EntryState::Live = entry.state() else {
             return None;
@@ -891,7 +960,7 @@ impl Model {
         if self.own_session.as_ref() == Some(entry.name()) {
             return None;
         }
-        self.activity(entry.name()).filter(|a| a.asks.is_empty())?;
+        self.activity(entry.name()).filter(|a| a.at_rest())?;
         Some(entry.name())
     }
 
@@ -1247,6 +1316,11 @@ impl Model {
                     .or_else(|| snapshot.entries().next())
                     .map(|(_, e)| entry_of(e))
             });
+        if cursor.as_ref().and_then(Cursor::entry_name)
+            != fallback.as_ref().and_then(Cursor::entry_name)
+        {
+            self.panel = Panel::Agents;
+        }
         *cursor = fallback;
         self.schedule_preview();
     }
@@ -1285,6 +1359,9 @@ impl Model {
             return;
         };
         if cursor.as_ref() != Some(&next) {
+            if cursor.as_ref().and_then(Cursor::entry_name) != next.entry_name() {
+                self.panel = Panel::Agents;
+            }
             *cursor = Some(next);
             self.schedule_preview();
         }

@@ -32,7 +32,7 @@ use ratatui::DefaultTerminal;
 use ratatui::layout::Rect;
 
 use model::{Connection, Intent, Mode, Model, Pane, TerminalFocus, Ticket};
-use update::Effect;
+use update::{Effect, Open};
 use worker::{Job, Msg, Workers};
 
 const FRAME: Duration = Duration::from_millis(16);
@@ -339,9 +339,13 @@ impl Runtime {
                     let result = self.connect(m, launch.session, launch.spec, intent, ticket);
                     Self::connect_failed(m, ticket, result);
                 }
-                Effect::Edit(path) => {
+                Effect::Edit(open) => {
                     Self::fill_screen(m, terminal);
-                    if let Err(e) = self.edit(terminal, &path, None).map(drop) {
+                    let (cwd, file) = match &open {
+                        Open::Checkout(dir) => (dir, None),
+                        Open::File { root, file } => (root, Some(file.as_path())),
+                    };
+                    if let Err(e) = self.edit(terminal, cwd, file).map(drop) {
                         m.error(format!("{e:#}"));
                     }
                     m.schedule_preview();

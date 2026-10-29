@@ -37,12 +37,13 @@ types into the embedded session. `?` shows every key.
 |---|---|
 | `⏎` / `l` | Attach the selected agent (resurrect or start it if needed) |
 | `⌃\` | Back to NAV from an agent. Twice goes to the previous agent |
-| `j k g G`, `[ ]` | Move, previous / next repo |
+| `1` `2` `3` | Focus the Agents, agent and Changes panels. `Esc` goes back to Agents |
+| `j k g G`, `[ ]` | Move in the focused panel, previous / next repo |
 | `Space` / `/` | Switcher (fuzzy), `⌃N ⌃P` to move |
-| `1`-`9`, `m` | Jump to a pinned agent, pin / unpin |
+| `m` | Pin / unpin (pinned agents get their own group) |
 | `n` | New agent form: prompt (`⌃E` edits it in $EDITOR), name (suggested from the prompt or a Linear/GitHub link), repo |
-| `o` | Open the agent's worktree in $EDITOR |
-| `r` | Reply without attaching (not while it shows a prompt) |
+| `e` | Open the agent's worktree in $EDITOR, or in Changes the file under the cursor |
+| `r` | Reply without attaching, once its turn is over and nothing is asking |
 | `d` / `D` | Kill the session / remove session, worktree and branch (confirms, lists anything that would be lost) |
 | `x` | Run a configured action on the selected agent (see below) |
 | `a` | Jump to the agent that needs you most (asking, failed, then finished), into AGENT |
@@ -64,10 +65,10 @@ Overview opens with a **Needs you** group, the status bar and terminal
 title show `◆ ! ✓` counts, and a bell rings when an agent you're not
 typing into starts waiting. Each agent's card has a second line saying
 what it's doing or what it said (the question, the tool, the last
-message), when there's room. Under the list, the selected agent's details
-come first, then the other busy agents': files it shares with another
-agent, its subagents, whether it's ready to merge (`dirty`, `behind`,
-`ready ↑n`), the files it changed and its last prompt.
+message), when there's room. Under the list, panel [2] details the
+selected agent (its subagents, files it shares with another agent,
+whether it's ready to merge, its last prompt) and [3] lists the files it
+changed.
 Agents started before this existed report nothing until restarted: `d`
 then `⏎` in the TUI restarts one through `agent`, resuming its conversation.
 
@@ -143,7 +144,7 @@ the reason.
 | `agent merged` | Worktrees whose branch can be removed without losing work. |
 | `agent prompt <name> <text>` / `--file` | Type a prompt into a running agent and submit it. |
 | `agent dump <name>` | Print an agent's screen with ANSI styling. |
-| `agent pin [<name>]` / `agent unpin` | Pin to the top of the TUI and a `1`-`9` slot. |
+| `agent pin [<name>]` / `agent unpin` | Pin to the top of the TUI. |
 | `agent --harness <id> …` | Harness for new agents (default `claude`, and `$AGENT_CLAUDE` overrides its program). |
 
 ## Spawning from an LLM (Claude Code's `Bash` tool, etc.)

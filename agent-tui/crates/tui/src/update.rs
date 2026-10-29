@@ -7,7 +7,7 @@ use std::time::{Duration, Instant, SystemTime};
 use agent_core::actions::{Action, CommandLine, Context, EventName, Invocation};
 use agent_core::activity::{Activity, State as ActivityState};
 use agent_core::config::ControlKey;
-use agent_core::model::{RepoKey, Slot};
+use agent_core::model::RepoKey;
 use agent_core::names::{Prompt, SessionName};
 use agent_core::ops::{Approved, Launch};
 use agent_core::ports::ClientId;
@@ -17,8 +17,8 @@ use ratatui::layout::Position;
 
 use crate::model::{
     Answer, Chord, Confirm, Cursor, Edge, Enter, Field, Focus, Follow, INFO_TTL, Inspection,
-    Intent, Mode, Model, NamingState, NewAgent, Overlay, Pane, Phase, Query, Reach, StatusKind,
-    Submission, TerminalFocus, Ticket, View, fuzzy_match, repo_matches,
+    Intent, Mode, Model, NamingState, NewAgent, Overlay, Pane, Panel, Phase, Query, Reach,
+    StatusKind, Submission, TerminalFocus, Ticket, View, fuzzy_match, repo_matches,
 };
 use crate::worker::{Job, Msg, Outcome};
 
@@ -34,6 +34,15 @@ const LONG_TURN: Duration = Duration::from_secs(30);
 const REINSPECT_AFTER: Duration = Duration::from_secs(3);
 /// And this often whatever it does.
 const SLOW_REFRESH: Duration = Duration::from_secs(30);
+
+/// What `$EDITOR` opens.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Open {
+    /// A checkout, as the editor's working directory.
+    Checkout(PathBuf),
+    /// A file, relative to the checkout the editor runs in.
+    File { root: PathBuf, file: PathBuf },
+}
 
 pub enum Effect {
     Job(Job),
@@ -53,8 +62,8 @@ pub enum Effect {
         intent: Intent,
         ticket: Ticket,
     },
-    /// Suspend the TUI and open `$EDITOR` here.
-    Edit(PathBuf),
+    /// Suspend the TUI and open `$EDITOR`.
+    Edit(Open),
     /// Suspend the TUI and edit the new-agent task in `$EDITOR`.
     EditTask(String),
     Quit,
@@ -539,6 +548,37 @@ fn sanitize_paste(text: &str) -> String {
         .collect()
 }
 
+/// Keys that choose the panel `j`/`k` act on, and those a panel gives its
+/// own meaning. `None` leaves the key to NAV.
+fn on_panel_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
+    match (code, m.panel) {
+        (KeyCode::Esc | KeyCode::Char('1'), Panel::Agent { .. } | Panel::Changes { .. }) => {
+            m.panel = Panel::Agents;
+            Some(Vec::new())
+        }
+        (KeyCode::Char('2'), _) if m.selected_entry().is_none() => {
+            m.info("select an agent to see it");
+            Some(Vec::new())
+        }
+        (KeyCode::Char('2'), _) => {
+            m.panel = Panel::Agent { offset: 0 };
+            Some(Vec::new())
+        }
+        (KeyCode::Char('3'), _) if m.changes().is_empty() => {
+            m.info("no changes to show");
+            Some(Vec::new())
+        }
+        (KeyCode::Char('3'), _) => {
+            m.panel = Panel::Changes { file: 0 };
+            Some(Vec::new())
+        }
+        (KeyCode::Char('e') | KeyCode::Enter, Panel::Changes { .. }) => m
+            .file_under_cursor()
+            .map(|(root, file)| vec![Effect::Edit(Open::File { root, file })]),
+        _ => None,
+    }
+}
+
 fn on_nav_key(m: &mut Model, key: KeyEvent) -> Vec<Effect> {
     let armed = std::mem::replace(&mut m.chord, Chord::Idle) == Chord::Armed;
     if pressed(&key, m.keys.nav()) {
@@ -556,6 +596,9 @@ fn on_nav_key(m: &mut Model, key: KeyEvent) -> Vec<Effect> {
         return enter_agent(m);
     }
     let selected = m.selected_entry().cloned();
+    if let Some(effects) = on_panel_key(m, key.code) {
+        return effects;
+    }
     match key.code {
         KeyCode::Char('q') => return vec![Effect::Quit],
         KeyCode::Esc | KeyCode::Char('i') => return enter_agent(m),
@@ -567,29 +610,16 @@ fn on_nav_key(m: &mut Model, key: KeyEvent) -> Vec<Effect> {
             (_, Some(entry)) => return activate(m, entry.name()),
             _ => {}
         },
-        KeyCode::Char('j') | KeyCode::Down => m.move_cursor(1),
-        KeyCode::Char('k') | KeyCode::Up => m.move_cursor(-1),
-        KeyCode::Char('g') | KeyCode::Home => m.move_to_edge(Edge::First),
-        KeyCode::Char('G') | KeyCode::End => m.move_to_edge(Edge::Last),
+        KeyCode::Char('j') | KeyCode::Down => m.move_in_panel(1),
+        KeyCode::Char('k') | KeyCode::Up => m.move_in_panel(-1),
+        KeyCode::Char('g') | KeyCode::Home => m.panel_to_edge(Edge::First),
+        KeyCode::Char('G') | KeyCode::End => m.panel_to_edge(Edge::Last),
         KeyCode::Char(']') => m.jump_repo(1),
         KeyCode::Char('[') => m.jump_repo(-1),
         KeyCode::Tab => m.toggle_view(),
         KeyCode::Char('p') => m.overlay = Overlay::Picker(Query::default()),
         KeyCode::Char(' ' | '/') => m.overlay = Overlay::Switcher(Query::default()),
         KeyCode::Char('?') => m.overlay = Overlay::Help,
-        KeyCode::Char(c @ '1'..='9') => {
-            let slot = c
-                .to_digit(10)
-                .and_then(|d| u8::try_from(d).ok())
-                .and_then(Slot::new);
-            match slot
-                .and_then(|s| m.snapshot().and_then(|snap| snap.slot(s)))
-                .map(|(_, e)| e.name().clone())
-            {
-                Some(name) => return activate(m, &name),
-                None => m.info(format!("nothing pinned to {c} · m pins the selected agent")),
-            }
-        }
         KeyCode::Char('m') => {
             if let Some(entry) = selected {
                 let name = entry.name().clone();
@@ -616,14 +646,14 @@ fn on_nav_key(m: &mut Model, key: KeyEvent) -> Vec<Effect> {
                 }
             }
         }
-        KeyCode::Char('o') => {
+        KeyCode::Char('e') => {
             let path = m.selected().and_then(|(repo, e)| {
                 e.and_then(|e| e.path())
                     .or_else(|| repo.key().root().map(agent_core::paths::RepoRoot::path))
                     .map(PathBuf::from)
             });
             if let Some(path) = path {
-                return vec![Effect::Edit(path)];
+                return vec![Effect::Edit(Open::Checkout(path))];
             }
         }
         KeyCode::Char('d') => match selected.map(|e| (m.reach(&e), e)) {
@@ -763,7 +793,9 @@ fn reply(m: &mut Model, to: SessionName, text: String) -> Vec<Effect> {
         .and_then(|(_, entry)| m.replyable(entry))
         .is_some();
     if !open {
-        m.error(format!("{to} is asking now, so the reply wasn't sent"));
+        m.error(format!(
+            "{to} isn't waiting for a prompt now, so the reply wasn't sent"
+        ));
         m.overlay = Overlay::Reply { to, text };
         return Vec::new();
     }
@@ -1114,6 +1146,7 @@ fn on_mouse(m: &mut Model, mouse: MouseEvent) -> Vec<Effect> {
             .find(|(y, _)| *y == mouse.row)
             .map(|(_, c)| c.clone());
         if let Some(cursor) = hit {
+            m.panel = Panel::Agents;
             m.set_cursor(cursor);
         }
     }
@@ -1251,7 +1284,7 @@ mod tests {
     }
 
     #[test]
-    fn pinned_slots_and_switcher_order() {
+    fn pins_come_early_in_the_switcher() {
         let mut m = model(&["idle"]);
         m.touch_mru(&name("fix"));
         m.touch_mru(&name("api"));
@@ -1261,9 +1294,138 @@ mod tests {
             .map(|(_, e)| e.name().to_string())
             .collect();
         assert_eq!(order, ["api", "idle", "fix", "web"]);
-        let effects = update(&mut m, key(KeyCode::Char('1')));
+    }
+
+    fn with_changes(m: &mut Model, files: usize) {
+        let changed = (0..files)
+            .map(|i| agent_core::ports::Change {
+                path: format!("src/f{i}.rs").into(),
+                lines: agent_core::ports::Lines::Untracked,
+            })
+            .collect();
+        m.facts.insert(
+            name("fix"),
+            Ok(agent_core::ports::WorktreeFacts {
+                changed,
+                ..Default::default()
+            }),
+        );
+    }
+
+    #[test]
+    fn number_keys_focus_panels_and_esc_returns_to_the_list() {
+        let mut m = model(&[]);
+        with_changes(&mut m, 3);
+        update(&mut m, key(KeyCode::Char('2')));
+        assert_eq!(m.panel, Panel::Agent { offset: 0 });
+        update(&mut m, key(KeyCode::Char('3')));
+        assert_eq!(m.panel, Panel::Changes { file: 0 });
+        assert!(update(&mut m, key(KeyCode::Esc)).is_empty());
+        assert_eq!(
+            m.panel,
+            Panel::Agents,
+            "Esc leaves [3] before it leaves NAV"
+        );
+        update(&mut m, key(KeyCode::Char('2')));
+        update(&mut m, key(KeyCode::Char('1')));
+        assert_eq!(m.panel, Panel::Agents);
+        with_changes(&mut m, 0);
+        update(&mut m, key(KeyCode::Char('3')));
+        assert_eq!(m.panel, Panel::Agents, "nothing to show in [3]");
+    }
+
+    #[test]
+    fn j_and_k_move_within_the_focused_panel() {
+        let mut m = model(&[]);
+        with_changes(&mut m, 3);
+        update(&mut m, key(KeyCode::Char('3')));
+        for _ in 0..5 {
+            update(&mut m, key(KeyCode::Char('j')));
+        }
+        assert_eq!(
+            m.panel,
+            Panel::Changes { file: 2 },
+            "the cursor stops at the last file"
+        );
+        assert_eq!(selected(&m).as_deref(), Some("fix"), "the selection stays");
+        update(&mut m, key(KeyCode::Char('g')));
+        assert_eq!(m.panel, Panel::Changes { file: 0 });
+        update(&mut m, key(KeyCode::Char('G')));
+        update(&mut m, key(KeyCode::Char('k')));
+        assert_eq!(m.panel, Panel::Changes { file: 1 });
+        let effects = update(&mut m, key(KeyCode::Char('e')));
         assert!(
-            matches!(effects.as_slice(), [Effect::Job(Job::Start { at, .. })] if at.name().as_str() == "idle")
+            matches!(effects.as_slice(), [Effect::Edit(Open::File { root, file })] if root.ends_with("w/api/fix") && file == std::path::Path::new("src/f1.rs")),
+            "e opens the file under the cursor"
+        );
+        update(&mut m, key(KeyCode::Char('2')));
+        update(&mut m, key(KeyCode::Char('j')));
+        update(&mut m, key(KeyCode::Char('j')));
+        assert_eq!(m.panel, Panel::Agent { offset: 2 });
+        update(&mut m, key(KeyCode::Char('k')));
+        assert_eq!(m.panel, Panel::Agent { offset: 1 });
+        update(&mut m, key(KeyCode::Char('1')));
+        update(&mut m, key(KeyCode::Char('j')));
+        assert_eq!(
+            selected(&m).as_deref(),
+            Some("idle"),
+            "[1] moves the selection"
+        );
+    }
+
+    #[test]
+    fn panels_fall_back_to_the_list() {
+        let mut m = model(&[]);
+        with_changes(&mut m, 3);
+        update(&mut m, key(KeyCode::Char('3')));
+        update(&mut m, key(KeyCode::Char(']')));
+        assert_eq!(m.panel, Panel::Agents, "a new selection starts in [1]");
+        update(&mut m, key(KeyCode::Char('[')));
+        update(&mut m, key(KeyCode::Char('2')));
+        m.revalidate();
+        assert_eq!(
+            m.panel,
+            Panel::Agent { offset: 0 },
+            "the same agent keeps [2]"
+        );
+        update(&mut m, key(KeyCode::Esc));
+        update(&mut m, key(KeyCode::Tab));
+        update(&mut m, key(KeyCode::Char('g')));
+        assert!(matches!(m.cursor(), Some(Cursor::Repo(_))));
+        update(&mut m, key(KeyCode::Char('2')));
+        assert_eq!(m.panel, Panel::Agents, "a repo row has no [2]");
+    }
+
+    #[test]
+    fn e_with_no_file_under_the_cursor_falls_through() {
+        let mut m = model(&[]);
+        with_changes(&mut m, 3);
+        update(&mut m, key(KeyCode::Char('3')));
+        update(&mut m, key(KeyCode::Char('G')));
+        with_changes(&mut m, 1);
+        let effects = update(&mut m, key(KeyCode::Char('e')));
+        assert!(
+            matches!(effects.as_slice(), [Effect::Edit(Open::File { file, .. })] if file == std::path::Path::new("src/f0.rs")),
+            "the cursor is clamped to the files left"
+        );
+        with_changes(&mut m, 0);
+        let effects = update(&mut m, key(KeyCode::Enter));
+        assert!(
+            !effects.iter().any(|e| matches!(e, Effect::Edit(_))),
+            "with nothing under the cursor, ⏎ attaches as in [1]"
+        );
+    }
+
+    #[test]
+    fn e_opens_the_selected_checkout_from_the_list() {
+        let mut m = model(&[]);
+        let effects = update(&mut m, key(KeyCode::Char('e')));
+        assert!(
+            matches!(effects.as_slice(), [Effect::Edit(Open::Checkout(path))] if path.ends_with("w/api/fix"))
+        );
+        assert!(
+            update(&mut m, key(KeyCode::Char('o'))).is_empty(),
+            "o is free"
         );
     }
 
@@ -1894,6 +2056,15 @@ mod tests {
         assert!(
             matches!(m.overlay, Overlay::None),
             "asking agents get no reply box"
+        );
+        m.activities = Some(HashMap::from([(
+            name("fix"),
+            reported(State::Working { tools: Vec::new() }, 5),
+        )]));
+        update(&mut m, key(KeyCode::Char('r')));
+        assert!(
+            matches!(m.overlay, Overlay::None),
+            "a working agent can open a prompt before it's reported"
         );
         m.activities = Some(HashMap::from([(name("fix"), reported(State::Idle, 5))]));
         update(&mut m, key(KeyCode::Char('r')));

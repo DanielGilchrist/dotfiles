@@ -1,5 +1,5 @@
-//! The sidebar: the agents as cards, then detail blocks under them about
-//! the selection and every other agent that isn't settled.
+//! The sidebar, three panels stacked lazygit-style: [1] the agents as
+//! cards, [2] the selected agent, [3] the files it changed.
 
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
@@ -10,7 +10,7 @@ use std::time::SystemTime;
 use agent_core::activity::Subagent;
 use agent_core::model::{Entry, EntryKind, Head, Repo, RepoKey, Snapshot};
 use agent_core::names::SessionName;
-use agent_core::ports::{Lines, Readiness, WorktreeFacts};
+use agent_core::ports::{DiffStat, Lines, Readiness, WorktreeFacts};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
@@ -19,19 +19,26 @@ use ratatui::widgets::Paragraph;
 use unicode_width::UnicodeWidthStr;
 
 use super::{
-    ACCENT, NAME_MIN, ago, bold, dim, fit, glyph, justify, line_width, name_style, scroll,
-    sidebar_focused, spinner, truncate_end, truncate_start, wrap,
+    ACCENT, NAME_MIN, ago, bold, dim, fit, glyph, justify, line_width, name_style, panel, scroll,
+    sidebar_count, sidebar_focused, sidebar_title, spinner, truncate_end, truncate_start, wrap,
 };
 use crate::model::{
-    AgentStatus, Cursor, Doing, Extent, Failure, Fold, ListScroll, Model, Place, Pulse, Row,
-    Target, View,
+    AgentStatus, Cursor, Doing, Extent, Failure, Fold, ListScroll, Model, Panel as Focused, Place,
+    Pulse, Row, Target,
 };
 
-/// Rows the list leaves for the detail when choosing a tier.
-const DETAIL_RESERVE: usize = 6;
+/// Rows [2] keeps inside its border however long the list is.
+const DETAIL_MIN: usize = 4;
+/// Rows [3] keeps inside its border however long the list is. It's kept
+/// even for an agent with no changes, so moving the selection never
+/// changes how much room the list has.
+const CHANGES_MIN: usize = 3;
 /// Inner widths below this use the short forms.
 const SHORT_BELOW: usize = 36;
 const LEAD_LINES: usize = 3;
+const PROMPT_LINES: usize = 2;
+/// Trailing path components a changed file keeps when they fit.
+const PATH_TAIL: usize = 3;
 /// Shared files listed one per line, beyond which they're summed up.
 const OVERLAP_LINES: usize = 2;
 
@@ -64,27 +71,27 @@ enum Tier {
     Two,
 }
 
-/// The most second lines that leave the detail [`DETAIL_RESERVE`] of a
-/// panel `rows` tall, counting every live card as if it had one.
+/// The most second lines that fit the list in `rows`, counting every live
+/// card as if it had one.
 fn tier(extent: Extent, rows: usize) -> Tier {
-    let avail = rows.saturating_sub(DETAIL_RESERVE);
-    if extent.rows + extent.live <= avail {
+    if extent.rows + extent.live <= rows {
         Tier::Two
-    } else if extent.rows < avail {
+    } else if extent.rows < rows {
         Tier::Waiting {
-            spare: avail - extent.rows,
+            spare: rows - extent.rows,
         }
     } else {
         Tier::One
     }
 }
 
-/// How much of its gist a card's second line showed, which decides
-/// whether the agent's block leads with the rest.
+/// How much of an agent's gist a line showed, which decides what [2]
+/// repeats of it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Shown {
     Whole,
     Cut,
+    /// The card has no second line.
     Hidden,
 }
 
@@ -258,10 +265,12 @@ fn basename(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
-/// How a card names its agent.
+/// How a card names its agent, and whether it sits under a header.
 enum Title {
-    /// By its label, as under its repo and in Focus.
+    /// By its label, as in Focus.
     Label,
+    /// By its label, indented under its open repo.
+    Child,
     /// By its label, with its repo on the right, as in Needs you and Pinned.
     Grouped(String),
     /// Like [`Title::Grouped`], for an agent from another repo listed in
@@ -271,13 +280,16 @@ enum Title {
     Repo(String),
 }
 
-/// One agent in the list: line 1 always, line 2 when the tier gives it one.
-struct Card {
-    lines: Vec<Line<'static>>,
-    shown: Shown,
+impl Title {
+    fn indent(&self) -> &'static str {
+        match self {
+            Self::Label | Self::Repo(_) => "",
+            Self::Child | Self::Grouped(_) | Self::Elsewhere(_) => "  ",
+        }
+    }
 }
 
-/// What every card and block on screen shares.
+/// What the list's cards and the selection's panels share.
 struct Deck<'m> {
     m: &'m Model,
     tier: Tier,
@@ -290,6 +302,7 @@ struct Deck<'m> {
 }
 
 impl<'m> Deck<'m> {
+    /// `rows` is the most the list can take.
     fn new(m: &'m Model, snapshot: &'m Snapshot, inner: usize, rows: usize) -> Self {
         let mut changed_by: HashMap<_, Vec<_>> = HashMap::new();
         for (repo, entry) in snapshot.entries() {
@@ -326,7 +339,9 @@ impl<'m> Deck<'m> {
         }
     }
 
-    fn card(&self, entry: &Entry, title: Title, selected: bool) -> Card {
+    /// An agent's lines in the list (line 1 always, line 2 when the tier
+    /// gives it one), and how much of its gist line 2 shows.
+    fn card(&self, entry: &Entry, title: Title, selected: bool) -> (Vec<Line<'static>>, Shown) {
         let m = self.m;
         let status = m.status(entry);
         let heard = m.activity(entry.name()).map_or(m.now, |a| a.heard);
@@ -336,20 +351,19 @@ impl<'m> Deck<'m> {
             Some(Gist::Delegating { .. }) => None,
             _ => m.subagents(entry),
         };
+        let indent = title.indent();
         let line1 = self.line1(entry, &status, title, subagents, selected);
         match gist {
             Some(gist) => {
-                let (text, shown) = gist.line(self.form, self.content.saturating_sub(2));
-                let line2 = Line::from(vec![Span::raw("  "), Span::styled(text, gist.style())]);
-                Card {
-                    lines: vec![line1, line2],
-                    shown,
-                }
+                let room = self.content.saturating_sub(indent.width() + 2);
+                let (text, shown) = gist.line(self.form, room);
+                let line2 = Line::from(vec![
+                    Span::raw(format!("{indent}  ")),
+                    Span::styled(text, gist.style()),
+                ]);
+                (vec![line1, line2], shown)
             }
-            None => Card {
-                lines: vec![line1],
-                shown: Shown::Hidden,
-            },
+            None => (vec![line1], Shown::Hidden),
         }
     }
 
@@ -368,7 +382,7 @@ impl<'m> Deck<'m> {
     ) -> Line<'static> {
         let m = self.m;
         let style = name_style(status, selected);
-        let mut left = vec![glyph(status), Span::raw(" ")];
+        let mut left = vec![Span::raw(title.indent()), glyph(status), Span::raw(" ")];
         let fixed = line_width(&left);
         let mut repo = None;
         match title {
@@ -385,18 +399,13 @@ impl<'m> Deck<'m> {
                     Form::Short => None,
                 };
             }
-            Title::Label => left.push(Span::styled(entry.label().to_string(), style)),
+            Title::Label | Title::Child => {
+                left.push(Span::styled(entry.label().to_string(), style));
+            }
         }
         left.extend(subagents.map(|n| Span::styled(format!(" ↳{n}"), dim())));
         let mut time = time_in_state(status, m.now);
         let mut markers = Vec::new();
-        if let Some(pin) = entry.pin() {
-            markers.push(Span::styled(
-                pin.slot()
-                    .map_or_else(|| "*".to_string(), |s| s.get().to_string()),
-                dim(),
-            ));
-        }
         if m.pane
             .connection()
             .and_then(|c| c.sharing(entry.name()))
@@ -484,16 +493,33 @@ impl<'m> Deck<'m> {
             .collect()
     }
 
-    /// The agent's block: its header rule, then its items in display order,
-    /// which is also the order they survive in.
-    fn block(&self, repo: &Repo, entry: &Entry, shown: Shown, role: Role) -> Block {
+    /// [2]: what the selected agent is doing, unless its `card` says it
+    /// whole, then what the pane can't show, in priority order.
+    fn detail(&self, repo: &Repo, entry: &Entry, card: Shown) -> Detail {
         let m = self.m;
         let status = m.status(entry);
         let activity = m.activity(entry.name());
         let width = self.content;
+        let in_pane = self.in_pane(entry);
         let heard = activity.map_or(m.now, |a| a.heard);
-        let lead = Gist::of(&status, heard, m.now)
-            .filter(|_| !self.in_pane(entry) && matches!(shown, Shown::Cut | Shown::Hidden))
+        let gist = Gist::of(&status, heard, m.now);
+        let time = time_in_state(&status, m.now);
+        let room = width.saturating_sub(2 + line_width(&time) + 1);
+        let (text, shown) = match (&gist, &status) {
+            (Some(gist), _) => gist.line(self.form, room),
+            (None, AgentStatus::Idle) => ("idle".to_string(), Shown::Whole),
+            (None, AgentStatus::Exited) => ("exited".to_string(), Shown::Whole),
+            (None, _) => ("no session".to_string(), Shown::Whole),
+        };
+        let style = gist.as_ref().map_or_else(dim, Gist::style);
+        let state = justify(
+            vec![glyph(&status), Span::raw(" "), Span::styled(text, style)],
+            time,
+            width,
+        );
+        let state = (card != Shown::Whole).then(|| Item::fixed(vec![state]));
+        let lead = gist
+            .filter(|_| state.is_some() && !in_pane && shown == Shown::Cut)
             .and_then(|gist| {
                 let style = gist.style();
                 gist.lead().map(|text| Item {
@@ -506,7 +532,6 @@ impl<'m> Deck<'m> {
                     },
                 })
             });
-        let overlap = overlap_item(&self.overlaps(repo, entry), width);
         let tree = activity.filter(|_| m.subagents(entry).is_some()).map(|a| {
             Item::fixed(tree(
                 a.subagents.values().collect(),
@@ -515,25 +540,20 @@ impl<'m> Deck<'m> {
                 m.now,
             ))
         });
-        let (readiness, files) = match m.facts.get(entry.name()) {
-            Some(Ok(facts)) => (
-                shows_readiness(entry, &status, facts.readiness())
-                    .then(|| Item::fixed(vec![readiness(facts.readiness())])),
-                files(facts, self.form, width, role.files()),
-            ),
-            Some(Err(e)) => (
-                Some(Item::fixed(vec![Line::styled(
-                    truncate_end(&format!("git: {e}"), width),
-                    dim(),
-                )])),
-                None,
-            ),
-            None => (None, None),
+        let overlap = overlap_item(&self.overlaps(repo, entry), width);
+        let readiness = match m.facts.get(entry.name()) {
+            Some(Ok(facts)) => shows_readiness(entry, &status, facts.readiness())
+                .then(|| Item::fixed(vec![readiness(facts.readiness())])),
+            Some(Err(e)) => Some(Item::fixed(vec![Line::styled(
+                truncate_end(&format!("git: {e}"), width),
+                dim(),
+            )])),
+            None => None,
         };
         let prompt = activity.and_then(|a| a.prompt.as_deref()).map(|prompt| {
             let room = width.saturating_sub(2);
             Item {
-                cap: role.prompt_lines(),
+                cap: PROMPT_LINES,
                 content: Content::Text {
                     rows: wrap(&format!("› {prompt}"), room),
                     style: dim(),
@@ -542,52 +562,33 @@ impl<'m> Deck<'m> {
                 },
             }
         });
-        Block {
-            header: self.header(repo, entry, &status, role),
-            items: [lead, overlap, tree, readiness, files, prompt]
+        let right = if in_pane {
+            vec![Span::styled("in pane", dim())]
+        } else if repo.name() != entry.label() {
+            vec![Span::styled(repo.name().into_owned(), dim())]
+        } else {
+            Vec::new()
+        };
+        Detail {
+            title: vec![
+                Span::raw("[2] "),
+                Span::styled(entry.label().to_string(), bold()),
+            ],
+            right,
+            items: [state, lead, tree, overlap, readiness, prompt]
                 .into_iter()
                 .flatten()
                 .collect(),
         }
     }
+}
 
-    /// `{glyph} {name} ─── {right}`. The right side says `in pane`, or the
-    /// repo (in Overview, unless the name says it) and the time in state
-    /// (unless the selection's card shows it).
-    fn header(
-        &self,
-        repo: &Repo,
-        entry: &Entry,
-        status: &AgentStatus,
-        role: Role,
-    ) -> Line<'static> {
-        let right: Vec<Span<'static>> = if self.in_pane(entry) {
-            vec![Span::styled("in pane", dim())]
-        } else {
-            let mut right = Vec::new();
-            if self.form == Form::Long
-                && self.m.view == View::Overview
-                && repo.name() != entry.label()
-            {
-                right.push(Span::styled(repo.name().into_owned(), dim()));
-            }
-            let time = match role {
-                Role::Selected => Vec::new(),
-                Role::Scrolled | Role::Other => time_in_state(status, self.m.now),
-            };
-            if !right.is_empty() && !time.is_empty() {
-                right.push(Span::raw("  "));
-            }
-            right.extend(time.into_iter().map(|t| t.patch_style(dim())));
-            right
-        };
-        let left = vec![
-            glyph(status),
-            Span::raw(" "),
-            Span::styled(entry.label().to_string(), bold()),
-        ];
-        rule(left, right, self.content)
-    }
+/// [2]'s title, what its top border says on the right, and its items in
+/// priority order.
+struct Detail {
+    title: Vec<Span<'static>>,
+    right: Vec<Span<'static>>,
+    items: Vec<Item>,
 }
 
 /// Only an agent worktree's commits are its own work, so any other
@@ -603,24 +604,6 @@ fn shows_readiness(entry: &Entry, status: &AgentStatus, readiness: Readiness) ->
         (_, EntryKind::Main { .. } | EntryKind::Adopted { .. } | EntryKind::Orphan { .. }) => false,
     }
 }
-
-/// `left`, a DIM rule, then `right`, in `width` columns.
-fn rule(left: Vec<Span<'static>>, right: Vec<Span<'static>>, width: usize) -> Line<'static> {
-    let right_width = match line_width(&right) {
-        0 => 0,
-        w => w + 1,
-    };
-    let mut spans = fit(left, width.saturating_sub(right_width + 2));
-    spans.push(Span::raw(" "));
-    let fill = width.saturating_sub(line_width(&spans) + right_width);
-    spans.push(Span::styled("─".repeat(fill), dim()));
-    if right_width > 0 {
-        spans.push(Span::raw(" "));
-        spans.extend(right);
-    }
-    Line::from(spans)
-}
-
 /// How long it's been in its state, for states where that matters. A
 /// working agent that's gone quiet gets a Yellow `?`.
 fn time_in_state(status: &AgentStatus, now: SystemTime) -> Vec<Span<'static>> {
@@ -799,29 +782,34 @@ fn counts(added: usize, removed: usize) -> (String, String) {
     (added, removed)
 }
 
-/// `changed n files  +a −r`, then every file in `diff --numstat` order
-/// with its counts in columns. It shows `cap` files unless rows are spare.
-fn files(facts: &WorktreeFacts, form: Form, width: usize, cap: usize) -> Option<Item> {
+/// The last [`PATH_TAIL`] components of `path`, fewer while they don't fit
+/// `width`, and the end of the file name when even that doesn't. The
+/// components it drops are the ones every file in a repo shares.
+fn tail(path: &str, width: usize) -> String {
+    let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
+    (1..=PATH_TAIL.min(parts.len()))
+        .rev()
+        .map(|n| parts[parts.len() - n..].join("/"))
+        .find(|tail| tail.width() <= width)
+        .unwrap_or_else(|| truncate_start(basename(path), width))
+}
+
+/// [3]: a row per changed file in `diff --numstat` order, its counts in
+/// columns, in `rows` rows, each after a gutter. With a cursor, the rows
+/// scroll to keep it in view and its gutter is marked. Without one, the
+/// last row says how many more when they don't all fit.
+fn changes(facts: &WorktreeFacts, width: usize, rows: usize, cursor: Option<usize>) -> Changes {
     let changed = &facts.changed;
-    if changed.is_empty() {
-        return None;
-    }
-    let diff = facts.diff();
-    let noun = if diff.files == 1 { "file" } else { "files" };
+    let cursor = cursor.map(|file| file.min(changed.len().saturating_sub(1)));
+    let (first, listed) = match (cursor, changed.len()) {
+        (Some(file), n) => (file.saturating_sub(rows.saturating_sub(1)), rows.min(n)),
+        (None, n) if n <= rows => (0, n),
+        (None, _) => (0, rows.saturating_sub(1)),
+    };
+    let shown = &changed[first..(first + listed).min(changed.len())];
     let green = Style::new().fg(Color::Green);
     let red = Style::new().fg(Color::Red);
-    let (added, removed) = counts(diff.added, diff.removed);
-    let mut header = vec![Span::styled(
-        format!("changed {} {noun}  ", diff.files),
-        dim(),
-    )];
-    header.push(Span::styled(added.clone(), green));
-    if !added.is_empty() && !removed.is_empty() {
-        header.push(Span::raw(" "));
-    }
-    header.push(Span::styled(removed, red));
-
-    let columns: Vec<(Span<'static>, String)> = changed
+    let columns: Vec<(Span<'static>, String)> = shown
         .iter()
         .map(|change| match change.lines {
             Lines::Counted { added, removed } => {
@@ -834,10 +822,11 @@ fn files(facts: &WorktreeFacts, form: Form, width: usize, cap: usize) -> Option<
         .collect();
     let added_width = columns.iter().map(|(a, _)| a.width()).max().unwrap_or(0);
     let removed_width = columns.iter().map(|(_, r)| r.width()).max().unwrap_or(0);
-    let rows = changed
+    let mut lines: Vec<Line<'static>> = shown
         .iter()
         .zip(columns)
-        .map(|(change, (added, removed))| {
+        .enumerate()
+        .map(|(i, (change, (added, removed)))| {
             let mut right = vec![Span::styled(
                 format!("{:>added_width$}", added.content),
                 added.style,
@@ -845,53 +834,33 @@ fn files(facts: &WorktreeFacts, form: Form, width: usize, cap: usize) -> Option<
             if removed_width > 0 {
                 right.push(Span::styled(format!(" {removed:<removed_width$}"), red));
             }
-            let path = change.path.to_string_lossy();
-            let path = match form {
-                Form::Long => path.as_ref(),
-                Form::Short => basename(&path),
+            let room = width.saturating_sub(line_width(&right) + 1);
+            let path = tail(&change.path.to_string_lossy(), room);
+            let mut line = justify(vec![Span::raw(path)], right, width);
+            let gutter = match cursor {
+                Some(file) if file == first + i => Span::styled("▌", Style::new().fg(ACCENT)),
+                _ => Span::raw(" "),
             };
-            let room = width.saturating_sub(2 + line_width(&right) + 1);
-            justify(
-                vec![Span::raw("  "), Span::raw(truncate_start(path, room))],
-                right,
-                width,
-            )
+            line.spans.insert(0, gutter);
+            line
         })
-        .collect::<Vec<_>>();
-    let more = usize::from(rows.len() > cap);
-    Some(Item {
-        cap: 1 + rows.len().min(cap) + more,
-        content: Content::Files {
-            header: Line::from(header),
-            rows,
-        },
-    })
+        .collect();
+    if cursor.is_none() && listed < changed.len() {
+        lines.push(Line::styled(
+            format!(" +{} more", changed.len() - listed),
+            dim(),
+        ));
+    }
+    Changes {
+        lines,
+        diff: facts.diff(),
+    }
 }
 
-/// Whether a block is the selection's, which gets more of each item, and
-/// whether its card is on screen to show its time.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Role {
-    Selected,
-    /// The selection, with its card scrolled out of view.
-    Scrolled,
-    Other,
-}
-
-impl Role {
-    fn files(self) -> usize {
-        match self {
-            Self::Selected | Self::Scrolled => 5,
-            Self::Other => 3,
-        }
-    }
-
-    fn prompt_lines(self) -> usize {
-        match self {
-            Self::Selected | Self::Scrolled => 2,
-            Self::Other => 1,
-        }
-    }
+/// [3]'s rows and the totals for its title.
+struct Changes {
+    lines: Vec<Line<'static>>,
+    diff: DiffStat,
 }
 
 /// A detail item: what it shows in as many rows as it's given, and how
@@ -913,11 +882,6 @@ enum Content {
         width: usize,
         hang: &'static str,
     },
-    /// A header and a row per file, the rows left out counted as `+k more`.
-    Files {
-        header: Line<'static>,
-        rows: Vec<Line<'static>>,
-    },
     /// A line per shared file, or one line for all of them.
     Overlap {
         files: Vec<Line<'static>>,
@@ -930,17 +894,6 @@ impl Item {
         Self {
             cap: lines.len(),
             content: Content::Fixed(lines),
-        }
-    }
-
-    /// Rows its tallest form takes.
-    fn full(&self) -> usize {
-        match &self.content {
-            Content::Fixed(lines) => lines.len(),
-            Content::Text { rows, .. } => rows.len(),
-            Content::Files { rows, .. } => 1 + rows.len(),
-            Content::Overlap { files, .. } if files.len() <= self.cap => files.len(),
-            Content::Overlap { .. } => 1,
         }
     }
 
@@ -969,23 +922,6 @@ impl Item {
                     })
                     .collect()
             }
-            Content::Files { header, rows: all } => {
-                let listed = match rows {
-                    0 => return Vec::new(),
-                    rows if rows > all.len() => all.len(),
-                    1 | 2 => rows - 1,
-                    rows => rows - 2,
-                };
-                let mut lines = vec![header.clone()];
-                lines.extend(all.iter().take(listed).cloned());
-                if listed < all.len() && rows > 2 {
-                    lines.push(Line::styled(
-                        format!("  +{} more", all.len() - listed),
-                        dim(),
-                    ));
-                }
-                lines
-            }
             Content::Overlap { files, all } => match rows {
                 0 => Vec::new(),
                 rows if files.len() <= rows.min(self.cap) => files.clone(),
@@ -995,114 +931,59 @@ impl Item {
     }
 }
 
-/// A detail block: a header rule, then its items in priority order.
-struct Block {
-    header: Line<'static>,
-    items: Vec<Item>,
-}
-
-/// The selection's block first, each item at its cap or shrunk to the rows
-/// left, stopping at the first that can't show at all, so a lower item
-/// never takes rows from a higher one. Only once the selection shows
-/// everything up to its caps do the other blocks follow, in list order,
-/// each starting only if its header and first item fit and the first item
-/// that has to shrink ending the detail. Rows still spare then let the
-/// selection's items grow past their caps.
-fn stack(
-    selected: Option<Block>,
-    others: impl IntoIterator<Item = Block>,
-    rows: usize,
-) -> Vec<Line<'static>> {
+/// Items at their caps in priority order, each shrunk to the rows left
+/// rather than skipped, stopping at the first that can't show at all, so a
+/// lower item never takes rows from a higher one. Rows still spare then let
+/// them grow past their caps.
+fn fill(items: &[Item], rows: usize) -> Vec<Line<'static>> {
     let mut heights = Vec::new();
-    let mut whole = true;
-    if let Some(block) = &selected {
-        let mut left = rows.saturating_sub(1);
-        for item in &block.items {
-            let height = item.fit(item.cap.min(left)).len();
-            if height < item.cap.min(item.full()) {
-                whole = false;
-            }
-            if height == 0 {
-                break;
-            }
-            left -= height;
-            heights.push(height);
+    let mut left = rows;
+    for item in items {
+        let height = item.fit(item.cap.min(left)).len();
+        if height == 0 {
+            break;
         }
-    }
-    let mut used = match heights.iter().sum::<usize>() {
-        0 => 0,
-        n => n + 1,
-    };
-    let mut rest = Vec::new();
-    if whole {
-        'blocks: for Block { header, items } in others {
-            let Some(first) = items.first() else {
-                continue;
-            };
-            if used + 1 + first.fit(first.cap).len().max(1) > rows {
-                break;
-            }
-            rest.push(header);
-            used += 1;
-            for item in &items {
-                let lines = item.fit(item.cap.min(rows - used));
-                let shrunk = lines.len() < item.cap.min(item.full());
-                used += lines.len();
-                rest.extend(lines);
-                if shrunk {
-                    break 'blocks;
-                }
-            }
-        }
+        left -= height;
+        heights.push(height);
     }
     let mut out = Vec::new();
-    if let Some(Block { header, items }) = selected
-        && !heights.is_empty()
-    {
-        let mut spare = rows - used;
-        out.push(header);
-        for (item, height) in items.iter().zip(heights) {
-            let lines = item.fit(height + spare);
-            spare -= lines.len().saturating_sub(height);
-            out.extend(lines);
-        }
+    for (item, height) in items.iter().zip(heights) {
+        let lines = item.fit(height + left);
+        left -= lines.len().saturating_sub(height);
+        out.extend(lines);
     }
-    out.extend(rest);
     out
 }
 
 /// The list's lines with the row each belongs to, the selected card's
-/// lines, and every agent listed with how its card showed its gist.
+/// lines, and how much of its agent's gist that card shows.
 struct List {
     lines: Vec<(Line<'static>, Option<Cursor>)>,
     selected: Option<Range<usize>>,
-    agents: Vec<(SessionName, Shown)>,
+    card: Shown,
 }
 
 fn list(deck: &Deck<'_>, snapshot: &Snapshot, rows: &[Row], cursor: Option<&Cursor>) -> List {
-    let focused = sidebar_focused(deck.m);
+    let focused = sidebar_focused(deck.m) && deck.m.panel == Focused::Agents;
     let mut list = List {
         lines: Vec::new(),
         selected: None,
-        agents: Vec::new(),
+        card: Shown::Hidden,
     };
     for row in rows {
         let row_cursor = row.cursor();
         let selected = row_cursor.is_some() && row_cursor.as_ref() == cursor;
-        let (lines, agent) = match row {
-            Row::Header(group) => (
-                vec![justify(
-                    vec![
-                        Span::styled("▾ ", dim()),
-                        Span::styled(group.title(), dim()),
-                    ],
-                    Vec::new(),
-                    deck.content,
-                )],
-                None,
-            ),
+        let lines = match row {
+            Row::Header(group) => vec![justify(
+                vec![
+                    Span::styled("▾ ", dim()),
+                    Span::styled(group.title(), dim()),
+                ],
+                Vec::new(),
+                deck.content,
+            )],
             Row::Repo { key, fold } => match snapshot.repo(key) {
-                Some(repo) => (vec![deck.repo_line(repo, *fold, selected)], None),
+                Some(repo) => vec![deck.repo_line(repo, *fold, selected)],
                 None => continue,
             },
             Row::Grouped(_, name) | Row::Entry { name, .. } | Row::Elsewhere(name) => {
@@ -1116,17 +997,20 @@ fn list(deck: &Deck<'_>, snapshot: &Snapshot, rows: &[Row], cursor: Option<&Curs
                     } => Title::Repo(repo_name),
                     Row::Elsewhere(_) => Title::Elsewhere(repo_name),
                     Row::Grouped(..) if repo_name != entry.label() => Title::Grouped(repo_name),
+                    Row::Grouped(..)
+                    | Row::Entry {
+                        place: Place::Nested,
+                        ..
+                    } => Title::Child,
                     _ => Title::Label,
                 };
-                let card = deck.card(entry, title, selected);
-                (card.lines, Some((name.clone(), card.shown)))
+                let (lines, shown) = deck.card(entry, title, selected);
+                if selected {
+                    list.card = shown;
+                }
+                lines
             }
         };
-        if let Some((name, shown)) = agent
-            && !list.agents.iter().any(|(n, _)| *n == name)
-        {
-            list.agents.push((name, shown));
-        }
         let start = list.lines.len();
         let gutter = match (selected, focused) {
             (true, true) => Span::styled("▌", Style::new().fg(ACCENT)),
@@ -1144,21 +1028,48 @@ fn list(deck: &Deck<'_>, snapshot: &Snapshot, rows: &[Row], cursor: Option<&Curs
     list
 }
 
-/// The sidebar as laid out for one frame: its lines, which row each list
-/// line selects, and the scroll to remember.
-struct Laid {
-    lines: Vec<Line<'static>>,
-    hits: Vec<(u16, Cursor)>,
-    scroll: ListScroll,
+/// The rows inside [1]'s border at most, leaving [2] and [3] their
+/// minimums, in a column `height` tall.
+fn list_room(height: u16) -> u16 {
+    let kept = u16::try_from(DETAIL_MIN + CHANGES_MIN + 6).unwrap_or(u16::MAX);
+    height
+        .saturating_sub(kept)
+        .max(height.saturating_sub(2).min(LIST_MIN))
 }
 
-/// The list, scrolled to keep the selection in view (and on the same
-/// screen row while it moves between groups, when scrolling allows),
-/// then the detail in the rows under it.
+/// Rows [1] keeps when the column is too short for [2] and [3] their
+/// minimums.
+const LIST_MIN: u16 = 3;
+
+/// A panel's place and its lines, each padded off the border.
+struct Panel {
+    area: Rect,
+    lines: Vec<Line<'static>>,
+}
+
+/// The sidebar as laid out for one frame: the panels, which row each list
+/// line selects, and the scroll to remember.
+struct Laid {
+    list: Panel,
+    hits: Vec<(u16, Cursor)>,
+    scroll: ListScroll,
+    /// [2], while an agent is selected.
+    agent: Option<(Panel, Detail)>,
+    /// The focused panel, its position clamped to what it shows.
+    focus: Focused,
+    /// [3], while the selected agent has changes and there's room.
+    changes: Option<(Panel, Changes)>,
+}
+
+/// Stacks [1] sized to its rows (scrolled to keep the selection in view,
+/// on the same screen row while it moves between groups when scrolling
+/// allows), [2] sized to what it says, and [3] in the rest. Without [3],
+/// [2] takes the rest, and without an agent selected, [1] does.
 fn lay_out(m: &Model, area: Rect) -> Option<Laid> {
     let snapshot = m.snapshot()?;
     let height = usize::from(area.height);
-    let deck = Deck::new(m, snapshot, usize::from(area.width), height);
+    let room = usize::from(m.areas.sidebar.height);
+    let deck = Deck::new(m, snapshot, usize::from(area.width).saturating_sub(2), room);
     let cursor = m.cursor();
     let list = list(&deck, snapshot, &m.rows(), cursor);
     let len = list.lines.len();
@@ -1167,68 +1078,209 @@ fn lay_out(m: &Model, area: Rect) -> Option<Laid> {
         (Some((was, at)), Some(now)) if was.follows(now) => selected_line.saturating_sub(*at),
         _ => m.scroll.offset,
     };
-    let offset = scroll(preferred, selected_line, height, len);
-    let visible = len.saturating_sub(offset).min(height);
-    let on_screen = offset..offset + visible;
+    let offset = scroll(preferred, selected_line, room, len);
+    let visible = len.saturating_sub(offset).min(room).max(1);
 
-    let block_of = |name: &SessionName, shown: Shown, role: Role| {
-        snapshot
-            .entry(name)
-            .map(|(repo, entry)| deck.block(repo, entry, shown, role))
+    let selection = m
+        .selected()
+        .and_then(|(repo, entry)| entry.map(|entry| (repo, entry)));
+    let rest = height.saturating_sub(visible + 2);
+    let agent_rows = match selection {
+        Some(_) if rest >= 3 => rest,
+        _ => 0,
     };
-    let shown_of = |name: &SessionName| {
-        list.agents
-            .iter()
-            .find(|(n, _)| n == name)
-            .map_or(Shown::Hidden, |(_, shown)| *shown)
+    let list_rows = height - agent_rows;
+    let panel_at = |y: usize, rows: usize| {
+        let y = area.y + u16::try_from(y).unwrap_or(u16::MAX);
+        Rect::new(
+            area.x,
+            y,
+            area.width,
+            u16::try_from(rows).unwrap_or(u16::MAX),
+        )
     };
-    let role = match &list.selected {
-        Some(card) if on_screen.contains(&card.start) => Role::Selected,
-        _ => Role::Scrolled,
-    };
-    let selected_name = cursor.and_then(Cursor::entry_name);
-    let selected = selected_name.and_then(|name| block_of(name, shown_of(name), role));
-    let others = list
-        .agents
-        .iter()
-        .filter(|(name, _)| Some(name) != selected_name)
-        .filter(|(name, _)| {
-            snapshot.entry(name).is_some_and(|(_, e)| {
-                let status = m.status(e);
-                Gist::of(&status, m.now, m.now).is_some()
-            })
-        })
-        .filter_map(|(name, shown)| block_of(name, *shown, Role::Other));
-    let detail = stack(selected, others, height - visible);
 
     let mut hits = Vec::new();
     let mut lines = Vec::new();
-    for (i, (line, row)) in list.lines.into_iter().enumerate().skip(offset).take(height) {
-        let y = area.y + u16::try_from(i - offset).unwrap_or(0);
+    for (i, (line, row)) in list.lines.into_iter().enumerate().skip(offset).take(room) {
+        let y = area.y + 1 + u16::try_from(i - offset).unwrap_or(0);
         hits.extend(row.map(|c| (y, c)));
         lines.push(line);
     }
-    lines.extend(detail.into_iter().map(|mut line| {
-        line.spans.insert(0, Span::raw(" "));
-        line
-    }));
     let anchor = cursor
         .cloned()
         .zip(list.selected.map(|r| r.start.saturating_sub(offset)));
+
+    let (agent, changes, focus) = match selection.filter(|_| agent_rows > 0) {
+        None => (None, None, Focused::Agents),
+        Some((repo, entry)) => {
+            let below = Rect::new(
+                area.x,
+                area.y + u16::try_from(list_rows).unwrap_or(u16::MAX),
+                area.width,
+                u16::try_from(agent_rows).unwrap_or(u16::MAX),
+            );
+            let below = agent_panels(&deck, repo, entry, list.card, below);
+            (Some(below.agent), below.changes, below.focus)
+        }
+    };
     Some(Laid {
-        lines,
+        list: Panel {
+            area: panel_at(0, list_rows),
+            lines,
+        },
         hits,
         scroll: ListScroll { offset, anchor },
+        agent,
+        focus,
+        changes,
     })
 }
 
-pub(super) fn draw(frame: &mut Frame<'_>, m: &mut Model, area: Rect) {
+/// [2] and [3] for the selected agent in `area`, and the focus clamped to
+/// what they show. [2] gets its capped items and the rows [3] doesn't need
+/// for its files, and [3] the rest.
+fn agent_panels(deck: &Deck<'_>, repo: &Repo, entry: &Entry, card: Shown, area: Rect) -> Below {
+    let m = deck.m;
+    let rows = usize::from(area.height);
+    let at = |y: usize, height: usize| {
+        Rect::new(
+            area.x,
+            area.y + u16::try_from(y).unwrap_or(u16::MAX),
+            area.width,
+            u16::try_from(height).unwrap_or(u16::MAX),
+        )
+    };
+    let detail = deck.detail(repo, entry, card);
+    let facts = match m.facts.get(entry.name()) {
+        Some(Ok(facts)) if !facts.changed.is_empty() => Some(facts),
+        _ => None,
+    }
+    .filter(|_| rows >= 1 + 2 + CHANGES_MIN + 2);
+    let inside = match facts {
+        Some(facts) => {
+            let capped: usize = detail.items.iter().map(|i| i.fit(i.cap).len()).sum();
+            let most = rows - 2 - CHANGES_MIN - 2;
+            let unwanted = rows.saturating_sub(2 + facts.changed.len().max(CHANGES_MIN) + 2);
+            fill(&detail.items, capped.min(most).max(unwanted))
+                .len()
+                .max(1)
+        }
+        None => rows - 2,
+    };
+    let file = match m.panel {
+        Focused::Changes { file } => facts.map(|f| file.min(f.changed.len() - 1)),
+        Focused::Agents | Focused::Agent { .. } => None,
+    };
+    let changes = facts.map(|facts| {
+        let height = rows - inside - 2;
+        let changes = changes(facts, deck.content, height - 2, file);
+        let panel = Panel {
+            area: at(inside + 2, height),
+            lines: changes.lines.clone(),
+        };
+        (panel, changes)
+    });
+    let (filled, focus) = match (m.panel, file) {
+        (Focused::Agent { offset }, _) => {
+            let all = fill(&detail.items, usize::MAX);
+            let offset = offset.min(all.len().saturating_sub(inside));
+            let shown = all.into_iter().skip(offset).take(inside).collect();
+            (shown, Focused::Agent { offset })
+        }
+        (_, Some(file)) => (fill(&detail.items, inside), Focused::Changes { file }),
+        (Focused::Agents | Focused::Changes { .. }, None) => {
+            (fill(&detail.items, inside), Focused::Agents)
+        }
+    };
+    Below {
+        agent: (pad(at(0, inside + 2), filled), detail),
+        changes,
+        focus,
+    }
+}
+
+/// [2] and [3], if there's room for it, with the focus clamped to them.
+struct Below {
+    agent: (Panel, Detail),
+    changes: Option<(Panel, Changes)>,
+    focus: Focused,
+}
+
+/// A panel holding `lines`, each a column off the left border.
+fn pad(area: Rect, lines: Vec<Line<'static>>) -> Panel {
+    let lines = lines
+        .into_iter()
+        .map(|mut line| {
+            line.spans.insert(0, Span::raw(" "));
+            line
+        })
+        .collect();
+    Panel { area, lines }
+}
+
+/// The three panels in `area`, the one `j`/`k` act on with `border` (the
+/// accent while the sidebar has the keys) and the others DIM.
+pub(super) fn draw(frame: &mut Frame<'_>, m: &mut Model, area: Rect, border: Style) {
+    let nav = sidebar_focused(m);
+    let style_of = |focused: bool| if focused { border } else { dim() };
+    let agents = matches!(m.panel, Focused::Agents);
+    let agent = matches!(m.panel, Focused::Agent { .. });
+    let files = matches!(m.panel, Focused::Changes { .. });
+    // Overview's folds and the tier depend on the list's room, so it's
+    // measured before anything asks for the rows.
+    m.areas.sidebar = Rect::new(
+        area.x + 1,
+        area.y + 1,
+        area.width.saturating_sub(2),
+        list_room(area.height),
+    );
+    let title = fit(sidebar_title(m), usize::from(area.width).saturating_sub(4));
+    let corner = sidebar_count(m, style_of(agents));
     let Some(laid) = lay_out(m, area) else {
+        frame.render_widget(panel(title, corner, style_of(agents), nav && agents), area);
         return;
     };
-    frame.render_widget(Paragraph::new(laid.lines), area);
+    let list = panel(title, corner, style_of(agents), nav && agents);
+    frame.render_widget(Paragraph::new(laid.list.lines).block(list), laid.list.area);
+    if let Some((Panel { area, lines }, detail)) = laid.agent {
+        let block = panel(detail.title, Vec::new(), style_of(agent), nav && agent)
+            .title_top(Line::from(pad_title(detail.right)).right_aligned());
+        frame.render_widget(Paragraph::new(lines).block(block), area);
+    }
+    if let Some((Panel { area, lines }, changes)) = laid.changes {
+        let (added, removed) = counts(changes.diff.added, changes.diff.removed);
+        let mut title = vec![Span::raw("[3] "), Span::styled("Changes", bold())];
+        for (count, colour) in [(added, Color::Green), (removed, Color::Red)] {
+            if !count.is_empty() {
+                title.push(Span::raw(" "));
+                title.push(Span::styled(count, Style::new().fg(colour)));
+            }
+        }
+        let corner = match laid.focus {
+            Focused::Changes { file } => vec![Span::styled(
+                format!("{} of {}", file + 1, changes.diff.files),
+                style_of(files),
+            )],
+            Focused::Agents | Focused::Agent { .. } => Vec::new(),
+        };
+        frame.render_widget(
+            Paragraph::new(lines).block(panel(title, corner, style_of(files), nav && files)),
+            area,
+        );
+    }
+    m.panel = laid.focus;
     m.scroll = laid.scroll;
     m.areas.rows = laid.hits;
+}
+
+/// `spans` with a space each side, as the border titles have.
+fn pad_title(mut spans: Vec<Span<'static>>) -> Vec<Span<'static>> {
+    if !spans.is_empty() {
+        spans.insert(0, Span::raw(" "));
+        spans.push(Span::raw(" "));
+    }
+    spans
 }
 
 #[cfg(test)]
@@ -1240,7 +1292,7 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     use super::*;
-    use crate::fixtures::{asking, fleet, name, reported};
+    use crate::fixtures::{fleet, name, reported};
     use crate::model::{Group, Pane, View};
 
     const SIZES: [(u16, u16); 3] = [(200, 50), (100, 30), (80, 24)];
@@ -1258,12 +1310,29 @@ mod tests {
         lines.iter().map(text).collect()
     }
 
-    /// Draws the whole screen, as the app does, and returns the sidebar's
-    /// inner area.
+    /// Draws the whole screen, as the app does.
     fn render(m: &mut Model, (width, height): (u16, u16)) -> Terminal<TestBackend> {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal.draw(|frame| super::super::draw(frame, m)).unwrap();
         terminal
+    }
+
+    /// The sidebar's column on a screen `size` big, as last drawn: the
+    /// left edge above the status bar.
+    fn column(m: &Model, (_, height): (u16, u16)) -> Rect {
+        Rect::new(0, 0, m.areas.sidebar.width + 2, height - 1)
+    }
+
+    fn laid(m: &mut Model, size: (u16, u16)) -> Laid {
+        render(m, size);
+        lay_out(m, column(m, size)).unwrap()
+    }
+
+    fn agent_lines(laid: &Laid) -> Vec<String> {
+        laid.agent
+            .as_ref()
+            .map(|(panel, _)| texts(&panel.lines))
+            .unwrap_or_default()
     }
 
     /// Each list row's cursor and how many lines its card takes.
@@ -1287,15 +1356,26 @@ mod tests {
     }
 
     #[test]
-    fn the_tier_gives_second_lines_while_the_detail_keeps_its_reserve() {
-        assert_eq!(tier(Extent { rows: 19, live: 7 }, 47), Tier::Two);
-        assert_eq!(tier(Extent { rows: 31, live: 10 }, 47), Tier::Two);
+    fn the_tier_gives_second_lines_while_the_list_fits() {
+        assert_eq!(tier(Extent { rows: 19, live: 7 }, 36), Tier::Two);
         assert_eq!(
-            tier(Extent { rows: 31, live: 18 }, 47),
+            tier(Extent { rows: 31, live: 18 }, 41),
             Tier::Waiting { spare: 10 }
         );
-        assert_eq!(tier(Extent { rows: 41, live: 3 }, 47), Tier::One);
+        assert_eq!(tier(Extent { rows: 41, live: 3 }, 41), Tier::One);
         assert_eq!(tier(Extent { rows: 0, live: 0 }, 4), Tier::Two);
+    }
+
+    #[test]
+    fn the_list_leaves_the_other_panels_their_minimums() {
+        assert_eq!(list_room(49), 36);
+        assert_eq!(list_room(23), 10);
+        assert_eq!(
+            list_room(10),
+            3,
+            "a short column keeps a few rows for the list"
+        );
+        assert_eq!(list_room(4), 2);
     }
 
     #[test]
@@ -1311,8 +1391,7 @@ mod tests {
         );
         assert_eq!(
             edit.line(Form::Short, 20),
-            ("Edit calc.ts".to_string(), Shown::Cut),
-            "the basename leaves the rest to the lead"
+            ("Edit calc.ts".to_string(), Shown::Cut)
         );
         let command = Target::Text("pnpm test --filter triage".into());
         let bash = Gist::Tool {
@@ -1328,7 +1407,6 @@ mod tests {
             quiet: "22s".into(),
         };
         assert_eq!(delegating.line(Form::Long, 40).0, "↳1 subagent · quiet 22s");
-        assert_eq!(delegating.line(Form::Short, 40).0, "↳1 · quiet 22s");
         assert_eq!(delegating.lead(), None, "the tree says more");
     }
 
@@ -1341,17 +1419,8 @@ mod tests {
             Some("Done Added retry. Tests pass.")
         );
         assert_eq!(
-            Gist::Done(None).line(Form::Long, 40),
-            ("done".to_string(), Shown::Whole)
-        );
-        assert_eq!(
             Gist::Failed(&Failure::RateLimit).line(Form::Short, 24),
             ("rate limited".to_string(), Shown::Whole)
-        );
-        let other = Failure::Other("server exploded\ntrace".into());
-        assert_eq!(
-            Gist::Failed(&other).line(Form::Long, 40),
-            ("server exploded".to_string(), Shown::Cut)
         );
     }
 
@@ -1384,22 +1453,38 @@ mod tests {
     }
 
     #[test]
-    fn changed_files_line_up_their_counts_and_say_how_many_more() {
+    fn changed_files_keep_their_meaningful_tail() {
+        assert_eq!(
+            tail("agent-tui/crates/core/src/activity.rs", 40),
+            "core/src/activity.rs"
+        );
+        assert_eq!(
+            tail("agent-tui/crates/core/src/activity.rs", 15),
+            "src/activity.rs"
+        );
+        assert_eq!(
+            tail("agent-tui/crates/core/src/activity.rs", 9),
+            "…ivity.rs"
+        );
+        assert_eq!(tail("Cargo.toml", 20), "Cargo.toml");
+    }
+
+    fn facts() -> WorktreeFacts {
         let change = |path: &str, lines| agent_core::ports::Change {
             path: path.into(),
             lines,
         };
-        let facts = WorktreeFacts {
+        WorktreeFacts {
             changed: vec![
                 change(
-                    "src/payroll/calc.ts",
+                    "a/src/payroll/calc.ts",
                     Lines::Counted {
                         added: 98,
                         removed: 52,
                     },
                 ),
                 change(
-                    "src/payroll/calc.test.ts",
+                    "a/src/payroll/calc.test.ts",
                     Lines::Counted {
                         added: 24,
                         removed: 0,
@@ -1409,35 +1494,32 @@ mod tests {
                 change("notes.md", Lines::Untracked),
             ],
             ..WorktreeFacts::default()
-        };
-        let item = |form, width, cap| files(&facts, form, width, cap).unwrap();
+        }
+    }
+
+    #[test]
+    fn changes_line_up_their_counts_and_say_how_many_more() {
+        let facts = facts();
         assert_eq!(
-            texts(&item(Form::Long, 34, 3).fit(5)),
+            texts(&changes(&facts, 34, 4, None).lines),
             [
-                "changed 4 files  +122 −52",
-                "  src/payroll/calc.ts      +98 −52",
-                "  src/payroll/calc.test.ts +24    ",
-                "  logo.png                 bin    ",
-                "  notes.md                 new    ",
+                " src/payroll/calc.ts        +98 −52",
+                " src/payroll/calc.test.ts   +24    ",
+                " logo.png                   bin    ",
+                " notes.md                   new    ",
+            ]
+        );
+        let short = changes(&facts, 34, 3, None);
+        assert_eq!(texts(&short.lines)[2], " +2 more");
+        let cursor = changes(&facts, 34, 2, Some(3));
+        assert_eq!(
+            texts(&cursor.lines),
+            [
+                " logo.png                       bin",
+                "▌notes.md                       new",
             ],
-            "one more file fits where `+1 more` would go"
+            "the rows scroll to keep the cursor in view"
         );
-        assert_eq!(item(Form::Long, 34, 3).cap, 5);
-        assert_eq!(item(Form::Long, 34, 3).fit(9).len(), 5, "every file");
-        assert_eq!(
-            texts(&item(Form::Long, 34, 3).fit(3))[1..],
-            ["  src/payroll/calc.ts      +98 −52", "  +3 more"],
-            "shrinks before it goes"
-        );
-        assert_eq!(
-            texts(&item(Form::Long, 34, 3).fit(1)),
-            ["changed 4 files  +122 −52"]
-        );
-        assert_eq!(
-            texts(&item(Form::Short, 26, 1).fit(3))[1],
-            "  calc.ts          +98 −52"
-        );
-        assert!(files(&WorktreeFacts::default(), Form::Long, 34, 3).is_none());
     }
 
     /// Text that shrinks a row at a time, `cap` rows of `full`.
@@ -1453,203 +1535,23 @@ mod tests {
         }
     }
 
-    fn block(name: &str, items: &[(usize, usize)]) -> Block {
-        Block {
-            header: Line::raw(format!("{name} ───")),
-            items: items.iter().map(|(cap, full)| item(*cap, *full)).collect(),
-        }
-    }
-
-    fn heads(lines: &[Line<'static>]) -> Vec<String> {
-        texts(lines)
-            .into_iter()
-            .filter(|l| l.ends_with('─'))
-            .collect()
-    }
-
     #[test]
-    fn the_selection_shrinks_items_in_priority_order_before_others_start() {
-        let selected = || Some(block("sel", &[(3, 3), (4, 4), (1, 1)]));
-        let others = || [block("a", &[(2, 2), (2, 2)]), block("b", &[(1, 1)])];
+    fn items_shrink_in_priority_order_then_grow_into_spare_rows() {
+        let items = [item(3, 3), item(4, 4), item(1, 1)];
         assert_eq!(
-            texts(&stack(selected(), others(), 7)),
-            [
-                "sel ───",
-                "row 0",
-                "row 1",
-                "row 2",
-                "row 0",
-                "row 1",
-                "row 2 …"
-            ],
-            "the second item shrinks and the third gets nothing, nor do others"
+            texts(&fill(&items, 6)),
+            ["row 0", "row 1", "row 2", "row 0", "row 1", "row 2 …"],
+            "the second item shrinks and the third gets nothing"
         );
         assert_eq!(
-            heads(&stack(selected(), others(), 20)),
-            ["sel ───", "a ───", "b ───"]
-        );
-        assert_eq!(
-            heads(&stack(selected(), others(), 13)),
-            ["sel ───", "a ───"],
-            "a's second item shrinks, which ends the detail"
-        );
-        assert_eq!(
-            heads(&stack(
-                selected(),
-                [block("a", &[(5, 5)]), block("b", &[(1, 1)])],
-                12
-            )),
-            ["sel ───"],
-            "b never jumps ahead of a"
-        );
-        assert_eq!(
-            heads(&stack(None, [block("a", &[]), block("b", &[(1, 1)])], 4)),
-            ["b ───"],
-            "a block with nothing to say has no header"
-        );
-        assert_eq!(
-            stack(
-                Some(block("sel", &[(2, 6), (1, 1)])),
-                [block("a", &[(1, 1)])],
-                9
-            )
-            .len(),
-            9,
-            "spare rows grow the selection past its caps"
-        );
-    }
-
-    fn agent_lines(m: &mut Model, agent: &str, size: (u16, u16)) -> Vec<Line<'static>> {
-        render(m, size);
-        let laid = lay_out(m, m.areas.sidebar).unwrap();
-        laid.lines
-            .into_iter()
-            .filter(|l| text(l).contains(agent))
-            .collect()
-    }
-
-    #[test]
-    fn cards_show_failures_staleness_and_subagents() {
-        let mut m = fleet(8);
-        m.toggle_view();
-        let mut activities = m.activities.clone().unwrap();
-        activities.insert(
-            name("payroll-fix-3"),
-            reported(State::Working { tools: Vec::new() }, 400),
-        );
-        m.activities = Some(activities);
-        let lines = texts(&laid(&mut m, (200, 50)));
-        let failed = lines
-            .iter()
-            .position(|l| l.contains("! rate-limit-1"))
-            .unwrap();
-        assert_eq!(lines[failed + 1].trim(), "rate limited");
-        let stale = agent_lines(&mut m, "payroll-fix-3", (200, 50));
-        let time: Vec<_> = stale[0].spans.iter().rev().take(2).collect();
-        assert_eq!(time[0].content, "?", "{:?}", stale[0]);
-        assert_eq!(time[0].style.fg, Some(Color::Yellow));
-        assert_eq!(time[1].content, "6m");
-        m.set_cursor(Cursor::Entry(name("obs-layout-4")));
-        let lines = texts(&laid(&mut m, (200, 50)));
-        let tree: Vec<&String> = lines
-            .iter()
-            .filter(|l| l.trim_start().starts_with(['├', '└']))
-            .collect();
-        assert_eq!(tree.len(), 3, "{}", lines.join("\n"));
-        assert!(
-            tree[0].contains("general-purpose") && tree[0].matches("general-purpose").count() == 1,
-            "the oldest first, and an empty description shows the kind once: {}",
-            tree[0]
-        );
-        assert!(tree[2].trim_start().starts_with("└ "));
-        assert!(tree[2].contains("Adversarial review:…  general-purpose  30s"));
-    }
-
-    fn laid(m: &mut Model, size: (u16, u16)) -> Vec<Line<'static>> {
-        render(m, size);
-        lay_out(m, m.areas.sidebar).unwrap().lines
-    }
-
-    #[test]
-    fn the_agent_in_the_pane_says_so_instead_of_its_time() {
-        let mut m = fleet(8);
-        let agent = name("obs-layout-4");
-        let ticket = m.ticket();
-        m.pane = Pane::Connecting {
-            name: agent.clone(),
-            ticket,
-        };
-        m.set_cursor(Cursor::Entry(name("rate-limit-1")));
-        let lines = texts(&laid(&mut m, (200, 50)));
-        let header = lines.iter().find(|l| l.contains("obs-layout-4 ─")).unwrap();
-        assert!(header.trim_end().ends_with("─ in pane"), "{header}");
-        let selected = lines.iter().find(|l| l.contains("rate-limit-1 ─")).unwrap();
-        assert!(
-            selected.trim_end().ends_with('─'),
-            "the selection's card shows its time, and Focus its repo: {selected}"
+            fill(&[item(2, 6), item(1, 1)], 9).len(),
+            7,
+            "spare rows grow past caps"
         );
     }
 
     #[test]
-    fn readiness_shows_only_what_needs_doing() {
-        let mut m = fleet(8);
-        let lines = texts(&laid(&mut m, (200, 50)));
-        assert!(
-            !lines.iter().any(|l| l.contains("nothing ahead")),
-            "{}",
-            lines.join("\n")
-        );
-    }
-
-    #[test]
-    fn overlaps_keep_the_file_and_count_the_agents() {
-        let mut m = fleet(8);
-        m.set_cursor(Cursor::Entry(name("rate-limit-1")));
-        let lines = laid(&mut m, (200, 50));
-        let overlap = lines.iter().find(|l| text(l).contains("overlap ")).unwrap();
-        assert_eq!(text(overlap).trim(), "overlap flow.ts · auth-refresh-2 +2");
-        let file = overlap
-            .spans
-            .iter()
-            .find(|s| s.content == "flow.ts")
-            .unwrap();
-        assert_eq!(file.style.fg, Some(Color::Yellow));
-        let lines = texts(&laid(&mut m, (80, 24)));
-        assert!(
-            lines
-                .iter()
-                .any(|l| l.trim() == "overlap flow.ts · auth-re…"),
-            "{}",
-            lines.join("\n")
-        );
-    }
-
-    #[test]
-    fn focus_lists_who_needs_you_in_other_repos() {
-        let mut m = fleet(8);
-        m.set_cursor(Cursor::Entry(name("agent-tui0")));
-        let lines = texts(&laid(&mut m, (200, 50)));
-        let header = lines.iter().position(|l| l.contains("Needs you")).unwrap();
-        assert!(
-            lines[header + 1].contains("◆ heucristic0"),
-            "{}",
-            lines.join("\n")
-        );
-        assert!(
-            lines[header + 2].contains("rate-limit-1") && lines[header + 2].contains("heucristic0")
-        );
-        assert!(!lines[header + 3].starts_with("    "), "one line each");
-        let items = m.items();
-        assert!(
-            !items
-                .iter()
-                .any(|c| c.entry_name() == Some(&name("rate-limit-1"))),
-            "they can't be selected in Focus"
-        );
-    }
-
-    #[test]
-    fn every_size_and_fleet_fits_its_panel() {
+    fn every_size_and_fleet_fits_its_column() {
         for size in SIZES {
             for agents in FLEETS {
                 for view in [View::Focus, View::Overview] {
@@ -1657,40 +1559,35 @@ mod tests {
                     if m.view != view {
                         m.toggle_view();
                     }
-                    let terminal = render(&mut m, size);
-                    let area = m.areas.sidebar;
-                    let laid = lay_out(&m, area);
                     let context = format!("{size:?}, {agents} agents, {view:?}");
-                    let Some(laid) = laid else {
-                        panic!("{context}: nothing laid out");
-                    };
-                    assert!(
-                        laid.lines.len() <= usize::from(area.height),
-                        "{context}: {} lines in {} rows",
-                        laid.lines.len(),
-                        area.height
-                    );
-                    for line in &laid.lines {
+                    let laid = laid(&mut m, size);
+                    let column = column(&m, size);
+                    let mut panels = vec![&laid.list];
+                    panels.extend(laid.agent.as_ref().map(|(p, _)| p));
+                    panels.extend(laid.changes.as_ref().map(|(p, _)| p));
+                    let mut y = column.y;
+                    for panel in panels {
+                        assert_eq!(panel.area.y, y, "{context}: panels stack");
                         assert!(
-                            line.width() < usize::from(area.width),
-                            "{context}: {:?} is wider than {}",
-                            text(line),
-                            area.width - 1
+                            panel.lines.len() + 2 <= usize::from(panel.area.height),
+                            "{context}: {} lines in {:?}",
+                            panel.lines.len(),
+                            panel.area
                         );
+                        for line in &panel.lines {
+                            assert!(
+                                line.width() < usize::from(column.width) - 1,
+                                "{context}: {:?} is too wide",
+                                text(line)
+                            );
+                        }
+                        y += panel.area.height;
                     }
-                    let buffer = terminal.backend().buffer();
-                    let border = area.x + area.width;
-                    for y in area.y..area.y + area.height {
-                        assert_eq!(buffer[(border, y)].symbol(), "│", "{context}: row {y}");
-                    }
-                    let lines = texts(&laid.lines);
-                    if agents == 0 {
-                        assert!(lines.is_empty(), "{context}");
-                    } else {
+                    assert_eq!(y, column.y + column.height, "{context}: the panels fill it");
+                    if agents > 0 {
                         assert!(
-                            lines.iter().any(|l| l.starts_with('▌')),
-                            "{context}: the selection shows\n{}",
-                            lines.join("\n")
+                            texts(&laid.list.lines).iter().any(|l| l.starts_with('▌')),
+                            "{context}: the selection shows"
                         );
                     }
                 }
@@ -1709,8 +1606,7 @@ mod tests {
                     let before = heights(&m);
                     m.move_cursor(1);
                     render(&mut m, size);
-                    let after = heights(&m);
-                    for (cursor, height) in &after {
+                    for (cursor, height) in &heights(&m) {
                         if let Some(was) = before.get(cursor) {
                             assert_eq!(was, height, "{size:?}, {agents} agents: {cursor:?}");
                         }
@@ -1723,7 +1619,7 @@ mod tests {
     #[test]
     fn the_tier_holds_while_agents_change_state() {
         for (_, height) in SIZES {
-            let rows = usize::from(height) - 3;
+            let rows = usize::from(list_room(height - 1));
             let mut m = fleet(20);
             m.toggle_view();
             let before = tier(m.extent(), rows);
@@ -1739,25 +1635,30 @@ mod tests {
         }
     }
 
+    fn after_gutter(line: &str) -> String {
+        line.chars().skip(1).collect()
+    }
+
     #[test]
-    fn the_tier_follows_the_agents_and_the_view() {
-        let rows = 47;
+    fn repo_children_are_indented_under_their_repo() {
         let mut m = fleet(8);
-        let focus = tier(m.extent(), rows);
         m.toggle_view();
-        assert_eq!(m.extent(), Extent { rows: 11, live: 7 });
-        assert_eq!(focus, Tier::Two);
-        assert_eq!(
-            fleet(21).extent(),
-            Extent { rows: 22, live: 3 },
-            "Focus: its 4 entries, the Needs you header, and the 17 elsewhere"
+        let lines = texts(&laid(&mut m, (200, 50)).list.lines);
+        let repo = lines
+            .iter()
+            .position(|l| l.contains("▾ agent-tui0"))
+            .unwrap();
+        assert!(
+            after_gutter(&lines[repo + 1]).starts_with("  ")
+                && lines[repo + 1].contains("agent-tui0"),
+            "{}",
+            lines.join("\n")
         );
-        let mut many = fleet(30);
-        many.toggle_view();
-        assert_eq!(tier(many.extent(), rows), Tier::Waiting { spare: 4 });
-        let mut more = fleet(40);
-        more.toggle_view();
-        assert_eq!(tier(more.extent(), rows), Tier::One);
+        assert!(
+            after_gutter(&lines[repo + 2]).starts_with("    "),
+            "line 2 sits under the name"
+        );
+        assert!(lines[1].starts_with("   ◆ heucristic0"), "{}", lines[1]);
     }
 
     #[test]
@@ -1792,70 +1693,143 @@ mod tests {
     }
 
     #[test]
-    fn the_selected_block_follows_the_list_and_others_follow_in_order() {
+    fn the_agent_panel_shows_state_tree_and_staleness() {
         let mut m = fleet(8);
         m.toggle_view();
-        render(&mut m, (200, 50));
-        let laid = lay_out(&m, m.areas.sidebar).unwrap();
-        let lines = texts(&laid.lines);
-        let list_end = lines
+        let mut activities = m.activities.clone().unwrap();
+        activities.insert(
+            name("payroll-fix-3"),
+            reported(State::Working { tools: Vec::new() }, 400),
+        );
+        m.activities = Some(activities);
+        let list = laid(&mut m, (200, 50)).list.lines;
+        let failed = texts(&list)
             .iter()
-            .position(|l| l.contains('─'))
-            .expect("a detail block");
+            .position(|l| l.contains("! rate-limit-1"))
+            .unwrap();
+        assert_eq!(texts(&list)[failed + 1].trim(), "rate limited");
+        let stale = list
+            .iter()
+            .find(|l| text(l).contains("payroll-fix-3"))
+            .unwrap();
+        let time: Vec<_> = stale.spans.iter().rev().take(2).collect();
+        assert_eq!(time[0].content, "?");
+        assert_eq!(time[0].style.fg, Some(Color::Yellow));
+        assert_eq!(time[1].content, "6m");
+
+        m.set_cursor(Cursor::Entry(name("obs-layout-4")));
+        let lines = agent_lines(&laid(&mut m, (200, 50)));
         assert!(
-            lines[list_end].contains(m.cursor().and_then(Cursor::entry_name).unwrap().as_str()),
-            "the selection's block comes first, right under the list\n{}",
+            lines[0].trim_start().starts_with('├'),
+            "the card already says what it's doing\n{}",
             lines.join("\n")
         );
+        let tree: Vec<&String> = lines
+            .iter()
+            .filter(|l| l.trim_start().starts_with(['├', '└']))
+            .collect();
+        assert_eq!(tree.len(), 3, "{}", lines.join("\n"));
+        assert!(tree[2].contains("Adversarial review:…  general-purpose  30s"));
+    }
+
+    #[test]
+    fn the_agent_in_the_pane_says_so() {
+        let mut m = fleet(8);
+        let agent = name("obs-layout-4");
+        let ticket = m.ticket();
+        m.pane = Pane::Connecting {
+            name: agent.clone(),
+            ticket,
+        };
+        m.set_cursor(Cursor::Entry(agent));
+        let laid = laid(&mut m, (200, 50));
+        let (_, detail) = laid.agent.unwrap();
+        assert_eq!(texts(&[Line::from(detail.right)]), ["in pane"]);
+    }
+
+    #[test]
+    fn overlaps_keep_the_file_and_count_the_agents() {
+        let mut m = fleet(8);
+        m.set_cursor(Cursor::Entry(name("rate-limit-1")));
+        let laid = laid(&mut m, (200, 50));
+        let lines = &laid.agent.as_ref().unwrap().0.lines;
+        let overlap = lines.iter().find(|l| text(l).contains("overlap ")).unwrap();
+        assert_eq!(text(overlap).trim(), "overlap flow.ts · auth-refresh-2 +2");
+        let file = overlap
+            .spans
+            .iter()
+            .find(|s| s.content == "flow.ts")
+            .unwrap();
+        assert_eq!(file.style.fg, Some(Color::Yellow));
+    }
+
+    #[test]
+    fn focus_lists_who_needs_you_in_other_repos() {
+        let mut m = fleet(8);
+        m.set_cursor(Cursor::Entry(name("agent-tui0")));
+        let lines = texts(&laid(&mut m, (200, 50)).list.lines);
+        let header = lines.iter().position(|l| l.contains("Needs you")).unwrap();
         assert!(
-            lines.iter().any(|l| l.contains("› go")),
+            lines[header + 1].contains("◆ heucristic0"),
             "{}",
             lines.join("\n")
         );
-    }
-
-    #[test]
-    fn an_agent_starting_to_ask_opens_and_closes_no_repos() {
-        let mut m = fleet(40);
-        m.view = View::Overview;
-        render(&mut m, (100, 30));
-        let folds = |m: &Model| -> Vec<String> {
-            m.rows()
-                .iter()
-                .filter_map(|row| match row {
-                    Row::Repo { key, fold } => Some(format!("{key:?} {fold:?}")),
-                    _ => None,
-                })
-                .collect()
-        };
-        let quiet = m
-            .snapshot()
-            .unwrap()
-            .entries()
-            .map(|(_, e)| e.clone())
-            .filter(|e| m.status(e) == AgentStatus::Idle)
-            .last()
-            .unwrap();
-        m.set_cursor(Cursor::Entry(quiet.name().clone()));
-        render(&mut m, (100, 30));
-        let before = folds(&m);
-        let mut activities = m.activities.clone().unwrap_or_default();
-        activities.insert(quiet.name().clone(), asking("rm?", 0));
-        crate::update::update(&mut m, crate::worker::Msg::Activities(activities));
-        render(&mut m, (100, 30));
-        assert_eq!(folds(&m), before);
-    }
-
-    #[test]
-    fn focus_keeps_the_detail_reserve_whatever_waits_elsewhere() {
-        let mut m = fleet(40);
-        m.view = View::Focus;
-        let extent = m.extent();
+        assert!(lines[header + 2].contains("rate-limit-1"));
         assert!(
-            extent.rows
-                >= 1 + m.snapshot().unwrap().entries().count()
-                    - m.selected().unwrap().0.entries().len(),
-            "every other repo's agent may wait: {extent:?}"
+            !m.items()
+                .iter()
+                .any(|c| c.entry_name() == Some(&name("rate-limit-1"))),
+            "they can't be selected in Focus"
         );
+    }
+
+    #[test]
+    fn a_hidden_panel_hands_focus_back_to_the_list() {
+        let mut m = fleet(8);
+        m.set_cursor(Cursor::Entry(name("rate-limit-1")));
+        m.panel = Focused::Changes { file: 9 };
+        let clamped = laid(&mut m, (200, 50));
+        assert_eq!(
+            clamped.focus,
+            Focused::Changes { file: 0 },
+            "one file changed"
+        );
+        m.facts.remove(&name("rate-limit-1"));
+        assert_eq!(laid(&mut m, (200, 50)).focus, Focused::Agents);
+    }
+
+    #[test]
+    fn the_agent_panel_repeats_the_card_only_when_the_card_cuts_it() {
+        let mut m = fleet(8);
+        m.toggle_view();
+        m.set_cursor(Cursor::Entry(name("payroll-fix-3")));
+        let lines = agent_lines(&laid(&mut m, (200, 50)));
+        assert!(
+            !lines[0].contains("Edit"),
+            "the card shows it whole\n{}",
+            lines.join("\n")
+        );
+        let lines = agent_lines(&laid(&mut m, (80, 24)));
+        assert!(
+            lines[0].contains("Edit") && lines[0].trim_end().ends_with("38s"),
+            "the short card cuts it, so [2] says it with the time\n{}",
+            lines.join("\n")
+        );
+    }
+
+    #[test]
+    fn the_focused_panel_scrolls_and_clamps() {
+        let mut m = fleet(8);
+        m.set_cursor(Cursor::Entry(name("obs-layout-4")));
+        m.panel = Focused::Agent { offset: 99 };
+        let scrolled = laid(&mut m, (80, 24));
+        let Focused::Agent { offset } = scrolled.focus else {
+            panic!("{:?}", scrolled.focus)
+        };
+        assert!(offset < 99, "clamped to what [2] shows");
+        m.panel = Focused::Changes { file: 2 };
+        let changed = laid(&mut m, (200, 50));
+        let lines = texts(&changed.changes.unwrap().0.lines);
+        assert!(lines[2].starts_with('▌'), "{}", lines.join("\n"));
     }
 }
