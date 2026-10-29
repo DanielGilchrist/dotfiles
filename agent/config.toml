@@ -19,3 +19,8 @@ label = "lazygit"
 # Takes over the TUI's terminal until lazygit quits.
 interactive = ["lazygit"]
 cwd = "{path}"
+
+# Repos the `p` picker and the `n` form offer beyond the ones shown: each
+# entry is a repo or a directory of repos.
+[repos]
+dirs = ["~/repos/TandaHQ", "~/repos/DanielGilchrist"]

@@ -60,7 +60,7 @@
 [include]
   path = ~/.gitconfig.local
 
-[includeIf "gitdir:~/Documents/repos/TandaHQ/"]
+[includeIf "gitdir:~/repos/TandaHQ/"]
   path = ~/.gitconfig.work
 
 [rerere]
