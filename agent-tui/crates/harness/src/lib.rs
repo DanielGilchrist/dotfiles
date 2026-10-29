@@ -80,10 +80,7 @@ impl Claude {
         self.projects.join(slug)
     }
 
-    /// The conversation to resume: the largest transcript written since the
-    /// worktree was created. Older ones belong to a previous agent that used
-    /// the same name; the largest beats the newest because a botched restart
-    /// leaves a tiny new transcript behind.
+    /// Transcripts under `workdir`'s project dir.
     fn transcripts(&self, workdir: &Path) -> io::Result<Vec<(PathBuf, std::fs::Metadata)>> {
         let entries = match std::fs::read_dir(self.project_dir(workdir)) {
             Ok(entries) => entries,
@@ -101,23 +98,32 @@ impl Claude {
         Ok(found)
     }
 
+    /// The conversation to resume: the newest transcript written since the
+    /// worktree was created that the user has spoken in. Older ones belong
+    /// to a previous agent that used the same name. `/clear` starts a new
+    /// transcript, so the newest is the one the user means, and a launch
+    /// that died before any message leaves one with no user turn, which is
+    /// skipped.
     fn resumable(&self, workdir: &Path) -> io::Result<Option<String>> {
         let born = std::fs::metadata(workdir)?
             .created()
             .unwrap_or(SystemTime::UNIX_EPOCH);
-        let mut best: Option<(u64, String)> = None;
-        for (path, meta) in self.transcripts(workdir)? {
-            if meta.modified()? < born {
+        let mut recent: Vec<(SystemTime, PathBuf)> = self
+            .transcripts(workdir)?
+            .into_iter()
+            .map(|(path, meta)| Ok((meta.modified()?, path)))
+            .collect::<io::Result<_>>()?;
+        recent.retain(|(modified, _)| *modified >= born);
+        recent.sort_by(|a, b| b.0.cmp(&a.0));
+        for (_, path) in recent {
+            if !has_user_turn(&path)? {
                 continue;
             }
-            let Some(id) = path.file_stem().and_then(|s| s.to_str()) else {
-                continue;
-            };
-            if best.as_ref().is_none_or(|(len, _)| meta.len() > *len) {
-                best = Some((meta.len(), id.to_string()));
+            if let Some(id) = path.file_stem().and_then(|s| s.to_str()) {
+                return Ok(Some(id.to_string()));
             }
         }
-        Ok(best.map(|(_, id)| id))
+        Ok(None)
     }
 }
 
@@ -236,6 +242,19 @@ impl Harnesses for Registry {
     fn all(&self) -> Vec<&dyn Harness> {
         vec![&self.claude]
     }
+}
+
+/// Whether the user has said anything in the transcript at `path`. The
+/// first user turn comes early, so this reads little of a long file.
+fn has_user_turn(path: &Path) -> io::Result<bool> {
+    use std::io::BufRead;
+    let file = std::fs::File::open(path)?;
+    for line in std::io::BufReader::new(file).lines() {
+        if line?.contains(r#""type":"user""#) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// `--settings` JSON adding hooks that report each event to the TUI with
@@ -420,7 +439,7 @@ mod tests {
     }
 
     #[test]
-    fn launches_fresh_with_the_bootstrap_then_resumes_the_largest_transcript() {
+    fn launches_fresh_with_the_bootstrap_then_resumes_the_newest_spoken_transcript() {
         let home = tempfile::tempdir().expect("a temp dir");
         let work = tempfile::tempdir().expect("a temp dir");
         let claude = Claude::new(home.path());
@@ -449,11 +468,29 @@ mod tests {
 
         let dir = claude.project_dir(&work.path().canonicalize().expect("exists"));
         std::fs::create_dir_all(&dir).expect("creates");
-        std::fs::write(dir.join("small.jsonl"), "x").expect("writes");
-        std::fs::write(dir.join("big.jsonl"), "xxxxxxxx").expect("writes");
+        let user = r#"{"type":"user","message":{"role":"user","content":"hi"}}"#;
+        let at = |secs: u64, name: &str, body: &str| {
+            let path = dir.join(format!("{name}.jsonl"));
+            std::fs::write(&path, body).expect("writes");
+            std::fs::File::open(&path)
+                .expect("opens")
+                .set_modified(SystemTime::now() + std::time::Duration::from_secs(secs))
+                .expect("sets mtime");
+        };
+        at(
+            1,
+            "before-clear",
+            &format!("{user}\n{user}\n{user}\n{user}\n"),
+        );
+        at(2, "after-clear", &format!("{user}\n"));
+        at(3, "died-at-launch", r#"{"type":"summary"}"#);
         let resumed = claude.launch(&ctx(None)).expect("succeeds");
         let args = resumed.arguments();
-        assert_eq!(args[args.len() - 2..], ["--resume", "big"]);
+        assert_eq!(
+            args[args.len() - 2..],
+            ["--resume", "after-clear"],
+            "the newest the user spoke in, not the largest or the empty newer one"
+        );
     }
 
     #[test]
