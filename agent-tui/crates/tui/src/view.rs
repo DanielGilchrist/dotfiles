@@ -652,10 +652,11 @@ fn draw_status_bar(frame: &mut Frame<'_>, m: &Model, area: Rect) {
         };
         counts.splice(0..0, [Span::raw(key), Span::raw(" ")]);
     }
-    // The counts sit between a space and the right edge's space.
+    // The counts sit between a space, the right edge's space and the
+    // column `justify` keeps between the sides.
     let badge_width = 9 + match line_width(&counts) {
         0 => 0,
-        counts => counts + 2,
+        counts => counts + 3,
     };
     let width = usize::from(area.width);
     let used = |hints: &[Hint<'_>]| {
