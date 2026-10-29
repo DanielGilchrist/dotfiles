@@ -544,8 +544,8 @@ mod tests {
 
     #[test]
     fn orphan_keys_differing_only_in_case_are_ordered_not_equal() {
-        let a = RepoKey::Orphan("Api".parse().unwrap());
-        let b = RepoKey::Orphan("api".parse().unwrap());
+        let a = RepoKey::Orphan("Api".parse().expect("parses"));
+        let b = RepoKey::Orphan("api".parse().expect("parses"));
         assert_ne!(a.cmp(&b), Ordering::Equal);
     }
 }

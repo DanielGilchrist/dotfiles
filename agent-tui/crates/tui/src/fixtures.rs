@@ -17,7 +17,7 @@ use crate::update::update;
 use crate::worker::Msg;
 
 pub fn name(s: &str) -> SessionName {
-    s.parse().unwrap()
+    s.parse().expect("parses")
 }
 
 pub fn wt(path: &str) -> Worktree {
@@ -216,7 +216,7 @@ pub fn fleet(n: usize) -> Model {
             facts_of.insert(entry, Ok(facts(k)));
         }
         repos.push((
-            RepoRoot::new(main.clone().into()).unwrap(),
+            RepoRoot::new(main.clone().into()).expect("absolute"),
             RepoWorktrees {
                 main: wt(&main),
                 linked: agents
@@ -231,11 +231,16 @@ pub fn fleet(n: usize) -> Model {
         repos,
         warnings: Vec::new(),
     };
-    let snapshot = assemble(&observation, &Layout::new("/w".into()).unwrap(), &[]).0;
+    let snapshot = assemble(
+        &observation,
+        &Layout::new("/w".into()).expect("absolute"),
+        &[],
+    )
+    .0;
     let mut m = Model::new(
         "/elsewhere".into(),
         None,
-        "claude".parse().unwrap(),
+        "claude".parse().expect("parses"),
         "claude".into(),
     );
     update(&mut m, Msg::Snapshot(Ok((snapshot, Vec::new()))));

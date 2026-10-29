@@ -441,15 +441,18 @@ mod tests {
         let porcelain = "worktree /src/api\nHEAD abc\nbranch refs/heads/main\n\n\
                          worktree /w/api/fix\nHEAD def\ndetached\n\n\
                          worktree /w/api/gone\nHEAD 123\nprunable gitdir file points to non-existent location\n\n";
-        let worktrees = parse_repo_worktrees(porcelain).unwrap();
-        assert_eq!(worktrees.main.head, Head::Branch("main".parse().unwrap()));
+        let worktrees = parse_repo_worktrees(porcelain).expect("succeeds");
+        assert_eq!(
+            worktrees.main.head,
+            Head::Branch("main".parse().expect("parses"))
+        );
         assert_eq!(worktrees.linked.len(), 1);
         assert_eq!(worktrees.linked[0].head, Head::Detached);
     }
 
     #[test]
     fn git_repo_round_trip() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().expect("a temp dir");
         let dir = tmp.path().to_path_buf();
         let run = |args: &[&str]| {
             assert!(
@@ -458,7 +461,7 @@ mod tests {
                     .arg(&dir)
                     .args(args)
                     .output()
-                    .unwrap()
+                    .expect("succeeds")
                     .status
                     .success()
             );
@@ -476,25 +479,26 @@ mod tests {
             "init",
         ]);
 
-        let dir = dir.canonicalize().unwrap();
-        let repo = Git.repo_of(&dir).unwrap().unwrap();
+        let dir = dir.canonicalize().expect("exists");
+        let repo = Git.repo_of(&dir).expect("succeeds").expect("succeeds");
         assert_eq!(repo.path(), dir);
         assert_eq!(
-            Git.head(&dir).unwrap(),
-            Head::Branch("main".parse().unwrap())
+            Git.head(&dir).expect("succeeds"),
+            Head::Branch("main".parse().expect("parses"))
         );
-        let main: BranchName = "main".parse().unwrap();
+        let main: BranchName = "main".parse().expect("parses");
         assert_eq!(
-            Git.local_branch(&repo, &main).unwrap(),
+            Git.local_branch(&repo, &main).expect("succeeds"),
             Some(LocalBranch::found(main.clone()))
         );
         assert_eq!(
-            Git.local_branch(&repo, &"nope".parse().unwrap()).unwrap(),
+            Git.local_branch(&repo, &"nope".parse().expect("parses"))
+                .expect("succeeds"),
             None
         );
-        assert!(Git.repo_of(Path::new("/")).unwrap().is_none());
+        assert!(Git.repo_of(Path::new("/")).expect("succeeds").is_none());
         assert_eq!(
-            Git.branch_state(&repo, &main).unwrap(),
+            Git.branch_state(&repo, &main).expect("succeeds"),
             BranchState::Unknown,
             "no origin means no base"
         );
@@ -502,7 +506,7 @@ mod tests {
 
     #[test]
     fn facts_count_commits_both_ways_and_changes_since_the_fork() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().expect("a temp dir");
         let origin = tmp.path().join("origin");
         let work = tmp.path().join("work");
         let git = |dir: &Path, args: &[&str]| {
@@ -512,33 +516,33 @@ mod tests {
                 .args(["-c", "user.name=t", "-c", "user.email=t@t"])
                 .args(args)
                 .output()
-                .unwrap();
+                .expect("succeeds");
             assert!(
                 out.status.success(),
                 "{}",
                 String::from_utf8_lossy(&out.stderr)
             );
         };
-        std::fs::create_dir_all(&origin).unwrap();
+        std::fs::create_dir_all(&origin).expect("creates");
         git(&origin, &["init", "-q", "-b", "main"]);
         git(&origin, &["commit", "-q", "--allow-empty", "-m", "init"]);
         git(
             tmp.path(),
-            &["clone", "-q", origin.to_str().unwrap(), "work"],
+            &["clone", "-q", origin.to_str().expect("succeeds"), "work"],
         );
-        std::fs::write(work.join("a.txt"), "one\ntwo\n").unwrap();
+        std::fs::write(work.join("a.txt"), "one\ntwo\n").expect("writes");
         git(&work, &["add", "a.txt"]);
         git(&work, &["commit", "-q", "-m", "a"]);
-        std::fs::write(work.join("a.txt"), "one\n").unwrap();
+        std::fs::write(work.join("a.txt"), "one\n").expect("writes");
         git(
             &origin,
             &["commit", "-q", "--allow-empty", "-m", "upstream"],
         );
         git(&work, &["fetch", "-q"]);
-        let facts = Git.facts(&work).unwrap();
+        let facts = Git.facts(&work).expect("succeeds");
         assert_eq!((facts.ahead, facts.behind, facts.dirty), (1, 1, 1));
-        std::fs::write(work.join("new.txt"), "x\n").unwrap();
-        let facts = Git.facts(&work).unwrap();
+        std::fs::write(work.join("new.txt"), "x\n").expect("writes");
+        let facts = Git.facts(&work).expect("succeeds");
         assert_eq!(
             facts.changed,
             [
@@ -580,14 +584,14 @@ mod tests {
 
     #[test]
     fn only_branches_deleted_from_their_own_remote_count_as_merged() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().expect("a temp dir");
         let sh = |dir: &Path, script: &str| {
             let out = Command::new("sh")
                 .arg("-c")
                 .arg(script)
                 .current_dir(dir)
                 .output()
-                .unwrap();
+                .expect("succeeds");
             assert!(
                 out.status.success(),
                 "{script}: {}",
@@ -599,22 +603,22 @@ mod tests {
             tmp.path(),
             "git init -q --bare -b main origin.git && git init -q -b main work",
         );
-        let work = tmp.path().join("work").canonicalize().unwrap();
+        let work = tmp.path().join("work").canonicalize().expect("exists");
         sh(
             &work,
             &format!(
                 "{commit} init && git remote add origin ../origin.git && git push -q -u origin main && git remote set-head origin main"
             ),
         );
-        let repo = Git.repo_of(&work).unwrap().unwrap();
+        let repo = Git.repo_of(&work).expect("succeeds").expect("succeeds");
 
         sh(
             &work,
             &format!("git checkout -q -b tracks-main origin/main && {commit} wip"),
         );
-        let tracks_main: BranchName = "tracks-main".parse().unwrap();
+        let tracks_main: BranchName = "tracks-main".parse().expect("parses");
         assert!(matches!(
-            Git.branch_state(&repo, &tracks_main).unwrap(),
+            Git.branch_state(&repo, &tracks_main).expect("succeeds"),
             BranchState::Unmerged { .. }
         ));
 
@@ -624,9 +628,9 @@ mod tests {
                 "git checkout -q -b merged main && {commit} done && git push -q -u origin merged && git -C ../origin.git branch -q -D merged"
             ),
         );
-        let merged: BranchName = "merged".parse().unwrap();
+        let merged: BranchName = "merged".parse().expect("parses");
         assert_eq!(
-            Git.branch_state(&repo, &merged).unwrap(),
+            Git.branch_state(&repo, &merged).expect("succeeds"),
             BranchState::Safe,
             "tracking ref still local, nothing after it"
         );
@@ -634,7 +638,7 @@ mod tests {
         sh(&work, &format!("{commit} after-merge"));
         assert!(
             matches!(
-                Git.branch_state(&repo, &merged).unwrap(),
+                Git.branch_state(&repo, &merged).expect("succeeds"),
                 BranchState::UpstreamGone { .. }
             ),
             "commits after the push"
@@ -643,21 +647,24 @@ mod tests {
         sh(&work, "git fetch -q --prune origin");
         assert!(
             matches!(
-                Git.branch_state(&repo, &merged).unwrap(),
+                Git.branch_state(&repo, &merged).expect("succeeds"),
                 BranchState::UpstreamGone { .. }
             ),
             "can't tell once the tracking ref is pruned"
         );
 
         sh(&work, "git checkout -q main");
-        let main: BranchName = "main".parse().unwrap();
-        assert_eq!(Git.branch_state(&repo, &main).unwrap(), BranchState::Safe);
+        let main: BranchName = "main".parse().expect("parses");
+        assert_eq!(
+            Git.branch_state(&repo, &main).expect("succeeds"),
+            BranchState::Safe
+        );
     }
 
     #[test]
     fn dirty_files_and_detached_commits_are_counted() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().canonicalize().unwrap();
+        let tmp = tempfile::tempdir().expect("a temp dir");
+        let dir = tmp.path().canonicalize().expect("exists");
         let sh = |script: &str| {
             assert!(
                 Command::new("sh")
@@ -665,17 +672,17 @@ mod tests {
                     .arg(script)
                     .current_dir(&dir)
                     .status()
-                    .unwrap()
+                    .expect("succeeds")
                     .success()
             );
         };
         let commit = "git -c user.name=t -c user.email=t@t commit -q --allow-empty -m";
         sh(&format!("git init -q -b main && {commit} init"));
-        assert_eq!(Git.dirty_files(&dir).unwrap(), 0);
+        assert_eq!(Git.dirty_files(&dir).expect("succeeds"), 0);
         sh("echo x > new.txt && echo y > other.txt");
-        assert_eq!(Git.dirty_files(&dir).unwrap(), 2);
-        assert_eq!(Git.unreachable_commits(&dir).unwrap(), 0);
+        assert_eq!(Git.dirty_files(&dir).expect("succeeds"), 2);
+        assert_eq!(Git.unreachable_commits(&dir).expect("succeeds"), 0);
         sh(&format!("git checkout -q --detach && {commit} detached"));
-        assert_eq!(Git.unreachable_commits(&dir).unwrap(), 1);
+        assert_eq!(Git.unreachable_commits(&dir).expect("succeeds"), 1);
     }
 }

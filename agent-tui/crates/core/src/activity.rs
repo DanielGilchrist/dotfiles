@@ -627,7 +627,7 @@ mod tests {
         for (secs, reported) in events {
             activity = Some(Activity::next(activity, reported, at(secs)));
         }
-        activity.unwrap()
+        activity.expect("succeeds")
     }
 
     fn main(event: Event) -> Reported {
@@ -1054,7 +1054,7 @@ mod tests {
         let old = format!(
             r#"{{"state":{{"kind":"asking","question":"run rm?"}},"since":{time},"prompt":null,"heard":{time},"events":3}}"#
         );
-        let activity: Activity = serde_json::from_str(&old).unwrap();
+        let activity: Activity = serde_json::from_str(&old).expect("json");
         assert_eq!(
             (activity.events, questions(&activity)),
             (3, vec!["run rm?"])
@@ -1062,7 +1062,7 @@ mod tests {
         let working = format!(
             r#"{{"state":{{"kind":"working","tools":[]}},"since":{time},"prompt":"go","heard":{time},"events":1}}"#
         );
-        let activity: Activity = serde_json::from_str(&working).unwrap();
+        let activity: Activity = serde_json::from_str(&working).expect("json");
         assert!(activity.subagents.is_empty() && activity.asks.is_empty());
         let states = [
             State::Idle,
@@ -1088,9 +1088,9 @@ mod tests {
                 (2, main(asked("Edit"))),
             ]);
             activity.state = state;
-            let json = serde_json::to_string(&activity).unwrap();
+            let json = serde_json::to_string(&activity).expect("json");
             assert_eq!(
-                serde_json::from_str::<Activity>(&json).unwrap(),
+                serde_json::from_str::<Activity>(&json).expect("succeeds"),
                 activity,
                 "{json}"
             );

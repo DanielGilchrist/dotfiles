@@ -351,21 +351,21 @@ mod tests {
     use crate::ports::SessionStatus;
 
     fn layout() -> Layout {
-        Layout::new("/w".into()).unwrap()
+        Layout::new("/w".into()).expect("absolute")
     }
 
     fn root(path: &str) -> RepoRoot {
-        RepoRoot::new(path.into()).unwrap()
+        RepoRoot::new(path.into()).expect("absolute")
     }
 
     fn name(s: &str) -> SessionName {
-        s.parse().unwrap()
+        s.parse().expect("parses")
     }
 
     fn wt(path: &str, branch: Option<&str>) -> Worktree {
         Worktree {
             path: path.into(),
-            head: branch.map_or(Head::Detached, |b| Head::Branch(b.parse().unwrap())),
+            head: branch.map_or(Head::Detached, |b| Head::Branch(b.parse().expect("parses"))),
         }
     }
 
@@ -416,14 +416,14 @@ mod tests {
         assert_eq!(order, ["api", "fix", "idle"]);
         assert_eq!(repo.first().label(), "main");
         assert_eq!(
-            repo.entry(&name("api")).unwrap().presence(),
+            repo.entry(&name("api")).expect("succeeds").presence(),
             Some(Presence::Exited)
         );
         assert_eq!(
-            repo.entry(&name("fix")).unwrap().presence(),
+            repo.entry(&name("fix")).expect("succeeds").presence(),
             Some(Presence::Live)
         );
-        let idle = repo.entry(&name("idle")).unwrap();
+        let idle = repo.entry(&name("idle")).expect("succeeds");
         assert_eq!(idle.presence(), None);
         let EntryState::Idle(at) = idle.state() else {
             panic!("idle should be startable")
@@ -433,10 +433,10 @@ mod tests {
 
     #[test]
     fn the_catalogue_offers_each_dir_or_its_children_that_are_repos() {
-        let base = tempfile::tempdir().unwrap();
+        let base = tempfile::tempdir().expect("a temp dir");
         let mk = |rel: &str| {
             let path = base.path().join(rel);
-            std::fs::create_dir_all(&path).unwrap();
+            std::fs::create_dir_all(&path).expect("creates");
             path
         };
         let repos = mk("repos");
@@ -444,11 +444,11 @@ mod tests {
         mk("repos/api/.git");
         mk("repos/notes");
         let linked = mk("repos/linked");
-        std::fs::write(linked.join(".git"), "gitdir: elsewhere").unwrap();
+        std::fs::write(linked.join(".git"), "gitdir: elsewhere").expect("writes");
         let single = mk("dots");
         mk("dots/.git");
         let via_link = base.path().join("link");
-        std::os::unix::fs::symlink(&single, &via_link).unwrap();
+        std::os::unix::fs::symlink(&single, &via_link).expect("links");
         let missing = base.path().join("nowhere");
         let found = catalogue(&[repos.clone(), via_link, missing.clone()]);
         let names: Vec<String> = found.repos.iter().map(|r| r.name().into_owned()).collect();
@@ -459,7 +459,7 @@ mod tests {
         );
         assert_eq!(
             found.repos[1].path(),
-            single.canonicalize().unwrap(),
+            single.canonicalize().expect("exists"),
             "a symlinked dir is offered by its real path"
         );
         assert_eq!(found.warnings.len(), 1);
@@ -478,7 +478,7 @@ mod tests {
             warnings: Vec::new(),
         };
         let snap = snapshot(&obs, &[]);
-        let entry = snap.repos()[0].entry(&name("scratch")).unwrap();
+        let entry = snap.repos()[0].entry(&name("scratch")).expect("succeeds");
         assert!(matches!(
             entry.kind(),
             EntryKind::Adopted {
@@ -541,8 +541,8 @@ mod tests {
             .collect();
         assert_eq!(order, ["b", "a", "api"]);
         assert_eq!(
-            snap.slot(crate::model::Slot::new(1).unwrap())
-                .unwrap()
+            snap.slot(crate::model::Slot::new(1).expect("succeeds"))
+                .expect("succeeds")
                 .1
                 .name()
                 .as_str(),
@@ -558,8 +558,8 @@ mod tests {
         };
         let snap = snapshot(&obs, &[name("gone"), name("a")]);
         assert_eq!(
-            snap.slot(crate::model::Slot::new(1).unwrap())
-                .unwrap()
+            snap.slot(crate::model::Slot::new(1).expect("succeeds"))
+                .expect("succeeds")
                 .1
                 .name()
                 .as_str(),

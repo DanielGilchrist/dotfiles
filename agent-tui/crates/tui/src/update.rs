@@ -1302,14 +1302,14 @@ mod tests {
             sessions,
             repos: vec![
                 (
-                    RepoRoot::new("/src/api".into()).unwrap(),
+                    RepoRoot::new("/src/api".into()).expect("absolute"),
                     RepoWorktrees {
                         main: wt("/src/api"),
                         linked: vec![wt("/w/api/fix"), wt("/w/api/idle")],
                     },
                 ),
                 (
-                    RepoRoot::new("/src/web".into()).unwrap(),
+                    RepoRoot::new("/src/web".into()).expect("absolute"),
                     RepoWorktrees {
                         main: wt("/src/web"),
                         linked: Vec::new(),
@@ -1319,11 +1319,11 @@ mod tests {
             warnings: Vec::new(),
         };
         let pins: Vec<SessionName> = pins.iter().map(|p| name(p)).collect();
-        assemble(&obs, &Layout::new("/w".into()).unwrap(), &pins).0
+        assemble(&obs, &Layout::new("/w".into()).expect("absolute"), &pins).0
     }
 
     fn root(path: &str) -> RepoRoot {
-        RepoRoot::new(path.into()).unwrap()
+        RepoRoot::new(path.into()).expect("absolute")
     }
 
     /// A snapshot with `extra` repos (main checkout only) beyond `api` and `web`.
@@ -1357,7 +1357,7 @@ mod tests {
                 },
             ));
         }
-        assemble(&obs, &Layout::new("/w".into()).unwrap(), &[]).0
+        assemble(&obs, &Layout::new("/w".into()).expect("absolute"), &[]).0
     }
 
     #[test]
@@ -1524,7 +1524,7 @@ mod tests {
         let mut m = Model::new(
             "/w/api/fix/src".into(),
             None,
-            "claude".parse().unwrap(),
+            "claude".parse().expect("parses"),
             "claude".into(),
         );
         update(
@@ -1555,7 +1555,7 @@ mod tests {
         let order: Vec<_> = (0..3)
             .map(|_| {
                 update(&mut m, key(KeyCode::Char('j')));
-                selected(&m).unwrap()
+                selected(&m).expect("succeeds")
             })
             .collect();
         assert_eq!(order, ["idle", "api", "fix"]);
@@ -1588,7 +1588,7 @@ mod tests {
         let mut m = model(&[]);
         let obs = Observation {
             repos: vec![(
-                RepoRoot::new("/src/api".into()).unwrap(),
+                RepoRoot::new("/src/api".into()).expect("absolute"),
                 RepoWorktrees {
                     main: wt("/src/api"),
                     linked: Vec::new(),
@@ -1596,7 +1596,7 @@ mod tests {
             )],
             ..Observation::default()
         };
-        let snap = assemble(&obs, &Layout::new("/w".into()).unwrap(), &[]).0;
+        let snap = assemble(&obs, &Layout::new("/w".into()).expect("absolute"), &[]).0;
         update(&mut m, Msg::Snapshot(Ok((snap, Vec::new()))));
         assert_eq!(selected(&m).as_deref(), Some("api"));
     }
@@ -2111,7 +2111,7 @@ mod tests {
             terminal_event = { name = "agent-spawn-dev", value = "{path}" }
         "#
         .parse::<agent_core::config::Config>()
-        .unwrap()
+        .expect("succeeds")
         .actions;
     }
 
@@ -2197,7 +2197,7 @@ mod tests {
         let mut m = Model::new(
             "/elsewhere".into(),
             None,
-            "claude".parse().unwrap(),
+            "claude".parse().expect("parses"),
             "claude".into(),
         );
         m.follow = Some(Follow::Restored(name("web")));
@@ -2230,7 +2230,7 @@ mod tests {
         let mut m = Model::new(
             "/w/api/fix/src".into(),
             None,
-            "claude".parse().unwrap(),
+            "claude".parse().expect("parses"),
             "claude".into(),
         );
         m.follow = Some(Follow::Restored(name("web")));
@@ -2259,7 +2259,7 @@ mod tests {
         let mut m = Model::new(
             "/elsewhere".into(),
             None,
-            "claude".parse().unwrap(),
+            "claude".parse().expect("parses"),
             "claude".into(),
         );
         update(
@@ -2429,7 +2429,7 @@ mod tests {
             m.cursor(),
             Some(&Cursor::Grouped(crate::model::Group::NeedsYou, name("fix")))
         );
-        assert!(m.items().contains(m.cursor().unwrap()));
+        assert!(m.items().contains(m.cursor().expect("succeeds")));
     }
 
     #[test]

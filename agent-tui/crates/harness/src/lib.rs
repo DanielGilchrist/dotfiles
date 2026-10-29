@@ -421,19 +421,19 @@ mod tests {
 
     #[test]
     fn launches_fresh_with_the_bootstrap_then_resumes_the_largest_transcript() {
-        let home = tempfile::tempdir().unwrap();
-        let work = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().expect("a temp dir");
+        let work = tempfile::tempdir().expect("a temp dir");
         let claude = Claude::new(home.path());
 
-        let go: Prompt = "--go".parse().unwrap();
-        let session = "fix".parse().unwrap();
+        let go: Prompt = "--go".parse().expect("parses");
+        let session = "fix".parse().expect("parses");
         let ctx = |bootstrap| LaunchCtx {
             session: &session,
             workdir: work.path(),
             bootstrap,
             report: Path::new("/bin/agent"),
         };
-        let fresh = claude.launch(&ctx(Some(&go))).unwrap();
+        let fresh = claude.launch(&ctx(Some(&go))).expect("succeeds");
         let tail: Vec<_> = fresh.arguments().iter().rev().take(2).collect();
         assert_eq!(
             tail,
@@ -447,11 +447,11 @@ mod tests {
                 .any(|k| k == "CLAUDECODE")
         );
 
-        let dir = claude.project_dir(&work.path().canonicalize().unwrap());
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("small.jsonl"), "x").unwrap();
-        std::fs::write(dir.join("big.jsonl"), "xxxxxxxx").unwrap();
-        let resumed = claude.launch(&ctx(None)).unwrap();
+        let dir = claude.project_dir(&work.path().canonicalize().expect("exists"));
+        std::fs::create_dir_all(&dir).expect("creates");
+        std::fs::write(dir.join("small.jsonl"), "x").expect("writes");
+        std::fs::write(dir.join("big.jsonl"), "xxxxxxxx").expect("writes");
+        let resumed = claude.launch(&ctx(None)).expect("succeeds");
         let args = resumed.arguments();
         assert_eq!(args[args.len() - 2..], ["--resume", "big"]);
     }
@@ -459,7 +459,7 @@ mod tests {
     #[test]
     fn launches_report_every_state_change_through_the_agent_binary() {
         let settings: serde_json::Value =
-            serde_json::from_str(&hook_settings(Path::new("/my bin/agent"), "fix")).unwrap();
+            serde_json::from_str(&hook_settings(Path::new("/my bin/agent"), "fix")).expect("json");
         let command = settings
             .pointer("/hooks/Stop/0/hooks/0/command")
             .and_then(serde_json::Value::as_str);
@@ -474,7 +474,7 @@ mod tests {
 
     #[test]
     fn hook_payloads_become_events() {
-        let event = |json: &str| claude_event(&serde_json::from_str(json).unwrap());
+        let event = |json: &str| claude_event(&serde_json::from_str(json).expect("json"));
         let main = |e: Event| Some(Reported::main(e));
         assert_eq!(
             event(
@@ -529,7 +529,7 @@ mod tests {
 
     #[test]
     fn subagent_payloads_say_which_subagent_they_came_from() {
-        let event = |json: &str| claude_event(&serde_json::from_str(json).unwrap());
+        let event = |json: &str| claude_event(&serde_json::from_str(json).expect("json"));
         let a1 = |e: Event| Some(Reported::subagent(AgentId::new("a1"), e));
         assert_eq!(
             event(

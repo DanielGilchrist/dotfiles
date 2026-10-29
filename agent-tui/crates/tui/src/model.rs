@@ -2134,7 +2134,7 @@ mod tests {
 
     #[test]
     fn needs_you_counts_as_the_same_place_as_any_other_row_for_its_agent() {
-        let fix: SessionName = "fix".parse().unwrap();
+        let fix: SessionName = "fix".parse().expect("parses");
         let needs_you = Cursor::Grouped(Group::NeedsYou, fix.clone());
         assert!(needs_you.follows(&Cursor::Entry(fix.clone())));
         assert!(Cursor::Grouped(Group::Pinned, fix.clone()).follows(&needs_you));

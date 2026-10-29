@@ -252,16 +252,16 @@ mod tests {
     use super::*;
 
     fn layout() -> Layout {
-        Layout::new("/w".into()).unwrap()
+        Layout::new("/w".into()).expect("absolute")
     }
 
     fn repo(path: &str) -> RepoRoot {
-        RepoRoot::new(path.into()).unwrap()
+        RepoRoot::new(path.into()).expect("absolute")
     }
 
     #[test]
     fn worktree_paths_stay_under_the_root() {
-        let wt = layout().worktree(&repo("/src/api"), "fix".parse().unwrap());
+        let wt = layout().worktree(&repo("/src/api"), "fix".parse().expect("parses"));
         assert_eq!(wt.path(), Path::new("/w/api/fix"));
     }
 
@@ -269,7 +269,7 @@ mod tests {
     fn enclosing_finds_the_agent_worktree_around_a_path() {
         let wt = layout()
             .enclosing(Path::new("/w/api/fix/src/main.rs"))
-            .unwrap();
+            .expect("succeeds");
         assert_eq!(wt.path(), Path::new("/w/api/fix"));
         assert_eq!(wt.name().as_str(), "fix");
     }
@@ -294,16 +294,16 @@ mod tests {
 
     #[test]
     fn dot_named_repos_get_visible_directories() {
-        let wt = layout().worktree(&repo("/home/d/.config"), "fix".parse().unwrap());
+        let wt = layout().worktree(&repo("/home/d/.config"), "fix".parse().expect("parses"));
         assert_eq!(wt.path(), Path::new("/w/_config/fix"));
         assert_eq!(layout().worktree_at(wt.path()), Some(wt));
-        let trash = layout().worktree(&repo("/src/.trash"), "x".parse().unwrap());
+        let trash = layout().worktree(&repo("/src/.trash"), "x".parse().expect("parses"));
         assert!(!trash.path().starts_with(layout().trash()));
     }
 
     #[test]
     fn typed_paths_expand_home_and_anchor_relative_ones() {
-        let home = home().unwrap();
+        let home = home().expect("HOME");
         let base = Path::new("/w/api/fix");
         assert_eq!(
             typed_path("~/code", base),

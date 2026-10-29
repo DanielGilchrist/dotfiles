@@ -36,7 +36,7 @@ pub struct FakeVcs {
 impl FakeVcs {
     pub fn new(root: &Path) -> Self {
         Self {
-            root: RepoRoot::new(root.to_path_buf()).unwrap(),
+            root: RepoRoot::new(root.to_path_buf()).expect("absolute"),
             heads: Mutex::default(),
             states: Mutex::default(),
             dirty: Mutex::default(),
@@ -48,27 +48,39 @@ impl FakeVcs {
     }
 
     pub fn set_head(&self, path: &Path, head: Head) {
-        self.heads.lock().unwrap().insert(path.to_path_buf(), head);
+        self.heads
+            .lock()
+            .expect("lock")
+            .insert(path.to_path_buf(), head);
     }
 
     pub fn set_state(&self, branch: &BranchName, state: BranchState) {
-        self.states.lock().unwrap().insert(branch.clone(), state);
+        self.states
+            .lock()
+            .expect("lock")
+            .insert(branch.clone(), state);
     }
 }
 
 impl Vcs for FakeVcs {
     fn repo_of(&self, dir: &Path) -> Result<Option<RepoRoot>, CommandError> {
-        if self.not_repos.lock().unwrap().iter().any(|p| p == dir) {
+        if self
+            .not_repos
+            .lock()
+            .expect("lock")
+            .iter()
+            .any(|p| p == dir)
+        {
             return Ok(None);
         }
-        if let Some(other) = self.other_repos.lock().unwrap().get(dir) {
+        if let Some(other) = self.other_repos.lock().expect("lock").get(dir) {
             return Ok(Some(other.clone()));
         }
         Ok(Some(self.root.clone()))
     }
 
     fn worktrees(&self, _: &RepoRoot) -> Result<RepoWorktrees, CommandError> {
-        let heads = self.heads.lock().unwrap();
+        let heads = self.heads.lock().expect("lock");
         let linked = heads
             .iter()
             .filter(|(p, _)| p.as_path() != self.root.path())
@@ -90,7 +102,7 @@ impl Vcs for FakeVcs {
         Ok(self
             .heads
             .lock()
-            .unwrap()
+            .expect("succeeds")
             .get(dir)
             .cloned()
             .unwrap_or(Head::Detached))
@@ -102,8 +114,8 @@ impl Vcs for FakeVcs {
         at: &AgentWorktree,
         _: &WorktreeStart,
     ) -> Result<(), CommandError> {
-        std::fs::create_dir_all(at.path()).unwrap();
-        std::fs::write(at.path().join(".git"), "gitdir: fake").unwrap();
+        std::fs::create_dir_all(at.path()).expect("creates");
+        std::fs::write(at.path().join(".git"), "gitdir: fake").expect("writes");
         self.set_head(at.path(), Head::Detached);
         Ok(())
     }
@@ -117,7 +129,7 @@ impl Vcs for FakeVcs {
         _: &RepoRoot,
         branch: &BranchName,
     ) -> Result<Option<LocalBranch>, CommandError> {
-        let deleted = self.deleted.lock().unwrap().contains(branch);
+        let deleted = self.deleted.lock().expect("lock").contains(branch);
         Ok((!deleted).then(|| LocalBranch::found(branch.clone())))
     }
 
@@ -133,7 +145,7 @@ impl Vcs for FakeVcs {
         Ok(self
             .states
             .lock()
-            .unwrap()
+            .expect("succeeds")
             .get(branch)
             .copied()
             .unwrap_or(BranchState::Safe))
@@ -143,7 +155,7 @@ impl Vcs for FakeVcs {
         Ok(self
             .dirty
             .lock()
-            .unwrap()
+            .expect("succeeds")
             .get(worktree)
             .copied()
             .unwrap_or(0))
@@ -153,7 +165,7 @@ impl Vcs for FakeVcs {
         Ok(self
             .detached_commits
             .lock()
-            .unwrap()
+            .expect("succeeds")
             .get(worktree)
             .copied()
             .unwrap_or(0))
@@ -164,7 +176,10 @@ impl Vcs for FakeVcs {
     }
 
     fn delete_branch(&self, _: &RepoRoot, branch: LocalBranch) -> Result<(), CommandError> {
-        self.deleted.lock().unwrap().push(branch.name().clone());
+        self.deleted
+            .lock()
+            .expect("lock")
+            .push(branch.name().clone());
         Ok(())
     }
 }
@@ -181,7 +196,7 @@ pub struct FakeHost {
 
 impl SessionHost for FakeHost {
     fn sessions(&self) -> Result<Vec<SessionInfo>, HostError> {
-        Ok(self.sessions.lock().unwrap().clone())
+        Ok(self.sessions.lock().expect("lock").clone())
     }
 
     fn attach(&self, name: &SessionName) -> LaunchSpec {
@@ -191,23 +206,23 @@ impl SessionHost for FakeHost {
     fn create(&self, name: &SessionName, pane: &PaneCommand) -> Result<LaunchSpec, HostError> {
         self.created
             .lock()
-            .unwrap()
+            .expect("succeeds")
             .push((name.clone(), pane.clone()));
         Ok(LaunchSpec::new("create").arg(name.as_str()))
     }
 
     fn start_detached(&self, name: &SessionName) -> Result<(), HostError> {
-        self.detached.lock().unwrap().push(name.clone());
+        self.detached.lock().expect("lock").push(name.clone());
         Ok(())
     }
 
     fn kill(&self, session: &Running) -> Result<(), HostError> {
         let name = session.name();
-        self.killed.lock().unwrap().push(name.clone());
+        self.killed.lock().expect("lock").push(name.clone());
         for s in self
             .sessions
             .lock()
-            .unwrap()
+            .expect("succeeds")
             .iter_mut()
             .filter(|s| &s.name == name)
         {
@@ -218,15 +233,18 @@ impl SessionHost for FakeHost {
     }
 
     fn delete(&self, name: &SessionName) -> Result<(), HostError> {
-        self.deleted.lock().unwrap().push(name.clone());
-        self.sessions.lock().unwrap().retain(|s| &s.name != name);
+        self.deleted.lock().expect("lock").push(name.clone());
+        self.sessions
+            .lock()
+            .expect("lock")
+            .retain(|s| &s.name != name);
         Ok(())
     }
 
     fn write(&self, name: &SessionName, bytes: &[u8]) -> Result<(), HostError> {
         self.written
             .lock()
-            .unwrap()
+            .expect("succeeds")
             .push((name.clone(), bytes.to_vec()));
         Ok(())
     }
@@ -255,11 +273,11 @@ pub struct MemStore {
 
 impl Store for MemStore {
     fn pinned(&self) -> Result<Vec<SessionName>, StoreError> {
-        Ok(self.pins.lock().unwrap().clone())
+        Ok(self.pins.lock().expect("lock").clone())
     }
 
     fn pin(&self, name: &SessionName) -> Result<(), StoreError> {
-        let mut pins = self.pins.lock().unwrap();
+        let mut pins = self.pins.lock().expect("lock");
         if !pins.contains(name) {
             pins.push(name.clone());
         }
@@ -267,38 +285,38 @@ impl Store for MemStore {
     }
 
     fn unpin(&self, name: &SessionName) -> Result<(), StoreError> {
-        self.pins.lock().unwrap().retain(|p| p != name);
+        self.pins.lock().expect("lock").retain(|p| p != name);
         Ok(())
     }
 
     fn record(&self, name: &SessionName) -> Result<Option<AgentRecord>, StoreError> {
-        Ok(self.records.lock().unwrap().get(name).cloned())
+        Ok(self.records.lock().expect("lock").get(name).cloned())
     }
 
     fn put_record(&self, name: &SessionName, record: &AgentRecord) -> Result<(), StoreError> {
         self.records
             .lock()
-            .unwrap()
+            .expect("succeeds")
             .insert(name.clone(), record.clone());
         Ok(())
     }
 
     fn forget(&self, name: &SessionName) -> Result<(), StoreError> {
         self.unpin(name)?;
-        self.records.lock().unwrap().remove(name);
-        self.activities.lock().unwrap().remove(name);
+        self.records.lock().expect("lock").remove(name);
+        self.activities.lock().expect("lock").remove(name);
         Ok(())
     }
 
     fn report(&self, name: &SessionName, event: Reported) -> Result<(), StoreError> {
-        let mut activities = self.activities.lock().unwrap();
+        let mut activities = self.activities.lock().expect("lock");
         let next = Activity::next(activities.remove(name), event, SystemTime::now());
         activities.insert(name.clone(), next);
         Ok(())
     }
 
     fn acknowledge(&self, name: &SessionName) -> Result<(), StoreError> {
-        let mut activities = self.activities.lock().unwrap();
+        let mut activities = self.activities.lock().expect("lock");
         if let Some(activity) = activities.remove(name) {
             activities.insert(name.clone(), activity.acknowledged(SystemTime::now()));
         }
@@ -306,15 +324,15 @@ impl Store for MemStore {
     }
 
     fn activities(&self) -> Result<HashMap<SessionName, Activity>, StoreError> {
-        Ok(self.activities.lock().unwrap().clone())
+        Ok(self.activities.lock().expect("lock").clone())
     }
 
     fn repos(&self) -> Result<Vec<RepoRoot>, StoreError> {
-        Ok(self.repos.lock().unwrap().clone())
+        Ok(self.repos.lock().expect("lock").clone())
     }
 
     fn list_repo(&self, repo: &RepoRoot) -> Result<Listing, StoreError> {
-        let mut repos = self.repos.lock().unwrap();
+        let mut repos = self.repos.lock().expect("lock");
         if repos.contains(repo) {
             return Ok(Listing::AlreadyListed);
         }
@@ -323,7 +341,7 @@ impl Store for MemStore {
     }
 
     fn unlist_repo(&self, repo: &RepoRoot) -> Result<Unlisting, StoreError> {
-        let mut repos = self.repos.lock().unwrap();
+        let mut repos = self.repos.lock().expect("lock");
         let before = repos.len();
         repos.retain(|r| r != repo);
         Ok(if repos.len() < before {
@@ -334,11 +352,11 @@ impl Store for MemStore {
     }
 
     fn last_selected(&self) -> Result<Option<SessionName>, StoreError> {
-        Ok(self.last_selected.lock().unwrap().clone())
+        Ok(self.last_selected.lock().expect("lock").clone())
     }
 
     fn set_last_selected(&self, name: &SessionName) -> Result<(), StoreError> {
-        *self.last_selected.lock().unwrap() = Some(name.clone());
+        *self.last_selected.lock().expect("lock") = Some(name.clone());
         Ok(())
     }
 }
@@ -353,7 +371,7 @@ pub struct FakeHarness {
 impl Default for FakeHarness {
     fn default() -> Self {
         Self {
-            id: "fake".parse().unwrap(),
+            id: "fake".parse().expect("parses"),
             active: AtomicBool::new(false),
         }
     }

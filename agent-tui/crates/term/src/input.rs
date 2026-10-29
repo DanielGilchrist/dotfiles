@@ -175,7 +175,7 @@ mod tests {
     #[test]
     fn cell_positions_are_one_based_and_bounded() {
         let area = Rect::new(10, 5, 4, 2);
-        let at = CellPos::within(area, Position::new(10, 5)).unwrap();
+        let at = CellPos::within(area, Position::new(10, 5)).expect("succeeds");
         assert_eq!((at.col.get(), at.row.get()), (1, 1));
         assert!(CellPos::within(area, Position::new(9, 5)).is_none());
         assert!(CellPos::within(area, Position::new(14, 5)).is_none());
@@ -183,14 +183,14 @@ mod tests {
 
     #[test]
     fn mouse_reports_only_when_requested() {
-        let at = CellPos::within(Rect::new(0, 0, 10, 10), Position::new(2, 3)).unwrap();
+        let at = CellPos::within(Rect::new(0, 0, 10, 10), Position::new(2, 3)).expect("succeeds");
         assert!(encode_mouse(MouseEventKind::ScrollUp, at, Modes::default()).is_none());
         let sgr = Modes {
             mouse: MouseReporting::Sgr,
             ..Modes::default()
         };
         assert_eq!(
-            encode_mouse(MouseEventKind::ScrollUp, at, sgr).unwrap(),
+            encode_mouse(MouseEventKind::ScrollUp, at, sgr).expect("succeeds"),
             b"\x1b[<64;3;4M"
         );
     }

@@ -1299,7 +1299,7 @@ mod tests {
     const FLEETS: [usize; 5] = [0, 1, 2, 8, 20];
 
     fn n(n: usize) -> NonZeroUsize {
-        NonZeroUsize::new(n).unwrap()
+        NonZeroUsize::new(n).expect("succeeds")
     }
 
     fn text(line: &Line<'_>) -> String {
@@ -1312,8 +1312,10 @@ mod tests {
 
     /// Draws the whole screen, as the app does.
     fn render(m: &mut Model, (width, height): (u16, u16)) -> Terminal<TestBackend> {
-        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-        terminal.draw(|frame| super::super::draw(frame, m)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("a backend");
+        terminal
+            .draw(|frame| super::super::draw(frame, m))
+            .expect("draws");
         terminal
     }
 
@@ -1325,7 +1327,7 @@ mod tests {
 
     fn laid(m: &mut Model, size: (u16, u16)) -> Laid {
         render(m, size);
-        lay_out(m, column(m, size)).unwrap()
+        lay_out(m, column(m, size)).expect("succeeds")
     }
 
     fn agent_lines(laid: &Laid) -> Vec<String> {
@@ -1338,7 +1340,7 @@ mod tests {
     /// Each list row's cursor and how many lines its card takes.
     fn heights(m: &Model) -> HashMap<String, usize> {
         let area = m.areas.sidebar;
-        let snapshot = m.snapshot().unwrap();
+        let snapshot = m.snapshot().expect("loaded");
         let deck = Deck::new(
             m,
             snapshot,
@@ -1625,7 +1627,7 @@ mod tests {
             let before = tier(m.extent(), rows);
             let everyone_done: HashMap<_, _> = m
                 .snapshot()
-                .unwrap()
+                .expect("succeeds")
                 .entries()
                 .map(|(_, e)| (e.name().clone(), reported(State::Done { summary: None }, 5)))
                 .collect();
@@ -1647,7 +1649,7 @@ mod tests {
         let repo = lines
             .iter()
             .position(|l| l.contains("▾ agent-tui0"))
-            .unwrap();
+            .expect("succeeds");
         assert!(
             after_gutter(&lines[repo + 1]).starts_with("  ")
                 && lines[repo + 1].contains("agent-tui0"),
@@ -1683,7 +1685,7 @@ mod tests {
         };
         let before = row(&m);
         assert!(before.is_some());
-        let mut activities = m.activities.clone().unwrap();
+        let mut activities = m.activities.clone().expect("succeeds");
         activities.insert(agent.clone(), reported(State::Idle, 1));
         m.activities = Some(activities);
         m.revalidate();
@@ -1696,7 +1698,7 @@ mod tests {
     fn the_agent_panel_shows_state_tree_and_staleness() {
         let mut m = fleet(8);
         m.toggle_view();
-        let mut activities = m.activities.clone().unwrap();
+        let mut activities = m.activities.clone().expect("succeeds");
         activities.insert(
             name("payroll-fix-3"),
             reported(State::Working { tools: Vec::new() }, 400),
@@ -1706,12 +1708,12 @@ mod tests {
         let failed = texts(&list)
             .iter()
             .position(|l| l.contains("! rate-limit-1"))
-            .unwrap();
+            .expect("succeeds");
         assert_eq!(texts(&list)[failed + 1].trim(), "rate limited");
         let stale = list
             .iter()
             .find(|l| text(l).contains("payroll-fix-3"))
-            .unwrap();
+            .expect("succeeds");
         let time: Vec<_> = stale.spans.iter().rev().take(2).collect();
         assert_eq!(time[0].content, "?");
         assert_eq!(time[0].style.fg, Some(Color::Yellow));
@@ -1743,7 +1745,7 @@ mod tests {
         };
         m.set_cursor(Cursor::Entry(agent));
         let laid = laid(&mut m, (200, 50));
-        let (_, detail) = laid.agent.unwrap();
+        let (_, detail) = laid.agent.expect("succeeds");
         assert_eq!(texts(&[Line::from(detail.right)]), ["in pane"]);
     }
 
@@ -1752,14 +1754,17 @@ mod tests {
         let mut m = fleet(8);
         m.set_cursor(Cursor::Entry(name("rate-limit-1")));
         let laid = laid(&mut m, (200, 50));
-        let lines = &laid.agent.as_ref().unwrap().0.lines;
-        let overlap = lines.iter().find(|l| text(l).contains("overlap ")).unwrap();
+        let lines = &laid.agent.as_ref().expect("[2] shows").0.lines;
+        let overlap = lines
+            .iter()
+            .find(|l| text(l).contains("overlap "))
+            .expect("found");
         assert_eq!(text(overlap).trim(), "overlap flow.ts · auth-refresh-2 +2");
         let file = overlap
             .spans
             .iter()
             .find(|s| s.content == "flow.ts")
-            .unwrap();
+            .expect("succeeds");
         assert_eq!(file.style.fg, Some(Color::Yellow));
     }
 
@@ -1768,7 +1773,10 @@ mod tests {
         let mut m = fleet(8);
         m.set_cursor(Cursor::Entry(name("agent-tui0")));
         let lines = texts(&laid(&mut m, (200, 50)).list.lines);
-        let header = lines.iter().position(|l| l.contains("Needs you")).unwrap();
+        let header = lines
+            .iter()
+            .position(|l| l.contains("Needs you"))
+            .expect("found");
         assert!(
             lines[header + 1].contains("◆ heucristic0"),
             "{}",
@@ -1829,7 +1837,7 @@ mod tests {
         assert!(offset < 99, "clamped to what [2] shows");
         m.panel = Focused::Changes { file: 2 };
         let changed = laid(&mut m, (200, 50));
-        let lines = texts(&changed.changes.unwrap().0.lines);
+        let lines = texts(&changed.changes.expect("succeeds").0.lines);
         assert!(lines[2].starts_with('▌'), "{}", lines.join("\n"));
     }
 }

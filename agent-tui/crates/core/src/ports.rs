@@ -530,7 +530,7 @@ mod tests {
     }
 
     fn n(n: usize) -> NonZeroUsize {
-        NonZeroUsize::new(n).unwrap()
+        NonZeroUsize::new(n).expect("succeeds")
     }
 
     #[test]

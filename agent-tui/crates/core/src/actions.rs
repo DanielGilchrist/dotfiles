@@ -423,7 +423,7 @@ mod tests {
     }
 
     fn fix() -> SessionName {
-        "fix".parse().unwrap()
+        "fix".parse().expect("parses")
     }
 
     fn parse(toml: &str) -> Result<Actions, String> {
@@ -442,8 +442,12 @@ mod tests {
             run = ["bin/test", "--cwd={path}", "{name} in {repo}", "{{literal}}"]
             "#,
         )
-        .unwrap();
-        let invocation = actions.get('t').unwrap().invoke(ctx(&fix())).unwrap();
+        .expect("succeeds");
+        let invocation = actions
+            .get('t')
+            .expect("present")
+            .invoke(ctx(&fix()))
+            .expect("succeeds");
         assert_eq!(
             invocation,
             Invocation::Run(CommandLine {
@@ -468,9 +472,12 @@ mod tests {
             terminal_event = { name = "agent-spawn-dev", value = "{path}" }
             "#,
         )
-        .unwrap();
-        let Invocation::TerminalEvent { name, value } =
-            actions.get('s').unwrap().invoke(ctx(&fix())).unwrap()
+        .expect("succeeds");
+        let Invocation::TerminalEvent { name, value } = actions
+            .get('s')
+            .expect("present")
+            .invoke(ctx(&fix()))
+            .expect("succeeds")
         else {
             panic!("expected a terminal event");
         };
@@ -482,21 +489,22 @@ mod tests {
 
     #[test]
     fn a_missing_checkout_is_refused() {
-        let actions = parse("[[action]]\nkey = 't'\nlabel = 't'\nrun = ['x', '{path}']").unwrap();
+        let actions =
+            parse("[[action]]\nkey = 't'\nlabel = 't'\nrun = ['x', '{path}']").expect("succeeds");
         let name = fix();
         let ctx = Context {
             path: None,
             ..ctx(&name)
         };
         assert_eq!(
-            actions.get('t').unwrap().invoke(ctx),
+            actions.get('t').expect("present").invoke(ctx),
             Err(Missing(Field::Path))
         );
     }
 
     #[test]
     fn mistakes_are_reported_with_the_action() {
-        let err = |toml: &str| parse(toml).unwrap_err();
+        let err = |toml: &str| parse(toml).expect_err("fails");
         assert!(
             err("[[action]]\nkey = 'tt'\nlabel = 'a'\nrun = ['x']")
                 .contains("one printable character")
@@ -530,8 +538,12 @@ mod tests {
         let actions = parse(
             "[[action]]\nkey = 'g'\nlabel = 'lazygit'\ninteractive = ['lazygit']\ncwd = '{path}'",
         )
-        .unwrap();
-        let invocation = actions.get('g').unwrap().invoke(ctx(&fix())).unwrap();
+        .expect("succeeds");
+        let invocation = actions
+            .get('g')
+            .expect("present")
+            .invoke(ctx(&fix()))
+            .expect("succeeds");
         assert_eq!(
             invocation,
             Invocation::Interactive(CommandLine {
@@ -541,12 +553,12 @@ mod tests {
             })
         );
         assert!(parse("[[action]]\nkey = 's'\nlabel = 's'\ncwd = '{path}'\nterminal_event = { name = 'n', value = 'v' }")
-            .unwrap_err()
+            .expect_err("fails")
             .contains("cwd only applies"));
     }
 
     #[test]
     fn no_config_means_no_actions() {
-        assert!(parse("").unwrap().is_empty());
+        assert!(parse("").expect("succeeds").is_empty());
     }
 }

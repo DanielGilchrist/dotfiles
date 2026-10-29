@@ -220,15 +220,15 @@ mod tests {
 
     #[test]
     fn nav_defaults_to_ctrl_backslash() {
-        let config: Config = "".parse().unwrap();
+        let config: Config = "".parse().expect("parses");
         assert_eq!(config.keys.nav().to_string(), "⌃\\");
     }
 
     #[test]
     fn nav_can_be_changed_but_must_be_sendable() {
-        let config: Config = "[keys]\nnav = 'ctrl-g'".parse().unwrap();
+        let config: Config = "[keys]\nnav = 'ctrl-g'".parse().expect("parses");
         assert_eq!(config.keys.nav().to_string(), "⌃G");
-        let err = |toml: &str| toml.parse::<Config>().unwrap_err().to_string();
+        let err = |toml: &str| toml.parse::<Config>().expect_err("fails").to_string();
         assert!(err("[keys]\nnav = 'ctrl-space'").contains("isn't a control key"));
         assert!(err("[keys]\nnav = 'alt-x'").contains("isn't a control key"));
         assert!(err("[keys]\nnav_sustained = 'ctrl-]'").contains("unknown field"));
@@ -236,13 +236,15 @@ mod tests {
 
     #[test]
     fn repo_dirs_are_absolute_with_home_expanded() {
-        let config: Config = "[repos]\ndirs = ['~/repos', '/srv/code']".parse().unwrap();
-        let home = paths::home().unwrap();
+        let config: Config = "[repos]\ndirs = ['~/repos', '/srv/code']"
+            .parse()
+            .expect("parses");
+        let home = paths::home().expect("HOME");
         assert_eq!(
             config.sources.dirs(),
             [home.join("repos"), PathBuf::from("/srv/code")]
         );
-        let err = |toml: &str| toml.parse::<Config>().unwrap_err();
+        let err = |toml: &str| toml.parse::<Config>().expect_err("fails");
         assert!(matches!(
             err("[repos]\ndirs = ['repos']"),
             ConfigError::Source {

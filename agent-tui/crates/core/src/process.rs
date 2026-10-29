@@ -270,8 +270,8 @@ mod tests {
 
     #[test]
     fn output_is_captured_and_failures_returned() {
-        let out =
-            output(Command::new("sh").args(["-c", "echo out; echo err >&2; exit 3"])).unwrap();
+        let out = output(Command::new("sh").args(["-c", "echo out; echo err >&2; exit 3"]))
+            .expect("succeeds");
         assert_eq!(out.stdout, b"out\n");
         assert_eq!(out.stderr, b"err\n");
         assert_eq!(out.status.code(), Some(3));

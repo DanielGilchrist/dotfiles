@@ -278,9 +278,9 @@ mod tests {
 
     #[test]
     fn agent_name_from_branch_flattens_slashes() {
-        let branch: BranchName = "user/fix-ci".parse().unwrap();
+        let branch: BranchName = "user/fix-ci".parse().expect("parses");
         assert_eq!(
-            AgentName::from_branch(&branch).unwrap().as_str(),
+            AgentName::from_branch(&branch).expect("succeeds").as_str(),
             "user-fix-ci"
         );
     }

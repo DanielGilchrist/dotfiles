@@ -466,8 +466,8 @@ mod tests {
         let panes: Vec<serde_json::Value> = serde_json::from_str(
             r#"[{"id":0,"is_plugin":true},{"id":4,"is_plugin":false,"is_focused":true},{"id":2,"is_plugin":false}]"#,
         )
-        .unwrap();
-        assert_eq!(harness_pane(&panes).unwrap(), "terminal_2");
+        .expect("succeeds");
+        assert_eq!(harness_pane(&panes).expect("succeeds"), "terminal_2");
     }
 
     #[test]

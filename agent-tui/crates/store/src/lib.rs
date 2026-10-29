@@ -324,50 +324,62 @@ mod tests {
     use super::*;
 
     fn name(s: &str) -> SessionName {
-        s.parse().unwrap()
+        s.parse().expect("parses")
     }
 
     #[test]
     fn pins_keep_their_order_and_round_trip() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("a temp dir");
         let store = FsStore::new(dir.path().to_path_buf());
-        store.pin(&name("b")).unwrap();
-        store.pin(&name("a")).unwrap();
-        store.pin(&name("b")).unwrap();
-        assert_eq!(store.pinned().unwrap(), vec![name("b"), name("a")]);
-        store.unpin(&name("b")).unwrap();
-        assert_eq!(store.pinned().unwrap(), vec![name("a")]);
+        store.pin(&name("b")).expect("succeeds");
+        store.pin(&name("a")).expect("succeeds");
+        store.pin(&name("b")).expect("succeeds");
+        assert_eq!(
+            store.pinned().expect("succeeds"),
+            vec![name("b"), name("a")]
+        );
+        store.unpin(&name("b")).expect("succeeds");
+        assert_eq!(store.pinned().expect("succeeds"), vec![name("a")]);
     }
 
     #[test]
     fn listed_repos_keep_their_order_and_round_trip() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("a temp dir");
         let store = FsStore::new(dir.path().to_path_buf());
-        let repo = |p: &str| RepoRoot::new(PathBuf::from(p)).unwrap();
-        assert_eq!(store.list_repo(&repo("/src/b")).unwrap(), Listing::Added);
-        assert_eq!(store.list_repo(&repo("/src/a")).unwrap(), Listing::Added);
+        let repo = |p: &str| RepoRoot::new(PathBuf::from(p)).expect("absolute");
         assert_eq!(
-            store.list_repo(&repo("/src/b")).unwrap(),
+            store.list_repo(&repo("/src/b")).expect("store"),
+            Listing::Added
+        );
+        assert_eq!(
+            store.list_repo(&repo("/src/a")).expect("store"),
+            Listing::Added
+        );
+        assert_eq!(
+            store.list_repo(&repo("/src/b")).expect("store"),
             Listing::AlreadyListed
         );
-        assert_eq!(store.repos().unwrap(), vec![repo("/src/b"), repo("/src/a")]);
         assert_eq!(
-            store.unlist_repo(&repo("/src/b")).unwrap(),
+            store.repos().expect("store"),
+            vec![repo("/src/b"), repo("/src/a")]
+        );
+        assert_eq!(
+            store.unlist_repo(&repo("/src/b")).expect("store"),
             Unlisting::Dropped
         );
         assert_eq!(
-            store.unlist_repo(&repo("/src/b")).unwrap(),
+            store.unlist_repo(&repo("/src/b")).expect("store"),
             Unlisting::NotListed
         );
-        assert_eq!(store.repos().unwrap(), vec![repo("/src/a")]);
-        std::fs::write(dir.path().join("repos"), "relative\n").unwrap();
+        assert_eq!(store.repos().expect("store"), vec![repo("/src/a")]);
+        std::fs::write(dir.path().join("repos"), "relative\n").expect("writes");
         assert!(matches!(store.repos(), Err(StoreError::Corrupt { .. })));
     }
 
     #[test]
     fn corrupt_pins_are_an_error_not_an_empty_list() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("pinned"), "ok\n-bad\n").unwrap();
+        let dir = tempfile::tempdir().expect("a temp dir");
+        std::fs::write(dir.path().join("pinned"), "ok\n-bad\n").expect("writes");
         let store = FsStore::new(dir.path().to_path_buf());
         assert!(matches!(store.pinned(), Err(StoreError::Corrupt { .. })));
         assert!(store.pin(&name("x")).is_err());
@@ -375,46 +387,50 @@ mod tests {
 
     #[test]
     fn records_round_trip_and_forget_unpins() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("a temp dir");
         let store = FsStore::new(dir.path().to_path_buf());
-        let pending = agent_core::ports::PendingPrompt::now("go".parse().unwrap());
+        let pending = agent_core::ports::PendingPrompt::now("go".parse().expect("parses"));
         let record = AgentRecord {
-            harness: "claude".parse().unwrap(),
+            harness: "claude".parse().expect("parses"),
             pending: Some(pending),
         };
-        store.put_record(&name("a"), &record).unwrap();
-        store.pin(&name("a")).unwrap();
-        assert_eq!(store.record(&name("a")).unwrap(), Some(record));
-        store.forget(&name("a")).unwrap();
-        assert_eq!(store.record(&name("a")).unwrap(), None);
+        store.put_record(&name("a"), &record).expect("succeeds");
+        store.pin(&name("a")).expect("succeeds");
+        assert_eq!(store.record(&name("a")).expect("succeeds"), Some(record));
+        store.forget(&name("a")).expect("succeeds");
+        assert_eq!(store.record(&name("a")).expect("succeeds"), None);
         assert_eq!(
-            store.pinned().unwrap(),
+            store.pinned().expect("succeeds"),
             [] as [agent_core::names::SessionName; 0]
         );
     }
 
     #[test]
     fn the_last_selection_round_trips() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("a temp dir");
         let store = FsStore::new(dir.path().to_path_buf());
-        assert_eq!(store.last_selected().unwrap(), None);
-        store.set_last_selected(&name("fix")).unwrap();
-        assert_eq!(store.last_selected().unwrap(), Some(name("fix")));
+        assert_eq!(store.last_selected().expect("succeeds"), None);
+        store.set_last_selected(&name("fix")).expect("succeeds");
+        assert_eq!(store.last_selected().expect("succeeds"), Some(name("fix")));
     }
 
     #[test]
     fn concurrent_pins_are_not_lost() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("a temp dir");
         let path = dir.path().to_path_buf();
         let handles: Vec<_> = (0..8)
             .map(|i| {
                 let path = path.clone();
-                std::thread::spawn(move || FsStore::new(path).pin(&name(&format!("a{i}"))).unwrap())
+                std::thread::spawn(move || {
+                    FsStore::new(path)
+                        .pin(&name(&format!("a{i}")))
+                        .expect("succeeds");
+                })
             })
             .collect();
         for h in handles {
-            h.join().unwrap();
+            h.join().expect("succeeds");
         }
-        assert_eq!(FsStore::new(path).pinned().unwrap().len(), 8);
+        assert_eq!(FsStore::new(path).pinned().expect("succeeds").len(), 8);
     }
 }
