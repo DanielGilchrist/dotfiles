@@ -16,8 +16,8 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::model::{
     AgentStatus, Blocked, Confirm, Derived, Enter, Field, Focus, Launchable, Load, Model,
     NameCheck, NameSource, NamingState, NewAgent, OfferEffect, Overlay, Pane, Panel, Phase,
-    Proposal, Pulse, Query, Reach, RepoInput, Row, StatusKind, Submission, View, Waiting,
-    fuzzy_match, invalid_chars, repo_matches,
+    Proposal, Pulse, Query, Reach, RepoInput, Row, StatusKind, Submission, Turn, View, Waiting,
+    WorkRoom, fuzzy_match, invalid_chars, repo_matches,
 };
 use crate::update::{Pick, Picks, Unusable, picker_matches, switcher_matches};
 
@@ -43,7 +43,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
         &[
             ("⏎ l", "attach, resurrect or start"),
             ("Esc i", "back to [1], then to the agent"),
-            ("1 2 3", "focus agents, agent, changes"),
+            ("1 2 3", "focus agents, turn, changes"),
             ("j k", "move, or scroll [2] [3]"),
             ("g G", "first / last"),
             ("[ ]", "previous / next repo"),
@@ -300,6 +300,9 @@ pub fn draw(frame: &mut Frame<'_>, m: &mut Model) {
         sidebar::draw(frame, m, left, sidebar_style);
     } else {
         m.areas.sidebar = Rect::default();
+        m.turn = Turn::Whole;
+        m.work_room = WorkRoom::Hidden;
+        m.panel = Panel::Agents;
     }
 
     let (title, path) = pane_title(m, usize::from(right.width));
@@ -573,6 +576,9 @@ fn draw_status_bar(frame: &mut Frame<'_>, m: &Model, area: Rect) {
             (_, Some(Reach::Own) | None) => {}
         }
         hints.push(ranked("Space", "switch", 6));
+        if let (Panel::Agents | Panel::Changes { .. }, Turn::Hidden(_)) = (m.panel, m.turn) {
+            hints.push(ranked("2", "read", 6));
+        }
         if let Some(entry) = entry {
             let pin = match entry.pin() {
                 Some(_) => "unpin",

@@ -51,7 +51,7 @@ types into the embedded session. `?` shows every key.
 |---|---|
 | `⏎` / `l` | Attach the selected agent (resurrect or start it if needed) |
 | `⌃\` | Back to NAV from an agent. Twice goes to the previous agent |
-| `1` `2` `3` | Focus the Agents, agent and Changes panels. `Esc` goes back to Agents |
+| `1` `2` `3` | Focus the Agents, turn and Changes panels. Focusing [2] or [3] expands it and shrinks the others, lazygit-style. From [2] or [3], `Esc` goes back to Agents |
 | `j k g G`, `[ ]` | Move in the focused panel, previous / next repo |
 | `Space` / `/` | Switcher (fuzzy), `⌃N ⌃P` to move |
 | `m` | Pin / unpin (pinned agents get their own group) |
@@ -80,10 +80,14 @@ Overview opens with a **Needs you** group, the status bar and terminal
 title show `◆ ! ✓` counts, and a bell rings when an agent you're not
 typing into starts waiting. Each agent's card has a second line saying
 what it's doing or what it said (the question, the tool, the last
-message), when there's room. Under the list, panel [2] details the
-selected agent (its subagents, files it shares with another agent,
-whether it's ready to merge, its last prompt) and [3] lists the files it
-changed.
+message), when there's room. Under the list, panel [2] is the turn: your
+last prompt, the agent's message or question in full, and the subagents
+it's waiting on. When it doesn't fit the last row says `+k more` and `2`
+focuses the panel to read it all. Panel [3] is the work: whether it's
+ready to merge (`2 uncommitted · ↑2`), the files it changed, a `∩` on any
+file another agent in the repo changed too, and `∩ n` in the title
+counting them. Focus [3] and put the cursor on one and the border says
+who.
 Agents started before this existed report nothing until restarted: `d`
 then `⏎` in the TUI restarts one through `agent`, resuming its conversation.
 
@@ -151,7 +155,7 @@ the reason.
 | `agent attach <name> --repo <path>` | Repo for a new worktree (default: the one containing the cwd). |
 | `agent attach … --headless` | Prepare everything but print `headless_session:`, `headless_cwd:` and `headless_cmd:` (fish-quoted) instead of attaching. |
 | `agent checkout <branch>` / `agent co` | Attach the worktree for a branch, creating it from the local or `origin/` branch. Name is the branch with `/` → `-`. |
-| `agent repo` | Attach or start the repo session. Run inside an agent worktree, it attaches that agent instead. |
+| `agent repo` | Attach or start the repo session. Run inside an agent worktree, it attaches that agent instead, even with `--repo`. |
 | `agent rm [<name>]` | Remove session, worktree and branch (name inferred from the cwd). Refuses if anything would be lost: uncommitted files, unpushed or unmerged commits. Run from inside the agent's own session, it finishes in the background. |
 | `agent rm --force [<name>]` | Same, discarding work. |
 | `agent rm --all [-f]` | Every agent worktree. Confirms first. |

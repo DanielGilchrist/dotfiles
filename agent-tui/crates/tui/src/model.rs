@@ -35,6 +35,31 @@ pub enum Panel {
     Changes { file: usize },
 }
 
+/// Whether the column is tall enough for [3] at all. Until a draw says
+/// otherwise there's room, so keys aren't refused on a guess.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkRoom {
+    Fits,
+    TooShort,
+    /// The sidebar isn't drawn at this width.
+    Hidden,
+}
+
+/// What [2] has beyond its rows, as last drawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Turn {
+    /// Everything fits.
+    Whole,
+    /// Unfocused, with this many rows left out.
+    Hidden(NonZeroUsize),
+    /// Focused and scrolled: the rows shown, of all of them.
+    Scrolled {
+        top: usize,
+        bottom: usize,
+        total: usize,
+    },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum View {
     Focus,
@@ -746,6 +771,11 @@ pub struct Model {
     pub chord: Chord,
     pub scroll: ListScroll,
     pub panel: Panel,
+    /// What [2] had beyond its rows when last drawn, for the footer.
+    pub turn: Turn,
+    /// Whether the column had room for [3] when last drawn, so `3` can
+    /// say why it did nothing.
+    pub work_room: WorkRoom,
     /// An agent to select once a refresh shows it.
     pub follow: Option<Follow>,
     next_ticket: u64,
@@ -799,6 +829,8 @@ impl Model {
             chord: Chord::Idle,
             scroll: ListScroll::default(),
             panel: Panel::Agents,
+            turn: Turn::Whole,
+            work_room: WorkRoom::Fits,
             follow: None,
             next_ticket: 0,
             actions: Actions::default(),

@@ -19,8 +19,8 @@ use ratatui::layout::Position;
 use crate::model::{
     Answer, Chord, Confirm, Cursor, Edge, Enter, Field, Focus, Follow, INFO_TTL, Inspection,
     Intent, Mode, Model, NamingState, NewAgent, Overlay, Pane, Panel, Phase, Query, Reach,
-    StatusKind, Submission, TerminalFocus, Ticket, View, fuzzy_match, match_rank, repo_matches,
-    unlisted,
+    StatusKind, Submission, TerminalFocus, Ticket, View, WorkRoom, fuzzy_match, match_rank,
+    repo_matches, unlisted,
 };
 use crate::worker::{Job, Msg, Outcome};
 
@@ -588,6 +588,10 @@ fn on_panel_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
             m.panel = Panel::Agents;
             Some(Vec::new())
         }
+        (KeyCode::Char('2' | '3'), _) if m.work_room == WorkRoom::Hidden => {
+            m.info("the sidebar is hidden at this width");
+            Some(Vec::new())
+        }
         (KeyCode::Char('2'), _) if m.selected_entry().is_none() => {
             m.info("select an agent to see it");
             Some(Vec::new())
@@ -597,7 +601,11 @@ fn on_panel_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
             Some(Vec::new())
         }
         (KeyCode::Char('3'), _) if m.changes().is_empty() => {
-            m.info("no changes to show");
+            m.info("no files to move to");
+            Some(Vec::new())
+        }
+        (KeyCode::Char('3'), _) if m.work_room == WorkRoom::TooShort => {
+            m.info("no room for [3] at this height");
             Some(Vec::new())
         }
         (KeyCode::Char('3'), _) => {
