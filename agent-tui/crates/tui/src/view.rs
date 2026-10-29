@@ -19,7 +19,7 @@ use crate::model::{
     Proposal, Pulse, Query, Reach, RepoInput, Row, StatusKind, Submission, View, Waiting,
     fuzzy_match, invalid_chars, repo_matches,
 };
-use crate::update::{picker_matches, switcher_matches};
+use crate::update::{Pick, Picks, Unusable, picker_matches, switcher_matches};
 
 mod sidebar;
 
@@ -48,7 +48,10 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
             ("g G", "first / last"),
             ("[ ]", "previous / next repo"),
             ("Space /", "switch agent"),
-            ("p", "pick repo"),
+            (
+                "p",
+                "repos: focus one, or add one from the catalogue or a path",
+            ),
             ("Tab", "focus ↔ overview"),
             ("m", "pin / unpin"),
             ("n", "new agent"),
@@ -62,8 +65,12 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
         ],
     ),
     (
-        " SWITCH ",
-        &[("⌃N ⌃P", "move"), ("⏎", "switch"), ("Esc", "close")],
+        " SWITCH / REPOS ",
+        &[
+            ("⌃N ⌃P", "move, and the nav key"),
+            ("⏎", "switch, focus or add"),
+            ("Esc", "close"),
+        ],
     ),
     (
         " STATES ",
@@ -534,6 +541,10 @@ fn draw_status_bar(frame: &mut Frame<'_>, m: &Model, area: Rect) {
             ranked("⇧Tab", "previous field", 2),
             ranked("⌃R", "use suggestion", 1),
         ]);
+    } else if let Focus::Overlay(Overlay::Switcher(_) | Overlay::Picker(_)) = focus {
+        // The overlay's border carries its keys, so the footer doesn't
+        // compete with it.
+        hints.push(ranked("?", "keys", 9));
     } else {
         let selected = m.selected();
         let entry = selected.and_then(|(_, e)| e);
@@ -723,10 +734,17 @@ fn highlighted<'a>(text: &'a str, query: &str, base: Style) -> Vec<Span<'a>> {
 
 type Item<'a> = (Vec<Span<'a>>, Vec<Span<'a>>);
 
+/// Columns of a query overlay's width that aren't a row's: the border,
+/// the list margin, the gutter and its pad.
+const QUERY_ROW_INSET: usize = 6;
+
+/// A query overlay: the input, then `items` with the one under the cursor
+/// marked. `verb` is what `⏎` does with it, left out when nothing is under
+/// it. A long query keeps its end in view.
 fn draw_query_list(
     frame: &mut Frame<'_>,
     title: &str,
-    verb: &str,
+    verb: Option<&str>,
     query: &Query,
     items: Vec<Item<'_>>,
 ) {
@@ -737,19 +755,26 @@ fn draw_query_list(
         u16::try_from(len).unwrap_or(u16::MAX).saturating_add(3),
     );
     clear_around(frame, area);
-    let block = overlay_block(title, hints(&[("⏎", verb), ("Esc", "close")]), dim());
+    let keys: Vec<(&str, &str)> = verb
+        .map(|verb| ("⏎", verb))
+        .into_iter()
+        .chain([("Esc", "close")])
+        .collect();
+    let block = overlay_block(title, hints(&keys), dim());
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let [input, list] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(inner);
     let list = list.inner(ratatui::layout::Margin::new(1, 0));
+    let room = usize::from(input.width).saturating_sub(" › ".width() + 1);
     let prompt = Line::from(vec![
         Span::styled(" › ", Style::new().fg(ACCENT)),
-        Span::raw(query.text.clone()),
+        Span::raw(truncate_start(&query.text, room)),
         Span::styled("█", dim()),
     ]);
     frame.render_widget(Paragraph::new(prompt), input);
 
     let index = query.index(len);
+    let marked = verb.map(|_| index);
     let height = usize::from(list.height);
     let width = usize::from(list.width).saturating_sub(2);
     let offset = scroll(query.offset.get(), index, height, len);
@@ -760,7 +785,7 @@ fn draw_query_list(
         .skip(offset)
         .take(height)
         .map(|(i, (left, right))| {
-            let gutter = if i == index {
+            let gutter = if marked == Some(i) {
                 Span::styled("▌", Style::new().fg(ACCENT))
             } else {
                 Span::raw(" ")
@@ -775,7 +800,7 @@ fn draw_query_list(
 
 fn draw_switcher(frame: &mut Frame<'_>, m: &Model, query: &Query) {
     let Some(snapshot) = m.snapshot() else { return };
-    let items = switcher_matches(m, &query.text)
+    let items: Vec<Item<'_>> = switcher_matches(m, &query.text)
         .into_iter()
         .filter_map(|name| snapshot.entry(&name))
         .map(|(repo, entry)| {
@@ -797,28 +822,75 @@ fn draw_switcher(frame: &mut Frame<'_>, m: &Model, query: &Query) {
             (left, right)
         })
         .collect();
-    draw_query_list(frame, "Switch", "switch", query, items);
+    let verb = (!items.is_empty()).then_some("switch");
+    draw_query_list(frame, "Switch", verb, query, items);
 }
 
+/// Every row says where its repo is (DIM), since a name alone can't tell
+/// two clones apart, and a listed row its live count before that. A typed
+/// path keeps its end. With no rows, the one row says why.
 fn draw_picker(frame: &mut Frame<'_>, m: &Model, query: &Query) {
-    let Some(snapshot) = m.snapshot() else { return };
-    let items = picker_matches(m, &query.text)
-        .into_iter()
-        .filter_map(|key| snapshot.repo(&key))
-        .map(|repo| {
-            let live = repo.counts().live;
-            let right = if live > 0 {
-                vec![Span::styled(
-                    format!("● {live}"),
-                    Style::new().fg(Color::Green),
-                )]
-            } else {
-                Vec::new()
-            };
-            (highlighted_owned(&repo.name(), &query.text), right)
+    let matches = picker_matches(m, &query.text);
+    let rows = matches.rows();
+    let verb = query.pick(rows).map(Pick::verb);
+    let width = usize::from(centred(frame, 60, 5).width).saturating_sub(QUERY_ROW_INSET);
+    // A place never takes more than half the row, so the name stays legible.
+    let place = |path: &Path| {
+        truncate_start(
+            &path.parent().map_or_else(String::new, display_path),
+            width / 2,
+        )
+    };
+    let mut items: Vec<Item<'_>> = rows
+        .iter()
+        .filter_map(|pick| {
+            Some(match pick {
+                Pick::Listed(key) => {
+                    let repo = m.snapshot()?.repo(key)?;
+                    let live = repo.counts().live;
+                    let mut right = Vec::new();
+                    if live > 0 {
+                        right.push(Span::raw(format!("● {live}  ")));
+                    }
+                    right.push(Span::styled(
+                        repo.key()
+                            .root()
+                            .map(|r| place(r.path()))
+                            .unwrap_or_default(),
+                        dim(),
+                    ));
+                    (highlighted_owned(&repo.name(), &query.text), right)
+                }
+                Pick::Found(root) => (
+                    highlighted_owned(&root.name(), &query.text),
+                    vec![Span::styled(place(root.path()), dim())],
+                ),
+                Pick::Path(path) => {
+                    let right = Span::styled("add its repo", dim());
+                    let room = width.saturating_sub(right.width() + 1);
+                    (
+                        vec![Span::raw(truncate_start(&display_path(path), room))],
+                        vec![right],
+                    )
+                }
+            })
         })
         .collect();
-    draw_query_list(frame, "Repos", "focus", query, items);
+    match matches {
+        Picks::Rows(_) => {}
+        Picks::NoMatch => items.push((vec![Span::styled("no match", dim())], Vec::new())),
+        Picks::Unusable(why) => {
+            let text = match why {
+                Unusable::UserHome => "~user paths aren't supported",
+                Unusable::NoHome => "~ needs HOME set",
+            };
+            items.push((
+                vec![Span::styled(text, Style::new().fg(Color::Red))],
+                Vec::new(),
+            ));
+        }
+    }
+    draw_query_list(frame, "Repos", verb, query, items);
 }
 
 fn highlighted_owned(text: &str, query: &str) -> Vec<Span<'static>> {
@@ -1100,7 +1172,7 @@ fn repo_line(
                     repo.push(Span::styled("  no repo matches", red));
                 }
             }
-            let count = repo_matches(m.snapshot(), &form.repo.text).len();
+            let count = repo_matches(m.snapshot(), &m.catalogue, &form.repo.text).len();
             if form.focus == Field::Repo && count > 1 {
                 right.push(Span::styled(
                     format!("⌃N ⌃P {} of {count}", form.repo.index(count) + 1),

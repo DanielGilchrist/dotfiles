@@ -1,7 +1,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::model::{Checkout, Entry, EntryKind, Repo, RepoKey, Snapshot, Worktree};
 use crate::names::{NameError, SessionName};
@@ -30,6 +30,15 @@ pub enum Warning {
         name: SessionName,
         hidden: PathBuf,
     },
+    /// A listed repo that isn't a git repo any more.
+    NotARepo {
+        path: PathBuf,
+    },
+    /// A `[repos] dirs` entry that couldn't be read.
+    Catalogue {
+        dir: PathBuf,
+        error: io::Error,
+    },
 }
 
 impl fmt::Display for Warning {
@@ -43,6 +52,16 @@ impl fmt::Display for Warning {
             Self::NameClash { name, hidden } => {
                 write!(f, "{} is hidden: {name} is already taken", hidden.display())
             }
+            Self::NotARepo { path } => {
+                write!(
+                    f,
+                    "{} isn't a git repo (agent forget drops it)",
+                    path.display()
+                )
+            }
+            Self::Catalogue { dir, error } => {
+                write!(f, "repos.dirs {}: {error}", dir.display())
+            }
         }
     }
 }
@@ -55,39 +74,66 @@ pub struct Observation {
     pub warnings: Vec<Warning>,
 }
 
+/// Where a candidate path came from, which decides what not being in a
+/// repo means for it. Listed sorts first, so a path that's both keeps its
+/// warning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Candidate {
+    /// A listed repo: not in a repo any more is worth a warning.
+    Listed,
+    /// A session's cwd or an agent worktree: not in a repo is normal.
+    Seen,
+}
+
+/// `listed` are repos the user keeps in the list whether or not anything
+/// runs in them. One that isn't a repo any more is a warning, not an error.
 pub fn observe(
     vcs: &dyn Vcs,
     host: &dyn SessionHost,
     layout: &Layout,
+    listed: &[RepoRoot],
 ) -> Result<Observation, HostError> {
     let sessions = host.sessions()?;
     let mut warnings = Vec::new();
 
-    let mut candidates: Vec<PathBuf> = sessions
+    let mut candidates: Vec<(PathBuf, Candidate)> = sessions
         .iter()
-        .filter_map(|s| s.cwd().map(PathBuf::from))
+        .filter_map(|s| s.cwd().map(|cwd| (PathBuf::from(cwd), Candidate::Seen)))
         .collect();
     match layout.scan() {
-        Ok(worktrees) => candidates.extend(worktrees.iter().map(|wt| wt.path().to_path_buf())),
+        Ok(worktrees) => candidates.extend(
+            worktrees
+                .iter()
+                .map(|wt| (wt.path().to_path_buf(), Candidate::Seen)),
+        ),
         Err(error) => warnings.push(Warning::Scan {
             root: layout.root().to_path_buf(),
             error,
         }),
     }
+    candidates.extend(
+        listed
+            .iter()
+            .map(|root| (root.path().to_path_buf(), Candidate::Listed)),
+    );
     candidates.sort();
-    candidates.dedup();
+    candidates.dedup_by(|a, b| a.0 == b.0);
 
+    let paths: Vec<PathBuf> = candidates.iter().map(|(p, _)| p.clone()).collect();
     let mut roots = BTreeSet::new();
-    for (path, result) in candidates
+    for ((path, candidate), result) in candidates
         .iter()
-        .zip(parallel_map(&candidates, |p| vcs.repo_of(p)))
+        .zip(parallel_map(&paths, |p| vcs.repo_of(p)))
     {
-        match result {
-            Ok(Some(root)) => {
+        match (result, candidate) {
+            (Ok(Some(root)), _) => {
                 roots.insert(root);
             }
-            Ok(None) => {}
-            Err(error) => warnings.push(Warning::Repo {
+            (Ok(None), Candidate::Seen) => {}
+            (Ok(None), Candidate::Listed) => {
+                warnings.push(Warning::NotARepo { path: path.clone() });
+            }
+            (Err(error), _) => warnings.push(Warning::Repo {
                 path: path.clone(),
                 error,
             }),
@@ -110,6 +156,62 @@ pub fn observe(
         repos,
         warnings,
     })
+}
+
+/// The repos the pickers offer beyond the snapshot, by name: each of
+/// `dirs` is a repo itself (it has a `.git` directory) or a directory
+/// whose children are, so `~/repos` lists every clone in it. Nothing runs
+/// git: a `.git` directory is enough to offer it, and the repo is checked
+/// when it's picked. Paths are canonical, as git reports main checkouts,
+/// so a found repo matches its listing. Linked worktrees (a `.git` file)
+/// are left out, since they'd list under another name.
+#[derive(Debug, Default)]
+pub struct Catalogue {
+    pub repos: Vec<RepoRoot>,
+    pub warnings: Vec<Warning>,
+}
+
+pub fn catalogue(dirs: &[PathBuf]) -> Catalogue {
+    let mut found = BTreeSet::new();
+    let mut warnings = Vec::new();
+    let mut offer = |path: PathBuf, warnings: &mut Vec<Warning>| match path.canonicalize() {
+        Ok(real) => found.extend(RepoRoot::new(real).ok()),
+        Err(error) => warnings.push(Warning::Catalogue { dir: path, error }),
+    };
+    for dir in dirs {
+        if has_git_dir(dir) {
+            offer(dir.clone(), &mut warnings);
+            continue;
+        }
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(error) => {
+                warnings.push(Warning::Catalogue {
+                    dir: dir.clone(),
+                    error,
+                });
+                continue;
+            }
+        };
+        for entry in entries {
+            match entry {
+                Ok(entry) if has_git_dir(&entry.path()) => offer(entry.path(), &mut warnings),
+                Ok(_) => {}
+                Err(error) => warnings.push(Warning::Catalogue {
+                    dir: dir.clone(),
+                    error,
+                }),
+            }
+        }
+    }
+    let mut repos: Vec<RepoRoot> = found.into_iter().collect();
+    repos.sort_by(|a, b| a.name().cmp(&b.name()).then_with(|| a.cmp(b)));
+    Catalogue { repos, warnings }
+}
+
+/// A main checkout: `.git` is a directory. A linked worktree has a file.
+fn has_git_dir(path: &Path) -> bool {
+    path.join(".git").is_dir()
 }
 
 /// Joins sessions to checkouts. An entry's identity is its session name:
@@ -327,6 +429,45 @@ mod tests {
             panic!("idle should be startable")
         };
         assert_eq!(at.cwd(), std::path::Path::new("/w/api/idle"));
+    }
+
+    #[test]
+    fn the_catalogue_offers_each_dir_or_its_children_that_are_repos() {
+        let base = tempfile::tempdir().unwrap();
+        let mk = |rel: &str| {
+            let path = base.path().join(rel);
+            std::fs::create_dir_all(&path).unwrap();
+            path
+        };
+        let repos = mk("repos");
+        mk("repos/web/.git");
+        mk("repos/api/.git");
+        mk("repos/notes");
+        let linked = mk("repos/linked");
+        std::fs::write(linked.join(".git"), "gitdir: elsewhere").unwrap();
+        let single = mk("dots");
+        mk("dots/.git");
+        let via_link = base.path().join("link");
+        std::os::unix::fs::symlink(&single, &via_link).unwrap();
+        let missing = base.path().join("nowhere");
+        let found = catalogue(&[repos.clone(), via_link, missing.clone()]);
+        let names: Vec<String> = found.repos.iter().map(|r| r.name().into_owned()).collect();
+        assert_eq!(
+            names,
+            ["api", "dots", "web"],
+            "linked worktrees are left out"
+        );
+        assert_eq!(
+            found.repos[1].path(),
+            single.canonicalize().unwrap(),
+            "a symlinked dir is offered by its real path"
+        );
+        assert_eq!(found.warnings.len(), 1);
+        assert!(
+            matches!(&found.warnings[0], Warning::Catalogue { dir, .. } if *dir == missing),
+            "{:?}",
+            found.warnings
+        );
     }
 
     #[test]

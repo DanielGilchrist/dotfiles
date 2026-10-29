@@ -10,7 +10,7 @@ use agent_core::model::Presence;
 use agent_core::names::{AgentName, BranchName, Prompt, SessionName};
 use agent_core::ops::{self, Backend, Consent, Delivery, Launch, Removed, Services};
 use agent_core::paths::{self, Layout, RepoRoot};
-use agent_core::ports::{Harness, HarnessId};
+use agent_core::ports::{Harness, HarnessId, Listing, Unlisting};
 use agent_git::Git;
 use agent_harness::Registry;
 use agent_store::FsStore;
@@ -37,7 +37,8 @@ struct Cli {
 enum Cmd {
     /// Open the TUI (the default)
     Tui,
-    /// Attach to the session for the repo's main checkout, starting it if needed
+    /// Attach to the session for the repo's main checkout, starting it if needed.
+    /// Inside an agent worktree, attaches that agent instead
     Repo {
         /// The repo (defaults to the one containing the cwd)
         #[arg(long)]
@@ -100,6 +101,10 @@ enum Cmd {
     },
     /// List agents by repo
     Ls,
+    /// Keep a repo listed in the TUI with nothing running in it (defaults to the cwd's)
+    Add { path: Option<PathBuf> },
+    /// Drop a repo from the list (defaults to the cwd's)
+    Forget { path: Option<PathBuf> },
     /// List agent worktrees whose branch can be removed without losing work
     Merged {
         #[arg(short, long)]
@@ -185,6 +190,53 @@ fn config() -> Result<Config> {
 
 fn cwd() -> Result<PathBuf> {
     std::env::current_dir().context("reading the current directory")
+}
+
+/// The repo session for `repo` or the cwd's repo. Inside an agent
+/// worktree with no `--repo`, that agent is the one meant.
+fn repo_session(
+    svc: Services<'_>,
+    repo: Option<PathBuf>,
+    frontend: Frontend,
+    harness: &dyn Harness,
+) -> Result<()> {
+    if repo.is_none()
+        && let Some(worktree) = svc.layout.enclosing(&cwd()?)
+    {
+        return finish(svc, &ops::attach_here(svc, &worktree, harness)?, frontend);
+    }
+    let repo = repo_arg(svc, repo)?.ok_or(ops::Error::NoRepo)?;
+    finish(svc, &ops::open_repo(svc, &repo, harness)?, frontend)
+}
+
+fn add(svc: Services<'_>, path: Option<PathBuf>) -> Result<()> {
+    let listed = ops::list_repo(svc, &dir_arg(path)?)?;
+    let path = listed.repo.path().display();
+    match listed.listing {
+        Listing::Added => println!("agent add: listed {path}"),
+        Listing::AlreadyListed => println!("agent add: {path} is already listed"),
+    }
+    Ok(())
+}
+
+fn forget(svc: Services<'_>, path: Option<PathBuf>) -> Result<()> {
+    let unlisted = ops::unlist_repo(svc, &dir_arg(path)?)?;
+    let path = unlisted.repo.path().display();
+    match unlisted.unlisting {
+        Unlisting::Dropped => println!("agent forget: unlisted {path}"),
+        Unlisting::NotListed => println!("agent forget: {path} wasn't listed"),
+    }
+    Ok(())
+}
+
+/// `path` made absolute against the cwd with its dots folded, so it
+/// compares equal to how the list stores it, or the cwd itself.
+fn dir_arg(path: Option<PathBuf>) -> Result<PathBuf> {
+    let cwd = cwd()?;
+    Ok(match path {
+        Some(path) => paths::normalise(&cwd.join(path)),
+        None => cwd,
+    })
 }
 
 fn repo_arg(svc: Services<'_>, repo: Option<PathBuf>) -> Result<Option<RepoRoot>> {
@@ -569,12 +621,7 @@ fn main() -> Result<()> {
             backend: Arc::new(backend),
         }),
         Cmd::Repo { repo, headless } => {
-            let repo = repo_arg(svc, repo)?.ok_or(ops::Error::NoRepo)?;
-            finish(
-                svc,
-                &ops::open_repo(svc, &repo, harness)?,
-                Frontend::from_flag(headless),
-            )
+            repo_session(svc, repo, Frontend::from_flag(headless), harness)
         }
         Cmd::Completions { shell } => {
             clap_complete::generate(shell, &mut Cli::command(), "agent", &mut std::io::stdout());
@@ -632,6 +679,8 @@ fn main() -> Result<()> {
             Ok(())
         }
         Cmd::Ls => ls(svc),
+        Cmd::Add { path } => add(svc, path),
+        Cmd::Forget { path } => forget(svc, path),
         Cmd::Merged { verbose } => {
             for (wt, branch) in ops::merged(svc)? {
                 match (verbose, branch) {

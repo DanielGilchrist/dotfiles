@@ -421,3 +421,148 @@ fn sweep_never_touches_live_worktrees() {
             .is_none()
     );
 }
+
+#[test]
+fn a_listed_repo_shows_with_nothing_running_until_its_forgotten() {
+    let world = World::new();
+    let svc = world.svc();
+    assert!(snapshot(svc).unwrap().0.is_empty());
+    let root = world.vcs.root.path().to_path_buf();
+    let listed = list_repo(svc, &root.join("src")).unwrap();
+    assert_eq!(
+        listed,
+        Listed {
+            repo: world.vcs.root.clone(),
+            listing: Listing::Added
+        }
+    );
+    assert_eq!(
+        list_repo(svc, &root).unwrap().listing,
+        Listing::AlreadyListed
+    );
+    let (snap, warnings) = snapshot(svc).unwrap();
+    assert!(warnings.is_empty(), "{warnings:?}");
+    let repo = &snap.repos()[0];
+    assert_eq!(
+        (
+            repo.name().as_ref(),
+            repo.entries().len(),
+            repo.first().presence()
+        ),
+        ("api", 1, None)
+    );
+    assert_eq!(
+        unlist_repo(svc, &root).unwrap().unlisting,
+        Unlisting::Dropped
+    );
+    assert_eq!(
+        unlist_repo(svc, &root).unwrap().unlisting,
+        Unlisting::NotListed
+    );
+    assert!(snapshot(svc).unwrap().0.is_empty());
+}
+
+#[test]
+fn a_repo_whose_name_cant_be_a_session_isnt_listed() {
+    let world = World::new();
+    let svc = world.svc();
+    let long = world.vcs.root.path().join("../a-very-long-repository-name");
+    let long = RepoRoot::new(long).unwrap();
+    world
+        .vcs
+        .other_repos
+        .lock()
+        .unwrap()
+        .insert(long.path().to_path_buf(), long.clone());
+    assert!(matches!(list_repo(svc, long.path()), Err(Error::Name(_))));
+    assert_eq!(world.store.repos().unwrap(), Vec::new());
+}
+
+#[test]
+fn forgetting_a_listed_path_inside_another_repo_drops_that_path_not_the_repo() {
+    let world = World::new();
+    let svc = world.svc();
+    let inner = RepoRoot::new(world.vcs.root.path().join("vendor/thing")).unwrap();
+    world.store.list_repo(&world.vcs.root).unwrap();
+    world.store.list_repo(&inner).unwrap();
+    assert_eq!(
+        unlist_repo(svc, inner.path()).unwrap(),
+        Unlisted {
+            repo: inner,
+            unlisting: Unlisting::Dropped
+        }
+    );
+    assert_eq!(world.store.repos().unwrap(), vec![world.vcs.root.clone()]);
+    assert_eq!(
+        unlist_repo(svc, &world.vcs.root.path().join("src"))
+            .unwrap()
+            .repo,
+        world.vcs.root,
+        "an unlisted path falls back to the repo holding it"
+    );
+}
+
+#[test]
+fn a_listed_path_that_stopped_being_a_repo_warns_and_can_be_forgotten() {
+    let world = World::new();
+    let svc = world.svc();
+    let gone = world.vcs.root.path().join("../gone");
+    let gone = RepoRoot::new(gone).unwrap();
+    world.store.list_repo(&gone).unwrap();
+    world
+        .vcs
+        .not_repos
+        .lock()
+        .unwrap()
+        .push(gone.path().to_path_buf());
+    let (snap, warnings) = snapshot(svc).unwrap();
+    assert!(snap.is_empty());
+    assert_eq!(warnings.len(), 1);
+    assert!(warnings[0].to_string().contains("isn't a git repo"));
+    assert!(matches!(
+        list_repo(svc, gone.path()),
+        Err(Error::NotARepo(_))
+    ));
+    unlist_repo(svc, gone.path()).unwrap();
+    assert_eq!(world.store.repos().unwrap(), Vec::new());
+}
+
+#[test]
+fn opening_a_repo_or_creating_an_agent_in_it_lists_it() {
+    let world = World::new();
+    let svc = world.svc();
+    open_repo(svc, &world.vcs.root, world.harness()).unwrap();
+    assert_eq!(world.store.repos().unwrap(), vec![world.vcs.root.clone()]);
+    world.store.unlist_repo(&world.vcs.root).unwrap();
+    create(
+        svc,
+        &"fix".parse().unwrap(),
+        &world.vcs.root,
+        None,
+        world.harness(),
+    )
+    .unwrap();
+    assert_eq!(world.store.repos().unwrap(), vec![world.vcs.root.clone()]);
+}
+
+#[test]
+fn attaching_here_starts_the_worktrees_agent_and_never_creates_one() {
+    let world = World::new();
+    let svc = world.svc();
+    let fix = world.existing_worktree("fix");
+    let launch = attach_here(svc, &fix, world.harness()).unwrap();
+    assert_eq!(launch.session.as_str(), "fix");
+    let created = world.host.created.lock().unwrap();
+    assert_eq!(created.len(), 1);
+    assert_eq!(created[0].1.cwd, fix.path());
+    drop(created);
+
+    let gone = world
+        .layout
+        .worktree(&world.vcs.root, "gone".parse().unwrap());
+    std::fs::create_dir_all(gone.path()).unwrap();
+    assert!(matches!(
+        attach_here(svc, &gone, world.harness()),
+        Err(Error::WorktreeGone { .. })
+    ));
+}

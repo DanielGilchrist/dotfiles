@@ -445,7 +445,11 @@ fn event_loop(terminal: &mut DefaultTerminal, options: Options, label: String) -
     let (msgs, inbox) = mpsc::channel();
     let (input, input_ctl) = mpsc::channel();
     spawn_input(msgs.clone(), input_ctl);
-    let workers = worker::spawn(Arc::clone(&options.backend), msgs);
+    let workers = worker::spawn(
+        Arc::clone(&options.backend),
+        options.config.sources.clone(),
+        msgs,
+    );
     let _ = workers.refresh.send(());
     let rt = Runtime {
         backend: options.backend,

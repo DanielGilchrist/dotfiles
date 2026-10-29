@@ -10,8 +10,8 @@ use crate::names::{AgentName, BranchName, InvalidPrompt, NameError, Prompt, Sess
 use crate::paths::{AgentWorktree, Layout, PathError, RepoRoot, TrashSlot};
 use crate::ports::{
     AgentRecord, BranchState, Harness, HarnessError, HarnessId, Harnesses, HostError, LaunchCtx,
-    PaneCommand, PendingPrompt, SessionHost, SessionInfo, SessionStatus, Store, StoreError, Vcs,
-    WorktreeStart,
+    Listing, PaneCommand, PendingPrompt, SessionHost, SessionInfo, SessionStatus, Store,
+    StoreError, Unlisting, Vcs, WorktreeStart,
 };
 use crate::process::{CommandError, LaunchSpec};
 
@@ -48,6 +48,8 @@ pub enum Error {
     NoRepo,
     #[error("{0} is not inside a git repository")]
     NotARepo(PathBuf),
+    #[error("{0} can't be listed: paths must be UTF-8 without newlines")]
+    Unstorable(PathBuf),
     #[error("{0} already exists. Move it aside first")]
     Occupied(PathBuf),
     #[error("{name}'s worktree {} is gone. Run this from its repo to recreate it", .path.display())]
@@ -147,7 +149,8 @@ pub fn bootstrap_prompt(task: Option<&Prompt>) -> Prompt {
 }
 
 pub fn snapshot(svc: Services<'_>) -> Result<(Snapshot, Vec<Warning>)> {
-    let mut obs = discover::observe(svc.vcs, svc.host, svc.layout)?;
+    let listed = svc.store.repos()?;
+    let mut obs = discover::observe(svc.vcs, svc.host, svc.layout, &listed)?;
     let pins = svc.store.pinned()?;
     let (snapshot, mut warnings) = discover::assemble(&obs, svc.layout, &pins);
     warnings.append(&mut obs.warnings);
@@ -156,6 +159,55 @@ pub fn snapshot(svc: Services<'_>) -> Result<(Snapshot, Vec<Warning>)> {
 
 pub fn repo_for(svc: Services<'_>, dir: &Path) -> Result<Option<RepoRoot>> {
     Ok(svc.vcs.repo_of(dir)?)
+}
+
+/// Keeps the repo containing `dir` in the list, so the TUI shows it with
+/// nothing running in it. The repo must be nameable as a session, or it
+/// could never show.
+pub fn list_repo(svc: Services<'_>, dir: &Path) -> Result<Listed> {
+    let repo = repo_for(svc, dir)?.ok_or_else(|| Error::NotARepo(dir.to_path_buf()))?;
+    listable(&repo)?;
+    let listing = svc.store.list_repo(&repo)?;
+    Ok(Listed { repo, listing })
+}
+
+/// Why `repo` couldn't be listed: its name can't be a session, or its
+/// path can't be stored.
+fn listable(repo: &RepoRoot) -> Result<()> {
+    repo.name().parse::<SessionName>()?;
+    if repo.path().to_str().is_none_or(|p| p.contains('\n')) {
+        return Err(Error::Unstorable(repo.path().to_path_buf()));
+    }
+    Ok(())
+}
+
+/// What [`list_repo`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Listed {
+    pub repo: RepoRoot,
+    pub listing: Listing,
+}
+
+/// Drops `dir` from the list: as written when it's listed that way (so a
+/// path that isn't a repo any more can be forgotten), else the repo
+/// containing it. The repo stays discovered while sessions or agent
+/// worktrees belong to it.
+pub fn unlist_repo(svc: Services<'_>, dir: &Path) -> Result<Unlisted> {
+    let as_written = RepoRoot::new(dir.to_path_buf())?;
+    let repo = if svc.store.repos()?.contains(&as_written) {
+        as_written
+    } else {
+        repo_for(svc, dir)?.unwrap_or(as_written)
+    };
+    let unlisting = svc.store.unlist_repo(&repo)?;
+    Ok(Unlisted { repo, unlisting })
+}
+
+/// What [`unlist_repo`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unlisted {
+    pub repo: RepoRoot,
+    pub unlisting: Unlisting,
 }
 
 fn find_session(svc: Services<'_>, name: &SessionName) -> Result<Option<SessionInfo>> {
@@ -395,7 +447,14 @@ pub fn create(
 ) -> Result<Launch> {
     let plan = plan(svc, name, Some(repo))?;
     match plan.new_worktree() {
-        Some(_) => execute(svc, plan, task, harness),
+        Some(_) => {
+            // The worktree makes the repo show either way, so one that can't
+            // be listed just doesn't stay once the agent is gone.
+            if listable(repo).is_ok() {
+                svc.store.list_repo(repo)?;
+            }
+            execute(svc, plan, task, harness)
+        }
         None => Err(Error::Appeared(name.clone())),
     }
 }
@@ -503,18 +562,47 @@ pub fn start(
 }
 
 /// Attach to the session for `repo`'s main checkout, starting it if there
-/// isn't one (named after the repo, running `harness`).
+/// isn't one (named after the repo, running `harness`). Either way the
+/// repo joins the list, so it stays shown once the session is gone.
 pub fn open_repo(svc: Services<'_>, repo: &RepoRoot, harness: &dyn Harness) -> Result<Launch> {
     let at = Startable::main(repo)?;
     let name = at.name();
-    match find_session(svc, &name)?.map(|s| s.status) {
-        Some(SessionStatus::Live { .. }) => Ok(Launch {
+    listable(repo)?;
+    let launch = match find_session(svc, &name)?.map(|s| s.status) {
+        Some(SessionStatus::Live { .. }) => Launch {
             spec: svc.host.attach(&name).cwd(repo.path()),
             session: name,
             delivery: Delivery::None,
-        }),
-        Some(SessionStatus::Exited { .. }) | None => start(svc, &at, harness, None),
+        },
+        Some(SessionStatus::Exited { .. }) | None => start(svc, &at, harness, None)?,
+    };
+    svc.store.list_repo(repo)?;
+    Ok(launch)
+}
+
+/// Attach to the agent whose worktree is `worktree`, starting its session
+/// if it exited or never began. Nothing is created: a worktree without a
+/// checkout is reported, not replaced.
+pub fn attach_here(
+    svc: Services<'_>,
+    worktree: &AgentWorktree,
+    harness: &dyn Harness,
+) -> Result<Launch> {
+    if !worktree.path().join(".git").exists() {
+        return Err(Error::WorktreeGone {
+            name: worktree.name().session(),
+            path: worktree.path().to_path_buf(),
+        });
     }
+    let session = find_session(svc, &worktree.name().session())?;
+    let plan = plan_attach(&AttachFacts {
+        name: worktree.name(),
+        existing: Some(worktree),
+        session: session.as_ref(),
+        repo: None,
+        layout: svc.layout,
+    })?;
+    execute(svc, plan, None, harness)
 }
 
 /// The harness command for a session's pane. A queued prompt is passed until

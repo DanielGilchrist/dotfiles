@@ -1,15 +1,21 @@
-//! The user's config file: actions and the key that leaves the agent.
+//! The user's config file: actions, the key that leaves the agent, and
+//! where repos can be found.
 //!
 //! ```toml
 //! [keys]
 //! nav = "ctrl-\\"
+//!
+//! [repos]
+//! dirs = ["~/repos", "~/.config"]
 //! ```
 
 use std::fmt;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
 use crate::actions::{Actions, RawAction};
+use crate::paths::{self, Typed};
 
 /// A control chord a terminal can send on its own: Ctrl with a letter or
 /// one of `\ ] ^ _`. Everything else would reach the TUI as plain text or
@@ -81,10 +87,26 @@ impl Keys {
     }
 }
 
+/// Where the pickers look for repos: each directory is a repo itself or
+/// holds repos, as `[repos] dirs` lists them, absolute.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Sources(Vec<PathBuf>);
+
+impl Sources {
+    pub fn new(dirs: Vec<PathBuf>) -> Self {
+        Self(dirs)
+    }
+
+    pub fn dirs(&self) -> &[PathBuf] {
+        &self.0
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Config {
     pub actions: Actions,
     pub keys: Keys,
+    pub sources: Sources,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -102,6 +124,19 @@ pub enum ConfigError {
         field: &'static str,
         source: InvalidControlKey,
     },
+    #[error("repos.dirs: {path:?} {reason}")]
+    Source { path: String, reason: SourceError },
+}
+
+/// Why a `[repos] dirs` entry can't be used.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SourceError {
+    #[error("must be absolute, or start with ~/")]
+    Relative,
+    #[error("~user paths aren't supported")]
+    UserHome,
+    #[error("needs HOME set to stand for the home directory")]
+    NoHome,
 }
 
 #[derive(Deserialize)]
@@ -111,6 +146,40 @@ struct RawConfig {
     action: Vec<RawAction>,
     #[serde(default)]
     keys: RawKeys,
+    #[serde(default)]
+    repos: RawRepos,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct RawRepos {
+    #[serde(default)]
+    dirs: Vec<String>,
+}
+
+impl RawRepos {
+    /// Each dir absolute, with a leading `~` as the home directory.
+    fn parse(self) -> Result<Sources, ConfigError> {
+        let invalid = |path: &str, reason: SourceError| ConfigError::Source {
+            path: path.to_string(),
+            reason,
+        };
+        let mut dirs = Vec::new();
+        for raw in &self.dirs {
+            let typed = raw
+                .starts_with('~')
+                .then(|| paths::typed_path(raw, Path::new("/")))
+                .flatten();
+            match typed {
+                Some(Typed::Path(path)) => dirs.push(path),
+                Some(Typed::Unsupported) => return Err(invalid(raw, SourceError::UserHome)),
+                Some(Typed::NoHome) => return Err(invalid(raw, SourceError::NoHome)),
+                None if Path::new(raw).is_absolute() => dirs.push(PathBuf::from(raw)),
+                None => return Err(invalid(raw, SourceError::Relative)),
+            }
+        }
+        Ok(Sources(dirs))
+    }
 }
 
 #[derive(Deserialize, Default)]
@@ -140,6 +209,7 @@ impl std::str::FromStr for Config {
         Ok(Self {
             actions: Actions::parse(raw.action)?,
             keys: raw.keys.parse()?,
+            sources: raw.repos.parse()?,
         })
     }
 }
@@ -162,5 +232,42 @@ mod tests {
         assert!(err("[keys]\nnav = 'ctrl-space'").contains("isn't a control key"));
         assert!(err("[keys]\nnav = 'alt-x'").contains("isn't a control key"));
         assert!(err("[keys]\nnav_sustained = 'ctrl-]'").contains("unknown field"));
+    }
+
+    #[test]
+    fn repo_dirs_are_absolute_with_home_expanded() {
+        let config: Config = "[repos]\ndirs = ['~/repos', '/srv/code']".parse().unwrap();
+        let home = paths::home().unwrap();
+        assert_eq!(
+            config.sources.dirs(),
+            [home.join("repos"), PathBuf::from("/srv/code")]
+        );
+        let err = |toml: &str| toml.parse::<Config>().unwrap_err();
+        assert!(matches!(
+            err("[repos]\ndirs = ['repos']"),
+            ConfigError::Source {
+                reason: SourceError::Relative,
+                ..
+            }
+        ));
+        assert!(matches!(
+            err("[repos]\ndirs = ['./repos']"),
+            ConfigError::Source {
+                reason: SourceError::Relative,
+                ..
+            }
+        ));
+        assert!(matches!(
+            err("[repos]\ndirs = ['~bob/repos']"),
+            ConfigError::Source {
+                reason: SourceError::UserHome,
+                ..
+            }
+        ));
+        assert!(
+            err("[repos]\nroots = []")
+                .to_string()
+                .contains("unknown field")
+        );
     }
 }

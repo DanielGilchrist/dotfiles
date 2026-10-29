@@ -134,6 +134,10 @@ Which cards get a line 2, worked out from the list at its tallest (every repo op
 
 Context % and cost from the harness are planned and not shown yet.
 
+## Repos
+
+The sidebar shows a repo while a session or an agent worktree belongs to it, and while it's **listed**: kept in `~/.local/state/agent/repos` by `agent add`, the picker, `agent repo`, or creating an agent in it. A listed repo with nothing running is one row, its main checkout, so `⏎` starts the repo session there. A repo whose directory name can't be a session name can't be listed. `agent forget` drops the listing. A listed path that isn't a repo any more is a discovery warning, not an error. The **catalogue** is what the picker and the `n` form offer beyond that: `[repos] dirs` in the config, each a repo or a directory of repos, read without running git (a `.git` directory is enough, and linked worktrees are left out). Paths are canonical so a found repo matches its listing. It's rescanned with every refresh, never puts a repo in the sidebar by itself, and what couldn't be read there is reported like a discovery warning.
+
 ## Views
 
 - **Focus** (default): one repo, no per-repo header rows. The main checkout is labelled by its branch, never `(root)`.
@@ -154,7 +158,7 @@ NAV:
 | `1` / `2` / `3` | focus [1] Agents, [2] the agent, [3] Changes |
 | `j`/`k`, `g`/`G` | move the selection in [1], scroll [2], move the file cursor in [3] |
 | `[` / `]` | previous / next repo |
-| `p` | repo picker |
+| `p` | repo picker: focus a listed repo, or add one from the catalogue or by path |
 | `Space` / `/` | switcher |
 | `Tab` | Focus ↔ Overview |
 | `m` | pin / unpin |
@@ -170,7 +174,8 @@ NAV:
 
 ## Overlays
 
-- **Switcher**: input focused on open. Index 0 is the previous agent, then pins, then MRU, then the rest. It never lists the TUI's own session. Rows use the Overview grammar: a main checkout reads `repo branch` (branch DIM) with nothing on the right. Other agents show their repo on the right (DIM). Age arrives with status. `Ctrl+n`/`Ctrl+p`/`Ctrl+\` move, `⏎` switches into AGENT, and `Esc` returns unchanged. Rows: glyph, `agent`, repo DIM, age DIM. Matched characters BOLD Cyan. Rounded DIM border, BOLD title, hints in the bottom border.
+- **Switcher**: input focused on open. Index 0 is the previous agent, then pins, then MRU, then the rest. It never lists the TUI's own session. Rows use the Overview grammar: a main checkout reads `repo branch` (branch DIM) with nothing on the right. Other agents show their repo on the right (DIM). Age arrives with status. `⌃N`/`⌃P`/`⌃\` move, `⏎` switches into AGENT, and `Esc` returns unchanged. Rows: glyph, `agent`, repo DIM, age DIM. Matched characters BOLD Cyan. Rounded DIM border, BOLD title, hints in the bottom border.
+- **Repo picker** (`p`): the same list grammar as the switcher. Rows are the sidebar's repos first, then the catalogue's repos the sidebar doesn't show, each group with an exact name first, then prefixes, then the rest. Every row ends with where the repo is (DIM, as `~/repos`), since a name alone can't tell two clones apart, and a listed row puts its live count before that (`● 2  ~/code`, default fg like the sidebar's counts). Text that starts like a path (`/`, `~`, `~/`, `.`, `./`, `../`) is the one row: the path keeping its end, and `add its repo` DIM. Whether it is one is checked off the UI thread when picked, and a failure lands in the status bar. With no row, the one row says `no match` (DIM) or `~user paths aren't supported` (Red) and the border offers only `Esc close`. Otherwise the bottom hint says what `⏎` does with the row under the cursor: `focus` a listed repo, `add` anything else. Adding lists the repo and focuses it once the next refresh shows it, unless a launch is already being followed. While the switcher or the picker is open the footer carries only `? keys`, since the border has the keys.
 - **Confirm**: sized to its content, with two short lines and hints in the bottom border padded by one space each side, the confirming key first and always BOLD Red (it must differ from the border), alternatives after it (`── Y discard and remove  k kill only  n/Esc cancel ─╯`). Border Yellow, Red when data would be lost, and the destructive key BOLD Red. Unmerged work lists the commit count per branch.
 - **Help**: the full keymap. Section headers are the same reversed-Cyan badges as the footer (`AGENT`, `NAV`). Keys and descriptions in default fg (DIM is unreadable on some themes at this density). Sized to fit 80x24, in two columns when the terminal is short.
 

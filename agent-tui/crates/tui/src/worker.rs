@@ -6,9 +6,12 @@ use std::thread::{self, JoinHandle};
 
 use agent_core::actions::CommandLine;
 use agent_core::activity::Activity;
+use agent_core::config::Sources;
+use agent_core::discover;
 use agent_core::model::{Removable, Running, Snapshot, Startable};
 use agent_core::names::{AgentName, Prompt, SessionName};
 use agent_core::ops::{self, Approved, Backend, Launch, RemovalPlan, Removed};
+use agent_core::paths::RepoRoot;
 use agent_core::ports::{ClientId, HarnessId, HostError, WorktreeFacts};
 use crossterm::event::{KeyEvent, MouseEvent};
 
@@ -55,6 +58,12 @@ pub enum Msg {
     Focus(crate::model::TerminalFocus),
     /// What every agent's harness last reported, when it changed.
     Activities(HashMap<SessionName, Activity>),
+    /// The repos under `[repos] dirs` and what couldn't be read there, when
+    /// either changed.
+    Catalogue {
+        repos: Vec<RepoRoot>,
+        warnings: Vec<String>,
+    },
     /// Git facts about an agent's worktree.
     Inspected {
         name: SessionName,
@@ -70,6 +79,8 @@ pub enum Outcome {
     },
     Pinned(SessionName),
     Unpinned(SessionName),
+    /// A repo was asked into the list.
+    Listed(ops::Listed),
     /// A configured action's process started.
     Started(String),
     /// It exited successfully.
@@ -108,6 +119,8 @@ pub enum Job {
     },
     Pin(SessionName),
     Unpin(SessionName),
+    /// List the repo holding this directory.
+    ListRepo(PathBuf),
     CheckShared {
         name: SessionName,
         own: Option<ClientId>,
@@ -142,7 +155,8 @@ impl Job {
             | Self::Kill(_)
             | Self::Remove { .. }
             | Self::Pin(_)
-            | Self::Unpin(_) => true,
+            | Self::Unpin(_)
+            | Self::ListRepo(_) => true,
             Self::PlanRemoval { .. }
             | Self::CheckShared { .. }
             | Self::Select(_)
@@ -272,17 +286,31 @@ impl Inspector {
 
 /// Two threads: one refreshes the snapshot, coalescing requests; the other
 /// runs user actions in order. A slow refresh never delays an action.
-pub fn spawn(backend: Arc<Backend>, msgs: Sender<Msg>) -> Workers {
+pub fn spawn(backend: Arc<Backend>, sources: Sources, msgs: Sender<Msg>) -> Workers {
     let (refresh, refresh_rx) = mpsc::channel::<()>();
     {
         let backend = Arc::clone(&backend);
         let msgs = msgs.clone();
         thread::spawn(move || {
             let mut heard = HashMap::new();
+            let mut offered = (Vec::new(), Vec::new());
             loop {
                 let msg = match refresh_rx.recv_timeout(ACTIVITY_POLL) {
                     Ok(()) => {
                         refresh_rx.try_iter().for_each(drop);
+                        let catalogue = discover::catalogue(sources.dirs());
+                        let warnings: Vec<String> =
+                            catalogue.warnings.iter().map(ToString::to_string).collect();
+                        if (&catalogue.repos, &warnings) != (&offered.0, &offered.1) {
+                            offered = (catalogue.repos.clone(), warnings.clone());
+                            let msg = Msg::Catalogue {
+                                repos: catalogue.repos,
+                                warnings,
+                            };
+                            if msgs.send(msg).is_err() {
+                                return;
+                            }
+                        }
                         snapshot(&backend)
                     }
                     Err(mpsc::RecvTimeoutError::Timeout) => match backend.store.activities() {
@@ -509,6 +537,9 @@ fn run(backend: &Arc<Backend>, job: Job, msgs: &Sender<Msg>) -> Option<Msg> {
                 .map(|()| Outcome::Unpinned(name))
                 .map_err(|e| describe(&e)),
         ),
+        Job::ListRepo(dir) => {
+            Msg::Done(ops::list_repo(svc, &dir).map(Outcome::Listed).map_err(err))
+        }
         Job::Select(name) => match svc.store.set_last_selected(&name) {
             Ok(()) => return None,
             Err(e) => Msg::Done(Err(describe(&e))),

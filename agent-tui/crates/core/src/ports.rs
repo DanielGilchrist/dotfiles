@@ -494,6 +494,26 @@ pub trait Store: Send + Sync {
     /// The agent last selected in the TUI, to start on next time.
     fn last_selected(&self) -> Result<Option<SessionName>, StoreError>;
     fn set_last_selected(&self, name: &SessionName) -> Result<(), StoreError>;
+    /// Repos listed in the TUI whether or not anything runs in them, in
+    /// the order they were listed.
+    fn repos(&self) -> Result<Vec<RepoRoot>, StoreError>;
+    /// Lists `repo` last.
+    fn list_repo(&self, repo: &RepoRoot) -> Result<Listing, StoreError>;
+    fn unlist_repo(&self, repo: &RepoRoot) -> Result<Unlisting, StoreError>;
+}
+
+/// What listing a repo did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Listing {
+    Added,
+    AlreadyListed,
+}
+
+/// What unlisting a repo did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unlisting {
+    Dropped,
+    NotListed,
 }
 
 #[cfg(test)]

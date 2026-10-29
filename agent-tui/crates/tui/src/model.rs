@@ -11,7 +11,7 @@ use agent_core::model::{
 };
 use agent_core::names::{AgentName, Prompt, SessionName};
 use agent_core::ops::{Approved, Hazardous, RemovalPlan};
-use agent_core::paths::RepoRoot;
+use agent_core::paths::{RepoRoot, Typed, typed_path};
 use agent_core::ports::{Change, HarnessId, WorktreeFacts};
 use agent_term::{Emulator, Terminal};
 use ratatui::layout::Rect;
@@ -672,6 +672,11 @@ pub enum Follow {
     /// the first snapshot can honour it, and starting inside an agent's
     /// checkout overrides it.
     Restored(SessionName),
+    /// A repo just listed from the picker: focus it once it shows. A
+    /// refresh was already in flight, so it gets two snapshots to show in
+    /// before the follow is dropped (the listing may be hidden by a name
+    /// clash).
+    Repo { root: RepoRoot, until: u64 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -746,6 +751,13 @@ pub struct Model {
     next_ticket: u64,
     pub actions: Actions,
     pub keys: Keys,
+    /// Repos found under `[repos] dirs`, by name, for the pickers to offer
+    /// beyond the snapshot.
+    pub catalogue: Vec<RepoRoot>,
+    /// What couldn't be read under `[repos] dirs`, as last reported.
+    pub catalogue_warnings: Vec<String>,
+    /// How many snapshots have loaded, to give a follow a deadline.
+    pub snapshots: u64,
     /// What each agent's harness last reported, once the first report of
     /// them has arrived.
     pub activities: Option<HashMap<SessionName, Activity>>,
@@ -791,6 +803,9 @@ impl Model {
             next_ticket: 0,
             actions: Actions::default(),
             keys: Keys::default(),
+            catalogue: Vec::new(),
+            catalogue_warnings: Vec::new(),
+            snapshots: 0,
             activities: None,
             now: SystemTime::now(),
             facts: HashMap::new(),
@@ -1210,6 +1225,7 @@ impl Model {
     /// still exists and somewhere sensible if not.
     pub fn load(&mut self, snapshot: Snapshot) {
         let first = matches!(self.load, Load::Pending);
+        self.snapshots += 1;
         let previous = self.cursor().cloned();
         let previous_repo = previous.as_ref().and_then(|c| {
             self.snapshot()
@@ -1248,6 +1264,15 @@ impl Model {
                 if let Some(cursor) = cursor {
                     self.set_cursor(cursor);
                     self.schedule_preview();
+                }
+            }
+            Some(Follow::Repo { root, until }) => {
+                let key = RepoKey::Root(root.clone());
+                if self.snapshot().is_some_and(|s| s.repo(&key).is_some()) {
+                    self.select_repo(&key);
+                    self.schedule_preview();
+                } else if self.snapshots < until {
+                    self.follow = Some(Follow::Repo { root, until });
                 }
             }
             Some(Follow::Restored(_)) | None => {}
@@ -1327,7 +1352,12 @@ impl Model {
 
     /// What `form` means against the current snapshot.
     pub fn derive(&self, form: &NewAgent) -> Derived {
-        form.derive(self.snapshot(), self.own_session.as_ref(), &self.start_dir)
+        form.derive(
+            self.snapshot(),
+            &self.catalogue,
+            self.own_session.as_ref(),
+            &self.start_dir,
+        )
     }
 
     /// Moves the cursor; repo rows and the pinned group only exist in
@@ -1900,6 +1930,7 @@ impl NewAgent {
     pub fn derive(
         &self,
         snapshot: Option<&Snapshot>,
+        catalogue: &[RepoRoot],
         own: Option<&SessionName>,
         start_dir: &Path,
     ) -> Derived {
@@ -1924,7 +1955,7 @@ impl NewAgent {
             (typed, _) => typed.to_string(),
         };
         let check = NameCheck::of(&name, snapshot, own);
-        let repo_input = self.parse_repo(snapshot, start_dir);
+        let repo_input = self.parse_repo(snapshot, catalogue, start_dir);
         let completion = match &repo_input {
             RepoInput::Search(Some(root)) => completes(&root.name(), self.repo.text.trim()),
             _ => None,
@@ -1940,28 +1971,24 @@ impl NewAgent {
         }
     }
 
-    fn parse_repo(&self, snapshot: Option<&Snapshot>, start_dir: &Path) -> RepoInput {
+    fn parse_repo(
+        &self,
+        snapshot: Option<&Snapshot>,
+        catalogue: &[RepoRoot],
+        start_dir: &Path,
+    ) -> RepoInput {
         let text = self.repo.text.trim();
         if text.is_empty() {
             return RepoInput::Default(self.default_repo.clone());
         }
-        if let Some(rest) = text.strip_prefix('~') {
-            if !(rest.is_empty() || rest.starts_with('/')) {
-                return RepoInput::Unsupported;
+        match typed_path(text, start_dir) {
+            Some(Typed::Path(path)) => RepoInput::path(path),
+            Some(Typed::Unsupported | Typed::NoHome) => RepoInput::Unsupported,
+            None => {
+                let matches = repo_matches(snapshot, catalogue, text);
+                RepoInput::Search(self.repo.pick(&matches).cloned())
             }
-            return match agent_core::paths::home() {
-                Ok(home) => RepoInput::path(home.join(rest.trim_start_matches('/'))),
-                Err(_) => RepoInput::Unsupported,
-            };
         }
-        if text.starts_with('/') {
-            return RepoInput::path(PathBuf::from(text));
-        }
-        if text.starts_with("./") || text.starts_with("../") || text == "." || text == ".." {
-            return RepoInput::path(start_dir.join(text));
-        }
-        let matches = repo_matches(snapshot, text);
-        RepoInput::Search(self.repo.pick(&matches).cloned())
     }
 }
 
@@ -2005,7 +2032,13 @@ fn free_name(base: &AgentName, snapshot: Option<&Snapshot>, own: Option<&Session
 
 /// Known repos (not orphan sessions) whose names fuzzily match `query`,
 /// prefix matches first.
-pub fn repo_matches(snapshot: Option<&Snapshot>, query: &str) -> Vec<RepoRoot> {
+/// Repos matching `query` by name: the snapshot's, then the catalogue's
+/// that aren't in it, prefix matches first.
+pub fn repo_matches(
+    snapshot: Option<&Snapshot>,
+    catalogue: &[RepoRoot],
+    query: &str,
+) -> Vec<RepoRoot> {
     let query_lower = query.to_lowercase();
     let mut matches: Vec<RepoRoot> = snapshot
         .map(|s| {
@@ -2017,8 +2050,36 @@ pub fn repo_matches(snapshot: Option<&Snapshot>, query: &str) -> Vec<RepoRoot> {
                 .collect()
         })
         .unwrap_or_default();
-    matches.sort_by_key(|root| !root.name().to_lowercase().starts_with(&query_lower));
+    matches.extend(
+        unlisted(snapshot, catalogue)
+            .filter(|root| fuzzy_match(query, &root.name()).is_some())
+            .cloned(),
+    );
+    matches.sort_by_key(|root| match_rank(&root.name(), &query_lower));
     matches
+}
+
+/// How well a name answers a lowercased query: an exact match, then a
+/// prefix, then any other match. Stable sorts keep ties in list order.
+pub fn match_rank(name: &str, query_lower: &str) -> u8 {
+    let name = name.to_lowercase();
+    if name == query_lower {
+        0
+    } else if name.starts_with(query_lower) {
+        1
+    } else {
+        2
+    }
+}
+
+/// The catalogue's repos the snapshot doesn't have.
+pub fn unlisted<'a>(
+    snapshot: Option<&'a Snapshot>,
+    catalogue: &'a [RepoRoot],
+) -> impl Iterator<Item = &'a RepoRoot> + 'a {
+    catalogue.iter().filter(move |root| {
+        snapshot.is_none_or(|s| s.repo(&RepoKey::Root((*root).clone())).is_none())
+    })
 }
 
 /// Byte offsets and characters that make `name` invalid, for highlighting.

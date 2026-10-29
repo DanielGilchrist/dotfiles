@@ -17,6 +17,61 @@ pub enum PathError {
     NoHome,
 }
 
+/// How text that starts like a path reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Typed {
+    /// `/`, `~`, `~/`, `.`, `./` or `..`, made absolute against `base`.
+    Path(PathBuf),
+    /// `~user/...`, which isn't supported.
+    Unsupported,
+    /// `~` with no home directory to stand for.
+    NoHome,
+}
+
+/// `text` as a path when it starts like one, with `~` as the home
+/// directory and `.` or `..` relative to `base`. Anything else is a name.
+pub fn typed_path(text: &str, base: &Path) -> Option<Typed> {
+    let text = text.trim();
+    if let Some(rest) = text.strip_prefix('~') {
+        if !(rest.is_empty() || rest.starts_with('/')) {
+            return Some(Typed::Unsupported);
+        }
+        return Some(match home() {
+            Ok(home) => Typed::Path(home.join(rest.trim_start_matches('/'))),
+            Err(_) => Typed::NoHome,
+        });
+    }
+    if text.starts_with('/') {
+        return Some(Typed::Path(PathBuf::from(text)));
+    }
+    if text.starts_with("./") || text.starts_with("../") || text == "." || text == ".." {
+        return Some(Typed::Path(base.join(text)));
+    }
+    None
+}
+
+/// `path` with `.` dropped and `..` folded into the component before it,
+/// without touching the filesystem, so a path that no longer exists still
+/// compares equal to how it was stored.
+pub fn normalise(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !matches!(
+                    out.components().next_back(),
+                    Some(Component::RootDir) | None
+                ) {
+                    out.pop();
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 pub fn home() -> Result<PathBuf, PathError> {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
@@ -244,6 +299,31 @@ mod tests {
         assert_eq!(layout().worktree_at(wt.path()), Some(wt));
         let trash = layout().worktree(&repo("/src/.trash"), "x".parse().unwrap());
         assert!(!trash.path().starts_with(layout().trash()));
+    }
+
+    #[test]
+    fn typed_paths_expand_home_and_anchor_relative_ones() {
+        let home = home().unwrap();
+        let base = Path::new("/w/api/fix");
+        assert_eq!(
+            typed_path("~/code", base),
+            Some(Typed::Path(home.join("code")))
+        );
+        assert_eq!(typed_path("~", base), Some(Typed::Path(home.clone())));
+        assert_eq!(typed_path("~bob/x", base), Some(Typed::Unsupported));
+        assert_eq!(
+            typed_path("../other", base),
+            Some(Typed::Path(base.join("../other")))
+        );
+        assert_eq!(typed_path("/srv", base), Some(Typed::Path("/srv".into())));
+        assert_eq!(typed_path("api", base), None);
+    }
+
+    #[test]
+    fn normalising_folds_dots_without_the_filesystem() {
+        assert_eq!(normalise(Path::new("/a/b/../c/./d")), Path::new("/a/c/d"));
+        assert_eq!(normalise(Path::new("/../a")), Path::new("/a"));
+        assert_eq!(normalise(Path::new("a/../../b")), Path::new("b"));
     }
 
     #[test]

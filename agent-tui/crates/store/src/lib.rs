@@ -6,8 +6,8 @@ use std::time::SystemTime;
 
 use agent_core::activity::{Activity, Reported};
 use agent_core::names::SessionName;
-use agent_core::paths::{PathError, home};
-use agent_core::ports::{AgentRecord, Store, StoreError};
+use agent_core::paths::{PathError, RepoRoot, home};
+use agent_core::ports::{AgentRecord, Listing, Store, StoreError, Unlisting};
 use nix::fcntl::{Flock, FlockArg};
 
 /// Pins and agent records under `$XDG_STATE_HOME/agent`. Read-modify-write
@@ -36,6 +36,10 @@ impl FsStore {
 
     fn pins_path(&self) -> PathBuf {
         self.dir.join("pinned")
+    }
+
+    fn repos_path(&self) -> PathBuf {
+        self.dir.join("repos")
     }
 
     fn selection_path(&self) -> PathBuf {
@@ -99,6 +103,43 @@ impl FsStore {
     }
 }
 
+impl FsStore {
+    fn read_repos(&self) -> Result<Vec<RepoRoot>, StoreError> {
+        let path = self.repos_path();
+        let Some(contents) = read_optional(&path)? else {
+            return Ok(Vec::new());
+        };
+        contents
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| {
+                RepoRoot::new(PathBuf::from(l)).map_err(|e| StoreError::Corrupt {
+                    path: path.clone(),
+                    detail: format!("{e}"),
+                })
+            })
+            .collect()
+    }
+
+    /// Applies `change` to the listed repos under the store lock, writing
+    /// only if it changed anything, and says whether it did.
+    fn update_repos(&self, change: impl FnOnce(&mut Vec<RepoRoot>)) -> Result<bool, StoreError> {
+        let _lock = self.lock()?;
+        let before = self.read_repos()?;
+        let mut repos = before.clone();
+        change(&mut repos);
+        if repos == before {
+            return Ok(false);
+        }
+        let contents: String = repos
+            .iter()
+            .flat_map(|r| [r.path().to_string_lossy().into_owned(), "\n".into()])
+            .collect();
+        write_atomic(&self.repos_path(), contents.as_bytes())?;
+        Ok(true)
+    }
+}
+
 fn io_err(path: &Path) -> impl FnOnce(io::Error) -> StoreError + '_ {
     move |source| StoreError::Io {
         path: path.to_path_buf(),
@@ -156,6 +197,32 @@ impl Store for FsStore {
 
     fn unpin(&self, name: &SessionName) -> Result<(), StoreError> {
         self.update_pins(|pins| pins.retain(|p| p != name))
+    }
+
+    fn repos(&self) -> Result<Vec<RepoRoot>, StoreError> {
+        self.read_repos()
+    }
+
+    fn list_repo(&self, repo: &RepoRoot) -> Result<Listing, StoreError> {
+        let changed = self.update_repos(|repos| {
+            if !repos.contains(repo) {
+                repos.push(repo.clone());
+            }
+        })?;
+        Ok(if changed {
+            Listing::Added
+        } else {
+            Listing::AlreadyListed
+        })
+    }
+
+    fn unlist_repo(&self, repo: &RepoRoot) -> Result<Unlisting, StoreError> {
+        let changed = self.update_repos(|repos| repos.retain(|r| r != repo))?;
+        Ok(if changed {
+            Unlisting::Dropped
+        } else {
+            Unlisting::NotListed
+        })
     }
 
     fn record(&self, name: &SessionName) -> Result<Option<AgentRecord>, StoreError> {
@@ -270,6 +337,31 @@ mod tests {
         assert_eq!(store.pinned().unwrap(), vec![name("b"), name("a")]);
         store.unpin(&name("b")).unwrap();
         assert_eq!(store.pinned().unwrap(), vec![name("a")]);
+    }
+
+    #[test]
+    fn listed_repos_keep_their_order_and_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsStore::new(dir.path().to_path_buf());
+        let repo = |p: &str| RepoRoot::new(PathBuf::from(p)).unwrap();
+        assert_eq!(store.list_repo(&repo("/src/b")).unwrap(), Listing::Added);
+        assert_eq!(store.list_repo(&repo("/src/a")).unwrap(), Listing::Added);
+        assert_eq!(
+            store.list_repo(&repo("/src/b")).unwrap(),
+            Listing::AlreadyListed
+        );
+        assert_eq!(store.repos().unwrap(), vec![repo("/src/b"), repo("/src/a")]);
+        assert_eq!(
+            store.unlist_repo(&repo("/src/b")).unwrap(),
+            Unlisting::Dropped
+        );
+        assert_eq!(
+            store.unlist_repo(&repo("/src/b")).unwrap(),
+            Unlisting::NotListed
+        );
+        assert_eq!(store.repos().unwrap(), vec![repo("/src/a")]);
+        std::fs::write(dir.path().join("repos"), "relative\n").unwrap();
+        assert!(matches!(store.repos(), Err(StoreError::Corrupt { .. })));
     }
 
     #[test]

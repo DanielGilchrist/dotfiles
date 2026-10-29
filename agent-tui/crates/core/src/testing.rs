@@ -12,9 +12,9 @@ use crate::names::{BranchName, Prompt, SessionName};
 use crate::paths::{AgentWorktree, RepoRoot};
 use crate::ports::{
     AgentRecord, BranchState, ClientControl, Harness, HarnessError, HarnessId, Harnesses,
-    HostError, LaunchCtx, LocalBranch, PaneCommand, PendingPrompt, RemoteBranch, RepoWorktrees,
-    Seen, SessionHost, SessionInfo, SessionStatus, Store, StoreError, Vcs, WorktreeFacts,
-    WorktreeStart,
+    HostError, LaunchCtx, Listing, LocalBranch, PaneCommand, PendingPrompt, RemoteBranch,
+    RepoWorktrees, Seen, SessionHost, SessionInfo, SessionStatus, Store, StoreError, Unlisting,
+    Vcs, WorktreeFacts, WorktreeStart,
 };
 use crate::process::{CommandError, LaunchSpec};
 
@@ -27,6 +27,10 @@ pub struct FakeVcs {
     pub dirty: Mutex<HashMap<PathBuf, usize>>,
     pub detached_commits: Mutex<HashMap<PathBuf, usize>>,
     pub deleted: Mutex<Vec<BranchName>>,
+    /// Paths that aren't inside any repo.
+    pub not_repos: Mutex<Vec<PathBuf>>,
+    /// Paths inside some other repo than `root`.
+    pub other_repos: Mutex<HashMap<PathBuf, RepoRoot>>,
 }
 
 impl FakeVcs {
@@ -38,6 +42,8 @@ impl FakeVcs {
             dirty: Mutex::default(),
             detached_commits: Mutex::default(),
             deleted: Mutex::default(),
+            not_repos: Mutex::default(),
+            other_repos: Mutex::default(),
         }
     }
 
@@ -51,7 +57,13 @@ impl FakeVcs {
 }
 
 impl Vcs for FakeVcs {
-    fn repo_of(&self, _: &Path) -> Result<Option<RepoRoot>, CommandError> {
+    fn repo_of(&self, dir: &Path) -> Result<Option<RepoRoot>, CommandError> {
+        if self.not_repos.lock().unwrap().iter().any(|p| p == dir) {
+            return Ok(None);
+        }
+        if let Some(other) = self.other_repos.lock().unwrap().get(dir) {
+            return Ok(Some(other.clone()));
+        }
         Ok(Some(self.root.clone()))
     }
 
@@ -238,6 +250,7 @@ pub struct MemStore {
     pub records: Mutex<HashMap<SessionName, AgentRecord>>,
     pub last_selected: Mutex<Option<SessionName>>,
     pub activities: Mutex<HashMap<SessionName, Activity>>,
+    pub repos: Mutex<Vec<RepoRoot>>,
 }
 
 impl Store for MemStore {
@@ -294,6 +307,30 @@ impl Store for MemStore {
 
     fn activities(&self) -> Result<HashMap<SessionName, Activity>, StoreError> {
         Ok(self.activities.lock().unwrap().clone())
+    }
+
+    fn repos(&self) -> Result<Vec<RepoRoot>, StoreError> {
+        Ok(self.repos.lock().unwrap().clone())
+    }
+
+    fn list_repo(&self, repo: &RepoRoot) -> Result<Listing, StoreError> {
+        let mut repos = self.repos.lock().unwrap();
+        if repos.contains(repo) {
+            return Ok(Listing::AlreadyListed);
+        }
+        repos.push(repo.clone());
+        Ok(Listing::Added)
+    }
+
+    fn unlist_repo(&self, repo: &RepoRoot) -> Result<Unlisting, StoreError> {
+        let mut repos = self.repos.lock().unwrap();
+        let before = repos.len();
+        repos.retain(|r| r != repo);
+        Ok(if repos.len() < before {
+            Unlisting::Dropped
+        } else {
+            Unlisting::NotListed
+        })
     }
 
     fn last_selected(&self) -> Result<Option<SessionName>, StoreError> {

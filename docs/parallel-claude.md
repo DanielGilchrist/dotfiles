@@ -22,6 +22,20 @@ it into `~/.local/bin/agent`. Session layouts record that path, so keep it.
   conversation. Sessions `agent` doesn't own are resurrected by zellij.
 - **Repo sessions**: `agent repo` runs an agent in the repo's main checkout
   (no worktree), named after the repo.
+- **Listed repos** stay in the TUI with nothing running in them, as one row
+  for the main checkout, so `⏎` starts the repo session there. A repo is
+  listed by `agent add`, the TUI's `p` picker, `agent repo`, or creating an
+  agent in it, and `agent forget` drops it. The list lives in
+  `~/.local/state/agent/repos`.
+- **Catalogue**: `[repos] dirs` in `~/.config/agent/config.toml` names
+  directories that are repos or hold repos (`~/repos` offers every clone in
+  it). The `p` picker and the `n` form's repo field offer them, and picking
+  one lists it. They aren't shown until picked.
+
+  ```toml
+  [repos]
+  dirs = ["~/repos", "~/.config"]
+  ```
 - **Names** are ≤20 chars of `[A-Za-z0-9._-]` (the zellij socket path limit
   on macOS). `agents` is reserved.
 - **State** lives in `~/.local/state/agent`: per-agent records (harness,
@@ -41,7 +55,8 @@ types into the embedded session. `?` shows every key.
 | `j k g G`, `[ ]` | Move in the focused panel, previous / next repo |
 | `Space` / `/` | Switcher (fuzzy), `⌃N ⌃P` to move |
 | `m` | Pin / unpin (pinned agents get their own group) |
-| `n` | New agent form: prompt (`⌃E` edits it in $EDITOR), name (suggested from the prompt or a Linear/GitHub link), repo |
+| `n` | New agent form: prompt (`⌃E` edits it in $EDITOR), name (suggested from the prompt or a Linear/GitHub link), repo (listed, from the catalogue, or a path) |
+| `p` | Repo picker: `⏎` focuses a listed repo, or adds one from the catalogue or by a typed path (`~/code/foo`) |
 | `e` | Open the agent's worktree in $EDITOR, or in Changes the file under the cursor |
 | `r` | Reply without attaching, once its turn is over and nothing is asking |
 | `d` / `D` | Kill the session / remove session, worktree and branch (confirms, lists anything that would be lost) |
@@ -136,11 +151,13 @@ the reason.
 | `agent attach <name> --repo <path>` | Repo for a new worktree (default: the one containing the cwd). |
 | `agent attach … --headless` | Prepare everything but print `headless_session:`, `headless_cwd:` and `headless_cmd:` (fish-quoted) instead of attaching. |
 | `agent checkout <branch>` / `agent co` | Attach the worktree for a branch, creating it from the local or `origin/` branch. Name is the branch with `/` → `-`. |
-| `agent repo` | Attach or start the repo session. |
+| `agent repo` | Attach or start the repo session. Run inside an agent worktree, it attaches that agent instead. |
 | `agent rm [<name>]` | Remove session, worktree and branch (name inferred from the cwd). Refuses if anything would be lost: uncommitted files, unpushed or unmerged commits. Run from inside the agent's own session, it finishes in the background. |
 | `agent rm --force [<name>]` | Same, discarding work. |
 | `agent rm --all [-f]` | Every agent worktree. Confirms first. |
 | `agent ls` | Agents by repo with their state. |
+| `agent add [<path>]` | Keep the repo holding the path (default: the cwd) listed in the TUI with nothing running in it. |
+| `agent forget [<path>]` | Drop it from the list. It stays while sessions or worktrees belong to it. |
 | `agent merged` | Worktrees whose branch can be removed without losing work. |
 | `agent prompt <name> <text>` / `--file` | Type a prompt into a running agent and submit it. |
 | `agent dump <name>` | Print an agent's screen with ANSI styling. |
@@ -173,7 +190,7 @@ previews, and attaches to the zellij sessions directly.
 | `<leader>an` | New worktree agent: name prompt → multi-line seed buffer (`<C-s>` submits) → `agent attach <name> --seed … --headless`. The session runs in an nvim tab and also shows up in the TUI. |
 | `<leader>aN` | Same as `<leader>an` but skips the seed buffer, so Claude starts with no prompt. |
 | `<leader>ac` | Branch picker (local + remote). Attaches an existing worktree for the pick, or creates one and spawns a bare agent. |
-| `<leader>as` | Repo session: `agent repo --headless`, an agent in the repo's main checkout named after the repo. No prompts. |
+| `<leader>as` | Repo session: `agent repo --headless`, an agent in the repo's main checkout named after the repo. No prompts. From inside an agent's worktree it opens that agent. |
 | `<leader>ao` | Open/focus the agent for the current worktree. If none, picker over running sessions. |
 | `<leader>av` (visual) | Send visual selection. |
 | `<leader>ap` | Single-line prompt → submit. |

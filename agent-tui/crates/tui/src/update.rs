@@ -10,7 +10,8 @@ use agent_core::config::ControlKey;
 use agent_core::model::RepoKey;
 use agent_core::names::{Prompt, SessionName};
 use agent_core::ops::{Approved, Launch};
-use agent_core::ports::ClientId;
+use agent_core::paths::{RepoRoot, Typed, typed_path};
+use agent_core::ports::{ClientId, Listing};
 use agent_term::{CellPos, encode_key, encode_mouse};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind};
 use ratatui::layout::Position;
@@ -18,7 +19,8 @@ use ratatui::layout::Position;
 use crate::model::{
     Answer, Chord, Confirm, Cursor, Edge, Enter, Field, Focus, Follow, INFO_TTL, Inspection,
     Intent, Mode, Model, NamingState, NewAgent, Overlay, Pane, Panel, Phase, Query, Reach,
-    StatusKind, Submission, TerminalFocus, Ticket, View, fuzzy_match, repo_matches,
+    StatusKind, Submission, TerminalFocus, Ticket, View, fuzzy_match, match_rank, repo_matches,
+    unlisted,
 };
 use crate::worker::{Job, Msg, Outcome};
 
@@ -179,6 +181,19 @@ pub fn update(m: &mut Model, msg: Msg) -> Vec<Effect> {
             Vec::new()
         }
         Msg::Activities(activities) => on_activities(m, activities),
+        Msg::Catalogue { repos, warnings } => {
+            m.catalogue = repos;
+            if !warnings.is_empty() && warnings != m.catalogue_warnings {
+                let more = if warnings.len() > 1 {
+                    format!(" (+{} more)", warnings.len() - 1)
+                } else {
+                    String::new()
+                };
+                m.error(format!("{}{more}", warnings[0]));
+            }
+            m.catalogue_warnings = warnings;
+            Vec::new()
+        }
         Msg::Focus(focus) => {
             m.terminal = focus;
             Vec::new()
@@ -326,6 +341,23 @@ fn report(m: &mut Model, outcome: Outcome) {
             m.error(format!("removed {name}, but {}", warnings.join(", ")));
         }
         Outcome::Pinned(name) => m.info(format!("pinned {name}")),
+        Outcome::Listed(listed) => {
+            let name = listed.repo.name().into_owned();
+            match listed.listing {
+                Listing::Added => m.info(format!("listed {name}")),
+                Listing::AlreadyListed => m.info(format!("{name} is already listed")),
+            }
+            // A launch in flight keeps its follow: the repo is still listed.
+            if !matches!(
+                m.follow,
+                Some(Follow::Submitted { .. } | Follow::Backgrounded { .. })
+            ) {
+                m.follow = Some(Follow::Repo {
+                    root: listed.repo,
+                    until: m.snapshots + 2,
+                });
+            }
+        }
         Outcome::Replied(name) => m.info(format!("sent to {name}")),
         Outcome::Unpinned(name) => m.info(format!("unpinned {name}")),
         Outcome::Started(label) => m.info(format!("started {label}")),
@@ -823,16 +855,104 @@ pub fn switcher_matches(m: &Model, query: &str) -> Vec<SessionName> {
         .collect()
 }
 
-pub fn picker_matches(m: &Model, query: &str) -> Vec<RepoKey> {
-    m.snapshot()
+/// A row of the repo picker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Pick {
+    /// A repo the sidebar shows: ⏎ focuses it.
+    Listed(RepoKey),
+    /// A catalogue repo the sidebar doesn't show: ⏎ lists it.
+    Found(RepoRoot),
+    /// A typed path: ⏎ lists the repo holding it. Whether it is one is
+    /// checked off the UI thread, so a slow mount can't stall typing.
+    Path(PathBuf),
+}
+
+impl Pick {
+    /// What ⏎ does with it, for the hint.
+    pub fn verb(&self) -> &'static str {
+        match self {
+            Self::Listed(_) => "focus",
+            Self::Found(_) | Self::Path(_) => "add",
+        }
+    }
+}
+
+/// The picker's rows for `query`, or why there are none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Picks {
+    Rows(Vec<Pick>),
+    /// Nothing matches the name.
+    NoMatch,
+    /// A path that can't be used.
+    Unusable(Unusable),
+}
+
+/// Why a typed path can't be a row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unusable {
+    /// `~user/...`.
+    UserHome,
+    /// `~` with no home directory set.
+    NoHome,
+}
+
+impl Picks {
+    pub fn rows(&self) -> &[Pick] {
+        match self {
+            Self::Rows(rows) => rows,
+            Self::NoMatch | Self::Unusable(_) => &[],
+        }
+    }
+}
+
+/// A typed path is the one row. Otherwise the listed repos matching
+/// `query`, then the catalogue's, each group with exact matches first,
+/// then prefixes.
+pub fn picker_matches(m: &Model, query: &str) -> Picks {
+    match typed_path(query, &m.start_dir) {
+        Some(Typed::Path(path)) => return Picks::Rows(vec![Pick::Path(path)]),
+        Some(Typed::Unsupported) => return Picks::Unusable(Unusable::UserHome),
+        Some(Typed::NoHome) => return Picks::Unusable(Unusable::NoHome),
+        None => {}
+    }
+    let query_lower = query.to_lowercase();
+    let mut listed: Vec<(u8, Pick)> = m
+        .snapshot()
         .map(|s| {
             s.repos()
                 .iter()
+                .filter(|r| r.key().root().is_some())
                 .filter(|r| fuzzy_match(query, &r.name()).is_some())
-                .map(|r| r.key().clone())
+                .map(|r| {
+                    (
+                        match_rank(&r.name(), &query_lower),
+                        Pick::Listed(r.key().clone()),
+                    )
+                })
                 .collect()
         })
-        .unwrap_or_default()
+        .unwrap_or_default();
+    listed.sort_by_key(|(rank, _)| *rank);
+    let mut found: Vec<(u8, Pick)> = unlisted(m.snapshot(), &m.catalogue)
+        .filter(|root| fuzzy_match(query, &root.name()).is_some())
+        .map(|root| {
+            (
+                match_rank(&root.name(), &query_lower),
+                Pick::Found(root.clone()),
+            )
+        })
+        .collect();
+    found.sort_by_key(|(rank, _)| *rank);
+    let rows: Vec<Pick> = listed
+        .into_iter()
+        .chain(found)
+        .map(|(_, pick)| pick)
+        .collect();
+    if rows.is_empty() {
+        Picks::NoMatch
+    } else {
+        Picks::Rows(rows)
+    }
 }
 
 fn on_overlay_key(m: &mut Model, key: KeyEvent) -> Vec<Effect> {
@@ -864,11 +984,14 @@ fn on_overlay_key(m: &mut Model, key: KeyEvent) -> Vec<Effect> {
             let matches = switcher_matches(m, &query.text);
             match key.code {
                 KeyCode::Esc | KeyCode::Tab => Vec::new(),
-                KeyCode::Enter => query
-                    .pick(&matches)
-                    .cloned()
-                    .map(|name| activate(m, &name))
-                    .unwrap_or_default(),
+                KeyCode::Enter => {
+                    if let Some(name) = query.pick(&matches).cloned() {
+                        activate(m, &name)
+                    } else {
+                        m.overlay = Overlay::Switcher(query);
+                        Vec::new()
+                    }
+                }
                 _ => {
                     edit_query(&mut query, &key, matches.len(), m.keys.nav());
                     m.overlay = Overlay::Switcher(query);
@@ -878,19 +1001,29 @@ fn on_overlay_key(m: &mut Model, key: KeyEvent) -> Vec<Effect> {
         }
         Overlay::Picker(mut query) => {
             let matches = picker_matches(m, &query.text);
+            let rows = matches.rows();
             match key.code {
-                KeyCode::Esc => {}
-                KeyCode::Enter => {
-                    if let Some(key) = query.pick(&matches).cloned() {
+                KeyCode::Esc | KeyCode::Tab => Vec::new(),
+                KeyCode::Enter => match query.pick(rows).cloned() {
+                    Some(Pick::Listed(key)) => {
                         m.select_repo(&key);
+                        Vec::new()
                     }
-                }
+                    Some(Pick::Found(root)) => {
+                        vec![Effect::Job(Job::ListRepo(root.path().to_path_buf()))]
+                    }
+                    Some(Pick::Path(path)) => vec![Effect::Job(Job::ListRepo(path))],
+                    None => {
+                        m.overlay = Overlay::Picker(query);
+                        Vec::new()
+                    }
+                },
                 _ => {
-                    edit_query(&mut query, &key, matches.len(), m.keys.nav());
+                    edit_query(&mut query, &key, rows.len(), m.keys.nav());
                     m.overlay = Overlay::Picker(query);
+                    Vec::new()
                 }
             }
-            Vec::new()
         }
         Overlay::Confirm(confirm) => on_confirm_key(m, confirm, &key),
         Overlay::Planning { ticket, name } => {
@@ -979,7 +1112,7 @@ fn on_new_key(m: &mut Model, key: &KeyEvent) -> Vec<Effect> {
         edit_form(m, |f| rest.chars().for_each(|c| f.repo.push(c)));
         return Vec::new();
     }
-    let repos = repo_matches(m.snapshot(), &form.repo.text).len();
+    let repos = repo_matches(m.snapshot(), &m.catalogue, &form.repo.text).len();
     match key.code {
         KeyCode::Esc => m.overlay = Overlay::None,
         KeyCode::Enter if !alt => return submit(m),
@@ -1187,6 +1320,191 @@ mod tests {
         };
         let pins: Vec<SessionName> = pins.iter().map(|p| name(p)).collect();
         assemble(&obs, &Layout::new("/w".into()).unwrap(), &pins).0
+    }
+
+    fn root(path: &str) -> RepoRoot {
+        RepoRoot::new(path.into()).unwrap()
+    }
+
+    /// A snapshot with `extra` repos (main checkout only) beyond `api` and `web`.
+    fn snapshot_with(extra: &[&str]) -> agent_core::model::Snapshot {
+        let mut obs = Observation {
+            sessions: Vec::new(),
+            repos: vec![
+                (
+                    root("/src/api"),
+                    RepoWorktrees {
+                        main: wt("/src/api"),
+                        linked: Vec::new(),
+                    },
+                ),
+                (
+                    root("/src/web"),
+                    RepoWorktrees {
+                        main: wt("/src/web"),
+                        linked: Vec::new(),
+                    },
+                ),
+            ],
+            warnings: Vec::new(),
+        };
+        for path in extra {
+            obs.repos.push((
+                root(path),
+                RepoWorktrees {
+                    main: wt(path),
+                    linked: Vec::new(),
+                },
+            ));
+        }
+        assemble(&obs, &Layout::new("/w".into()).unwrap(), &[]).0
+    }
+
+    #[test]
+    fn the_picker_offers_catalogue_repos_the_sidebar_lacks_after_the_listed_ones() {
+        let mut m = model(&[]);
+        m.catalogue = vec![root("/srv/code/tools"), root("/src/api")];
+        assert_eq!(
+            picker_matches(&m, ""),
+            Picks::Rows(vec![
+                Pick::Listed(RepoKey::Root(root("/src/api"))),
+                Pick::Listed(RepoKey::Root(root("/src/web"))),
+                Pick::Found(root("/srv/code/tools")),
+            ]),
+            "api isn't offered twice"
+        );
+        assert_eq!(
+            picker_matches(&m, "to"),
+            Picks::Rows(vec![Pick::Found(root("/srv/code/tools"))])
+        );
+        assert_eq!(picker_matches(&m, "zzz"), Picks::NoMatch);
+        assert_eq!(
+            picker_matches(&m, "~bob/x"),
+            Picks::Unusable(Unusable::UserHome)
+        );
+    }
+
+    #[test]
+    fn the_picker_puts_an_exact_name_before_a_longer_one_within_its_group() {
+        let mut m = model(&[]);
+        m.catalogue = vec![root("/srv/apis"), root("/srv/api")];
+        assert_eq!(
+            picker_matches(&m, "api"),
+            Picks::Rows(vec![
+                Pick::Listed(RepoKey::Root(root("/src/api"))),
+                Pick::Found(root("/srv/api")),
+                Pick::Found(root("/srv/apis")),
+            ])
+        );
+    }
+
+    #[test]
+    fn picking_a_catalogue_repo_lists_it_then_focuses_it_once_it_shows() {
+        let mut m = model(&[]);
+        m.catalogue = vec![root("/srv/code/tools")];
+        update(&mut m, key(KeyCode::Char('p')));
+        type_text(&mut m, "tools");
+        let effects = update(&mut m, key(KeyCode::Enter));
+        assert!(
+            matches!(effects.as_slice(), [Effect::Job(Job::ListRepo(dir))] if dir == std::path::Path::new("/srv/code/tools"))
+        );
+        assert!(matches!(m.overlay, Overlay::None));
+
+        update(
+            &mut m,
+            Msg::Done(Ok(Outcome::Listed(agent_core::ops::Listed {
+                repo: root("/srv/code/tools"),
+                listing: Listing::Added,
+            }))),
+        );
+        let following = Some(Follow::Repo {
+            root: root("/srv/code/tools"),
+            until: m.snapshots + 2,
+        });
+        assert_eq!(m.follow, following);
+        update(&mut m, Msg::Snapshot(Ok((snapshot_with(&[]), Vec::new()))));
+        assert_eq!(
+            m.follow, following,
+            "a refresh from before the listing keeps the follow"
+        );
+        update(
+            &mut m,
+            Msg::Snapshot(Ok((snapshot_with(&["/srv/code/tools"]), Vec::new()))),
+        );
+        assert_eq!(m.follow, None);
+        assert_eq!(selected(&m).as_deref(), Some("tools"));
+    }
+
+    #[test]
+    fn a_typed_path_is_the_only_row_and_adds_the_repo_holding_it() {
+        let mut m = model(&[]);
+        update(&mut m, key(KeyCode::Char('p')));
+        type_text(&mut m, "../other");
+        assert_eq!(
+            picker_matches(&m, "../other"),
+            Picks::Rows(vec![Pick::Path("/w/api/fix/src/../other".into())])
+        );
+        let effects = update(&mut m, key(KeyCode::Enter));
+        assert!(
+            matches!(effects.as_slice(), [Effect::Job(Job::ListRepo(dir))] if dir == std::path::Path::new("/w/api/fix/src/../other"))
+        );
+        assert!(matches!(m.overlay, Overlay::None));
+
+        update(&mut m, key(KeyCode::Char('p')));
+        type_text(&mut m, "zzz");
+        assert!(update(&mut m, key(KeyCode::Enter)).is_empty());
+        assert!(
+            matches!(m.overlay, Overlay::Picker(_)),
+            "⏎ with no row keeps the picker open"
+        );
+    }
+
+    #[test]
+    fn a_listed_repo_that_never_shows_stops_being_followed() {
+        let mut m = model(&[]);
+        update(
+            &mut m,
+            Msg::Done(Ok(Outcome::Listed(agent_core::ops::Listed {
+                repo: root("/srv/code/tools"),
+                listing: Listing::Added,
+            }))),
+        );
+        update(&mut m, Msg::Snapshot(Ok((snapshot_with(&[]), Vec::new()))));
+        assert!(m.follow.is_some());
+        update(&mut m, Msg::Snapshot(Ok((snapshot_with(&[]), Vec::new()))));
+        assert_eq!(
+            m.follow, None,
+            "the refresh the listing caused didn't show it, so later picks aren't blocked"
+        );
+    }
+
+    #[test]
+    fn listing_a_repo_doesnt_clobber_a_launch_being_followed() {
+        let mut m = model(&[]);
+        let ticket = m.ticket();
+        m.follow = Some(Follow::Submitted {
+            name: name("web"),
+            ticket,
+        });
+        update(
+            &mut m,
+            Msg::Done(Ok(Outcome::Listed(agent_core::ops::Listed {
+                repo: root("/srv/code/tools"),
+                listing: Listing::AlreadyListed,
+            }))),
+        );
+        assert_eq!(
+            m.follow,
+            Some(Follow::Submitted {
+                name: name("web"),
+                ticket,
+            })
+        );
+        assert!(
+            m.status
+                .as_ref()
+                .is_some_and(|s| s.text == "tools is already listed")
+        );
     }
 
     /// `api` (main exited, agent `fix` live, agent `idle` with no session) and `web` (main only).
