@@ -28,8 +28,7 @@ it into `~/.local/bin/agent`. Session layouts record that path, so keep it.
   reattaches to it with everything intact. A resurrect with a queued
   prompt stops it first and resumes, since `claude attach` can't carry
   one. To really quit every session: `claude stop <id>` for each entry in
-  `~/.claude/sessions/*.json` (`move-repos` does this), then kill the
-  zellij sessions.
+  `~/.claude/sessions/*.json`, then kill the zellij sessions.
 - **Repo sessions**: `agent repo` runs an agent in the repo's main checkout
   (no worktree), named after the repo.
 - **Listed repos** stay in the TUI with nothing running in them, as one row
