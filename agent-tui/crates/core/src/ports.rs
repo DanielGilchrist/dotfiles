@@ -9,7 +9,7 @@ use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
-use crate::activity::{Activity, Event};
+use crate::activity::{Activity, Reported};
 use crate::model::{Head, Presence, Running, Worktree};
 use crate::names::{BranchName, Prompt, SessionName};
 use crate::paths::{AgentWorktree, RepoRoot};
@@ -318,7 +318,7 @@ pub trait Harness: Send + Sync {
     fn launch(&self, ctx: &LaunchCtx<'_>) -> Result<LaunchSpec, HarnessError>;
     /// What a hook payload reported through `agent event` means, if it's
     /// anything the TUI shows.
-    fn event(&self, _payload: &str) -> Option<Event> {
+    fn event(&self, _payload: &str) -> Option<Reported> {
         None
     }
     /// Whether the agent has recorded any activity in `workdir` since `since`,
@@ -412,7 +412,7 @@ pub trait Store: Send + Sync {
     fn put_record(&self, name: &SessionName, record: &AgentRecord) -> Result<(), StoreError>;
     fn forget(&self, name: &SessionName) -> Result<(), StoreError>;
     /// Applies what `name`'s harness reported to its activity.
-    fn report(&self, name: &SessionName, event: Event) -> Result<(), StoreError>;
+    fn report(&self, name: &SessionName, event: Reported) -> Result<(), StoreError>;
     /// The user has looked at `name`: a finished turn stops being news.
     fn acknowledge(&self, name: &SessionName) -> Result<(), StoreError>;
     /// Every agent's latest activity.

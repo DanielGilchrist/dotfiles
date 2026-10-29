@@ -4,7 +4,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use agent_core::activity::{Activity, Event};
+use agent_core::activity::{Activity, Reported};
 use agent_core::names::SessionName;
 use agent_core::paths::{PathError, home};
 use agent_core::ports::{AgentRecord, Store, StoreError};
@@ -206,7 +206,7 @@ impl Store for FsStore {
         Ok(())
     }
 
-    fn report(&self, name: &SessionName, event: Event) -> Result<(), StoreError> {
+    fn report(&self, name: &SessionName, event: Reported) -> Result<(), StoreError> {
         let _lock = self.lock()?;
         let path = self.activity_path(name);
         // A corrupt file shouldn't stop an agent's state from moving on.

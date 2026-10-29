@@ -41,7 +41,7 @@ Distilled from two research briefs (interaction, visual) on lazygit, helix, k9s,
 | asking (a permission prompt or a question) | `◆` | Yellow BOLD, name BOLD, time Yellow |
 | failed (rate limited, overloaded…) | `!` | Red BOLD, name BOLD |
 | done, unseen | `✓` | Green BOLD, name BOLD |
-| working | braille spinner | default |
+| working, or its turn ended while background subagents run | braille spinner, `↳n` after the name while subagents run | default |
 | working but silent for 5 minutes with no tool running | the frozen frame, time with `?` | default |
 | idle, seen, or a harness without hooks | `●` | default |
 | exited (resurrectable) | `○` | DIM, name DIM |

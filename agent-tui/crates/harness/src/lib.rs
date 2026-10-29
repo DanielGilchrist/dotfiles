@@ -3,7 +3,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use agent_core::activity::Event;
+use agent_core::activity::{About, AgentId, Background, Event, Input, Origin, Reported, ToolId};
 use agent_core::names::Prompt;
 use agent_core::ports::{
     Harness, HarnessError, HarnessId, Harnesses, LaunchCtx, PendingPrompt, Seen,
@@ -23,6 +23,8 @@ const HOOKS: &[(&str, Option<&str>)] = &[
     ("PermissionRequest", None),
     ("PermissionDenied", None),
     ("Notification", Some("elicitation_dialog")),
+    ("SubagentStart", None),
+    ("SubagentStop", None),
     ("Stop", None),
     ("StopFailure", None),
     ("SessionEnd", None),
@@ -158,7 +160,7 @@ impl Harness for Claude {
         })
     }
 
-    fn event(&self, payload: &str) -> Option<Event> {
+    fn event(&self, payload: &str) -> Option<Reported> {
         claude_event(&serde_json::from_str(payload).ok()?)
     }
 
@@ -274,46 +276,130 @@ fn target(input: &serde_json::Value) -> Option<String> {
         .map(snippet)
 }
 
-/// A hook payload as an [`Event`].
-fn claude_event(payload: &serde_json::Value) -> Option<Event> {
+/// Prompts Claude Code writes to tell the agent something, like a
+/// background subagent finishing.
+const NOTIFICATION_PREFIXES: &[&str] = &["<agent-message", "<task-notification"];
+
+/// A hook payload as a [`Reported`] event.
+fn claude_event(payload: &serde_json::Value) -> Option<Reported> {
     let text = |key: &str| payload.get(key).and_then(serde_json::Value::as_str);
-    let subagent = payload.get("agent_id").is_some_and(|id| !id.is_null());
+    let at = |pointer: &str| payload.pointer(pointer).and_then(serde_json::Value::as_str);
     let tool = || text("tool_name").unwrap_or("a tool").to_string();
-    let id = || text("tool_use_id").unwrap_or_default().to_string();
+    let id = || ToolId::new(text("tool_use_id").unwrap_or_default());
     let input = payload.get("tool_input").cloned().unwrap_or_default();
-    Some(match text("hook_event_name")? {
-        "SessionStart" if text("source") == Some("compact") => Event::Busy,
+    let kind = |value: Option<&str>| value.unwrap_or("subagent").to_string();
+    let name = text("hook_event_name")?;
+    let launched = at("/tool_response/agentId")
+        .filter(|_| at("/tool_response/status") == Some("async_launched"));
+    let origin = match launched.or_else(|| text("agent_id")) {
+        Some(id) => Origin::Subagent(AgentId::new(id)),
+        None => Origin::Main,
+    };
+    let event = match name {
+        "SessionStart" if text("source") == Some("compact") => Event::Compacted,
         "SessionStart" => Event::Started,
-        "UserPromptSubmit" => Event::Prompted(snippet(text("prompt").unwrap_or_default())),
-        // A subagent working means the main agent is too, whatever it's
-        // waiting on.
-        "PreToolUse" | "PostToolUse" | "PostToolUseFailure" | "PermissionDenied" if subagent => {
-            Event::Busy
+        "UserPromptSubmit" => {
+            let prompt = text("prompt").unwrap_or_default();
+            Event::Prompted(
+                if NOTIFICATION_PREFIXES
+                    .iter()
+                    .any(|p| prompt.trim_start().starts_with(p))
+                {
+                    Input::Notification
+                } else {
+                    Input::User(snippet(prompt))
+                },
+            )
         }
         "PreToolUse" if text("tool_name") == Some("AskUserQuestion") => {
             let question = input
                 .pointer("/questions/0/question")
                 .and_then(serde_json::Value::as_str);
-            Event::Asked(snippet(question.unwrap_or("has a question")))
+            Event::Asked {
+                question: snippet(question.unwrap_or("has a question")),
+                about: About::Tool(id()),
+            }
         }
         "PreToolUse" => Event::ToolStarted {
             id: id(),
             tool: tool(),
             target: target(&input),
         },
-        "PostToolUse" | "PostToolUseFailure" | "PermissionDenied" => {
-            Event::ToolFinished { id: id() }
+        "PostToolUse" if launched.is_some() => Event::SubagentLaunched {
+            tool: id(),
+            kind: kind(
+                input
+                    .get("subagent_type")
+                    .and_then(serde_json::Value::as_str),
+            ),
+            description: snippet(
+                at("/tool_response/description")
+                    .or_else(|| input.get("description").and_then(serde_json::Value::as_str))
+                    .unwrap_or_default(),
+            ),
+        },
+        "PostToolUse" | "PostToolUseFailure" => Event::ToolFinished { id: id() },
+        "PermissionDenied" if text("tool_use_id").is_some() => Event::ToolFinished { id: id() },
+        "PermissionDenied" => Event::Declined,
+        // Its question already arrived with its PreToolUse.
+        "PermissionRequest" if text("tool_name") == Some("AskUserQuestion") => return None,
+        "PermissionRequest" => {
+            let target = target(&input);
+            Event::Asked {
+                question: match &target {
+                    Some(target) => format!("{}: {target}", tool()),
+                    None => tool(),
+                },
+                about: About::Call {
+                    tool: tool(),
+                    target,
+                },
+            }
         }
-        "PermissionRequest" => Event::Asked(match target(&input) {
-            Some(target) => format!("{}: {target}", tool()),
-            None => tool(),
-        }),
-        "Notification" => Event::Asked(snippet(text("message").unwrap_or("has a question"))),
-        "Stop" => Event::Finished(text("last_assistant_message").map(snippet)),
+        "Notification" => Event::Asked {
+            question: snippet(text("message").unwrap_or("has a question")),
+            about: About::Unknown,
+        },
+        "SubagentStart" => Event::SubagentStarted {
+            kind: kind(text("agent_type")),
+        },
+        "SubagentStop" => Event::SubagentStopped,
+        "Stop" => Event::Finished {
+            summary: text("last_assistant_message").map(snippet),
+            running: background_subagents(payload),
+        },
         "StopFailure" => Event::Failed(text("error").unwrap_or("error").replace('_', " ")),
         "SessionEnd" => Event::Ended,
         _ => return None,
-    })
+    };
+    Some(Reported { origin, event })
+}
+
+/// The subagents a finished turn left running. Other background work
+/// (shells, monitors) doesn't hand anything back to the agent.
+fn background_subagents(payload: &serde_json::Value) -> Vec<Background> {
+    let tasks = payload
+        .get("background_tasks")
+        .and_then(serde_json::Value::as_array)
+        .map_or(&[][..], Vec::as_slice);
+    tasks
+        .iter()
+        .filter(|task| task.get("type").and_then(serde_json::Value::as_str) == Some("subagent"))
+        .filter(|task| {
+            matches!(
+                task.get("status").and_then(serde_json::Value::as_str),
+                None | Some("running" | "pending")
+            )
+        })
+        .filter_map(|task| {
+            let field = |key: &str| task.get(key).and_then(serde_json::Value::as_str);
+            Some(Background {
+                id: AgentId::new(field("id")?),
+                kind: field("agent_type").unwrap_or("subagent").to_string(),
+                description: field("description").map(snippet),
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -389,12 +475,13 @@ mod tests {
     #[test]
     fn hook_payloads_become_events() {
         let event = |json: &str| claude_event(&serde_json::from_str(json).unwrap());
+        let main = |e: Event| Some(Reported::main(e));
         assert_eq!(
             event(
                 r#"{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_use_id":"t1","tool_input":{"command":"cargo test\n--all"}}"#
             ),
-            Some(Event::ToolStarted {
-                id: "t1".into(),
+            main(Event::ToolStarted {
+                id: ToolId::new("t1"),
                 tool: "Bash".into(),
                 target: Some("cargo test".into())
             })
@@ -403,34 +490,91 @@ mod tests {
             event(
                 r#"{"hook_event_name":"PermissionRequest","tool_name":"Bash","tool_input":{"command":"rm -rf tmp"}}"#
             ),
-            Some(Event::Asked("Bash: rm -rf tmp".into()))
+            main(Event::Asked {
+                question: "Bash: rm -rf tmp".into(),
+                about: About::Call {
+                    tool: "Bash".into(),
+                    target: Some("rm -rf tmp".into())
+                }
+            })
         );
         assert_eq!(
             event(
-                r#"{"hook_event_name":"PreToolUse","tool_name":"AskUserQuestion","tool_input":{"questions":[{"question":"Which DB?"}]}}"#
+                r#"{"hook_event_name":"PreToolUse","tool_name":"AskUserQuestion","tool_use_id":"q1","tool_input":{"questions":[{"question":"Which DB?"}]}}"#
             ),
-            Some(Event::Asked("Which DB?".into()))
-        );
-        assert_eq!(
-            event(r#"{"hook_event_name":"PreToolUse","tool_name":"Read","agent_id":"sub-1"}"#),
-            Some(Event::Busy)
+            main(Event::Asked {
+                question: "Which DB?".into(),
+                about: About::Tool(ToolId::new("q1"))
+            })
         );
         assert_eq!(
             event(r#"{"hook_event_name":"SessionStart","source":"compact"}"#),
-            Some(Event::Busy)
+            main(Event::Compacted)
         );
         assert_eq!(
             event(r#"{"hook_event_name":"SessionStart","source":"resume"}"#),
-            Some(Event::Started)
+            main(Event::Started)
         );
         assert_eq!(
             event(r#"{"hook_event_name":"StopFailure","error":"rate_limit"}"#),
-            Some(Event::Failed("rate limit".into()))
+            main(Event::Failed("rate limit".into()))
         );
         assert_eq!(
-            event(r#"{"hook_event_name":"Stop","last_assistant_message":"Done. All green."}"#),
-            Some(Event::Finished(Some("Done. All green.".into())))
+            event(
+                r#"{"hook_event_name":"UserPromptSubmit","prompt":"<agent-message from=\"a1\">done</agent-message>"}"#
+            ),
+            main(Event::Prompted(Input::Notification))
         );
-        assert_eq!(event(r#"{"hook_event_name":"SubagentStop"}"#), None);
+    }
+
+    #[test]
+    fn subagent_payloads_say_which_subagent_they_came_from() {
+        let event = |json: &str| claude_event(&serde_json::from_str(json).unwrap());
+        let a1 = |e: Event| Some(Reported::subagent(AgentId::new("a1"), e));
+        assert_eq!(
+            event(
+                r#"{"hook_event_name":"PermissionRequest","tool_name":"Bash","agent_id":"a1","tool_input":{"command":"ls"}}"#
+            ),
+            a1(Event::Asked {
+                question: "Bash: ls".into(),
+                about: About::Call {
+                    tool: "Bash".into(),
+                    target: Some("ls".into())
+                }
+            })
+        );
+        assert_eq!(
+            event(r#"{"hook_event_name":"SubagentStart","agent_id":"a1","agent_type":"Explore"}"#),
+            a1(Event::SubagentStarted {
+                kind: "Explore".into()
+            })
+        );
+        assert_eq!(
+            event(r#"{"hook_event_name":"SubagentStop","agent_id":"a1"}"#),
+            a1(Event::SubagentStopped)
+        );
+        assert_eq!(
+            event(
+                r#"{"hook_event_name":"PostToolUse","tool_name":"Agent","agent_id":null,"tool_use_id":"t9","tool_input":{"subagent_type":"general-purpose","description":"review"},"tool_response":{"status":"async_launched","agentId":"a1","description":"Adversarial review"}}"#
+            ),
+            a1(Event::SubagentLaunched {
+                tool: ToolId::new("t9"),
+                kind: "general-purpose".into(),
+                description: "Adversarial review".into()
+            })
+        );
+        assert_eq!(
+            event(
+                r#"{"hook_event_name":"Stop","agent_id":null,"last_assistant_message":"Waiting.","background_tasks":[{"id":"a1","type":"subagent","status":"running","agent_type":"Explore","description":"look"},{"id":"s1","type":"shell","status":"running"},{"id":"a2","type":"subagent","status":"completed"}]}"#
+            ),
+            Some(Reported::main(Event::Finished {
+                summary: Some("Waiting.".into()),
+                running: vec![Background {
+                    id: AgentId::new("a1"),
+                    kind: "Explore".into(),
+                    description: Some("look".into())
+                }]
+            }))
+        );
     }
 }

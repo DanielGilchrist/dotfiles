@@ -14,8 +14,8 @@ use ratatui::widgets::{Block, BorderType, Clear, Padding, Paragraph};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::model::{
-    AgentStatus, Blocked, Confirm, Derived, Enter, Field, Focus, Fold, Launchable, Load, Model,
-    NameCheck, NameSource, NamingState, NewAgent, OfferEffect, Overlay, Pane, Phase, Place,
+    AgentStatus, Blocked, Confirm, Derived, Doing, Enter, Field, Focus, Fold, Launchable, Load,
+    Model, NameCheck, NameSource, NamingState, NewAgent, OfferEffect, Overlay, Pane, Phase, Place,
     Proposal, Pulse, Query, Reach, RepoInput, Row, StatusKind, Submission, View, Waiting,
     fuzzy_match, invalid_chars, repo_matches,
 };
@@ -482,6 +482,9 @@ fn entry_row<'a>(
         None => left.push(Span::styled(entry.label(), style)),
     }
     let mut markers: Vec<Span<'a>> = Vec::new();
+    if let Some(n) = m.subagents(entry) {
+        markers.push(Span::raw(format!("↳{n}")));
+    }
     if let Some(others) = m.pane.connection().and_then(|c| c.sharing(entry.name())) {
         markers.push(Span::styled(
             format!("⇄{others}"),
@@ -1533,9 +1536,27 @@ fn describe_status(status: &AgentStatus) -> (String, Option<String>) {
         AgentStatus::Exited => ("exited".to_string(), None),
         AgentStatus::Idle => ("idle".to_string(), None),
         AgentStatus::Working {
-            tool: Some(tool), ..
+            doing: Doing::Tool(tool),
+            ..
         } => (tool.name.clone(), tool.target.clone()),
-        AgentStatus::Working { tool: None, .. } => ("thinking".to_string(), None),
+        AgentStatus::Working {
+            doing: Doing::Thinking,
+            ..
+        } => ("thinking".to_string(), None),
+        AgentStatus::Working {
+            doing: Doing::HandingBack,
+            ..
+        } => ("handing back".to_string(), None),
+        AgentStatus::Working {
+            doing: Doing::Delegating(n),
+            ..
+        } => (
+            format!(
+                "waiting on {n} subagent{}",
+                if n.get() == 1 { "" } else { "s" }
+            ),
+            None,
+        ),
         AgentStatus::Asking { question, .. } => ("asking".to_string(), Some(question.clone())),
         AgentStatus::Failed { reason, .. } => (reason.clone(), None),
         AgentStatus::Done { summary, .. } => ("done".to_string(), summary.clone()),
@@ -1546,7 +1567,7 @@ fn describe_status(status: &AgentStatus) -> (String, Option<String>) {
 fn state_time(status: &AgentStatus, now: SystemTime) -> Option<Span<'static>> {
     match status {
         AgentStatus::Working {
-            tool: Some(tool),
+            doing: Doing::Tool(tool),
             pulse: Pulse::Steady,
             ..
         } => Some(Span::styled(ago(tool.since, now), dim())),

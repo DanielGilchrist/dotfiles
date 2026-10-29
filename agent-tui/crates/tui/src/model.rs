@@ -251,7 +251,7 @@ pub enum AgentStatus {
     /// harness without hooks.
     Idle,
     Working {
-        tool: Option<Tool>,
+        doing: Doing,
         since: SystemTime,
         pulse: Pulse,
     },
@@ -268,6 +268,17 @@ pub enum AgentStatus {
         summary: Option<String>,
         since: SystemTime,
     },
+}
+
+/// What a working agent is busy with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Doing {
+    Thinking,
+    Tool(Tool),
+    /// Its turn ended and it waits on this many background subagents.
+    Delegating(NonZeroUsize),
+    /// Its subagents finished and it's about to take their results.
+    HandingBack,
 }
 
 /// Why an agent needs the user.
@@ -719,24 +730,32 @@ impl Model {
             return AgentStatus::Idle;
         };
         let since = activity.since;
+        if let Some(ask) = activity.waiting() {
+            return AgentStatus::Asking {
+                question: ask.question.clone(),
+                since: ask.since,
+            };
+        }
         match &activity.state {
             ActivityState::Idle | ActivityState::Exited => AgentStatus::Idle,
-            ActivityState::Working { .. } => {
+            ActivityState::Working { .. } | ActivityState::Delegating => {
                 let pulse = if activity.stale(self.now) {
                     Pulse::Stale
                 } else {
                     Pulse::Steady
                 };
+                let doing = match (&activity.state, activity.current_tool()) {
+                    (ActivityState::Delegating, _) => NonZeroUsize::new(activity.subagents.len())
+                        .map_or(Doing::HandingBack, Doing::Delegating),
+                    (_, Some(tool)) => Doing::Tool(tool.clone()),
+                    (_, None) => Doing::Thinking,
+                };
                 AgentStatus::Working {
-                    tool: activity.current_tool().cloned(),
+                    doing,
                     since,
                     pulse,
                 }
             }
-            ActivityState::Asking { question } => AgentStatus::Asking {
-                question: question.clone(),
-                since,
-            },
             ActivityState::Failed { reason } => AgentStatus::Failed {
                 reason: reason.clone(),
                 since,
@@ -746,6 +765,14 @@ impl Model {
                 since,
             },
         }
+    }
+
+    /// How many subagents a live agent has running, if any.
+    pub fn subagents(&self, entry: &Entry) -> Option<NonZeroUsize> {
+        let EntryState::Live = entry.state() else {
+            return None;
+        };
+        NonZeroUsize::new(self.activity(entry.name())?.subagents.len())
     }
 
     /// Agents that need the user, in the order `a` visits them: blocked ones

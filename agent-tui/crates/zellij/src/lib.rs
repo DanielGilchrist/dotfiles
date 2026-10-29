@@ -174,6 +174,22 @@ fn pane_cwd(name: &SessionName) -> Result<Option<PathBuf>, HostError> {
         .map(PathBuf::from))
 }
 
+/// The pane the harness runs in: the session's first terminal pane, since
+/// the user may have split others off it.
+fn harness_pane(panes: &[serde_json::Value]) -> Result<String, HostError> {
+    terminal_panes(panes)
+        .filter_map(|p| p["id"].as_u64())
+        .min()
+        .map(|id| format!("terminal_{id}"))
+        .ok_or_else(|| {
+            CommandError::Parse {
+                command: "zellij action list-panes".into(),
+                detail: "no terminal panes".into(),
+            }
+            .into()
+        })
+}
+
 /// A KDL v1 string literal.
 fn kdl_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
@@ -327,10 +343,12 @@ impl SessionHost for Zellij {
         }
     }
 
+    /// Writes to the harness's pane, whichever pane has focus.
     fn write(&self, name: &SessionName, bytes: &[u8]) -> Result<(), HostError> {
+        let pane = harness_pane(&panes(name)?)?;
         for chunk in bytes.chunks(WRITE_CHUNK) {
             let mut cmd = session_cmd(name);
-            cmd.args(["action", "write"])
+            cmd.args(["action", "write", "--pane-id", &pane])
                 .args(chunk.iter().map(u8::to_string));
             process::run(&mut cmd)?;
         }
@@ -338,22 +356,9 @@ impl SessionHost for Zellij {
     }
 
     fn screen(&self, name: &SessionName) -> Result<String, HostError> {
-        let panes = panes(name)?;
-        let terminals: Vec<_> = terminal_panes(&panes).collect();
-        let pane = terminals
-            .iter()
-            .find(|p| p["is_focused"] == true)
-            .or(terminals.first());
-        let Some(id) = pane.and_then(|p| p["id"].as_u64()) else {
-            return Err(CommandError::Parse {
-                command: "zellij action list-panes".into(),
-                detail: "no terminal panes".into(),
-            }
-            .into());
-        };
+        let pane = harness_pane(&panes(name)?)?;
         let mut cmd = session_cmd(name);
-        cmd.args(["action", "dump-screen", "--ansi", "--pane-id"])
-            .arg(format!("terminal_{id}"));
+        cmd.args(["action", "dump-screen", "--ansi", "--pane-id", &pane]);
         Ok(process::run(&mut cmd)?)
     }
 
@@ -454,6 +459,15 @@ mod tests {
         let ours = "layout {\n    tab name=\"Tab #1\" {\n        pane command=\"claude\" cwd=\"/w/api/fix\" {\n";
         assert_eq!(layout_cwd(ours), Some("/w/api/fix".into()));
         assert_eq!(layout_cwd("layout {\n    tab {\n        pane\n"), None);
+    }
+
+    #[test]
+    fn writes_go_to_the_first_terminal_pane_not_the_focused_one() {
+        let panes: Vec<serde_json::Value> = serde_json::from_str(
+            r#"[{"id":0,"is_plugin":true},{"id":4,"is_plugin":false,"is_focused":true},{"id":2,"is_plugin":false}]"#,
+        )
+        .unwrap();
+        assert_eq!(harness_pane(&panes).unwrap(), "terminal_2");
     }
 
     #[test]

@@ -56,7 +56,7 @@ passed with `--settings` (your own settings stay untouched), recorded by
 - `◆` asking you (a permission prompt or a question)
 - `!` failed (rate limited, overloaded)
 - `✓` finished a turn you haven't looked at
-- spinner: working (it stops, dimmed with `?`, after 5 minutes of silence with no tool running)
+- spinner: working, including a finished turn still waiting on background subagents (`↳n` counts them). It stops, dimmed with `?`, after 5 minutes of silence with no tool running
 - `●` idle, `○` exited, `·` no session
 
 Overview opens with a **Needs you** group, the status bar and terminal

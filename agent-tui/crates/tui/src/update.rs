@@ -400,19 +400,22 @@ fn newly_waiting(m: &Model, next: &HashMap<SessionName, Activity>) -> bool {
     next.iter()
         .filter(|(name, _)| Some(*name) != typing_into && Some(*name) != m.own_session.as_ref())
         .any(|(name, activity)| {
-            match (
-                &activity.state,
-                previous.get(name).map(|b| (&b.state, b.since)),
-            ) {
-                (ActivityState::Asking { .. }, Some((ActivityState::Asking { .. }, _)))
-                | (ActivityState::Failed { .. }, Some((ActivityState::Failed { .. }, _)))
-                | (ActivityState::Done { .. }, Some((ActivityState::Done { .. }, _))) => false,
-                (ActivityState::Asking { .. } | ActivityState::Failed { .. }, _) => true,
-                (ActivityState::Done { .. }, Some((ActivityState::Working { .. }, started))) => {
-                    activity.since.duration_since(started).unwrap_or_default() >= LONG_TURN
+            let before = previous.get(name);
+            let asks_anew = activity
+                .asks
+                .iter()
+                .any(|ask| before.is_none_or(|b| !b.asks.contains(ask)));
+            asks_anew
+                || match (&activity.state, before.map(|b| (&b.state, b.since))) {
+                    (ActivityState::Failed { .. }, Some((ActivityState::Failed { .. }, _)))
+                    | (ActivityState::Done { .. }, Some((ActivityState::Done { .. }, _))) => false,
+                    (ActivityState::Failed { .. }, _) => true,
+                    (
+                        ActivityState::Done { .. },
+                        Some((ActivityState::Working { .. } | ActivityState::Delegating, started)),
+                    ) => activity.since.duration_since(started).unwrap_or_default() >= LONG_TURN,
+                    _ => false,
                 }
-                _ => false,
-            }
         })
 }
 
@@ -1699,7 +1702,23 @@ mod tests {
             prompt: Some("go".into()),
             heard: since,
             events: 1,
+            asks: Vec::new(),
+            subagents: std::collections::BTreeMap::new(),
         }
+    }
+
+    fn asking(question: &str, secs_ago: u64) -> Activity {
+        let mut activity = reported(
+            agent_core::activity::State::Working { tools: Vec::new() },
+            secs_ago,
+        );
+        activity.asks.push(agent_core::activity::Ask {
+            asker: agent_core::activity::Origin::Main,
+            question: question.into(),
+            answered_by: agent_core::activity::Answer::AnyTool,
+            since: activity.since,
+        });
+        activity
     }
 
     fn two_live() -> Model {
@@ -1737,15 +1756,9 @@ mod tests {
         m.activities
             .get_or_insert_default()
             .insert(name("web"), reported(State::Done { summary: None }, 600));
-        m.activities.get_or_insert_default().insert(
-            name("fix"),
-            reported(
-                State::Asking {
-                    question: "rm?".into(),
-                },
-                5,
-            ),
-        );
+        m.activities
+            .get_or_insert_default()
+            .insert(name("fix"), asking("rm?", 5));
         assert_eq!(
             m.needs_you(),
             [name("fix"), name("web")],

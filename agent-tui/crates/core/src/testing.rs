@@ -6,7 +6,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
 
-use crate::activity::{Activity, Event};
+use crate::activity::{Activity, Reported};
 use crate::model::{Head, Running, Worktree};
 use crate::names::{BranchName, Prompt, SessionName};
 use crate::paths::{AgentWorktree, RepoRoot};
@@ -277,7 +277,7 @@ impl Store for MemStore {
         Ok(())
     }
 
-    fn report(&self, name: &SessionName, event: Event) -> Result<(), StoreError> {
+    fn report(&self, name: &SessionName, event: Reported) -> Result<(), StoreError> {
         let mut activities = self.activities.lock().unwrap();
         let next = Activity::next(activities.remove(name), event, SystemTime::now());
         activities.insert(name.clone(), next);
