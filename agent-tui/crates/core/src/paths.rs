@@ -127,6 +127,12 @@ impl AgentWorktree {
     pub fn name(&self) -> &AgentName {
         &self.name
     }
+
+    /// Whether a checkout is there: a worktree's `.git` file. A directory
+    /// left behind by a removal isn't an agent.
+    pub fn checked_out(&self) -> bool {
+        self.path.join(".git").exists()
+    }
 }
 
 /// Where agent worktrees live on disk.
@@ -174,7 +180,13 @@ impl Layout {
         self.enclosing(path).filter(|wt| wt.path == path)
     }
 
-    /// The agent worktree containing `path` (or equal to it).
+    /// The agent worktree containing `path` whose checkout is still there.
+    pub fn enclosing_checkout(&self, path: &Path) -> Option<AgentWorktree> {
+        self.enclosing(path).filter(AgentWorktree::checked_out)
+    }
+
+    /// The agent worktree containing `path` (or equal to it), by its path
+    /// alone.
     pub fn enclosing(&self, path: &Path) -> Option<AgentWorktree> {
         let mut components = path.strip_prefix(&self.root).ok()?.components();
         let (Some(Component::Normal(repo)), Some(Component::Normal(name))) =

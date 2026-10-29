@@ -588,7 +588,7 @@ pub fn attach_here(
     worktree: &AgentWorktree,
     harness: &dyn Harness,
 ) -> Result<Launch> {
-    if !worktree.path().join(".git").exists() {
+    if !worktree.checked_out() {
         return Err(Error::WorktreeGone {
             name: worktree.name().session(),
             path: worktree.path().to_path_buf(),

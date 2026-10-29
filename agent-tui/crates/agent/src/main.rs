@@ -38,7 +38,7 @@ enum Cmd {
     /// Open the TUI (the default)
     Tui,
     /// Attach to the session for the repo's main checkout, starting it if needed.
-    /// Inside an agent worktree, attaches that agent instead
+    /// Inside an agent worktree, attaches that agent instead, whatever --repo says
     Repo {
         /// The repo (defaults to the one containing the cwd)
         #[arg(long)]
@@ -193,16 +193,23 @@ fn cwd() -> Result<PathBuf> {
 }
 
 /// The repo session for `repo` or the cwd's repo. Inside an agent
-/// worktree with no `--repo`, that agent is the one meant.
+/// worktree that agent is the one meant, whatever `--repo` says: callers
+/// like the nvim plugin pass the main checkout with every command. A
+/// stale directory under the worktrees root isn't an agent, so it falls
+/// through.
 fn repo_session(
     svc: Services<'_>,
     repo: Option<PathBuf>,
     frontend: Frontend,
     harness: &dyn Harness,
 ) -> Result<()> {
-    if repo.is_none()
-        && let Some(worktree) = svc.layout.enclosing(&cwd()?)
-    {
+    if let Some(worktree) = svc.layout.enclosing_checkout(&cwd()?) {
+        if repo.is_some() {
+            eprintln!(
+                "agent repo: inside {}'s worktree, so --repo is ignored",
+                worktree.name()
+            );
+        }
         return finish(svc, &ops::attach_here(svc, &worktree, harness)?, frontend);
     }
     let repo = repo_arg(svc, repo)?.ok_or(ops::Error::NoRepo)?;
