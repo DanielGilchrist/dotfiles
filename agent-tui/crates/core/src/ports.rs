@@ -68,6 +68,40 @@ impl WorktreeFacts {
             removed: counted().map(|(_, removed)| removed).sum(),
         }
     }
+
+    /// How close the work is to shipping. Uncommitted files come first,
+    /// since nothing else is final until they're committed.
+    pub fn readiness(&self) -> Readiness {
+        match (
+            NonZeroUsize::new(self.dirty),
+            NonZeroUsize::new(self.ahead),
+            NonZeroUsize::new(self.behind),
+        ) {
+            (Some(dirty), ..) => Readiness::Dirty {
+                dirty,
+                ahead: self.ahead,
+            },
+            (None, None, _) => Readiness::NothingAhead,
+            (None, Some(ahead), Some(behind)) => Readiness::Behind { behind, ahead },
+            (None, Some(ahead), None) => Readiness::Ready { ahead },
+        }
+    }
+}
+
+/// Whether a worktree's work could be shipped as it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Readiness {
+    /// Files not committed yet, on top of `ahead` commits.
+    Dirty { dirty: NonZeroUsize, ahead: usize },
+    /// Committed, but the default branch has moved on since the fork.
+    Behind {
+        behind: NonZeroUsize,
+        ahead: NonZeroUsize,
+    },
+    /// Committed and up to date with the default branch.
+    Ready { ahead: NonZeroUsize },
+    /// Clean, with no commits of its own.
+    NothingAhead,
 }
 
 /// Lines changed across a worktree's files.
@@ -460,4 +494,46 @@ pub trait Store: Send + Sync {
     /// The agent last selected in the TUI, to start on next time.
     fn last_selected(&self) -> Result<Option<SessionName>, StoreError>;
     fn set_last_selected(&self, name: &SessionName) -> Result<(), StoreError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn facts(dirty: usize, ahead: usize, behind: usize) -> WorktreeFacts {
+        WorktreeFacts {
+            ahead,
+            behind,
+            changed: Vec::new(),
+            dirty,
+        }
+    }
+
+    fn n(n: usize) -> NonZeroUsize {
+        NonZeroUsize::new(n).unwrap()
+    }
+
+    #[test]
+    fn uncommitted_work_outranks_how_far_ahead_or_behind_it_is() {
+        assert_eq!(
+            facts(2, 3, 4).readiness(),
+            Readiness::Dirty {
+                dirty: n(2),
+                ahead: 3
+            }
+        );
+        assert_eq!(
+            facts(0, 3, 4).readiness(),
+            Readiness::Behind {
+                behind: n(4),
+                ahead: n(3)
+            }
+        );
+        assert_eq!(facts(0, 3, 0).readiness(), Readiness::Ready { ahead: n(3) });
+        assert_eq!(
+            facts(0, 0, 4).readiness(),
+            Readiness::NothingAhead,
+            "behind with nothing to ship is nothing to ship"
+        );
+    }
 }

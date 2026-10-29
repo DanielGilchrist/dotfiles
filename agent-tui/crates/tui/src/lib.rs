@@ -3,6 +3,9 @@ mod update;
 mod view;
 mod worker;
 
+#[cfg(test)]
+mod fixtures;
+
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

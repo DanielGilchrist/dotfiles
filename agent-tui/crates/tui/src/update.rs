@@ -1068,24 +1068,13 @@ fn on_mouse(m: &mut Model, mouse: MouseEvent) -> Vec<Effect> {
 #[cfg(test)]
 mod tests {
     use agent_core::discover::{Observation, assemble};
-    use agent_core::model::{Head, Worktree};
     use agent_core::paths::{Layout, RepoRoot};
     use agent_core::ports::{RepoWorktrees, SessionInfo, SessionStatus};
     use crossterm::event::KeyEvent;
 
     use super::*;
+    use crate::fixtures::{asking, name, reported, wt};
     use crate::model::{Launchable, NameCheck, Row};
-
-    fn name(s: &str) -> SessionName {
-        s.parse().unwrap()
-    }
-
-    fn wt(path: &str) -> Worktree {
-        Worktree {
-            path: path.into(),
-            head: Head::Detached,
-        }
-    }
 
     fn snapshot(sessions: Vec<SessionInfo>, pins: &[&str]) -> agent_core::model::Snapshot {
         let obs = Observation {
@@ -1717,33 +1706,6 @@ mod tests {
         assert_eq!(selected(&m).as_deref(), Some("fix"));
     }
 
-    fn reported(state: agent_core::activity::State, secs_ago: u64) -> Activity {
-        let since = SystemTime::now() - Duration::from_secs(secs_ago);
-        Activity {
-            state,
-            since,
-            prompt: Some("go".into()),
-            heard: since,
-            events: 1,
-            asks: Vec::new(),
-            subagents: std::collections::BTreeMap::new(),
-        }
-    }
-
-    fn asking(question: &str, secs_ago: u64) -> Activity {
-        let mut activity = reported(
-            agent_core::activity::State::Working { tools: Vec::new() },
-            secs_ago,
-        );
-        activity.asks.push(agent_core::activity::Ask {
-            asker: agent_core::activity::Origin::Main,
-            question: question.into(),
-            answered_by: agent_core::activity::Answer::AnyTool,
-            since: activity.since,
-        });
-        activity
-    }
-
     fn two_live() -> Model {
         let sessions = vec![
             SessionInfo {
@@ -1834,6 +1796,53 @@ mod tests {
             rows[1],
             Row::Grouped(crate::model::Group::NeedsYou, name("fix"))
         );
+        update(&mut m, key(KeyCode::Char('j')));
+        update(&mut m, key(KeyCode::Char('j')));
+        update(&mut m, key(KeyCode::Char('j')));
+        assert!(
+            !m.rows()
+                .iter()
+                .any(|r| matches!(r, Row::Entry { name, .. } if name.as_str() == "fix")),
+            "listed under Needs you, not again under its repo: {:?}",
+            m.rows()
+        );
+    }
+
+    #[test]
+    fn the_selection_follows_an_agent_into_and_out_of_needs_you() {
+        use agent_core::activity::State;
+        let mut m = two_live();
+        update(&mut m, key(KeyCode::Tab));
+        m.set_cursor(Cursor::Entry(name("fix")));
+        update(
+            &mut m,
+            Msg::Activities(HashMap::from([(name("fix"), asking("rm?", 5))])),
+        );
+        assert_eq!(
+            m.cursor(),
+            Some(&Cursor::Grouped(crate::model::Group::NeedsYou, name("fix")))
+        );
+        update(
+            &mut m,
+            Msg::Activities(HashMap::from([(name("fix"), reported(State::Idle, 0))])),
+        );
+        assert_eq!(m.cursor(), Some(&Cursor::Entry(name("fix"))));
+    }
+
+    #[test]
+    fn a_pinned_selection_follows_its_agent_into_needs_you() {
+        let mut m = model(&["fix"]);
+        update(&mut m, key(KeyCode::Tab));
+        m.set_cursor(Cursor::Grouped(crate::model::Group::Pinned, name("fix")));
+        update(
+            &mut m,
+            Msg::Activities(HashMap::from([(name("fix"), asking("rm?", 5))])),
+        );
+        assert_eq!(
+            m.cursor(),
+            Some(&Cursor::Grouped(crate::model::Group::NeedsYou, name("fix")))
+        );
+        assert!(m.items().contains(m.cursor().unwrap()));
     }
 
     #[test]

@@ -14,25 +14,25 @@ use ratatui::widgets::{Block, BorderType, Clear, Padding, Paragraph};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::model::{
-    AgentStatus, Blocked, Confirm, Derived, Doing, Enter, Field, Focus, Fold, Launchable, Load,
-    Model, NameCheck, NameSource, NamingState, NewAgent, OfferEffect, Overlay, Pane, Phase, Place,
-    Proposal, Pulse, Query, Reach, RepoInput, Row, StatusKind, Submission, View, Waiting,
-    fuzzy_match, invalid_chars, repo_matches,
+    AgentStatus, Blocked, Confirm, Derived, Enter, Field, Focus, Launchable, Load, Model,
+    NameCheck, NameSource, NamingState, NewAgent, OfferEffect, Overlay, Pane, Phase, Proposal,
+    Pulse, Query, Reach, RepoInput, StatusKind, Submission, View, Waiting, fuzzy_match,
+    invalid_chars, repo_matches,
 };
 use crate::update::{picker_matches, switcher_matches};
 
-const SIDEBAR_MAX: u16 = 30;
-const SIDEBAR_MIN: u16 = 16;
+mod sidebar;
+
+const SIDEBAR_MAX: u16 = 48;
+const SIDEBAR_MIN: u16 = 28;
+/// The sidebar's share of the width, in percent, between the bounds above.
+const SIDEBAR_SHARE: u32 = 24;
 const ACCENT: Color = Color::Cyan;
 
 const TASK_ROWS: usize = 6;
 const SPINNER: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
 /// Below this width the agent needs every column; Space still switches agents.
 const NARROW: u16 = 60;
-/// Below this many rows the peek gives its space back to the list.
-const PEEK_MIN_BODY: u16 = 15;
-/// The list keeps at least this many rows when the peek shows.
-const LIST_MIN_ROWS: u16 = 5;
 /// A name keeps at least this many columns before row details give way.
 const NAME_MIN: usize = 8;
 /// The NAV and switcher sections of the help; the AGENT section names the
@@ -221,30 +221,6 @@ fn ago(since: SystemTime, now: SystemTime) -> String {
     }
 }
 
-/// How long it's been in its state, for states where that matters. A
-/// working agent that's gone quiet gets a `?`.
-fn time_in_state(status: &AgentStatus, now: SystemTime) -> Option<Span<'static>> {
-    match status {
-        AgentStatus::Working {
-            since,
-            pulse: Pulse::Stale,
-            ..
-        } => Some(Span::styled(format!("{}?", ago(*since, now)), dim())),
-        AgentStatus::Asking { since, .. } => Some(Span::styled(
-            ago(*since, now),
-            Style::new().fg(Color::Yellow),
-        )),
-        AgentStatus::Working {
-            since,
-            pulse: Pulse::Steady,
-            ..
-        }
-        | AgentStatus::Failed { since, .. }
-        | AgentStatus::Done { since, .. } => Some(Span::styled(ago(*since, now), dim())),
-        AgentStatus::NoSession | AgentStatus::Exited | AgentStatus::Idle => None,
-    }
-}
-
 fn hint<'a>(key: &'a str, desc: &'a str) -> [Span<'a>; 3] {
     [
         Span::raw(key),
@@ -302,19 +278,24 @@ pub fn draw(frame: &mut Frame<'_>, m: &mut Model) {
     let sidebar_width = if body.width < NARROW {
         0
     } else {
-        SIDEBAR_MAX.min(body.width / 4).max(SIDEBAR_MIN) + borders
+        let share = u32::from(body.width) * SIDEBAR_SHARE / 100;
+        u16::try_from(share)
+            .unwrap_or(u16::MAX)
+            .clamp(SIDEBAR_MIN, SIDEBAR_MAX)
+            + borders
     };
     let [left, right] =
         Layout::horizontal([Constraint::Length(sidebar_width), Constraint::Min(0)]).areas(body);
     let (sidebar_style, pane_style) = focus_styles(m);
 
+    // Overview's folds depend on the sidebar's height, so it's measured
+    // before anything asks for the rows.
+    m.areas.sidebar = if sidebar_width > 0 {
+        Block::bordered().inner(left)
+    } else {
+        Rect::default()
+    };
     if sidebar_width > 0 {
-        let peek = peek(m, usize::from(left.width).saturating_sub(4));
-        let height = peek
-            .as_ref()
-            .map_or(0, |p| peek_height(body.height, p.lines.len()));
-        let [list_area, peek_area] =
-            Layout::vertical([Constraint::Min(0), Constraint::Length(height)]).areas(left);
         let title = fit(sidebar_title(m), usize::from(left.width).saturating_sub(4));
         let sidebar = panel(
             title,
@@ -322,12 +303,9 @@ pub fn draw(frame: &mut Frame<'_>, m: &mut Model) {
             sidebar_style,
             sidebar_focused(m),
         );
-        let list = sidebar.inner(list_area);
-        frame.render_widget(sidebar, list_area);
-        draw_sidebar(frame, m, list);
-        if let Some(peek) = peek.filter(|_| height > 0) {
-            draw_peek(frame, peek, peek_area);
-        }
+        frame.render_widget(sidebar, left);
+        let area = m.areas.sidebar;
+        sidebar::draw(frame, m, area);
     }
 
     let (title, path) = pane_title(m, usize::from(right.width));
@@ -404,23 +382,7 @@ fn sidebar_title(m: &Model) -> Vec<Span<'static>> {
     match (m.snapshot(), m.view, m.selected()) {
         (None, _, _) => vec![Span::styled("Loading…", dim())],
         (Some(_), View::Focus, Some((repo, _))) => {
-            let elsewhere = m
-                .needs_you()
-                .iter()
-                .filter(|name| {
-                    m.snapshot()
-                        .and_then(|s| s.entry(name))
-                        .is_some_and(|(r, _)| r.key() != repo.key())
-                })
-                .count();
-            let mut title = vec![Span::styled(repo.name().into_owned(), bold())];
-            if elsewhere > 0 {
-                title.push(Span::styled(
-                    format!(" ◆ {elsewhere}"),
-                    Style::new().fg(Color::Yellow),
-                ));
-            }
-            title
+            vec![Span::styled(repo.name().into_owned(), bold())]
         }
         (Some(_), View::Focus, None) => vec![Span::styled("Agents", bold())],
         (Some(_), View::Overview, _) => vec![Span::styled("All repos", bold())],
@@ -437,198 +399,6 @@ fn sidebar_count(m: &Model, border: Style) -> Vec<Span<'static>> {
         )],
         None => Vec::new(),
     }
-}
-
-/// A collapsed repo's live and exited agents, leaving out those already
-/// listed under Needs you.
-fn settled_counts(m: &Model, repo: &agent_core::model::Repo) -> (usize, usize) {
-    repo.entries()
-        .iter()
-        .fold((0, 0), |(live, exited), entry| match m.status(entry) {
-            AgentStatus::Idle | AgentStatus::Working { .. } => (live + 1, exited),
-            AgentStatus::Exited => (live, exited + 1),
-            AgentStatus::NoSession
-            | AgentStatus::Asking { .. }
-            | AgentStatus::Failed { .. }
-            | AgentStatus::Done { .. } => (live, exited),
-        })
-}
-
-/// Glyph and label on the left. On the right: the repo for a group row,
-/// the time in state, then shared and pin markers. When the name would get
-/// fewer than [`NAME_MIN`] columns, the repo goes first, then a finished
-/// agent's time. Markers and the time of an agent waiting on you stay.
-/// `repo_label` names a collapsed single-entry repo.
-fn entry_row<'a>(
-    m: &Model,
-    entry: &'a Entry,
-    indent: &'static str,
-    repo_label: Option<String>,
-    group_repo: Option<String>,
-    selected: bool,
-    width: usize,
-) -> (Vec<Span<'a>>, Vec<Span<'a>>) {
-    let status = m.status(entry);
-    let style = name_style(&status, selected);
-    let mut left = vec![Span::raw(indent), glyph(&status), Span::raw(" ")];
-    let fixed = line_width(&left);
-    match repo_label {
-        Some(repo) => {
-            left.push(Span::styled(repo, style));
-            if let Some(Head::Branch(branch)) = entry.head() {
-                left.push(Span::styled(format!(" {branch}"), dim()));
-            }
-        }
-        None => left.push(Span::styled(entry.label(), style)),
-    }
-    let mut markers: Vec<Span<'a>> = Vec::new();
-    if let Some(n) = m.subagents(entry) {
-        markers.push(Span::raw(format!("↳{n}")));
-    }
-    if let Some(others) = m.pane.connection().and_then(|c| c.sharing(entry.name())) {
-        markers.push(Span::styled(
-            format!("⇄{others}"),
-            Style::new().fg(Color::Yellow),
-        ));
-    }
-    if let Some(pin) = entry.pin() {
-        markers.push(Span::styled(
-            pin.slot()
-                .map_or_else(|| "*".to_string(), |s| s.get().to_string()),
-            dim(),
-        ));
-    }
-    let mut repo = group_repo.map(|r| Span::styled(r, dim()));
-    let mut time = time_in_state(&status, m.now);
-    let joined = |repo: &Option<Span<'a>>, time: &Option<Span<'static>>| -> Vec<Span<'a>> {
-        let cells: Vec<Span<'a>> = repo
-            .iter()
-            .cloned()
-            .chain(time.iter().cloned())
-            .chain(markers.iter().cloned())
-            .collect();
-        let mut right = Vec::new();
-        for cell in cells {
-            if !right.is_empty() {
-                right.push(Span::raw(" "));
-            }
-            right.push(cell);
-        }
-        right
-    };
-    let squeezed =
-        |right: &[Span<'a>]| width.saturating_sub(fixed + line_width(right) + 1) < NAME_MIN;
-    if squeezed(&joined(&repo, &time)) {
-        repo = None;
-    }
-    if squeezed(&joined(&repo, &time)) && matches!(status, AgentStatus::Done { .. }) {
-        time = None;
-    }
-    (left, joined(&repo, &time))
-}
-
-fn draw_sidebar(frame: &mut Frame<'_>, m: &mut Model, area: Rect) {
-    let Some(snapshot) = m.snapshot() else { return };
-    let content_width = usize::from(area.width).saturating_sub(2);
-    let focused = sidebar_focused(m);
-    let rows = m.rows();
-    let cursor = m.cursor();
-    let selected_index =
-        cursor.and_then(|c| rows.iter().position(|r| r.cursor().as_ref() == Some(c)));
-    let height = usize::from(area.height);
-    let offset = scroll(
-        m.sidebar_offset,
-        selected_index.unwrap_or(0),
-        height,
-        rows.len(),
-    );
-
-    let mut lines = Vec::new();
-    let mut hits = Vec::new();
-    for (i, row) in rows.iter().enumerate().skip(offset).take(height) {
-        let y = area.y + u16::try_from(i - offset).unwrap_or(0);
-        let selected = selected_index == Some(i);
-        let gutter = match (selected, focused) {
-            (true, true) => Span::styled("▌", Style::new().fg(ACCENT)),
-            (true, false) => Span::styled("▌", dim()),
-            (false, _) => Span::raw(" "),
-        };
-        hits.extend(row.cursor().map(|c| (y, c)));
-        let (left, right) = match row {
-            Row::Header(group) => (
-                vec![
-                    Span::styled("▾ ", dim()),
-                    Span::styled(group.title(), dim()),
-                ],
-                Vec::new(),
-            ),
-            Row::Repo { key, fold } => {
-                let Some(repo) = snapshot.repo(key) else {
-                    continue;
-                };
-                let (live, exited) = match fold {
-                    Fold::Closed => settled_counts(m, repo),
-                    Fold::Open => (0, 0),
-                };
-                let mut right = Vec::new();
-                for (n, g, style) in [(live, "●", Style::new()), (exited, "○", dim())] {
-                    if n > 0 {
-                        if !right.is_empty() {
-                            right.push(Span::raw("  "));
-                        }
-                        right.push(Span::styled(format!("{g} {n}"), style));
-                    }
-                }
-                let name = Span::styled(
-                    repo.name().into_owned(),
-                    if selected { bold() } else { Style::new() },
-                );
-                let arrow = match fold {
-                    Fold::Open => "▾ ",
-                    Fold::Closed => "▸ ",
-                };
-                (vec![Span::styled(arrow, dim()), name], right)
-            }
-            Row::Grouped(_, name) => {
-                let Some((repo, entry)) = snapshot.entry(name) else {
-                    continue;
-                };
-                entry_row(
-                    m,
-                    entry,
-                    "  ",
-                    None,
-                    Some(repo.name().into_owned()),
-                    selected,
-                    content_width,
-                )
-            }
-            Row::Entry { name, place } => {
-                let Some((repo, entry)) = snapshot.entry(name) else {
-                    continue;
-                };
-                match place {
-                    Place::Solo => entry_row(
-                        m,
-                        entry,
-                        "",
-                        Some(repo.name().into_owned()),
-                        None,
-                        selected,
-                        content_width,
-                    ),
-                    Place::Nested => entry_row(m, entry, "  ", None, None, selected, content_width),
-                    Place::Alone => entry_row(m, entry, "", None, None, selected, content_width),
-                }
-            }
-        };
-        let mut line = justify(left, right, content_width);
-        line.spans.insert(0, gutter);
-        lines.push(line);
-    }
-    frame.render_widget(Paragraph::new(lines), area);
-    m.sidebar_offset = offset;
-    m.areas.rows = hits;
 }
 
 /// The pane's title (the selected agent) and its corner (the path, or a
@@ -1069,6 +839,9 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
             for c in word.chars() {
                 if row.width() + c.width().unwrap_or(0) > width {
                     rows.push(std::mem::take(&mut row));
+                    if c == ' ' {
+                        continue;
+                    }
                 }
                 row.push(c);
             }
@@ -1507,172 +1280,6 @@ fn draw_planning(frame: &mut Frame<'_>, name: &SessionName) {
     frame.render_widget(Paragraph::new(line).block(block), area);
 }
 
-/// The bottom of the sidebar: what the pane can't show about an agent.
-struct Peek {
-    title: Vec<Span<'static>>,
-    /// In display order, each with its priority: lower survives longer.
-    lines: Vec<(u8, Line<'static>)>,
-}
-
-/// Rows for the peek, or none when it doesn't fit: at most a third of the
-/// sidebar and 8 lines, never leaving the list fewer than 5 rows.
-fn peek_height(body: u16, lines: usize) -> u16 {
-    let lines = u16::try_from(lines).unwrap_or(u16::MAX);
-    if body < PEEK_MIN_BODY || lines == 0 {
-        return 0;
-    }
-    let inner = (body / 3).saturating_sub(2).clamp(3, 8).min(lines);
-    let room = body.saturating_sub(2 + LIST_MIN_ROWS + 2);
-    match inner.min(room) {
-        0 => 0,
-        inner => inner + 2,
-    }
-}
-
-/// What a state line says, and the detail under it.
-fn describe_status(status: &AgentStatus) -> (String, Option<String>) {
-    match status {
-        AgentStatus::NoSession => ("no session".to_string(), None),
-        AgentStatus::Exited => ("exited".to_string(), None),
-        AgentStatus::Idle => ("idle".to_string(), None),
-        AgentStatus::Working {
-            doing: Doing::Tool(tool),
-            ..
-        } => (tool.name.clone(), tool.target.clone()),
-        AgentStatus::Working {
-            doing: Doing::Thinking,
-            ..
-        } => ("thinking".to_string(), None),
-        AgentStatus::Working {
-            doing: Doing::HandingBack,
-            ..
-        } => ("handing back".to_string(), None),
-        AgentStatus::Working {
-            doing: Doing::Delegating(n),
-            ..
-        } => (
-            format!(
-                "waiting on {n} subagent{}",
-                if n.get() == 1 { "" } else { "s" }
-            ),
-            None,
-        ),
-        AgentStatus::Asking { question, .. } => ("asking".to_string(), Some(question.clone())),
-        AgentStatus::Failed { reason, .. } => (reason.clone(), None),
-        AgentStatus::Done { summary, .. } => ("done".to_string(), summary.clone()),
-    }
-}
-
-/// How long the current tool has run, else how long it's been in its state.
-fn state_time(status: &AgentStatus, now: SystemTime) -> Option<Span<'static>> {
-    match status {
-        AgentStatus::Working {
-            doing: Doing::Tool(tool),
-            pulse: Pulse::Steady,
-            ..
-        } => Some(Span::styled(ago(tool.since, now), dim())),
-        _ => time_in_state(status, now),
-    }
-}
-
-fn peek(m: &Model, width: usize) -> Option<Peek> {
-    let now = m.now;
-    let entry = m.peek_target()?;
-    let status = m.status(entry);
-    let mut lines: Vec<(u8, Line<'static>)> = Vec::new();
-    let (verb, detail) = describe_status(&status);
-    // When the pane shows the agent, its question or tool is already on
-    // screen: the title carries the state and the body what the pane can't.
-    let in_pane = m.pane.session() == Some(entry.name());
-    let title = if in_pane {
-        let mut title = vec![glyph(&status), Span::styled(format!(" {verb}"), bold())];
-        title.extend(
-            state_time(&status, now).map(|t| Span::styled(format!(" {}", t.content), t.style)),
-        );
-        title
-    } else {
-        vec![Span::styled(entry.label().to_string(), bold())]
-    };
-    if !in_pane {
-        let mut state = vec![glyph(&status), Span::raw(format!(" {verb}"))];
-        let time: Vec<Span<'static>> = state_time(&status, now).into_iter().collect();
-        state = justify(state, time, width).spans;
-        lines.push((1, Line::from(state)));
-        if let Some(detail) = detail {
-            let mut wrapped = wrap(&detail, width).into_iter();
-            if let Some(first) = wrapped.next() {
-                lines.push((2, Line::raw(first)));
-            }
-            if let Some(second) = wrapped.next() {
-                lines.push((6, Line::raw(second)));
-            }
-        }
-    }
-    if let Some(prompt) = m.activity(entry.name()).and_then(|a| a.prompt.clone()) {
-        lines.push((
-            3,
-            Line::from(fit(vec![Span::styled(format!("› {prompt}"), dim())], width)),
-        ));
-    }
-    if let Some(Err(e)) = m.facts.get(entry.name()) {
-        lines.push((
-            4,
-            Line::from(fit(vec![Span::styled(format!("git: {e}"), dim())], width)),
-        ));
-    }
-    if let Some(Ok(facts)) = m.facts.get(entry.name()) {
-        let diff = facts.diff();
-        let changes = match diff.files {
-            0 => vec![Span::styled("no changes", dim())],
-            files => vec![
-                Span::styled(format!("+{}", diff.added), Style::new().fg(Color::Green)),
-                Span::raw(" "),
-                Span::styled(format!("−{}", diff.removed), Style::new().fg(Color::Red)),
-                Span::styled(
-                    format!(" · {files} {}", if files == 1 { "file" } else { "files" }),
-                    dim(),
-                ),
-            ],
-        };
-        lines.push((4, Line::from(changes)));
-        let mut git = Vec::new();
-        if facts.ahead > 0 {
-            git.push(format!("↑{}", facts.ahead));
-        }
-        if facts.behind > 0 {
-            git.push(format!("↓{}", facts.behind));
-        }
-        if facts.dirty > 0 {
-            git.push(format!("{} uncommitted", facts.dirty));
-        }
-        if !git.is_empty() {
-            lines.push((5, Line::from(Span::styled(git.join(" · "), dim()))));
-        }
-    }
-    Some(Peek { title, lines })
-}
-
-fn draw_peek(frame: &mut Frame<'_>, peek: Peek, area: Rect) {
-    let rows = usize::from(area.height.saturating_sub(2));
-    let mut kept: Vec<(usize, u8)> = peek
-        .lines
-        .iter()
-        .enumerate()
-        .map(|(i, (priority, _))| (i, *priority))
-        .collect();
-    kept.sort_by_key(|(i, priority)| (*priority, *i));
-    kept.truncate(rows);
-    kept.sort_unstable();
-    let mut all: Vec<Option<Line<'static>>> =
-        peek.lines.into_iter().map(|(_, line)| Some(line)).collect();
-    let lines: Vec<Line<'static>> = kept
-        .into_iter()
-        .filter_map(|(i, _)| all.get_mut(i).and_then(Option::take))
-        .collect();
-    let block = panel(peek.title, Vec::new(), dim(), false).padding(Padding::horizontal(1));
-    frame.render_widget(Paragraph::new(lines).block(block), area);
-}
-
 fn draw_actions(frame: &mut Frame<'_>, m: &Model, target: &SessionName) {
     let actions = m.actions.all();
     let label_width = actions
@@ -1797,24 +1404,6 @@ fn draw_help(frame: &mut Frame<'_>, keys: Keys) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn the_peek_takes_a_third_up_to_eight_lines_and_leaves_the_list_room() {
-        assert_eq!(
-            peek_height(23, 7),
-            7,
-            "an 80x24 terminal: 5 lines and borders"
-        );
-        assert_eq!(peek_height(44, 7), 9, "never more lines than it has");
-        assert_eq!(peek_height(44, 20), 10, "at most 8 lines");
-        assert_eq!(peek_height(29, 2), 4);
-        assert_eq!(
-            peek_height(14, 7),
-            0,
-            "short terminals keep every row for the list"
-        );
-        assert_eq!(peek_height(23, 0), 0);
-    }
 
     #[test]
     fn times_read_in_the_largest_whole_unit() {

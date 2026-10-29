@@ -61,8 +61,12 @@ passed with `--settings` (your own settings stay untouched), recorded by
 
 Overview opens with a **Needs you** group, the status bar and terminal
 title show `◆ ! ✓` counts, and a bell rings when an agent you're not
-typing into starts waiting. The panel under the list shows the agent's
-last prompt, diff size since it forked, and commits and uncommitted files.
+typing into starts waiting. Each agent's card has a second line saying
+what it's doing or what it said (the question, the tool, the last
+message), when there's room. Under the list, the selected agent's details
+come first, then the other busy agents': files it shares with another
+agent, its subagents, whether it's ready to merge (`dirty`, `behind`,
+`ready ↑n`), the files it changed and its last prompt.
 Agents started before this existed report nothing until restarted: `d`
 then `⏎` in the TUI restarts one through `agent`, resuming its conversation.
 

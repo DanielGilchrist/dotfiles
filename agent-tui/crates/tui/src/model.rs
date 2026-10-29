@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
 use agent_core::actions::Actions;
-use agent_core::activity::{Activity, State as ActivityState, Tool};
+use agent_core::activity::{Activity, State as ActivityState};
 use agent_core::config::Keys;
 use agent_core::model::{
     Entry, EntryState, Removable, Repo, RepoKey, Revival, Running, Snapshot, Startable,
@@ -59,6 +59,18 @@ impl Group {
 }
 
 impl Cursor {
+    /// Whether `other` selects the same thing, counting an agent moving
+    /// into or out of Needs you as staying put.
+    pub fn follows(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Grouped(Group::NeedsYou, agent), elsewhere)
+            | (elsewhere, Self::Grouped(Group::NeedsYou, agent)) => {
+                elsewhere.entry_name() == Some(agent)
+            }
+            _ => self == other,
+        }
+    }
+
     pub fn entry_name(&self) -> Option<&SessionName> {
         match self {
             Self::Entry(name) | Self::Grouped(_, name) => Some(name),
@@ -86,6 +98,10 @@ pub enum Row {
     },
     /// An agent in one of Overview's groups.
     Grouped(Group, SessionName),
+    /// An agent in another repo that needs you, listed under Focus's repo
+    /// so it isn't missed. Selecting it would change the repo in focus, so
+    /// it can't be selected: `a` goes there.
+    Elsewhere(SessionName),
     Entry {
         name: SessionName,
         place: Place,
@@ -113,7 +129,7 @@ impl Row {
     /// What selecting this row selects; group headers select nothing.
     pub fn cursor(&self) -> Option<Cursor> {
         match self {
-            Self::Header(_) => None,
+            Self::Header(_) | Self::Elsewhere(_) => None,
             Self::Repo { key, .. } => Some(Cursor::Repo(key.clone())),
             Self::Grouped(group, name) => Some(Cursor::Grouped(*group, name.clone())),
             Self::Entry { name, .. } => Some(Cursor::Entry(name.clone())),
@@ -128,6 +144,27 @@ fn sole(repo: &Repo) -> Option<&Entry> {
         [only] => Some(only),
         _ => None,
     }
+}
+
+/// Which repos stay open when they don't all fit: those nearest the
+/// selection, while their entries fit in `spare` rows. `sizes` are the
+/// rows each repo's entries take, `origin` is where the selection is (0
+/// above the repos, `i + 1` in repo `i`), and the repo holding it always
+/// opens.
+fn folds(sizes: &[usize], origin: usize, spare: usize) -> Vec<Fold> {
+    let mut order: Vec<usize> = (0..sizes.len()).collect();
+    order.sort_by_key(|&i| (i + 1).abs_diff(origin));
+    let mut folds = vec![Fold::Closed; sizes.len()];
+    let mut left = spare;
+    for i in order {
+        let holds_selection = i + 1 == origin;
+        if sizes[i] > left && !holds_selection {
+            break;
+        }
+        left = left.saturating_sub(sizes[i]);
+        folds[i] = Fold::Open;
+    }
+    folds
 }
 
 /// Where keystrokes go while connected.
@@ -258,7 +295,7 @@ pub enum AgentStatus {
         since: SystemTime,
     },
     Failed {
-        reason: String,
+        failure: Failure,
         since: SystemTime,
     },
     /// Finished a turn the user hasn't looked at.
@@ -276,11 +313,56 @@ pub struct Inspection {
     pub at: Instant,
 }
 
+/// Why a turn failed, as far as the harness's reason says.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Failure {
+    RateLimit,
+    Overloaded,
+    Billing,
+    Other(String),
+}
+
+impl Failure {
+    fn of(reason: &str) -> Self {
+        let lower = reason.to_lowercase();
+        if lower.contains("rate limit") {
+            Self::RateLimit
+        } else if lower.contains("overload") {
+            Self::Overloaded
+        } else if lower.contains("billing") {
+            Self::Billing
+        } else {
+            Self::Other(reason.to_string())
+        }
+    }
+}
+
+/// What a tool acts on. A path keeps its end when cut, anything else its
+/// start.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Target {
+    Path(String),
+    Text(String),
+}
+
+impl Target {
+    fn of(target: &str) -> Self {
+        if target.contains('/') && !target.contains(char::is_whitespace) {
+            Self::Path(target.to_string())
+        } else {
+            Self::Text(target.to_string())
+        }
+    }
+}
+
 /// What a working agent is busy with.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Doing {
     Thinking,
-    Tool(Tool),
+    Tool {
+        name: String,
+        target: Option<Target>,
+    },
     /// Its turn ended and it waits on this many background subagents.
     Delegating(NonZeroUsize),
     /// Its subagents finished and it's about to take their results.
@@ -588,11 +670,33 @@ pub struct Status {
     pub at: Instant,
 }
 
-/// Screen regions from the last draw, for mouse hit-testing and pty sizing.
+/// Screen regions from the last draw, for mouse hit-testing, pty sizing
+/// and how many repos Overview can keep open.
 #[derive(Default)]
 pub struct Areas {
     pub terminal: Rect,
+    /// Inside the sidebar's border, empty while it's hidden.
+    pub sidebar: Rect,
     pub rows: Vec<(u16, Cursor)>,
+}
+
+/// Where the sidebar list was scrolled to, and where the selection sat on
+/// screen, as last drawn.
+#[derive(Debug, Default)]
+pub struct ListScroll {
+    pub offset: usize,
+    /// The selection and its line on screen.
+    pub anchor: Option<(Cursor, usize)>,
+}
+
+/// The sidebar list at its tallest for the current agents and view: every
+/// card one line, every repo open, and every place an agent could be listed
+/// counted, so agents changing state never change it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Extent {
+    pub rows: usize,
+    /// The cards whose agent has a session, which may take a second line.
+    pub live: usize,
 }
 
 pub enum Load {
@@ -619,8 +723,7 @@ pub struct Model {
     pub harness_label: String,
     pub last_warnings: Vec<String>,
     pub chord: Chord,
-    /// First visible sidebar row.
-    pub sidebar_offset: usize,
+    pub scroll: ListScroll,
     /// An agent to select once a refresh shows it.
     pub follow: Option<Follow>,
     next_ticket: u64,
@@ -665,7 +768,7 @@ impl Model {
             harness_label,
             last_warnings: Vec::new(),
             chord: Chord::Idle,
-            sidebar_offset: 0,
+            scroll: ListScroll::default(),
             follow: None,
             next_ticket: 0,
             actions: Actions::default(),
@@ -751,7 +854,10 @@ impl Model {
                 let doing = match (&activity.state, activity.current_tool()) {
                     (ActivityState::Delegating, _) => NonZeroUsize::new(activity.subagents.len())
                         .map_or(Doing::HandingBack, Doing::Delegating),
-                    (_, Some(tool)) => Doing::Tool(tool.clone()),
+                    (_, Some(tool)) => Doing::Tool {
+                        name: tool.name.clone(),
+                        target: tool.target.as_deref().map(Target::of),
+                    },
                     (_, None) => Doing::Thinking,
                 };
                 AgentStatus::Working {
@@ -761,7 +867,7 @@ impl Model {
                 }
             }
             ActivityState::Failed { reason } => AgentStatus::Failed {
-                reason: reason.clone(),
+                failure: Failure::of(reason),
                 since,
             },
             ActivityState::Done { summary } => AgentStatus::Done {
@@ -829,16 +935,6 @@ impl Model {
         self.reconcile(repo.as_ref());
     }
 
-    /// The agent the peek describes: the one in the pane, else the
-    /// selection.
-    pub fn peek_target(&self) -> Option<&Entry> {
-        let snapshot = self.snapshot()?;
-        match self.pane.session() {
-            Some(name) => snapshot.entry(name).map(|(_, e)| e),
-            None => self.selected_entry(),
-        }
-    }
-
     pub fn focus(&self) -> Focus<'_> {
         match (&self.overlay, self.pane.connection()) {
             (Overlay::None, Some(c)) if c.mode == Mode::Agent => Focus::Agent(c),
@@ -872,15 +968,7 @@ impl Model {
         match self.view {
             View::Focus => current
                 .and_then(|k| snapshot.repo(k))
-                .map(|repo| {
-                    repo.entries()
-                        .iter()
-                        .map(|e| Row::Entry {
-                            name: e.name().clone(),
-                            place: Place::Alone,
-                        })
-                        .collect()
-                })
+                .map(|repo| self.focus_rows(repo))
                 .unwrap_or_default(),
             View::Overview => {
                 let mut rows = Vec::new();
@@ -906,25 +994,47 @@ impl Model {
                             .map(|(_, e)| Row::Grouped(Group::Pinned, e.name().clone())),
                     );
                 }
-                for repo in snapshot.repos() {
+                let repos = snapshot.repos();
+                let listed = |e: &&Entry| !waiting.contains(e.name());
+                // Folds are worked out from the extent's worst case, so
+                // agents changing state never open or close a repo.
+                let sizes: Vec<usize> = repos
+                    .iter()
+                    .map(|r| match sole(r) {
+                        Some(_) => 0,
+                        None => r.entries().len(),
+                    })
+                    .collect();
+                let room = usize::from(self.areas.sidebar.height);
+                let tallest = self.extent().rows;
+                let folds = if tallest <= room {
+                    vec![Fold::Open; repos.len()]
+                } else {
+                    let origin = current
+                        .and_then(|k| repos.iter().position(|r| r.key() == k))
+                        .map_or(0, |i| i + 1);
+                    let shut = tallest - sizes.iter().sum::<usize>();
+                    folds(&sizes, origin, room.saturating_sub(shut))
+                };
+                for (repo, fold) in repos.iter().zip(folds) {
                     if let Some(only) = sole(repo) {
-                        rows.push(Row::Entry {
-                            name: only.name().clone(),
-                            place: Place::Solo,
-                        });
+                        if listed(&only) {
+                            rows.push(Row::Entry {
+                                name: only.name().clone(),
+                                place: Place::Solo,
+                            });
+                        }
                         continue;
                     }
-                    let fold = match cursor {
-                        Cursor::Grouped(..) => Fold::Closed,
-                        _ if current == Some(repo.key()) => Fold::Open,
-                        _ => Fold::Closed,
-                    };
+                    if !repo.entries().iter().any(|e| listed(&e)) {
+                        continue;
+                    }
                     rows.push(Row::Repo {
                         key: repo.key().clone(),
                         fold,
                     });
                     if let Fold::Open = fold {
-                        rows.extend(repo.entries().iter().map(|e| Row::Entry {
+                        rows.extend(repo.entries().iter().filter(listed).map(|e| Row::Entry {
                             name: e.name().clone(),
                             place: Place::Nested,
                         }));
@@ -932,6 +1042,76 @@ impl Model {
                 }
                 rows
             }
+        }
+    }
+
+    /// Focus: the repo's entries, then agents from other repos that need
+    /// you.
+    fn focus_rows(&self, repo: &Repo) -> Vec<Row> {
+        let mut rows: Vec<Row> = repo
+            .entries()
+            .iter()
+            .map(|e| Row::Entry {
+                name: e.name().clone(),
+                place: Place::Alone,
+            })
+            .collect();
+        let elsewhere: Vec<Row> = self
+            .needs_you()
+            .into_iter()
+            .filter(|name| repo.entry(name).is_none())
+            .map(Row::Elsewhere)
+            .collect();
+        if !elsewhere.is_empty() {
+            rows.push(Row::Header(Group::NeedsYou));
+            rows.extend(elsewhere);
+        }
+        rows
+    }
+
+    /// The sidebar list at its tallest: both views reserve the Needs you
+    /// header even while it's hidden, Focus counts every other repo's entry
+    /// as a one-line row in it, and Overview counts pinned agents twice, in
+    /// their group and their repo.
+    pub fn extent(&self) -> Extent {
+        let Some(snapshot) = self.snapshot() else {
+            return Extent::default();
+        };
+        let (headers, cards): (usize, Vec<&Entry>) = match self.view {
+            View::Focus => {
+                let Some((repo, _)) = self.selected() else {
+                    return Extent::default();
+                };
+                let elsewhere = snapshot.entries().count() - repo.entries().len();
+                return Extent {
+                    rows: 1 + elsewhere + repo.entries().len(),
+                    live: repo
+                        .entries()
+                        .iter()
+                        .filter(|e| matches!(e.state(), EntryState::Live))
+                        .count(),
+                };
+            }
+            View::Overview => {
+                let pinned = snapshot.pinned();
+                let groups = 1 + usize::from(!pinned.is_empty());
+                let repos = snapshot.repos().iter().filter(|r| sole(r).is_none());
+                (
+                    groups + repos.count(),
+                    pinned
+                        .into_iter()
+                        .chain(snapshot.entries())
+                        .map(|(_, e)| e)
+                        .collect(),
+                )
+            }
+        };
+        Extent {
+            rows: headers + cards.len(),
+            live: cards
+                .iter()
+                .filter(|e| matches!(e.state(), EntryState::Live))
+                .count(),
         }
     }
 
@@ -998,29 +1178,44 @@ impl Model {
         let view = self.view;
         let start_dir = self.start_dir.clone();
         let waiting = self.needs_you();
+        let listed_in_needs_you =
+            |name: &SessionName| view == View::Overview && waiting.contains(name);
         let Load::Ready { snapshot, cursor } = &mut self.load else {
             return;
         };
         let valid = match cursor.as_ref() {
             None => false,
-            Some(Cursor::Repo(key)) => view == View::Overview && snapshot.repo(key).is_some(),
+            Some(Cursor::Repo(key)) => {
+                view == View::Overview
+                    && snapshot
+                        .repo(key)
+                        .is_some_and(|r| r.entries().iter().any(|e| !waiting.contains(e.name())))
+            }
             Some(Cursor::Grouped(Group::NeedsYou, name)) => {
                 view == View::Overview && waiting.contains(name)
             }
             Some(Cursor::Grouped(Group::Pinned, name)) => {
                 view == View::Overview
+                    && !waiting.contains(name)
                     && snapshot.entry(name).is_some_and(|(_, e)| e.pin().is_some())
             }
-            Some(Cursor::Entry(name)) => snapshot.entry(name).is_some(),
+            Some(Cursor::Entry(name)) => {
+                snapshot.entry(name).is_some() && !listed_in_needs_you(name)
+            }
         };
         if valid {
             return;
         }
-        let entry_of = |e: &Entry| Cursor::Entry(e.name().clone());
+        let entry_of = |e: &Entry| match e.name() {
+            name if listed_in_needs_you(name) => Cursor::Grouped(Group::NeedsYou, name.clone()),
+            name => Cursor::Entry(name.clone()),
+        };
         let fallback = match cursor.as_ref() {
-            Some(Cursor::Grouped(_, name)) => snapshot.entry(name).map(|(_, e)| entry_of(e)),
+            Some(Cursor::Grouped(_, name) | Cursor::Entry(name)) => {
+                snapshot.entry(name).map(|(_, e)| entry_of(e))
+            }
             Some(Cursor::Repo(key)) => snapshot.repo(key).map(|r| entry_of(r.first())),
-            _ => None,
+            None => None,
         };
         let fallback = fallback
             .or_else(|| {
@@ -1044,7 +1239,9 @@ impl Model {
     }
 
     /// Moves the cursor; repo rows and the pinned group only exist in
-    /// Overview, so in Focus those become the entry they stand for.
+    /// Overview, so in Focus those become the entry they stand for. In
+    /// Overview an agent that needs you is listed only under Needs you, and
+    /// a repo whose agents all need you has no row of its own.
     pub fn set_cursor(&mut self, next: Cursor) {
         let next = match (self.view, next) {
             (View::Focus, Cursor::Grouped(_, name)) => Cursor::Entry(name),
@@ -1052,6 +1249,18 @@ impl Model {
                 Some(repo) => Cursor::Entry(repo.first().name().clone()),
                 None => return,
             },
+            (View::Overview, Cursor::Entry(name)) if self.needs_you().contains(&name) => {
+                Cursor::Grouped(Group::NeedsYou, name)
+            }
+            (View::Overview, Cursor::Repo(key)) => {
+                let waiting = self.needs_you();
+                match self.snapshot().and_then(|s| s.repo(&key)) {
+                    Some(repo) if repo.entries().iter().all(|e| waiting.contains(e.name())) => {
+                        Cursor::Grouped(Group::NeedsYou, repo.first().name().clone())
+                    }
+                    _ => Cursor::Repo(key),
+                }
+            }
             (_, next) => next,
         };
         let Load::Ready { cursor, .. } = &mut self.load else {
@@ -1729,4 +1938,50 @@ pub fn invalid_chars(name: &str) -> Vec<(usize, char)> {
             !allowed
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repos_nearest_the_selection_stay_open_while_they_fit() {
+        use Fold::{Closed, Open};
+        assert_eq!(
+            folds(&[3, 0, 4, 2], 1, 5),
+            [Open, Open, Closed, Closed],
+            "the repo after next doesn't fit, so nothing further opens"
+        );
+        assert_eq!(
+            folds(&[3, 0, 4, 2], 0, 3),
+            [Open, Open, Closed, Closed],
+            "a selection in Needs you counts from the top"
+        );
+        assert_eq!(
+            folds(&[3, 4], 2, 0),
+            [Closed, Open],
+            "the selection's repo opens without room"
+        );
+        assert_eq!(folds(&[2, 2, 2], 2, 6), [Open; 3]);
+    }
+
+    #[test]
+    fn failures_and_tool_targets_are_read_once() {
+        assert_eq!(Failure::of("Rate limit"), Failure::RateLimit);
+        assert_eq!(Failure::of("server overloaded"), Failure::Overloaded);
+        assert_eq!(Failure::of("billing error"), Failure::Billing);
+        assert_eq!(Failure::of("boom"), Failure::Other("boom".into()));
+        assert_eq!(Target::of("src/a.rs"), Target::Path("src/a.rs".into()));
+        assert_eq!(Target::of("ls src/"), Target::Text("ls src/".into()));
+        assert_eq!(Target::of("cargo"), Target::Text("cargo".into()));
+    }
+
+    #[test]
+    fn needs_you_counts_as_the_same_place_as_any_other_row_for_its_agent() {
+        let fix: SessionName = "fix".parse().unwrap();
+        let needs_you = Cursor::Grouped(Group::NeedsYou, fix.clone());
+        assert!(needs_you.follows(&Cursor::Entry(fix.clone())));
+        assert!(Cursor::Grouped(Group::Pinned, fix.clone()).follows(&needs_you));
+        assert!(!Cursor::Grouped(Group::Pinned, fix.clone()).follows(&Cursor::Entry(fix)));
+    }
 }
