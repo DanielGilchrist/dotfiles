@@ -8,7 +8,7 @@ use agent_core::actions::{Action, CommandLine, Context, EventName, Invocation};
 use agent_core::activity::{Activity, State as ActivityState};
 use agent_core::config::ControlKey;
 use agent_core::model::{RepoKey, Slot};
-use agent_core::names::SessionName;
+use agent_core::names::{Prompt, SessionName};
 use agent_core::ops::{Approved, Launch};
 use agent_core::ports::ClientId;
 use agent_term::{CellPos, encode_key, encode_mouse};
@@ -317,6 +317,7 @@ fn report(m: &mut Model, outcome: Outcome) {
             m.error(format!("removed {name}, but {}", warnings.join(", ")));
         }
         Outcome::Pinned(name) => m.info(format!("pinned {name}")),
+        Outcome::Replied(name) => m.info(format!("sent to {name}")),
         Outcome::Unpinned(name) => m.info(format!("unpinned {name}")),
         Outcome::Started(label) => m.info(format!("started {label}")),
         Outcome::Finished(label) => m.info(format!("{label} finished")),
@@ -599,6 +600,22 @@ fn on_nav_key(m: &mut Model, key: KeyEvent) -> Vec<Effect> {
             }
         }
         KeyCode::Char('n') => open_new_form(m),
+        KeyCode::Char('r') => {
+            if let Some(entry) = selected {
+                match m.replyable(&entry).cloned() {
+                    Some(to) => {
+                        m.overlay = Overlay::Reply {
+                            to,
+                            text: String::new(),
+                        }
+                    }
+                    None => m.info(format!(
+                        "{} can't take a reply from here · ⏎ attaches",
+                        entry.name()
+                    )),
+                }
+            }
+        }
         KeyCode::Char('o') => {
             let path = m.selected().and_then(|(repo, e)| {
                 e.and_then(|e| e.path())
@@ -733,6 +750,26 @@ fn request_removal(m: &mut Model) -> Vec<Effect> {
     Vec::new()
 }
 
+/// Sends a reply, unless the agent started asking since: the text would
+/// then land in its prompt, so the reply stays open with an error.
+fn reply(m: &mut Model, to: SessionName, text: String) -> Vec<Effect> {
+    let Ok(prompt) = text.parse::<Prompt>() else {
+        m.overlay = Overlay::Reply { to, text };
+        return Vec::new();
+    };
+    let open = m
+        .snapshot()
+        .and_then(|s| s.entry(&to))
+        .and_then(|(_, entry)| m.replyable(entry))
+        .is_some();
+    if !open {
+        m.error(format!("{to} is asking now, so the reply wasn't sent"));
+        m.overlay = Overlay::Reply { to, text };
+        return Vec::new();
+    }
+    vec![Effect::Job(Job::Reply { to, prompt })]
+}
+
 /// Shared query editing for the switcher and picker. Other keys are ignored.
 fn edit_query(query: &mut Query, key: &KeyEvent, len: usize, nav: ControlKey) {
     match key.code {
@@ -773,6 +810,24 @@ fn on_overlay_key(m: &mut Model, key: KeyEvent) -> Vec<Effect> {
             m.overlay = Overlay::New(form);
             on_new_key(m, &key)
         }
+        Overlay::Reply { to, mut text } => match key.code {
+            KeyCode::Esc => Vec::new(),
+            KeyCode::Enter => reply(m, to, text),
+            _ => {
+                match key.code {
+                    KeyCode::Backspace => {
+                        text.pop();
+                    }
+                    _ if ctrl(&key, 'u') => text.clear(),
+                    KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        text.push(c);
+                    }
+                    _ => {}
+                }
+                m.overlay = Overlay::Reply { to, text };
+                Vec::new()
+            }
+        },
         Overlay::Switcher(mut query) => {
             let matches = switcher_matches(m, &query.text);
             match key.code {
@@ -1805,6 +1860,49 @@ mod tests {
                 .any(|r| matches!(r, Row::Entry { name, .. } if name.as_str() == "fix")),
             "listed under Needs you, not again under its repo: {:?}",
             m.rows()
+        );
+    }
+
+    #[test]
+    fn a_reply_goes_to_the_selected_agent_while_it_shows_no_prompt() {
+        use agent_core::activity::State;
+        let mut m = two_live();
+        m.set_cursor(Cursor::Entry(name("fix")));
+        m.activities = Some(HashMap::from([(
+            name("fix"),
+            reported(State::Done { summary: None }, 5),
+        )]));
+        update(&mut m, key(KeyCode::Char('r')));
+        type_text(&mut m, "rebase");
+        let effects = update(&mut m, key(KeyCode::Enter));
+        assert!(
+            matches!(effects.as_slice(), [Effect::Job(Job::Reply { to, prompt })]
+                if to.as_str() == "fix" && prompt.as_str() == "rebase"),
+            "{}",
+            effects.len()
+        );
+        assert!(matches!(m.overlay, Overlay::None));
+    }
+
+    #[test]
+    fn no_reply_is_typed_into_a_prompt() {
+        use agent_core::activity::State;
+        let mut m = two_live();
+        m.set_cursor(Cursor::Entry(name("fix")));
+        m.activities = Some(HashMap::from([(name("fix"), asking("rm?", 5))]));
+        update(&mut m, key(KeyCode::Char('r')));
+        assert!(
+            matches!(m.overlay, Overlay::None),
+            "asking agents get no reply box"
+        );
+        m.activities = Some(HashMap::from([(name("fix"), reported(State::Idle, 5))]));
+        update(&mut m, key(KeyCode::Char('r')));
+        type_text(&mut m, "go");
+        m.activities = Some(HashMap::from([(name("fix"), asking("rm?", 0))]));
+        assert!(update(&mut m, key(KeyCode::Enter)).is_empty());
+        assert!(
+            matches!(&m.overlay, Overlay::Reply { text, .. } if text == "go"),
+            "the text is kept for when it's answered"
         );
     }
 

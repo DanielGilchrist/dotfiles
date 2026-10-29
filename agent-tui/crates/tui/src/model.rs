@@ -637,6 +637,11 @@ pub enum Overlay {
     Help,
     /// The configured actions, to run on this agent.
     Actions(SessionName),
+    /// A reply being typed for an agent.
+    Reply {
+        to: SessionName,
+        text: String,
+    },
     /// Working out what removing `name` would lose; the confirmation
     /// replaces this when the answer arrives.
     Planning {
@@ -875,6 +880,19 @@ impl Model {
                 since,
             },
         }
+    }
+
+    /// The agent `r` can type a reply into: live, reporting its state, and
+    /// showing no prompt, where typed text would pick a menu option.
+    pub fn replyable<'a>(&self, entry: &'a Entry) -> Option<&'a SessionName> {
+        let EntryState::Live = entry.state() else {
+            return None;
+        };
+        if self.own_session.as_ref() == Some(entry.name()) {
+            return None;
+        }
+        self.activity(entry.name()).filter(|a| a.asks.is_empty())?;
+        Some(entry.name())
     }
 
     /// How many subagents a live agent has running, if any.

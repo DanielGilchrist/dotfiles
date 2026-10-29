@@ -42,6 +42,7 @@ types into the embedded session. `?` shows every key.
 | `1`-`9`, `m` | Jump to a pinned agent, pin / unpin |
 | `n` | New agent form: prompt (`⌃E` edits it in $EDITOR), name (suggested from the prompt or a Linear/GitHub link), repo |
 | `o` | Open the agent's worktree in $EDITOR |
+| `r` | Reply without attaching (not while it shows a prompt) |
 | `d` / `D` | Kill the session / remove session, worktree and branch (confirms, lists anything that would be lost) |
 | `x` | Run a configured action on the selected agent (see below) |
 | `a` | Jump to the agent that needs you most (asking, failed, then finished), into AGENT |

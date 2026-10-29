@@ -74,9 +74,15 @@ pub enum Outcome {
     Started(String),
     /// It exited successfully.
     Finished(String),
+    Replied(SessionName),
 }
 
 pub enum Job {
+    /// Type a reply into an agent and submit it.
+    Reply {
+        to: SessionName,
+        prompt: Prompt,
+    },
     Start {
         at: Startable,
         harness: HarnessId,
@@ -143,6 +149,7 @@ impl Job {
             | Self::SuggestName { .. }
             | Self::TakeOver { .. }
             | Self::Acknowledge(_)
+            | Self::Reply { .. }
             | Self::Run { .. } => false,
         }
     }
@@ -448,6 +455,11 @@ fn run(backend: &Arc<Backend>, job: Job, msgs: &Sender<Msg>) -> Option<Msg> {
             Ok(()) => return None,
             Err(e) => Msg::Done(Err(describe(&e))),
         },
+        Job::Reply { to, prompt } => Msg::Done(
+            ops::inject(svc, &to, &prompt)
+                .map(|()| Outcome::Replied(to))
+                .map_err(err),
+        ),
         Job::Kill(running) => Msg::Done(
             ops::kill(svc, &running)
                 .map(|()| Outcome::Killed(running.name().clone()))

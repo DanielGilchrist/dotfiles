@@ -121,6 +121,7 @@ NAV:
 | `a` | next agent that needs you (see Attention) |
 | `n` | start an agent in the selected idle worktree |
 | `o` | open the checkout in `$EDITOR` |
+| `r` | reply to the agent without attaching: a one-line box sends it as a prompt. Only offered while the agent reports its state and shows no prompt, where typed text would pick a menu option, and checked again on `⏎` |
 | `d` | kill session, **with confirmation (owner)**: `y` or `⏎`, since it can be resurrected |
 | `D` | remove session, worktree and branch (confirmation, or `Y` if commits would be lost) |
 | `x` | actions overlay ("Run on <agent>"): the configured actions, one key each. `Esc` closes |

@@ -53,6 +53,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
             ("m", "pin / unpin"),
             ("n", "new agent"),
             ("o", "open in $EDITOR"),
+            ("r", "reply without attaching"),
             ("d", "kill session"),
             ("D", "remove with worktree and branch"),
             ("x", "run a configured action"),
@@ -327,6 +328,7 @@ pub fn draw(frame: &mut Frame<'_>, m: &mut Model) {
         Overlay::Confirm(confirm) => draw_confirm(frame, confirm),
         Overlay::Help => draw_help(frame, m.keys),
         Overlay::Actions(target) => draw_actions(frame, m, target),
+        Overlay::Reply { to, text } => draw_reply(frame, to, text),
         Overlay::Planning { name, .. } => draw_planning(frame, name),
     }
 }
@@ -562,6 +564,9 @@ fn draw_status_bar(frame: &mut Frame<'_>, m: &Model, area: Rect) {
                 None => "pin",
             };
             hints.push(ranked("m", pin, 3));
+            if m.replyable(entry).is_some() {
+                hints.push(ranked("r", "reply", 5));
+            }
         }
         hints.push(ranked("n", "new", 4));
         hints.push(ranked(
@@ -1311,6 +1316,25 @@ fn draw_actions(frame: &mut Frame<'_>, m: &Model, target: &SessionName) {
     clear_around(frame, area);
     let block = overlay_block(&title, hints(&[("Esc", "close")]), dim());
     frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn draw_reply(frame: &mut Frame<'_>, to: &SessionName, text: &str) {
+    let area = centred(frame, 72, 3);
+    clear_around(frame, area);
+    let block = overlay_block(
+        &format!("Reply to {to}"),
+        hints(&[("⏎", "send"), ("Esc", "close")]),
+        dim(),
+    );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let room = usize::from(inner.width).saturating_sub(4);
+    let line = Line::from(vec![
+        Span::styled(" › ", Style::new().fg(ACCENT)),
+        Span::raw(truncate_start(text, room)),
+        Span::styled("█", dim()),
+    ]);
+    frame.render_widget(Paragraph::new(line), inner);
 }
 
 fn pad(text: &str, width: usize) -> String {
