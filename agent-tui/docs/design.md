@@ -23,14 +23,14 @@ Distilled from two research briefs (interaction, visual) on lazygit, helix, k9s,
 │ ● payroll-fix             ││                                                 │
 │ ✓ main                    ││                                                 │
 ╰─────────────────── 1 of 3─╯╰─────────────────────── ~/worktrees/heucristic/… ╯
-  NAV    ⏎ attach  Space switch  d kill  D remove  m pin  Tab overview  ? keys      killed foo
+  NAV    ⏎ attach  Space switch  d kill  D remove  m pin  Tab agents  ? keys      killed foo
 ```
 
 - Rounded panels, like lazygit: the sidebar's three (see Sidebar) and the selected agent's terminal. Each has its title in the top border and its metadata in the bottom-right corner (`N of M` for the list, the path or a Yellow `⇄ shared · ⏎ take over` for the terminal).
 - The panel keys go to has a Cyan border (the focused sidebar panel in NAV, the terminal in AGENT). The others are DIM, and all are DIM while an overlay has the keys. The owner rejected free-floating rules and a titles-in-rules frame. Borders belong to panels.
 - Sidebar: 24% of the width, clamped to 28-48 inner columns, plus its border. It's hidden below 60 columns so the agent keeps every column (Space still switches). Rows keep one column of inner padding on both edges. The terminal panel has one column of horizontal padding so the agent's own full-width rules don't fuse with our border.
-- List title: `[1]` and the scope BOLD (`heucristic` in Focus, `Agents` in Overview). Position lives only in the `N of M` corner, in the border's colour and tucked against it (`1 of 3─╯`). The focused panel's title takes the Cyan accent, as lazygit's active title does. Terminal title: the identifier BOLD (Cyan when focused): `repo / agent` with the repo and `/` DIM, or for a main checkout `repo` BOLD + ` branch` DIM.
-- Status bar (one row, no border, the owner's "modern neovim-ish bottom nav"): the mode badge (`  NAV  ` / ` AGENT `, seven columns, Cyan reversed. Cyan always means "keys go here", and Yellow is reserved for attention and warnings), then up to 7 context hints (key default fg, description DIM), then the status message right-aligned (errors Red and sticky until the next key, info expiring after ~4s). Hints drop least important first (`x`, `D`, `d`, `m`, `n`, then `r` and `Tab`, then `Space` and `2`, then `Esc` and `⏎`, then `e`, while `? keys` always stays). The status is cut to fit rather than pushing hints out, so the row never jitters. In AGENT the hints are `⌃\ nav  ⌃\ ⌃\ previous`, naming the configured key (plus the attention count once status exists). Hints never offer actions that are invalid for the selection.
+- List title: `[1]` then the three tabs, lazygit-style: the selected row's repo (`heucristic`), `Agents` and `Pinned`, the active one BOLD and the others plain with a DIM ` · ` between. The form follows the width alone, never the cursor: below 32 columns inside the border (the title's two padding columns, 4 for `[1] `, 8 for the shortest repo name, 18 for the other tabs) only the active tab shows, and above it the repo name yields to fit as names do. With the sidebar clamped to 28-48 inner columns that means the strip shows from about 140 columns. With no row selected only the active tab shows, and the repo tab with no repo is bare `[1]`. Position lives only in the `N of M` corner, in the border's colour and tucked against it (`1 of 3─╯`). The focused panel's title takes the Cyan accent, as lazygit's active title does. Terminal title: the identifier BOLD (Cyan when focused): `repo / agent` with the repo and `/` DIM, or for a main checkout `repo` BOLD + ` branch` DIM.
+- Status bar (one row, no border, the owner's "modern neovim-ish bottom nav"): the mode badge (`  NAV  ` / ` AGENT `, seven columns, Cyan reversed. Cyan always means "keys go here", and Yellow is reserved for attention and warnings), then up to 7 context hints (key default fg, description DIM), then the status message right-aligned (errors Red and sticky until the next key, info expiring after ~4s). Hints drop least important first (`x`, `D`, `d`, `m`, `n`, then `r`, `Space` and `2`, then `Tab`, which at most widths is the only cue that [1] has tabs, then `Esc` and `⏎`, then `e`, while `? keys` always stays). The status is cut to fit rather than pushing hints out, so the row never jitters. In AGENT the hints are `⌃\ nav  ⌃\ ⌃\ previous`, naming the configured key (plus the attention count once status exists). Hints never offer actions that are invalid for the selection.
 - Key names, everywhere (status bar, overlays, help): `⏎`, `Esc`, `Space`, `Tab`, and the configured escape key, as in `⌃\`. Help sections are named after the modes: `AGENT`, `NAV`.
 - Render the pty cursor only in AGENT.
 
@@ -53,7 +53,7 @@ Never `✗`/`×` for exited (reads as "close"). Rows show the time in state righ
 
 ## Attention
 
-- Overview opens with a **Needs you** group listing every asking, failed or done-unseen agent, in the order `a` visits them: asking and failed first, then done, longest waiting first. A waiting agent shows here and nowhere else, not under Pinned or its repo. Selecting a row here keeps no repo open for it, so when repos don't all fit they close from the bottom. Collapsed repo counts leave waiting agents out.
+- Overview opens with a **Needs you** group listing every asking, failed or done-unseen agent, in the order `a` visits them: asking and failed first, then done, longest waiting first. A waiting agent shows here and nowhere else, not under its repo. Pinned ends with the same group for the waiting agents that aren't pinned. Selecting a row here keeps no repo open for it, so when repos don't all fit they close from the bottom. Collapsed repo counts leave waiting agents out.
 - Focus lists agents from other repos that need you under the repo's cards, in a `▾ Needs you` group with their repo on the right. They're one line each and can't be selected, since selecting one would change the repo in focus: `a` goes there. The status bar carries the counts.
 - `a` attaches the most urgent agent other than the one in the pane, into AGENT (`⌃\ a` from AGENT). With none: `Nothing needs you`.
 - Done clears to idle on attach, or after 3s in the pane while the terminal has focus (terminals that never report focus count as focused). Failed clears on the next prompt, asking when its hook state changes.
@@ -106,14 +106,14 @@ Three panels stacked, each with one noun: [1] the fleet, [2] the selected agent'
 ▌  Bash: pnpm test --filter triage
 ```
 
-- Line 1: gutter, glyph, name, then on the right the repo (DIM, only in Needs you and Pinned, and not in the short form), the time in state and `⇄`. The right side never truncates, and the name yields down to 8 columns.
-- Cards under a `▾` header (a repo, Needs you, Pinned) are indented 2.
+- Line 1: gutter, glyph, name, then on the right the repo (DIM, only in Needs you and the Pinned tab, and not in the short form), the time in state and `⇄`. The right side never truncates, and the name yields down to 8 columns.
+- Cards under a `▾` header (a repo, Needs you) are indented 2. The Pinned tab's pins have no header and aren't.
 - Line 2, indented under the name, cut with `…`: the question (default fg), the failure (`rate limited`, `overloaded`, `billing limit`, or the reason's first line), the tool and its target (a path keeps its end, `Edit  …/payroll/calc.ts`, and in the short form only its basename), `thinking`, `↳3 subagents · quiet 22s`, `handing back`, or the first line of the last message with markdown stripped. All DIM except the question. Settled agents (idle, exited, no session) have no line 2.
 - Selection never changes a card's height, and the gutter covers both lines.
 
 ### Tier
 
-Which cards get a line 2, worked out from the list at its tallest (every repo open, Needs you's header reserved, pinned agents counted twice) and the agents with a session, so state changes never change it: line 2 for every agent that isn't settled when that fits [1], else for the first agents `a` would visit while rows remain, else for none.
+Which cards get a line 2, worked out from the list at its tallest (every repo open, Needs you's header reserved, and in the Pinned tab every agent that isn't pinned counted as waiting) and the agents with a session, so state changes never change it: line 2 for every agent that isn't settled when that fits [1], else for the first agents `a` would visit while rows remain, else for none.
 
 ### [2] The turn
 
@@ -146,9 +146,11 @@ The sidebar shows a repo while a session or an agent worktree belongs to it, and
 
 ## Views
 
-- **Focus** (default): one repo, no per-repo header rows. The main checkout is labelled by its branch, never `(root)`.
-- **Overview**: an accordion. Repo rows are selectable items with `▸`/`▾` (DIM) and collapsed repo rows show right-aligned nonzero counts of settled agents in `● ○` order (waiting agents are counted under Needs you, and open repos show none), each glyph a space before its number and pairs two spaces apart (`● 1  ○ 2`) (idle `·` worktrees are not counted). Every repo is open when the whole list fits with one-line cards. Otherwise the repos furthest from the selection close first, and the repo holding the selection always stays open. Like the tier, this counts every place an agent could be listed, so agents changing state never open or close a repo. A repo whose agents are all under Needs you has no row. Cards are indented under the repo, and line 2 sits under the name. An agent under Needs you isn't listed again under its repo, and the selection follows an agent as it moves between them, keeping its screen row when the list scrolls. A repo whose only entry is its main checkout collapses to one row.
-- **Pinned (owner)**: pinned agents sort first. In Overview they form a `▾ Pinned` group (DIM) above the repos. In Focus they sort to the top of their repo, and in the switcher they come first.
+Three tabs in [1], cycled with `Tab` and `⇧Tab`, named in its title where the width allows (see Layout) and otherwise only by the footer's `Tab` hint, which names the next tab (`repo`, `agents`, `pinned`). Moving between tabs keeps the selected agent when the new tab lists it. Otherwise the tab selects its first row (in Pinned the first pin, else the first Needs you row) and remembers what was selected, so the next tab that lists it, or a full cycle, comes back to it unless you moved in between.
+
+- **Repo (Focus, default)**: one repo, named by the selected row's repo in the title, no per-repo header rows. The main checkout is labelled by its branch, never `(root)`.
+- **Agents (Overview)**: an accordion. Repo rows are selectable items with `▸`/`▾` (DIM) and collapsed repo rows show right-aligned nonzero counts of settled agents in `● ○` order (waiting agents are counted under Needs you, and open repos show none), each glyph a space before its number and pairs two spaces apart (`● 1  ○ 2`) (idle `·` worktrees are not counted). Every repo is open when the whole list fits with one-line cards. Otherwise the repos furthest from the selection close first, and the repo holding the selection always stays open. Like the tier, this counts every place an agent could be listed, so agents changing state never open or close a repo. A repo whose agents are all under Needs you has no row. Cards are indented under the repo, and line 2 sits under the name. An agent under Needs you isn't listed again under its repo, and the selection follows an agent as it moves between them, keeping its screen row when the list scrolls. A repo whose only entry is its main checkout collapses to one row.
+- **Pinned (owner)**: its own tab, with the Focus grammar. The pins come first, flat and in pin order, with their repo on the right as Needs you rows have. A waiting pin stays in its place, its glyph and time saying so. Then `▾ Needs you` for the waiting agents that aren't pinned, selectable as in Overview. With nothing to list the tab is empty and the terminal area says `Nothing pinned`. Selecting an agent the tab doesn't list (the switcher, `⌃\` back from it) goes to Agents with it. `p`, `[` and `]` go to the repo tab. Pinned agents also sort to the top of their repo in Focus and come first in the switcher.
 - **Hiding is removed (owner).**
 
 ## Keymap
@@ -167,7 +169,7 @@ NAV:
 | `[` / `]` | previous / next repo |
 | `p` | repo picker: focus a listed repo, or add one from the catalogue or by path |
 | `Space` / `/` | switcher |
-| `Tab` | Focus ↔ Overview |
+| `Tab` / `⇧Tab` | next / previous tab in [1]: repo, agents, pinned |
 | `m` | pin / unpin |
 | `a` | next agent that needs you (see Attention) |
 | `n` | start an agent in the selected idle worktree |

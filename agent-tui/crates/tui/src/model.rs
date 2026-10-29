@@ -54,6 +54,13 @@ pub enum Wrap {
     Clamp,
 }
 
+/// Which way a cycle goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    Forward,
+    Back,
+}
+
 /// What [2] has beyond its rows, as last drawn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Turn {
@@ -71,8 +78,37 @@ pub enum Turn {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum View {
+    /// One repo.
     Focus,
+    /// Every repo.
     Overview,
+    /// The pinned agents.
+    Pinned,
+}
+
+impl View {
+    pub const ALL: [Self; 3] = [Self::Focus, Self::Overview, Self::Pinned];
+
+    fn index(self) -> usize {
+        Self::ALL.iter().position(|v| *v == self).unwrap_or(0)
+    }
+
+    pub fn next(self) -> Self {
+        Self::ALL[(self.index() + 1) % Self::ALL.len()]
+    }
+
+    pub fn previous(self) -> Self {
+        Self::ALL[(self.index() + Self::ALL.len() - 1) % Self::ALL.len()]
+    }
+
+    /// The tab's name in the footer hint, where no repo is to hand.
+    pub fn hint(self) -> &'static str {
+        match self {
+            Self::Focus => "repo",
+            Self::Overview => "agents",
+            Self::Pinned => "pinned",
+        }
+    }
 }
 
 /// What the sidebar selection points at, by identity so it survives refreshes.
@@ -80,25 +116,24 @@ pub enum View {
 pub enum Cursor {
     /// A repo row; only exists in Overview.
     Repo(RepoKey),
+    /// An entry where its repo lists it, or a pin in the Pinned tab.
     Entry(SessionName),
-    /// The copy of an entry in one of Overview's groups above the repos.
+    /// The copy of an entry in a group: Overview's and Pinned's Needs you.
     Grouped(Group, SessionName),
 }
 
-/// Overview's groups above the repos. Selecting a copy there doesn't
-/// expand its repo.
+/// A group of agents listed above or below the repos. Selecting a copy
+/// there doesn't expand its repo.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Group {
     /// Agents asking something, failed, or done and not yet seen.
     NeedsYou,
-    Pinned,
 }
 
 impl Group {
     pub fn title(self) -> &'static str {
         match self {
             Self::NeedsYou => "Needs you",
-            Self::Pinned => "Pinned",
         }
     }
 }
@@ -141,7 +176,7 @@ pub enum Row {
         key: RepoKey,
         fold: Fold,
     },
-    /// An agent in one of Overview's groups.
+    /// An agent in a group: Overview's or Pinned's Needs you.
     Grouped(Group, SessionName),
     /// An agent in another repo that needs you, listed under Focus's repo
     /// so it isn't missed. Selecting it would change the repo in focus, so
@@ -168,6 +203,8 @@ pub enum Place {
     Nested,
     /// Its repo's only entry, standing in for the repo row.
     Solo,
+    /// In the Pinned tab, with its repo on the right.
+    Pinned,
 }
 
 impl Row {
@@ -794,6 +831,9 @@ pub struct Model {
     /// worktree shows up before its session has started, and a second
     /// start from `⏎` would race the first and skip its prompt.
     pub launching: Vec<(Ticket, SessionName)>,
+    /// What was selected before a tab that doesn't list it was cycled
+    /// to, restored by the next tab that does unless you moved meanwhile.
+    displaced: Option<Cursor>,
     next_ticket: u64,
     pub actions: Actions,
     pub keys: Keys,
@@ -849,6 +889,7 @@ impl Model {
             work_room: WorkRoom::Fits,
             follow: None,
             launching: Vec::new(),
+            displaced: None,
             next_ticket: 0,
             actions: Actions::default(),
             keys: Keys::default(),
@@ -1129,39 +1170,35 @@ impl Model {
     }
 
     pub fn rows(&self) -> Vec<Row> {
-        let (Some(snapshot), Some(cursor)) = (self.snapshot(), self.cursor()) else {
+        let Some(snapshot) = self.snapshot() else {
             return Vec::new();
         };
-        let current = cursor.repo(snapshot).map(Repo::key);
+        let current = self.cursor().and_then(|c| c.repo(snapshot)).map(Repo::key);
         match self.view {
             View::Focus => current
                 .and_then(|k| snapshot.repo(k))
                 .map(|repo| self.focus_rows(repo))
                 .unwrap_or_default(),
-            View::Overview => {
-                let mut rows = Vec::new();
-                let waiting = self.needs_you();
-                if !waiting.is_empty() {
-                    rows.push(Row::Header(Group::NeedsYou));
-                    rows.extend(
-                        waiting
-                            .iter()
-                            .map(|name| Row::Grouped(Group::NeedsYou, name.clone())),
-                    );
-                }
-                let pinned: Vec<_> = snapshot
+            View::Pinned => {
+                let mut rows: Vec<Row> = snapshot
                     .pinned()
                     .into_iter()
-                    .filter(|(_, e)| !waiting.contains(e.name()))
+                    .map(|(_, e)| Row::Entry {
+                        name: e.name().clone(),
+                        place: Place::Pinned,
+                    })
                     .collect();
-                if !pinned.is_empty() {
-                    rows.push(Row::Header(Group::Pinned));
-                    rows.extend(
-                        pinned
-                            .iter()
-                            .map(|(_, e)| Row::Grouped(Group::Pinned, e.name().clone())),
-                    );
-                }
+                let waiting: Vec<SessionName> = self
+                    .needs_you()
+                    .into_iter()
+                    .filter(|name| !self.pinned(name))
+                    .collect();
+                rows.extend(Self::needs_you_rows(&waiting));
+                rows
+            }
+            View::Overview => {
+                let waiting = self.needs_you();
+                let mut rows = Self::needs_you_rows(&waiting);
                 let repos = snapshot.repos();
                 let listed = |e: &&Entry| !waiting.contains(e.name());
                 // Folds are worked out from the extent's worst case, so
@@ -1213,6 +1250,20 @@ impl Model {
         }
     }
 
+    /// The Needs you group, when anyone is in it.
+    fn needs_you_rows(waiting: &[SessionName]) -> Vec<Row> {
+        if waiting.is_empty() {
+            return Vec::new();
+        }
+        std::iter::once(Row::Header(Group::NeedsYou))
+            .chain(
+                waiting
+                    .iter()
+                    .map(|name| Row::Grouped(Group::NeedsYou, name.clone())),
+            )
+            .collect()
+    }
+
     /// Focus: the repo's entries, then agents from other repos that need
     /// you.
     fn focus_rows(&self, repo: &Repo) -> Vec<Row> {
@@ -1237,10 +1288,10 @@ impl Model {
         rows
     }
 
-    /// The sidebar list at its tallest: both views reserve the Needs you
+    /// The sidebar list at its tallest: every tab reserves the Needs you
     /// header even while it's hidden, Focus counts every other repo's entry
-    /// as a one-line row in it, and Overview counts pinned agents twice, in
-    /// their group and their repo.
+    /// as a one-line row in it, and Pinned counts every entry that isn't
+    /// pinned as waiting under the pins.
     pub fn extent(&self) -> Extent {
         let Some(snapshot) = self.snapshot() else {
             return Extent::default();
@@ -1261,18 +1312,13 @@ impl Model {
                 };
             }
             View::Overview => {
-                let pinned = snapshot.pinned();
-                let groups = 1 + usize::from(!pinned.is_empty());
                 let repos = snapshot.repos().iter().filter(|r| sole(r).is_none());
                 (
-                    groups + repos.count(),
-                    pinned
-                        .into_iter()
-                        .chain(snapshot.entries())
-                        .map(|(_, e)| e)
-                        .collect(),
+                    1 + repos.count(),
+                    snapshot.entries().map(|(_, e)| e).collect(),
                 )
             }
+            View::Pinned => (1, snapshot.entries().map(|(_, e)| e).collect()),
         };
         Extent {
             rows: headers + cards.len(),
@@ -1356,10 +1402,17 @@ impl Model {
         let view = self.view;
         let start_dir = self.start_dir.clone();
         let waiting = self.needs_you();
-        let listed_in_needs_you =
-            |name: &SessionName| view == View::Overview && waiting.contains(name);
         let Load::Ready { snapshot, cursor } = &mut self.load else {
             return;
+        };
+        let in_needs_you = |e: &Entry| match view {
+            View::Focus => false,
+            View::Overview => waiting.contains(e.name()),
+            View::Pinned => waiting.contains(e.name()) && e.pin().is_none(),
+        };
+        let listed = |e: &Entry| match view {
+            View::Focus | View::Overview => !in_needs_you(e),
+            View::Pinned => e.pin().is_some(),
         };
         let valid = match cursor.as_ref() {
             None => false,
@@ -1367,46 +1420,49 @@ impl Model {
                 view == View::Overview
                     && snapshot
                         .repo(key)
-                        .is_some_and(|r| r.entries().iter().any(|e| !waiting.contains(e.name())))
+                        .is_some_and(|r| r.entries().iter().any(&listed))
             }
             Some(Cursor::Grouped(Group::NeedsYou, name)) => {
-                view == View::Overview && waiting.contains(name)
+                snapshot.entry(name).is_some_and(|(_, e)| in_needs_you(e))
             }
-            Some(Cursor::Grouped(Group::Pinned, name)) => {
-                view == View::Overview
-                    && !waiting.contains(name)
-                    && snapshot.entry(name).is_some_and(|(_, e)| e.pin().is_some())
-            }
-            Some(Cursor::Entry(name)) => {
-                snapshot.entry(name).is_some() && !listed_in_needs_you(name)
-            }
+            Some(Cursor::Entry(name)) => snapshot.entry(name).is_some_and(|(_, e)| listed(e)),
         };
         if valid {
             return;
         }
-        let entry_of = |e: &Entry| match e.name() {
-            name if listed_in_needs_you(name) => Cursor::Grouped(Group::NeedsYou, name.clone()),
-            name => Cursor::Entry(name.clone()),
+        let entry_of = |e: &Entry| {
+            if in_needs_you(e) {
+                Some(Cursor::Grouped(Group::NeedsYou, e.name().clone()))
+            } else if listed(e) {
+                Some(Cursor::Entry(e.name().clone()))
+            } else {
+                None
+            }
         };
         let fallback = match cursor.as_ref() {
             Some(Cursor::Grouped(_, name) | Cursor::Entry(name)) => {
-                snapshot.entry(name).map(|(_, e)| entry_of(e))
+                snapshot.entry(name).and_then(|(_, e)| entry_of(e))
             }
-            Some(Cursor::Repo(key)) => snapshot.repo(key).map(|r| entry_of(r.first())),
+            Some(Cursor::Repo(key)) => snapshot.repo(key).and_then(|r| entry_of(r.first())),
             None => None,
         };
-        let fallback = fallback
-            .or_else(|| {
-                previous_repo
-                    .and_then(|k| snapshot.repo(k))
-                    .map(|r| entry_of(r.first()))
-            })
-            .or_else(|| {
-                snapshot
-                    .containing(&start_dir)
-                    .or_else(|| snapshot.entries().next())
-                    .map(|(_, e)| entry_of(e))
-            });
+        let fallback = fallback.or_else(|| match view {
+            View::Pinned => snapshot
+                .pinned()
+                .first()
+                .map(|(_, e)| *e)
+                .or_else(|| snapshot.entries().map(|(_, e)| e).find(|e| in_needs_you(e)))
+                .and_then(entry_of),
+            View::Focus | View::Overview => previous_repo
+                .and_then(|k| snapshot.repo(k))
+                .and_then(|r| entry_of(r.first()))
+                .or_else(|| {
+                    snapshot
+                        .containing(&start_dir)
+                        .or_else(|| snapshot.entries().next())
+                        .and_then(|(_, e)| entry_of(e))
+                }),
+        });
         if cursor.as_ref().and_then(Cursor::entry_name)
             != fallback.as_ref().and_then(Cursor::entry_name)
         {
@@ -1426,17 +1482,44 @@ impl Model {
         )
     }
 
-    /// Moves the cursor; repo rows and the pinned group only exist in
-    /// Overview, so in Focus those become the entry they stand for. In
-    /// Overview an agent that needs you is listed only under Needs you, and
-    /// a repo whose agents all need you has no row of its own.
+    /// Whether `name` is a pinned agent in the snapshot.
+    fn pinned(&self, name: &SessionName) -> bool {
+        self.snapshot()
+            .and_then(|s| s.entry(name))
+            .is_some_and(|(_, e)| e.pin().is_some())
+    }
+
+    /// Moves the cursor; repo rows only exist in Overview, so in Focus
+    /// those become the entry they stand for. In Overview an agent that
+    /// needs you is listed only under Needs you, and a repo whose agents
+    /// all need you has no row of its own. Pinned lists pins and the
+    /// other waiting agents, so anything else moves the tab to Overview.
     pub fn set_cursor(&mut self, next: Cursor) {
+        self.displaced = None;
+        if self.view == View::Pinned {
+            let listed = match &next {
+                Cursor::Repo(_) => false,
+                Cursor::Entry(name) | Cursor::Grouped(_, name) => {
+                    self.pinned(name) || self.needs_you().contains(name)
+                }
+            };
+            if !listed {
+                self.view = View::Overview;
+            }
+        }
         let next = match (self.view, next) {
             (View::Focus, Cursor::Grouped(_, name)) => Cursor::Entry(name),
             (View::Focus, Cursor::Repo(key)) => match self.snapshot().and_then(|s| s.repo(&key)) {
                 Some(repo) => Cursor::Entry(repo.first().name().clone()),
                 None => return,
             },
+            (View::Pinned, Cursor::Entry(name) | Cursor::Grouped(_, name)) => {
+                if self.pinned(&name) {
+                    Cursor::Entry(name)
+                } else {
+                    Cursor::Grouped(Group::NeedsYou, name)
+                }
+            }
             (View::Overview, Cursor::Entry(name)) if self.needs_you().contains(&name) => {
                 Cursor::Grouped(Group::NeedsYou, name)
             }
@@ -1518,26 +1601,52 @@ impl Model {
         self.select_repo(&key);
     }
 
+    /// Selects a repo, in the repo tab when the Pinned tab is showing.
     pub fn select_repo(&mut self, key: &RepoKey) {
         let Some(repo) = self.snapshot().and_then(|s| s.repo(key)) else {
             return;
         };
         let cursor = match (self.view, sole(repo)) {
             (View::Overview, None) => Cursor::Repo(key.clone()),
-            (View::Overview, Some(_)) | (View::Focus, _) => {
+            (View::Overview, Some(_)) | (View::Focus | View::Pinned, _) => {
                 Cursor::Entry(repo.first().name().clone())
             }
         };
+        if self.view == View::Pinned {
+            self.view = View::Focus;
+        }
         self.set_cursor(cursor);
     }
 
+    /// The next tab.
+    #[cfg(test)]
     pub fn toggle_view(&mut self) {
-        self.view = match self.view {
-            View::Focus => View::Overview,
-            View::Overview => View::Focus,
-        };
+        self.cycle_view(Direction::Forward);
+    }
+
+    /// Moves to the next or previous tab, keeping the selected agent when
+    /// the tab lists it. One that doesn't is remembered, so a full cycle
+    /// comes back to it.
+    pub fn cycle_view(&mut self, direction: Direction) {
+        let remembered = self
+            .displaced
+            .take()
+            .filter(|c| self.snapshot().and_then(|s| c.repo(s)).is_some());
+        let wanted = remembered.or_else(|| self.cursor().cloned());
         let repo = self.selected().map(|(r, _)| r.key().clone());
+        self.view = match direction {
+            Direction::Forward => self.view.next(),
+            Direction::Back => self.view.previous(),
+        };
+        if let Load::Ready { cursor, .. } = &mut self.load {
+            cursor.clone_from(&wanted);
+        }
         self.reconcile(repo.as_ref());
+        if self.cursor().and_then(Cursor::entry_name)
+            != wanted.as_ref().and_then(Cursor::entry_name)
+        {
+            self.displaced = wanted;
+        }
     }
 
     pub fn info(&mut self, text: impl Into<String>) {
@@ -2208,7 +2317,17 @@ mod tests {
         let fix: SessionName = "fix".parse().expect("parses");
         let needs_you = Cursor::Grouped(Group::NeedsYou, fix.clone());
         assert!(needs_you.follows(&Cursor::Entry(fix.clone())));
-        assert!(Cursor::Grouped(Group::Pinned, fix.clone()).follows(&needs_you));
-        assert!(!Cursor::Grouped(Group::Pinned, fix.clone()).follows(&Cursor::Entry(fix)));
+        assert!(Cursor::Entry(fix.clone()).follows(&needs_you));
+        let web: SessionName = "web".parse().expect("parses");
+        assert!(!Cursor::Entry(web).follows(&needs_you));
+    }
+
+    #[test]
+    fn the_tabs_cycle_in_order_and_back() {
+        for (i, view) in View::ALL.into_iter().enumerate() {
+            assert_eq!(view.next(), View::ALL[(i + 1) % View::ALL.len()]);
+            assert_eq!(view.next().previous(), view);
+            assert_eq!(view.previous().next(), view);
+        }
     }
 }

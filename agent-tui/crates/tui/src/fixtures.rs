@@ -195,6 +195,7 @@ pub fn fleet(n: usize) -> Model {
     let mut repos = Vec::new();
     let mut activities = HashMap::new();
     let mut facts_of = HashMap::new();
+    let mut pins = Vec::new();
     for (r, start) in (0..n).step_by(PER_REPO).enumerate() {
         let repo = format!("{}{}", REPOS[r % REPOS.len()], r / REPOS.len());
         let main = format!("/src/{repo}");
@@ -212,6 +213,9 @@ pub fn fleet(n: usize) -> Model {
             sessions.extend(session(k, &cwd, &entry));
             if let Some(activity) = doing(k) {
                 activities.insert(entry.clone(), activity);
+            }
+            if k % 10 == 0 {
+                pins.push(entry.clone());
             }
             facts_of.insert(entry, Ok(facts(k)));
         }
@@ -234,7 +238,7 @@ pub fn fleet(n: usize) -> Model {
     let snapshot = assemble(
         &observation,
         &Layout::new("/w".into()).expect("absolute"),
-        &[],
+        &pins,
     )
     .0;
     let mut m = Model::new(

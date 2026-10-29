@@ -53,7 +53,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
                 "p",
                 "repos: focus one, or add one from the catalogue or a path",
             ),
-            ("Tab", "focus ↔ overview"),
+            ("Tab ⇧Tab", "next / previous tab: repo, agents, pinned"),
             ("m", "pin / unpin"),
             ("n", "new agent"),
             ("e", "open in $EDITOR, the file in [3]"),
@@ -377,19 +377,47 @@ fn panel<'a>(
         .title_bottom(Line::from(corner).right_aligned())
 }
 
-fn sidebar_title(m: &Model) -> Vec<Span<'static>> {
-    match (m.snapshot(), m.view, m.selected()) {
-        (None, _, _) => vec![Span::raw("[1] "), Span::styled("Loading…", dim())],
-        (Some(_), View::Focus, Some((repo, _))) => {
-            vec![
-                Span::raw("[1] "),
-                Span::styled(repo.name().into_owned(), bold()),
-            ]
+/// The tab strip needs the repo name at its shortest, the two fixed tabs
+/// and the separators.
+const TABS_MIN: usize = 4 + NAME_MIN + 18;
+
+/// `[1]` then the tabs, lazygit-style: the active one BOLD, the others
+/// plain with a DIM `·` between. The form follows the width alone, so
+/// moving the cursor never flips it: below `TABS_MIN` only the active tab
+/// shows, and above it the repo name yields to fit.
+fn sidebar_title(m: &Model, width: usize) -> Vec<Span<'static>> {
+    let Some(_) = m.snapshot() else {
+        return vec![Span::raw("[1] "), Span::styled("Loading…", dim())];
+    };
+    let repo = m.selected().map(|(repo, _)| repo.name().into_owned());
+    let name = |view: View, room: usize| match view {
+        View::Focus => repo.as_deref().map(|r| truncate_end(r, room)),
+        View::Overview => Some("Agents".into()),
+        View::Pinned => Some("Pinned".into()),
+    };
+    if width < TABS_MIN || repo.is_none() {
+        let mut title = vec![Span::raw("[1]")];
+        if let Some(active) = name(m.view, width.saturating_sub(4)) {
+            title.push(Span::raw(" "));
+            title.push(Span::styled(active, bold()));
         }
-        (Some(_), View::Focus, None) | (Some(_), View::Overview, _) => {
-            vec![Span::raw("[1] "), Span::styled("Agents", bold())]
-        }
+        return title;
     }
+    let mut tabs = vec![Span::raw("[1] ")];
+    for (i, view) in View::ALL.into_iter().enumerate() {
+        if i > 0 {
+            tabs.push(Span::styled(" · ", dim()));
+        }
+        // An explicit default colour keeps the inactive tabs out of the
+        // focused panel's accent, which would read them as one title.
+        let style = if view == m.view {
+            bold()
+        } else {
+            Style::new().fg(Color::Reset)
+        };
+        tabs.extend(name(view, width - (TABS_MIN - NAME_MIN)).map(|n| Span::styled(n, style)));
+    }
+    tabs
 }
 
 /// `3 of 7`: where the selection is in the list, in the border's colour.
@@ -493,6 +521,7 @@ fn draw_terminal(frame: &mut Frame<'_>, m: &Model, area: Rect) {
             Line::styled(format!("attaching to {name}…"), dim())
         }
         (Load::Pending, ..) => Line::styled("Loading…", dim()),
+        (_, _, None) if m.view == View::Pinned => Line::styled("Nothing pinned", dim()),
         (_, _, None) => action("n", "new agent".into()),
         (_, _, Some((repo, None))) => action("⏎", format!("focus {}", repo.name())),
         (_, _, Some((_, Some(entry)))) => match m.reach(entry) {
@@ -576,9 +605,9 @@ fn draw_status_bar(frame: &mut Frame<'_>, m: &Model, area: Rect) {
             }
             (_, Some(Reach::Own) | None) => {}
         }
-        hints.push(ranked("Space", "switch", 6));
+        hints.push(ranked("Space", "switch", 5));
         if let (Panel::Agents | Panel::Changes { .. }, Turn::Hidden(_)) = (m.panel, m.turn) {
-            hints.push(ranked("2", "read", 6));
+            hints.push(ranked("2", "read", 5));
         }
         if let Some(entry) = entry {
             let pin = match entry.pin() {
@@ -591,15 +620,7 @@ fn draw_status_bar(frame: &mut Frame<'_>, m: &Model, area: Rect) {
             }
         }
         hints.push(ranked("n", "new", 4));
-        hints.push(ranked(
-            "Tab",
-            if m.view == View::Focus {
-                "overview"
-            } else {
-                "focus"
-            },
-            5,
-        ));
+        hints.push(ranked("Tab", m.view.next().hint(), 6));
         if entry.is_some() && !m.actions.is_empty() {
             hints.push(ranked("x", "actions", 0));
         }
