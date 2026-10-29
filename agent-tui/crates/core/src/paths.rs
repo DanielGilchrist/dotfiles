@@ -18,12 +18,18 @@ pub enum PathError {
 }
 
 pub fn home() -> Result<PathBuf, PathError> {
-    let home = std::env::var_os("HOME").map(PathBuf::from).ok_or(PathError::NoHome)?;
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or(PathError::NoHome)?;
     absolute(home)
 }
 
 fn absolute(path: PathBuf) -> Result<PathBuf, PathError> {
-    if path.is_absolute() { Ok(path) } else { Err(PathError::NotAbsolute(path)) }
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        Err(PathError::NotAbsolute(path))
+    }
 }
 
 /// The main worktree of a git repository: the identity of a repo.
@@ -44,7 +50,9 @@ impl RepoRoot {
     }
 
     pub fn name(&self) -> Cow<'_, str> {
-        self.0.file_name().map_or(Cow::Borrowed(""), |n| n.to_string_lossy())
+        self.0
+            .file_name()
+            .map_or(Cow::Borrowed(""), |n| n.to_string_lossy())
     }
 }
 
@@ -74,7 +82,9 @@ pub struct Layout {
 
 impl Layout {
     pub fn new(root: PathBuf) -> Result<Self, PathError> {
-        Ok(Self { root: absolute(root)? })
+        Ok(Self {
+            root: absolute(root)?,
+        })
     }
 
     /// `$AGENT_WORKTREES`, defaulting to `~/worktrees`.
@@ -112,7 +122,8 @@ impl Layout {
     /// The agent worktree containing `path` (or equal to it).
     pub fn enclosing(&self, path: &Path) -> Option<AgentWorktree> {
         let mut components = path.strip_prefix(&self.root).ok()?.components();
-        let (Some(Component::Normal(repo)), Some(Component::Normal(name))) = (components.next(), components.next())
+        let (Some(Component::Normal(repo)), Some(Component::Normal(name))) =
+            (components.next(), components.next())
         else {
             return None;
         };
@@ -120,7 +131,10 @@ impl Layout {
             return None;
         }
         let name: AgentName = name.to_str()?.parse().ok()?;
-        Some(AgentWorktree { path: self.root.join(repo).join(name.as_str()), name })
+        Some(AgentWorktree {
+            path: self.root.join(repo).join(name.as_str()),
+            name,
+        })
     }
 
     pub fn scan(&self) -> io::Result<Vec<AgentWorktree>> {
@@ -147,7 +161,11 @@ impl Layout {
     }
 
     pub fn named(&self, name: &AgentName) -> io::Result<Vec<AgentWorktree>> {
-        Ok(self.scan()?.into_iter().filter(|wt| &wt.name == name).collect())
+        Ok(self
+            .scan()?
+            .into_iter()
+            .filter(|wt| &wt.name == name)
+            .collect())
     }
 
     pub fn trash(&self) -> PathBuf {
@@ -157,7 +175,9 @@ impl Layout {
     /// A fresh path in the trash dir. It shares a filesystem with every
     /// worktree, so moving a worktree there is an atomic rename.
     pub fn trash_slot(&self, name: &AgentName) -> TrashSlot {
-        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
         TrashSlot(self.trash().join(format!("{name}-{nanos}")))
     }
 }
@@ -192,7 +212,9 @@ mod tests {
 
     #[test]
     fn enclosing_finds_the_agent_worktree_around_a_path() {
-        let wt = layout().enclosing(Path::new("/w/api/fix/src/main.rs")).unwrap();
+        let wt = layout()
+            .enclosing(Path::new("/w/api/fix/src/main.rs"))
+            .unwrap();
         assert_eq!(wt.path(), Path::new("/w/api/fix"));
         assert_eq!(wt.name().as_str(), "fix");
     }
@@ -205,7 +227,12 @@ mod tests {
 
     #[test]
     fn paths_outside_agent_worktrees_are_rejected() {
-        for path in ["/elsewhere/api/fix", "/w/api", "/w/.trash/fix-1", "/w/api/.hidden"] {
+        for path in [
+            "/elsewhere/api/fix",
+            "/w/api",
+            "/w/.trash/fix-1",
+            "/w/api/.hidden",
+        ] {
             assert!(layout().enclosing(Path::new(path)).is_none(), "{path}");
         }
     }

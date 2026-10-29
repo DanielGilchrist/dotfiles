@@ -7,7 +7,9 @@ use std::time::Duration;
 use agent_core::model::{Head, Worktree};
 use agent_core::names::BranchName;
 use agent_core::paths::{AgentWorktree, RepoRoot};
-use agent_core::ports::{BranchState, LocalBranch, RemoteBranch, RepoWorktrees, Vcs, WorktreeStart};
+use agent_core::ports::{
+    BranchState, DiffStat, LocalBranch, Progress, RemoteBranch, RepoWorktrees, Vcs, WorktreeStart,
+};
 use agent_core::process::{self, CommandError};
 
 /// A checkout of a large repo can take minutes.
@@ -39,7 +41,10 @@ fn git(dir: &Path) -> Command {
 }
 
 fn parse_error(cmd: &Command, detail: impl Into<String>) -> CommandError {
-    CommandError::Parse { command: process::describe(cmd), detail: detail.into() }
+    CommandError::Parse {
+        command: process::describe(cmd),
+        detail: detail.into(),
+    }
 }
 
 /// Runs a query whose exit code 1 means "no" (`rev-parse --verify --quiet`).
@@ -55,14 +60,21 @@ fn query(mut cmd: Command) -> Result<bool, CommandError> {
 fn parse_repo_worktrees(porcelain: &str) -> Result<RepoWorktrees, String> {
     let mut worktrees = parse_worktrees(porcelain)?.into_iter();
     let main = worktrees.next().ok_or("no worktrees listed")?;
-    Ok(RepoWorktrees { main, linked: worktrees.collect() })
+    Ok(RepoWorktrees {
+        main,
+        linked: worktrees.collect(),
+    })
 }
 
 fn parse_worktrees(porcelain: &str) -> Result<Vec<Worktree>, String> {
     porcelain
         .split("\n\n")
         .filter(|block| !block.trim().is_empty())
-        .filter(|block| !block.lines().any(|l| l == "bare" || l.starts_with("prunable")))
+        .filter(|block| {
+            !block
+                .lines()
+                .any(|l| l == "bare" || l.starts_with("prunable"))
+        })
         .map(|block| {
             let mut path = None;
             let mut head = Head::Detached;
@@ -85,35 +97,70 @@ impl Git {
         cmd.args(["config", "--get", key]);
         let out = process::output(&mut cmd)?;
         match out.status.code() {
-            Some(0) => Ok(Some(String::from_utf8_lossy(&out.stdout).trim().to_string())),
+            Some(0) => Ok(Some(
+                String::from_utf8_lossy(&out.stdout).trim().to_string(),
+            )),
             Some(1) => Ok(None),
             _ => Err(process::failed(&cmd, &out)),
         }
+    }
+
+    /// `git diff --shortstat` of the working tree against `since`.
+    fn shortstat(dir: &Path, since: &str) -> Result<DiffStat, CommandError> {
+        let mut cmd = git(dir);
+        cmd.args(["diff", "--shortstat", since]);
+        let out = process::run(&mut cmd)?;
+        let number = |unit: &str| {
+            out.split(',')
+                .find(|part| part.contains(unit))
+                .and_then(|part| part.split_whitespace().next())
+                .and_then(|n| n.parse().ok())
+                .unwrap_or(0)
+        };
+        Ok(DiffStat {
+            files: number("file"),
+            added: number("insertion"),
+            removed: number("deletion"),
+        })
     }
 
     fn count(dir: &Path, range: &[&str]) -> Result<usize, CommandError> {
         let mut cmd = git(dir);
         cmd.args(["rev-list", "--count"]).args(range);
         let count = process::run(&mut cmd)?;
-        count.trim().parse().map_err(|_| parse_error(&cmd, count.trim()))
+        count
+            .trim()
+            .parse()
+            .map_err(|_| parse_error(&cmd, count.trim()))
     }
 
     /// For a branch with commits ahead of the base: did it track its own
     /// branch on a remote that has since been deleted (merged with
     /// auto-delete)? Safe only if nothing was committed after the last push,
     /// which needs the remote-tracking ref to still be present locally.
-    fn upstream_state(repo: &RepoRoot, branch: &BranchName, ahead: NonZeroUsize) -> Result<BranchState, CommandError> {
+    fn upstream_state(
+        repo: &RepoRoot,
+        branch: &BranchName,
+        ahead: NonZeroUsize,
+    ) -> Result<BranchState, CommandError> {
         let unmerged = BranchState::Unmerged { ahead };
-        let (Some(remote), Some(merge)) =
-            (Self::config(repo, &format!("branch.{branch}.remote"))?, Self::config(repo, &format!("branch.{branch}.merge"))?)
-        else {
+        let (Some(remote), Some(merge)) = (
+            Self::config(repo, &format!("branch.{branch}.remote"))?,
+            Self::config(repo, &format!("branch.{branch}.merge"))?,
+        ) else {
             return Ok(unmerged);
         };
         if merge != format!("refs/heads/{branch}") || remote == "." {
             return Ok(unmerged);
         }
         let mut ls = git(repo.path());
-        ls.args(["ls-remote", "--exit-code", "--heads", &remote, branch.as_str()]);
+        ls.args([
+            "ls-remote",
+            "--exit-code",
+            "--heads",
+            &remote,
+            branch.as_str(),
+        ]);
         let out = process::output(&mut ls)?;
         match out.status.code() {
             Some(0) => return Ok(unmerged),
@@ -129,15 +176,24 @@ impl Git {
         Ok(BranchState::UpstreamGone { ahead })
     }
 
-    fn default_base(repo: &RepoRoot) -> Result<Option<String>, CommandError> {
-        let mut cmd = git(repo.path());
-        cmd.args(["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"]);
+    /// Origin's default branch, as seen from `dir` (any of the repo's
+    /// worktrees: refs are shared).
+    fn default_base(dir: &Path) -> Result<Option<String>, CommandError> {
+        let mut cmd = git(dir);
+        cmd.args([
+            "symbolic-ref",
+            "--quiet",
+            "--short",
+            "refs/remotes/origin/HEAD",
+        ]);
         let out = process::output(&mut cmd)?;
         if out.status.success() {
-            return Ok(Some(String::from_utf8_lossy(&out.stdout).trim().to_string()));
+            return Ok(Some(
+                String::from_utf8_lossy(&out.stdout).trim().to_string(),
+            ));
         }
         for candidate in ["origin/main", "origin/master"] {
-            let mut cmd = git(repo.path());
+            let mut cmd = git(dir);
             cmd.args(["rev-parse", "--verify", "--quiet", candidate]);
             if query(cmd)? {
                 return Ok(Some(candidate.into()));
@@ -164,7 +220,9 @@ impl Vcs for Git {
         cmd.args(["worktree", "list", "--porcelain"]);
         let stdout = process::run(&mut cmd)?;
         let worktrees = parse_repo_worktrees(&stdout).map_err(|e| parse_error(&cmd, e))?;
-        RepoRoot::new(worktrees.main.path).map(Some).map_err(|e| parse_error(&cmd, e.to_string()))
+        RepoRoot::new(worktrees.main.path)
+            .map(Some)
+            .map_err(|e| parse_error(&cmd, e.to_string()))
     }
 
     fn worktrees(&self, repo: &RepoRoot) -> Result<RepoWorktrees, CommandError> {
@@ -181,20 +239,34 @@ impl Vcs for Git {
         match out.status.code() {
             Some(0) => {
                 let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                name.parse().map(Head::Branch).map_err(|e: agent_core::names::NameError| parse_error(&cmd, e.to_string()))
+                name.parse()
+                    .map(Head::Branch)
+                    .map_err(|e: agent_core::names::NameError| parse_error(&cmd, e.to_string()))
             }
             Some(1) => Ok(Head::Detached),
             _ => Err(process::failed(&cmd, &out)),
         }
     }
 
-    fn add_worktree(&self, repo: &RepoRoot, at: &AgentWorktree, start: &WorktreeStart) -> Result<(), CommandError> {
+    fn add_worktree(
+        &self,
+        repo: &RepoRoot,
+        at: &AgentWorktree,
+        start: &WorktreeStart,
+    ) -> Result<(), CommandError> {
         let mut cmd = git(repo.path());
-        cmd.args(["-c", "checkout.workers=8", "-c", "checkout.thresholdForParallelism=100", "worktree", "add"]);
+        cmd.args([
+            "-c",
+            "checkout.workers=8",
+            "-c",
+            "checkout.thresholdForParallelism=100",
+            "worktree",
+            "add",
+        ]);
         match start {
             WorktreeStart::DefaultBase => {
                 cmd.arg("--detach").arg(at.path());
-                if let Some(base) = Self::default_base(repo)? {
+                if let Some(base) = Self::default_base(repo.path())? {
                     cmd.arg(base);
                 }
             }
@@ -203,33 +275,57 @@ impl Vcs for Git {
             }
             WorktreeStart::TrackRemote(remote) => {
                 let branch = remote.name();
-                cmd.args(["-b", branch.as_str()]).arg(at.path()).arg(format!("origin/{branch}"));
+                cmd.args(["-b", branch.as_str()])
+                    .arg(at.path())
+                    .arg(format!("origin/{branch}"));
             }
         }
         let out = process::output_within(&mut cmd, CHECKOUT_TIMEOUT)?;
-        if out.status.success() { Ok(()) } else { Err(process::failed(&cmd, &out)) }
+        if out.status.success() {
+            Ok(())
+        } else {
+            Err(process::failed(&cmd, &out))
+        }
     }
 
     fn prune_worktrees(&self, repo: &RepoRoot) -> Result<(), CommandError> {
         process::run(git(repo.path()).args(["worktree", "prune"])).map(drop)
     }
 
-    fn local_branch(&self, repo: &RepoRoot, branch: &BranchName) -> Result<Option<LocalBranch>, CommandError> {
+    fn local_branch(
+        &self,
+        repo: &RepoRoot,
+        branch: &BranchName,
+    ) -> Result<Option<LocalBranch>, CommandError> {
         let mut cmd = git(repo.path());
-        cmd.args(["rev-parse", "--verify", "--quiet"]).arg(format!("refs/heads/{branch}"));
+        cmd.args(["rev-parse", "--verify", "--quiet"])
+            .arg(format!("refs/heads/{branch}"));
         Ok(query(cmd)?.then(|| LocalBranch::found(branch.clone())))
     }
 
-    fn remote_branch(&self, repo: &RepoRoot, branch: &BranchName) -> Result<Option<RemoteBranch>, CommandError> {
+    fn remote_branch(
+        &self,
+        repo: &RepoRoot,
+        branch: &BranchName,
+    ) -> Result<Option<RemoteBranch>, CommandError> {
         let mut cmd = git(repo.path());
-        cmd.args(["rev-parse", "--verify", "--quiet"]).arg(format!("refs/remotes/origin/{branch}"));
+        cmd.args(["rev-parse", "--verify", "--quiet"])
+            .arg(format!("refs/remotes/origin/{branch}"));
         Ok(query(cmd)?.then(|| RemoteBranch::found(branch.clone())))
     }
 
-    fn branch_state(&self, repo: &RepoRoot, branch: &BranchName) -> Result<BranchState, CommandError> {
-        let Some(local) = self.local_branch(repo, branch)? else { return Ok(BranchState::Missing) };
+    fn branch_state(
+        &self,
+        repo: &RepoRoot,
+        branch: &BranchName,
+    ) -> Result<BranchState, CommandError> {
+        let Some(local) = self.local_branch(repo, branch)? else {
+            return Ok(BranchState::Missing);
+        };
         let branch = local.name();
-        let Some(base) = Self::default_base(repo)? else { return Ok(BranchState::Unknown) };
+        let Some(base) = Self::default_base(repo.path())? else {
+            return Ok(BranchState::Unknown);
+        };
         let ahead = Self::count(repo.path(), &[&format!("{base}..{branch}")])?;
         match NonZeroUsize::new(ahead) {
             None => Ok(BranchState::Safe),
@@ -246,6 +342,22 @@ impl Vcs for Git {
 
     fn unreachable_commits(&self, worktree: &Path) -> Result<usize, CommandError> {
         Self::count(worktree, &["HEAD", "--not", "--branches", "--remotes"])
+    }
+
+    fn progress(&self, worktree: &Path) -> Result<Progress, CommandError> {
+        let Some(base) = Self::default_base(worktree)? else {
+            return Ok(Progress {
+                ahead: 0,
+                diff: Self::shortstat(worktree, "HEAD")?,
+            });
+        };
+        let mut cmd = git(worktree);
+        cmd.args(["merge-base", "HEAD", &base]);
+        let fork = process::run(&mut cmd)?.trim().to_string();
+        Ok(Progress {
+            ahead: Self::count(worktree, &[&format!("{fork}..HEAD")])?,
+            diff: Self::shortstat(worktree, &fork)?,
+        })
     }
 
     fn delete_branch(&self, repo: &RepoRoot, branch: LocalBranch) -> Result<(), CommandError> {
@@ -272,47 +384,168 @@ mod tests {
     fn git_repo_round_trip() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().to_path_buf();
-        let run = |args: &[&str]| assert!(Command::new("git").arg("-C").arg(&dir).args(args).output().unwrap().status.success());
+        let run = |args: &[&str]| {
+            assert!(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(&dir)
+                    .args(args)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success()
+            );
+        };
         run(&["init", "-q", "-b", "main"]);
-        run(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "init"]);
+        run(&[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "init",
+        ]);
 
         let dir = dir.canonicalize().unwrap();
         let repo = Git.repo_of(&dir).unwrap().unwrap();
         assert_eq!(repo.path(), dir);
-        assert_eq!(Git.head(&dir).unwrap(), Head::Branch("main".parse().unwrap()));
+        assert_eq!(
+            Git.head(&dir).unwrap(),
+            Head::Branch("main".parse().unwrap())
+        );
         let main: BranchName = "main".parse().unwrap();
-        assert_eq!(Git.local_branch(&repo, &main).unwrap(), Some(LocalBranch::found(main.clone())));
-        assert_eq!(Git.local_branch(&repo, &"nope".parse().unwrap()).unwrap(), None);
+        assert_eq!(
+            Git.local_branch(&repo, &main).unwrap(),
+            Some(LocalBranch::found(main.clone()))
+        );
+        assert_eq!(
+            Git.local_branch(&repo, &"nope".parse().unwrap()).unwrap(),
+            None
+        );
         assert!(Git.repo_of(Path::new("/")).unwrap().is_none());
-        assert_eq!(Git.branch_state(&repo, &main).unwrap(), BranchState::Unknown, "no origin means no base");
+        assert_eq!(
+            Git.branch_state(&repo, &main).unwrap(),
+            BranchState::Unknown,
+            "no origin means no base"
+        );
+    }
+
+    #[test]
+    fn progress_counts_commits_and_changes_since_the_fork() {
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origin");
+        let work = tmp.path().join("work");
+        let git = |dir: &Path, args: &[&str]| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        std::fs::create_dir_all(&origin).unwrap();
+        git(&origin, &["init", "-q", "-b", "main"]);
+        git(&origin, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        git(
+            tmp.path(),
+            &["clone", "-q", origin.to_str().unwrap(), "work"],
+        );
+        std::fs::write(work.join("a.txt"), "one\ntwo\n").unwrap();
+        git(&work, &["add", "a.txt"]);
+        git(&work, &["commit", "-q", "-m", "a"]);
+        std::fs::write(work.join("a.txt"), "one\n").unwrap();
+        let progress = Git.progress(&work).unwrap();
+        assert_eq!(progress.ahead, 1);
+        assert_eq!(
+            progress.diff,
+            DiffStat {
+                files: 1,
+                added: 1,
+                removed: 0
+            },
+            "uncommitted edits count too"
+        );
     }
 
     #[test]
     fn only_branches_deleted_from_their_own_remote_count_as_merged() {
         let tmp = tempfile::tempdir().unwrap();
         let sh = |dir: &Path, script: &str| {
-            let out = Command::new("sh").arg("-c").arg(script).current_dir(dir).output().unwrap();
-            assert!(out.status.success(), "{script}: {}", String::from_utf8_lossy(&out.stderr));
+            let out = Command::new("sh")
+                .arg("-c")
+                .arg(script)
+                .current_dir(dir)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{script}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
         };
         let commit = "git -c user.name=t -c user.email=t@t commit -q --allow-empty -m";
-        sh(tmp.path(), "git init -q --bare -b main origin.git && git init -q -b main work");
+        sh(
+            tmp.path(),
+            "git init -q --bare -b main origin.git && git init -q -b main work",
+        );
         let work = tmp.path().join("work").canonicalize().unwrap();
-        sh(&work, &format!("{commit} init && git remote add origin ../origin.git && git push -q -u origin main && git remote set-head origin main"));
+        sh(
+            &work,
+            &format!(
+                "{commit} init && git remote add origin ../origin.git && git push -q -u origin main && git remote set-head origin main"
+            ),
+        );
         let repo = Git.repo_of(&work).unwrap().unwrap();
 
-        sh(&work, &format!("git checkout -q -b tracks-main origin/main && {commit} wip"));
+        sh(
+            &work,
+            &format!("git checkout -q -b tracks-main origin/main && {commit} wip"),
+        );
         let tracks_main: BranchName = "tracks-main".parse().unwrap();
-        assert!(matches!(Git.branch_state(&repo, &tracks_main).unwrap(), BranchState::Unmerged { .. }));
+        assert!(matches!(
+            Git.branch_state(&repo, &tracks_main).unwrap(),
+            BranchState::Unmerged { .. }
+        ));
 
-        sh(&work, &format!("git checkout -q -b merged main && {commit} done && git push -q -u origin merged && git -C ../origin.git branch -q -D merged"));
+        sh(
+            &work,
+            &format!(
+                "git checkout -q -b merged main && {commit} done && git push -q -u origin merged && git -C ../origin.git branch -q -D merged"
+            ),
+        );
         let merged: BranchName = "merged".parse().unwrap();
-        assert_eq!(Git.branch_state(&repo, &merged).unwrap(), BranchState::Safe, "tracking ref still local, nothing after it");
+        assert_eq!(
+            Git.branch_state(&repo, &merged).unwrap(),
+            BranchState::Safe,
+            "tracking ref still local, nothing after it"
+        );
 
         sh(&work, &format!("{commit} after-merge"));
-        assert!(matches!(Git.branch_state(&repo, &merged).unwrap(), BranchState::UpstreamGone { .. }), "commits after the push");
+        assert!(
+            matches!(
+                Git.branch_state(&repo, &merged).unwrap(),
+                BranchState::UpstreamGone { .. }
+            ),
+            "commits after the push"
+        );
 
         sh(&work, "git fetch -q --prune origin");
-        assert!(matches!(Git.branch_state(&repo, &merged).unwrap(), BranchState::UpstreamGone { .. }), "can't tell once the tracking ref is pruned");
+        assert!(
+            matches!(
+                Git.branch_state(&repo, &merged).unwrap(),
+                BranchState::UpstreamGone { .. }
+            ),
+            "can't tell once the tracking ref is pruned"
+        );
 
         sh(&work, "git checkout -q main");
         let main: BranchName = "main".parse().unwrap();
@@ -323,7 +556,17 @@ mod tests {
     fn dirty_files_and_detached_commits_are_counted() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().canonicalize().unwrap();
-        let sh = |script: &str| assert!(Command::new("sh").arg("-c").arg(script).current_dir(&dir).status().unwrap().success());
+        let sh = |script: &str| {
+            assert!(
+                Command::new("sh")
+                    .arg("-c")
+                    .arg(script)
+                    .current_dir(&dir)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
         let commit = "git -c user.name=t -c user.email=t@t commit -q --allow-empty -m";
         sh(&format!("git init -q -b main && {commit} init"));
         assert_eq!(Git.dirty_files(&dir).unwrap(), 0);

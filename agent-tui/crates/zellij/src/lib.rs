@@ -1,14 +1,17 @@
 use std::collections::HashMap;
-use std::fmt::Write as _;
 use std::ffi::OsString;
+use std::fmt::Write as _;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
+use std::sync::OnceLock;
+use std::time::{Duration, SystemTime};
 
 use agent_core::model::Running;
 use agent_core::names::SessionName;
-use agent_core::ports::{ClientControl, ClientId, HostError, PaneCommand, SessionHost, SessionInfo, SessionStatus};
+use agent_core::ports::{
+    ClientControl, ClientId, HostError, PaneCommand, SessionHost, SessionInfo, SessionStatus,
+};
 use agent_core::process::{self, CommandError, LaunchSpec, parallel_map};
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
@@ -57,7 +60,11 @@ fn parse_sessions(listing: &str) -> Vec<(SessionName, Listed)> {
         .lines()
         .filter_map(|line| {
             let name = line.split_whitespace().next()?.parse().ok()?;
-            let listed = if line.contains("(EXITED") { Listed::Exited } else { Listed::Live };
+            let listed = if line.contains("(EXITED") {
+                Listed::Exited
+            } else {
+                Listed::Live
+            };
             Some((name, listed))
         })
         .collect()
@@ -70,7 +77,9 @@ fn list() -> Result<Vec<(SessionName, Listed)>, HostError> {
     let stdout = String::from_utf8_lossy(&out.stdout);
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
-        return if stderr.contains("No active zellij sessions") || stdout.contains("No active zellij sessions") {
+        return if stderr.contains("No active zellij sessions")
+            || stdout.contains("No active zellij sessions")
+        {
             Ok(Vec::new())
         } else {
             Err(process::failed(&cmd, &out).into())
@@ -87,16 +96,82 @@ fn panes(name: &SessionName) -> Result<Vec<serde_json::Value>, HostError> {
         return Err(process::failed(&cmd, &out).into());
     }
     let stdout = String::from_utf8_lossy(&out.stdout);
-    serde_json::from_str(&stdout)
-        .map_err(|e| CommandError::Parse { command: process::describe(&cmd), detail: e.to_string() }.into())
+    serde_json::from_str(&stdout).map_err(|e| {
+        CommandError::Parse {
+            command: process::describe(&cmd),
+            detail: e.to_string(),
+        }
+        .into()
+    })
 }
 
 fn terminal_panes(panes: &[serde_json::Value]) -> impl Iterator<Item = &serde_json::Value> {
     panes.iter().filter(|p| p["is_plugin"] != true)
 }
 
+/// Where zellij keeps resurrection layouts, from `zellij setup --check`.
+fn cache_dir() -> Option<&'static Path> {
+    static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
+    DIR.get_or_init(|| {
+        let out = process::output(zellij().args(["setup", "--check"])).ok()?;
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .find_map(|line| line.strip_prefix("[CACHE DIR]:"))
+            .map(|dir| PathBuf::from(dir.trim()))
+    })
+    .as_deref()
+}
+
+/// Where an exited session last ran, from its newest resurrection layout.
+fn exited_cwd(name: &SessionName) -> Option<PathBuf> {
+    let newest = std::fs::read_dir(cache_dir()?)
+        .ok()?
+        .flatten()
+        .map(|dir| {
+            dir.path()
+                .join("session_info")
+                .join(name.as_str())
+                .join("session-layout.kdl")
+        })
+        .filter_map(|path| Some((std::fs::metadata(&path).ok()?.modified().ok()?, path)))
+        .max_by_key(|(modified, _): &(SystemTime, PathBuf)| *modified)?;
+    layout_cwd(&std::fs::read_to_string(newest.1).ok()?)
+}
+
+/// The first `cwd` in a serialized layout: the layout's own, or else its
+/// first pane's.
+fn layout_cwd(kdl: &str) -> Option<PathBuf> {
+    kdl.lines().find_map(|line| {
+        let (_, rest) = line.split_once(" cwd")?;
+        let value = rest.strip_prefix(' ').or_else(|| rest.strip_prefix('='))?;
+        kdl_unquote(value).map(PathBuf::from)
+    })
+}
+
+/// The KDL v1 string literal at the start of `s`.
+fn kdl_unquote(s: &str) -> Option<String> {
+    let mut chars = s.strip_prefix('"')?.chars();
+    let mut out = String::new();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => return Some(out),
+            '\\' => match chars.next()? {
+                'n' => out.push('\n'),
+                't' => out.push('\t'),
+                'r' => out.push('\r'),
+                c @ ('"' | '\\' | '/') => out.push(c),
+                _ => return None,
+            },
+            c => out.push(c),
+        }
+    }
+    None
+}
+
 fn pane_cwd(name: &SessionName) -> Result<Option<PathBuf>, HostError> {
-    Ok(terminal_panes(&panes(name)?).find_map(|p| p["pane_cwd"].as_str()).map(PathBuf::from))
+    Ok(terminal_panes(&panes(name)?)
+        .find_map(|p| p["pane_cwd"].as_str())
+        .map(PathBuf::from))
 }
 
 /// A KDL v1 string literal.
@@ -121,7 +196,10 @@ fn kdl_string(s: &str) -> String {
 }
 
 fn layout_kdl(pane: &PaneCommand) -> String {
-    let mut node = format!("pane command={}", kdl_string(&pane.program.to_string_lossy()));
+    let mut node = format!(
+        "pane command={}",
+        kdl_string(&pane.program.to_string_lossy())
+    );
     let _ = write!(node, " cwd={}", kdl_string(&pane.cwd.to_string_lossy()));
     if !pane.args.is_empty() {
         let args: Vec<String> = pane.args.iter().map(|a| kdl_string(a)).collect();
@@ -136,7 +214,10 @@ fn is_client_of(args: &[OsString], name: &str) -> bool {
     match args.as_slice() {
         ["attach", rest @ ..] => rest.last() == Some(&name),
         ["-s" | "--session", session, rest @ ..] => {
-            *session == name && rest.iter().any(|a| matches!(*a, "-n" | "--new-session-with-layout"))
+            *session == name
+                && rest
+                    .iter()
+                    .any(|a| matches!(*a, "-n" | "--new-session-with-layout"))
         }
         _ => false,
     }
@@ -147,10 +228,17 @@ impl SessionHost for Zellij {
         let listed = list()?;
         Ok(parallel_map(&listed, |(name, listed)| {
             let status = match listed {
-                Listed::Live => SessionStatus::Live { cwd: pane_cwd(name).ok().flatten() },
-                Listed::Exited => SessionStatus::Exited,
+                Listed::Live => SessionStatus::Live {
+                    cwd: pane_cwd(name).ok().flatten(),
+                },
+                Listed::Exited => SessionStatus::Exited {
+                    cwd: exited_cwd(name),
+                },
             };
-            SessionInfo { name: name.clone(), status }
+            SessionInfo {
+                name: name.clone(),
+                status,
+            }
         }))
     }
 
@@ -159,33 +247,60 @@ impl SessionHost for Zellij {
     }
 
     fn create(&self, name: &SessionName, pane: &PaneCommand) -> Result<LaunchSpec, HostError> {
-        if list()?.iter().any(|(n, listed)| n == name && *listed == Listed::Exited) {
+        if list()?
+            .iter()
+            .any(|(n, listed)| n == name && *listed == Listed::Exited)
+        {
             process::run(zellij().args(["delete-session", name.as_str()]))?;
         }
         let io = |context: String| move |source| HostError::Io { context, source };
-        std::fs::create_dir_all(&self.layouts).map_err(io(format!("creating {}", self.layouts.display())))?;
+        std::fs::create_dir_all(&self.layouts)
+            .map_err(io(format!("creating {}", self.layouts.display())))?;
         let path = self.layout(name);
-        let mut tmp = tempfile::NamedTempFile::new_in(&self.layouts).map_err(io("creating layout".into()))?;
-        tmp.write_all(layout_kdl(pane).as_bytes()).map_err(io("writing layout".into()))?;
-        tmp.persist(&path).map_err(|e| HostError::Io { context: format!("saving {}", path.display()), source: e.error })?;
-        Ok(LaunchSpec::new("zellij").args(["-s", name.as_str(), "-n"]).arg(&path).cwd(&pane.cwd))
+        let mut tmp =
+            tempfile::NamedTempFile::new_in(&self.layouts).map_err(io("creating layout".into()))?;
+        tmp.write_all(layout_kdl(pane).as_bytes())
+            .map_err(io("writing layout".into()))?;
+        tmp.persist(&path).map_err(|e| HostError::Io {
+            context: format!("saving {}", path.display()),
+            source: e.error,
+        })?;
+        Ok(LaunchSpec::new("zellij")
+            .args(["-s", name.as_str(), "-n"])
+            .arg(&path)
+            .cwd(&pane.cwd))
     }
 
     fn start_detached(&self, name: &SessionName) -> Result<(), HostError> {
-        let status = list()?.into_iter().find_map(|(n, listed)| (n == *name).then_some(listed));
+        let status = list()?
+            .into_iter()
+            .find_map(|(n, listed)| (n == *name).then_some(listed));
         if status == Some(Listed::Live) {
             return Ok(());
         }
         let layout = self.layout(name);
         if !layout.exists() {
-            let missing = std::io::Error::new(std::io::ErrorKind::NotFound, format!("no layout at {}", layout.display()));
-            return Err(HostError::Io { context: format!("starting {name} detached"), source: missing });
+            let missing = std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("no layout at {}", layout.display()),
+            );
+            return Err(HostError::Io {
+                context: format!("starting {name} detached"),
+                source: missing,
+            });
         }
         if status == Some(Listed::Exited) {
             process::run(zellij().args(["delete-session", name.as_str()]))?;
         }
         let mut cmd = zellij();
-        cmd.args(["attach", "--create-background", name.as_str(), "options", "--default-layout"]).arg(&layout);
+        cmd.args([
+            "attach",
+            "--create-background",
+            name.as_str(),
+            "options",
+            "--default-layout",
+        ])
+        .arg(&layout);
         for var in NESTING_ENV {
             cmd.env_remove(var);
         }
@@ -204,9 +319,10 @@ impl SessionHost for Zellij {
         }
         let layout = self.layout(name);
         match std::fs::remove_file(&layout) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
-                Err(HostError::Io { context: format!("removing {}", layout.display()), source: e })
-            }
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(HostError::Io {
+                context: format!("removing {}", layout.display()),
+                source: e,
+            }),
             _ => Ok(()),
         }
     }
@@ -214,7 +330,8 @@ impl SessionHost for Zellij {
     fn write(&self, name: &SessionName, bytes: &[u8]) -> Result<(), HostError> {
         for chunk in bytes.chunks(WRITE_CHUNK) {
             let mut cmd = session_cmd(name);
-            cmd.args(["action", "write"]).args(chunk.iter().map(u8::to_string));
+            cmd.args(["action", "write"])
+                .args(chunk.iter().map(u8::to_string));
             process::run(&mut cmd)?;
         }
         Ok(())
@@ -223,12 +340,20 @@ impl SessionHost for Zellij {
     fn screen(&self, name: &SessionName) -> Result<String, HostError> {
         let panes = panes(name)?;
         let terminals: Vec<_> = terminal_panes(&panes).collect();
-        let pane = terminals.iter().find(|p| p["is_focused"] == true).or(terminals.first());
+        let pane = terminals
+            .iter()
+            .find(|p| p["is_focused"] == true)
+            .or(terminals.first());
         let Some(id) = pane.and_then(|p| p["id"].as_u64()) else {
-            return Err(CommandError::Parse { command: "zellij action list-panes".into(), detail: "no terminal panes".into() }.into());
+            return Err(CommandError::Parse {
+                command: "zellij action list-panes".into(),
+                detail: "no terminal panes".into(),
+            }
+            .into());
         };
         let mut cmd = session_cmd(name);
-        cmd.args(["action", "dump-screen", "--ansi", "--pane-id"]).arg(format!("terminal_{id}"));
+        cmd.args(["action", "dump-screen", "--ansi", "--pane-id"])
+            .arg(format!("terminal_{id}"));
         Ok(process::run(&mut cmd)?)
     }
 
@@ -242,7 +367,11 @@ impl SessionHost for Zellij {
 }
 
 impl ClientControl for Zellij {
-    fn other_clients(&self, name: &SessionName, own: Option<ClientId>) -> Result<Vec<ClientId>, HostError> {
+    fn other_clients(
+        &self,
+        name: &SessionName,
+        own: Option<ClientId>,
+    ) -> Result<Vec<ClientId>, HostError> {
         let mut system = System::new();
         system.refresh_processes_specifics(
             ProcessesToUpdate::All,
@@ -272,7 +401,9 @@ impl ClientControl for Zellij {
             .iter()
             .filter(|(_, p)| {
                 let cmd = p.cmd();
-                cmd.first().and_then(|exe| Path::new(exe).file_name()).is_some_and(|n| n == "zellij")
+                cmd.first()
+                    .and_then(|exe| Path::new(exe).file_name())
+                    .is_some_and(|n| n == "zellij")
                     && is_client_of(&cmd[1..], name.as_str())
             })
             .map(|(pid, _)| pid.as_u32())
@@ -286,8 +417,14 @@ impl ClientControl for Zellij {
     /// SIGHUP is what a closing terminal sends, so the session just loses a viewer.
     fn detach(&self, clients: &[ClientId]) -> Result<(), HostError> {
         for &client in clients {
-            let pid = i32::try_from(client.get()).map_err(|e| HostError::Detach { client, reason: e.to_string() })?;
-            kill(Pid::from_raw(pid), Signal::SIGHUP).map_err(|e| HostError::Detach { client, reason: e.to_string() })?;
+            let pid = i32::try_from(client.get()).map_err(|e| HostError::Detach {
+                client,
+                reason: e.to_string(),
+            })?;
+            kill(Pid::from_raw(pid), Signal::SIGHUP).map_err(|e| HostError::Detach {
+                client,
+                reason: e.to_string(),
+            })?;
         }
         Ok(())
     }
@@ -311,13 +448,32 @@ mod tests {
     }
 
     #[test]
+    fn exited_sessions_ran_where_their_layout_or_first_pane_did() {
+        let fish = "layout {\n    cwd \"/Users/d/.config\"\n    tab {\n        pane command=\"claude\" {\n";
+        assert_eq!(layout_cwd(fish), Some("/Users/d/.config".into()));
+        let ours = "layout {\n    tab name=\"Tab #1\" {\n        pane command=\"claude\" cwd=\"/w/api/fix\" {\n";
+        assert_eq!(layout_cwd(ours), Some("/w/api/fix".into()));
+        assert_eq!(layout_cwd("layout {\n    tab {\n        pane\n"), None);
+    }
+
+    #[test]
+    fn kdl_strings_read_back_what_was_written() {
+        let path = "/a \"b\"\\c\td";
+        assert_eq!(kdl_unquote(&kdl_string(path)).as_deref(), Some(path));
+    }
+
+    #[test]
     fn kdl_strings_escape_quotes_and_control_characters() {
         assert_eq!(kdl_string("a\"b\\c\nd\x1be"), "\"a\\\"b\\\\c\\nd\\u{1b}e\"");
     }
 
     #[test]
     fn layout_puts_args_in_a_child_block() {
-        let pane = PaneCommand { program: "/bin/agent".into(), args: vec!["exec".into(), "fix".into()], cwd: "/w/api/fix".into() };
+        let pane = PaneCommand {
+            program: "/bin/agent".into(),
+            args: vec!["exec".into(), "fix".into()],
+            cwd: "/w/api/fix".into(),
+        };
         let kdl = layout_kdl(&pane);
         assert!(kdl.contains("pane command=\"/bin/agent\" cwd=\"/w/api/fix\" {"));
         assert!(kdl.contains("args \"exec\" \"fix\""));
@@ -328,7 +484,10 @@ mod tests {
         assert!(is_client_of(&os(&["attach", "fix"]), "fix"));
         assert!(is_client_of(&os(&["attach", "--create", "fix"]), "fix"));
         assert!(is_client_of(&os(&["-s", "fix", "-n", "/l.kdl"]), "fix"));
-        assert!(!is_client_of(&os(&["--session", "fix", "action", "list-panes"]), "fix"));
+        assert!(!is_client_of(
+            &os(&["--session", "fix", "action", "list-panes"]),
+            "fix"
+        ));
         assert!(!is_client_of(&os(&["attach", "fixer"]), "fix"));
     }
 }

@@ -19,7 +19,9 @@ impl Emulator for Vt100 {
     }
 
     fn resize(&mut self, size: TermSize) {
-        self.0.screen_mut().set_size(size.rows.get(), size.cols.get());
+        self.0
+            .screen_mut()
+            .set_size(size.rows.get(), size.cols.get());
     }
 
     fn modes(&self) -> Modes {
@@ -29,7 +31,11 @@ impl Emulator for Vt100 {
         Modes {
             application_cursor: screen.application_cursor(),
             bracketed_paste: screen.bracketed_paste(),
-            mouse: if reporting && sgr { MouseReporting::Sgr } else { MouseReporting::Off },
+            mouse: if reporting && sgr {
+                MouseReporting::Sgr
+            } else {
+                MouseReporting::Off
+            },
             cursor_visible: !screen.hide_cursor(),
         }
     }
@@ -39,6 +45,8 @@ impl Emulator for Vt100 {
         if !show_cursor {
             cursor.hide();
         }
-        PseudoTerminal::new(self.0.screen()).cursor(cursor).render(area, buf);
+        PseudoTerminal::new(self.0.screen())
+            .cursor(cursor)
+            .render(area, buf);
     }
 }

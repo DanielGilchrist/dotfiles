@@ -20,7 +20,10 @@ pub struct TermSize {
 
 impl TermSize {
     pub fn of(area: Rect) -> Option<Self> {
-        Some(Self { rows: NonZeroU16::new(area.height)?, cols: NonZeroU16::new(area.width)? })
+        Some(Self {
+            rows: NonZeroU16::new(area.height)?,
+            cols: NonZeroU16::new(area.width)?,
+        })
     }
 }
 

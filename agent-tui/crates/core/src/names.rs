@@ -16,7 +16,9 @@ pub enum NameError {
     Reserved(String),
     #[error("'{name}' is {len} bytes, over the {MAX_SESSION_LEN} byte limit for session names")]
     TooLong { name: String, len: usize },
-    #[error("'{0}' must start with a letter or digit and contain only letters, digits, '.', '-' or '_'")]
+    #[error(
+        "'{0}' must start with a letter or digit and contain only letters, digits, '.', '-' or '_'"
+    )]
     InvalidAgent(String),
     #[error("'{0}' must not start with '-' or contain whitespace, control characters or '/'")]
     InvalidSession(String),
@@ -86,7 +88,10 @@ fn check_session_rules(s: &str) -> Result<(), NameError> {
         return Err(NameError::Reserved(s.into()));
     }
     if s.len() > MAX_SESSION_LEN {
-        return Err(NameError::TooLong { name: s.into(), len: s.len() });
+        return Err(NameError::TooLong {
+            name: s.into(),
+            len: s.len(),
+        });
     }
     Ok(())
 }
@@ -191,7 +196,10 @@ impl FromStr for Prompt {
         if s.trim().is_empty() {
             return Err(InvalidPrompt::Empty);
         }
-        if let Some(c) = s.chars().find(|c| c.is_control() && !matches!(c, '\n' | '\t')) {
+        if let Some(c) = s
+            .chars()
+            .find(|c| c.is_control() && !matches!(c, '\n' | '\t'))
+        {
             return Err(InvalidPrompt::Control(c));
         }
         Ok(Self(s.into()))
@@ -217,10 +225,15 @@ mod tests {
         for ok in ["fix-ci", "a", "payroll.v2", "x_1", "12345678901234567890"] {
             assert!(ok.parse::<AgentName>().is_ok(), "{ok}");
         }
-        for bad in ["", ".", "..", "../x", "/tmp/x", "-rf", ".config", "a b", "a/b", "agents"] {
+        for bad in [
+            "", ".", "..", "../x", "/tmp/x", "-rf", ".config", "a b", "a/b", "agents",
+        ] {
             assert!(bad.parse::<AgentName>().is_err(), "{bad}");
         }
-        assert!(matches!("123456789012345678901".parse::<AgentName>(), Err(NameError::TooLong { len: 21, .. })));
+        assert!(matches!(
+            "123456789012345678901".parse::<AgentName>(),
+            Err(NameError::TooLong { len: 21, .. })
+        ));
     }
 
     #[test]
@@ -244,7 +257,10 @@ mod tests {
         for ok in ["main", "feature/x", "fix-1.2", "user/a_b"] {
             assert!(ok.parse::<BranchName>().is_ok(), "{ok}");
         }
-        for bad in ["", "-x", "a..b", "a b", "a/", "/a", "a.lock", "a/.b", "@", "a@{1}", "a~1", "a.", "a//b"] {
+        for bad in [
+            "", "-x", "a..b", "a b", "a/", "/a", "a.lock", "a/.b", "@", "a@{1}", "a~1", "a.",
+            "a//b",
+        ] {
             assert!(bad.parse::<BranchName>().is_err(), "{bad}");
         }
     }
@@ -253,13 +269,19 @@ mod tests {
     fn prompts_must_have_content() {
         assert!("fix the build".parse::<Prompt>().is_ok());
         assert_eq!("  \n ".parse::<Prompt>(), Err(InvalidPrompt::Empty));
-        assert_eq!("a\x1b[201~b".parse::<Prompt>(), Err(InvalidPrompt::Control('\x1b')));
+        assert_eq!(
+            "a\x1b[201~b".parse::<Prompt>(),
+            Err(InvalidPrompt::Control('\x1b'))
+        );
         assert!("line one\n\tline two".parse::<Prompt>().is_ok());
     }
 
     #[test]
     fn agent_name_from_branch_flattens_slashes() {
         let branch: BranchName = "user/fix-ci".parse().unwrap();
-        assert_eq!(AgentName::from_branch(&branch).unwrap().as_str(), "user-fix-ci");
+        assert_eq!(
+            AgentName::from_branch(&branch).unwrap().as_str(),
+            "user-fix-ci"
+        );
     }
 }

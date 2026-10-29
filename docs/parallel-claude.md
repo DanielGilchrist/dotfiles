@@ -17,8 +17,9 @@ it into `~/.local/bin/agent`. Session layouts record that path, so keep it.
 - **Zellij session per agent**, named after the worktree. Sessions persist
   across terminal and laptop restarts and can be attached from anywhere
   (`zellij attach <name>`, another tab, a phone over SSH). After a reboot
-  they show as exited. Selecting one in the TUI resurrects it, resuming the
-  harness's last conversation.
+  they show as exited. Selecting one in the TUI starts it again through
+  `agent` (so it reports its state), resuming the harness's last
+  conversation. Sessions `agent` doesn't own are resurrected by zellij.
 - **Repo sessions**: `agent repo` runs an agent in the repo's main checkout
   (no worktree), named after the repo.
 - **Names** are ≤20 chars of `[A-Za-z0-9._-]` (the zellij socket path limit
@@ -43,7 +44,27 @@ types into the embedded session. `?` shows every key.
 | `o` | Open the agent's worktree in $EDITOR |
 | `d` / `D` | Kill the session / remove session, worktree and branch (confirms, lists anything that would be lost) |
 | `x` | Run a configured action on the selected agent (see below) |
+| `a` | Jump to the agent that needs you most (asking, failed, then finished), into AGENT |
 | `q` | Quit (agents keep running) |
+
+### What agents are doing
+
+Agents launched by `agent` report their state through Claude Code hooks
+passed with `--settings` (your own settings stay untouched), recorded by
+`agent event` in `~/.local/state/agent/activity/`.
+
+- `◆` asking you (a permission prompt or a question)
+- `!` failed (rate limited, overloaded)
+- `✓` finished a turn you haven't looked at
+- spinner: working (it stops, dimmed with `?`, after 5 minutes of silence with no tool running)
+- `●` idle, `○` exited, `·` no session
+
+Overview opens with a **Needs you** group, the status bar and terminal
+title show `◆ ! ✓` counts, and a bell rings when an agent you're not
+typing into starts waiting. The panel under the list shows the agent's
+last prompt, diff size since it forked, and commits and uncommitted files.
+Agents started before this existed report nothing until restarted: `d`
+then `⏎` in the TUI restarts one through `agent`, resuming its conversation.
 
 ### Actions
 
@@ -133,8 +154,8 @@ the reason.
    `--headless`: it only prepares the session for the caller to run.
 3. **Names must fit the rules above.** `agent` rejects others with the reason.
 4. **Repeat-attach semantics:** a running agent gets `-e`/`--seed` typed
-   into it, an exited session is resurrected, and an idle worktree gets a
-   new session.
+   into it, and an exited session or idle worktree gets a new session that
+   resumes its conversation.
 
 ## Neovim keybinds (`agent_nvim` plugin, `<leader>a`)
 

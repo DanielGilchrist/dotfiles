@@ -69,7 +69,9 @@ pub struct Keys {
 
 impl Default for Keys {
     fn default() -> Self {
-        Self { nav: ControlKey::BACKSLASH }
+        Self {
+            nav: ControlKey::BACKSLASH,
+        }
     }
 }
 
@@ -90,9 +92,16 @@ pub enum ConfigError {
     #[error(transparent)]
     Toml(#[from] toml::de::Error),
     #[error("action {index} ({label}): {reason}")]
-    Action { index: usize, label: String, reason: String },
+    Action {
+        index: usize,
+        label: String,
+        reason: String,
+    },
     #[error("keys.{field}: {source}")]
-    Key { field: &'static str, source: InvalidControlKey },
+    Key {
+        field: &'static str,
+        source: InvalidControlKey,
+    },
 }
 
 #[derive(Deserialize)]
@@ -113,7 +122,10 @@ struct RawKeys {
 impl RawKeys {
     fn parse(self) -> Result<Keys, ConfigError> {
         let nav = match self.nav {
-            Some(raw) => raw.parse().map_err(|source| ConfigError::Key { field: "nav", source })?,
+            Some(raw) => raw.parse().map_err(|source| ConfigError::Key {
+                field: "nav",
+                source,
+            })?,
             None => Keys::default().nav,
         };
         Ok(Keys { nav })
@@ -125,7 +137,10 @@ impl std::str::FromStr for Config {
 
     fn from_str(s: &str) -> Result<Self, ConfigError> {
         let raw: RawConfig = toml::from_str(s)?;
-        Ok(Self { actions: Actions::parse(raw.action)?, keys: raw.keys.parse()? })
+        Ok(Self {
+            actions: Actions::parse(raw.action)?,
+            keys: raw.keys.parse()?,
+        })
     }
 }
 

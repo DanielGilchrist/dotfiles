@@ -1,16 +1,22 @@
+use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use agent_core::actions::Actions;
+use agent_core::activity::{Activity, State as ActivityState, Tool};
 use agent_core::config::Keys;
-use agent_core::model::{Entry, EntryState, Removable, Repo, RepoKey, Running, Snapshot, Startable};
+use agent_core::model::{
+    Entry, EntryState, Removable, Repo, RepoKey, Revival, Running, Snapshot, Startable,
+};
 use agent_core::names::{AgentName, Prompt, SessionName};
-use agent_core::paths::RepoRoot;
 use agent_core::ops::{Approved, Hazardous, RemovalPlan};
+use agent_core::paths::RepoRoot;
 use agent_core::ports::HarnessId;
 use agent_term::{Emulator, Terminal};
 use ratatui::layout::Rect;
+
+use crate::worker::Facts;
 
 pub const PREVIEW_DEBOUNCE: Duration = Duration::from_millis(150);
 pub const INFO_TTL: Duration = Duration::from_secs(4);
@@ -32,14 +38,32 @@ pub enum Cursor {
     /// A repo row; only exists in Overview.
     Repo(RepoKey),
     Entry(SessionName),
-    /// The copy of a pinned entry in Overview's pinned group.
-    Pinned(SessionName),
+    /// The copy of an entry in one of Overview's groups above the repos.
+    Grouped(Group, SessionName),
+}
+
+/// Overview's groups above the repos. Selecting a copy there doesn't
+/// expand its repo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Group {
+    /// Agents asking something, failed, or done and not yet seen.
+    NeedsYou,
+    Pinned,
+}
+
+impl Group {
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::NeedsYou => "Needs you",
+            Self::Pinned => "Pinned",
+        }
+    }
 }
 
 impl Cursor {
     pub fn entry_name(&self) -> Option<&SessionName> {
         match self {
-            Self::Entry(name) | Self::Pinned(name) => Some(name),
+            Self::Entry(name) | Self::Grouped(_, name) => Some(name),
             Self::Repo(_) => None,
         }
     }
@@ -47,19 +71,27 @@ impl Cursor {
     pub fn repo<'a>(&'a self, snapshot: &'a Snapshot) -> Option<&'a Repo> {
         match self {
             Self::Repo(key) => snapshot.repo(key),
-            Self::Entry(name) | Self::Pinned(name) => snapshot.entry(name).map(|(repo, _)| repo),
+            Self::Entry(name) | Self::Grouped(_, name) => {
+                snapshot.entry(name).map(|(repo, _)| repo)
+            }
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Row {
-    PinnedHeader,
+    Header(Group),
     /// A repo with more than one entry. Its entries follow when it's open.
-    Repo { key: RepoKey, fold: Fold },
-    /// An agent in Overview's Pinned group.
-    Pinned(SessionName),
-    Entry { name: SessionName, place: Place },
+    Repo {
+        key: RepoKey,
+        fold: Fold,
+    },
+    /// An agent in one of Overview's groups.
+    Grouped(Group, SessionName),
+    Entry {
+        name: SessionName,
+        place: Place,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,12 +112,12 @@ pub enum Place {
 }
 
 impl Row {
-    /// What selecting this row selects; the Pinned header selects nothing.
+    /// What selecting this row selects; group headers select nothing.
     pub fn cursor(&self) -> Option<Cursor> {
         match self {
-            Self::PinnedHeader => None,
+            Self::Header(_) => None,
             Self::Repo { key, .. } => Some(Cursor::Repo(key.clone())),
-            Self::Pinned(name) => Some(Cursor::Pinned(name.clone())),
+            Self::Grouped(group, name) => Some(Cursor::Grouped(*group, name.clone())),
             Self::Entry { name, .. } => Some(Cursor::Entry(name.clone())),
         }
     }
@@ -134,12 +166,17 @@ pub struct Connection {
     /// Other clients attached to the same session.
     pub others: Option<NonZeroUsize>,
     pub mode: Mode,
+    pub opened: Instant,
 }
 
 impl Connection {
     /// Other clients attached, if this connection is to `name`.
     pub fn sharing(&self, name: &SessionName) -> Option<NonZeroUsize> {
-        if &self.name == name { self.others } else { None }
+        if &self.name == name {
+            self.others
+        } else {
+            None
+        }
     }
 }
 
@@ -177,14 +214,19 @@ impl Pane {
     /// The session the pane is still waiting to connect to for `ticket`.
     pub fn awaiting(&self, ticket: Ticket) -> Option<&SessionName> {
         match self {
-            Self::Connecting { name, ticket: pending } if *pending == ticket => Some(name),
+            Self::Connecting {
+                name,
+                ticket: pending,
+            } if *pending == ticket => Some(name),
             _ => None,
         }
     }
 
     /// Stops waiting for `ticket`'s connection, if the pane still is.
     pub fn abandon(&mut self, ticket: Ticket) {
-        if let Self::Connecting { ticket: pending, .. } = self
+        if let Self::Connecting {
+            ticket: pending, ..
+        } = self
             && *pending == ticket
         {
             *self = Self::Empty;
@@ -199,19 +241,145 @@ pub enum Focus<'a> {
     Nav(Option<&'a Connection>),
 }
 
+/// What a row says about an agent: its session and, while that's live,
+/// what its harness reported.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentStatus {
+    NoSession,
+    Exited,
+    /// Live, with nothing to report: waiting for a prompt, seen, or a
+    /// harness without hooks.
+    Idle,
+    Working {
+        tool: Option<Tool>,
+        since: SystemTime,
+        pulse: Pulse,
+    },
+    Asking {
+        question: String,
+        since: SystemTime,
+    },
+    Failed {
+        reason: String,
+        since: SystemTime,
+    },
+    /// Finished a turn the user hasn't looked at.
+    Done {
+        summary: Option<String>,
+        since: SystemTime,
+    },
+}
+
+/// Why an agent needs the user.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Waiting {
+    Asking,
+    Failed,
+    Done,
+}
+
+impl Waiting {
+    pub fn glyph(self) -> &'static str {
+        match self {
+            Self::Asking => "◆",
+            Self::Failed => "!",
+            Self::Done => "✓",
+        }
+    }
+}
+
+/// How many agents need the user, by kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Attention {
+    pub asking: usize,
+    pub failed: usize,
+    pub done: usize,
+}
+
+impl Attention {
+    /// The non-zero counts, most urgent first.
+    pub fn parts(self) -> Vec<(Waiting, usize)> {
+        [
+            (Waiting::Asking, self.asking),
+            (Waiting::Failed, self.failed),
+            (Waiting::Done, self.done),
+        ]
+        .into_iter()
+        .filter(|(_, n)| *n > 0)
+        .collect()
+    }
+
+    /// The terminal title: counts first, so a narrow tab still shows them.
+    pub fn title(self) -> String {
+        let counts: Vec<String> = self
+            .parts()
+            .iter()
+            .map(|(kind, n)| format!("{}{n}", kind.glyph()))
+            .collect();
+        match counts.as_slice() {
+            [] => "agent".into(),
+            _ => format!("{} · agent", counts.join(" ")),
+        }
+    }
+}
+
+/// Whether the terminal the TUI runs in has focus. Terminals that never
+/// report it count as focused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalFocus {
+    Focused,
+    Unfocused,
+}
+
+/// Whether a working agent is still being heard from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pulse {
+    Steady,
+    /// Nothing heard for a while with no tool running: interrupted or stuck.
+    Stale,
+}
+
+/// How urgently an agent needs the user, most urgent first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Urgency {
+    Blocked,
+    Unseen,
+}
+
+impl AgentStatus {
+    /// Whether, and how urgently, it needs the user, and since when.
+    pub fn urgency(&self) -> Option<(Urgency, SystemTime)> {
+        match self {
+            Self::Asking { since, .. } | Self::Failed { since, .. } => {
+                Some((Urgency::Blocked, *since))
+            }
+            Self::Done { since, .. } => Some((Urgency::Unseen, *since)),
+            Self::NoSession | Self::Exited | Self::Idle | Self::Working { .. } => None,
+        }
+    }
+}
+
 /// What this TUI can do with an entry, worked out in one place so the keys
 /// and the hints agree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Reach {
     /// The session this TUI runs in: nothing here can act on it.
     Own,
-    Other { enter: Enter, kill: Option<Running>, remove: Option<Removable> },
+    Other {
+        enter: Enter,
+        kill: Option<Running>,
+        remove: Option<Removable>,
+    },
 }
 
 /// What ⏎ does to an entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Enter {
     Attach,
+    /// Start an exited agent again through `agent`, resuming its
+    /// conversation.
+    Restart(Startable),
+    /// Let zellij replay a session we don't own the checkout of.
     Resurrect,
     Start(Startable),
 }
@@ -220,7 +388,7 @@ impl Enter {
     pub fn verb(&self) -> &'static str {
         match self {
             Self::Attach => "attach",
-            Self::Resurrect => "resurrect",
+            Self::Restart(_) | Self::Resurrect => "resurrect",
             Self::Start(_) => "start",
         }
     }
@@ -246,7 +414,9 @@ impl Query {
 
     pub fn step(&mut self, delta: isize, len: usize) {
         let current = self.index(len);
-        self.index = current.saturating_add_signed(delta).min(len.saturating_sub(1));
+        self.index = current
+            .saturating_add_signed(delta)
+            .min(len.saturating_sub(1));
     }
 
     pub fn push(&mut self, c: char) {
@@ -330,8 +500,16 @@ impl Proposal {
     /// exactly these.
     pub fn offers(&self) -> Vec<Offer> {
         let (key, label) = self.primary();
-        let remove = Offer { key, label, effect: OfferEffect::Destroys };
-        let kill = self.plan().running().map(|_| Offer { key: KILL_ONLY, label: "kill only", effect: OfferEffect::Keeps });
+        let remove = Offer {
+            key,
+            label,
+            effect: OfferEffect::Destroys,
+        };
+        let kill = self.plan().running().map(|_| Offer {
+            key: KILL_ONLY,
+            label: "kill only",
+            effect: OfferEffect::Keeps,
+        });
         std::iter::once(remove).chain(kill).collect()
     }
 
@@ -362,7 +540,10 @@ pub enum Overlay {
     Actions(SessionName),
     /// Working out what removing `name` would lose; the confirmation
     /// replaces this when the answer arrives.
-    Planning { ticket: Ticket, name: SessionName },
+    Planning {
+        ticket: Ticket,
+        name: SessionName,
+    },
 }
 
 /// Why the model wants an agent selected when it next appears.
@@ -399,7 +580,10 @@ pub struct Areas {
 
 pub enum Load {
     Pending,
-    Ready { snapshot: Snapshot, cursor: Option<Cursor> },
+    Ready {
+        snapshot: Snapshot,
+        cursor: Option<Cursor>,
+    },
 }
 
 pub struct Model {
@@ -425,10 +609,31 @@ pub struct Model {
     next_ticket: u64,
     pub actions: Actions,
     pub keys: Keys,
+    /// What each agent's harness last reported, once the first report of
+    /// them has arrived.
+    pub activities: Option<HashMap<SessionName, Activity>>,
+    /// The clock for this frame, so every row, count and title agrees.
+    pub now: SystemTime,
+    /// Git facts for the agent the peek shows, and when they were asked for.
+    pub facts: Option<(SessionName, Facts)>,
+    pub inspected: Option<(SessionName, Instant)>,
+    /// When the peek's facts should be asked for again.
+    pub inspect_due: Option<Instant>,
+    /// The finished turn last marked seen, so it's marked once.
+    pub acknowledged: Option<(SessionName, u64)>,
+    pub last_bell: Option<Instant>,
+    /// A bell held back by the rate limit, to ring when it allows.
+    pub bell_due: Option<Instant>,
+    pub terminal: TerminalFocus,
 }
 
 impl Model {
-    pub fn new(start_dir: PathBuf, own_session: Option<SessionName>, harness: HarnessId, harness_label: String) -> Self {
+    pub fn new(
+        start_dir: PathBuf,
+        own_session: Option<SessionName>,
+        harness: HarnessId,
+        harness_label: String,
+    ) -> Self {
         Self {
             load: Load::Pending,
             view: View::Focus,
@@ -449,6 +654,15 @@ impl Model {
             next_ticket: 0,
             actions: Actions::default(),
             keys: Keys::default(),
+            activities: None,
+            now: SystemTime::now(),
+            facts: None,
+            inspected: None,
+            inspect_due: None,
+            acknowledged: None,
+            last_bell: None,
+            bell_due: None,
+            terminal: TerminalFocus::Focused,
         }
     }
 
@@ -491,6 +705,109 @@ impl Model {
         self.selected().and_then(|(_, e)| e)
     }
 
+    pub fn activity(&self, name: &SessionName) -> Option<&Activity> {
+        self.activities.as_ref()?.get(name)
+    }
+
+    pub fn status(&self, entry: &Entry) -> AgentStatus {
+        match entry.state() {
+            EntryState::Idle(_) => return AgentStatus::NoSession,
+            EntryState::Exited(_) => return AgentStatus::Exited,
+            EntryState::Live => {}
+        }
+        let Some(activity) = self.activity(entry.name()) else {
+            return AgentStatus::Idle;
+        };
+        let since = activity.since;
+        match &activity.state {
+            ActivityState::Idle | ActivityState::Exited => AgentStatus::Idle,
+            ActivityState::Working { .. } => {
+                let pulse = if activity.stale(self.now) {
+                    Pulse::Stale
+                } else {
+                    Pulse::Steady
+                };
+                AgentStatus::Working {
+                    tool: activity.current_tool().cloned(),
+                    since,
+                    pulse,
+                }
+            }
+            ActivityState::Asking { question } => AgentStatus::Asking {
+                question: question.clone(),
+                since,
+            },
+            ActivityState::Failed { reason } => AgentStatus::Failed {
+                reason: reason.clone(),
+                since,
+            },
+            ActivityState::Done { summary } => AgentStatus::Done {
+                summary: summary.clone(),
+                since,
+            },
+        }
+    }
+
+    /// Agents that need the user, in the order `a` visits them: blocked ones
+    /// (asking or failed) before unseen ones, longest waiting first.
+    pub fn needs_you(&self) -> Vec<SessionName> {
+        let Some(snapshot) = self.snapshot() else {
+            return Vec::new();
+        };
+        let mut waiting: Vec<_> = snapshot
+            .entries()
+            .filter(|(_, e)| self.own_session.as_ref() != Some(e.name()))
+            .filter_map(|(_, e)| {
+                self.status(e)
+                    .urgency()
+                    .map(|(urgency, since)| (urgency, since, e.name().clone()))
+            })
+            .collect();
+        waiting.sort();
+        waiting.into_iter().map(|(_, _, name)| name).collect()
+    }
+
+    /// The agents `a` would visit, by kind: needing the user, and not the
+    /// one being typed into.
+    pub fn attention(&self) -> Attention {
+        let typing_into = match self.focus() {
+            Focus::Agent(c) => Some(&c.name),
+            Focus::Overlay(_) | Focus::Nav(_) => None,
+        };
+        let Some(snapshot) = self.snapshot() else {
+            return Attention::default();
+        };
+        self.needs_you()
+            .iter()
+            .filter(|name| Some(*name) != typing_into)
+            .fold(Attention::default(), |mut counts, name| {
+                match snapshot.entry(name).map(|(_, e)| self.status(e)) {
+                    Some(AgentStatus::Asking { .. }) => counts.asking += 1,
+                    Some(AgentStatus::Failed { .. }) => counts.failed += 1,
+                    Some(AgentStatus::Done { .. }) => counts.done += 1,
+                    _ => {}
+                }
+                counts
+            })
+    }
+
+    /// Re-checks the cursor after what it points at may have gone, such as
+    /// a Needs you row once its agent is seen.
+    pub fn revalidate(&mut self) {
+        let repo = self.selected().map(|(r, _)| r.key().clone());
+        self.reconcile(repo.as_ref());
+    }
+
+    /// The agent the peek describes: the one in the pane, else the
+    /// selection.
+    pub fn peek_target(&self) -> Option<&Entry> {
+        let snapshot = self.snapshot()?;
+        match self.pane.session() {
+            Some(name) => snapshot.entry(name).map(|(_, e)| e),
+            None => self.selected_entry(),
+        }
+    }
+
     pub fn focus(&self) -> Focus<'_> {
         match (&self.overlay, self.pane.connection()) {
             (Overlay::None, Some(c)) if c.mode == Mode::Agent => Focus::Agent(c),
@@ -505,42 +822,81 @@ impl Model {
         }
         let enter = match entry.state() {
             EntryState::Live => Enter::Attach,
-            EntryState::Exited => Enter::Resurrect,
+            EntryState::Exited(Revival::Restart(at)) => Enter::Restart(at),
+            EntryState::Exited(Revival::Resurrect) => Enter::Resurrect,
             EntryState::Idle(at) => Enter::Start(at),
         };
-        Reach::Other { enter, kill: entry.running(self.own_session.as_ref()), remove: entry.removable() }
+        Reach::Other {
+            enter,
+            kill: entry.running(self.own_session.as_ref()),
+            remove: entry.removable(),
+        }
     }
 
     pub fn rows(&self) -> Vec<Row> {
-        let (Some(snapshot), Some(cursor)) = (self.snapshot(), self.cursor()) else { return Vec::new() };
+        let (Some(snapshot), Some(cursor)) = (self.snapshot(), self.cursor()) else {
+            return Vec::new();
+        };
         let current = cursor.repo(snapshot).map(Repo::key);
         match self.view {
             View::Focus => current
                 .and_then(|k| snapshot.repo(k))
                 .map(|repo| {
-                    repo.entries().iter().map(|e| Row::Entry { name: e.name().clone(), place: Place::Alone }).collect()
+                    repo.entries()
+                        .iter()
+                        .map(|e| Row::Entry {
+                            name: e.name().clone(),
+                            place: Place::Alone,
+                        })
+                        .collect()
                 })
                 .unwrap_or_default(),
             View::Overview => {
                 let mut rows = Vec::new();
-                let pinned = snapshot.pinned();
+                let waiting = self.needs_you();
+                if !waiting.is_empty() {
+                    rows.push(Row::Header(Group::NeedsYou));
+                    rows.extend(
+                        waiting
+                            .iter()
+                            .map(|name| Row::Grouped(Group::NeedsYou, name.clone())),
+                    );
+                }
+                let pinned: Vec<_> = snapshot
+                    .pinned()
+                    .into_iter()
+                    .filter(|(_, e)| !waiting.contains(e.name()))
+                    .collect();
                 if !pinned.is_empty() {
-                    rows.push(Row::PinnedHeader);
-                    rows.extend(pinned.iter().map(|(_, e)| Row::Pinned(e.name().clone())));
+                    rows.push(Row::Header(Group::Pinned));
+                    rows.extend(
+                        pinned
+                            .iter()
+                            .map(|(_, e)| Row::Grouped(Group::Pinned, e.name().clone())),
+                    );
                 }
                 for repo in snapshot.repos() {
                     if let Some(only) = sole(repo) {
-                        rows.push(Row::Entry { name: only.name().clone(), place: Place::Solo });
+                        rows.push(Row::Entry {
+                            name: only.name().clone(),
+                            place: Place::Solo,
+                        });
                         continue;
                     }
                     let fold = match cursor {
-                        Cursor::Pinned(_) => Fold::Closed,
+                        Cursor::Grouped(..) => Fold::Closed,
                         _ if current == Some(repo.key()) => Fold::Open,
                         _ => Fold::Closed,
                     };
-                    rows.push(Row::Repo { key: repo.key().clone(), fold });
+                    rows.push(Row::Repo {
+                        key: repo.key().clone(),
+                        fold,
+                    });
                     if let Fold::Open = fold {
-                        rows.extend(repo.entries().iter().map(|e| Row::Entry { name: e.name().clone(), place: Place::Nested }));
+                        rows.extend(repo.entries().iter().map(|e| Row::Entry {
+                            name: e.name().clone(),
+                            place: Place::Nested,
+                        }));
                     }
                 }
                 rows
@@ -557,8 +913,15 @@ impl Model {
     pub fn load(&mut self, snapshot: Snapshot) {
         let first = matches!(self.load, Load::Pending);
         let previous = self.cursor().cloned();
-        let previous_repo = previous.as_ref().and_then(|c| self.snapshot().and_then(|s| c.repo(s)).map(|r| r.key().clone()));
-        self.load = Load::Ready { snapshot, cursor: previous };
+        let previous_repo = previous.as_ref().and_then(|c| {
+            self.snapshot()
+                .and_then(|s| c.repo(s))
+                .map(|r| r.key().clone())
+        });
+        self.load = Load::Ready {
+            snapshot,
+            cursor: previous,
+        };
         self.reconcile(previous_repo.as_ref());
         match self.follow.take() {
             Some(Follow::Submitted { name, ticket }) => match self.entry_cursor(&name) {
@@ -576,7 +939,10 @@ impl Model {
                 None => self.follow = Some(Follow::Backgrounded { name, ticket }),
             },
             Some(Follow::Restored(name)) if first => {
-                let here = self.snapshot().and_then(|s| s.containing(&self.start_dir)).map(|(_, e)| e.name().clone());
+                let here = self
+                    .snapshot()
+                    .and_then(|s| s.containing(&self.start_dir))
+                    .map(|(_, e)| e.name().clone());
                 let cursor = match here {
                     Some(here) => self.entry_cursor(&here),
                     None => self.entry_cursor(&name),
@@ -592,18 +958,27 @@ impl Model {
 
     /// A cursor on `name` if the snapshot shows it.
     fn entry_cursor(&self, name: &SessionName) -> Option<Cursor> {
-        self.snapshot()?.entry(name).map(|_| Cursor::Entry(name.clone()))
+        self.snapshot()?
+            .entry(name)
+            .map(|_| Cursor::Entry(name.clone()))
     }
 
     fn reconcile(&mut self, previous_repo: Option<&RepoKey>) {
         let view = self.view;
         let start_dir = self.start_dir.clone();
-        let Load::Ready { snapshot, cursor } = &mut self.load else { return };
+        let waiting = self.needs_you();
+        let Load::Ready { snapshot, cursor } = &mut self.load else {
+            return;
+        };
         let valid = match cursor.as_ref() {
             None => false,
             Some(Cursor::Repo(key)) => view == View::Overview && snapshot.repo(key).is_some(),
-            Some(Cursor::Pinned(name)) => {
-                view == View::Overview && snapshot.entry(name).is_some_and(|(_, e)| e.pin().is_some())
+            Some(Cursor::Grouped(Group::NeedsYou, name)) => {
+                view == View::Overview && waiting.contains(name)
+            }
+            Some(Cursor::Grouped(Group::Pinned, name)) => {
+                view == View::Overview
+                    && snapshot.entry(name).is_some_and(|(_, e)| e.pin().is_some())
             }
             Some(Cursor::Entry(name)) => snapshot.entry(name).is_some(),
         };
@@ -612,13 +987,22 @@ impl Model {
         }
         let entry_of = |e: &Entry| Cursor::Entry(e.name().clone());
         let fallback = match cursor.as_ref() {
-            Some(Cursor::Pinned(name)) => snapshot.entry(name).map(|(_, e)| entry_of(e)),
+            Some(Cursor::Grouped(_, name)) => snapshot.entry(name).map(|(_, e)| entry_of(e)),
             Some(Cursor::Repo(key)) => snapshot.repo(key).map(|r| entry_of(r.first())),
             _ => None,
         };
         let fallback = fallback
-            .or_else(|| previous_repo.and_then(|k| snapshot.repo(k)).map(|r| entry_of(r.first())))
-            .or_else(|| snapshot.containing(&start_dir).or_else(|| snapshot.entries().next()).map(|(_, e)| entry_of(e)));
+            .or_else(|| {
+                previous_repo
+                    .and_then(|k| snapshot.repo(k))
+                    .map(|r| entry_of(r.first()))
+            })
+            .or_else(|| {
+                snapshot
+                    .containing(&start_dir)
+                    .or_else(|| snapshot.entries().next())
+                    .map(|(_, e)| entry_of(e))
+            });
         *cursor = fallback;
         self.schedule_preview();
     }
@@ -632,16 +1016,16 @@ impl Model {
     /// Overview, so in Focus those become the entry they stand for.
     pub fn set_cursor(&mut self, next: Cursor) {
         let next = match (self.view, next) {
-            (View::Focus, Cursor::Pinned(name)) => Cursor::Entry(name),
-            (View::Focus, Cursor::Repo(key)) => {
-                match self.snapshot().and_then(|s| s.repo(&key)) {
-                    Some(repo) => Cursor::Entry(repo.first().name().clone()),
-                    None => return,
-                }
-            }
+            (View::Focus, Cursor::Grouped(_, name)) => Cursor::Entry(name),
+            (View::Focus, Cursor::Repo(key)) => match self.snapshot().and_then(|s| s.repo(&key)) {
+                Some(repo) => Cursor::Entry(repo.first().name().clone()),
+                None => return,
+            },
             (_, next) => next,
         };
-        let Load::Ready { cursor, .. } = &mut self.load else { return };
+        let Load::Ready { cursor, .. } = &mut self.load else {
+            return;
+        };
         if cursor.as_ref() != Some(&next) {
             *cursor = Some(next);
             self.schedule_preview();
@@ -657,8 +1041,13 @@ impl Model {
         if items.is_empty() {
             return;
         }
-        let current = self.cursor().and_then(|c| items.iter().position(|i| i == c)).unwrap_or(0);
-        let next = current.checked_add_signed(delta).map_or(items.len() - 1, |n| n % items.len());
+        let current = self
+            .cursor()
+            .and_then(|c| items.iter().position(|i| i == c))
+            .unwrap_or(0);
+        let next = current
+            .checked_add_signed(delta)
+            .map_or(items.len() - 1, |n| n % items.len());
         self.set_cursor(items[next].clone());
     }
 
@@ -674,7 +1063,9 @@ impl Model {
     }
 
     pub fn jump_repo(&mut self, delta: isize) {
-        let Some(snapshot) = self.snapshot() else { return };
+        let Some(snapshot) = self.snapshot() else {
+            return;
+        };
         let repos = snapshot.repos();
         if repos.is_empty() {
             return;
@@ -684,16 +1075,22 @@ impl Model {
             .and_then(|c| c.repo(snapshot))
             .and_then(|r| repos.iter().position(|x| x.key() == r.key()))
             .unwrap_or(0);
-        let next = current.checked_add_signed(delta).map_or(repos.len() - 1, |n| n % repos.len());
+        let next = current
+            .checked_add_signed(delta)
+            .map_or(repos.len() - 1, |n| n % repos.len());
         let key = repos[next].key().clone();
         self.select_repo(&key);
     }
 
     pub fn select_repo(&mut self, key: &RepoKey) {
-        let Some(repo) = self.snapshot().and_then(|s| s.repo(key)) else { return };
+        let Some(repo) = self.snapshot().and_then(|s| s.repo(key)) else {
+            return;
+        };
         let cursor = match (self.view, sole(repo)) {
             (View::Overview, None) => Cursor::Repo(key.clone()),
-            (View::Overview, Some(_)) | (View::Focus, _) => Cursor::Entry(repo.first().name().clone()),
+            (View::Overview, Some(_)) | (View::Focus, _) => {
+                Cursor::Entry(repo.first().name().clone())
+            }
         };
         self.set_cursor(cursor);
     }
@@ -708,23 +1105,49 @@ impl Model {
     }
 
     pub fn info(&mut self, text: impl Into<String>) {
-        self.status = Some(Status { text: text.into(), kind: StatusKind::Info, at: Instant::now() });
+        self.status = Some(Status {
+            text: text.into(),
+            kind: StatusKind::Info,
+            at: Instant::now(),
+        });
     }
 
     pub fn error(&mut self, text: impl Into<String>) {
-        self.status = Some(Status { text: text.into(), kind: StatusKind::Error, at: Instant::now() });
+        self.status = Some(Status {
+            text: text.into(),
+            kind: StatusKind::Error,
+            at: Instant::now(),
+        });
     }
 
     /// Switcher order: the previous agent first (alt-tab), then pins, then
     /// the rest by recency, then everything else, live first.
     pub fn switcher_items(&self) -> Vec<(&Repo, &Entry)> {
-        let Some(snapshot) = self.snapshot() else { return Vec::new() };
+        let Some(snapshot) = self.snapshot() else {
+            return Vec::new();
+        };
         let current = self.pane.session();
-        let recent: Vec<_> = self.mru.iter().filter(|n| Some(*n) != current).filter_map(|n| snapshot.entry(n)).collect();
-        let mut rest: Vec<_> = snapshot.entries().filter(|(_, e)| self.reach(e) != Reach::Own).collect();
-        rest.sort_by_cached_key(|(_, e)| (e.presence().is_none(), e.name().as_str().to_lowercase()));
+        let recent: Vec<_> = self
+            .mru
+            .iter()
+            .filter(|n| Some(*n) != current)
+            .filter_map(|n| snapshot.entry(n))
+            .collect();
+        let mut rest: Vec<_> = snapshot
+            .entries()
+            .filter(|(_, e)| self.reach(e) != Reach::Own)
+            .collect();
+        rest.sort_by_cached_key(|(_, e)| {
+            (e.presence().is_none(), e.name().as_str().to_lowercase())
+        });
         let mut ordered: Vec<(&Repo, &Entry)> = Vec::new();
-        let candidates = recent.first().copied().into_iter().chain(snapshot.pinned()).chain(recent).chain(rest);
+        let candidates = recent
+            .first()
+            .copied()
+            .into_iter()
+            .chain(snapshot.pinned())
+            .chain(recent)
+            .chain(rest);
         for item in candidates.filter(|(_, e)| self.reach(e) != Reach::Own) {
             if !ordered.iter().any(|(_, e)| e.name() == item.1.name()) {
                 ordered.push(item);
@@ -737,7 +1160,9 @@ impl Model {
 /// Case-insensitive subsequence match; returns matched byte offsets.
 pub fn fuzzy_match(query: &str, text: &str) -> Option<Vec<usize>> {
     let mut indices = Vec::new();
-    let mut chars = text.char_indices().map(|(i, c)| (i, c.to_ascii_lowercase()));
+    let mut chars = text
+        .char_indices()
+        .map(|(i, c)| (i, c.to_ascii_lowercase()));
     for q in query.chars().map(|c| c.to_ascii_lowercase()) {
         let (i, _) = chars.by_ref().find(|(_, c)| *c == q)?;
         indices.push(i);
@@ -792,7 +1217,11 @@ pub enum RepoInput {
 
 impl RepoInput {
     fn path(path: PathBuf) -> Self {
-        if path.is_dir() { Self::Path(path) } else { Self::Missing(path) }
+        if path.is_dir() {
+            Self::Path(path)
+        } else {
+            Self::Missing(path)
+        }
     }
 
     pub fn choice(&self) -> Option<RepoChoice> {
@@ -809,18 +1238,32 @@ impl RepoInput {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NameCheck {
     Empty,
-    TooLong { bytes: usize },
+    TooLong {
+        bytes: usize,
+    },
     Invalid(String),
     /// The session the TUI runs in.
     Own,
     /// A repo's main checkout without a session; start it from the list.
-    MainCheckout { repo: String },
+    MainCheckout {
+        repo: String,
+    },
     /// Running: ⏎ attaches and types the task in.
-    Live { name: AgentName, repo: String },
+    Live {
+        name: AgentName,
+        repo: String,
+    },
     /// Exited: ⏎ resurrects it, which can't carry a task.
-    Exited { name: AgentName, repo: String },
+    Exited {
+        name: AgentName,
+        repo: String,
+    },
     /// An agent worktree with no session: ⏎ starts it with the task.
-    Idle { name: AgentName, repo: String, at: Startable },
+    Idle {
+        name: AgentName,
+        repo: String,
+        at: Startable,
+    },
     Free(AgentName),
 }
 
@@ -836,7 +1279,10 @@ impl NameCheck {
             Err(NameError::TooLong { len, .. }) => return Self::TooLong { bytes: len },
             Err(NameError::Reserved(_)) => return Self::Invalid(format!("'{text}' is reserved")),
             Err(_) => {
-                let bad = invalid_chars(text).into_iter().next().map_or(' ', |(_, c)| c);
+                let bad = invalid_chars(text)
+                    .into_iter()
+                    .next()
+                    .map_or(' ', |(_, c)| c);
                 return Self::Invalid(format!("'{bad}' not allowed: letters, digits, . - _"));
             }
         };
@@ -844,13 +1290,20 @@ impl NameCheck {
         if own == Some(&session) {
             return Self::Own;
         }
-        let Some((repo, entry)) = snapshot.and_then(|s| s.entry(&session)) else { return Self::Free(name) };
+        let Some((repo, entry)) = snapshot.and_then(|s| s.entry(&session)) else {
+            return Self::Free(name);
+        };
         let repo = repo.name().into_owned();
         match (entry.kind(), entry.state()) {
             (_, EntryState::Live) => Self::Live { name, repo },
-            (_, EntryState::Exited) => Self::Exited { name, repo },
-            (EntryKind::Agent { .. }, EntryState::Idle(at)) => Self::Idle { name, repo, at },
-            (_, EntryState::Idle(_)) => Self::MainCheckout { repo },
+            (_, EntryState::Exited(Revival::Resurrect)) => Self::Exited { name, repo },
+            (
+                EntryKind::Agent { .. },
+                EntryState::Idle(at) | EntryState::Exited(Revival::Restart(at)),
+            ) => Self::Idle { name, repo, at },
+            (_, EntryState::Exited(Revival::Restart(_)) | EntryState::Idle(_)) => {
+                Self::MainCheckout { repo }
+            }
         }
     }
 }
@@ -867,7 +1320,10 @@ pub enum Phase {
     Editing,
     /// Waiting for `launch`'s result, which activates the agent. The form
     /// shows `launch` as it was submitted, whatever refreshes say since.
-    Submitting { ticket: Ticket, launch: Launchable },
+    Submitting {
+        ticket: Ticket,
+        launch: Launchable,
+    },
 }
 
 /// What ⏎ in the form does, decided in `refresh` from the name check, the
@@ -881,9 +1337,16 @@ pub enum Submission {
 /// Something the form can launch, carried out as decided.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Launchable {
-    Create { name: AgentName, repo: RepoChoice, task: Option<Prompt> },
+    Create {
+        name: AgentName,
+        repo: RepoChoice,
+        task: Option<Prompt>,
+    },
     /// Running: attach, typing the prompt in if there is one.
-    Attach { name: AgentName, task: Option<Prompt> },
+    Attach {
+        name: AgentName,
+        task: Option<Prompt>,
+    },
     /// Exited: resurrect it. A prompt can't be typed into a dead session.
     Resurrect(AgentName),
     /// An idle worktree: start it with the prompt.
@@ -893,7 +1356,9 @@ pub enum Launchable {
 impl Launchable {
     pub fn session(&self) -> SessionName {
         match self {
-            Self::Create { name, .. } | Self::Attach { name, .. } | Self::Resurrect(name) => name.session(),
+            Self::Create { name, .. } | Self::Attach { name, .. } | Self::Resurrect(name) => {
+                name.session()
+            }
             Self::Start { at, .. } => at.name(),
         }
     }
@@ -937,9 +1402,10 @@ impl Blocked {
             Self::Name => None,
             Self::Prompt(why) => Some(format!("prompt: {why}")),
             Self::NoRepo => Some("pick a repo: type its name, or a path".into()),
-            Self::ExitedWithPrompt => {
-                Some("it exited, so the prompt can't be typed in. Clear it to resurrect, then send it".into())
-            }
+            Self::ExitedWithPrompt => Some(
+                "it exited, so the prompt can't be typed in. Clear it to resurrect, then send it"
+                    .into(),
+            ),
         }
     }
 }
@@ -953,13 +1419,25 @@ impl Submission {
         match (check, task) {
             (_, Err(why)) => Self::Blocked(Blocked::Prompt(why)),
             (NameCheck::Free(name), Ok(task)) => match repo.choice() {
-                Some(repo) => Self::Ready(Launchable::Create { name: name.clone(), repo, task }),
+                Some(repo) => Self::Ready(Launchable::Create {
+                    name: name.clone(),
+                    repo,
+                    task,
+                }),
                 None => Self::Blocked(Blocked::NoRepo),
             },
-            (NameCheck::Live { name, .. }, Ok(task)) => Self::Ready(Launchable::Attach { name: name.clone(), task }),
+            (NameCheck::Live { name, .. }, Ok(task)) => Self::Ready(Launchable::Attach {
+                name: name.clone(),
+                task,
+            }),
             (NameCheck::Exited { .. }, Ok(Some(_))) => Self::Blocked(Blocked::ExitedWithPrompt),
-            (NameCheck::Exited { name, .. }, Ok(None)) => Self::Ready(Launchable::Resurrect(name.clone())),
-            (NameCheck::Idle { at, .. }, Ok(task)) => Self::Ready(Launchable::Start { at: at.clone(), task }),
+            (NameCheck::Exited { name, .. }, Ok(None)) => {
+                Self::Ready(Launchable::Resurrect(name.clone()))
+            }
+            (NameCheck::Idle { at, .. }, Ok(task)) => Self::Ready(Launchable::Start {
+                at: at.clone(),
+                task,
+            }),
             (
                 NameCheck::Empty
                 | NameCheck::TooLong { .. }
@@ -1004,7 +1482,10 @@ pub enum NamingState {
     Due(Instant),
     Asking,
     /// The model's name for `prompt`.
-    Answered { prompt: String, name: AgentName },
+    Answered {
+        prompt: String,
+        name: AgentName,
+    },
 }
 
 /// The new-agent form. `name` is what the user typed; when it's empty the
@@ -1073,12 +1554,20 @@ impl NewAgent {
             return;
         }
         self.naming.state = match name {
-            Some(name) => NamingState::Answered { prompt: self.task.clone(), name },
+            Some(name) => NamingState::Answered {
+                prompt: self.task.clone(),
+                name,
+            },
             None => NamingState::Idle,
         };
     }
 
-    pub fn derive(&self, snapshot: Option<&Snapshot>, own: Option<&SessionName>, start_dir: &Path) -> Derived {
+    pub fn derive(
+        &self,
+        snapshot: Option<&Snapshot>,
+        own: Option<&SessionName>,
+        start_dir: &Path,
+    ) -> Derived {
         use agent_core::naming::{Source, suggest};
         let local = suggest(&self.task);
         let answer = match &self.naming.state {
@@ -1091,7 +1580,10 @@ impl NewAgent {
             (Some(words), None) => Some((words.name, NameSource::Words)),
             (None, None) => None,
         }
-        .map(|(name, source)| NameSuggestion { name: free_name(&name, snapshot, own), source });
+        .map(|(name, source)| NameSuggestion {
+            name: free_name(&name, snapshot, own),
+            source,
+        });
         let name = match (self.name.as_str(), &suggestion) {
             ("", Some(suggestion)) => suggestion.name.clone(),
             (typed, _) => typed.to_string(),
@@ -1103,7 +1595,14 @@ impl NewAgent {
             _ => None,
         };
         let submission = Submission::of(&check, &self.task, &repo_input);
-        Derived { suggestion, name, check, repo_input, completion, submission }
+        Derived {
+            suggestion,
+            name,
+            check,
+            repo_input,
+            completion,
+            submission,
+        }
     }
 
     fn parse_repo(&self, snapshot: Option<&Snapshot>, start_dir: &Path) -> RepoInput {
@@ -1129,7 +1628,6 @@ impl NewAgent {
         let matches = repo_matches(snapshot, text);
         RepoInput::Search(self.repo.pick(&matches).cloned())
     }
-
 }
 
 /// What's left of `name` after `typed`, compared a character at a time
@@ -1160,7 +1658,10 @@ fn free_name(base: &AgentName, snapshot: Option<&Snapshot>, own: Option<&Session
     (2..100)
         .map(|n| {
             let suffix = format!("-{n}");
-            let stem = &base.as_str()[..base.as_str().len().min(agent_core::names::MAX_SESSION_LEN - suffix.len())];
+            let stem = &base.as_str()[..base
+                .as_str()
+                .len()
+                .min(agent_core::names::MAX_SESSION_LEN - suffix.len())];
             format!("{}{suffix}", stem.trim_end_matches(['-', '.', '_']))
         })
         .find(|candidate| !taken(candidate))
@@ -1189,8 +1690,11 @@ pub fn repo_matches(snapshot: Option<&Snapshot>, query: &str) -> Vec<RepoRoot> {
 pub fn invalid_chars(name: &str) -> Vec<(usize, char)> {
     name.char_indices()
         .filter(|&(i, c)| {
-            let allowed =
-                if i == 0 { c.is_ascii_alphanumeric() } else { c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') };
+            let allowed = if i == 0 {
+                c.is_ascii_alphanumeric()
+            } else {
+                c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_')
+            };
             !allowed
         })
         .collect()

@@ -19,7 +19,11 @@ pub enum CommandError {
         source: io::Error,
     },
     #[error("{command} failed ({status}): {stderr}")]
-    Failed { command: String, status: String, stderr: String },
+    Failed {
+        command: String,
+        status: String,
+        stderr: String,
+    },
     #[error("{command} timed out after {}s", .after.as_secs())]
     TimedOut { command: String, after: Duration },
     #[error("unexpected output from {command}: {detail}")]
@@ -58,7 +62,12 @@ fn drain(mut pipe: impl Read + Send + 'static) -> mpsc::Receiver<Vec<u8>> {
 /// The pipe's contents, or `None` if something still holds it open past the
 /// deadline; partial output must never pass for complete output.
 fn collect(pipe: &mpsc::Receiver<Vec<u8>>, deadline: Instant) -> Option<Vec<u8>> {
-    pipe.recv_timeout(deadline.saturating_duration_since(Instant::now()).max(Duration::from_millis(100))).ok()
+    pipe.recv_timeout(
+        deadline
+            .saturating_duration_since(Instant::now())
+            .max(Duration::from_millis(100)),
+    )
+    .ok()
 }
 
 /// Runs `cmd` to completion within `timeout`, killing it if it overruns.
@@ -69,7 +78,10 @@ pub fn output_within(cmd: &mut Command, timeout: Duration) -> Result<Output, Com
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|source| CommandError::Spawn { command: command.clone(), source })?;
+        .map_err(|source| CommandError::Spawn {
+            command: command.clone(),
+            source,
+        })?;
     let stdout = drain(child.stdout.take().expect("stdout is piped"));
     let stderr = drain(child.stderr.take().expect("stderr is piped"));
     let deadline = Instant::now() + timeout;
@@ -80,14 +92,24 @@ pub fn output_within(cmd: &mut Command, timeout: Duration) -> Result<Output, Com
             Ok(None) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(CommandError::TimedOut { command, after: timeout });
+                return Err(CommandError::TimedOut {
+                    command,
+                    after: timeout,
+                });
             }
             Err(source) => return Err(CommandError::Spawn { command, source }),
         }
     };
     match (collect(&stdout, deadline), collect(&stderr, deadline)) {
-        (Some(stdout), Some(stderr)) => Ok(Output { status, stdout, stderr }),
-        _ => Err(CommandError::TimedOut { command, after: timeout }),
+        (Some(stdout), Some(stderr)) => Ok(Output {
+            status,
+            stdout,
+            stderr,
+        }),
+        _ => Err(CommandError::TimedOut {
+            command,
+            after: timeout,
+        }),
     }
 }
 
@@ -101,7 +123,10 @@ pub fn run(cmd: &mut Command) -> Result<String, CommandError> {
     if !out.status.success() {
         return Err(failed(cmd, &out));
     }
-    String::from_utf8(out.stdout).map_err(|e| CommandError::Parse { command: describe(cmd), detail: e.to_string() })
+    String::from_utf8(out.stdout).map_err(|e| CommandError::Parse {
+        command: describe(cmd),
+        detail: e.to_string(),
+    })
 }
 
 pub fn failed(cmd: &Command, out: &Output) -> CommandError {
@@ -119,8 +144,14 @@ pub fn parallel_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -
     }
     let chunk = items.len().div_ceil(MAX_THREADS);
     thread::scope(|s| {
-        let handles: Vec<_> = items.chunks(chunk).map(|c| s.spawn(|| c.iter().map(&f).collect::<Vec<_>>())).collect();
-        handles.into_iter().flat_map(|h| h.join().expect("worker panicked")).collect()
+        let handles: Vec<_> = items
+            .chunks(chunk)
+            .map(|c| s.spawn(|| c.iter().map(&f).collect::<Vec<_>>()))
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().expect("worker panicked"))
+            .collect()
     })
 }
 
@@ -136,7 +167,13 @@ pub struct LaunchSpec {
 
 impl LaunchSpec {
     pub fn new(program: impl Into<OsString>) -> Self {
-        Self { program: program.into(), args: Vec::new(), cwd: None, env: Vec::new(), env_remove: Vec::new() }
+        Self {
+            program: program.into(),
+            args: Vec::new(),
+            cwd: None,
+            env: Vec::new(),
+            env_remove: Vec::new(),
+        }
     }
 
     #[must_use]
@@ -224,13 +261,17 @@ mod tests {
         let mut cmd = Command::new("sleep");
         cmd.arg("5");
         let started = Instant::now();
-        assert!(matches!(output_within(&mut cmd, Duration::from_millis(100)), Err(CommandError::TimedOut { .. })));
+        assert!(matches!(
+            output_within(&mut cmd, Duration::from_millis(100)),
+            Err(CommandError::TimedOut { .. })
+        ));
         assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     #[test]
     fn output_is_captured_and_failures_returned() {
-        let out = output(Command::new("sh").args(["-c", "echo out; echo err >&2; exit 3"])).unwrap();
+        let out =
+            output(Command::new("sh").args(["-c", "echo out; echo err >&2; exit 3"])).unwrap();
         assert_eq!(out.stdout, b"out\n");
         assert_eq!(out.stderr, b"err\n");
         assert_eq!(out.status.code(), Some(3));
@@ -239,6 +280,9 @@ mod tests {
     #[test]
     fn parallel_map_preserves_order() {
         let items: Vec<u32> = (0..50).collect();
-        assert_eq!(parallel_map(&items, |n| n * 2), items.iter().map(|n| n * 2).collect::<Vec<_>>());
+        assert_eq!(
+            parallel_map(&items, |n| n * 2),
+            items.iter().map(|n| n * 2).collect::<Vec<_>>()
+        );
     }
 }

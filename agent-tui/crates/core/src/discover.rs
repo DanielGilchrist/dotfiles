@@ -12,12 +12,24 @@ use crate::process::{CommandError, parallel_map};
 /// Something discovery skipped, without failing as a whole.
 #[derive(Debug)]
 pub enum Warning {
-    Scan { root: PathBuf, error: io::Error },
-    Repo { path: PathBuf, error: CommandError },
+    Scan {
+        root: PathBuf,
+        error: io::Error,
+    },
+    Repo {
+        path: PathBuf,
+        error: CommandError,
+    },
     /// A repo whose directory name isn't a usable session name.
-    Unnamed { root: RepoRoot, error: NameError },
+    Unnamed {
+        root: RepoRoot,
+        error: NameError,
+    },
     /// Two checkouts want the same session name; the later one is hidden.
-    NameClash { name: SessionName, hidden: PathBuf },
+    NameClash {
+        name: SessionName,
+        hidden: PathBuf,
+    },
 }
 
 impl fmt::Display for Warning {
@@ -25,8 +37,12 @@ impl fmt::Display for Warning {
         match self {
             Self::Scan { root, error } => write!(f, "scanning {}: {error}", root.display()),
             Self::Repo { path, error } => write!(f, "{}: {error}", path.display()),
-            Self::Unnamed { root, error } => write!(f, "{} has no session: {error}", root.path().display()),
-            Self::NameClash { name, hidden } => write!(f, "{} is hidden: {name} is already taken", hidden.display()),
+            Self::Unnamed { root, error } => {
+                write!(f, "{} has no session: {error}", root.path().display())
+            }
+            Self::NameClash { name, hidden } => {
+                write!(f, "{} is hidden: {name} is already taken", hidden.display())
+            }
         }
     }
 }
@@ -39,26 +55,42 @@ pub struct Observation {
     pub warnings: Vec<Warning>,
 }
 
-pub fn observe(vcs: &dyn Vcs, host: &dyn SessionHost, layout: &Layout) -> Result<Observation, HostError> {
+pub fn observe(
+    vcs: &dyn Vcs,
+    host: &dyn SessionHost,
+    layout: &Layout,
+) -> Result<Observation, HostError> {
     let sessions = host.sessions()?;
     let mut warnings = Vec::new();
 
-    let mut candidates: Vec<PathBuf> = sessions.iter().filter_map(|s| s.cwd().map(PathBuf::from)).collect();
+    let mut candidates: Vec<PathBuf> = sessions
+        .iter()
+        .filter_map(|s| s.cwd().map(PathBuf::from))
+        .collect();
     match layout.scan() {
         Ok(worktrees) => candidates.extend(worktrees.iter().map(|wt| wt.path().to_path_buf())),
-        Err(error) => warnings.push(Warning::Scan { root: layout.root().to_path_buf(), error }),
+        Err(error) => warnings.push(Warning::Scan {
+            root: layout.root().to_path_buf(),
+            error,
+        }),
     }
     candidates.sort();
     candidates.dedup();
 
     let mut roots = BTreeSet::new();
-    for (path, result) in candidates.iter().zip(parallel_map(&candidates, |p| vcs.repo_of(p))) {
+    for (path, result) in candidates
+        .iter()
+        .zip(parallel_map(&candidates, |p| vcs.repo_of(p)))
+    {
         match result {
             Ok(Some(root)) => {
                 roots.insert(root);
             }
             Ok(None) => {}
-            Err(error) => warnings.push(Warning::Repo { path: path.clone(), error }),
+            Err(error) => warnings.push(Warning::Repo {
+                path: path.clone(),
+                error,
+            }),
         }
     }
 
@@ -67,18 +99,30 @@ pub fn observe(vcs: &dyn Vcs, host: &dyn SessionHost, layout: &Layout) -> Result
     for (root, result) in roots.iter().zip(parallel_map(&roots, |r| vcs.worktrees(r))) {
         match result {
             Ok(worktrees) => repos.push((root.clone(), worktrees)),
-            Err(error) => warnings.push(Warning::Repo { path: root.path().to_path_buf(), error }),
+            Err(error) => warnings.push(Warning::Repo {
+                path: root.path().to_path_buf(),
+                error,
+            }),
         }
     }
-    Ok(Observation { sessions, repos, warnings })
+    Ok(Observation {
+        sessions,
+        repos,
+        warnings,
+    })
 }
 
 /// Joins sessions to checkouts. An entry's identity is its session name:
 /// the main checkout is named after the repo, agent worktrees after their
 /// directory, and any other session joins the repo whose checkout holds its
 /// cwd. Sessions inside no known repo become single-entry orphan repos.
-pub fn assemble(obs: &Observation, layout: &Layout, pins: &[SessionName]) -> (Snapshot, Vec<Warning>) {
-    let sessions: HashMap<&SessionName, &SessionInfo> = obs.sessions.iter().map(|s| (&s.name, s)).collect();
+pub fn assemble(
+    obs: &Observation,
+    layout: &Layout,
+    pins: &[SessionName],
+) -> (Snapshot, Vec<Warning>) {
+    let sessions: HashMap<&SessionName, &SessionInfo> =
+        obs.sessions.iter().map(|s| (&s.name, s)).collect();
     let session_of = |name: &SessionName| sessions.get(name).map(|s| s.status.presence());
     let mut claimed: HashSet<SessionName> = HashSet::new();
     let mut warnings = Vec::new();
@@ -90,7 +134,10 @@ pub fn assemble(obs: &Observation, layout: &Layout, pins: &[SessionName]) -> (Sn
             if claimed.insert(name.clone()) {
                 Some(name)
             } else {
-                warnings.push(Warning::NameClash { name, hidden: path.clone() });
+                warnings.push(Warning::NameClash {
+                    name,
+                    hidden: path.clone(),
+                });
                 None
             }
         };
@@ -98,17 +145,32 @@ pub fn assemble(obs: &Observation, layout: &Layout, pins: &[SessionName]) -> (Sn
         match root.name().parse::<SessionName>() {
             Ok(name) => {
                 if let Some(name) = claim(name, &worktrees.main.path, &mut warnings) {
-                    let kind = EntryKind::Main { root: root.clone(), head: worktrees.main.head.clone(), session: session_of(&name) };
+                    let kind = EntryKind::Main {
+                        root: root.clone(),
+                        head: worktrees.main.head.clone(),
+                        session: session_of(&name),
+                    };
                     entries.push(Entry::new(name.clone(), kind));
                 }
             }
-            Err(error) => warnings.push(Warning::Unnamed { root: root.clone(), error }),
+            Err(error) => warnings.push(Warning::Unnamed {
+                root: root.clone(),
+                error,
+            }),
         }
 
         for wt in &worktrees.linked {
-            let Some(worktree) = layout.worktree_at(&wt.path) else { continue };
-            let Some(name) = claim(worktree.name().session(), &wt.path, &mut warnings) else { continue };
-            let kind = EntryKind::Agent { session: session_of(&name), head: wt.head.clone(), worktree };
+            let Some(worktree) = layout.worktree_at(&wt.path) else {
+                continue;
+            };
+            let Some(name) = claim(worktree.name().session(), &wt.path, &mut warnings) else {
+                continue;
+            };
+            let kind = EntryKind::Agent {
+                session: session_of(&name),
+                head: wt.head.clone(),
+                worktree,
+            };
             entries.push(Entry::new(name.clone(), kind));
         }
 
@@ -116,22 +178,28 @@ pub fn assemble(obs: &Observation, layout: &Layout, pins: &[SessionName]) -> (Sn
             Some(agent) => Checkout::Agent(agent),
             None => Checkout::External(wt.path.clone()),
         };
-        let all: Vec<(&Worktree, Checkout)> = std::iter::once((&worktrees.main, Checkout::Main(root.clone())))
-            .chain(worktrees.linked.iter().map(|w| (w, checkout_of(w))))
-            .collect();
+        let all: Vec<(&Worktree, Checkout)> =
+            std::iter::once((&worktrees.main, Checkout::Main(root.clone())))
+                .chain(worktrees.linked.iter().map(|w| (w, checkout_of(w))))
+                .collect();
         for session in &obs.sessions {
             if claimed.contains(&session.name) {
                 continue;
             }
             let Some(cwd) = session.cwd() else { continue };
-            let Some((wt, checkout)) =
-                all.iter().filter(|(wt, _)| cwd.starts_with(&wt.path)).max_by_key(|(wt, _)| wt.path.as_os_str().len())
+            let Some((wt, checkout)) = all
+                .iter()
+                .filter(|(wt, _)| cwd.starts_with(&wt.path))
+                .max_by_key(|(wt, _)| wt.path.as_os_str().len())
             else {
                 continue;
             };
             claimed.insert(session.name.clone());
-            let kind =
-                EntryKind::Adopted { checkout: checkout.clone(), head: wt.head.clone(), presence: session.status.presence() };
+            let kind = EntryKind::Adopted {
+                checkout: checkout.clone(),
+                head: wt.head.clone(),
+                presence: session.status.presence(),
+            };
             entries.push(Entry::new(session.name.clone(), kind));
         }
 
@@ -139,13 +207,26 @@ pub fn assemble(obs: &Observation, layout: &Layout, pins: &[SessionName]) -> (Sn
     }
 
     for session in obs.sessions.iter().filter(|s| !claimed.contains(&s.name)) {
-        let kind = EntryKind::Orphan { cwd: session.cwd().map(PathBuf::from), presence: session.status.presence() };
-        grouped.push((RepoKey::Orphan(session.name.clone()), vec![Entry::new(session.name.clone(), kind)]));
+        let kind = EntryKind::Orphan {
+            cwd: session.cwd().map(PathBuf::from),
+            presence: session.status.presence(),
+        };
+        grouped.push((
+            RepoKey::Orphan(session.name.clone()),
+            vec![Entry::new(session.name.clone(), kind)],
+        ));
     }
 
     // Pins for agents that no longer exist are kept but don't take a slot.
-    let present: HashSet<&SessionName> = grouped.iter().flat_map(|(_, es)| es.iter().map(Entry::name)).collect();
-    let live_pins: Vec<SessionName> = pins.iter().filter(|p| present.contains(p)).cloned().collect();
+    let present: HashSet<&SessionName> = grouped
+        .iter()
+        .flat_map(|(_, es)| es.iter().map(Entry::name))
+        .collect();
+    let live_pins: Vec<SessionName> = pins
+        .iter()
+        .filter(|p| present.contains(p))
+        .cloned()
+        .collect();
     for (_, entries) in &mut grouped {
         for entry in entries {
             if let Some(position) = live_pins.iter().position(|p| p == entry.name()) {
@@ -154,7 +235,10 @@ pub fn assemble(obs: &Observation, layout: &Layout, pins: &[SessionName]) -> (Sn
         }
     }
 
-    let repos = grouped.into_iter().filter_map(|(key, entries)| Repo::new(key, entries)).collect();
+    let repos = grouped
+        .into_iter()
+        .filter_map(|(key, entries)| Repo::new(key, entries))
+        .collect();
     (Snapshot::new(repos), warnings)
 }
 
@@ -177,19 +261,36 @@ mod tests {
     }
 
     fn wt(path: &str, branch: Option<&str>) -> Worktree {
-        Worktree { path: path.into(), head: branch.map_or(Head::Detached, |b| Head::Branch(b.parse().unwrap())) }
+        Worktree {
+            path: path.into(),
+            head: branch.map_or(Head::Detached, |b| Head::Branch(b.parse().unwrap())),
+        }
     }
 
     fn repo(main: &str, linked: &[&str]) -> (RepoRoot, RepoWorktrees) {
-        (root(main), RepoWorktrees { main: wt(main, Some("main")), linked: linked.iter().map(|p| wt(p, None)).collect() })
+        (
+            root(main),
+            RepoWorktrees {
+                main: wt(main, Some("main")),
+                linked: linked.iter().map(|p| wt(p, None)).collect(),
+            },
+        )
     }
 
     fn live(n: &str, cwd: &str) -> SessionInfo {
-        SessionInfo { name: name(n), status: SessionStatus::Live { cwd: Some(cwd.into()) } }
+        SessionInfo {
+            name: name(n),
+            status: SessionStatus::Live {
+                cwd: Some(cwd.into()),
+            },
+        }
     }
 
     fn exited(n: &str) -> SessionInfo {
-        SessionInfo { name: name(n), status: SessionStatus::Exited }
+        SessionInfo {
+            name: name(n),
+            status: SessionStatus::Exited { cwd: None },
+        }
     }
 
     fn snapshot(obs: &Observation, pins: &[SessionName]) -> Snapshot {
@@ -205,14 +306,26 @@ mod tests {
         };
         let snap = snapshot(&obs, &[]);
         let repo = &snap.repos()[0];
-        let order: Vec<_> = repo.entries().iter().map(|e| e.name().to_string()).collect();
+        let order: Vec<_> = repo
+            .entries()
+            .iter()
+            .map(|e| e.name().to_string())
+            .collect();
         assert_eq!(order, ["api", "fix", "idle"]);
         assert_eq!(repo.first().label(), "main");
-        assert_eq!(repo.entry(&name("api")).unwrap().presence(), Some(Presence::Exited));
-        assert_eq!(repo.entry(&name("fix")).unwrap().presence(), Some(Presence::Live));
+        assert_eq!(
+            repo.entry(&name("api")).unwrap().presence(),
+            Some(Presence::Exited)
+        );
+        assert_eq!(
+            repo.entry(&name("fix")).unwrap().presence(),
+            Some(Presence::Live)
+        );
         let idle = repo.entry(&name("idle")).unwrap();
         assert_eq!(idle.presence(), None);
-        let EntryState::Idle(at) = idle.state() else { panic!("idle should be startable") };
+        let EntryState::Idle(at) = idle.state() else {
+            panic!("idle should be startable")
+        };
         assert_eq!(at.cwd(), std::path::Path::new("/w/api/idle"));
     }
 
@@ -225,13 +338,22 @@ mod tests {
         };
         let snap = snapshot(&obs, &[]);
         let entry = snap.repos()[0].entry(&name("scratch")).unwrap();
-        assert!(matches!(entry.kind(), EntryKind::Adopted { checkout: Checkout::Main(_), .. }));
+        assert!(matches!(
+            entry.kind(),
+            EntryKind::Adopted {
+                checkout: Checkout::Main(_),
+                ..
+            }
+        ));
         assert!(!matches!(entry.state(), EntryState::Idle(_)));
     }
 
     #[test]
     fn sessions_outside_known_repos_become_orphans() {
-        let obs = Observation { sessions: vec![exited("stray")], ..Observation::default() };
+        let obs = Observation {
+            sessions: vec![exited("stray")],
+            ..Observation::default()
+        };
         let snap = snapshot(&obs, &[]);
         assert!(matches!(snap.repos()[0].key(), RepoKey::Orphan(n) if n.as_str() == "stray"));
     }
@@ -244,13 +366,21 @@ mod tests {
             warnings: Vec::new(),
         };
         let (snap, warnings) = assemble(&obs, &layout(), &[]);
-        assert_eq!(snap.entries().filter(|(_, e)| e.name().as_str() == "api").count(), 1);
+        assert_eq!(
+            snap.entries()
+                .filter(|(_, e)| e.name().as_str() == "api")
+                .count(),
+            1
+        );
         assert!(matches!(warnings.as_slice(), [Warning::NameClash { .. }]));
     }
 
     #[test]
     fn unusable_repo_names_are_reported() {
-        let obs = Observation { repos: vec![repo("/src/a-very-long-repository-name", &[])], ..Observation::default() };
+        let obs = Observation {
+            repos: vec![repo("/src/a-very-long-repository-name", &[])],
+            ..Observation::default()
+        };
         let (snap, warnings) = assemble(&obs, &layout(), &[]);
         assert!(snap.is_empty());
         assert!(matches!(warnings.as_slice(), [Warning::Unnamed { .. }]));
@@ -258,24 +388,50 @@ mod tests {
 
     #[test]
     fn pinned_entries_sort_first_in_pin_order() {
-        let obs = Observation { repos: vec![repo("/src/api", &["/w/api/a", "/w/api/b"])], ..Observation::default() };
+        let obs = Observation {
+            repos: vec![repo("/src/api", &["/w/api/a", "/w/api/b"])],
+            ..Observation::default()
+        };
         let snap = snapshot(&obs, &[name("b"), name("a")]);
-        let order: Vec<_> = snap.repos()[0].entries().iter().map(|e| e.name().to_string()).collect();
+        let order: Vec<_> = snap.repos()[0]
+            .entries()
+            .iter()
+            .map(|e| e.name().to_string())
+            .collect();
         assert_eq!(order, ["b", "a", "api"]);
-        assert_eq!(snap.slot(crate::model::Slot::new(1).unwrap()).unwrap().1.name().as_str(), "b");
+        assert_eq!(
+            snap.slot(crate::model::Slot::new(1).unwrap())
+                .unwrap()
+                .1
+                .name()
+                .as_str(),
+            "b"
+        );
     }
 
     #[test]
     fn pins_for_missing_agents_dont_take_slots() {
-        let obs = Observation { repos: vec![repo("/src/api", &["/w/api/a"])], ..Observation::default() };
+        let obs = Observation {
+            repos: vec![repo("/src/api", &["/w/api/a"])],
+            ..Observation::default()
+        };
         let snap = snapshot(&obs, &[name("gone"), name("a")]);
-        assert_eq!(snap.slot(crate::model::Slot::new(1).unwrap()).unwrap().1.name().as_str(), "a");
+        assert_eq!(
+            snap.slot(crate::model::Slot::new(1).unwrap())
+                .unwrap()
+                .1
+                .name()
+                .as_str(),
+            "a"
+        );
     }
 
     #[test]
     fn external_worktrees_without_sessions_are_omitted() {
-        let obs =
-            Observation { repos: vec![repo("/src/api", &["/src/api/.claude/worktrees/x"])], ..Observation::default() };
+        let obs = Observation {
+            repos: vec![repo("/src/api", &["/src/api/.claude/worktrees/x"])],
+            ..Observation::default()
+        };
         assert_eq!(snapshot(&obs, &[]).repos()[0].entries().len(), 1);
     }
 }

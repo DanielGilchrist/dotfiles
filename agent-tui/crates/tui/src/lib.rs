@@ -17,13 +17,18 @@ use agent_core::ports::{ClientId, HarnessId};
 use agent_core::process::LaunchSpec;
 use agent_term::{EmulatorFactory, Liveness, TermSize, Terminal};
 use anyhow::{Context, Result};
-use crossterm::event::{self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event};
+use crossterm::event::{
+    self, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+    EnableFocusChange, EnableMouseCapture, Event,
+};
 use crossterm::execute;
-use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode};
+use crossterm::terminal::{
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+};
 use ratatui::DefaultTerminal;
 use ratatui::layout::Rect;
 
-use model::{Connection, Intent, Mode, Model, Pane, Ticket};
+use model::{Connection, Intent, Mode, Model, Pane, TerminalFocus, Ticket};
 use update::Effect;
 use worker::{Job, Msg, Workers};
 
@@ -46,7 +51,10 @@ pub struct Options {
 fn base64(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
-        let n = chunk.iter().enumerate().fold(0u32, |n, (i, b)| n | u32::from(*b) << (16 - 8 * i));
+        let n = chunk
+            .iter()
+            .enumerate()
+            .fold(0u32, |n, (i, b)| n | u32::from(*b) << (16 - 8 * i));
         for i in 0..4 {
             if i <= chunk.len() {
                 out.push(char::from(BASE64[(n >> (18 - 6 * i) & 63) as usize]));
@@ -87,6 +95,14 @@ enum Flow {
     Quit,
 }
 
+/// `OSC 2`, the terminal's window or tab title.
+fn set_title(terminal: &mut DefaultTerminal, title: &str) {
+    use std::io::Write;
+    let clean: String = title.chars().filter(|c| !c.is_control()).collect();
+    let _ = write!(terminal.backend_mut(), "\x1b]2;{clean}\x07")
+        .and_then(|()| terminal.backend_mut().flush());
+}
+
 enum InputCtl {
     /// Stop reading the tty and acknowledge once parked.
     Pause(SyncSender<()>),
@@ -95,12 +111,24 @@ enum InputCtl {
 
 fn enter_screen() -> Result<()> {
     enable_raw_mode()?;
-    execute!(std::io::stdout(), EnterAlternateScreen, EnableMouseCapture, EnableBracketedPaste)?;
+    execute!(
+        std::io::stdout(),
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste,
+        EnableFocusChange
+    )?;
     Ok(())
 }
 
 fn leave_screen() {
-    let _ = execute!(std::io::stdout(), DisableMouseCapture, DisableBracketedPaste, LeaveAlternateScreen);
+    let _ = execute!(
+        std::io::stdout(),
+        DisableFocusChange,
+        DisableMouseCapture,
+        DisableBracketedPaste,
+        LeaveAlternateScreen
+    );
     let _ = disable_raw_mode();
 }
 
@@ -157,7 +185,8 @@ fn spawn_input(msgs: Sender<Msg>, ctl: Receiver<InputCtl>) {
                 Ok(Event::Mouse(mouse)) => Msg::Mouse(mouse),
                 Ok(Event::Paste(text)) => Msg::Paste(text),
                 Ok(Event::Resize(..)) => Msg::Resize,
-                Ok(_) => continue,
+                Ok(Event::FocusGained) => Msg::Focus(TerminalFocus::Focused),
+                Ok(Event::FocusLost) => Msg::Focus(TerminalFocus::Unfocused),
                 Err(_) => return,
             };
             if msgs.send(msg).is_err() {
@@ -175,13 +204,29 @@ struct Runtime {
 }
 
 impl Runtime {
-    fn connect(&self, m: &mut Model, name: SessionName, spec: LaunchSpec, intent: Intent, ticket: Ticket) -> Result<()> {
-        let Some(_) = m.pane.awaiting(ticket) else { return Ok(()) };
+    fn connect(
+        &self,
+        m: &mut Model,
+        name: SessionName,
+        spec: LaunchSpec,
+        intent: Intent,
+        ticket: Ticket,
+    ) -> Result<()> {
+        let Some(_) = m.pane.awaiting(ticket) else {
+            return Ok(());
+        };
         let spec = spec.env_remove(self.backend.host.nesting_env().iter().copied());
         let size = TermSize::of(m.areas.terminal).context("the terminal pane has no size")?;
-        let term = Terminal::spawn(&spec, size, (self.emulator)(size)).with_context(|| format!("attaching to {name}"))?;
+        let term = Terminal::spawn(&spec, size, (self.emulator)(size))
+            .with_context(|| format!("attaching to {name}"))?;
         let own = term.pid().map(ClientId::new);
-        m.pane = Pane::Connected(Connection { name: name.clone(), term, others: None, mode: Mode::Nav });
+        m.pane = Pane::Connected(Connection {
+            name: name.clone(),
+            term,
+            others: None,
+            mode: Mode::Nav,
+            opened: Instant::now(),
+        });
         m.touch_mru(&name);
         match intent {
             Intent::Activate => {
@@ -197,26 +242,48 @@ impl Runtime {
     }
 
     fn send(&self, job: Job) -> Result<()> {
-        self.workers.jobs.send(job).ok().context("the background worker stopped")
+        self.workers
+            .jobs
+            .send(job)
+            .ok()
+            .context("the background worker stopped")
     }
 
     /// Runs `$EDITOR` with `arg` in `cwd`, handing it the terminal; reports
     /// whether it exited successfully (`:cq` doesn't).
-    fn edit(&self, terminal: &mut DefaultTerminal, cwd: &Path, arg: Option<&Path>) -> Result<Edited> {
+    fn edit(
+        &self,
+        terminal: &mut DefaultTerminal,
+        cwd: &Path,
+        arg: Option<&Path>,
+    ) -> Result<Edited> {
         let editor = std::env::var("EDITOR").unwrap_or_else(|_| "nvim".into());
-        let argv = shell_words::split(&editor).with_context(|| format!("parsing $EDITOR ({editor})"))?;
+        let argv =
+            shell_words::split(&editor).with_context(|| format!("parsing $EDITOR ({editor})"))?;
         let (program, args) = argv.split_first().context("$EDITOR is empty")?;
 
         let mut command = std::process::Command::new(program);
         command.args(args).args(arg).current_dir(cwd);
-        let status = self.suspended(terminal, &mut command).with_context(|| format!("running {program}"))?;
-        Ok(if status.success() { Edited::Saved } else { Edited::Cancelled })
+        let status = self
+            .suspended(terminal, &mut command)
+            .with_context(|| format!("running {program}"))?;
+        Ok(if status.success() {
+            Edited::Saved
+        } else {
+            Edited::Cancelled
+        })
     }
 
     /// Hands the terminal to `command` until it exits.
-    fn suspended(&self, terminal: &mut DefaultTerminal, command: &mut std::process::Command) -> Result<std::process::ExitStatus> {
+    fn suspended(
+        &self,
+        terminal: &mut DefaultTerminal,
+        command: &mut std::process::Command,
+    ) -> Result<std::process::ExitStatus> {
         let (ack, parked) = mpsc::sync_channel(1);
-        self.input.send(InputCtl::Pause(ack)).context("input thread is gone")?;
+        self.input
+            .send(InputCtl::Pause(ack))
+            .context("input thread is gone")?;
         parked.recv().context("input thread is gone")?;
         leave_screen();
         let status = command.status();
@@ -232,23 +299,39 @@ impl Runtime {
     /// can't crop the session for clients the editor attaches. The event
     /// loop sizes it back to the pane on the next frame.
     fn fill_screen(m: &mut Model, terminal: &DefaultTerminal) {
-        let full = terminal.size().ok().and_then(|s| TermSize::of(Rect::new(0, 0, s.width, s.height)));
+        let full = terminal
+            .size()
+            .ok()
+            .and_then(|s| TermSize::of(Rect::new(0, 0, s.width, s.height)));
         if let (Pane::Connected(c), Some(full)) = (&mut m.pane, full) {
             let _ = c.term.resize(full);
         }
     }
 
-    fn apply(&self, m: &mut Model, terminal: &mut DefaultTerminal, effects: Vec<Effect>) -> Result<Flow> {
+    fn apply(
+        &self,
+        m: &mut Model,
+        terminal: &mut DefaultTerminal,
+        effects: Vec<Effect>,
+    ) -> Result<Flow> {
         for effect in effects {
             match effect {
                 Effect::Quit => return Ok(Flow::Quit),
                 Effect::Job(job) => self.send(job)?,
-                Effect::Attach { name, intent, ticket } => {
+                Effect::Attach {
+                    name,
+                    intent,
+                    ticket,
+                } => {
                     let spec = self.backend.host.attach(&name);
                     let result = self.connect(m, name, spec, intent, ticket);
                     Self::connect_failed(m, ticket, result);
                 }
-                Effect::Connect { launch, intent, ticket } => {
+                Effect::Connect {
+                    launch,
+                    intent,
+                    ticket,
+                } => {
                     let result = self.connect(m, launch.session, launch.spec, intent, ticket);
                     Self::connect_failed(m, ticket, result);
                 }
@@ -272,6 +355,13 @@ impl Runtime {
                         Err(e) => m.error(format!("{label}: {e:#}")),
                     }
                     m.schedule_preview();
+                }
+                Effect::Bell => {
+                    use std::io::Write;
+                    let _ = terminal
+                        .backend_mut()
+                        .write_all(b"\x07")
+                        .and_then(|()| terminal.backend_mut().flush());
                 }
                 Effect::TerminalEvent { name, value } => {
                     if let Err(e) = set_user_var(terminal, name.as_str(), value.as_bytes()) {
@@ -300,14 +390,25 @@ impl Runtime {
     /// was cancelled; the text is cleaned of carriage returns and control
     /// characters, as pasted text is.
     fn edit_task(&self, terminal: &mut DefaultTerminal, task: &str) -> Result<Option<String>> {
-        let file = tempfile::Builder::new().prefix("agent-task-").suffix(".md").tempfile()?;
-        std::fs::write(file.path(), task).with_context(|| format!("writing {}", file.path().display()))?;
-        let dir = file.path().parent().map_or_else(std::env::temp_dir, Path::to_path_buf);
+        let file = tempfile::Builder::new()
+            .prefix("agent-task-")
+            .suffix(".md")
+            .tempfile()?;
+        std::fs::write(file.path(), task)
+            .with_context(|| format!("writing {}", file.path().display()))?;
+        let dir = file
+            .path()
+            .parent()
+            .map_or_else(std::env::temp_dir, Path::to_path_buf);
         if let Edited::Cancelled = self.edit(terminal, &dir, Some(file.path()))? {
             return Ok(None);
         }
-        let edited = std::fs::read_to_string(file.path()).with_context(|| format!("reading {}", file.path().display()))?;
-        let clean: String = edited.chars().filter(|c| !c.is_control() || matches!(c, '\n' | '\t')).collect();
+        let edited = std::fs::read_to_string(file.path())
+            .with_context(|| format!("reading {}", file.path().display()))?;
+        let clean: String = edited
+            .chars()
+            .filter(|c| !c.is_control() || matches!(c, '\n' | '\t'))
+            .collect();
         Ok(Some(clean.trim_end().to_string()))
     }
 
@@ -327,7 +428,8 @@ pub fn run(options: Options) -> Result<()> {
         .label()
         .to_string();
     let _guard = ScreenGuard::enter()?;
-    let mut terminal = ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stdout()))?;
+    let mut terminal =
+        ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stdout()))?;
     event_loop(&mut terminal, options, label)
 }
 
@@ -337,27 +439,51 @@ fn event_loop(terminal: &mut DefaultTerminal, options: Options, label: String) -
     spawn_input(msgs.clone(), input_ctl);
     let workers = worker::spawn(Arc::clone(&options.backend), msgs);
     let _ = workers.refresh.send(());
-    let rt = Runtime { backend: options.backend, emulator: options.emulator, workers, input };
+    let rt = Runtime {
+        backend: options.backend,
+        emulator: options.emulator,
+        workers,
+        input,
+    };
 
-    let mut m = Model::new(options.start_dir, options.own_session, options.harness, label);
-    m.follow = rt.backend.store.last_selected().ok().flatten().map(model::Follow::Restored);
+    let mut m = Model::new(
+        options.start_dir,
+        options.own_session,
+        options.harness,
+        label,
+    );
+    m.follow = rt
+        .backend
+        .store
+        .last_selected()
+        .ok()
+        .flatten()
+        .map(model::Follow::Restored);
     m.actions = options.config.actions;
     m.keys = options.config.keys;
     let mut last_refresh = Instant::now();
     let mut last_selection = None;
+    let mut last_title = String::new();
 
     loop {
         if let Pane::Connected(c) = &mut m.pane
-            && c.term.pump() == Liveness::Exited {
-                let name = c.name.clone();
-                m.pane = Pane::Empty;
-                m.info(format!("detached from {name}"));
-            }
+            && c.term.pump() == Liveness::Exited
+        {
+            let name = c.name.clone();
+            m.pane = Pane::Empty;
+            m.info(format!("detached from {name}"));
+        }
         if let (Pane::Connected(c), Some(size)) = (&mut m.pane, TermSize::of(m.areas.terminal))
-            && let Err(e) = c.term.resize(size) {
-                m.error(format!("resizing the pane: {e}"));
-            }
+            && let Err(e) = c.term.resize(size)
+        {
+            m.error(format!("resizing the pane: {e}"));
+        }
         terminal.draw(|f| view::draw(f, &mut m))?;
+        let title = m.attention().title();
+        if title != last_title {
+            set_title(terminal, &title);
+            last_title = title;
+        }
 
         let mut effects = update::tick(&mut m);
         match inbox.recv_timeout(FRAME) {
@@ -382,10 +508,17 @@ fn event_loop(terminal: &mut DefaultTerminal, options: Options, label: String) -
 
         if last_refresh.elapsed() >= REFRESH_EVERY {
             last_refresh = Instant::now();
-            rt.workers.refresh.send(()).ok().context("the refresh worker stopped")?;
+            rt.workers
+                .refresh
+                .send(())
+                .ok()
+                .context("the refresh worker stopped")?;
             if let Some(c) = m.pane.connection().filter(|c| c.mode != Mode::Agent) {
                 let own = c.term.pid().map(ClientId::new);
-                rt.send(Job::CheckShared { name: c.name.clone(), own })?;
+                rt.send(Job::CheckShared {
+                    name: c.name.clone(),
+                    own,
+                })?;
             }
         }
     }
@@ -400,6 +533,9 @@ mod tests {
         assert_eq!(super::base64(b"f"), "Zg==");
         assert_eq!(super::base64(b"fo"), "Zm8=");
         assert_eq!(super::base64(b"foo"), "Zm9v");
-        assert_eq!(super::base64("/w/api/fix ✓".as_bytes()), "L3cvYXBpL2ZpeCDinJM=");
+        assert_eq!(
+            super::base64("/w/api/fix ✓".as_bytes()),
+            "L3cvYXBpL2ZpeCDinJM="
+        );
     }
 }

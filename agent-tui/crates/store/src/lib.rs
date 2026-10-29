@@ -1,7 +1,10 @@
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
+use agent_core::activity::{Activity, Event};
 use agent_core::names::SessionName;
 use agent_core::paths::{PathError, home};
 use agent_core::ports::{AgentRecord, Store, StoreError};
@@ -43,27 +46,64 @@ impl FsStore {
         self.dir.join("records").join(format!("{name}.json"))
     }
 
+    fn activity_dir(&self) -> PathBuf {
+        self.dir.join("activity")
+    }
+
+    fn activity_path(&self, name: &SessionName) -> PathBuf {
+        self.activity_dir().join(format!("{name}.json"))
+    }
+
+    fn read_activity(path: &Path) -> Result<Option<Activity>, StoreError> {
+        let Some(contents) = read_optional(path)? else {
+            return Ok(None);
+        };
+        serde_json::from_str(&contents)
+            .map(Some)
+            .map_err(|e| StoreError::Corrupt {
+                path: path.to_path_buf(),
+                detail: e.to_string(),
+            })
+    }
+
     fn lock(&self) -> Result<Flock<File>, StoreError> {
         std::fs::create_dir_all(&self.dir).map_err(io_err(&self.dir))?;
         let path = self.dir.join(".lock");
-        let file = OpenOptions::new().create(true).truncate(false).write(true).open(&path).map_err(io_err(&path))?;
-        Flock::lock(file, FlockArg::LockExclusive)
-            .map_err(|(_, errno)| StoreError::Io { path, source: io::Error::from(errno) })
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .map_err(io_err(&path))?;
+        Flock::lock(file, FlockArg::LockExclusive).map_err(|(_, errno)| StoreError::Io {
+            path,
+            source: io::Error::from(errno),
+        })
     }
 
     fn read_pins(&self) -> Result<Vec<SessionName>, StoreError> {
         let path = self.pins_path();
-        let Some(contents) = read_optional(&path)? else { return Ok(Vec::new()) };
+        let Some(contents) = read_optional(&path)? else {
+            return Ok(Vec::new());
+        };
         contents
             .lines()
             .filter(|l| !l.is_empty())
-            .map(|l| l.parse().map_err(|e| StoreError::Corrupt { path: path.clone(), detail: format!("{e}") }))
+            .map(|l| {
+                l.parse().map_err(|e| StoreError::Corrupt {
+                    path: path.clone(),
+                    detail: format!("{e}"),
+                })
+            })
             .collect()
     }
 }
 
 fn io_err(path: &Path) -> impl FnOnce(io::Error) -> StoreError + '_ {
-    move |source| StoreError::Io { path: path.to_path_buf(), source }
+    move |source| StoreError::Io {
+        path: path.to_path_buf(),
+        source,
+    }
 }
 
 fn read_optional(path: &Path) -> Result<Option<String>, StoreError> {
@@ -120,8 +160,15 @@ impl Store for FsStore {
 
     fn record(&self, name: &SessionName) -> Result<Option<AgentRecord>, StoreError> {
         let path = self.record_path(name);
-        let Some(contents) = read_optional(&path)? else { return Ok(None) };
-        serde_json::from_str(&contents).map(Some).map_err(|e| StoreError::Corrupt { path, detail: e.to_string() })
+        let Some(contents) = read_optional(&path)? else {
+            return Ok(None);
+        };
+        serde_json::from_str(&contents)
+            .map(Some)
+            .map_err(|e| StoreError::Corrupt {
+                path,
+                detail: e.to_string(),
+            })
     }
 
     fn put_record(&self, name: &SessionName, record: &AgentRecord) -> Result<(), StoreError> {
@@ -132,8 +179,15 @@ impl Store for FsStore {
 
     fn last_selected(&self) -> Result<Option<SessionName>, StoreError> {
         let path = self.selection_path();
-        let Some(contents) = read_optional(&path)? else { return Ok(None) };
-        serde_json::from_str(&contents).map(Some).map_err(|e| StoreError::Corrupt { path, detail: e.to_string() })
+        let Some(contents) = read_optional(&path)? else {
+            return Ok(None);
+        };
+        serde_json::from_str(&contents)
+            .map(Some)
+            .map_err(|e| StoreError::Corrupt {
+                path,
+                detail: e.to_string(),
+            })
     }
 
     fn set_last_selected(&self, name: &SessionName) -> Result<(), StoreError> {
@@ -143,11 +197,58 @@ impl Store for FsStore {
 
     fn forget(&self, name: &SessionName) -> Result<(), StoreError> {
         self.unpin(name)?;
-        let path = self.record_path(name);
-        match std::fs::remove_file(&path) {
-            Err(e) if e.kind() != io::ErrorKind::NotFound => Err(io_err(&path)(e)),
-            _ => Ok(()),
+        for path in [self.record_path(name), self.activity_path(name)] {
+            match std::fs::remove_file(&path) {
+                Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(io_err(&path)(e)),
+                _ => {}
+            }
         }
+        Ok(())
+    }
+
+    fn report(&self, name: &SessionName, event: Event) -> Result<(), StoreError> {
+        let _lock = self.lock()?;
+        let path = self.activity_path(name);
+        // A corrupt file shouldn't stop an agent's state from moving on.
+        let previous = Self::read_activity(&path).ok().flatten();
+        let next = Activity::next(previous, event, SystemTime::now());
+        let json = serde_json::to_vec(&next).expect("activity serializes");
+        write_atomic(&path, &json)
+    }
+
+    fn acknowledge(&self, name: &SessionName) -> Result<(), StoreError> {
+        let _lock = self.lock()?;
+        let path = self.activity_path(name);
+        let Some(activity) = Self::read_activity(&path)? else {
+            return Ok(());
+        };
+        let json = serde_json::to_vec(&activity.acknowledged(SystemTime::now()))
+            .expect("activity serializes");
+        write_atomic(&path, &json)
+    }
+
+    /// Unreadable files (corrupt, or from an older format) are left out
+    /// rather than hiding everyone else's activity.
+    fn activities(&self) -> Result<HashMap<SessionName, Activity>, StoreError> {
+        let dir = self.activity_dir();
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(HashMap::new()),
+            Err(e) => return Err(io_err(&dir)(e)),
+        };
+        let mut activities = HashMap::new();
+        for path in entries.filter_map(Result::ok).map(|e| e.path()) {
+            let name = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .and_then(|s| s.parse::<SessionName>().ok());
+            if let (Some(name), Some("json")) = (name, path.extension().and_then(|e| e.to_str()))
+                && let Ok(Some(activity)) = Self::read_activity(&path)
+            {
+                activities.insert(name, activity);
+            }
+        }
+        Ok(activities)
     }
 }
 
@@ -185,13 +286,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = FsStore::new(dir.path().to_path_buf());
         let pending = agent_core::ports::PendingPrompt::now("go".parse().unwrap());
-        let record = AgentRecord { harness: "claude".parse().unwrap(), pending: Some(pending) };
+        let record = AgentRecord {
+            harness: "claude".parse().unwrap(),
+            pending: Some(pending),
+        };
         store.put_record(&name("a"), &record).unwrap();
         store.pin(&name("a")).unwrap();
         assert_eq!(store.record(&name("a")).unwrap(), Some(record));
         store.forget(&name("a")).unwrap();
         assert_eq!(store.record(&name("a")).unwrap(), None);
-        assert_eq!(store.pinned().unwrap(), [] as [agent_core::names::SessionName; 0]);
+        assert_eq!(
+            store.pinned().unwrap(),
+            [] as [agent_core::names::SessionName; 0]
+        );
     }
 
     #[test]

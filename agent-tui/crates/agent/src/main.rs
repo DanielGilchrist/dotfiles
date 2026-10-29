@@ -1,5 +1,5 @@
 use std::ffi::OsStr;
-use std::io::{BufRead, IsTerminal, Write};
+use std::io::{BufRead, IsTerminal, Read, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -19,7 +19,11 @@ use anyhow::{Context, Result, bail};
 use clap::{ArgGroup, CommandFactory, Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "agent", version, about = "Coding agents in git worktrees, persisted in zellij sessions")]
+#[command(
+    name = "agent",
+    version,
+    about = "Coding agents in git worktrees, persisted in zellij sessions"
+)]
 struct Cli {
     /// Harness for new agents (e.g. claude)
     #[arg(long, global = true)]
@@ -118,6 +122,7 @@ enum Cmd {
     /// Run the harness for a session's pane (used in session layouts)
     #[command(hide = true)]
     Exec { name: SessionName },
+
     /// Finish deleting removed worktrees
     #[command(hide = true)]
     Sweep { worktrees: Vec<PathBuf> },
@@ -161,13 +166,18 @@ fn backend() -> Result<Backend> {
 /// `$XDG_CONFIG_HOME/agent/config.toml` (default `~/.config`), or the
 /// defaults if there's no file.
 fn config() -> Result<Config> {
-    let dir = match std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).filter(|d| d.is_absolute()) {
+    let dir = match std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|d| d.is_absolute())
+    {
         Some(dir) => dir,
         None => paths::home()?.join(".config"),
     };
     let path = dir.join("agent").join("config.toml");
     match std::fs::read_to_string(&path) {
-        Ok(text) => text.parse().with_context(|| format!("in {}", path.display())),
+        Ok(text) => text
+            .parse()
+            .with_context(|| format!("in {}", path.display())),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
         Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
     }
@@ -195,24 +205,42 @@ fn infer_name(svc: Services<'_>, name: Option<SessionName>) -> Result<SessionNam
         return Ok(wt.name().session());
     }
     let (snapshot, _) = ops::snapshot(svc)?;
-    snapshot.containing(&cwd).map(|(_, e)| e.name().clone()).context("not inside an agent's checkout (pass a name)")
+    snapshot
+        .containing(&cwd)
+        .map(|(_, e)| e.name().clone())
+        .context("not inside an agent's checkout (pass a name)")
 }
 
 fn fish_quote(s: &OsStr) -> String {
-    format!("'{}'", s.to_string_lossy().replace('\\', "\\\\").replace('\'', "\\'"))
+    format!(
+        "'{}'",
+        s.to_string_lossy()
+            .replace('\\', "\\\\")
+            .replace('\'', "\\'")
+    )
 }
 
 fn read_prompt(file: &Path) -> Result<Prompt> {
-    let text = std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
-    text.parse().with_context(|| format!("{} is empty", file.display()))
+    let text =
+        std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
+    text.parse()
+        .with_context(|| format!("{} is empty", file.display()))
 }
 
 fn edit_prompt(name: &AgentName) -> Result<Option<Prompt>> {
-    let file = tempfile::Builder::new().prefix(&format!("agent-{name}-")).suffix(".md").tempfile()?;
+    let file = tempfile::Builder::new()
+        .prefix(&format!("agent-{name}-"))
+        .suffix(".md")
+        .tempfile()?;
     let editor = std::env::var("EDITOR").unwrap_or_else(|_| "nvim".into());
-    let argv = shell_words::split(&editor).with_context(|| format!("parsing $EDITOR ({editor})"))?;
+    let argv =
+        shell_words::split(&editor).with_context(|| format!("parsing $EDITOR ({editor})"))?;
     let (program, args) = argv.split_first().context("$EDITOR is empty")?;
-    let status = Command::new(program).args(args).arg(file.path()).status().with_context(|| format!("running {program}"))?;
+    let status = Command::new(program)
+        .args(args)
+        .arg(file.path())
+        .status()
+        .with_context(|| format!("running {program}"))?;
     if !status.success() {
         return Ok(None);
     }
@@ -248,12 +276,18 @@ fn finish(svc: Services<'_>, launch: &Launch, frontend: Frontend) -> Result<()> 
         Frontend::Headless => headless(launch),
         Frontend::Detached => {
             svc.host.start_detached(&launch.session)?;
-            println!("agent: {} is running. Attach with `zellij attach {}`", launch.session, launch.session);
+            println!(
+                "agent: {} is running. Attach with `zellij attach {}`",
+                launch.session, launch.session
+            );
             Ok(())
         }
         Frontend::Foreground => {
-            let status =
-                launch.spec.command().status().with_context(|| format!("running {}", launch.spec.program().display()))?;
+            let status = launch
+                .spec
+                .command()
+                .status()
+                .with_context(|| format!("running {}", launch.spec.program().display()))?;
             if !status.success() {
                 bail!("{} exited with {status}", launch.spec.program().display());
             }
@@ -274,7 +308,14 @@ fn headless(launch: &Launch) -> Result<()> {
     Ok(())
 }
 
-fn attach(svc: Services<'_>, name: &AgentName, seed: Seed, repo: Option<&RepoRoot>, frontend: Frontend, harness: &dyn Harness) -> Result<()> {
+fn attach(
+    svc: Services<'_>,
+    name: &AgentName,
+    seed: Seed,
+    repo: Option<&RepoRoot>,
+    frontend: Frontend,
+    harness: &dyn Harness,
+) -> Result<()> {
     let plan = ops::plan(svc, name, repo)?;
     let task = match (seed, frontend, plan.new_worktree()) {
         (Seed::Text(prompt), ..) => Some(prompt),
@@ -293,11 +334,17 @@ fn attach(svc: Services<'_>, name: &AgentName, seed: Seed, repo: Option<&RepoRoo
 }
 
 fn own_session() -> Option<SessionName> {
-    std::env::var("ZELLIJ_SESSION_NAME").ok().and_then(|s| s.parse().ok())
+    std::env::var("ZELLIJ_SESSION_NAME")
+        .ok()
+        .and_then(|s| s.parse().ok())
 }
 
 fn consent(force: bool) -> Consent {
-    if force { Consent::Discard } else { Consent::Clean }
+    if force {
+        Consent::Discard
+    } else {
+        Consent::Clean
+    }
 }
 
 fn remove(svc: Services<'_>, name: &SessionName, consent: Consent) -> Result<String> {
@@ -307,8 +354,16 @@ fn remove(svc: Services<'_>, name: &SessionName, consent: Consent) -> Result<Str
         (Ok(approved), _) => approved,
         (Err(hazardous), Consent::Discard) => hazardous.force(),
         (Err(hazardous), Consent::Clean) => {
-            let why: Vec<String> = hazardous.plan().hazards().iter().map(ToString::to_string).collect();
-            bail!("refusing to remove {name}: {} (re-run with --force to discard)", why.join(", "));
+            let why: Vec<String> = hazardous
+                .plan()
+                .hazards()
+                .iter()
+                .map(ToString::to_string)
+                .collect();
+            bail!(
+                "refusing to remove {name}: {} (re-run with --force to discard)",
+                why.join(", ")
+            );
         }
     };
     if own.as_ref() == Some(name) {
@@ -316,7 +371,9 @@ fn remove(svc: Services<'_>, name: &SessionName, consent: Consent) -> Result<Str
     }
     Ok(match ops::remove(svc, approved, None)? {
         Removed::Session(name) => format!("killed {name}. It has no worktree to remove"),
-        Removed::Agent { worktree, warnings, .. } => {
+        Removed::Agent {
+            worktree, warnings, ..
+        } => {
             ops::spawn_sweep(svc, std::slice::from_ref(&worktree))?;
             for warning in &warnings {
                 eprintln!("agent rm: warning: {warning}");
@@ -345,7 +402,9 @@ fn remove_own(approved: &ops::Approved) -> Result<String> {
         .process_group(0)
         .spawn()
         .context("starting the removal")?;
-    Ok(format!("removing {name} in the background. This session is about to end"))
+    Ok(format!(
+        "removing {name} in the background. This session is about to end"
+    ))
 }
 
 fn rm_all(svc: Services<'_>, consent: Consent) -> Result<()> {
@@ -395,11 +454,21 @@ fn ls(svc: Services<'_>) -> Result<()> {
                 None => "idle",
             };
             let pin = match e.pin() {
-                Some(pin) => pin.slot().map_or_else(|| "*".to_string(), |s| s.get().to_string()),
+                Some(pin) => pin
+                    .slot()
+                    .map_or_else(|| "*".to_string(), |s| s.get().to_string()),
                 None => String::new(),
             };
-            let path = e.path().map_or_else(|| "-".into(), |p| p.display().to_string());
-            [repo.name().into_owned(), e.name().to_string(), state.into(), pin, path]
+            let path = e
+                .path()
+                .map_or_else(|| "-".into(), |p| p.display().to_string());
+            [
+                repo.name().into_owned(),
+                e.name().to_string(),
+                state.into(),
+                pin,
+                path,
+            ]
         })
         .collect();
     if rows.is_empty() {
@@ -407,10 +476,21 @@ fn ls(svc: Services<'_>) -> Result<()> {
         return Ok(());
     }
     let header = ["REPO", "NAME", "STATE", "PIN", "PATH"].map(String::from);
-    let widths: Vec<usize> =
-        (0..5).map(|i| rows.iter().chain([&header]).map(|r| r[i].chars().count()).max().unwrap_or(0)).collect();
+    let widths: Vec<usize> = (0..5)
+        .map(|i| {
+            rows.iter()
+                .chain([&header])
+                .map(|r| r[i].chars().count())
+                .max()
+                .unwrap_or(0)
+        })
+        .collect();
     for row in std::iter::once(&header).chain(&rows) {
-        let cells: Vec<String> = row.iter().zip(&widths).map(|(c, w)| format!("{c:<w$}")).collect();
+        let cells: Vec<String> = row
+            .iter()
+            .zip(&widths)
+            .map(|(c, w)| format!("{c:<w$}"))
+            .collect();
         println!("{}", cells.join("  ").trim_end());
     }
     Ok(())
@@ -422,53 +502,133 @@ fn exec(svc: Services<'_>, name: &SessionName) -> Result<()> {
     Err(error).with_context(|| format!("running {}", spec.program().display()))
 }
 
+/// `agent event <session>`, run by an agent's harness hooks with the hook's
+/// JSON payload on stdin. Handled before argument parsing and always exits
+/// 0: a failure would surface as a hook error in the agent, and exit
+/// status 2 would block what it was about to do.
+fn hook_event(name: Option<&std::ffi::OsString>) -> ! {
+    let name = name
+        .and_then(|n| n.to_str())
+        .and_then(|n| n.parse::<SessionName>().ok());
+    if let (Some(name), Ok(backend)) = (name, backend()) {
+        event(backend.services(), &name);
+    }
+    std::process::exit(0)
+}
+
+/// Records a hook's payload as the agent's activity.
+fn event(svc: Services<'_>, name: &SessionName) {
+    let mut payload = String::new();
+    if std::io::stdin().read_to_string(&mut payload).is_err() {
+        return;
+    }
+    let harness = match svc.store.record(name) {
+        Ok(Some(record)) => svc.harnesses.get(&record.harness),
+        _ => None,
+    }
+    .unwrap_or_else(|| svc.harnesses.default_harness());
+    if let Some(event) = harness.event(&payload) {
+        let _ = svc.store.report(name, event);
+    }
+}
+
 fn sweep(svc: Services<'_>, paths: &[PathBuf]) -> Result<()> {
     std::thread::sleep(std::time::Duration::from_secs(5));
-    let worktrees: Vec<_> = paths.iter().filter_map(|p| svc.layout.worktree_at(p)).collect();
+    let worktrees: Vec<_> = paths
+        .iter()
+        .filter_map(|p| svc.layout.worktree_at(p))
+        .collect();
     Ok(ops::sweep(svc.layout, &worktrees)?)
 }
 
 fn main() -> Result<()> {
+    let mut args = std::env::args_os().skip(1);
+    if args.next().is_some_and(|first| first == "event") {
+        hook_event(args.next().as_ref());
+    }
     let cli = Cli::parse();
     let backend = backend()?;
     let svc = backend.services();
     let harness: &dyn Harness = match &cli.harness {
         Some(id) => svc.harnesses.get(id).with_context(|| {
-            let known: Vec<String> = svc.harnesses.all().iter().map(|h| h.id().to_string()).collect();
+            let known: Vec<String> = svc
+                .harnesses
+                .all()
+                .iter()
+                .map(|h| h.id().to_string())
+                .collect();
             format!("unknown harness {id} (known: {})", known.join(", "))
         })?,
         None => svc.harnesses.default_harness(),
     };
     match cli.command.unwrap_or(Cmd::Tui) {
-        Cmd::Tui => {
-            agent_tui::run(agent_tui::Options {
+        Cmd::Tui => agent_tui::run(agent_tui::Options {
             config: config()?,
             own_session: own_session(),
             start_dir: cwd()?,
             harness: harness.id().clone(),
             emulator: agent_term::vt100,
             backend: Arc::new(backend),
-            })
-        }
+        }),
         Cmd::Repo { repo, headless } => {
             let repo = repo_arg(svc, repo)?.ok_or(ops::Error::NoRepo)?;
-            finish(svc, &ops::open_repo(svc, &repo, harness)?, Frontend::from_flag(headless))
+            finish(
+                svc,
+                &ops::open_repo(svc, &repo, harness)?,
+                Frontend::from_flag(headless),
+            )
         }
         Cmd::Completions { shell } => {
             clap_complete::generate(shell, &mut Cli::command(), "agent", &mut std::io::stdout());
             Ok(())
         }
-        Cmd::Attach { name, prompt, seed, no_prompt, repo, headless, no_focus: _ } => {
+        Cmd::Attach {
+            name,
+            prompt,
+            seed,
+            no_prompt,
+            repo,
+            headless,
+            no_focus: _,
+        } => {
             let repo = repo_arg(svc, repo)?;
-            attach(svc, &name, Seed::from_args(prompt, seed, no_prompt), repo.as_ref(), Frontend::from_flag(headless), harness)
+            attach(
+                svc,
+                &name,
+                Seed::from_args(prompt, seed, no_prompt),
+                repo.as_ref(),
+                Frontend::from_flag(headless),
+                harness,
+            )
         }
-        Cmd::Checkout { branch, name, repo, headless, no_focus: _ } => {
+        Cmd::Checkout {
+            branch,
+            name,
+            repo,
+            headless,
+            no_focus: _,
+        } => {
             let repo = repo_arg(svc, repo)?.ok_or(ops::Error::NoRepo)?;
             let name = ops::checkout(svc, &repo, &branch, name)?;
-            attach(svc, &name, Seed::None, Some(&repo), Frontend::from_flag(headless), harness)
+            attach(
+                svc,
+                &name,
+                Seed::None,
+                Some(&repo),
+                Frontend::from_flag(headless),
+                harness,
+            )
         }
-        Cmd::Rm { name: _, force, all: true } => rm_all(svc, consent(force)),
-        Cmd::Rm { name, force, all: false } => {
+        Cmd::Rm {
+            name: _,
+            force,
+            all: true,
+        } => rm_all(svc, consent(force)),
+        Cmd::Rm {
+            name,
+            force,
+            all: false,
+        } => {
             let name = infer_name(svc, name)?;
             println!("agent rm: {}", remove(svc, &name, consent(force))?);
             Ok(())
@@ -499,6 +659,7 @@ fn main() -> Result<()> {
         Cmd::Pin { name } => Ok(svc.store.pin(&infer_name(svc, name)?)?),
         Cmd::Unpin { name } => Ok(svc.store.unpin(&infer_name(svc, name)?)?),
         Cmd::Exec { name } => exec(svc, &name),
+
         Cmd::Sweep { worktrees } => sweep(svc, &worktrees),
     }
 }
@@ -514,7 +675,8 @@ mod tests {
 
     #[test]
     fn attach_takes_one_kind_of_first_prompt() {
-        let parse = |args: &[&str]| Cli::try_parse_from(["agent", "attach", "x"].iter().chain(args));
+        let parse =
+            |args: &[&str]| Cli::try_parse_from(["agent", "attach", "x"].iter().chain(args));
         assert!(parse(&["--no-prompt"]).is_ok());
         assert!(parse(&["--seed", "f"]).is_ok());
         assert!(parse(&["--prompt", "hi"]).is_ok());

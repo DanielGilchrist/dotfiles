@@ -1,13 +1,15 @@
+use std::collections::HashMap;
+use std::ffi::OsString;
 use std::fmt;
 use std::io;
 use std::num::NonZeroUsize;
-use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
+use crate::activity::{Activity, Event};
 use crate::model::{Head, Presence, Running, Worktree};
 use crate::names::{BranchName, Prompt, SessionName};
 use crate::paths::{AgentWorktree, RepoRoot};
@@ -18,6 +20,23 @@ use crate::process::{CommandError, LaunchSpec};
 pub struct RepoWorktrees {
     pub main: Worktree,
     pub linked: Vec<Worktree>,
+}
+
+/// A worktree's work since it forked from the default branch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Progress {
+    /// Commits on top of the fork point.
+    pub ahead: usize,
+    /// Committed and uncommitted changes since the fork point.
+    pub diff: DiffStat,
+}
+
+/// `git diff --shortstat`'s three numbers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DiffStat {
+    pub files: usize,
+    pub added: usize,
+    pub removed: usize,
 }
 
 /// A branch a [`Vcs`] found in the repo's local refs. Only `Vcs`
@@ -65,10 +84,14 @@ pub enum BranchState {
     /// No commits ahead of the default base, or pushed to its own remote
     /// branch which has since been deleted (merged with auto-delete).
     Safe,
-    Unmerged { ahead: NonZeroUsize },
+    Unmerged {
+        ahead: NonZeroUsize,
+    },
     /// Its upstream branch was deleted (often: merged with auto-delete), but
     /// commits after the last push can't be ruled out.
-    UpstreamGone { ahead: NonZeroUsize },
+    UpstreamGone {
+        ahead: NonZeroUsize,
+    },
     /// There's no default base to compare against.
     Unknown,
 }
@@ -78,25 +101,49 @@ pub trait Vcs: Send + Sync {
     fn repo_of(&self, dir: &Path) -> Result<Option<RepoRoot>, CommandError>;
     fn worktrees(&self, repo: &RepoRoot) -> Result<RepoWorktrees, CommandError>;
     fn head(&self, dir: &Path) -> Result<Head, CommandError>;
-    fn add_worktree(&self, repo: &RepoRoot, at: &AgentWorktree, start: &WorktreeStart) -> Result<(), CommandError>;
+    fn add_worktree(
+        &self,
+        repo: &RepoRoot,
+        at: &AgentWorktree,
+        start: &WorktreeStart,
+    ) -> Result<(), CommandError>;
     fn prune_worktrees(&self, repo: &RepoRoot) -> Result<(), CommandError>;
-    fn local_branch(&self, repo: &RepoRoot, branch: &BranchName) -> Result<Option<LocalBranch>, CommandError>;
-    fn remote_branch(&self, repo: &RepoRoot, branch: &BranchName) -> Result<Option<RemoteBranch>, CommandError>;
-    fn branch_state(&self, repo: &RepoRoot, branch: &BranchName) -> Result<BranchState, CommandError>;
+    fn local_branch(
+        &self,
+        repo: &RepoRoot,
+        branch: &BranchName,
+    ) -> Result<Option<LocalBranch>, CommandError>;
+    fn remote_branch(
+        &self,
+        repo: &RepoRoot,
+        branch: &BranchName,
+    ) -> Result<Option<RemoteBranch>, CommandError>;
+    fn branch_state(
+        &self,
+        repo: &RepoRoot,
+        branch: &BranchName,
+    ) -> Result<BranchState, CommandError>;
     /// Modified, staged and untracked files in a worktree.
     fn dirty_files(&self, worktree: &Path) -> Result<usize, CommandError>;
     /// Commits reachable from the worktree's HEAD but from no branch or
     /// remote ref (work on a detached HEAD).
     fn unreachable_commits(&self, worktree: &Path) -> Result<usize, CommandError>;
     fn delete_branch(&self, repo: &RepoRoot, branch: LocalBranch) -> Result<(), CommandError>;
+    /// How far a worktree has come since it forked from the default branch.
+    fn progress(&self, worktree: &Path) -> Result<Progress, CommandError>;
 }
 
 /// Where a live session's terminal is, when the host could tell.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionStatus {
-    Live { cwd: Option<PathBuf> },
-    /// Dead but resurrectable; hosts don't report a cwd for these.
-    Exited,
+    Live {
+        cwd: Option<PathBuf>,
+    },
+    /// Dead but resurrectable. `cwd` is where it last ran, when the host
+    /// remembers.
+    Exited {
+        cwd: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -108,18 +155,16 @@ pub struct SessionInfo {
 impl SessionInfo {
     pub fn cwd(&self) -> Option<&Path> {
         match &self.status {
-            SessionStatus::Live { cwd } => cwd.as_deref(),
-            SessionStatus::Exited => None,
+            SessionStatus::Live { cwd } | SessionStatus::Exited { cwd } => cwd.as_deref(),
         }
     }
-
 }
 
 impl SessionStatus {
     pub fn presence(&self) -> Presence {
         match self {
             Self::Live { .. } => Presence::Live,
-            Self::Exited => Presence::Exited,
+            Self::Exited { .. } => Presence::Exited,
         }
     }
 }
@@ -161,7 +206,11 @@ pub enum HostError {
 /// Hosts whose sessions accept several clients can report and detach them.
 pub trait ClientControl: Send + Sync {
     /// Clients attached to `name`, excluding `own` and anything it spawned.
-    fn other_clients(&self, name: &SessionName, own: Option<ClientId>) -> Result<Vec<ClientId>, HostError>;
+    fn other_clients(
+        &self,
+        name: &SessionName,
+        own: Option<ClientId>,
+    ) -> Result<Vec<ClientId>, HostError>;
     fn detach(&self, clients: &[ClientId]) -> Result<(), HostError>;
 }
 
@@ -210,8 +259,14 @@ impl FromStr for HarnessId {
     type Err = InvalidHarnessId;
 
     fn from_str(s: &str) -> Result<Self, InvalidHarnessId> {
-        let valid = !s.is_empty() && s.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
-        if valid { Ok(Self(s.into())) } else { Err(InvalidHarnessId(s.into())) }
+        let valid = !s.is_empty()
+            && s.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+        if valid {
+            Ok(Self(s.into()))
+        } else {
+            Err(InvalidHarnessId(s.into()))
+        }
     }
 }
 
@@ -239,6 +294,9 @@ pub struct LaunchCtx<'a> {
     pub session: &'a SessionName,
     pub workdir: &'a Path,
     pub bootstrap: Option<&'a Prompt>,
+    /// The agent binary. Harnesses with hooks report through it with
+    /// `<report> event <session>`, the hook's JSON payload on stdin.
+    pub report: &'a Path,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -258,11 +316,20 @@ pub trait Harness: Send + Sync {
     /// Resume the worktree's conversation if there is one, otherwise start
     /// fresh; either way `bootstrap`, if any, is sent as the next prompt.
     fn launch(&self, ctx: &LaunchCtx<'_>) -> Result<LaunchSpec, HarnessError>;
+    /// What a hook payload reported through `agent event` means, if it's
+    /// anything the TUI shows.
+    fn event(&self, _payload: &str) -> Option<Event> {
+        None
+    }
     /// Whether the agent has recorded any activity in `workdir` since `since`,
     /// i.e. a prompt queued then has been received.
     /// Evidence the agent was active after `pending` was queued, so it has
     /// seen the prompt.
-    fn acknowledged(&self, workdir: &Path, pending: &PendingPrompt) -> Result<Option<Seen>, HarnessError>;
+    fn acknowledged(
+        &self,
+        workdir: &Path,
+        pending: &PendingPrompt,
+    ) -> Result<Option<Seen>, HarnessError>;
     /// The bytes that type `prompt` into a running agent and submit it.
     fn submit(&self, prompt: &Prompt) -> Vec<u8>;
     /// A one-shot, non-interactive answer to `question` from the harness's
@@ -289,7 +356,10 @@ pub struct PendingPrompt {
 
 impl PendingPrompt {
     pub fn now(prompt: Prompt) -> Self {
-        Self { prompt, queued: SystemTime::now() }
+        Self {
+            prompt,
+            queued: SystemTime::now(),
+        }
     }
 }
 
@@ -341,6 +411,12 @@ pub trait Store: Send + Sync {
     fn record(&self, name: &SessionName) -> Result<Option<AgentRecord>, StoreError>;
     fn put_record(&self, name: &SessionName, record: &AgentRecord) -> Result<(), StoreError>;
     fn forget(&self, name: &SessionName) -> Result<(), StoreError>;
+    /// Applies what `name`'s harness reported to its activity.
+    fn report(&self, name: &SessionName, event: Event) -> Result<(), StoreError>;
+    /// The user has looked at `name`: a finished turn stops being news.
+    fn acknowledge(&self, name: &SessionName) -> Result<(), StoreError>;
+    /// Every agent's latest activity.
+    fn activities(&self) -> Result<HashMap<SessionName, Activity>, StoreError>;
     /// The agent last selected in the TUI, to start on next time.
     fn last_selected(&self) -> Result<Option<SessionName>, StoreError>;
     fn set_last_selected(&self, name: &SessionName) -> Result<(), StoreError>;

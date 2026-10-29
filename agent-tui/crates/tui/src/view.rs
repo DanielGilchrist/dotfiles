@@ -1,8 +1,9 @@
 use std::path::Path;
+use std::time::SystemTime;
 
 use agent_core::actions::Kind;
 use agent_core::config::Keys;
-use agent_core::model::{Entry, EntryKind, Head, Presence};
+use agent_core::model::{Entry, EntryKind, Head};
 use agent_core::names::SessionName;
 use agent_core::ops::Deletes;
 use ratatui::Frame;
@@ -13,8 +14,10 @@ use ratatui::widgets::{Block, BorderType, Clear, Padding, Paragraph};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::model::{
-    Blocked, Confirm, Derived, Enter, Field, Focus, Load, Model, NameCheck, NameSource, NamingState, NewAgent, OfferEffect,
-    Overlay, Pane, Phase, Proposal, Query, Reach, Launchable, RepoInput, Row, StatusKind, Fold, Place, Submission, View, fuzzy_match, invalid_chars, repo_matches,
+    AgentStatus, Blocked, Confirm, Derived, Enter, Field, Focus, Fold, Launchable, Load, Model,
+    NameCheck, NameSource, NamingState, NewAgent, OfferEffect, Overlay, Pane, Phase, Place,
+    Proposal, Pulse, Query, Reach, RepoInput, Row, StatusKind, Submission, View, Waiting,
+    fuzzy_match, invalid_chars, repo_matches,
 };
 use crate::update::{picker_matches, switcher_matches};
 
@@ -26,6 +29,12 @@ const TASK_ROWS: usize = 6;
 const SPINNER: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
 /// Below this width the agent needs every column; Space still switches agents.
 const NARROW: u16 = 60;
+/// Below this many rows the peek gives its space back to the list.
+const PEEK_MIN_BODY: u16 = 15;
+/// The list keeps at least this many rows when the peek shows.
+const LIST_MIN_ROWS: u16 = 5;
+/// A name keeps at least this many columns before row details give way.
+const NAME_MIN: usize = 8;
 /// The NAV and switcher sections of the help; the AGENT section names the
 /// configured keys.
 const HELP: &[(&str, &[(&str, &str)])] = &[
@@ -47,10 +56,27 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
             ("d", "kill session"),
             ("D", "remove with worktree and branch"),
             ("x", "run a configured action"),
+            ("a", "next agent that needs you"),
             ("q", "quit"),
         ],
     ),
-    (" SWITCH ", &[("⌃N ⌃P", "move"), ("⏎", "switch"), ("Esc", "close")]),
+    (
+        " SWITCH ",
+        &[("⌃N ⌃P", "move"), ("⏎", "switch"), ("Esc", "close")],
+    ),
+    (
+        " STATES ",
+        &[
+            ("◆", "asking you"),
+            ("!", "failed"),
+            ("✓", "done, unseen"),
+            ("⠹", "working"),
+            ("⠹?", "gone quiet"),
+            ("●", "idle"),
+            ("○", "exited"),
+            ("·", "no session"),
+        ],
+    ),
 ];
 
 fn dim() -> Style {
@@ -128,28 +154,103 @@ fn fit(mut spans: Vec<Span<'_>>, room: usize) -> Vec<Span<'_>> {
 /// Left spans, then right spans flush to `width`; the left side yields first.
 fn justify<'a>(left: Vec<Span<'a>>, right: Vec<Span<'a>>, width: usize) -> Line<'a> {
     let right_width = line_width(&right);
-    let mut left = fit(left, width.saturating_sub(right_width + usize::from(right_width > 0)));
+    let mut left = fit(
+        left,
+        width.saturating_sub(right_width + usize::from(right_width > 0)),
+    );
     let pad = width.saturating_sub(line_width(&left) + right_width);
     left.push(Span::raw(" ".repeat(pad)));
     left.extend(right);
     Line::from(left)
 }
 
-fn glyph(presence: Option<Presence>) -> Span<'static> {
-    match presence {
-        Some(Presence::Live) => Span::raw("●"),
-        Some(Presence::Exited) => Span::styled("○", dim()),
-        None => Span::styled("·", dim()),
+/// One glyph per state: a spinner that stops when the agent goes quiet, and
+/// attention glyphs that read without colour.
+fn glyph(status: &AgentStatus) -> Span<'static> {
+    match status {
+        AgentStatus::NoSession => Span::styled("·", dim()),
+        AgentStatus::Exited => Span::styled("○", dim()),
+        AgentStatus::Idle => Span::raw("●"),
+        AgentStatus::Working {
+            pulse: Pulse::Steady,
+            ..
+        } => Span::raw(spinner()),
+        AgentStatus::Working {
+            pulse: Pulse::Stale,
+            ..
+        } => Span::styled(SPINNER[0], dim()),
+        AgentStatus::Asking { .. } => Span::styled(
+            "◆",
+            Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        ),
+        AgentStatus::Failed { .. } => Span::styled(
+            "!",
+            Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ),
+        AgentStatus::Done { .. } => Span::styled(
+            "✓",
+            Style::new().fg(Color::Green).add_modifier(Modifier::BOLD),
+        ),
     }
 }
 
-fn name_style(presence: Option<Presence>, selected: bool) -> Style {
-    let base = if presence == Some(Presence::Live) { Style::new() } else { dim() };
-    if selected { base.add_modifier(Modifier::BOLD) } else { base }
+/// Agents waiting on the user read BOLD, like unread mail. Dead ones DIM.
+fn name_style(status: &AgentStatus, selected: bool) -> Style {
+    let base = match status {
+        AgentStatus::NoSession | AgentStatus::Exited => dim(),
+        AgentStatus::Asking { .. } | AgentStatus::Failed { .. } | AgentStatus::Done { .. } => {
+            Style::new().add_modifier(Modifier::BOLD)
+        }
+        AgentStatus::Idle | AgentStatus::Working { .. } => Style::new(),
+    };
+    if selected {
+        base.add_modifier(Modifier::BOLD)
+    } else {
+        base
+    }
+}
+
+/// `38s`, `4m`, `2h`, `3d`.
+fn ago(since: SystemTime, now: SystemTime) -> String {
+    let secs = now.duration_since(since).unwrap_or_default().as_secs();
+    match secs {
+        0..60 => format!("{secs}s"),
+        60..3600 => format!("{}m", secs / 60),
+        3600..86_400 => format!("{}h", secs / 3600),
+        _ => format!("{}d", secs / 86_400),
+    }
+}
+
+/// How long it's been in its state, for states where that matters. A
+/// working agent that's gone quiet gets a `?`.
+fn time_in_state(status: &AgentStatus, now: SystemTime) -> Option<Span<'static>> {
+    match status {
+        AgentStatus::Working {
+            since,
+            pulse: Pulse::Stale,
+            ..
+        } => Some(Span::styled(format!("{}?", ago(*since, now)), dim())),
+        AgentStatus::Asking { since, .. } => Some(Span::styled(
+            ago(*since, now),
+            Style::new().fg(Color::Yellow),
+        )),
+        AgentStatus::Working {
+            since,
+            pulse: Pulse::Steady,
+            ..
+        }
+        | AgentStatus::Failed { since, .. }
+        | AgentStatus::Done { since, .. } => Some(Span::styled(ago(*since, now), dim())),
+        AgentStatus::NoSession | AgentStatus::Exited | AgentStatus::Idle => None,
+    }
 }
 
 fn hint<'a>(key: &'a str, desc: &'a str) -> [Span<'a>; 3] {
-    [Span::raw(key), Span::styled(format!(" {desc}"), dim()), Span::raw("  ")]
+    [
+        Span::raw(key),
+        Span::styled(format!(" {desc}"), dim()),
+        Span::raw("  "),
+    ]
 }
 
 fn hints<'a>(pairs: &[(&'a str, &'a str)]) -> Vec<Span<'a>> {
@@ -173,11 +274,19 @@ fn scroll(offset: usize, selected: usize, height: usize, len: usize) -> usize {
 }
 
 fn badge(text: &'static str) -> Span<'static> {
-    Span::styled(text, Style::new().fg(ACCENT).add_modifier(Modifier::REVERSED | Modifier::BOLD))
+    Span::styled(
+        text,
+        Style::new()
+            .fg(ACCENT)
+            .add_modifier(Modifier::REVERSED | Modifier::BOLD),
+    )
 }
 
 fn display_path(path: &Path) -> String {
-    match agent_core::paths::home().ok().and_then(|h| path.strip_prefix(h).ok().map(Path::to_path_buf)) {
+    match agent_core::paths::home()
+        .ok()
+        .and_then(|h| path.strip_prefix(h).ok().map(Path::to_path_buf))
+    {
         Some(rest) => format!("~/{}", rest.display()),
         None => path.display().to_string(),
     }
@@ -187,19 +296,38 @@ fn display_path(path: &Path) -> String {
 /// agent's terminal) with the focused one's border in Cyan, over a one-line
 /// status bar carrying the mode badge and context hints.
 pub fn draw(frame: &mut Frame<'_>, m: &mut Model) {
-    let [body, footer] = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(frame.area());
+    let [body, footer] =
+        Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(frame.area());
     let borders = 2;
-    let sidebar_width =
-        if body.width < NARROW { 0 } else { SIDEBAR_MAX.min(body.width / 4).max(SIDEBAR_MIN) + borders };
-    let [left, right] = Layout::horizontal([Constraint::Length(sidebar_width), Constraint::Min(0)]).areas(body);
+    let sidebar_width = if body.width < NARROW {
+        0
+    } else {
+        SIDEBAR_MAX.min(body.width / 4).max(SIDEBAR_MIN) + borders
+    };
+    let [left, right] =
+        Layout::horizontal([Constraint::Length(sidebar_width), Constraint::Min(0)]).areas(body);
     let (sidebar_style, pane_style) = focus_styles(m);
 
     if sidebar_width > 0 {
+        let peek = peek(m, usize::from(left.width).saturating_sub(4));
+        let height = peek
+            .as_ref()
+            .map_or(0, |p| peek_height(body.height, p.lines.len()));
+        let [list_area, peek_area] =
+            Layout::vertical([Constraint::Min(0), Constraint::Length(height)]).areas(left);
         let title = fit(sidebar_title(m), usize::from(left.width).saturating_sub(4));
-        let sidebar = panel(title, sidebar_count(m, sidebar_style), sidebar_style, sidebar_focused(m));
-        let list = sidebar.inner(left);
-        frame.render_widget(sidebar, left);
+        let sidebar = panel(
+            title,
+            sidebar_count(m, sidebar_style),
+            sidebar_style,
+            sidebar_focused(m),
+        );
+        let list = sidebar.inner(list_area);
+        frame.render_widget(sidebar, list_area);
         draw_sidebar(frame, m, list);
+        if let Some(peek) = peek.filter(|_| height > 0) {
+            draw_peek(frame, peek, peek_area);
+        }
     }
 
     let (title, path) = pane_title(m, usize::from(right.width));
@@ -243,9 +371,17 @@ fn focus_styles(m: &Model) -> (Style, Style) {
 /// A rounded panel with `title` in the top border and `corner` (a count or
 /// a path) tucked into the bottom-right, lazygit-style (`1 of 6─╯`). The
 /// focused panel's title takes the accent, as lazygit's active title does.
-fn panel<'a>(mut title: Vec<Span<'a>>, mut corner: Vec<Span<'a>>, border: Style, focused: bool) -> Block<'a> {
+fn panel<'a>(
+    mut title: Vec<Span<'a>>,
+    mut corner: Vec<Span<'a>>,
+    border: Style,
+    focused: bool,
+) -> Block<'a> {
     if focused {
-        for span in title.iter_mut().filter(|s| !s.style.add_modifier.contains(Modifier::DIM)) {
+        for span in title
+            .iter_mut()
+            .filter(|s| !s.style.add_modifier.contains(Modifier::DIM) && s.style.fg.is_none())
+        {
             span.style = span.style.fg(ACCENT);
         }
     }
@@ -267,7 +403,25 @@ fn panel<'a>(mut title: Vec<Span<'a>>, mut corner: Vec<Span<'a>>, border: Style,
 fn sidebar_title(m: &Model) -> Vec<Span<'static>> {
     match (m.snapshot(), m.view, m.selected()) {
         (None, _, _) => vec![Span::styled("Loading…", dim())],
-        (Some(_), View::Focus, Some((repo, _))) => vec![Span::styled(repo.name().into_owned(), bold())],
+        (Some(_), View::Focus, Some((repo, _))) => {
+            let elsewhere = m
+                .needs_you()
+                .iter()
+                .filter(|name| {
+                    m.snapshot()
+                        .and_then(|s| s.entry(name))
+                        .is_some_and(|(r, _)| r.key() != repo.key())
+                })
+                .count();
+            let mut title = vec![Span::styled(repo.name().into_owned(), bold())];
+            if elsewhere > 0 {
+                title.push(Span::styled(
+                    format!(" ◆ {elsewhere}"),
+                    Style::new().fg(Color::Yellow),
+                ));
+            }
+            title
+        }
         (Some(_), View::Focus, None) => vec![Span::styled("Agents", bold())],
         (Some(_), View::Overview, _) => vec![Span::styled("All repos", bold())],
     }
@@ -277,22 +431,47 @@ fn sidebar_title(m: &Model) -> Vec<Span<'static>> {
 fn sidebar_count(m: &Model, border: Style) -> Vec<Span<'static>> {
     let items = m.items();
     match m.cursor().and_then(|c| items.iter().position(|i| i == c)) {
-        Some(i) => vec![Span::styled(format!("{} of {}", i + 1, items.len()), border)],
+        Some(i) => vec![Span::styled(
+            format!("{} of {}", i + 1, items.len()),
+            border,
+        )],
         None => Vec::new(),
     }
 }
 
-/// Glyph and label on the left, shared and pin markers on the right.
+/// A collapsed repo's live and exited agents, leaving out those already
+/// listed under Needs you.
+fn settled_counts(m: &Model, repo: &agent_core::model::Repo) -> (usize, usize) {
+    repo.entries()
+        .iter()
+        .fold((0, 0), |(live, exited), entry| match m.status(entry) {
+            AgentStatus::Idle | AgentStatus::Working { .. } => (live + 1, exited),
+            AgentStatus::Exited => (live, exited + 1),
+            AgentStatus::NoSession
+            | AgentStatus::Asking { .. }
+            | AgentStatus::Failed { .. }
+            | AgentStatus::Done { .. } => (live, exited),
+        })
+}
+
+/// Glyph and label on the left. On the right: the repo for a group row,
+/// the time in state, then shared and pin markers. When the name would get
+/// fewer than [`NAME_MIN`] columns, the repo goes first, then a finished
+/// agent's time. Markers and the time of an agent waiting on you stay.
 /// `repo_label` names a collapsed single-entry repo.
 fn entry_row<'a>(
     m: &Model,
     entry: &'a Entry,
     indent: &'static str,
     repo_label: Option<String>,
+    group_repo: Option<String>,
     selected: bool,
+    width: usize,
 ) -> (Vec<Span<'a>>, Vec<Span<'a>>) {
-    let style = name_style(entry.presence(), selected);
-    let mut left = vec![Span::raw(indent), glyph(entry.presence()), Span::raw(" ")];
+    let status = m.status(entry);
+    let style = name_style(&status, selected);
+    let mut left = vec![Span::raw(indent), glyph(&status), Span::raw(" ")];
+    let fixed = line_width(&left);
     match repo_label {
         Some(repo) => {
             left.push(Span::styled(repo, style));
@@ -302,17 +481,47 @@ fn entry_row<'a>(
         }
         None => left.push(Span::styled(entry.label(), style)),
     }
-    let mut right = Vec::new();
+    let mut markers: Vec<Span<'a>> = Vec::new();
     if let Some(others) = m.pane.connection().and_then(|c| c.sharing(entry.name())) {
-        right.push(Span::styled(format!("⇄{others}"), Style::new().fg(Color::Yellow)));
+        markers.push(Span::styled(
+            format!("⇄{others}"),
+            Style::new().fg(Color::Yellow),
+        ));
     }
     if let Some(pin) = entry.pin() {
-        if !right.is_empty() {
-            right.push(Span::raw(" "));
-        }
-        right.push(Span::styled(pin.slot().map_or_else(|| "*".to_string(), |s| s.get().to_string()), dim()));
+        markers.push(Span::styled(
+            pin.slot()
+                .map_or_else(|| "*".to_string(), |s| s.get().to_string()),
+            dim(),
+        ));
     }
-    (left, right)
+    let mut repo = group_repo.map(|r| Span::styled(r, dim()));
+    let mut time = time_in_state(&status, m.now);
+    let joined = |repo: &Option<Span<'a>>, time: &Option<Span<'static>>| -> Vec<Span<'a>> {
+        let cells: Vec<Span<'a>> = repo
+            .iter()
+            .cloned()
+            .chain(time.iter().cloned())
+            .chain(markers.iter().cloned())
+            .collect();
+        let mut right = Vec::new();
+        for cell in cells {
+            if !right.is_empty() {
+                right.push(Span::raw(" "));
+            }
+            right.push(cell);
+        }
+        right
+    };
+    let squeezed =
+        |right: &[Span<'a>]| width.saturating_sub(fixed + line_width(right) + 1) < NAME_MIN;
+    if squeezed(&joined(&repo, &time)) {
+        repo = None;
+    }
+    if squeezed(&joined(&repo, &time)) && matches!(status, AgentStatus::Done { .. }) {
+        time = None;
+    }
+    (left, joined(&repo, &time))
 }
 
 fn draw_sidebar(frame: &mut Frame<'_>, m: &mut Model, area: Rect) {
@@ -321,9 +530,15 @@ fn draw_sidebar(frame: &mut Frame<'_>, m: &mut Model, area: Rect) {
     let focused = sidebar_focused(m);
     let rows = m.rows();
     let cursor = m.cursor();
-    let selected_index = cursor.and_then(|c| rows.iter().position(|r| r.cursor().as_ref() == Some(c)));
+    let selected_index =
+        cursor.and_then(|c| rows.iter().position(|r| r.cursor().as_ref() == Some(c)));
     let height = usize::from(area.height);
-    let offset = scroll(m.sidebar_offset, selected_index.unwrap_or(0), height, rows.len());
+    let offset = scroll(
+        m.sidebar_offset,
+        selected_index.unwrap_or(0),
+        height,
+        rows.len(),
+    );
 
     let mut lines = Vec::new();
     let mut hits = Vec::new();
@@ -337,12 +552,23 @@ fn draw_sidebar(frame: &mut Frame<'_>, m: &mut Model, area: Rect) {
         };
         hits.extend(row.cursor().map(|c| (y, c)));
         let (left, right) = match row {
-            Row::PinnedHeader => (vec![Span::styled("▾ ", dim()), Span::styled("Pinned", dim())], Vec::new()),
+            Row::Header(group) => (
+                vec![
+                    Span::styled("▾ ", dim()),
+                    Span::styled(group.title(), dim()),
+                ],
+                Vec::new(),
+            ),
             Row::Repo { key, fold } => {
-                let Some(repo) = snapshot.repo(key) else { continue };
-                let counts = repo.counts();
+                let Some(repo) = snapshot.repo(key) else {
+                    continue;
+                };
+                let (live, exited) = match fold {
+                    Fold::Closed => settled_counts(m, repo),
+                    Fold::Open => (0, 0),
+                };
                 let mut right = Vec::new();
-                for (n, g, style) in [(counts.live, "●", Style::new()), (counts.exited, "○", dim())] {
+                for (n, g, style) in [(live, "●", Style::new()), (exited, "○", dim())] {
                     if n > 0 {
                         if !right.is_empty() {
                             right.push(Span::raw("  "));
@@ -350,25 +576,46 @@ fn draw_sidebar(frame: &mut Frame<'_>, m: &mut Model, area: Rect) {
                         right.push(Span::styled(format!("{g} {n}"), style));
                     }
                 }
-                let name = Span::styled(repo.name().into_owned(), if selected { bold() } else { Style::new() });
+                let name = Span::styled(
+                    repo.name().into_owned(),
+                    if selected { bold() } else { Style::new() },
+                );
                 let arrow = match fold {
                     Fold::Open => "▾ ",
                     Fold::Closed => "▸ ",
                 };
                 (vec![Span::styled(arrow, dim()), name], right)
             }
-            Row::Pinned(name) => {
-                let Some((repo, entry)) = snapshot.entry(name) else { continue };
-                let (mut left, right) = entry_row(m, entry, "  ", None, selected);
-                left.push(Span::styled(format!(" {}", repo.name()), dim()));
-                (left, right)
+            Row::Grouped(_, name) => {
+                let Some((repo, entry)) = snapshot.entry(name) else {
+                    continue;
+                };
+                entry_row(
+                    m,
+                    entry,
+                    "  ",
+                    None,
+                    Some(repo.name().into_owned()),
+                    selected,
+                    content_width,
+                )
             }
             Row::Entry { name, place } => {
-                let Some((repo, entry)) = snapshot.entry(name) else { continue };
+                let Some((repo, entry)) = snapshot.entry(name) else {
+                    continue;
+                };
                 match place {
-                    Place::Solo => entry_row(m, entry, "", Some(repo.name().into_owned()), selected),
-                    Place::Nested => entry_row(m, entry, "  ", None, selected),
-                    Place::Alone => entry_row(m, entry, "", None, selected),
+                    Place::Solo => entry_row(
+                        m,
+                        entry,
+                        "",
+                        Some(repo.name().into_owned()),
+                        None,
+                        selected,
+                        content_width,
+                    ),
+                    Place::Nested => entry_row(m, entry, "  ", None, None, selected, content_width),
+                    Place::Alone => entry_row(m, entry, "", None, None, selected, content_width),
                 }
             }
         };
@@ -393,7 +640,9 @@ fn pane_title(m: &Model, width: usize) -> (Vec<Span<'static>>, Vec<Span<'static>
         },
         None => m.selected(),
     };
-    let Some((repo, entry)) = shown else { return (Vec::new(), Vec::new()) };
+    let Some((repo, entry)) = shown else {
+        return (Vec::new(), Vec::new());
+    };
     let identifier = bold();
     let repo_name = repo.name().into_owned();
     let mut title = Vec::new();
@@ -413,18 +662,35 @@ fn pane_title(m: &Model, width: usize) -> (Vec<Span<'static>>, Vec<Span<'static>
     }
     let sharing = entry.and_then(|e| m.pane.connection().and_then(|c| c.sharing(e.name())));
     let corner = if let Some(others) = sharing {
-        let clients = if others.get() == 1 { "client" } else { "clients" };
-        vec![Span::styled(format!("⇄ {others} other {clients} · ⏎ take over"), Style::new().fg(Color::Yellow))]
+        let clients = if others.get() == 1 {
+            "client"
+        } else {
+            "clients"
+        };
+        vec![Span::styled(
+            format!("⇄ {others} other {clients} · ⏎ take over"),
+            Style::new().fg(Color::Yellow),
+        )]
     } else {
-        let path = entry.and_then(Entry::path).or_else(|| repo.key().root().map(agent_core::paths::RepoRoot::path));
-        path.map(|p| vec![Span::styled(truncate_start(&display_path(p), width.saturating_sub(7)), dim())]).unwrap_or_default()
+        let path = entry
+            .and_then(Entry::path)
+            .or_else(|| repo.key().root().map(agent_core::paths::RepoRoot::path));
+        path.map(|p| {
+            vec![Span::styled(
+                truncate_start(&display_path(p), width.saturating_sub(7)),
+                dim(),
+            )]
+        })
+        .unwrap_or_default()
     };
     (fit(title, width.saturating_sub(6)), corner)
 }
 
 fn centered(frame: &mut Frame<'_>, area: Rect, lines: Vec<Line<'_>>) {
     let height = u16::try_from(lines.len()).unwrap_or(1);
-    let [middle] = Layout::vertical([Constraint::Length(height)]).flex(Flex::Center).areas(area);
+    let [middle] = Layout::vertical([Constraint::Length(height)])
+        .flex(Flex::Center)
+        .areas(area);
     frame.render_widget(Paragraph::new(lines).centered(), middle);
 }
 
@@ -434,17 +700,33 @@ fn draw_terminal(frame: &mut Frame<'_>, m: &Model, area: Rect) {
         c.term.render(area, frame.buffer_mut(), show_cursor);
         return;
     }
-    let action = |key: &'static str, text: String| Line::from(vec![Span::styled(key, bold()), Span::raw(format!(" {text}"))]);
+    let action = |key: &'static str, text: String| {
+        Line::from(vec![
+            Span::styled(key, bold()),
+            Span::raw(format!(" {text}")),
+        ])
+    };
     let line = match (&m.load, &m.pane, m.selected()) {
-        (_, Pane::Connecting { name, .. }, _) => Line::styled(format!("attaching to {name}…"), dim()),
+        (_, Pane::Connecting { name, .. }, _) => {
+            Line::styled(format!("attaching to {name}…"), dim())
+        }
         (Load::Pending, ..) => Line::styled("Loading…", dim()),
         (_, _, None) => action("n", "new agent".into()),
         (_, _, Some((repo, None))) => action("⏎", format!("focus {}", repo.name())),
         (_, _, Some((_, Some(entry)))) => match m.reach(entry) {
             Reach::Own => Line::styled("this TUI runs here", dim()),
-            Reach::Other { enter: Enter::Attach, .. } => Line::styled(format!("attaching to {}…", entry.name()), dim()),
-            Reach::Other { enter: Enter::Resurrect, .. } => action("⏎", format!("resurrect {}", entry.name())),
-            Reach::Other { enter: Enter::Start(_), .. } => action("⏎", format!("start {} here", m.harness_label)),
+            Reach::Other {
+                enter: Enter::Attach,
+                ..
+            } => Line::styled(format!("attaching to {}…", entry.name()), dim()),
+            Reach::Other {
+                enter: Enter::Resurrect | Enter::Restart(_),
+                ..
+            } => action("⏎", format!("resurrect {}", entry.name())),
+            Reach::Other {
+                enter: Enter::Start(_),
+                ..
+            } => action("⏎", format!("start {} here", m.harness_label)),
         },
     };
     centered(frame, area, vec![line]);
@@ -457,7 +739,10 @@ struct Hint<'a> {
 }
 
 fn ranked<'a>(key: &'a str, desc: &'a str, rank: u8) -> Hint<'a> {
-    Hint { spans: hint(key, desc), rank }
+    Hint {
+        spans: hint(key, desc),
+        rank,
+    }
 }
 
 /// The mode badge, then context hints, then the status message on the
@@ -483,7 +768,14 @@ fn draw_status_bar(frame: &mut Frame<'_>, m: &Model, area: Rect) {
         let entry = selected.and_then(|(_, e)| e);
         match (selected, entry.map(|e| m.reach(e))) {
             (Some((_, None)), _) => hints.push(ranked("⏎", "focus", 7)),
-            (_, Some(Reach::Other { enter, kill, remove })) => {
+            (
+                _,
+                Some(Reach::Other {
+                    enter,
+                    kill,
+                    remove,
+                }),
+            ) => {
                 hints.push(ranked("⏎", enter.verb(), 7));
                 hints.extend(kill.map(|_| ranked("d", "kill", 2)));
                 hints.extend(remove.map(|_| ranked("D", "remove", 1)));
@@ -499,30 +791,89 @@ fn draw_status_bar(frame: &mut Frame<'_>, m: &Model, area: Rect) {
             hints.push(ranked("m", pin, 3));
         }
         hints.push(ranked("n", "new", 4));
-        hints.push(ranked("Tab", if m.view == View::Focus { "overview" } else { "focus" }, 5));
-        hints.push(ranked("?", "keys", 9));
+        hints.push(ranked(
+            "Tab",
+            if m.view == View::Focus {
+                "overview"
+            } else {
+                "focus"
+            },
+            5,
+        ));
         if entry.is_some() && !m.actions.is_empty() {
             hints.push(ranked("x", "actions", 0));
         }
+        hints.push(ranked("?", "keys", 9));
     }
 
-    let badge_width = 9;
+    // What needs you, led by the key that goes there. It shows and hides
+    // as a block at the right edge, so the hints never shift.
+    let mut counts: Vec<Span<'static>> = Vec::new();
+    for (kind, n) in m.attention().parts() {
+        let colour = match kind {
+            Waiting::Asking => Color::Yellow,
+            Waiting::Failed => Color::Red,
+            Waiting::Done => Color::Green,
+        };
+        counts.extend([
+            Span::styled(
+                format!("{} {n}", kind.glyph()),
+                Style::new().fg(colour).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+        ]);
+    }
+    counts.pop();
+    if !counts.is_empty() {
+        let key = match focus {
+            Focus::Agent(_) => format!("{nav} a"),
+            Focus::Nav(_) | Focus::Overlay(_) => "a".to_string(),
+        };
+        counts.splice(0..0, [Span::raw(key), Span::raw(" ")]);
+    }
+    // The counts sit between a space and the right edge's space.
+    let badge_width = 9 + match line_width(&counts) {
+        0 => 0,
+        counts => counts + 2,
+    };
     let width = usize::from(area.width);
-    let used = |hints: &[Hint<'_>]| hints.iter().map(|h| line_width(&h.spans)).sum::<usize>().saturating_sub(2);
+    let used = |hints: &[Hint<'_>]| {
+        hints
+            .iter()
+            .map(|h| line_width(&h.spans))
+            .sum::<usize>()
+            .saturating_sub(2)
+    };
     while hints.len() > 1 && used(&hints) > width.saturating_sub(badge_width) {
-        let lowest = hints.iter().enumerate().min_by_key(|(_, h)| h.rank).map_or(0, |(i, _)| i);
+        let lowest = hints
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, h)| h.rank)
+            .map_or(0, |(i, _)| i);
         hints.remove(lowest);
     }
     let room_for_status = width.saturating_sub(badge_width + used(&hints) + 3);
-    let status = match &m.status {
+    let mut status = match &m.status {
         Some(status) if room_for_status > 0 => {
-            let style = if status.kind == StatusKind::Error { Style::new().fg(Color::Red) } else { Style::new() };
-            let mut spans = fit(vec![Span::styled(status.text.clone(), style)], room_for_status);
+            let style = if status.kind == StatusKind::Error {
+                Style::new().fg(Color::Red)
+            } else {
+                Style::new()
+            };
+            let mut spans = fit(
+                vec![Span::styled(status.text.clone(), style)],
+                room_for_status,
+            );
             spans.push(Span::raw(" "));
             spans
         }
         _ => Vec::new(),
     };
+    if !counts.is_empty() {
+        status.push(Span::raw(" "));
+        status.extend(counts);
+        status.push(Span::raw(" "));
+    }
     let label = match focus {
         Focus::Agent(_) => " AGENT ",
         Focus::Nav(_) | Focus::Overlay(_) => "  NAV  ",
@@ -544,8 +895,12 @@ fn centred(frame: &Frame<'_>, width: u16, height: u16) -> Rect {
     let area = frame.area();
     let width = width.min(area.width.saturating_sub(4));
     let height = height.min(area.height.saturating_sub(2));
-    let [area] = Layout::horizontal([Constraint::Length(width)]).flex(Flex::Center).areas(area);
-    let [area] = Layout::vertical([Constraint::Length(height)]).flex(Flex::Center).areas(area);
+    let [area] = Layout::horizontal([Constraint::Length(width)])
+        .flex(Flex::Center)
+        .areas(area);
+    let [area] = Layout::vertical([Constraint::Length(height)])
+        .flex(Flex::Center)
+        .areas(area);
     area
 }
 
@@ -574,7 +929,11 @@ fn highlighted<'a>(text: &'a str, query: &str, base: Style) -> Vec<Span<'a>> {
     let matched = fuzzy_match(query, text).unwrap_or_default();
     text.char_indices()
         .map(|(i, c)| {
-            let style = if matched.contains(&i) { base.add_modifier(Modifier::BOLD).fg(ACCENT) } else { base };
+            let style = if matched.contains(&i) {
+                base.add_modifier(Modifier::BOLD).fg(ACCENT)
+            } else {
+                base
+            };
             Span::styled(c.to_string(), style)
         })
         .collect()
@@ -582,16 +941,30 @@ fn highlighted<'a>(text: &'a str, query: &str, base: Style) -> Vec<Span<'a>> {
 
 type Item<'a> = (Vec<Span<'a>>, Vec<Span<'a>>);
 
-fn draw_query_list(frame: &mut Frame<'_>, title: &str, verb: &str, query: &Query, items: Vec<Item<'_>>) {
+fn draw_query_list(
+    frame: &mut Frame<'_>,
+    title: &str,
+    verb: &str,
+    query: &Query,
+    items: Vec<Item<'_>>,
+) {
     let len = items.len();
-    let area = overlay_area(frame, 60, u16::try_from(len).unwrap_or(u16::MAX).saturating_add(3));
+    let area = overlay_area(
+        frame,
+        60,
+        u16::try_from(len).unwrap_or(u16::MAX).saturating_add(3),
+    );
     clear_around(frame, area);
     let block = overlay_block(title, hints(&[("⏎", verb), ("Esc", "close")]), dim());
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let [input, list] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(inner);
     let list = list.inner(ratatui::layout::Margin::new(1, 0));
-    let prompt = Line::from(vec![Span::styled(" › ", Style::new().fg(ACCENT)), Span::raw(query.text.clone()), Span::styled("█", dim())]);
+    let prompt = Line::from(vec![
+        Span::styled(" › ", Style::new().fg(ACCENT)),
+        Span::raw(query.text.clone()),
+        Span::styled("█", dim()),
+    ]);
     frame.render_widget(Paragraph::new(prompt), input);
 
     let index = query.index(len);
@@ -605,7 +978,11 @@ fn draw_query_list(frame: &mut Frame<'_>, title: &str, verb: &str, query: &Query
         .skip(offset)
         .take(height)
         .map(|(i, (left, right))| {
-            let gutter = if i == index { Span::styled("▌", Style::new().fg(ACCENT)) } else { Span::raw(" ") };
+            let gutter = if i == index {
+                Span::styled("▌", Style::new().fg(ACCENT))
+            } else {
+                Span::raw(" ")
+            };
             let mut line = justify(left, right, width);
             line.spans.insert(0, gutter);
             line
@@ -620,8 +997,13 @@ fn draw_switcher(frame: &mut Frame<'_>, m: &Model, query: &Query) {
         .into_iter()
         .filter_map(|name| snapshot.entry(&name))
         .map(|(repo, entry)| {
-            let mut left = vec![glyph(entry.presence()), Span::raw(" ")];
-            left.extend(highlighted(entry.name().as_str(), &query.text, name_style(entry.presence(), false)));
+            let status = m.status(entry);
+            let mut left = vec![glyph(&status), Span::raw(" ")];
+            left.extend(highlighted(
+                entry.name().as_str(),
+                &query.text,
+                name_style(&status, false),
+            ));
             let mut right = Vec::new();
             if let EntryKind::Main { head, .. } = entry.kind() {
                 if let Head::Branch(branch) = head {
@@ -649,7 +1031,14 @@ fn draw_picker(frame: &mut Frame<'_>, m: &Model, query: &Query) {
         .filter_map(|key| snapshot.repo(&key))
         .map(|repo| {
             let live = repo.counts().live;
-            let right = if live > 0 { vec![Span::styled(format!("● {live}"), Style::new().fg(Color::Green))] } else { Vec::new() };
+            let right = if live > 0 {
+                vec![Span::styled(
+                    format!("● {live}"),
+                    Style::new().fg(Color::Green),
+                )]
+            } else {
+                Vec::new()
+            };
             (highlighted_owned(&repo.name(), &query.text), right)
         })
         .collect();
@@ -657,7 +1046,10 @@ fn draw_picker(frame: &mut Frame<'_>, m: &Model, query: &Query) {
 }
 
 fn highlighted_owned(text: &str, query: &str) -> Vec<Span<'static>> {
-    highlighted(text, query, Style::new()).into_iter().map(|s| Span::styled(s.content.into_owned(), s.style)).collect()
+    highlighted(text, query, Style::new())
+        .into_iter()
+        .map(|s| Span::styled(s.content.into_owned(), s.style))
+        .collect()
 }
 
 /// `text` split into rows of at most `width` columns, breaking at spaces
@@ -684,7 +1076,9 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
 }
 
 fn spinner() -> &'static str {
-    let tick = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() / 100);
+    let tick = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() / 100);
     SPINNER[usize::try_from(tick).unwrap_or(0) % SPINNER.len()]
 }
 
@@ -704,7 +1098,13 @@ fn draw_new(frame: &mut Frame<'_>, m: &Model, form: &NewAgent) {
     let mut lines = Vec::new();
 
     let task_rows = TASK_ROWS.min(usize::from(frame.area().height.saturating_sub(14)).max(1));
-    lines.extend(task_lines(form, &fields, &m.harness_label, field_width, task_rows));
+    lines.extend(task_lines(
+        form,
+        &fields,
+        &m.harness_label,
+        field_width,
+        task_rows,
+    ));
     lines.push(Line::raw(""));
 
     // Name: the suggestion DIM with where it came from until one is typed;
@@ -726,10 +1126,16 @@ fn draw_new(frame: &mut Frame<'_>, m: &Model, form: &NewAgent) {
             None => name.push(Span::styled("from the prompt, or type one", dim())),
         }
         if let NamingState::Asking = form.naming.state {
-            source = vec![Span::styled(format!("{} asking {}", spinner(), m.harness_label), dim())];
+            source = vec![Span::styled(
+                format!("{} asking {}", spinner(), m.harness_label),
+                dim(),
+            )];
         }
     } else {
-        let bad: Vec<usize> = invalid_chars(&form.name).into_iter().map(|(i, _)| i).collect();
+        let bad: Vec<usize> = invalid_chars(&form.name)
+            .into_iter()
+            .map(|(i, _)| i)
+            .collect();
         name.extend(form.name.char_indices().map(|(i, c)| {
             let wrong = i + c.len_utf8() > max || bad.contains(&i);
             Span::styled(c.to_string(), if wrong { red } else { Style::new() })
@@ -741,20 +1147,28 @@ fn draw_new(frame: &mut Frame<'_>, m: &Model, form: &NewAgent) {
     let message = match (&form.phase, &form.error, check) {
         (Phase::Submitting { .. }, ..) | (_, None, NameCheck::Empty | NameCheck::Free(_)) => None,
         (_, Some(error), _) => Some(Span::styled(error.clone(), red)),
-        (_, None, NameCheck::TooLong { bytes }) => Some(Span::styled(format!("{} over zellij's limit", bytes - max), red)),
+        (_, None, NameCheck::TooLong { bytes }) => Some(Span::styled(
+            format!("{} over zellij's limit", bytes - max),
+            red,
+        )),
         (_, None, NameCheck::Invalid(why)) => Some(Span::styled(why.clone(), red)),
         (_, None, NameCheck::Own) => Some(Span::styled("this TUI runs in that session", yellow)),
-        (_, None, NameCheck::MainCheckout { repo }) => {
-            Some(Span::styled(format!("{repo}'s main checkout: select it in the list and press ⏎"), yellow))
-        }
+        (_, None, NameCheck::MainCheckout { repo }) => Some(Span::styled(
+            format!("{repo}'s main checkout: select it in the list and press ⏎"),
+            yellow,
+        )),
         (_, None, NameCheck::Live { .. } | NameCheck::Exited { .. } | NameCheck::Idle { .. }) => {
             let text = match &derived.submission {
                 Submission::Ready(Launchable::Attach { task: Some(_), .. }) => {
                     "already running: the prompt will be typed into it"
                 }
-                Submission::Ready(Launchable::Attach { task: None, .. }) => "already running · ⏎ attaches",
+                Submission::Ready(Launchable::Attach { task: None, .. }) => {
+                    "already running · ⏎ attaches"
+                }
                 Submission::Ready(Launchable::Resurrect(_)) => "exited · ⏎ resurrects it",
-                Submission::Blocked(Blocked::ExitedWithPrompt) => "exited, so clear the prompt to resurrect it",
+                Submission::Blocked(Blocked::ExitedWithPrompt) => {
+                    "exited, so clear the prompt to resurrect it"
+                }
                 Submission::Ready(Launchable::Start { .. }) => "an idle worktree · ⏎ starts it",
                 Submission::Ready(Launchable::Create { .. }) | Submission::Blocked(_) => "",
             };
@@ -775,7 +1189,9 @@ fn draw_new(frame: &mut Frame<'_>, m: &Model, form: &NewAgent) {
 
     let keys = form_keys(form, &derived, usize::from(width).saturating_sub(4));
 
-    let height = u16::try_from(lines.len()).unwrap_or(u16::MAX).saturating_add(2);
+    let height = u16::try_from(lines.len())
+        .unwrap_or(u16::MAX)
+        .saturating_add(2);
     let area = overlay_area(frame, width, height);
     clear_around(frame, area);
     let block = overlay_block("New agent", keys, dim()).padding(Padding::horizontal(1));
@@ -798,25 +1214,47 @@ impl Fields {
     }
 
     fn label(&self, field: Field, text: &'static str) -> Span<'static> {
-        let style = if self.focus == Some(field) { Style::new().fg(ACCENT).add_modifier(Modifier::BOLD) } else { dim() };
+        let style = if self.focus == Some(field) {
+            Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)
+        } else {
+            dim()
+        };
         Span::styled(format!("{text:<8}"), style)
     }
 
     fn cursor(&self, field: Field) -> Span<'static> {
-        if self.focus == Some(field) { Span::styled("█", dim()) } else { Span::raw("") }
+        if self.focus == Some(field) {
+            Span::styled("█", dim())
+        } else {
+            Span::raw("")
+        }
     }
 }
 
 /// The prompt, wrapped on words, its last `task_rows` rows shown with a
 /// marker for the rest.
-fn task_lines(form: &NewAgent, fields: &Fields, harness_label: &str, field_width: usize, task_rows: usize) -> Vec<Line<'static>> {
+fn task_lines(
+    form: &NewAgent,
+    fields: &Fields,
+    harness_label: &str,
+    field_width: usize,
+    task_rows: usize,
+) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
-    let mut rows = if form.task.is_empty() { Vec::new() } else { wrap(&form.task, field_width) };
+    let mut rows = if form.task.is_empty() {
+        Vec::new()
+    } else {
+        wrap(&form.task, field_width)
+    };
     let hidden = rows.len().saturating_sub(task_rows);
     rows.drain(..hidden);
     if rows.is_empty() {
         let placeholder = format!("first message for {harness_label} (optional)");
-        lines.push(Line::from(vec![fields.label(Field::Task, "prompt"), fields.cursor(Field::Task), Span::styled(placeholder, dim())]));
+        lines.push(Line::from(vec![
+            fields.label(Field::Task, "prompt"),
+            fields.cursor(Field::Task),
+            Span::styled(placeholder, dim()),
+        ]));
     } else {
         let last = rows.len() - 1;
         for (i, row) in rows.into_iter().enumerate() {
@@ -836,12 +1274,19 @@ fn task_lines(form: &NewAgent, fields: &Fields, harness_label: &str, field_width
 }
 
 /// The repo row: the default DIM, a search completed inline, a path checked.
-fn repo_line(m: &Model, form: &NewAgent, derived: &Derived, fields: &Fields, inner: usize) -> Line<'static> {
+fn repo_line(
+    m: &Model,
+    form: &NewAgent,
+    derived: &Derived,
+    fields: &Fields,
+    inner: usize,
+) -> Line<'static> {
     let red = Style::new().fg(Color::Red);
     let attaching = matches!(
         &derived.submission,
-        Submission::Ready(Launchable::Attach { .. } | Launchable::Resurrect(_) | Launchable::Start { .. })
-            | Submission::Blocked(Blocked::ExitedWithPrompt)
+        Submission::Ready(
+            Launchable::Attach { .. } | Launchable::Resurrect(_) | Launchable::Start { .. }
+        ) | Submission::Blocked(Blocked::ExitedWithPrompt)
     );
     let mut repo = vec![fields.label(Field::Repo, "repo")];
     let mut right = Vec::new();
@@ -878,7 +1323,10 @@ fn repo_line(m: &Model, form: &NewAgent, derived: &Derived, fields: &Fields, inn
             }
             let count = repo_matches(m.snapshot(), &form.repo.text).len();
             if form.focus == Field::Repo && count > 1 {
-                right.push(Span::styled(format!("⌃N ⌃P {} of {count}", form.repo.index(count) + 1), dim()));
+                right.push(Span::styled(
+                    format!("⌃N ⌃P {} of {count}", form.repo.index(count) + 1),
+                    dim(),
+                ));
             }
         }
         RepoInput::Path(_) => {
@@ -904,7 +1352,10 @@ fn repo_line(m: &Model, form: &NewAgent, derived: &Derived, fields: &Fields, inn
 fn form_keys<'a>(form: &'a NewAgent, derived: &Derived, room: usize) -> Vec<Span<'a>> {
     if let Phase::Submitting { launch, .. } = &form.phase {
         return vec![
-            Span::styled(format!("{} {} {}", spinner(), launch.progress(), launch.session()), dim()),
+            Span::styled(
+                format!("{} {} {}", spinner(), launch.progress(), launch.session()),
+                dim(),
+            ),
             Span::raw("  "),
             Span::raw("Esc"),
             Span::styled(" background", dim()),
@@ -916,10 +1367,16 @@ fn form_keys<'a>(form: &'a NewAgent, derived: &Derived, room: usize) -> Vec<Span
     };
     let mut hints: Vec<Hint<'_>> = Vec::new();
     hints.extend(enter.map(|enter| ranked("⏎", enter, 9)));
-    hints.push(match derived.completion.as_ref().filter(|_| form.focus == Field::Repo) {
-        Some(_) => ranked("Tab", "complete", 8),
-        None => ranked("Tab", "next", 4),
-    });
+    hints.push(
+        match derived
+            .completion
+            .as_ref()
+            .filter(|_| form.focus == Field::Repo)
+        {
+            Some(_) => ranked("Tab", "complete", 8),
+            None => ranked("Tab", "next", 4),
+        },
+    );
     if form.focus == Field::Task {
         hints.push(ranked("⌃J", "newline", 5));
     }
@@ -927,7 +1384,11 @@ fn form_keys<'a>(form: &'a NewAgent, derived: &Derived, room: usize) -> Vec<Span
     hints.push(ranked("Esc", "cancel", 9));
     let used = |hints: &[Hint<'_>]| hints.iter().map(|h| line_width(&h.spans)).sum::<usize>();
     while hints.len() > 2 && used(&hints) > room {
-        let lowest = hints.iter().enumerate().min_by_key(|(_, h)| h.rank).map_or(0, |(i, _)| i);
+        let lowest = hints
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, h)| h.rank)
+            .map_or(0, |(i, _)| i);
         hints.remove(lowest);
     }
     hints.into_iter().flat_map(|h| h.spans).collect()
@@ -937,34 +1398,58 @@ fn draw_confirm(frame: &mut Frame<'_>, confirm: &Confirm) {
     let warn = Style::new().fg(Color::Yellow);
     let danger = Style::new().fg(Color::Red);
     let destructive = |key: &'static str, desc: &'static str| {
-        vec![Span::styled(key, danger.add_modifier(Modifier::BOLD)), Span::styled(format!(" {desc}"), dim()), Span::raw("  ")]
+        vec![
+            Span::styled(key, danger.add_modifier(Modifier::BOLD)),
+            Span::styled(format!(" {desc}"), dim()),
+            Span::raw("  "),
+        ]
     };
     let (title, body, keys, border) = match confirm {
         Confirm::Kill(running) => (
             format!("Kill {}", running.name()),
-            vec![Line::raw("Stops the session. The checkout and branch stay."), Line::styled("Resurrect it from the sidebar.", dim())],
+            vec![
+                Line::raw("Stops the session. The checkout and branch stay."),
+                Line::styled("Resurrect it from the sidebar.", dim()),
+            ],
             [destructive("y/⏎", "kill"), hints(&[("n/Esc", "cancel")])].concat(),
             warn,
         ),
         Confirm::Remove(proposal) => {
             let plan = proposal.plan();
             let mut body = vec![match plan.deletes() {
-                Deletes::Agent { branch: Some(branch), .. } => {
-                    Line::raw(format!("Deletes the session, the worktree and the {branch} branch."))
+                Deletes::Agent {
+                    branch: Some(branch),
+                    ..
+                } => Line::raw(format!(
+                    "Deletes the session, the worktree and the {branch} branch."
+                )),
+                Deletes::Agent { branch: None, .. } => {
+                    Line::raw("Deletes the session and the worktree. It's on no branch.")
                 }
-                Deletes::Agent { branch: None, .. } => Line::raw("Deletes the session and the worktree. It's on no branch."),
-                Deletes::Session => Line::raw("Deletes the session. No files or branches are touched."),
+                Deletes::Session => {
+                    Line::raw("Deletes the session. No files or branches are touched.")
+                }
             }];
-            body.extend(plan.hazards().iter().map(|h| Line::styled(h.to_string(), danger.add_modifier(Modifier::BOLD))));
+            body.extend(
+                plan.hazards()
+                    .iter()
+                    .map(|h| Line::styled(h.to_string(), danger.add_modifier(Modifier::BOLD))),
+            );
             let mut keys: Vec<Span<'_>> = proposal
                 .offers()
                 .into_iter()
                 .flat_map(|offer| {
                     let key = match offer.effect {
-                        OfferEffect::Destroys => Span::styled(offer.key.to_string(), danger.add_modifier(Modifier::BOLD)),
+                        OfferEffect::Destroys => {
+                            Span::styled(offer.key.to_string(), danger.add_modifier(Modifier::BOLD))
+                        }
                         OfferEffect::Keeps => Span::raw(offer.key.to_string()),
                     };
-                    [key, Span::styled(format!(" {}", offer.label), dim()), Span::raw("  ")]
+                    [
+                        key,
+                        Span::styled(format!(" {}", offer.label), dim()),
+                        Span::raw("  "),
+                    ]
                 })
                 .collect();
             keys.extend(hints(&[("n/Esc", "cancel")]));
@@ -975,10 +1460,22 @@ fn draw_confirm(frame: &mut Frame<'_>, confirm: &Confirm) {
             (format!("Remove {}", plan.name()), body, keys, border)
         }
     };
-    let content = body.iter().map(Line::width).max().unwrap_or(0).max(line_width(&keys) + 4);
-    let area = overlay_area(frame, u16::try_from(content + 6).unwrap_or(u16::MAX), u16::MAX);
+    let content = body
+        .iter()
+        .map(Line::width)
+        .max()
+        .unwrap_or(0)
+        .max(line_width(&keys) + 4);
+    let area = overlay_area(
+        frame,
+        u16::try_from(content + 6).unwrap_or(u16::MAX),
+        u16::MAX,
+    );
     let inner_width = usize::from(area.width).saturating_sub(6).max(1);
-    let wrapped: usize = body.iter().map(|l| l.width().div_ceil(inner_width).max(1)).sum();
+    let wrapped: usize = body
+        .iter()
+        .map(|l| l.width().div_ceil(inner_width).max(1))
+        .sum();
     let height = u16::try_from(wrapped + 4).unwrap_or(u16::MAX);
     let area = overlay_area(frame, area.width, height);
     clear_around(frame, area);
@@ -992,17 +1489,167 @@ fn draw_confirm(frame: &mut Frame<'_>, confirm: &Confirm) {
 }
 
 fn draw_planning(frame: &mut Frame<'_>, name: &SessionName) {
-    let line = Line::from(vec![Span::raw(" "), Span::styled(format!("{} checking what would be lost…", spinner()), dim())]);
+    let line = Line::from(vec![
+        Span::raw(" "),
+        Span::styled(format!("{} checking what would be lost…", spinner()), dim()),
+    ]);
     let width = u16::try_from(line.width() + 6).unwrap_or(u16::MAX);
     let area = centred(frame, width.max(30), 3);
     clear_around(frame, area);
-    let block = overlay_block(&format!("Remove {name}"), hints(&[("Esc", "cancel")]), Style::new().fg(Color::Yellow));
+    let block = overlay_block(
+        &format!("Remove {name}"),
+        hints(&[("Esc", "cancel")]),
+        Style::new().fg(Color::Yellow),
+    );
     frame.render_widget(Paragraph::new(line).block(block), area);
+}
+
+/// The bottom of the sidebar: what the pane can't show about an agent.
+struct Peek {
+    title: Vec<Span<'static>>,
+    /// In display order, each with its priority: lower survives longer.
+    lines: Vec<(u8, Line<'static>)>,
+}
+
+/// Rows for the peek, or none when it doesn't fit: at most a third of the
+/// sidebar and 8 lines, never leaving the list fewer than 5 rows.
+fn peek_height(body: u16, lines: usize) -> u16 {
+    let lines = u16::try_from(lines).unwrap_or(u16::MAX);
+    if body < PEEK_MIN_BODY || lines == 0 {
+        return 0;
+    }
+    let inner = (body / 3).saturating_sub(2).clamp(3, 8).min(lines);
+    let room = body.saturating_sub(2 + LIST_MIN_ROWS + 2);
+    match inner.min(room) {
+        0 => 0,
+        inner => inner + 2,
+    }
+}
+
+/// What a state line says, and the detail under it.
+fn describe_status(status: &AgentStatus) -> (String, Option<String>) {
+    match status {
+        AgentStatus::NoSession => ("no session".to_string(), None),
+        AgentStatus::Exited => ("exited".to_string(), None),
+        AgentStatus::Idle => ("idle".to_string(), None),
+        AgentStatus::Working {
+            tool: Some(tool), ..
+        } => (tool.name.clone(), tool.target.clone()),
+        AgentStatus::Working { tool: None, .. } => ("thinking".to_string(), None),
+        AgentStatus::Asking { question, .. } => ("asking".to_string(), Some(question.clone())),
+        AgentStatus::Failed { reason, .. } => (reason.clone(), None),
+        AgentStatus::Done { summary, .. } => ("done".to_string(), summary.clone()),
+    }
+}
+
+/// How long the current tool has run, else how long it's been in its state.
+fn state_time(status: &AgentStatus, now: SystemTime) -> Option<Span<'static>> {
+    match status {
+        AgentStatus::Working {
+            tool: Some(tool),
+            pulse: Pulse::Steady,
+            ..
+        } => Some(Span::styled(ago(tool.since, now), dim())),
+        _ => time_in_state(status, now),
+    }
+}
+
+fn peek(m: &Model, width: usize) -> Option<Peek> {
+    let now = m.now;
+    let entry = m.peek_target()?;
+    let status = m.status(entry);
+    let mut lines: Vec<(u8, Line<'static>)> = Vec::new();
+    let (verb, detail) = describe_status(&status);
+    // When the pane shows the agent, its question or tool is already on
+    // screen: the title carries the state and the body what the pane can't.
+    let in_pane = m.pane.session() == Some(entry.name());
+    let title = if in_pane {
+        let mut title = vec![glyph(&status), Span::styled(format!(" {verb}"), bold())];
+        title.extend(
+            state_time(&status, now).map(|t| Span::styled(format!(" {}", t.content), t.style)),
+        );
+        title
+    } else {
+        vec![Span::styled(entry.label().to_string(), bold())]
+    };
+    if !in_pane {
+        let mut state = vec![glyph(&status), Span::raw(format!(" {verb}"))];
+        let time: Vec<Span<'static>> = state_time(&status, now).into_iter().collect();
+        state = justify(state, time, width).spans;
+        lines.push((1, Line::from(state)));
+        if let Some(detail) = detail {
+            let mut wrapped = wrap(&detail, width).into_iter();
+            if let Some(first) = wrapped.next() {
+                lines.push((2, Line::raw(first)));
+            }
+            if let Some(second) = wrapped.next() {
+                lines.push((6, Line::raw(second)));
+            }
+        }
+    }
+    if let Some(prompt) = m.activity(entry.name()).and_then(|a| a.prompt.clone()) {
+        lines.push((
+            3,
+            Line::from(fit(vec![Span::styled(format!("› {prompt}"), dim())], width)),
+        ));
+    }
+    if let Some((_, facts)) = m.facts.as_ref().filter(|(name, _)| name == entry.name()) {
+        let diff = facts.progress.diff;
+        let changes = match diff.files {
+            0 => vec![Span::styled("no changes", dim())],
+            files => vec![
+                Span::styled(format!("+{}", diff.added), Style::new().fg(Color::Green)),
+                Span::raw(" "),
+                Span::styled(format!("−{}", diff.removed), Style::new().fg(Color::Red)),
+                Span::styled(
+                    format!(" · {files} {}", if files == 1 { "file" } else { "files" }),
+                    dim(),
+                ),
+            ],
+        };
+        lines.push((4, Line::from(changes)));
+        let mut git = Vec::new();
+        if facts.progress.ahead > 0 {
+            git.push(format!("↑{}", facts.progress.ahead));
+        }
+        if facts.dirty > 0 {
+            git.push(format!("{} uncommitted", facts.dirty));
+        }
+        if !git.is_empty() {
+            lines.push((5, Line::from(Span::styled(git.join(" · "), dim()))));
+        }
+    }
+    Some(Peek { title, lines })
+}
+
+fn draw_peek(frame: &mut Frame<'_>, peek: Peek, area: Rect) {
+    let rows = usize::from(area.height.saturating_sub(2));
+    let mut kept: Vec<(usize, u8)> = peek
+        .lines
+        .iter()
+        .enumerate()
+        .map(|(i, (priority, _))| (i, *priority))
+        .collect();
+    kept.sort_by_key(|(i, priority)| (*priority, *i));
+    kept.truncate(rows);
+    kept.sort_unstable();
+    let mut all: Vec<Option<Line<'static>>> =
+        peek.lines.into_iter().map(|(_, line)| Some(line)).collect();
+    let lines: Vec<Line<'static>> = kept
+        .into_iter()
+        .filter_map(|(i, _)| all.get_mut(i).and_then(Option::take))
+        .collect();
+    let block = panel(peek.title, Vec::new(), dim(), false).padding(Padding::horizontal(1));
+    frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 fn draw_actions(frame: &mut Frame<'_>, m: &Model, target: &SessionName) {
     let actions = m.actions.all();
-    let label_width = actions.iter().map(|a| a.label.as_str().width()).max().unwrap_or(0);
+    let label_width = actions
+        .iter()
+        .map(|a| a.label.as_str().width())
+        .max()
+        .unwrap_or(0);
     let lines: Vec<Line<'_>> = actions
         .iter()
         .map(|action| {
@@ -1020,7 +1667,9 @@ fn draw_actions(frame: &mut Frame<'_>, m: &Model, target: &SessionName) {
     let width = lines.iter().map(Line::width).max().unwrap_or(0) + 3;
     let title = format!("Run on {target}");
     let width = width.max(title.width() + 6);
-    let height = u16::try_from(lines.len()).unwrap_or(u16::MAX).saturating_add(2);
+    let height = u16::try_from(lines.len())
+        .unwrap_or(u16::MAX)
+        .saturating_add(2);
     let area = centred(frame, u16::try_from(width).unwrap_or(u16::MAX), height);
     clear_around(frame, area);
     let block = overlay_block(&title, hints(&[("Esc", "close")]), dim());
@@ -1031,11 +1680,17 @@ fn pad(text: &str, width: usize) -> String {
     format!("{text}{}", " ".repeat(width.saturating_sub(text.width())))
 }
 
-fn help_section<K: AsRef<str>>(section: &'static str, keys: &[(K, &'static str)]) -> Vec<Line<'static>> {
+fn help_section<K: AsRef<str>>(
+    section: &'static str,
+    keys: &[(K, &'static str)],
+) -> Vec<Line<'static>> {
     let mut lines = vec![Line::from(vec![Span::raw(" "), badge(section)])];
-    lines.extend(
-        keys.iter().map(|(key, desc)| Line::from(vec![Span::raw(format!("   {:<10}", key.as_ref())), Span::raw(*desc)])),
-    );
+    lines.extend(keys.iter().map(|(key, desc)| {
+        Line::from(vec![
+            Span::raw(format!("   {:<10}", key.as_ref())),
+            Span::raw(*desc),
+        ])
+    }));
     lines
 }
 
@@ -1043,9 +1698,15 @@ fn help_section<K: AsRef<str>>(section: &'static str, keys: &[(K, &'static str)]
 /// too short for that.
 fn draw_help(frame: &mut Frame<'_>, keys: Keys) {
     let nav = keys.nav();
-    let agent = [(nav.to_string(), "back to NAV"), (format!("{nav} {nav}"), "previous agent")];
+    let agent = [
+        (nav.to_string(), "back to NAV"),
+        (format!("{nav} {nav}"), "previous agent"),
+    ];
     let sections: Vec<Vec<Line<'static>>> = std::iter::once(help_section(" AGENT ", &agent))
-        .chain(HELP.iter().map(|(section, keys)| help_section(section, keys)))
+        .chain(
+            HELP.iter()
+                .map(|(section, keys)| help_section(section, keys)),
+        )
         .collect();
     let available = usize::from(frame.area().height.saturating_sub(4));
     let stacked = |sections: &[Vec<Line<'static>>], gap: bool| {
@@ -1064,11 +1725,23 @@ fn draw_help(frame: &mut Frame<'_>, keys: Keys) {
     } else if rows <= available {
         vec![stacked(&sections, false)]
     } else {
-        let (longest, _) = sections.iter().enumerate().max_by_key(|(_, s)| s.len()).unwrap_or((0, &Vec::new()));
-        let others: Vec<_> = sections.iter().enumerate().filter(|(i, _)| *i != longest).map(|(_, s)| s.clone()).collect();
+        let (longest, _) = sections
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, s)| s.len())
+            .unwrap_or((0, &Vec::new()));
+        let others: Vec<_> = sections
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != longest)
+            .map(|(_, s)| s.clone())
+            .collect();
         vec![sections[longest].clone(), stacked(&others, true)]
     };
-    let widths: Vec<usize> = columns.iter().map(|c| c.iter().map(Line::width).max().unwrap_or(0) + 2).collect();
+    let widths: Vec<usize> = columns
+        .iter()
+        .map(|c| c.iter().map(Line::width).max().unwrap_or(0) + 2)
+        .collect();
     let height = columns.iter().map(Vec::len).max().unwrap_or(0);
     let area = centred(
         frame,
@@ -1079,8 +1752,52 @@ fn draw_help(frame: &mut Frame<'_>, keys: Keys) {
     let block = overlay_block("Keys", hints(&[("any key", "close")]), dim());
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let constraints: Vec<Constraint> = widths.iter().map(|w| Constraint::Length(u16::try_from(*w).unwrap_or(u16::MAX))).collect();
-    for (column, rect) in columns.into_iter().zip(Layout::horizontal(constraints).split(inner).iter()) {
+    let constraints: Vec<Constraint> = widths
+        .iter()
+        .map(|w| Constraint::Length(u16::try_from(*w).unwrap_or(u16::MAX)))
+        .collect();
+    for (column, rect) in columns
+        .into_iter()
+        .zip(Layout::horizontal(constraints).split(inner).iter())
+    {
         frame.render_widget(Paragraph::new(column), *rect);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_peek_takes_a_third_up_to_eight_lines_and_leaves_the_list_room() {
+        assert_eq!(
+            peek_height(23, 7),
+            7,
+            "an 80x24 terminal: 5 lines and borders"
+        );
+        assert_eq!(peek_height(44, 7), 9, "never more lines than it has");
+        assert_eq!(peek_height(44, 20), 10, "at most 8 lines");
+        assert_eq!(peek_height(29, 2), 4);
+        assert_eq!(
+            peek_height(14, 7),
+            0,
+            "short terminals keep every row for the list"
+        );
+        assert_eq!(peek_height(23, 0), 0);
+    }
+
+    #[test]
+    fn times_read_in_the_largest_whole_unit() {
+        let now = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        let ago_secs = |secs| ago(now - std::time::Duration::from_secs(secs), now);
+        assert_eq!(
+            [
+                ago_secs(38),
+                ago_secs(240),
+                ago_secs(7300),
+                ago_secs(300_000)
+            ],
+            ["38s", "4m", "2h", "3d"]
+        );
     }
 }

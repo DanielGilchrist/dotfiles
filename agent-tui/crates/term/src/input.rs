@@ -56,7 +56,12 @@ pub fn encode_key(key: KeyEvent, modes: Modes) -> Vec<u8> {
         .into_bytes()
     };
     let tilde = |n: u8| -> Vec<u8> {
-        if param > 1 { format!("\x1b[{n};{param}~") } else { format!("\x1b[{n}~") }.into_bytes()
+        if param > 1 {
+            format!("\x1b[{n};{param}~")
+        } else {
+            format!("\x1b[{n}~")
+        }
+        .into_bytes()
     };
 
     let mut bytes = match key.code {
@@ -81,7 +86,9 @@ pub fn encode_key(key: KeyEvent, modes: Modes) -> Vec<u8> {
         KeyCode::PageUp => return tilde(5),
         KeyCode::PageDown => return tilde(6),
         KeyCode::F(n @ 1..=4) => format!("\x1bO{}", char::from(b'P' + n - 1)).into_bytes(),
-        KeyCode::F(n @ 5..=12) => return tilde([15, 17, 18, 19, 20, 21, 23, 24][usize::from(n - 5)]),
+        KeyCode::F(n @ 5..=12) => {
+            return tilde([15, 17, 18, 19, 20, 21, 23, 24][usize::from(n - 5)]);
+        }
         _ => return Vec::new(),
     };
     if mods.contains(KeyModifiers::ALT) {
@@ -121,21 +128,48 @@ mod tests {
 
     #[test]
     fn control_keys_map_to_c0_bytes() {
-        assert_eq!(encode_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL), Modes::default()), [0x03]);
-        assert_eq!(encode_key(key(KeyCode::Char('4'), KeyModifiers::CONTROL), Modes::default()), [0x1c]);
+        assert_eq!(
+            encode_key(
+                key(KeyCode::Char('c'), KeyModifiers::CONTROL),
+                Modes::default()
+            ),
+            [0x03]
+        );
+        assert_eq!(
+            encode_key(
+                key(KeyCode::Char('4'), KeyModifiers::CONTROL),
+                Modes::default()
+            ),
+            [0x1c]
+        );
     }
 
     #[test]
     fn arrows_respect_application_cursor_and_modifiers() {
-        let app = Modes { application_cursor: true, ..Modes::default() };
-        assert_eq!(encode_key(key(KeyCode::Up, KeyModifiers::NONE), Modes::default()), b"\x1b[A");
-        assert_eq!(encode_key(key(KeyCode::Up, KeyModifiers::NONE), app), b"\x1bOA");
-        assert_eq!(encode_key(key(KeyCode::Up, KeyModifiers::SHIFT), app), b"\x1b[1;2A");
+        let app = Modes {
+            application_cursor: true,
+            ..Modes::default()
+        };
+        assert_eq!(
+            encode_key(key(KeyCode::Up, KeyModifiers::NONE), Modes::default()),
+            b"\x1b[A"
+        );
+        assert_eq!(
+            encode_key(key(KeyCode::Up, KeyModifiers::NONE), app),
+            b"\x1bOA"
+        );
+        assert_eq!(
+            encode_key(key(KeyCode::Up, KeyModifiers::SHIFT), app),
+            b"\x1b[1;2A"
+        );
     }
 
     #[test]
     fn alt_prefixes_escape() {
-        assert_eq!(encode_key(key(KeyCode::Char('x'), KeyModifiers::ALT), Modes::default()), b"\x1bx");
+        assert_eq!(
+            encode_key(key(KeyCode::Char('x'), KeyModifiers::ALT), Modes::default()),
+            b"\x1bx"
+        );
     }
 
     #[test]
@@ -151,7 +185,13 @@ mod tests {
     fn mouse_reports_only_when_requested() {
         let at = CellPos::within(Rect::new(0, 0, 10, 10), Position::new(2, 3)).unwrap();
         assert!(encode_mouse(MouseEventKind::ScrollUp, at, Modes::default()).is_none());
-        let sgr = Modes { mouse: MouseReporting::Sgr, ..Modes::default() };
-        assert_eq!(encode_mouse(MouseEventKind::ScrollUp, at, sgr).unwrap(), b"\x1b[<64;3;4M");
+        let sgr = Modes {
+            mouse: MouseReporting::Sgr,
+            ..Modes::default()
+        };
+        assert_eq!(
+            encode_mouse(MouseEventKind::ScrollUp, at, sgr).unwrap(),
+            b"\x1b[<64;3;4M"
+        );
     }
 }

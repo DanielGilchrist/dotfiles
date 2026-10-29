@@ -6,12 +6,19 @@ use std::time::Duration;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
 fn main() -> anyhow::Result<()> {
-    let bin = std::env::args().nth(1).expect("usage: harness <bin> [steps...]");
+    let bin = std::env::args()
+        .nth(1)
+        .expect("usage: harness <bin> [steps...]");
     let steps: Vec<String> = std::env::args().skip(2).collect();
     let rows = std::env::var("ROWS").map_or(45, |v| v.parse().unwrap());
     let cols = std::env::var("COLS").map_or(160, |v| v.parse().unwrap());
 
-    let pair = native_pty_system().openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })?;
+    let pair = native_pty_system().openpty(PtySize {
+        rows,
+        cols,
+        pixel_width: 0,
+        pixel_height: 0,
+    })?;
     let mut cmd = CommandBuilder::new(bin);
     cmd.cwd(std::env::current_dir()?);
     cmd.env("TERM", "xterm-256color");
@@ -68,7 +75,9 @@ fn unescape(keys: &str) -> Vec<u8> {
                 tail
             }
             (b'\\', [b'x', hi, lo, tail @ ..]) => {
-                let hex = std::str::from_utf8(&[*hi, *lo]).ok().and_then(|h| u8::from_str_radix(h, 16).ok());
+                let hex = std::str::from_utf8(&[*hi, *lo])
+                    .ok()
+                    .and_then(|h| u8::from_str_radix(h, 16).ok());
                 out.push(hex.expect("bad \\x escape"));
                 tail
             }

@@ -6,13 +6,15 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
 
+use crate::activity::{Activity, Event};
 use crate::model::{Head, Running, Worktree};
 use crate::names::{BranchName, Prompt, SessionName};
 use crate::paths::{AgentWorktree, RepoRoot};
 use crate::ports::{
-    AgentRecord, BranchState, ClientControl, Harness, HarnessError, HarnessId, Harnesses, HostError, LaunchCtx,
-    PaneCommand, RepoWorktrees, SessionHost, SessionInfo, SessionStatus, Store, StoreError, Vcs,
-    LocalBranch, PendingPrompt, RemoteBranch, Seen, WorktreeStart,
+    AgentRecord, BranchState, ClientControl, Harness, HarnessError, HarnessId, Harnesses,
+    HostError, LaunchCtx, LocalBranch, PaneCommand, PendingPrompt, Progress, RemoteBranch,
+    RepoWorktrees, Seen, SessionHost, SessionInfo, SessionStatus, Store, StoreError, Vcs,
+    WorktreeStart,
 };
 use crate::process::{CommandError, LaunchSpec};
 
@@ -58,16 +60,36 @@ impl Vcs for FakeVcs {
         let linked = heads
             .iter()
             .filter(|(p, _)| p.as_path() != self.root.path())
-            .map(|(path, head)| Worktree { path: path.clone(), head: head.clone() })
+            .map(|(path, head)| Worktree {
+                path: path.clone(),
+                head: head.clone(),
+            })
             .collect();
-        Ok(RepoWorktrees { main: Worktree { path: self.root.path().into(), head: Head::Detached }, linked })
+        Ok(RepoWorktrees {
+            main: Worktree {
+                path: self.root.path().into(),
+                head: Head::Detached,
+            },
+            linked,
+        })
     }
 
     fn head(&self, dir: &Path) -> Result<Head, CommandError> {
-        Ok(self.heads.lock().unwrap().get(dir).cloned().unwrap_or(Head::Detached))
+        Ok(self
+            .heads
+            .lock()
+            .unwrap()
+            .get(dir)
+            .cloned()
+            .unwrap_or(Head::Detached))
     }
 
-    fn add_worktree(&self, _: &RepoRoot, at: &AgentWorktree, _: &WorktreeStart) -> Result<(), CommandError> {
+    fn add_worktree(
+        &self,
+        _: &RepoRoot,
+        at: &AgentWorktree,
+        _: &WorktreeStart,
+    ) -> Result<(), CommandError> {
         std::fs::create_dir_all(at.path()).unwrap();
         std::fs::write(at.path().join(".git"), "gitdir: fake").unwrap();
         self.set_head(at.path(), Head::Detached);
@@ -78,25 +100,55 @@ impl Vcs for FakeVcs {
         Ok(())
     }
 
-    fn local_branch(&self, _: &RepoRoot, branch: &BranchName) -> Result<Option<LocalBranch>, CommandError> {
+    fn local_branch(
+        &self,
+        _: &RepoRoot,
+        branch: &BranchName,
+    ) -> Result<Option<LocalBranch>, CommandError> {
         let deleted = self.deleted.lock().unwrap().contains(branch);
         Ok((!deleted).then(|| LocalBranch::found(branch.clone())))
     }
 
-    fn remote_branch(&self, _: &RepoRoot, _: &BranchName) -> Result<Option<RemoteBranch>, CommandError> {
+    fn remote_branch(
+        &self,
+        _: &RepoRoot,
+        _: &BranchName,
+    ) -> Result<Option<RemoteBranch>, CommandError> {
         Ok(None)
     }
 
     fn branch_state(&self, _: &RepoRoot, branch: &BranchName) -> Result<BranchState, CommandError> {
-        Ok(self.states.lock().unwrap().get(branch).copied().unwrap_or(BranchState::Safe))
+        Ok(self
+            .states
+            .lock()
+            .unwrap()
+            .get(branch)
+            .copied()
+            .unwrap_or(BranchState::Safe))
     }
 
     fn dirty_files(&self, worktree: &Path) -> Result<usize, CommandError> {
-        Ok(self.dirty.lock().unwrap().get(worktree).copied().unwrap_or(0))
+        Ok(self
+            .dirty
+            .lock()
+            .unwrap()
+            .get(worktree)
+            .copied()
+            .unwrap_or(0))
     }
 
     fn unreachable_commits(&self, worktree: &Path) -> Result<usize, CommandError> {
-        Ok(self.detached_commits.lock().unwrap().get(worktree).copied().unwrap_or(0))
+        Ok(self
+            .detached_commits
+            .lock()
+            .unwrap()
+            .get(worktree)
+            .copied()
+            .unwrap_or(0))
+    }
+
+    fn progress(&self, _: &Path) -> Result<Progress, CommandError> {
+        Ok(Progress::default())
     }
 
     fn delete_branch(&self, _: &RepoRoot, branch: LocalBranch) -> Result<(), CommandError> {
@@ -125,7 +177,10 @@ impl SessionHost for FakeHost {
     }
 
     fn create(&self, name: &SessionName, pane: &PaneCommand) -> Result<LaunchSpec, HostError> {
-        self.created.lock().unwrap().push((name.clone(), pane.clone()));
+        self.created
+            .lock()
+            .unwrap()
+            .push((name.clone(), pane.clone()));
         Ok(LaunchSpec::new("create").arg(name.as_str()))
     }
 
@@ -137,8 +192,15 @@ impl SessionHost for FakeHost {
     fn kill(&self, session: &Running) -> Result<(), HostError> {
         let name = session.name();
         self.killed.lock().unwrap().push(name.clone());
-        for s in self.sessions.lock().unwrap().iter_mut().filter(|s| &s.name == name) {
-            s.status = SessionStatus::Exited;
+        for s in self
+            .sessions
+            .lock()
+            .unwrap()
+            .iter_mut()
+            .filter(|s| &s.name == name)
+        {
+            let cwd = s.cwd().map(Path::to_path_buf);
+            s.status = SessionStatus::Exited { cwd };
         }
         Ok(())
     }
@@ -150,7 +212,10 @@ impl SessionHost for FakeHost {
     }
 
     fn write(&self, name: &SessionName, bytes: &[u8]) -> Result<(), HostError> {
-        self.written.lock().unwrap().push((name.clone(), bytes.to_vec()));
+        self.written
+            .lock()
+            .unwrap()
+            .push((name.clone(), bytes.to_vec()));
         Ok(())
     }
 
@@ -172,6 +237,7 @@ pub struct MemStore {
     pub pins: Mutex<Vec<SessionName>>,
     pub records: Mutex<HashMap<SessionName, AgentRecord>>,
     pub last_selected: Mutex<Option<SessionName>>,
+    pub activities: Mutex<HashMap<SessionName, Activity>>,
 }
 
 impl Store for MemStore {
@@ -197,14 +263,37 @@ impl Store for MemStore {
     }
 
     fn put_record(&self, name: &SessionName, record: &AgentRecord) -> Result<(), StoreError> {
-        self.records.lock().unwrap().insert(name.clone(), record.clone());
+        self.records
+            .lock()
+            .unwrap()
+            .insert(name.clone(), record.clone());
         Ok(())
     }
 
     fn forget(&self, name: &SessionName) -> Result<(), StoreError> {
         self.unpin(name)?;
         self.records.lock().unwrap().remove(name);
+        self.activities.lock().unwrap().remove(name);
         Ok(())
+    }
+
+    fn report(&self, name: &SessionName, event: Event) -> Result<(), StoreError> {
+        let mut activities = self.activities.lock().unwrap();
+        let next = Activity::next(activities.remove(name), event, SystemTime::now());
+        activities.insert(name.clone(), next);
+        Ok(())
+    }
+
+    fn acknowledge(&self, name: &SessionName) -> Result<(), StoreError> {
+        let mut activities = self.activities.lock().unwrap();
+        if let Some(activity) = activities.remove(name) {
+            activities.insert(name.clone(), activity.acknowledged(SystemTime::now()));
+        }
+        Ok(())
+    }
+
+    fn activities(&self) -> Result<HashMap<SessionName, Activity>, StoreError> {
+        Ok(self.activities.lock().unwrap().clone())
     }
 
     fn last_selected(&self) -> Result<Option<SessionName>, StoreError> {
@@ -226,7 +315,10 @@ pub struct FakeHarness {
 
 impl Default for FakeHarness {
     fn default() -> Self {
-        Self { id: "fake".parse().unwrap(), active: AtomicBool::new(false) }
+        Self {
+            id: "fake".parse().unwrap(),
+            active: AtomicBool::new(false),
+        }
     }
 }
 
@@ -236,7 +328,10 @@ impl Harness for FakeHarness {
     }
 
     fn acknowledged(&self, _: &Path, _: &PendingPrompt) -> Result<Option<Seen>, HarnessError> {
-        Ok(self.active.load(Ordering::SeqCst).then(|| Seen::at(SystemTime::now())))
+        Ok(self
+            .active
+            .load(Ordering::SeqCst)
+            .then(|| Seen::at(SystemTime::now())))
     }
 
     fn label(&self) -> &'static str {

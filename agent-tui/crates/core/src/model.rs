@@ -61,19 +61,37 @@ impl Checkout {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EntryKind {
     /// A repo's main checkout, named after the repo.
-    Main { root: RepoRoot, head: Head, session: Option<Presence> },
+    Main {
+        root: RepoRoot,
+        head: Head,
+        session: Option<Presence>,
+    },
     /// An agent worktree, named after its directory.
-    Agent { worktree: AgentWorktree, head: Head, session: Option<Presence> },
+    Agent {
+        worktree: AgentWorktree,
+        head: Head,
+        session: Option<Presence>,
+    },
     /// A session with its own name whose terminal is inside a known checkout.
-    Adopted { checkout: Checkout, head: Head, presence: Presence },
+    Adopted {
+        checkout: Checkout,
+        head: Head,
+        presence: Presence,
+    },
     /// A session inside no repo we know of.
-    Orphan { cwd: Option<PathBuf>, presence: Presence },
+    Orphan {
+        cwd: Option<PathBuf>,
+        presence: Presence,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Start {
     /// A repo's main checkout; the name is the repo's.
-    Main { name: SessionName, root: RepoRoot },
+    Main {
+        name: SessionName,
+        root: RepoRoot,
+    },
     Agent(AgentWorktree),
 }
 
@@ -87,17 +105,20 @@ pub struct Startable(Start);
 pub enum EntryState {
     Live,
     /// Dead but resurrectable.
-    Exited,
+    Exited(Revival),
     Idle(Startable),
 }
 
-impl From<Presence> for EntryState {
-    fn from(presence: Presence) -> Self {
-        match presence {
-            Presence::Live => Self::Live,
-            Presence::Exited => Self::Exited,
-        }
-    }
+/// How an exited session comes back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Revival {
+    /// One of our checkouts: start it again through `agent exec`, which
+    /// resumes the conversation with today's launch (hooks included),
+    /// whatever command zellij cached for it.
+    Restart(Startable),
+    /// A session we don't own the checkout of: zellij replays its cached
+    /// command.
+    Resurrect,
 }
 
 impl Startable {
@@ -107,7 +128,10 @@ impl Startable {
 
     /// A repo's main checkout, in a session named after the repo.
     pub(crate) fn main(root: &RepoRoot) -> Result<Self, crate::names::NameError> {
-        Ok(Self(Start::Main { name: root.name().parse()?, root: root.clone() }))
+        Ok(Self(Start::Main {
+            name: root.name().parse()?,
+            root: root.clone(),
+        }))
     }
 
     pub fn name(&self) -> SessionName {
@@ -192,7 +216,11 @@ impl Entry {
     }
 
     pub(crate) fn new(name: SessionName, kind: EntryKind) -> Self {
-        Self { name, kind, pin: None }
+        Self {
+            name,
+            kind,
+            pin: None,
+        }
     }
 
     pub(crate) fn pin_at(&mut self, position: usize) {
@@ -214,13 +242,17 @@ impl Entry {
     pub fn presence(&self) -> Option<Presence> {
         match &self.kind {
             EntryKind::Main { session, .. } | EntryKind::Agent { session, .. } => *session,
-            EntryKind::Adopted { presence, .. } | EntryKind::Orphan { presence, .. } => Some(*presence),
+            EntryKind::Adopted { presence, .. } | EntryKind::Orphan { presence, .. } => {
+                Some(*presence)
+            }
         }
     }
 
     pub fn head(&self) -> Option<&Head> {
         match &self.kind {
-            EntryKind::Main { head, .. } | EntryKind::Agent { head, .. } | EntryKind::Adopted { head, .. } => Some(head),
+            EntryKind::Main { head, .. }
+            | EntryKind::Agent { head, .. }
+            | EntryKind::Adopted { head, .. } => Some(head),
             EntryKind::Orphan { .. } => None,
         }
     }
@@ -249,29 +281,76 @@ impl Entry {
     pub fn removable(&self) -> Option<Removable> {
         match (&self.kind, self.state()) {
             (EntryKind::Agent { worktree, .. }, _) => Some(Removable::Worktree(worktree.clone())),
-            (_, EntryState::Live | EntryState::Exited) => Some(Removable::Session(self.name.clone())),
+            (_, EntryState::Live | EntryState::Exited(_)) => {
+                Some(Removable::Session(self.name.clone()))
+            }
             (_, EntryState::Idle(_)) => None,
         }
     }
 
     /// Its session, or where one can start when there's none.
     pub fn state(&self) -> EntryState {
+        let main = |root: &RepoRoot| {
+            Startable(Start::Main {
+                name: self.name.clone(),
+                root: root.clone(),
+            })
+        };
         match &self.kind {
-            EntryKind::Main { session: Some(presence), .. } | EntryKind::Agent { session: Some(presence), .. } => {
-                (*presence).into()
+            EntryKind::Main {
+                session: Some(Presence::Live),
+                ..
             }
-            EntryKind::Adopted { presence, .. } | EntryKind::Orphan { presence, .. } => (*presence).into(),
-            EntryKind::Main { root, session: None, .. } => {
-                EntryState::Idle(Startable(Start::Main { name: self.name.clone(), root: root.clone() }))
+            | EntryKind::Agent {
+                session: Some(Presence::Live),
+                ..
             }
-            EntryKind::Agent { worktree, session: None, .. } => EntryState::Idle(Startable::worktree(worktree)),
+            | EntryKind::Adopted {
+                presence: Presence::Live,
+                ..
+            }
+            | EntryKind::Orphan {
+                presence: Presence::Live,
+                ..
+            } => EntryState::Live,
+            EntryKind::Main {
+                root,
+                session: Some(Presence::Exited),
+                ..
+            } => EntryState::Exited(Revival::Restart(main(root))),
+            EntryKind::Agent {
+                worktree,
+                session: Some(Presence::Exited),
+                ..
+            } => EntryState::Exited(Revival::Restart(Startable::worktree(worktree))),
+            EntryKind::Adopted {
+                presence: Presence::Exited,
+                ..
+            }
+            | EntryKind::Orphan {
+                presence: Presence::Exited,
+                ..
+            } => EntryState::Exited(Revival::Resurrect),
+            EntryKind::Main {
+                root,
+                session: None,
+                ..
+            } => EntryState::Idle(main(root)),
+            EntryKind::Agent {
+                worktree,
+                session: None,
+                ..
+            } => EntryState::Idle(Startable::worktree(worktree)),
         }
     }
 
     /// The main checkout reads best as its branch; everything else by name.
     pub fn label(&self) -> &str {
         match &self.kind {
-            EntryKind::Main { head: Head::Branch(branch), .. } => branch.as_str(),
+            EntryKind::Main {
+                head: Head::Branch(branch),
+                ..
+            } => branch.as_str(),
             _ => self.name.as_str(),
         }
     }
@@ -284,7 +363,13 @@ impl Entry {
             Some(Presence::Exited) => 1,
             None => 2,
         };
-        (self.pin.is_none(), self.pin, !self.is_main(), state, self.name.as_str().to_lowercase())
+        (
+            self.pin.is_none(),
+            self.pin,
+            !self.is_main(),
+            state,
+            self.name.as_str().to_lowercase(),
+        )
     }
 }
 
@@ -313,7 +398,12 @@ impl RepoKey {
     fn rank(&self) -> (String, u8, &Path, &str) {
         match self {
             Self::Root(root) => (root.name().to_lowercase(), 0, root.path(), ""),
-            Self::Orphan(name) => (name.as_str().to_lowercase(), 1, Path::new(""), name.as_str()),
+            Self::Orphan(name) => (
+                name.as_str().to_lowercase(),
+                1,
+                Path::new(""),
+                name.as_str(),
+            ),
         }
     }
 }
@@ -410,7 +500,9 @@ impl Snapshot {
     }
 
     pub fn entries(&self) -> impl Iterator<Item = (&Repo, &Entry)> {
-        self.repos.iter().flat_map(|r| r.entries.iter().map(move |e| (r, e)))
+        self.repos
+            .iter()
+            .flat_map(|r| r.entries.iter().map(move |e| (r, e)))
     }
 
     pub fn entry(&self, name: &SessionName) -> Option<(&Repo, &Entry)> {
@@ -425,7 +517,8 @@ impl Snapshot {
     }
 
     pub fn slot(&self, slot: Slot) -> Option<(&Repo, &Entry)> {
-        self.entries().find(|(_, e)| e.pin.and_then(Pin::slot) == Some(slot))
+        self.entries()
+            .find(|(_, e)| e.pin.and_then(Pin::slot) == Some(slot))
     }
 
     /// The deepest entry whose checkout contains `path`.

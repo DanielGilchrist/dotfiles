@@ -1,9 +1,11 @@
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime};
 
 use agent_core::actions::{Action, CommandLine, Context, EventName, Invocation};
+use agent_core::activity::{Activity, State as ActivityState};
 use agent_core::config::ControlKey;
 use agent_core::model::{RepoKey, Slot};
 use agent_core::names::SessionName;
@@ -14,26 +16,53 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent
 use ratatui::layout::Position;
 
 use crate::model::{
-    Answer, Chord, Confirm, Cursor, Edge, Enter, Field, Focus, Follow, INFO_TTL, Intent, Mode, Model,
-    NamingState, NewAgent, Overlay, Pane, Phase, Reach, Submission,
-    Query, StatusKind, Ticket, View, fuzzy_match, repo_matches,
+    Answer, Chord, Confirm, Cursor, Edge, Enter, Field, Focus, Follow, INFO_TTL, Intent, Mode,
+    Model, NamingState, NewAgent, Overlay, Pane, Phase, Query, Reach, StatusKind, Submission,
+    TerminalFocus, Ticket, View, fuzzy_match, repo_matches,
 };
 use crate::worker::{Job, Msg, Outcome};
+
+/// How long the pane shows a finished agent, terminal focused, before it
+/// counts as seen.
+const SEEN_AFTER: Duration = Duration::from_secs(3);
+/// At most one bell this often.
+const BELL_EVERY: Duration = Duration::from_secs(10);
+/// A turn this long rings when it finishes; shorter ones you were probably
+/// watching.
+const LONG_TURN: Duration = Duration::from_secs(30);
+/// The peek's git facts refresh on its agent's activity, at most this often.
+const REINSPECT_AFTER: Duration = Duration::from_secs(3);
 
 pub enum Effect {
     Job(Job),
     /// Attach to an existing session (resurrecting it if it exited).
-    Attach { name: SessionName, intent: Intent, ticket: Ticket },
-    Connect { launch: Launch, intent: Intent, ticket: Ticket },
+    Attach {
+        name: SessionName,
+        intent: Intent,
+        ticket: Ticket,
+    },
+    Connect {
+        launch: Launch,
+        intent: Intent,
+        ticket: Ticket,
+    },
     /// Suspend the TUI and open `$EDITOR` here.
     Edit(PathBuf),
     /// Suspend the TUI and edit the new-agent task in `$EDITOR`.
     EditTask(String),
     Quit,
+    /// Ring the terminal's bell.
+    Bell,
     /// Ask the terminal the TUI runs in to set a user variable.
-    TerminalEvent { name: EventName, value: OsString },
+    TerminalEvent {
+        name: EventName,
+        value: OsString,
+    },
     /// Suspend the TUI and run an action's command in its terminal.
-    Interactive { label: String, launch: CommandLine },
+    Interactive {
+        label: String,
+        launch: CommandLine,
+    },
 }
 
 /// Whether `key` is `control`, in either encoding terminals send.
@@ -47,14 +76,20 @@ fn ctrl(key: &KeyEvent, c: char) -> bool {
 }
 
 fn own_client(m: &Model) -> Option<ClientId> {
-    m.pane.connection().and_then(|c| c.term.pid()).map(ClientId::new)
+    m.pane
+        .connection()
+        .and_then(|c| c.term.pid())
+        .map(ClientId::new)
 }
 
 pub fn update(m: &mut Model, msg: Msg) -> Vec<Effect> {
     match msg {
         Msg::Key(key) if key.kind == KeyEventKind::Release => Vec::new(),
         Msg::Key(key) => {
-            if m.status.as_ref().is_some_and(|s| s.kind == StatusKind::Error) {
+            if m.status
+                .as_ref()
+                .is_some_and(|s| s.kind == StatusKind::Error)
+            {
                 m.status = None;
             }
             on_key(m, key)
@@ -71,7 +106,11 @@ pub fn update(m: &mut Model, msg: Msg) -> Vec<Effect> {
         Msg::Paste(text) => {
             if let Some(c) = m.pane.connection().filter(|c| c.mode == Mode::Agent) {
                 let text = sanitize_paste(&text);
-                let bytes = if c.term.modes().bracketed_paste { format!("\x1b[200~{text}\x1b[201~") } else { text };
+                let bytes = if c.term.modes().bracketed_paste {
+                    format!("\x1b[200~{text}\x1b[201~")
+                } else {
+                    text
+                };
                 c.term.send(bytes.into_bytes());
             }
             Vec::new()
@@ -80,7 +119,11 @@ pub fn update(m: &mut Model, msg: Msg) -> Vec<Effect> {
         Msg::Snapshot(Ok((snapshot, warnings))) => {
             m.load(snapshot);
             if !warnings.is_empty() && warnings != m.last_warnings {
-                let more = if warnings.len() > 1 { format!(" (+{} more in `agent ls`)", warnings.len() - 1) } else { String::new() };
+                let more = if warnings.len() > 1 {
+                    format!(" (+{} more in `agent ls`)", warnings.len() - 1)
+                } else {
+                    String::new()
+                };
                 m.error(format!("discovery: {}{more}", warnings[0]));
             }
             m.last_warnings = warnings;
@@ -103,15 +146,7 @@ pub fn update(m: &mut Model, msg: Msg) -> Vec<Effect> {
         }
         Msg::Launched { ticket, result } => on_launched(m, ticket, result),
         Msg::Done(Ok(outcome)) => {
-            match outcome {
-                Outcome::Killed(name) => m.info(format!("killed {name} · ⏎ resurrects")),
-                Outcome::Removed { name, warnings } if warnings.is_empty() => m.info(format!("removed {name}")),
-                Outcome::Removed { name, warnings } => m.error(format!("removed {name}, but {}", warnings.join(", "))),
-                Outcome::Pinned(name) => m.info(format!("pinned {name}")),
-                Outcome::Unpinned(name) => m.info(format!("unpinned {name}")),
-                Outcome::Started(label) => m.info(format!("started {label}")),
-                Outcome::Finished(label) => m.info(format!("{label} finished")),
-            }
+            report(m, outcome);
             Vec::new()
         }
         Msg::NameSuggested { generation, name } => {
@@ -123,6 +158,18 @@ pub fn update(m: &mut Model, msg: Msg) -> Vec<Effect> {
         Msg::Shared { name, others } => {
             if let Some(c) = m.pane.connection_mut().filter(|c| c.name == name) {
                 c.others = NonZeroUsize::new(others);
+            }
+            Vec::new()
+        }
+        Msg::Activities(activities) => on_activities(m, activities),
+        Msg::Focus(focus) => {
+            m.terminal = focus;
+            Vec::new()
+        }
+        Msg::Inspected { name, facts } => {
+            match facts {
+                Ok(facts) => m.facts = Some((name, facts)),
+                Err(e) => m.error(e),
             }
             Vec::new()
         }
@@ -145,8 +192,12 @@ pub fn update(m: &mut Model, msg: Msg) -> Vec<Effect> {
 
 /// Asks the harness to name the form's prompt once typing has paused.
 fn ask_for_name(m: &mut Model) -> Option<Effect> {
-    let Overlay::New(form) = &mut m.overlay else { return None };
-    let NamingState::Due(at) = form.naming.state else { return None };
+    let Overlay::New(form) = &mut m.overlay else {
+        return None;
+    };
+    let NamingState::Due(at) = form.naming.state else {
+        return None;
+    };
     if Instant::now() < at {
         return None;
     }
@@ -154,36 +205,61 @@ fn ask_for_name(m: &mut Model) -> Option<Effect> {
     let prompt = form.task.parse::<agent_core::names::Prompt>().ok()?;
     form.naming.state = NamingState::Asking;
     let generation = form.naming.generation;
-    Some(Effect::Job(Job::SuggestName { prompt, harness: m.harness.clone(), generation }))
+    Some(Effect::Job(Job::SuggestName {
+        prompt,
+        harness: m.harness.clone(),
+        generation,
+    }))
 }
 
 /// Periodic work: debounced preview attach, naming, and status expiry.
 pub fn tick(m: &mut Model) -> Vec<Effect> {
-    if m.status.as_ref().is_some_and(|s| s.kind == StatusKind::Info && s.at.elapsed() > INFO_TTL) {
+    if m.status
+        .as_ref()
+        .is_some_and(|s| s.kind == StatusKind::Info && s.at.elapsed() > INFO_TTL)
+    {
         m.status = None;
     }
-    if let Some(ask) = ask_for_name(m) {
-        return vec![ask];
-    }
+    m.now = SystemTime::now();
+    let mut effects: Vec<Effect> = ask_for_name(m).into_iter().collect();
+    effects.extend(bell(m));
+    effects.extend(acknowledge(m, SEEN_AFTER).map(Effect::Job));
+    effects.extend(preview(m));
+    effects.extend(inspect(m).map(Effect::Job));
+    effects
+}
+
+/// Attaches the selected live agent once the cursor has rested on it.
+fn preview(m: &mut Model) -> Option<Effect> {
     let due = m.preview_at.is_some_and(|t| Instant::now() >= t);
     if !due || matches!(m.focus(), Focus::Agent(_)) {
-        return Vec::new();
+        return None;
     }
     m.preview_at = None;
     let target = m.selected_entry().and_then(|e| match m.reach(e) {
-        Reach::Other { enter: Enter::Attach, .. } => Some(e.name().clone()),
+        Reach::Other {
+            enter: Enter::Attach,
+            ..
+        } => Some(e.name().clone()),
         _ => None,
     });
     match target {
-        Some(name) if m.pane.session() == Some(&name) => Vec::new(),
+        Some(name) if m.pane.session() == Some(&name) => None,
         Some(name) => {
             let ticket = m.ticket();
-            m.pane = Pane::Connecting { name: name.clone(), ticket };
-            vec![Effect::Attach { name, intent: Intent::Preview, ticket }]
+            m.pane = Pane::Connecting {
+                name: name.clone(),
+                ticket,
+            };
+            Some(Effect::Attach {
+                name,
+                intent: Intent::Preview,
+                ticket,
+            })
         }
         None => {
             m.pane = Pane::Empty;
-            Vec::new()
+            None
         }
     }
 }
@@ -193,12 +269,17 @@ pub fn tick(m: &mut Model) -> Vec<Effect> {
 fn on_launched(m: &mut Model, ticket: Ticket, result: Result<Launch, String>) -> Vec<Effect> {
     match result {
         Ok(launch) => {
-            if matches!(&m.overlay, Overlay::New(form) if matches!(form.phase, Phase::Submitting { ticket: t, .. } if t == ticket)) {
+            if matches!(&m.overlay, Overlay::New(form) if matches!(form.phase, Phase::Submitting { ticket: t, .. } if t == ticket))
+            {
                 m.overlay = Overlay::None;
             }
             // A backgrounded launch no longer has the pane waiting on it, so
             // this connects nothing; its follow previews it instead.
-            vec![Effect::Connect { launch, intent: Intent::Activate, ticket }]
+            vec![Effect::Connect {
+                launch,
+                intent: Intent::Activate,
+                ticket,
+            }]
         }
         Err(e) => {
             m.pane.abandon(ticket);
@@ -210,7 +291,7 @@ fn on_launched(m: &mut Model, ticket: Ticket, result: Result<Launch, String>) ->
             {
                 form.phase = Phase::Editing;
                 form.error = Some(e);
-                    return Vec::new();
+                return Vec::new();
             }
             m.error(e);
             Vec::new()
@@ -218,22 +299,149 @@ fn on_launched(m: &mut Model, ticket: Ticket, result: Result<Launch, String>) ->
     }
 }
 
+/// Says how a finished job went.
+fn report(m: &mut Model, outcome: Outcome) {
+    match outcome {
+        Outcome::Killed(name) => m.info(format!("killed {name} · ⏎ resurrects")),
+        Outcome::Removed { name, warnings } if warnings.is_empty() => {
+            m.info(format!("removed {name}"));
+        }
+        Outcome::Removed { name, warnings } => {
+            m.error(format!("removed {name}, but {}", warnings.join(", ")));
+        }
+        Outcome::Pinned(name) => m.info(format!("pinned {name}")),
+        Outcome::Unpinned(name) => m.info(format!("unpinned {name}")),
+        Outcome::Started(label) => m.info(format!("started {label}")),
+        Outcome::Finished(label) => m.info(format!("{label} finished")),
+    }
+}
+
+/// New reports from the agents: queue a bell if one newly needs the user,
+/// refresh the peek's git facts if its agent did something, and move the
+/// cursor off a Needs you row that's gone.
+fn on_activities(m: &mut Model, activities: HashMap<SessionName, Activity>) -> Vec<Effect> {
+    if newly_waiting(m, &activities) {
+        let allowed = m.last_bell.map_or_else(Instant::now, |at| at + BELL_EVERY);
+        m.bell_due = Some(m.bell_due.map_or(allowed, |due| due.min(allowed)));
+    }
+    let target = m.peek_target().map(|e| e.name().clone());
+    let events = |all: Option<&HashMap<SessionName, Activity>>| {
+        target.as_ref().and_then(|t| all?.get(t)).map(|a| a.events)
+    };
+    if events(m.activities.as_ref()) != events(Some(&activities)) {
+        let allowed = m
+            .inspected
+            .as_ref()
+            .map_or_else(Instant::now, |(_, at)| *at + REINSPECT_AFTER);
+        m.inspect_due = Some(allowed);
+    }
+    m.activities = Some(activities);
+    m.revalidate();
+    Vec::new()
+}
+
+/// The agent in the pane has finished a turn and been in view for `after`
+/// with the terminal focused: mark it seen.
+fn acknowledge(m: &mut Model, after: Duration) -> Option<Job> {
+    let c = m
+        .pane
+        .connection()
+        .filter(|c| c.opened.elapsed() >= after)?;
+    if m.terminal == TerminalFocus::Unfocused {
+        return None;
+    }
+    let activity = m.activity(&c.name)?;
+    let ActivityState::Done { .. } = activity.state else {
+        return None;
+    };
+    let mark = (c.name.clone(), activity.events);
+    if m.acknowledged.as_ref() == Some(&mark) {
+        return None;
+    }
+    m.acknowledged = Some(mark);
+    Some(Job::Acknowledge(c.name.clone()))
+}
+
+/// Asks for git facts about the peek's agent when it changed, or when its
+/// agent's activity made a refresh due.
+fn inspect(m: &mut Model) -> Option<Job> {
+    let entry = m.peek_target()?;
+    let name = entry.name().clone();
+    let worktree = entry.path()?.to_path_buf();
+    let same = matches!(&m.inspected, Some((n, _)) if *n == name);
+    let due = m.inspect_due.is_some_and(|at| Instant::now() >= at);
+    if same && !due {
+        return None;
+    }
+    m.inspected = Some((name.clone(), Instant::now()));
+    m.inspect_due = None;
+    Some(Job::Inspect { name, worktree })
+}
+
+/// Rings the queued bell once the rate limit allows.
+fn bell(m: &mut Model) -> Option<Effect> {
+    m.bell_due.filter(|due| Instant::now() >= *due)?;
+    m.bell_due = None;
+    m.last_bell = Some(Instant::now());
+    Some(Effect::Bell)
+}
+
+/// Whether an agent newly needs the user: asking, failed, or finished a
+/// turn that took a while. Not the agent being typed into or the TUI's own
+/// session, and nothing on the first report, when all of it is old news.
+fn newly_waiting(m: &Model, next: &HashMap<SessionName, Activity>) -> bool {
+    let Some(previous) = m.activities.as_ref() else {
+        return false;
+    };
+    let typing_into = match m.focus() {
+        Focus::Agent(c) => Some(&c.name),
+        Focus::Overlay(_) | Focus::Nav(_) => None,
+    };
+    next.iter()
+        .filter(|(name, _)| Some(*name) != typing_into && Some(*name) != m.own_session.as_ref())
+        .any(|(name, activity)| {
+            match (
+                &activity.state,
+                previous.get(name).map(|b| (&b.state, b.since)),
+            ) {
+                (ActivityState::Asking { .. }, Some((ActivityState::Asking { .. }, _)))
+                | (ActivityState::Failed { .. }, Some((ActivityState::Failed { .. }, _)))
+                | (ActivityState::Done { .. }, Some((ActivityState::Done { .. }, _))) => false,
+                (ActivityState::Asking { .. } | ActivityState::Failed { .. }, _) => true,
+                (ActivityState::Done { .. }, Some((ActivityState::Working { .. }, started))) => {
+                    activity.since.duration_since(started).unwrap_or_default() >= LONG_TURN
+                }
+                _ => false,
+            }
+        })
+}
+
 /// Keys now go to the connected agent; other clients are detached so the
 /// session takes this pane's size.
 pub fn enter_agent(m: &mut Model) -> Vec<Effect> {
     let own = own_client(m);
-    let Some(c) = m.pane.connection_mut() else { return Vec::new() };
+    let Some(c) = m.pane.connection_mut() else {
+        return Vec::new();
+    };
     c.mode = Mode::Agent;
     let name = c.name.clone();
     m.touch_mru(&name);
     m.preview_at = None;
-    vec![Effect::Job(Job::TakeOver { name, own })]
+    let mut effects = vec![Effect::Job(Job::TakeOver { name, own })];
+    effects.extend(acknowledge(m, Duration::ZERO).map(Effect::Job));
+    effects
 }
 
 fn activate(m: &mut Model, name: &SessionName) -> Vec<Effect> {
-    let Some(reach) = m.snapshot().and_then(|s| s.entry(name)).map(|(_, e)| m.reach(e)) else { return Vec::new() };
+    let Some(reach) = m
+        .snapshot()
+        .and_then(|s| s.entry(name))
+        .map(|(_, e)| m.reach(e))
+    else {
+        return Vec::new();
+    };
     m.overlay = Overlay::None;
-    if !matches!(m.cursor(), Some(Cursor::Pinned(n)) if n == name) {
+    if !matches!(m.cursor(), Some(Cursor::Grouped(_, n)) if n == name) {
         m.set_cursor(Cursor::Entry(name.clone()));
     }
     m.preview_at = None;
@@ -245,12 +453,31 @@ fn activate(m: &mut Model, name: &SessionName) -> Vec<Effect> {
         return enter_agent(m);
     }
     let ticket = m.ticket();
-    m.pane = Pane::Connecting { name: name.clone(), ticket };
+    m.pane = Pane::Connecting {
+        name: name.clone(),
+        ticket,
+    };
     match enter {
-        Enter::Attach | Enter::Resurrect => vec![Effect::Attach { name: name.clone(), intent: Intent::Activate, ticket }],
+        Enter::Attach | Enter::Resurrect => vec![Effect::Attach {
+            name: name.clone(),
+            intent: Intent::Activate,
+            ticket,
+        }],
         Enter::Start(at) => {
             m.info(format!("starting {name}…"));
-            vec![Effect::Job(Job::Start { at, harness: m.harness.clone(), ticket })]
+            vec![Effect::Job(Job::Start {
+                at,
+                harness: m.harness.clone(),
+                ticket,
+            })]
+        }
+        Enter::Restart(at) => {
+            m.info(format!("resurrecting {name}…"));
+            vec![Effect::Job(Job::Start {
+                at,
+                harness: m.harness.clone(),
+                ticket,
+            })]
         }
     }
 }
@@ -280,7 +507,9 @@ fn on_key(m: &mut Model, key: KeyEvent) -> Vec<Effect> {
 /// Control characters other than newlines and tabs could end a bracketed
 /// paste early and run the rest as keystrokes.
 fn sanitize_paste(text: &str) -> String {
-    text.chars().filter(|c| !c.is_control() || matches!(c, '\n' | '\r' | '\t')).collect()
+    text.chars()
+        .filter(|c| !c.is_control() || matches!(c, '\n' | '\r' | '\t'))
+        .collect()
 }
 
 fn on_nav_key(m: &mut Model, key: KeyEvent) -> Vec<Effect> {
@@ -288,7 +517,11 @@ fn on_nav_key(m: &mut Model, key: KeyEvent) -> Vec<Effect> {
     if pressed(&key, m.keys.nav()) {
         if armed {
             let current = m.pane.session().cloned();
-            let previous = m.mru().iter().find(|n| Some(*n) != current.as_ref()).cloned();
+            let previous = m
+                .mru()
+                .iter()
+                .find(|n| Some(*n) != current.as_ref())
+                .cloned();
             if let Some(name) = previous {
                 return activate(m, &name);
             }
@@ -318,8 +551,14 @@ fn on_nav_key(m: &mut Model, key: KeyEvent) -> Vec<Effect> {
         KeyCode::Char(' ' | '/') => m.overlay = Overlay::Switcher(Query::default()),
         KeyCode::Char('?') => m.overlay = Overlay::Help,
         KeyCode::Char(c @ '1'..='9') => {
-            let slot = c.to_digit(10).and_then(|d| u8::try_from(d).ok()).and_then(Slot::new);
-            match slot.and_then(|s| m.snapshot().and_then(|snap| snap.slot(s))).map(|(_, e)| e.name().clone()) {
+            let slot = c
+                .to_digit(10)
+                .and_then(|d| u8::try_from(d).ok())
+                .and_then(Slot::new);
+            match slot
+                .and_then(|s| m.snapshot().and_then(|snap| snap.slot(s)))
+                .map(|(_, e)| e.name().clone())
+            {
                 Some(name) => return activate(m, &name),
                 None => m.info(format!("nothing pinned to {c} · m pins the selected agent")),
             }
@@ -336,23 +575,53 @@ fn on_nav_key(m: &mut Model, key: KeyEvent) -> Vec<Effect> {
         KeyCode::Char('n') => open_new_form(m),
         KeyCode::Char('o') => {
             let path = m.selected().and_then(|(repo, e)| {
-                e.and_then(|e| e.path()).or_else(|| repo.key().root().map(agent_core::paths::RepoRoot::path)).map(PathBuf::from)
+                e.and_then(|e| e.path())
+                    .or_else(|| repo.key().root().map(agent_core::paths::RepoRoot::path))
+                    .map(PathBuf::from)
             });
             if let Some(path) = path {
                 return vec![Effect::Edit(path)];
             }
         }
         KeyCode::Char('d') => match selected.map(|e| (m.reach(&e), e)) {
-            Some((Reach::Other { kill: Some(running), .. }, _)) => m.overlay = Overlay::Confirm(Confirm::Kill(running)),
-            Some((Reach::Own, entry)) => m.error(format!("can't kill {}: this TUI runs in it", entry.name())),
-            Some((Reach::Other { enter: Enter::Resurrect, .. }, entry)) => {
+            Some((
+                Reach::Other {
+                    kill: Some(running),
+                    ..
+                },
+                _,
+            )) => m.overlay = Overlay::Confirm(Confirm::Kill(running)),
+            Some((Reach::Own, entry)) => {
+                m.error(format!("can't kill {}: this TUI runs in it", entry.name()));
+            }
+            Some((
+                Reach::Other {
+                    enter: Enter::Resurrect | Enter::Restart(_),
+                    ..
+                },
+                entry,
+            )) => {
                 m.info(format!("{} isn't running. D removes it", entry.name()));
             }
             Some((Reach::Other { .. }, _)) | None => m.info("no session to kill"),
         },
         KeyCode::Char('D') => return request_removal(m),
+        KeyCode::Char('a') => {
+            let here = m.pane.session().cloned();
+            let next = m
+                .needs_you()
+                .into_iter()
+                .find(|name| Some(name) != here.as_ref());
+            match next {
+                Some(name) => return activate(m, &name),
+                None => m.info("Nothing needs you"),
+            }
+        }
         KeyCode::Char('x') => match selected {
-            _ if m.actions.is_empty() => m.info(format!("no actions · add [[action]] to {}", crate::CONFIG_HINT)),
+            _ if m.actions.is_empty() => m.info(format!(
+                "no actions · add [[action]] to {}",
+                crate::CONFIG_HINT
+            )),
             Some(entry) => m.overlay = Overlay::Actions(entry.name().clone()),
             None => m.info("select an agent to run an action on"),
         },
@@ -374,8 +643,14 @@ fn run_action(m: &mut Model, target: &SessionName, action: &Action) -> Vec<Effec
         repo: repo.key().root().map(agent_core::paths::RepoRoot::path),
     };
     match action.invoke(ctx) {
-        Ok(Invocation::Run(launch)) => vec![Effect::Job(Job::Run { label: format!("{} on {target}", action.label), launch })],
-        Ok(Invocation::Interactive(launch)) => vec![Effect::Interactive { label: action.label.to_string(), launch }],
+        Ok(Invocation::Run(launch)) => vec![Effect::Job(Job::Run {
+            label: format!("{} on {target}", action.label),
+            launch,
+        })],
+        Ok(Invocation::Interactive(launch)) => vec![Effect::Interactive {
+            label: action.label.to_string(),
+            launch,
+        }],
         Ok(Invocation::TerminalEvent { name, value }) => {
             m.info(format!("sent {} for {target}", action.label));
             vec![Effect::TerminalEvent { name, value }]
@@ -391,22 +666,43 @@ fn open_new_form(m: &mut Model) {
     let default_repo = m
         .selected()
         .and_then(|(repo, _)| repo.key().root().cloned())
-        .or_else(|| m.snapshot().and_then(|s| s.containing(&m.start_dir)).and_then(|(r, _)| r.key().root().cloned()));
+        .or_else(|| {
+            m.snapshot()
+                .and_then(|s| s.containing(&m.start_dir))
+                .and_then(|(r, _)| r.key().root().cloned())
+        });
     m.overlay = Overlay::New(Box::new(NewAgent::new(default_repo)));
 }
 
 /// Plans removing the selected agent; the confirmation opens when the plan
 /// arrives.
 fn request_removal(m: &mut Model) -> Vec<Effect> {
-    let Some(entry) = m.selected_entry().cloned() else { return Vec::new() };
+    let Some(entry) = m.selected_entry().cloned() else {
+        return Vec::new();
+    };
     match m.reach(&entry) {
-        Reach::Own => m.error(format!("can't remove {}: this TUI runs in it", entry.name())),
-        Reach::Other { remove: Some(target), .. } => {
+        Reach::Own => m.error(format!(
+            "can't remove {}: this TUI runs in it",
+            entry.name()
+        )),
+        Reach::Other {
+            remove: Some(target),
+            ..
+        } => {
             let ticket = m.ticket();
-            m.overlay = Overlay::Planning { ticket, name: entry.name().clone() };
-            return vec![Effect::Job(Job::PlanRemoval { target, ticket, own: m.own_session.clone() })];
+            m.overlay = Overlay::Planning {
+                ticket,
+                name: entry.name().clone(),
+            };
+            return vec![Effect::Job(Job::PlanRemoval {
+                target,
+                ticket,
+                own: m.own_session.clone(),
+            })];
         }
-        Reach::Other { remove: None, .. } => m.info(format!("{} has nothing to remove", entry.name())),
+        Reach::Other { remove: None, .. } => {
+            m.info(format!("{} has nothing to remove", entry.name()));
+        }
     }
     Vec::new()
 }
@@ -434,7 +730,13 @@ pub fn switcher_matches(m: &Model, query: &str) -> Vec<SessionName> {
 
 pub fn picker_matches(m: &Model, query: &str) -> Vec<RepoKey> {
     m.snapshot()
-        .map(|s| s.repos().iter().filter(|r| fuzzy_match(query, &r.name()).is_some()).map(|r| r.key().clone()).collect())
+        .map(|s| {
+            s.repos()
+                .iter()
+                .filter(|r| fuzzy_match(query, &r.name()).is_some())
+                .map(|r| r.key().clone())
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -449,7 +751,11 @@ fn on_overlay_key(m: &mut Model, key: KeyEvent) -> Vec<Effect> {
             let matches = switcher_matches(m, &query.text);
             match key.code {
                 KeyCode::Esc | KeyCode::Tab => Vec::new(),
-                KeyCode::Enter => query.pick(&matches).cloned().map(|name| activate(m, &name)).unwrap_or_default(),
+                KeyCode::Enter => query
+                    .pick(&matches)
+                    .cloned()
+                    .map(|name| activate(m, &name))
+                    .unwrap_or_default(),
                 _ => {
                     edit_query(&mut query, &key, matches.len(), m.keys.nav());
                     m.overlay = Overlay::Switcher(query);
@@ -482,7 +788,9 @@ fn on_overlay_key(m: &mut Model, key: KeyEvent) -> Vec<Effect> {
         }
         Overlay::Actions(target) => {
             let action = match key.code {
-                KeyCode::Char(c) if (key.modifiers - KeyModifiers::SHIFT).is_empty() => m.actions.get(c).cloned(),
+                KeyCode::Char(c) if (key.modifiers - KeyModifiers::SHIFT).is_empty() => {
+                    m.actions.get(c).cloned()
+                }
                 _ => None,
             };
             match (key.code, action) {
@@ -512,7 +820,9 @@ fn type_into(form: &mut NewAgent, c: char) {
 /// Deletes the last word of `text`, and the space before it.
 fn delete_word(text: &mut String) {
     let trimmed = text.trim_end_matches([' ', '\n', '-', '/']).len();
-    let start = text[..trimmed].rfind([' ', '\n', '-', '/']).map_or(0, |i| i + 1);
+    let start = text[..trimmed]
+        .rfind([' ', '\n', '-', '/'])
+        .map_or(0, |i| i + 1);
     text.truncate(start);
 }
 
@@ -533,7 +843,9 @@ fn edit_form(m: &mut Model, edit: impl FnOnce(&mut NewAgent)) {
 }
 
 fn on_new_key(m: &mut Model, key: &KeyEvent) -> Vec<Effect> {
-    let Overlay::New(form) = &m.overlay else { return Vec::new() };
+    let Overlay::New(form) = &m.overlay else {
+        return Vec::new();
+    };
     if let Phase::Submitting { ticket, launch } = &form.phase {
         // Esc backgrounds it: the form closes, the pane stops waiting, and
         // the agent previews once a refresh shows it.
@@ -546,8 +858,10 @@ fn on_new_key(m: &mut Model, key: &KeyEvent) -> Vec<Effect> {
         return Vec::new();
     }
     let alt = key.modifiers.contains(KeyModifiers::ALT);
-    let accept =
-        m.derive(form).completion.filter(|_| form.focus == Field::Repo && matches!(key.code, KeyCode::Tab | KeyCode::Right));
+    let accept = m
+        .derive(form)
+        .completion
+        .filter(|_| form.focus == Field::Repo && matches!(key.code, KeyCode::Tab | KeyCode::Right));
     if let Some(rest) = accept {
         edit_form(m, |f| rest.chars().for_each(|c| f.repo.push(c)));
         return Vec::new();
@@ -557,7 +871,9 @@ fn on_new_key(m: &mut Model, key: &KeyEvent) -> Vec<Effect> {
         KeyCode::Esc => m.overlay = Overlay::None,
         KeyCode::Enter if !alt => return submit(m),
         _ if ctrl(key, 'e') => {
-            let Overlay::New(form) = &mut m.overlay else { return Vec::new() };
+            let Overlay::New(form) = &mut m.overlay else {
+                return Vec::new();
+            };
             form.focus = Field::Task;
             return vec![Effect::EditTask(form.task.clone())];
         }
@@ -592,7 +908,9 @@ fn on_new_key(m: &mut Model, key: &KeyEvent) -> Vec<Effect> {
                 }
                 Field::Repo => form.repo.pop(),
             },
-            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => type_into(form, c),
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                type_into(form, c);
+            }
             _ => {}
         }),
     }
@@ -604,9 +922,13 @@ fn on_new_key(m: &mut Model, key: &KeyEvent) -> Vec<Effect> {
 /// that's refused rather than silently dropped.
 fn submit(m: &mut Model) -> Vec<Effect> {
     let ticket = m.ticket();
-    let Overlay::New(form) = &m.overlay else { return Vec::new() };
+    let Overlay::New(form) = &m.overlay else {
+        return Vec::new();
+    };
     let submission = m.derive(form).submission;
-    let Overlay::New(form) = &mut m.overlay else { return Vec::new() };
+    let Overlay::New(form) = &mut m.overlay else {
+        return Vec::new();
+    };
     if let Phase::Submitting { .. } = form.phase {
         return Vec::new();
     }
@@ -617,11 +939,24 @@ fn submit(m: &mut Model) -> Vec<Effect> {
             return Vec::new();
         }
     };
-    form.phase = Phase::Submitting { ticket, launch: launch.clone() };
+    form.phase = Phase::Submitting {
+        ticket,
+        launch: launch.clone(),
+    };
     let session = launch.session();
-    m.pane = Pane::Connecting { name: session.clone(), ticket };
-    m.follow = Some(Follow::Submitted { name: session, ticket });
-    vec![Effect::Job(Job::Launch { launch, harness: m.harness.clone(), ticket })]
+    m.pane = Pane::Connecting {
+        name: session.clone(),
+        ticket,
+    };
+    m.follow = Some(Follow::Submitted {
+        name: session,
+        ticket,
+    });
+    vec![Effect::Job(Job::Launch {
+        launch,
+        harness: m.harness.clone(),
+        ticket,
+    })]
 }
 
 fn drop_connection_to(m: &mut Model, name: &SessionName) {
@@ -632,7 +967,10 @@ fn drop_connection_to(m: &mut Model, name: &SessionName) {
 
 fn remove(m: &mut Model, approved: Approved) -> Vec<Effect> {
     drop_connection_to(m, &approved.name());
-    vec![Effect::Job(Job::Remove { approved, own: m.own_session.clone() })]
+    vec![Effect::Job(Job::Remove {
+        approved,
+        own: m.own_session.clone(),
+    })]
 }
 
 fn on_confirm_key(m: &mut Model, confirm: Confirm, key: &KeyEvent) -> Vec<Effect> {
@@ -667,7 +1005,10 @@ fn on_mouse(m: &mut Model, mouse: MouseEvent) -> Vec<Effect> {
         return Vec::new();
     }
     if let Some(cell) = CellPos::within(m.areas.terminal, at) {
-        let scrolling = matches!(mouse.kind, MouseEventKind::ScrollUp | MouseEventKind::ScrollDown);
+        let scrolling = matches!(
+            mouse.kind,
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+        );
         let forward = match m.focus() {
             Focus::Agent(c) => Some(c),
             Focus::Nav(Some(_)) if clicked => return enter_agent(m),
@@ -685,7 +1026,12 @@ fn on_mouse(m: &mut Model, mouse: MouseEvent) -> Vec<Effect> {
         if let Some(c) = m.pane.connection_mut() {
             c.mode = Mode::Nav;
         }
-        let hit = m.areas.rows.iter().find(|(y, _)| *y == mouse.row).map(|(_, c)| c.clone());
+        let hit = m
+            .areas
+            .rows
+            .iter()
+            .find(|(y, _)| *y == mouse.row)
+            .map(|(_, c)| c.clone());
         if let Some(cursor) = hit {
             m.set_cursor(cursor);
         }
@@ -709,7 +1055,10 @@ mod tests {
     }
 
     fn wt(path: &str) -> Worktree {
-        Worktree { path: path.into(), head: Head::Detached }
+        Worktree {
+            path: path.into(),
+            head: Head::Detached,
+        }
     }
 
     fn snapshot(sessions: Vec<SessionInfo>, pins: &[&str]) -> agent_core::model::Snapshot {
@@ -718,9 +1067,18 @@ mod tests {
             repos: vec![
                 (
                     RepoRoot::new("/src/api".into()).unwrap(),
-                    RepoWorktrees { main: wt("/src/api"), linked: vec![wt("/w/api/fix"), wt("/w/api/idle")] },
+                    RepoWorktrees {
+                        main: wt("/src/api"),
+                        linked: vec![wt("/w/api/fix"), wt("/w/api/idle")],
+                    },
                 ),
-                (RepoRoot::new("/src/web".into()).unwrap(), RepoWorktrees { main: wt("/src/web"), linked: Vec::new() }),
+                (
+                    RepoRoot::new("/src/web".into()).unwrap(),
+                    RepoWorktrees {
+                        main: wt("/src/web"),
+                        linked: Vec::new(),
+                    },
+                ),
             ],
             warnings: Vec::new(),
         };
@@ -731,11 +1089,27 @@ mod tests {
     /// `api` (main exited, agent `fix` live, agent `idle` with no session) and `web` (main only).
     fn model(pins: &[&str]) -> Model {
         let sessions = vec![
-            SessionInfo { name: name("fix"), status: SessionStatus::Live { cwd: Some("/w/api/fix".into()) } },
-            SessionInfo { name: name("api"), status: SessionStatus::Exited },
+            SessionInfo {
+                name: name("fix"),
+                status: SessionStatus::Live {
+                    cwd: Some("/w/api/fix".into()),
+                },
+            },
+            SessionInfo {
+                name: name("api"),
+                status: SessionStatus::Exited { cwd: None },
+            },
         ];
-        let mut m = Model::new("/w/api/fix/src".into(), None, "claude".parse().unwrap(), "claude".into());
-        update(&mut m, Msg::Snapshot(Ok((snapshot(sessions, pins), Vec::new()))));
+        let mut m = Model::new(
+            "/w/api/fix/src".into(),
+            None,
+            "claude".parse().unwrap(),
+            "claude".into(),
+        );
+        update(
+            &mut m,
+            Msg::Snapshot(Ok((snapshot(sessions, pins), Vec::new()))),
+        );
         m
     }
 
@@ -744,7 +1118,9 @@ mod tests {
     }
 
     fn selected(m: &Model) -> Option<String> {
-        m.cursor().and_then(Cursor::entry_name).map(ToString::to_string)
+        m.cursor()
+            .and_then(Cursor::entry_name)
+            .map(ToString::to_string)
     }
 
     #[test]
@@ -770,7 +1146,9 @@ mod tests {
         update(&mut m, key(KeyCode::Tab));
         let rows = m.rows();
         assert_eq!(rows.len(), 5, "{rows:?}");
-        assert!(matches!(rows.last(), Some(Row::Entry { name, place: crate::model::Place::Solo }) if name.as_str() == "web"));
+        assert!(
+            matches!(rows.last(), Some(Row::Entry { name, place: crate::model::Place::Solo }) if name.as_str() == "web")
+        );
     }
 
     #[test]
@@ -790,7 +1168,10 @@ mod tests {
         let obs = Observation {
             repos: vec![(
                 RepoRoot::new("/src/api".into()).unwrap(),
-                RepoWorktrees { main: wt("/src/api"), linked: Vec::new() },
+                RepoWorktrees {
+                    main: wt("/src/api"),
+                    linked: Vec::new(),
+                },
             )],
             ..Observation::default()
         };
@@ -804,24 +1185,33 @@ mod tests {
         let mut m = model(&["idle"]);
         m.touch_mru(&name("fix"));
         m.touch_mru(&name("api"));
-        let order: Vec<_> = m.switcher_items().iter().map(|(_, e)| e.name().to_string()).collect();
+        let order: Vec<_> = m
+            .switcher_items()
+            .iter()
+            .map(|(_, e)| e.name().to_string())
+            .collect();
         assert_eq!(order, ["api", "idle", "fix", "web"]);
         let effects = update(&mut m, key(KeyCode::Char('1')));
-        assert!(matches!(effects.as_slice(), [Effect::Job(Job::Start { at, .. })] if at.name().as_str() == "idle"));
+        assert!(
+            matches!(effects.as_slice(), [Effect::Job(Job::Start { at, .. })] if at.name().as_str() == "idle")
+        );
     }
 
     #[test]
-    fn idle_worktrees_start_and_exited_sessions_resurrect() {
+    fn idle_and_exited_checkouts_start_through_agent() {
         let mut m = model(&[]);
         assert!(update(&mut m, key(KeyCode::Char('j'))).is_empty());
         let effects = update(&mut m, key(KeyCode::Enter));
-        assert!(matches!(effects.as_slice(), [Effect::Job(Job::Start { .. })]));
-        update(&mut m, key(KeyCode::Char('j')));
-        let effects = update(&mut m, key(KeyCode::Enter));
         assert!(matches!(
             effects.as_slice(),
-            [Effect::Attach { name, intent: Intent::Activate, .. }] if name.as_str() == "api"
+            [Effect::Job(Job::Start { .. })]
         ));
+        update(&mut m, key(KeyCode::Char('j')));
+        let effects = update(&mut m, key(KeyCode::Enter));
+        assert!(
+            matches!(effects.as_slice(), [Effect::Job(Job::Start { at, .. })] if at.name().as_str() == "api"),
+            "an exited main checkout restarts through agent, not zellij's cached command"
+        );
     }
 
     #[test]
@@ -829,11 +1219,19 @@ mod tests {
         let mut m = model(&[]);
         update(&mut m, key(KeyCode::Char('j')));
         let effects = update(&mut m, key(KeyCode::Enter));
-        let [Effect::Job(Job::Start { ticket: stale, .. })] = effects.as_slice() else { panic!() };
+        let [Effect::Job(Job::Start { ticket: stale, .. })] = effects.as_slice() else {
+            panic!()
+        };
         let stale = *stale;
         update(&mut m, key(KeyCode::Char('j')));
         update(&mut m, key(KeyCode::Enter));
-        update(&mut m, Msg::Launched { ticket: stale, result: Err("boom".into()) });
+        update(
+            &mut m,
+            Msg::Launched {
+                ticket: stale,
+                result: Err("boom".into()),
+            },
+        );
         assert!(matches!(&m.pane, Pane::Connecting { name, .. } if name.as_str() == "api"));
     }
 
@@ -844,7 +1242,9 @@ mod tests {
         assert!(matches!(m.overlay, Overlay::Confirm(Confirm::Kill(_))));
         assert!(update(&mut m, key(KeyCode::Char('x'))).is_empty());
         let effects = update(&mut m, key(KeyCode::Char('y')));
-        assert!(matches!(effects.as_slice(), [Effect::Job(Job::Kill(r))] if r.name().as_str() == "fix"));
+        assert!(
+            matches!(effects.as_slice(), [Effect::Job(Job::Kill(r))] if r.name().as_str() == "fix")
+        );
     }
 
     #[test]
@@ -881,9 +1281,20 @@ mod tests {
     fn new_opens_on_the_selected_repo_and_derives_the_name() {
         let mut m = model(&[]);
         open_form(&mut m);
-        assert_eq!(form(&m).default_repo.as_ref().map(|r| r.name().into_owned()).as_deref(), Some("api"));
+        assert_eq!(
+            form(&m)
+                .default_repo
+                .as_ref()
+                .map(|r| r.name().into_owned())
+                .as_deref(),
+            Some("api")
+        );
         type_text(&mut m, "Fix the flaky login test");
-        assert_eq!(form(&m).name, "", "the name is a suggestion, not typed text");
+        assert_eq!(
+            form(&m).name,
+            "",
+            "the name is a suggestion, not typed text"
+        );
         assert_eq!(derived(&m).name, "fix-flaky-login-test");
         assert!(matches!(&derived(&m).check, NameCheck::Free(_)));
     }
@@ -903,7 +1314,10 @@ mod tests {
         open_form(&mut m);
         update(&mut m, key(KeyCode::Tab));
         type_text(&mut m, "a-name-that-is-far-too-long");
-        assert!(matches!(&derived(&m).check, NameCheck::TooLong { bytes: 27 }));
+        assert!(matches!(
+            &derived(&m).check,
+            NameCheck::TooLong { bytes: 27 }
+        ));
         assert!(update(&mut m, key(KeyCode::Enter)).is_empty());
         assert!(matches!(m.overlay, Overlay::New(_)));
     }
@@ -916,8 +1330,15 @@ mod tests {
         update(&mut m, key(KeyCode::Tab));
         type_text(&mut m, "dm");
         assert_eq!(derived(&m).name, "dm");
-        update(&mut m, Msg::Key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)));
-        assert_eq!(derived(&m).name, "add-dark-mode", "⌃R goes back to the suggestion");
+        update(
+            &mut m,
+            Msg::Key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)),
+        );
+        assert_eq!(
+            derived(&m).name,
+            "add-dark-mode",
+            "⌃R goes back to the suggestion"
+        );
     }
 
     #[test]
@@ -925,24 +1346,52 @@ mod tests {
         let mut m = model(&[]);
         open_form(&mut m);
         type_text(&mut m, "why is the export slow");
-        let Overlay::New(f) = &mut m.overlay else { panic!() };
+        let Overlay::New(f) = &mut m.overlay else {
+            panic!()
+        };
         f.naming.state = NamingState::Due(Instant::now());
         let effects = tick(&mut m);
-        let [Effect::Job(Job::SuggestName { generation, .. })] = effects.as_slice() else { panic!("no ask") };
-        let generation = *generation;
-        update(&mut m, Msg::NameSuggested { generation: generation - 1, name: "stale".parse().ok() });
-        assert_eq!(derived(&m).suggestion.map(|s| s.source), Some(crate::model::NameSource::Words));
-        update(&mut m, Msg::NameSuggested { generation, name: "slow-export".parse().ok() });
+        let Some(generation) = effects.iter().find_map(|e| match e {
+            Effect::Job(Job::SuggestName { generation, .. }) => Some(*generation),
+            _ => None,
+        }) else {
+            panic!("no ask")
+        };
+        update(
+            &mut m,
+            Msg::NameSuggested {
+                generation: generation - 1,
+                name: "stale".parse().ok(),
+            },
+        );
+        assert_eq!(
+            derived(&m).suggestion.map(|s| s.source),
+            Some(crate::model::NameSource::Words)
+        );
+        update(
+            &mut m,
+            Msg::NameSuggested {
+                generation,
+                name: "slow-export".parse().ok(),
+            },
+        );
         assert_eq!(derived(&m).name, "slow-export");
         type_text(&mut m, "!");
-        assert_ne!(derived(&m).name, "slow-export", "a new prompt drops the old answer");
+        assert_ne!(
+            derived(&m).name,
+            "slow-export",
+            "a new prompt drops the old answer"
+        );
     }
 
     #[test]
     fn linked_prompts_are_named_from_the_link_without_asking() {
         let mut m = model(&[]);
         open_form(&mut m);
-        type_text(&mut m, "look at https://linear.app/t/issue/ENG-7/broken-export please");
+        type_text(
+            &mut m,
+            "look at https://linear.app/t/issue/ENG-7/broken-export please",
+        );
         assert_eq!(derived(&m).name, "eng-7-broken-export");
         assert!(matches!(form(&m).naming.state, NamingState::Idle));
     }
@@ -955,7 +1404,12 @@ mod tests {
         let effects = update(&mut m, key(KeyCode::Enter));
         let [
             Effect::Job(Job::Launch {
-                launch: Launchable::Create { name, repo: crate::model::RepoChoice::Known(root), task: Some(task) },
+                launch:
+                    Launchable::Create {
+                        name,
+                        repo: crate::model::RepoChoice::Known(root),
+                        task: Some(task),
+                    },
                 ticket,
                 ..
             }),
@@ -966,11 +1420,23 @@ mod tests {
         assert_eq!(name.as_str(), "add-dark-mode");
         assert_eq!(root.name(), "api");
         assert_eq!(task.as_str(), "add dark mode");
-        assert!(matches!(&m.pane, Pane::Connecting { name, .. } if name.as_str() == "add-dark-mode"));
+        assert!(
+            matches!(&m.pane, Pane::Connecting { name, .. } if name.as_str() == "add-dark-mode")
+        );
         let ticket = *ticket;
-        update(&mut m, Msg::Launched { ticket, result: Err("boom".into()) });
+        update(
+            &mut m,
+            Msg::Launched {
+                ticket,
+                result: Err("boom".into()),
+            },
+        );
         assert_eq!(form(&m).error.as_deref(), Some("boom"));
-        assert_eq!(form(&m).task, "add dark mode", "the text survives a failure");
+        assert_eq!(
+            form(&m).task,
+            "add dark mode",
+            "the text survives a failure"
+        );
         assert!(matches!(form(&m).phase, Phase::Editing) && m.follow.is_none());
     }
 
@@ -985,7 +1451,10 @@ mod tests {
         let effects = update(&mut m, key(KeyCode::Enter));
         assert!(matches!(
             effects.as_slice(),
-            [Effect::Job(Job::Launch { launch: Launchable::Attach { task: Some(_), .. }, .. })]
+            [Effect::Job(Job::Launch {
+                launch: Launchable::Attach { task: Some(_), .. },
+                ..
+            })]
         ));
     }
 
@@ -997,21 +1466,24 @@ mod tests {
         update(&mut m, key(KeyCode::Tab));
         type_text(&mut m, "idle");
         assert!(matches!(&derived(&m).check, NameCheck::Idle { .. }));
-        update(&mut m, Msg::Key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL)));
+        update(
+            &mut m,
+            Msg::Key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL)),
+        );
         type_text(&mut m, "web");
         assert!(matches!(&derived(&m).check, NameCheck::MainCheckout { .. }));
         assert!(update(&mut m, key(KeyCode::Enter)).is_empty());
     }
 
     #[test]
-    fn exited_agents_wont_silently_drop_a_task() {
+    fn a_main_checkout_is_started_from_the_list_not_the_form() {
         let mut m = model(&[]);
         open_form(&mut m);
         type_text(&mut m, "go");
         update(&mut m, key(KeyCode::Tab));
         type_text(&mut m, "api");
+        assert!(matches!(derived(&m).check, NameCheck::MainCheckout { .. }));
         assert!(update(&mut m, key(KeyCode::Enter)).is_empty());
-        assert!(form(&m).error.is_some());
     }
 
     #[test]
@@ -1023,7 +1495,11 @@ mod tests {
         assert_eq!(derived(&m).completion.as_deref(), Some("b"));
         update(&mut m, key(KeyCode::Tab));
         assert_eq!(form(&m).repo.text, "web");
-        assert_eq!(form(&m).focus, Field::Repo, "completing doesn't leave the field");
+        assert_eq!(
+            form(&m).focus,
+            Field::Repo,
+            "completing doesn't leave the field"
+        );
     }
 
     #[test]
@@ -1032,12 +1508,20 @@ mod tests {
         open_form(&mut m);
         type_text(&mut m, "add dark mode");
         let effects = update(&mut m, key(KeyCode::Enter));
-        let [Effect::Job(Job::Launch { ticket, .. })] = effects.as_slice() else { panic!() };
+        let [Effect::Job(Job::Launch { ticket, .. })] = effects.as_slice() else {
+            panic!()
+        };
         let ticket = *ticket;
         update(&mut m, key(KeyCode::Esc));
         assert!(matches!(m.overlay, Overlay::None));
-        assert_eq!(m.pane.awaiting(ticket), None, "navigating can't be undone by the late result");
-        assert!(matches!(&m.follow, Some(Follow::Backgrounded { name, .. }) if name.as_str() == "add-dark-mode"));
+        assert_eq!(
+            m.pane.awaiting(ticket),
+            None,
+            "navigating can't be undone by the late result"
+        );
+        assert!(
+            matches!(&m.follow, Some(Follow::Backgrounded { name, .. }) if name.as_str() == "add-dark-mode")
+        );
     }
 
     #[test]
@@ -1045,7 +1529,13 @@ mod tests {
         let mut m = model(&[]);
         m.follow = Some(Follow::Restored(name("web")));
         let ticket = m.ticket();
-        update(&mut m, Msg::Launched { ticket, result: Err("boom".into()) });
+        update(
+            &mut m,
+            Msg::Launched {
+                ticket,
+                result: Err("boom".into()),
+            },
+        );
         assert_eq!(m.follow, Some(Follow::Restored(name("web"))));
     }
 
@@ -1083,8 +1573,13 @@ mod tests {
         assert!(matches!(&m.overlay, Overlay::Actions(n) if n.as_str() == "fix"));
         let effects = update(&mut m, key(KeyCode::Char('t')));
         assert!(matches!(m.overlay, Overlay::None));
-        let [Effect::Job(Job::Run { label, launch })] = effects.as_slice() else { panic!("expected a run") };
-        assert_eq!((label.as_str(), launch.program.to_str()), ("tests on fix", Some("bin/test")));
+        let [Effect::Job(Job::Run { label, launch })] = effects.as_slice() else {
+            panic!("expected a run")
+        };
+        assert_eq!(
+            (label.as_str(), launch.program.to_str()),
+            ("tests on fix", Some("bin/test"))
+        );
         assert_eq!(launch.args, ["fix", "/src/api"]);
     }
 
@@ -1094,7 +1589,11 @@ mod tests {
         with_actions(&mut m);
         update(&mut m, key(KeyCode::Char('x')));
         assert!(update(&mut m, key(KeyCode::Char('s'))).is_empty());
-        assert!(m.status.as_ref().is_some_and(|s| s.kind == StatusKind::Error && s.text.contains("no {path}")));
+        assert!(
+            m.status
+                .as_ref()
+                .is_some_and(|s| s.kind == StatusKind::Error && s.text.contains("no {path}"))
+        );
     }
 
     #[test]
@@ -1102,47 +1601,207 @@ mod tests {
         let mut m = model(&[]);
         update(&mut m, key(KeyCode::Char('x')));
         assert!(matches!(m.overlay, Overlay::None));
-        assert!(m.status.as_ref().is_some_and(|s| s.text.contains("config.toml")));
+        assert!(
+            m.status
+                .as_ref()
+                .is_some_and(|s| s.text.contains("config.toml"))
+        );
     }
 
     #[test]
     fn kill_is_only_offered_for_running_sessions() {
         let mut m = model(&[]);
         update(&mut m, key(KeyCode::Char('d')));
-        assert!(matches!(&m.overlay, Overlay::Confirm(Confirm::Kill(r)) if r.name().as_str() == "fix"));
+        assert!(
+            matches!(&m.overlay, Overlay::Confirm(Confirm::Kill(r)) if r.name().as_str() == "fix")
+        );
         update(&mut m, key(KeyCode::Esc));
         update(&mut m, key(KeyCode::Char('j')));
         update(&mut m, key(KeyCode::Char('j')));
         assert_eq!(selected(&m).as_deref(), Some("api"));
         update(&mut m, key(KeyCode::Char('d')));
         assert!(matches!(m.overlay, Overlay::None));
-        assert!(m.status.as_ref().is_some_and(|s| s.text == "api isn't running. D removes it"));
+        assert!(
+            m.status
+                .as_ref()
+                .is_some_and(|s| s.text == "api isn't running. D removes it")
+        );
     }
 
     #[test]
     fn the_restored_selection_is_previewed_like_any_other() {
         let sessions = vec![
-            SessionInfo { name: name("fix"), status: SessionStatus::Live { cwd: Some("/w/api/fix".into()) } },
-            SessionInfo { name: name("web"), status: SessionStatus::Live { cwd: Some("/src/web".into()) } },
+            SessionInfo {
+                name: name("fix"),
+                status: SessionStatus::Live {
+                    cwd: Some("/w/api/fix".into()),
+                },
+            },
+            SessionInfo {
+                name: name("web"),
+                status: SessionStatus::Live {
+                    cwd: Some("/src/web".into()),
+                },
+            },
         ];
-        let mut m = Model::new("/elsewhere".into(), None, "claude".parse().unwrap(), "claude".into());
+        let mut m = Model::new(
+            "/elsewhere".into(),
+            None,
+            "claude".parse().unwrap(),
+            "claude".into(),
+        );
         m.follow = Some(Follow::Restored(name("web")));
-        update(&mut m, Msg::Snapshot(Ok((snapshot(sessions, &[]), Vec::new()))));
+        update(
+            &mut m,
+            Msg::Snapshot(Ok((snapshot(sessions, &[]), Vec::new()))),
+        );
         assert_eq!(selected(&m).as_deref(), Some("web"));
         m.preview_at = m.preview_at.map(|_| Instant::now());
         let effects = tick(&mut m);
-        assert!(matches!(effects.as_slice(), [Effect::Attach { name, intent: Intent::Preview, .. }] if name.as_str() == "web"));
+        assert!(effects.iter().any(|e| matches!(e, Effect::Attach { name, intent: Intent::Preview, .. } if name.as_str() == "web")));
     }
 
     #[test]
     fn starting_inside_an_agent_beats_the_restored_selection() {
         let sessions = vec![
-            SessionInfo { name: name("fix"), status: SessionStatus::Live { cwd: Some("/w/api/fix".into()) } },
-            SessionInfo { name: name("web"), status: SessionStatus::Live { cwd: Some("/src/web".into()) } },
+            SessionInfo {
+                name: name("fix"),
+                status: SessionStatus::Live {
+                    cwd: Some("/w/api/fix".into()),
+                },
+            },
+            SessionInfo {
+                name: name("web"),
+                status: SessionStatus::Live {
+                    cwd: Some("/src/web".into()),
+                },
+            },
         ];
-        let mut m = Model::new("/w/api/fix/src".into(), None, "claude".parse().unwrap(), "claude".into());
+        let mut m = Model::new(
+            "/w/api/fix/src".into(),
+            None,
+            "claude".parse().unwrap(),
+            "claude".into(),
+        );
         m.follow = Some(Follow::Restored(name("web")));
-        update(&mut m, Msg::Snapshot(Ok((snapshot(sessions, &[]), Vec::new()))));
+        update(
+            &mut m,
+            Msg::Snapshot(Ok((snapshot(sessions, &[]), Vec::new()))),
+        );
         assert_eq!(selected(&m).as_deref(), Some("fix"));
+    }
+
+    fn reported(state: agent_core::activity::State, secs_ago: u64) -> Activity {
+        let since = SystemTime::now() - Duration::from_secs(secs_ago);
+        Activity {
+            state,
+            since,
+            prompt: Some("go".into()),
+            heard: since,
+            events: 1,
+        }
+    }
+
+    fn two_live() -> Model {
+        let sessions = vec![
+            SessionInfo {
+                name: name("fix"),
+                status: SessionStatus::Live {
+                    cwd: Some("/w/api/fix".into()),
+                },
+            },
+            SessionInfo {
+                name: name("web"),
+                status: SessionStatus::Live {
+                    cwd: Some("/src/web".into()),
+                },
+            },
+        ];
+        let mut m = Model::new(
+            "/elsewhere".into(),
+            None,
+            "claude".parse().unwrap(),
+            "claude".into(),
+        );
+        update(
+            &mut m,
+            Msg::Snapshot(Ok((snapshot(sessions, &[]), Vec::new()))),
+        );
+        m
+    }
+
+    #[test]
+    fn blocked_agents_come_before_finished_ones_and_lead_the_overview() {
+        use agent_core::activity::State;
+        let mut m = two_live();
+        m.activities
+            .get_or_insert_default()
+            .insert(name("web"), reported(State::Done { summary: None }, 600));
+        m.activities.get_or_insert_default().insert(
+            name("fix"),
+            reported(
+                State::Asking {
+                    question: "rm?".into(),
+                },
+                5,
+            ),
+        );
+        assert_eq!(
+            m.needs_you(),
+            [name("fix"), name("web")],
+            "asking beats an older done"
+        );
+        assert_eq!(m.attention().title(), "◆1 ✓1 · agent");
+        update(&mut m, key(KeyCode::Tab));
+        let rows = m.rows();
+        assert_eq!(rows[0], Row::Header(crate::model::Group::NeedsYou));
+        assert_eq!(
+            rows[1],
+            Row::Grouped(crate::model::Group::NeedsYou, name("fix"))
+        );
+    }
+
+    #[test]
+    fn a_goes_to_the_most_urgent_agent_and_says_when_nothing_waits() {
+        use agent_core::activity::State;
+        let mut m = two_live();
+        update(&mut m, key(KeyCode::Char('a')));
+        assert!(
+            m.status
+                .as_ref()
+                .is_some_and(|s| s.text == "Nothing needs you")
+        );
+        m.activities.get_or_insert_default().insert(
+            name("web"),
+            reported(
+                State::Failed {
+                    reason: "rate limit".into(),
+                },
+                30,
+            ),
+        );
+        let effects = update(&mut m, key(KeyCode::Char('a')));
+        assert!(
+            matches!(effects.as_slice(), [Effect::Attach { name, intent: Intent::Activate, .. }] if name.as_str() == "web")
+        );
+    }
+
+    #[test]
+    fn a_long_turn_finishing_elsewhere_rings_once() {
+        use agent_core::activity::State;
+        let mut m = two_live();
+        m.activities.get_or_insert_default().insert(
+            name("fix"),
+            reported(State::Working { tools: Vec::new() }, 120),
+        );
+        let mut next = m.activities.clone().unwrap_or_default();
+        next.insert(name("fix"), reported(State::Done { summary: None }, 0));
+        update(&mut m, Msg::Activities(next.clone()));
+        assert!(tick(&mut m).iter().any(|e| matches!(e, Effect::Bell)));
+        update(&mut m, Msg::Activities(next));
+        assert!(
+            !tick(&mut m).iter().any(|e| matches!(e, Effect::Bell)),
+            "already done"
+        );
     }
 }

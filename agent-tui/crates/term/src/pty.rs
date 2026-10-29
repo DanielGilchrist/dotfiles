@@ -21,7 +21,12 @@ pub enum Liveness {
 }
 
 fn pty_size(size: TermSize) -> PtySize {
-    PtySize { rows: size.rows.get(), cols: size.cols.get(), pixel_width: 0, pixel_height: 0 }
+    PtySize {
+        rows: size.rows.get(),
+        cols: size.cols.get(),
+        pixel_width: 0,
+        pixel_height: 0,
+    }
 }
 
 fn to_io(e: impl std::fmt::Display) -> io::Error {
@@ -70,7 +75,11 @@ impl<E: Emulator> Terminal<E> {
         let mut writer = pair.master.take_writer().map_err(to_io)?;
         thread::spawn(move || {
             for bytes in input_rx {
-                if writer.write_all(&bytes).and_then(|()| writer.flush()).is_err() {
+                if writer
+                    .write_all(&bytes)
+                    .and_then(|()| writer.flush())
+                    .is_err()
+                {
                     break;
                 }
             }

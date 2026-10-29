@@ -100,7 +100,10 @@ impl std::str::FromStr for Template {
                             None => return Err(TemplateError::Unclosed),
                         }
                     }
-                    let field = Field::ALL.into_iter().find(|f| f.placeholder() == name).ok_or(TemplateError::Unknown(name))?;
+                    let field = Field::ALL
+                        .into_iter()
+                        .find(|f| f.placeholder() == name)
+                        .ok_or(TemplateError::Unknown(name))?;
                     if !text.is_empty() {
                         pieces.push(Piece::Text(std::mem::take(&mut text)));
                     }
@@ -195,8 +198,16 @@ impl Command {
     fn render(&self, ctx: Context<'_>) -> Result<CommandLine, Missing> {
         Ok(CommandLine {
             program: self.program.render(ctx)?,
-            args: self.args.iter().map(|a| a.render(ctx)).collect::<Result<_, _>>()?,
-            cwd: self.cwd.as_ref().map(|c| c.render(ctx).map(PathBuf::from)).transpose()?,
+            args: self
+                .args
+                .iter()
+                .map(|a| a.render(ctx))
+                .collect::<Result<_, _>>()?,
+            cwd: self
+                .cwd
+                .as_ref()
+                .map(|c| c.render(ctx).map(PathBuf::from))
+                .transpose()?,
         })
     }
 }
@@ -258,13 +269,15 @@ pub enum Invocation {
     TerminalEvent { name: EventName, value: OsString },
 }
 
-
 impl Action {
     pub fn invoke(&self, ctx: Context<'_>) -> Result<Invocation, Missing> {
         Ok(match &self.kind {
             Kind::Run(command) => Invocation::Run(command.render(ctx)?),
             Kind::Interactive(command) => Invocation::Interactive(command.render(ctx)?),
-            Kind::TerminalEvent { name, value } => Invocation::TerminalEvent { name: name.clone(), value: value.render(ctx)? },
+            Kind::TerminalEvent { name, value } => Invocation::TerminalEvent {
+                name: name.clone(),
+                value: value.render(ctx)?,
+            },
         })
     }
 }
@@ -296,7 +309,10 @@ fn template(s: &str) -> Result<Template, String> {
 }
 
 fn command(field: &str, argv: &[String], cwd: Option<&str>) -> Result<Command, String> {
-    let Some((program, args)) = argv.split_first().filter(|(program, _)| !program.trim().is_empty()) else {
+    let Some((program, args)) = argv
+        .split_first()
+        .filter(|(program, _)| !program.trim().is_empty())
+    else {
         return Err(format!("{field} needs a program first"));
     };
     Ok(Command {
@@ -311,27 +327,51 @@ impl RawAction {
         let mut chars = self.key.chars();
         let key = match (chars.next(), chars.next()) {
             (Some(c), None) if !c.is_whitespace() && !c.is_control() => Key(c),
-            _ => return Err(format!("key {:?} must be one printable character", self.key)),
+            _ => {
+                return Err(format!(
+                    "key {:?} must be one printable character",
+                    self.key
+                ));
+            }
         };
         if self.label.trim().is_empty() || self.label.chars().any(char::is_control) {
             return Err(format!("label {:?} must be one non-blank line", self.label));
         }
         let kind = match (self.run, self.interactive, self.terminal_event, self.cwd) {
             (Some(argv), None, None, cwd) => Kind::Run(command("run", &argv, cwd.as_deref())?),
-            (None, Some(argv), None, cwd) => Kind::Interactive(command("interactive", &argv, cwd.as_deref())?),
-            (None, None, Some(_), Some(_)) => return Err("cwd only applies to run and interactive".into()),
+            (None, Some(argv), None, cwd) => {
+                Kind::Interactive(command("interactive", &argv, cwd.as_deref())?)
+            }
+            (None, None, Some(_), Some(_)) => {
+                return Err("cwd only applies to run and interactive".into());
+            }
             (None, None, Some(event), None) => {
                 let valid = !event.name.is_empty()
-                    && event.name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+                    && event
+                        .name
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
                 if !valid {
-                    return Err(format!("terminal_event name {:?} must be letters, digits, '-', '_' or '.'", event.name));
+                    return Err(format!(
+                        "terminal_event name {:?} must be letters, digits, '-', '_' or '.'",
+                        event.name
+                    ));
                 }
-                Kind::TerminalEvent { name: EventName(event.name), value: template(&event.value)? }
+                Kind::TerminalEvent {
+                    name: EventName(event.name),
+                    value: template(&event.value)?,
+                }
             }
-            (None, None, None, _) => return Err("needs one of run, interactive or terminal_event".into()),
+            (None, None, None, _) => {
+                return Err("needs one of run, interactive or terminal_event".into());
+            }
             _ => return Err("can only have one of run, interactive or terminal_event".into()),
         };
-        Ok(Action { key, label: Label(self.label), kind })
+        Ok(Action {
+            key,
+            label: Label(self.label),
+            kind,
+        })
     }
 }
 
@@ -340,10 +380,17 @@ impl Actions {
         let mut actions: Vec<Action> = Vec::new();
         for (i, raw) in raw.into_iter().enumerate() {
             let label = raw.label.clone();
-            let invalid = |reason: String| ConfigError::Action { index: i + 1, label: label.clone(), reason };
+            let invalid = |reason: String| ConfigError::Action {
+                index: i + 1,
+                label: label.clone(),
+                reason,
+            };
             let action = raw.parse().map_err(invalid)?;
             if let Some(other) = actions.iter().find(|a| a.key == action.key) {
-                return Err(invalid(format!("key '{}' is also used by {}", action.key, other.label)));
+                return Err(invalid(format!(
+                    "key '{}' is also used by {}",
+                    action.key, other.label
+                )));
             }
             actions.push(action);
         }
@@ -368,7 +415,11 @@ mod tests {
     use super::*;
 
     fn ctx(name: &SessionName) -> Context<'_> {
-        Context { name, path: Some(Path::new("/w/api/fix")), repo: Some(Path::new("/r/api")) }
+        Context {
+            name,
+            path: Some(Path::new("/w/api/fix")),
+            repo: Some(Path::new("/r/api")),
+        }
     }
 
     fn fix() -> SessionName {
@@ -376,7 +427,9 @@ mod tests {
     }
 
     fn parse(toml: &str) -> Result<Actions, String> {
-        toml.parse::<crate::config::Config>().map(|c| c.actions).map_err(|e| e.to_string())
+        toml.parse::<crate::config::Config>()
+            .map(|c| c.actions)
+            .map_err(|e| e.to_string())
     }
 
     #[test]
@@ -395,7 +448,11 @@ mod tests {
             invocation,
             Invocation::Run(CommandLine {
                 program: "bin/test".into(),
-                args: vec!["--cwd=/w/api/fix".into(), "fix in /r/api".into(), "{literal}".into()],
+                args: vec![
+                    "--cwd=/w/api/fix".into(),
+                    "fix in /r/api".into(),
+                    "{literal}".into()
+                ],
                 cwd: None,
             })
         );
@@ -412,44 +469,76 @@ mod tests {
             "#,
         )
         .unwrap();
-        let Invocation::TerminalEvent { name, value } = actions.get('s').unwrap().invoke(ctx(&fix())).unwrap() else {
+        let Invocation::TerminalEvent { name, value } =
+            actions.get('s').unwrap().invoke(ctx(&fix())).unwrap()
+        else {
             panic!("expected a terminal event");
         };
-        assert_eq!((name.as_str(), value.to_str()), ("agent-spawn-dev", Some("/w/api/fix")));
+        assert_eq!(
+            (name.as_str(), value.to_str()),
+            ("agent-spawn-dev", Some("/w/api/fix"))
+        );
     }
 
     #[test]
     fn a_missing_checkout_is_refused() {
         let actions = parse("[[action]]\nkey = 't'\nlabel = 't'\nrun = ['x', '{path}']").unwrap();
         let name = fix();
-        let ctx = Context { path: None, ..ctx(&name) };
-        assert_eq!(actions.get('t').unwrap().invoke(ctx), Err(Missing(Field::Path)));
+        let ctx = Context {
+            path: None,
+            ..ctx(&name)
+        };
+        assert_eq!(
+            actions.get('t').unwrap().invoke(ctx),
+            Err(Missing(Field::Path))
+        );
     }
 
     #[test]
     fn mistakes_are_reported_with_the_action() {
         let err = |toml: &str| parse(toml).unwrap_err();
-        assert!(err("[[action]]\nkey = 'tt'\nlabel = 'a'\nrun = ['x']").contains("one printable character"));
-        assert!(err("[[action]]\nkey = 't'\nlabel = 'a'\nrun = ['x', '{cwd}']").contains("unknown placeholder {cwd}"));
+        assert!(
+            err("[[action]]\nkey = 'tt'\nlabel = 'a'\nrun = ['x']")
+                .contains("one printable character")
+        );
+        assert!(
+            err("[[action]]\nkey = 't'\nlabel = 'a'\nrun = ['x', '{cwd}']")
+                .contains("unknown placeholder {cwd}")
+        );
         assert!(err("[[action]]\nkey = 't'\nlabel = 'a'\nrun = ['{path']").contains("unclosed"));
-        assert!(err("[[action]]\nkey = 't'\nlabel = 'a'").contains("needs one of run, interactive or terminal_event"));
+        assert!(
+            err("[[action]]\nkey = 't'\nlabel = 'a'")
+                .contains("needs one of run, interactive or terminal_event")
+        );
         assert!(err("[[action]]\nkey = 't'\nlabel = 'a'\nrun = []").contains("needs a program"));
         assert!(err("[[action]]\nkey = 't'\nlabel = 'a'\nrun = ['']").contains("needs a program"));
-        assert!(err("[[action]]\nkey = 't'\nlabel = \"a\\nb\"\nrun = ['x']").contains("one non-blank line"));
+        assert!(
+            err("[[action]]\nkey = 't'\nlabel = \"a\\nb\"\nrun = ['x']")
+                .contains("one non-blank line")
+        );
         assert!(err("[[action]]\nkey = 't'\nlabel = 'a'\nrun = ['x']\nterminal_event = { name = 'n', value = 'v' }")
             .contains("only have one of"));
         assert!(err("[[action]]\nkey = 't'\nlabel = 'a'\nrun = ['x']\n[[action]]\nkey = 't'\nlabel = 'b'\nrun = ['y']")
             .contains("also used by a"));
-        assert!(err("[[action]]\nkey = 't'\nlabel = 'a'\ncommand = ['x']").contains("unknown field"));
+        assert!(
+            err("[[action]]\nkey = 't'\nlabel = 'a'\ncommand = ['x']").contains("unknown field")
+        );
     }
 
     #[test]
     fn interactive_commands_can_run_in_the_checkout() {
-        let actions = parse("[[action]]\nkey = 'g'\nlabel = 'lazygit'\ninteractive = ['lazygit']\ncwd = '{path}'").unwrap();
+        let actions = parse(
+            "[[action]]\nkey = 'g'\nlabel = 'lazygit'\ninteractive = ['lazygit']\ncwd = '{path}'",
+        )
+        .unwrap();
         let invocation = actions.get('g').unwrap().invoke(ctx(&fix())).unwrap();
         assert_eq!(
             invocation,
-            Invocation::Interactive(CommandLine { program: "lazygit".into(), args: Vec::new(), cwd: Some("/w/api/fix".into()) })
+            Invocation::Interactive(CommandLine {
+                program: "lazygit".into(),
+                args: Vec::new(),
+                cwd: Some("/w/api/fix".into())
+            })
         );
         assert!(parse("[[action]]\nkey = 's'\nlabel = 's'\ncwd = '{path}'\nterminal_event = { name = 'n', value = 'v' }")
             .unwrap_err()
@@ -461,4 +550,3 @@ mod tests {
         assert!(parse("").unwrap().is_empty());
     }
 }
-
