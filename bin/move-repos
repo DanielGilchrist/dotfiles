@@ -1,0 +1,113 @@
+#!/usr/bin/env fish
+# Moves ~/Documents/repos to ~/repos and points every per-machine record at
+# the new place. Safe to rerun: each step skips what's already done.
+#
+# Run it with no Claude Code sessions open (they rewrite ~/.claude.json on
+# exit) and no zellij sessions for the moved repos (their cwd is baked in).
+
+set -l old "$HOME/Documents/repos"
+set -l new "$HOME/repos"
+set -l old_slug (string replace -a / - "$old")
+set -l new_slug (string replace -a / - "$new")
+
+function step
+    echo (set_color cyan)"==> $argv"(set_color normal)
+end
+
+step "Moving repos"
+if test -d $old
+    mkdir -p $new
+    for org in $old/*/
+        set -l name (basename $org)
+        mkdir -p $new/$name
+        for repo in $org*/
+            set -l dest $new/$name/(basename $repo)
+            if test -e $dest
+                echo "  skip $dest exists"
+            else
+                mv $repo $dest
+                echo "  moved $(basename $repo)"
+            end
+        end
+        rmdir $org 2>/dev/null
+    end
+    rmdir $old 2>/dev/null
+else
+    echo "  nothing at $old"
+end
+
+step "Repairing worktree links"
+for repo in $new/*/*/
+    test -d $repo/.git; or continue
+    set -l name (basename $repo)
+    set -l linked $HOME/worktrees/$name/*/
+    if test (count $linked) -gt 0
+        git -C $repo worktree repair $linked
+        echo "  $name: "(count $linked)" worktrees"
+    else
+        git -C $repo worktree repair
+    end
+end
+
+step "Claude Code: ~/.claude.json project keys"
+if test -f $HOME/.claude.json; and grep -q "$old" $HOME/.claude.json
+    cp $HOME/.claude.json $HOME/.claude.json.before-move-repos
+    python3 -c 'import json, sys, os
+old, new = sys.argv[1], sys.argv[2]
+path = os.path.expanduser("~/.claude.json")
+data = json.loads(open(path).read().replace(old, new))
+json.dump(data, open(path, "w"), indent=2)' "$old" "$new"
+    echo "  rewritten (backup at ~/.claude.json.before-move-repos)"
+else
+    echo "  nothing to do"
+end
+
+step "Claude Code: project dirs (memory, transcripts)"
+set -l projects $HOME/.claude/projects
+for dir in $projects/$old_slug*
+    test -e $dir; or continue
+    set -l dest (string replace $old_slug $new_slug $dir)
+    if test -e $dest
+        cp -Rn $dir/ $dest/
+        rm -r $dir
+        echo "  merged "(basename $dir)
+    else
+        mv $dir $dest
+        echo "  renamed "(basename $dir)
+    end
+end
+
+step "Claude Code: plugin install records"
+set -l plugins $HOME/.claude/plugins/installed_plugins.json
+if test -f $plugins; and grep -q "$old" $plugins
+    sed -i '' "s|$old|$new|g" $plugins
+    echo "  rewritten"
+else
+    echo "  nothing to do"
+end
+
+step "agent TUI state"
+set -l state $HOME/.local/state/agent
+for f in $state/repos $state/layouts/*.kdl
+    test -f $f; or continue
+    if grep -q "$old" $f
+        sed -i '' "s|$old|$new|g" $f
+        echo "  rewritten "(string replace $state/ "" $f)
+    end
+end
+
+step "ssh: devbox tunnel script path"
+if test -f $HOME/.ssh/config; and grep -q "$old" $HOME/.ssh/config
+    cp $HOME/.ssh/config $HOME/.ssh/config.before-move-repos
+    sed -i '' "s|$old|$new|g" $HOME/.ssh/config
+    echo "  rewritten (backup at ~/.ssh/config.before-move-repos)"
+else
+    echo "  nothing to do"
+end
+
+step "zellij: exited sessions with the old cwd"
+for name in (zellij list-sessions -n 2>/dev/null | grep EXITED | string split -f1 ' ')
+    zellij delete-session $name >/dev/null 2>&1; and echo "  dropped $name (agent resurrects it)"
+end
+
+step "Done. Restart WezTerm and nvim so they read the new REPOS_DIR."

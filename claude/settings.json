@@ -148,7 +148,7 @@
   "skipAutoPermissionPrompt": true,
   "defaultMode": "acceptEdits",
   "additionalDirectories": [
-    "~/Documents/repos",
+    "~/repos",
     "~/.asdf/installs",
     "~/worktrees"
   ],

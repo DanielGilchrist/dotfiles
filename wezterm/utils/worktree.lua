@@ -17,7 +17,7 @@ local path_utils = require("utils.path")
 ---@field contains fun(path: string): boolean
 local M = {
   DIR = wezterm.home_dir .. "/worktrees",
-  REPOS_DIR = wezterm.home_dir .. "/Documents/repos",
+  REPOS_DIR = wezterm.home_dir .. "/repos",
 }
 
 ---Directories exactly two levels below <root> that contain a `.git`
