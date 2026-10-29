@@ -61,11 +61,12 @@ types into the embedded session. `?` shows every key.
 |---|---|
 | `⏎` / `l` | Attach the selected agent (resurrect or start it if needed) |
 | `⌃\` | Back to NAV from an agent. Twice goes to the previous agent |
-| `1` `2` `3` | Focus the Agents, turn and Changes panels. Focusing [2] or [3] expands it only as far as its content needs: from the other lower panel's spare rows first, then the list, and only then does the other panel collapse to its title line (at the smallest sizes the collapse can leave it a few blank rows). From [2] or [3], `Esc` goes back to Agents |
+| `1` `2` `3` | Focus the list [1], the turn and Changes panels. Focusing [2] or [3] expands it only as far as its content needs: from the other lower panel's spare rows first, then the list, and only then does the other panel collapse to its title line (at the smallest sizes the collapse can leave it a few blank rows). From [2] or [3], `Esc` goes back to the list |
 | `j k g G`, `[ ]` | Move in the focused panel, previous / next repo |
 | `⌃D ⌃U` | Half a page in the focused panel, handy in Changes |
 | `Space` / `/` | Switcher (fuzzy), `⌃N ⌃P` to move |
-| `m` | Pin / unpin (pinned agents get their own group) |
+| `Tab` / `⇧Tab` | Cycle [1]'s tabs: the repo, all agents, pinned. The title names them where the width allows, the active one bold, and the footer's `Tab` hint names the next |
+| `m` | Pin / unpin (pinned agents get their own tab) |
 | `n` | New agent form: prompt (`⌃E` edits it in $EDITOR), name (suggested from the prompt or a Linear/GitHub link), repo (listed, from the catalogue, or a path) |
 | `p` | Repo picker: `⏎` focuses a listed repo, or adds one from the catalogue or by a typed path (`~/code/foo`) |
 | `e` | Open the agent's worktree in $EDITOR, or in Changes the file under the cursor |
@@ -87,7 +88,7 @@ passed with `--settings` (your own settings stay untouched), recorded by
 - spinner: working, including a finished turn still waiting on background subagents (`↳n` counts them). It stops, dimmed with `?`, after 5 minutes of silence with no tool running
 - `●` idle, `○` exited, `·` no session
 
-Overview opens with a **Needs you** group, the status bar and terminal
+The Agents tab opens with a **Needs you** group, the status bar and terminal
 title show `◆ ! ✓` counts, and a bell rings when an agent you're not
 typing into starts waiting. Each agent's card has a second line saying
 what it's doing or what it said (the question, the tool, the last
@@ -146,11 +147,11 @@ the reason.
 
 | Key | Action |
 |---|---|
-| `CMD+0` | Toggle the agents tab (runs the TUI, started on first use) |
-| `CMD+Shift+0` | Pin the agents tab to position 0 |
+| `CMD+0` | Toggle the `agent` tab (runs the TUI, started on first use) |
+| `CMD+Shift+0` | Pin the `agent` tab to position 0 |
 | `CMD+Shift+O` | Worktree picker: a shell tab in a `~/worktrees/<repo>/<branch>` dir |
-| `CMD+Left` / `CMD+Right` | Cycle tabs, skipping the agents tab |
-| `Shift+Alt+{` / `}` | Move tabs (the agents tab stays put) |
+| `CMD+Left` / `CMD+Right` | Cycle tabs, skipping the `agent` tab |
+| `Shift+Alt+{` / `}` | Move tabs (the `agent` tab stays put) |
 
 ## Commands
 

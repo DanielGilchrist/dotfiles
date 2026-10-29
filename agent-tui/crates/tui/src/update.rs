@@ -17,9 +17,9 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent
 use ratatui::layout::Position;
 
 use crate::model::{
-    Answer, Chord, Confirm, Cursor, Edge, Enter, Field, Focus, Follow, INFO_TTL, Inspection,
-    Intent, Mode, Model, NamingState, NewAgent, Overlay, Pane, Panel, Phase, Query, Reach,
-    StatusKind, Submission, TerminalFocus, Ticket, View, WorkRoom, fuzzy_match, match_rank,
+    Answer, Chord, Confirm, Cursor, Direction, Edge, Enter, Field, Focus, Follow, INFO_TTL,
+    Inspection, Intent, Mode, Model, NamingState, NewAgent, Overlay, Pane, Panel, Phase, Query,
+    Reach, StatusKind, Submission, TerminalFocus, Ticket, View, WorkRoom, fuzzy_match, match_rank,
     repo_matches, unlisted,
 };
 use crate::worker::{Job, Msg, Outcome};
@@ -667,7 +667,8 @@ fn on_nav_key(m: &mut Model, key: KeyEvent) -> Vec<Effect> {
         KeyCode::Char('G') | KeyCode::End => m.panel_to_edge(Edge::Last),
         KeyCode::Char(']') => m.jump_repo(1),
         KeyCode::Char('[') => m.jump_repo(-1),
-        KeyCode::Tab => m.toggle_view(),
+        KeyCode::Tab => m.cycle_view(Direction::Forward),
+        KeyCode::BackTab => m.cycle_view(Direction::Back),
         KeyCode::Char('p') => m.overlay = Overlay::Picker(Query::default()),
         KeyCode::Char(' ' | '/') => m.overlay = Overlay::Switcher(Query::default()),
         KeyCode::Char('?') => m.overlay = Overlay::Help,
@@ -2507,19 +2508,242 @@ mod tests {
     }
 
     #[test]
-    fn a_pinned_selection_follows_its_agent_into_needs_you() {
+    fn tab_cycles_repo_agents_pinned_and_back() {
         let mut m = model(&["fix"]);
+        assert_eq!(m.view, View::Focus);
         update(&mut m, key(KeyCode::Tab));
-        m.set_cursor(Cursor::Grouped(crate::model::Group::Pinned, name("fix")));
+        assert_eq!(m.view, View::Overview);
+        update(&mut m, key(KeyCode::Tab));
+        assert_eq!(m.view, View::Pinned);
+        assert_eq!(
+            m.cursor(),
+            Some(&Cursor::Entry(name("fix"))),
+            "the selected agent is pinned, so it stays selected"
+        );
+        update(&mut m, key(KeyCode::Tab));
+        assert_eq!(m.view, View::Focus);
+        assert_eq!(m.cursor(), Some(&Cursor::Entry(name("fix"))));
+        update(&mut m, key(KeyCode::BackTab));
+        assert_eq!(m.view, View::Pinned);
+        update(&mut m, key(KeyCode::BackTab));
+        assert_eq!(m.view, View::Overview);
+    }
+
+    #[test]
+    fn the_pinned_tab_lists_pins_then_the_other_agents_that_need_you() {
+        let mut m = model(&["api"]);
+        update(&mut m, key(KeyCode::Tab));
+        update(&mut m, key(KeyCode::Tab));
+        let pin = Row::Entry {
+            name: name("api"),
+            place: crate::model::Place::Pinned,
+        };
+        assert_eq!(m.rows(), vec![pin.clone()]);
+        assert_eq!(
+            m.cursor(),
+            Some(&Cursor::Entry(name("api"))),
+            "fix isn't listed here, so the first pin is selected"
+        );
         update(
             &mut m,
             Msg::Activities(HashMap::from([(name("fix"), asking("rm?", 5))])),
         );
         assert_eq!(
+            m.rows(),
+            vec![
+                pin,
+                Row::Header(crate::model::Group::NeedsYou),
+                Row::Grouped(crate::model::Group::NeedsYou, name("fix")),
+            ]
+        );
+        assert_eq!(
+            m.extent().rows,
+            5,
+            "the Needs you header and all four entries, pinned or not"
+        );
+    }
+
+    #[test]
+    fn a_waiting_pin_stays_in_its_place_on_the_pinned_tab() {
+        let mut m = model(&["fix"]);
+        update(&mut m, key(KeyCode::Tab));
+        update(&mut m, key(KeyCode::Tab));
+        update(
+            &mut m,
+            Msg::Activities(HashMap::from([(name("fix"), asking("rm?", 5))])),
+        );
+        assert_eq!(
+            m.rows(),
+            vec![Row::Entry {
+                name: name("fix"),
+                place: crate::model::Place::Pinned,
+            }]
+        );
+        assert_eq!(m.cursor(), Some(&Cursor::Entry(name("fix"))));
+    }
+
+    #[test]
+    fn an_empty_pinned_tab_selects_nothing_and_a_repo_pick_leaves_it() {
+        let mut m = model(&[]);
+        update(&mut m, key(KeyCode::Tab));
+        update(&mut m, key(KeyCode::Tab));
+        assert_eq!(m.rows(), Vec::new());
+        assert_eq!(m.cursor(), None, "nothing to select");
+        update(&mut m, key(KeyCode::Char('p')));
+        assert!(matches!(m.overlay, Overlay::Picker(_)));
+        for c in "api".chars() {
+            update(&mut m, key(KeyCode::Char(c)));
+        }
+        update(&mut m, key(KeyCode::Enter));
+        assert_eq!(m.view, View::Focus, "picking a repo leaves the pinned tab");
+        assert_eq!(m.cursor(), Some(&Cursor::Entry(name("api"))));
+    }
+
+    #[test]
+    fn the_pinned_tab_falls_back_to_needs_you_when_nothing_is_pinned() {
+        let mut m = model(&[]);
+        update(
+            &mut m,
+            Msg::Activities(HashMap::from([(name("fix"), asking("rm?", 5))])),
+        );
+        m.set_cursor(Cursor::Entry(name("api")));
+        update(&mut m, key(KeyCode::Tab));
+        update(&mut m, key(KeyCode::Tab));
+        assert_eq!(m.view, View::Pinned);
+        assert_eq!(
             m.cursor(),
             Some(&Cursor::Grouped(crate::model::Group::NeedsYou, name("fix")))
         );
-        assert!(m.items().contains(m.cursor().expect("succeeds")));
+        assert!(m.items().contains(m.cursor().expect("selected")));
+    }
+
+    #[test]
+    fn selecting_an_agent_the_pinned_tab_lacks_moves_to_the_agents_tab() {
+        let mut m = model(&["api"]);
+        update(&mut m, key(KeyCode::Tab));
+        update(&mut m, key(KeyCode::Tab));
+        m.set_cursor(Cursor::Entry(name("fix")));
+        assert_eq!(m.view, View::Overview);
+        assert_eq!(m.cursor(), Some(&Cursor::Entry(name("fix"))));
+        assert!(m.items().contains(m.cursor().expect("selected")));
+        let snapshot = m.snapshot().expect("loaded").clone();
+        update(&mut m, Msg::Snapshot(Ok((snapshot, Vec::new()))));
+        assert_eq!(
+            m.cursor(),
+            Some(&Cursor::Entry(name("fix"))),
+            "survives a refresh"
+        );
+    }
+
+    #[test]
+    fn a_full_tab_cycle_comes_back_to_the_agent_the_pinned_tab_lacked() {
+        let mut m = model(&["api"]);
+        assert_eq!(m.cursor(), Some(&Cursor::Entry(name("fix"))));
+        update(&mut m, key(KeyCode::Tab));
+        update(&mut m, key(KeyCode::Tab));
+        assert_eq!(m.cursor(), Some(&Cursor::Entry(name("api"))));
+        update(&mut m, key(KeyCode::Tab));
+        assert_eq!(m.view, View::Focus);
+        assert_eq!(m.cursor(), Some(&Cursor::Entry(name("fix"))));
+
+        update(&mut m, key(KeyCode::Tab));
+        update(&mut m, key(KeyCode::Tab));
+        m.set_cursor(Cursor::Entry(name("api")));
+        update(&mut m, key(KeyCode::Tab));
+        assert_eq!(
+            m.cursor(),
+            Some(&Cursor::Entry(name("api"))),
+            "moving on the pinned tab is kept"
+        );
+    }
+
+    #[test]
+    fn the_pinned_tab_opens_on_the_first_pin_not_a_needs_you_row() {
+        let mut m = model(&["web"]);
+        update(
+            &mut m,
+            Msg::Activities(HashMap::from([(name("fix"), asking("rm?", 5))])),
+        );
+        m.set_cursor(Cursor::Entry(name("idle")));
+        update(&mut m, key(KeyCode::Tab));
+        update(&mut m, key(KeyCode::Tab));
+        assert_eq!(m.view, View::Pinned);
+        assert_eq!(m.cursor(), Some(&Cursor::Entry(name("web"))));
+    }
+
+    fn snapshot_with_tools(with_tools: bool) -> agent_core::model::Snapshot {
+        let mut repos = vec![
+            (
+                root("/src/api"),
+                RepoWorktrees {
+                    main: wt("/src/api"),
+                    linked: vec![wt("/w/api/fix"), wt("/w/api/idle")],
+                },
+            ),
+            (
+                root("/src/web"),
+                RepoWorktrees {
+                    main: wt("/src/web"),
+                    linked: Vec::new(),
+                },
+            ),
+        ];
+        if with_tools {
+            repos.push((
+                root("/src/tools"),
+                RepoWorktrees {
+                    main: wt("/src/tools"),
+                    linked: Vec::new(),
+                },
+            ));
+        }
+        let obs = Observation {
+            sessions: vec![SessionInfo {
+                name: name("fix"),
+                status: SessionStatus::Live {
+                    cwd: Some("/w/api/fix".into()),
+                },
+            }],
+            repos,
+            warnings: Vec::new(),
+        };
+        let pins = [name("api")];
+        assemble(&obs, &Layout::new("/w".into()).expect("absolute"), &pins).0
+    }
+
+    #[test]
+    fn a_displaced_agent_that_has_gone_does_not_drag_the_selection() {
+        let mut m = Model::new(
+            "/w/api/fix/src".into(),
+            None,
+            "claude".parse().expect("parses"),
+            "claude".into(),
+        );
+        update(
+            &mut m,
+            Msg::Snapshot(Ok((snapshot_with_tools(true), Vec::new()))),
+        );
+        update(
+            &mut m,
+            Msg::Activities(HashMap::from([(name("fix"), asking("rm?", 5))])),
+        );
+        m.set_cursor(Cursor::Entry(name("tools")));
+        update(&mut m, key(KeyCode::Tab));
+        update(&mut m, key(KeyCode::Tab));
+        let pin = Cursor::Entry(name("api"));
+        assert_eq!(
+            m.cursor(),
+            Some(&pin),
+            "tools isn't pinned, so the first pin"
+        );
+        update(
+            &mut m,
+            Msg::Snapshot(Ok((snapshot_with_tools(false), Vec::new()))),
+        );
+        assert_eq!(m.cursor(), Some(&pin));
+        update(&mut m, key(KeyCode::Tab));
+        assert_eq!(m.view, View::Focus);
+        assert_eq!(m.cursor(), Some(&pin), "the gone agent is forgotten");
     }
 
     #[test]

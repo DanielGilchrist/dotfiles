@@ -286,8 +286,11 @@ enum Title {
     Label,
     /// By its label, indented under its open repo.
     Child,
-    /// By its label, with its repo on the right, as in Needs you and Pinned.
+    /// By its label, with its repo on the right, under a Needs you header.
     Grouped(String),
+    /// By its label, with its repo on the right and no header above it,
+    /// as in the Pinned tab.
+    Pinned(String),
     /// Like [`Title::Grouped`], for an agent from another repo listed in
     /// Focus. It never takes a second line, so it can't change the tier.
     Elsewhere(String),
@@ -298,7 +301,7 @@ enum Title {
 impl Title {
     fn indent(&self) -> &'static str {
         match self {
-            Self::Label | Self::Repo(_) => "",
+            Self::Label | Self::Repo(_) | Self::Pinned(_) => "",
             Self::Child | Self::Grouped(_) | Self::Elsewhere(_) => "  ",
         }
     }
@@ -407,7 +410,7 @@ impl<'m> Deck<'m> {
                     left.push(Span::styled(format!(" {branch}"), dim()));
                 }
             }
-            Title::Grouped(name) | Title::Elsewhere(name) => {
+            Title::Grouped(name) | Title::Elsewhere(name) | Title::Pinned(name) => {
                 left.push(Span::styled(entry.label().to_string(), style));
                 repo = match self.form {
                     Form::Long => Some(name),
@@ -1034,6 +1037,10 @@ fn list(deck: &Deck<'_>, snapshot: &Snapshot, rows: &[Row], cursor: Option<&Curs
                         place: Place::Solo, ..
                     } => Title::Repo(repo_name),
                     Row::Elsewhere(_) => Title::Elsewhere(repo_name),
+                    Row::Entry {
+                        place: Place::Pinned,
+                        ..
+                    } if repo_name != entry.label() => Title::Pinned(repo_name),
                     Row::Grouped(..) if repo_name != entry.label() => Title::Grouped(repo_name),
                     Row::Grouped(..)
                     | Row::Entry {
@@ -1789,7 +1796,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, m: &mut Model, area: Rect, border: Sty
         area.width.saturating_sub(2),
         list_room(area.height),
     );
-    let title = fit(sidebar_title(m), usize::from(area.width).saturating_sub(4));
+    let title = sidebar_title(m, usize::from(area.width).saturating_sub(4));
     let corner = sidebar_count(m, style_of(agents));
     let Some(laid) = lay_out(m, area) else {
         m.turn = Turn::Whole;
@@ -2193,12 +2200,12 @@ mod tests {
         ];
         for size in SIZES {
             for agents in FLEETS {
-                for (view, panel) in [View::Focus, View::Overview]
+                for (view, panel) in View::ALL
                     .into_iter()
                     .flat_map(|view| panels.map(|panel| (view, panel)))
                 {
                     let mut m = fleet(agents);
-                    if m.view != view {
+                    while m.view != view {
                         m.toggle_view();
                     }
                     m.panel = panel;
@@ -2273,10 +2280,15 @@ mod tests {
 
     #[test]
     fn the_tier_holds_while_agents_change_state() {
-        for (_, height) in SIZES {
+        for ((_, height), view) in SIZES
+            .into_iter()
+            .flat_map(|size| View::ALL.map(|view| (size, view)))
+        {
             let rows = usize::from(list_room(height - 1));
             let mut m = fleet(20);
-            m.toggle_view();
+            while m.view != view {
+                m.toggle_view();
+            }
             let before = tier(m.extent(), rows);
             let everyone_done: HashMap<_, _> = m
                 .snapshot()
@@ -2286,7 +2298,37 @@ mod tests {
                 .collect();
             m.activities = Some(everyone_done);
             m.revalidate();
-            assert_eq!(tier(m.extent(), rows), before, "{rows} rows");
+            assert_eq!(tier(m.extent(), rows), before, "{rows} rows, {view:?}");
+        }
+    }
+
+    #[test]
+    fn the_title_strip_follows_the_width_not_the_selection() {
+        let mut m = fleet(8);
+        m.set_cursor(Cursor::Entry(name("heucristic0")));
+        let text =
+            |spans: &[Span<'_>]| spans.iter().map(|s| s.content.as_ref()).collect::<String>();
+        assert_eq!(
+            text(&super::super::sidebar_title(&m, 29)),
+            "[1] heucristic0"
+        );
+        assert_eq!(
+            text(&super::super::sidebar_title(&m, 30)),
+            "[1] heucris… · Agents · Pinned"
+        );
+        assert_eq!(
+            text(&super::super::sidebar_title(&m, 40)),
+            "[1] heucristic0 · Agents · Pinned"
+        );
+        m.toggle_view();
+        assert_eq!(text(&super::super::sidebar_title(&m, 29)), "[1] Agents");
+        m.toggle_view();
+        assert_eq!(text(&super::super::sidebar_title(&m, 29)), "[1] Pinned");
+        for width in [29, 30, 40] {
+            let before = text(&super::super::sidebar_title(&m, width)).contains('·');
+            m.set_cursor(Cursor::Entry(name("agent-tui1")));
+            let after = text(&super::super::sidebar_title(&m, width)).contains('·');
+            assert_eq!(before, after, "{width} wide");
         }
     }
 
