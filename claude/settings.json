@@ -108,7 +108,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "PROMPT=$(cat | jq -r '.userPrompt // empty' 2>/dev/null); if echo \"$PROMPT\" | grep -qE '^/[a-z]'; then SKILL=$(echo \"$PROMPT\" | grep -oE '^/[a-z-]+' | sed 's/^\\///'); echo \"$SKILL\" >> /tmp/cc-user-invoked-skill; fi; exit 0"
+            "command": "PROMPT=$(cat | jq -r '.prompt // empty' 2>/dev/null); if echo \"$PROMPT\" | grep -qE '^/[a-z]'; then SKILL=$(echo \"$PROMPT\" | grep -oE '^/[a-z-]+' | sed 's/^\\///'); echo \"$SKILL\" >> /tmp/cc-user-invoked-skill; fi; exit 0"
           }
         ]
       }
