@@ -298,6 +298,7 @@ fn preview(m: &mut Model) -> Option<Effect> {
 /// A start or create finished: connect, or say why it failed where the
 /// user is looking (the form that asked, or the status bar).
 fn on_launched(m: &mut Model, ticket: Ticket, result: Result<Launch, String>) -> Vec<Effect> {
+    m.launching.retain(|(t, _)| *t != ticket);
     match result {
         Ok(launch) => {
             if matches!(&m.overlay, Overlay::New(form) if matches!(form.phase, Phase::Submitting { ticket: t, .. } if t == ticket))
@@ -513,11 +514,10 @@ fn activate(m: &mut Model, name: &SessionName) -> Vec<Effect> {
         m.set_cursor(Cursor::Entry(name.clone()));
     }
     m.preview_at = None;
-    // Its worktree can show up before its launch has finished, and
-    // starting it from here would skip the first prompt.
-    if matches!(&m.follow, Some(Follow::Submitted { name: n, .. } | Follow::Backgrounded { name: n, .. }) if n == name)
-    {
-        m.info(format!("{name} is still being created"));
+    // Its worktree can show up before its launch has finished, and a
+    // second start from here would race it and skip the first prompt.
+    if m.launching.iter().any(|(_, n)| n == name) {
+        m.info(format!("{name} is still starting"));
         return Vec::new();
     }
     let Reach::Other { enter, .. } = reach else {
@@ -1213,6 +1213,7 @@ fn submit(m: &mut Model) -> Vec<Effect> {
         name: session.clone(),
         ticket,
     };
+    m.launching.push((ticket, session.clone()));
     m.follow = Some(Follow::Submitted {
         name: session,
         ticket,
@@ -1414,21 +1415,39 @@ mod tests {
     }
 
     #[test]
-    fn enter_on_an_agent_still_being_created_does_nothing() {
+    fn enter_on_an_agent_still_being_created_does_nothing_until_its_launch_lands() {
         let mut m = model(&[]);
         let ticket = m.ticket();
-        m.follow = Some(Follow::Submitted {
-            name: name("idle"),
-            ticket,
-        });
+        m.launching.push((ticket, name("idle")));
         m.set_cursor(Cursor::Entry(name("idle")));
         assert!(update(&mut m, key(KeyCode::Enter)).is_empty());
         assert!(
             m.status
                 .as_ref()
-                .is_some_and(|s| s.text.contains("still being created"))
+                .is_some_and(|s| s.text.contains("still starting"))
         );
         assert!(matches!(m.pane, Pane::Empty), "no connection was started");
+        // A refresh showing the worktree idle doesn't lift the guard.
+        update(
+            &mut m,
+            Msg::Snapshot(Ok((snapshot(Vec::new(), &[]), Vec::new()))),
+        );
+        m.set_cursor(Cursor::Entry(name("idle")));
+        assert!(update(&mut m, key(KeyCode::Enter)).is_empty());
+        // The launch landing does, whichever way it went.
+        update(
+            &mut m,
+            Msg::Launched {
+                ticket,
+                result: Err("no".into()),
+            },
+        );
+        assert_eq!(m.launching.len(), 0);
+        let effects = update(&mut m, key(KeyCode::Enter));
+        assert!(
+            matches!(effects.as_slice(), [Effect::Job(Job::Start { .. })]),
+            "the idle worktree starts as usual"
+        );
     }
 
     #[test]

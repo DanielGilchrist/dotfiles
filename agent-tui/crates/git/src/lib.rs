@@ -34,7 +34,10 @@ fn custom_ssh() -> bool {
 
 fn git(dir: &Path) -> Command {
     let mut cmd = process::quiet("git");
-    cmd.env("GIT_TERMINAL_PROMPT", "0")
+    // Output is parsed, and the lock reason a worktree add writes is
+    // translated, so git runs in the C locale.
+    cmd.env("LC_ALL", "C")
+        .env("GIT_TERMINAL_PROMPT", "0")
         .arg("-C")
         .arg(dir)
         .arg("--no-optional-locks");
@@ -108,7 +111,7 @@ fn parse_worktrees(porcelain: &str) -> Result<Vec<Worktree>, String> {
         .filter(|block| !block.trim().is_empty())
         // `locked initializing` is what `git worktree add` holds while it
         // checks the files out (builtin/worktree.c, add_worktree), so a
-        // worktree still appearing is not one yet.
+        // worktree listed that way isn't finished.
         .filter(|block| {
             !block
                 .lines()
@@ -445,7 +448,8 @@ mod tests {
                          worktree /w/api/fix\nHEAD def\ndetached\n\n\
                          worktree /w/api/gone\nHEAD 123\nprunable gitdir file points to non-existent location\n\n\
                          worktree /w/api/new\nHEAD 456\ndetached\nlocked initializing\n\n\
-                         worktree /w/api/held\nHEAD 789\ndetached\nlocked by hand\n\n";
+                         worktree /w/api/held\nHEAD 789\ndetached\nlocked by hand\n\n\
+                         worktree /w/api/bare-lock\nHEAD 790\ndetached\nlocked\n\n";
         let worktrees = parse_repo_worktrees(porcelain).expect("succeeds");
         assert_eq!(
             worktrees.main.head,
@@ -453,11 +457,12 @@ mod tests {
         );
         assert_eq!(
             worktrees.linked.len(),
-            2,
-            "one still being created is skipped, one locked by hand stays"
+            3,
+            "one still being created is skipped, locks with other or no reasons stay"
         );
         assert_eq!(worktrees.linked[0].head, Head::Detached);
         assert_eq!(worktrees.linked[1].path, Path::new("/w/api/held"));
+        assert_eq!(worktrees.linked[2].path, Path::new("/w/api/bare-lock"));
     }
 
     #[test]
