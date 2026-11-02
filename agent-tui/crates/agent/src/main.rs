@@ -79,7 +79,7 @@ enum Cmd {
     #[command(visible_alias = "co")]
     Checkout {
         branch: BranchName,
-        /// Agent name (defaults to the branch with '/' replaced by '-')
+        /// Agent name (defaults to the branch's words, cut to fit a session name)
         #[arg(long)]
         name: Option<AgentName>,
         #[arg(long)]

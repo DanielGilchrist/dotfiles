@@ -139,8 +139,11 @@ impl FromStr for AgentName {
 }
 
 impl AgentName {
+    /// The branch's words, lowercased and joined with `-`, cut at the last
+    /// whole word that fits a session name.
     pub fn from_branch(branch: &BranchName) -> Result<Self, NameError> {
-        branch.as_str().replace('/', "-").parse()
+        crate::naming::fit(crate::naming::words(branch.as_str()))
+            .ok_or_else(|| NameError::InvalidAgent(branch.to_string()))
     }
 
     pub fn session(&self) -> SessionName {
@@ -277,11 +280,23 @@ mod tests {
     }
 
     #[test]
-    fn agent_name_from_branch_flattens_slashes() {
+    fn agent_name_from_branch_flattens_slashes_and_fits() {
         let branch: BranchName = "user/fix-ci".parse().expect("parses");
         assert_eq!(
             AgentName::from_branch(&branch).expect("succeeds").as_str(),
             "user-fix-ci"
+        );
+        let long: BranchName = "axel-chargebee-webhook-handler-classes"
+            .parse()
+            .expect("parses");
+        assert_eq!(
+            AgentName::from_branch(&long).expect("succeeds").as_str(),
+            "axel-chargebee"
+        );
+        let cased: BranchName = "Feature/Add_Thing".parse().expect("parses");
+        assert_eq!(
+            AgentName::from_branch(&cased).expect("succeeds").as_str(),
+            "feature-add-thing"
         );
     }
 }

@@ -107,7 +107,7 @@ pub struct Suggestion {
 }
 
 /// Joins `words` with `-`, stopping at the last whole word that fits.
-fn fit<I: IntoIterator<Item = String>>(words: I) -> Option<AgentName> {
+pub(crate) fn fit<I: IntoIterator<Item = String>>(words: I) -> Option<AgentName> {
     let mut name = String::new();
     for word in words {
         let joined = if name.is_empty() {
@@ -126,7 +126,7 @@ fn fit<I: IntoIterator<Item = String>>(words: I) -> Option<AgentName> {
     name.parse().ok()
 }
 
-fn words(text: &str) -> impl Iterator<Item = String> + '_ {
+pub(crate) fn words(text: &str) -> impl Iterator<Item = String> + '_ {
     text.split(|c: char| !c.is_ascii_alphanumeric())
         .filter(|w| !w.is_empty())
         .map(str::to_ascii_lowercase)

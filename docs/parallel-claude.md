@@ -187,7 +187,7 @@ success = "green"    # finished turns, added lines
 | `agent attach <name> --no-prompt` | Start without a prompt. |
 | `agent attach <name> --repo <path>` | Repo for a new worktree (default: the one containing the cwd). |
 | `agent attach … --headless` | Prepare everything but print `headless_session:`, `headless_cwd:` and `headless_cmd:` (fish-quoted) instead of attaching. |
-| `agent checkout <branch>` / `agent co` | Attach the worktree for a branch, creating it from the local or `origin/` branch. Name is the branch with `/` → `-`. |
+| `agent checkout <branch>` / `agent co` | Attach the worktree for a branch, creating it from the local or `origin/` branch. The name is the branch's words joined with `-`, cut at the last word that fits 20 characters (`--name` overrides). |
 | `agent repo` | Attach or start the repo session. Run inside an agent worktree, it attaches that agent instead, even with `--repo`. |
 | `agent rm [<name>]` | Remove session, worktree and branch (name inferred from the cwd). Refuses if anything would be lost: uncommitted files, unpushed or unmerged commits. Run from inside the agent's own session, it finishes in the background. |
 | `agent rm --force [<name>]` | Same, discarding work. |
