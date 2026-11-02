@@ -9,7 +9,7 @@ use agent_core::config::Keys;
 use agent_core::model::{
     Entry, EntryState, Removable, Repo, RepoKey, Revival, Running, Snapshot, Startable,
 };
-use agent_core::names::{AgentName, Prompt, SessionName};
+use agent_core::names::{AgentName, BranchName, Checkout, Prompt, SessionName};
 use agent_core::ops::{Approved, Hazardous, RemovalPlan};
 use agent_core::paths::{RepoRoot, Typed, typed_path};
 use agent_core::ports::{Change, HarnessId, WorktreeFacts};
@@ -1900,14 +1900,22 @@ pub enum Launchable {
     Resurrect(AgentName),
     /// An idle worktree: start it with the prompt.
     Start { at: Startable, task: Option<Prompt> },
+    /// A branch or pull request to review: its worktree is created or
+    /// found by the branch, so the agent reached may be named otherwise.
+    Checkout {
+        name: AgentName,
+        repo: RepoChoice,
+        target: Checkout,
+    },
 }
 
 impl Launchable {
     pub fn session(&self) -> SessionName {
         match self {
-            Self::Create { name, .. } | Self::Attach { name, .. } | Self::Resurrect(name) => {
-                name.session()
-            }
+            Self::Create { name, .. }
+            | Self::Attach { name, .. }
+            | Self::Resurrect(name)
+            | Self::Checkout { name, .. } => name.session(),
             Self::Start { at, .. } => at.name(),
         }
     }
@@ -1920,6 +1928,7 @@ impl Launchable {
             Self::Attach { task: None, .. } => "attach",
             Self::Resurrect(_) => "resurrect",
             Self::Start { .. } => "start",
+            Self::Checkout { .. } => "check out",
         }
     }
 
@@ -1930,6 +1939,7 @@ impl Launchable {
             Self::Attach { .. } => "attaching to",
             Self::Resurrect(_) => "resurrecting",
             Self::Start { .. } => "starting",
+            Self::Checkout { .. } => "checking out",
         }
     }
 }
@@ -1939,6 +1949,13 @@ pub enum Blocked {
     /// The name check says why.
     Name,
     Prompt(String),
+    /// Not a branch name or a pull request link.
+    Target(String),
+    /// The name is an agent on another branch (`None`: a detached HEAD),
+    /// so the checkout can't attach to it.
+    OnAnotherBranch(Option<BranchName>),
+    /// The name is an agent in another repo, whose branches are its own.
+    InAnotherRepo(String),
     NoRepo,
     /// Exited, with a prompt that couldn't be delivered.
     ExitedWithPrompt,
@@ -1948,8 +1965,9 @@ impl Blocked {
     /// Why ⏎ did nothing, unless the form already shows it.
     pub fn reason(&self) -> Option<String> {
         match self {
-            Self::Name => None,
+            Self::Name | Self::OnAnotherBranch(_) | Self::InAnotherRepo(_) => None,
             Self::Prompt(why) => Some(format!("prompt: {why}")),
+            Self::Target(why) => Some(why.clone()),
             Self::NoRepo => Some("pick a repo: type its name, or a path".into()),
             Self::ExitedWithPrompt => Some(
                 "it exited, so the prompt can't be typed in. Clear it to resurrect, then send it"
@@ -1960,6 +1978,64 @@ impl Blocked {
 }
 
 impl Submission {
+    /// A checkout needs a target and a repo. A name that already exists
+    /// is still a checkout when its agent is on the branch (the worker
+    /// attaches), and refused here when the snapshot shows it isn't. For a
+    /// pull request the branch is only known once the forge answers.
+    fn checkout(
+        check: &NameCheck,
+        target: &str,
+        repo: &RepoInput,
+        snapshot: Option<&Snapshot>,
+    ) -> Self {
+        let target = match target.trim() {
+            "" => {
+                return Self::Blocked(Blocked::Target("type a branch, or a GitHub PR link".into()));
+            }
+            text => match text.parse::<Checkout>() {
+                Ok(target) => target,
+                Err(why) => return Self::Blocked(Blocked::Target(why.to_string())),
+            },
+        };
+        let name = match check {
+            NameCheck::Free(name) => name,
+            NameCheck::Live { name, .. }
+            | NameCheck::Exited { name, .. }
+            | NameCheck::Idle { name, .. } => {
+                let existing = snapshot.and_then(|s| s.entry(&name.session()));
+                let chosen = match repo.choice() {
+                    Some(RepoChoice::Known(root)) => Some(root),
+                    Some(RepoChoice::Path(_)) | None => None,
+                };
+                if let (Some((in_repo, _)), Some(chosen)) = (existing, chosen)
+                    && in_repo.key().root() != Some(&chosen)
+                {
+                    return Self::Blocked(Blocked::InAnotherRepo(in_repo.name().into_owned()));
+                }
+                let head = existing.and_then(|(_, e)| e.head());
+                if let (Checkout::Branch(branch), Some(head)) = (&target, head)
+                    && head.branch() != Some(branch)
+                {
+                    return Self::Blocked(Blocked::OnAnotherBranch(head.branch().cloned()));
+                }
+                name
+            }
+            NameCheck::Empty
+            | NameCheck::TooLong { .. }
+            | NameCheck::Invalid(_)
+            | NameCheck::Own
+            | NameCheck::MainCheckout { .. } => return Self::Blocked(Blocked::Name),
+        };
+        match repo.choice() {
+            Some(repo) => Self::Ready(Launchable::Checkout {
+                name: name.clone(),
+                repo,
+                target,
+            }),
+            None => Self::Blocked(Blocked::NoRepo),
+        }
+    }
+
     fn of(check: &NameCheck, task: &str, repo: &RepoInput) -> Self {
         let task = match task.trim() {
             "" => Ok(None),
@@ -2005,6 +2081,7 @@ pub enum NameSource {
     Link,
     Words,
     Model,
+    Branch,
 }
 
 /// The name used when none is typed.
@@ -2037,11 +2114,21 @@ pub enum NamingState {
     },
 }
 
+/// What the form's first field is: a first prompt for a new agent, or
+/// what to check out for review.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FormKind {
+    New,
+    Checkout,
+}
+
 /// The new-agent form. `name` is what the user typed; when it's empty the
 /// suggestion is used. `suggestion`, `check` and `repo_input` are derived
 /// from the fields and the snapshot, and refreshed whenever either changes.
+/// For a checkout, `task` holds the branch or pull request link.
 #[derive(Debug, Clone)]
 pub struct NewAgent {
+    pub kind: FormKind,
     pub task: String,
     pub name: String,
     pub repo: Query,
@@ -2070,8 +2157,9 @@ pub struct Derived {
 }
 
 impl NewAgent {
-    pub fn new(default_repo: Option<RepoRoot>) -> Self {
+    pub fn new(kind: FormKind, default_repo: Option<RepoRoot>) -> Self {
         Self {
+            kind,
             task: String::new(),
             name: String::new(),
             repo: Query::default(),
@@ -2089,8 +2177,10 @@ impl NewAgent {
         self.naming.generation += 1;
         let source = agent_core::naming::suggest(&self.task).map(|s| s.source);
         let words = self.task.split_whitespace().count();
-        self.naming.state = match source {
-            Some(agent_core::naming::Source::Link) => NamingState::Idle,
+        self.naming.state = match (self.kind, source) {
+            (FormKind::Checkout, _) | (_, Some(agent_core::naming::Source::Link)) => {
+                NamingState::Idle
+            }
             _ if words < NAMING_MIN_WORDS => NamingState::Idle,
             _ => NamingState::Due(Instant::now() + NAMING_DEBOUNCE),
         };
@@ -2118,33 +2208,65 @@ impl NewAgent {
         own: Option<&SessionName>,
         start_dir: &Path,
     ) -> Derived {
-        use agent_core::naming::{Source, suggest};
-        let local = suggest(&self.task);
-        let answer = match &self.naming.state {
-            NamingState::Answered { prompt, name } if *prompt == self.task => Some(name),
-            _ => None,
+        use agent_core::naming::{Source, for_checkout, suggest};
+        let suggestion = match self.kind {
+            FormKind::Checkout => self
+                .task
+                .trim()
+                .parse::<Checkout>()
+                .ok()
+                .and_then(|target| {
+                    let source = match target {
+                        Checkout::Branch(_) => NameSource::Branch,
+                        Checkout::PullRequest(_) => NameSource::Link,
+                    };
+                    for_checkout(&target).map(|name| NameSuggestion {
+                        name: name.to_string(),
+                        source,
+                    })
+                }),
+            FormKind::New => {
+                let local = suggest(&self.task);
+                let answer = match &self.naming.state {
+                    NamingState::Answered { prompt, name } if *prompt == self.task => Some(name),
+                    _ => None,
+                };
+                match (local, answer) {
+                    (Some(link), _) if link.source == Source::Link => {
+                        Some((link.name, NameSource::Link))
+                    }
+                    (_, Some(name)) => Some((name.clone(), NameSource::Model)),
+                    (Some(words), None) => Some((words.name, NameSource::Words)),
+                    (None, None) => None,
+                }
+                .map(|(name, source)| NameSuggestion {
+                    name: free_name(&name, snapshot, own),
+                    source,
+                })
+            }
         };
-        let suggestion = match (local, answer) {
-            (Some(link), _) if link.source == Source::Link => Some((link.name, NameSource::Link)),
-            (_, Some(name)) => Some((name.clone(), NameSource::Model)),
-            (Some(words), None) => Some((words.name, NameSource::Words)),
-            (None, None) => None,
-        }
-        .map(|(name, source)| NameSuggestion {
-            name: free_name(&name, snapshot, own),
-            source,
-        });
         let name = match (self.name.as_str(), &suggestion) {
             ("", Some(suggestion)) => suggestion.name.clone(),
             (typed, _) => typed.to_string(),
         };
         let check = NameCheck::of(&name, snapshot, own);
-        let repo_input = self.parse_repo(snapshot, catalogue, start_dir);
+        let mut repo_input = self.parse_repo(snapshot, catalogue, start_dir);
+        // A pull request link names its repo, which wins over the selected
+        // one while nothing is typed and exactly one repo has that name.
+        if let (FormKind::Checkout, RepoInput::Default(_)) = (self.kind, &repo_input)
+            && let Ok(Checkout::PullRequest(pr)) = self.task.trim().parse::<Checkout>()
+            && let Some(root) = named_repo(snapshot, catalogue, &pr.repo)
+        {
+            repo_input = RepoInput::Default(Some(root));
+        }
         let completion = match &repo_input {
             RepoInput::Search(Some(root)) => completes(&root.name(), self.repo.text.trim()),
             _ => None,
         };
-        let submission = Submission::of(&check, &self.task, &repo_input);
+        let submission = match self.kind {
+            FormKind::New => Submission::of(&check, &self.task, &repo_input),
+            FormKind::Checkout => Submission::checkout(&check, &self.task, &repo_input, snapshot),
+        };
         Derived {
             suggestion,
             name,
@@ -2214,8 +2336,20 @@ fn free_name(base: &AgentName, snapshot: Option<&Snapshot>, own: Option<&Session
         .unwrap_or_else(|| base.to_string())
 }
 
-/// Known repos (not orphan sessions) whose names fuzzily match `query`,
-/// prefix matches first.
+/// The one repo, listed or in the catalogue, called exactly `name`.
+fn named_repo(snapshot: Option<&Snapshot>, catalogue: &[RepoRoot], name: &str) -> Option<RepoRoot> {
+    let listed = snapshot
+        .into_iter()
+        .flat_map(|s| s.repos().iter().filter_map(|r| r.key().root()));
+    let mut named = listed
+        .chain(unlisted(snapshot, catalogue))
+        .filter(|root| root.name() == name);
+    match (named.next(), named.next()) {
+        (Some(root), None) => Some(root.clone()),
+        _ => None,
+    }
+}
+
 /// Repos matching `query` by name: the snapshot's, then the catalogue's
 /// that aren't in it, prefix matches first.
 pub fn repo_matches(

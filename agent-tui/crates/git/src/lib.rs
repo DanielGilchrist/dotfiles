@@ -5,11 +5,11 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use agent_core::model::{Head, Worktree};
-use agent_core::names::BranchName;
+use agent_core::names::{BranchName, NameError, PullRequest};
 use agent_core::paths::{AgentWorktree, RepoRoot};
 use agent_core::ports::{
-    BranchState, Change, Lines, LocalBranch, RemoteBranch, RepoWorktrees, Vcs, WorktreeFacts,
-    WorktreeStart,
+    BranchState, Change, Fetch, Forge, Lines, LocalBranch, PullRequestHead, RemoteBranch,
+    RepoWorktrees, Vcs, WorktreeFacts, WorktreeStart,
 };
 use agent_core::process::{self, CommandError};
 
@@ -19,6 +19,40 @@ const CHECKOUT_TIMEOUT: Duration = Duration::from_secs(600);
 /// [`Vcs`] backed by the `git` CLI.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Git;
+
+/// GitHub through the `gh` CLI.
+pub struct GitHub;
+
+impl Forge for GitHub {
+    fn pull_request_head(&self, pr: &PullRequest) -> Result<PullRequestHead, CommandError> {
+        let mut cmd = process::quiet("gh");
+        cmd.args(["pr", "view", &pr.number.to_string(), "--repo", &pr.slug()])
+            .args(["--json", "headRefName,isCrossRepository"])
+            .args(["--jq", "[.headRefName, .isCrossRepository] | @tsv"]);
+        let out = process::run(&mut cmd)?;
+        parse_pull_request_head(out.trim()).map_err(|detail| CommandError::Parse {
+            command: "gh pr view".into(),
+            detail,
+        })
+    }
+}
+
+/// `<branch>\t<true|false>`, as `gh --jq @tsv` prints it.
+fn parse_pull_request_head(line: &str) -> Result<PullRequestHead, String> {
+    let (branch, cross) = line
+        .split_once('\t')
+        .ok_or_else(|| format!("expected '<branch>\t<bool>', got {line:?}"))?;
+    let cross_repository = match cross {
+        "true" => true,
+        "false" => false,
+        other => return Err(format!("expected true or false, got {other:?}")),
+    };
+    let branch = branch.parse().map_err(|e: NameError| e.to_string())?;
+    Ok(PullRequestHead {
+        branch,
+        cross_repository,
+    })
+}
 
 /// Whether the user has their own ssh command for git; if not, ours runs ssh
 /// in batch mode so a passphrase prompt can't draw over the TUI.
@@ -325,6 +359,12 @@ impl Vcs for Git {
                     .arg(at.path())
                     .arg(format!("origin/{branch}"));
             }
+            WorktreeStart::AtRemote(remote) => {
+                let branch = remote.name();
+                cmd.args(["--no-track", "-B", branch.as_str()])
+                    .arg(at.path())
+                    .arg(format!("origin/{branch}"));
+            }
         }
         let out = process::output_within(&mut cmd, CHECKOUT_TIMEOUT)?;
         if out.status.success() {
@@ -358,6 +398,27 @@ impl Vcs for Git {
         cmd.args(["rev-parse", "--verify", "--quiet"])
             .arg(format!("refs/remotes/origin/{branch}"));
         Ok(query(cmd)?.then(|| RemoteBranch::found(branch.clone())))
+    }
+
+    fn fetch(&self, repo: &RepoRoot, what: &Fetch) -> Result<(), CommandError> {
+        let mut cmd = git(repo.path());
+        let into = what.branch();
+        let from = match what {
+            Fetch::Branch(branch) => format!("refs/heads/{branch}"),
+            Fetch::PullRequest(number) => format!("refs/pull/{number}/head"),
+        };
+        // An explicit refspec lands the tracking branch even in a clone
+        // whose configured refspec doesn't cover it (`--single-branch`).
+        cmd.args(["fetch", "-q", "origin"])
+            .arg(format!("+{from}:refs/remotes/origin/{into}"));
+        let out = process::output_within(&mut cmd, CHECKOUT_TIMEOUT)?;
+        if out.status.success()
+            || String::from_utf8_lossy(&out.stderr).contains("couldn't find remote ref")
+        {
+            Ok(())
+        } else {
+            Err(process::failed(&cmd, &out))
+        }
     }
 
     fn branch_state(
@@ -441,6 +502,53 @@ impl Vcs for Git {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fetching_a_ref_origin_lacks_is_nothing_fetched_not_a_failure() {
+        let tmp = tempfile::tempdir().expect("a temp dir");
+        let origin = tmp.path().join("origin");
+        let sh = |dir: &Path, args: &[&str]| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .output()
+                .expect("succeeds");
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        std::fs::create_dir(&origin).expect("creates");
+        sh(&origin, &["init", "-q", "-b", "main"]);
+        sh(&origin, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        sh(
+            tmp.path(),
+            &["clone", "-q", origin.to_str().expect("succeeds"), "work"],
+        );
+        let work = tmp.path().join("work").canonicalize().expect("exists");
+        let repo = Git.repo_of(&work).expect("succeeds").expect("a repo");
+        let branch = |name: &str| name.parse::<BranchName>().expect("parses");
+        Git.fetch(&repo, &Fetch::Branch(branch("nosuch")))
+            .expect("a branch origin lacks is nothing fetched");
+        assert_eq!(
+            Git.remote_branch(&repo, &branch("nosuch"))
+                .expect("succeeds"),
+            None
+        );
+        Git.fetch(&repo, &Fetch::PullRequest(99))
+            .expect("a pull request origin lacks is nothing fetched");
+        sh(&origin, &["branch", "later"]);
+        Git.fetch(&repo, &Fetch::Branch(branch("later")))
+            .expect("succeeds");
+        assert!(
+            Git.remote_branch(&repo, &branch("later"))
+                .expect("succeeds")
+                .is_some()
+        );
+    }
 
     #[test]
     fn porcelain_parses_branches_detached_and_skips_prunable() {

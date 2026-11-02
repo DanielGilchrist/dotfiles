@@ -6,11 +6,13 @@ use std::process::{Command, Stdio};
 
 use crate::discover::{self, Warning};
 use crate::model::{Presence, Removable, Running, Snapshot, Startable};
-use crate::names::{AgentName, BranchName, InvalidPrompt, NameError, Prompt, SessionName};
+use crate::names::{
+    AgentName, BranchName, Checkout, InvalidPrompt, NameError, Prompt, SessionName,
+};
 use crate::paths::{AgentWorktree, Layout, PathError, RepoRoot, TrashSlot, WorktreeState};
 use crate::ports::{
-    AgentRecord, BranchState, Harness, HarnessError, HarnessId, Harnesses, HostError, LaunchCtx,
-    Listing, PaneCommand, PendingPrompt, SessionHost, SessionInfo, SessionStatus, Store,
+    AgentRecord, BranchState, Fetch, Forge, Harness, HarnessError, HarnessId, Harnesses, HostError,
+    LaunchCtx, Listing, PaneCommand, PendingPrompt, SessionHost, SessionInfo, SessionStatus, Store,
     StoreError, Unlisting, Vcs, WorktreeStart,
 };
 use crate::process::{CommandError, LaunchSpec};
@@ -68,8 +70,13 @@ pub enum Error {
     Appeared(AgentName),
     #[error("{branch} is checked out at {}, outside the agent worktrees", .path.display())]
     CheckedOutElsewhere { branch: BranchName, path: PathBuf },
-    #[error("branch {0} not found locally or on origin (try `git fetch`)")]
+    #[error("branch {0} not found locally or on origin")]
     BranchNotFound(BranchName),
+    #[error("{name} is already an agent on {}", .on.as_ref().map_or("a detached HEAD".to_string(), ToString::to_string))]
+    NameTaken {
+        name: AgentName,
+        on: Option<BranchName>,
+    },
     #[error("no agent record for {0}, so agent didn't start it")]
     NoRecord(SessionName),
     #[error("unknown harness {0}")]
@@ -96,6 +103,7 @@ fn io_error(context: impl Into<String>) -> impl FnOnce(io::Error) -> Error {
 /// Owned ports, for callers that outlive a borrow (the TUI's worker thread).
 pub struct Backend {
     pub vcs: Box<dyn Vcs>,
+    pub forge: Box<dyn Forge>,
     pub host: Box<dyn SessionHost>,
     pub store: Box<dyn Store>,
     pub harnesses: Box<dyn Harnesses>,
@@ -107,6 +115,7 @@ impl Backend {
     pub fn services(&self) -> Services<'_> {
         Services {
             vcs: self.vcs.as_ref(),
+            forge: self.forge.as_ref(),
             host: self.host.as_ref(),
             store: self.store.as_ref(),
             harnesses: self.harnesses.as_ref(),
@@ -120,6 +129,7 @@ impl Backend {
 #[derive(Clone, Copy)]
 pub struct Services<'a> {
     pub vcs: &'a dyn Vcs,
+    pub forge: &'a dyn Forge,
     pub host: &'a dyn SessionHost,
     pub store: &'a dyn Store,
     pub harnesses: &'a dyn Harnesses,
@@ -658,39 +668,127 @@ pub fn checkout(
     branch: &BranchName,
     name: Option<AgentName>,
 ) -> Result<AgentName> {
+    checkout_from(svc, repo, &Fetch::Branch(branch.clone()), name)
+}
+
+/// The agent for `fetch`'s branch in `repo`: the worktree already on it,
+/// or a new one named `name` (else after the branch). A branch is taken
+/// from the local branch, else origin's, fetched if unknown. A pull
+/// request head is always fetched, since origin's copy may be stale or
+/// another branch's altogether, and reset onto its `pr/N` branch.
+fn checkout_from(
+    svc: Services<'_>,
+    repo: &RepoRoot,
+    fetch: &Fetch,
+    name: Option<AgentName>,
+) -> Result<AgentName> {
+    let branch = fetch.branch();
     let worktrees = svc.vcs.worktrees(repo)?;
-    if worktrees.main.head.branch() == Some(branch) {
+    if worktrees.main.head.branch() == Some(&branch) {
         return Err(Error::CheckedOutElsewhere {
-            branch: branch.clone(),
+            branch,
             path: worktrees.main.path,
         });
     }
     if let Some(wt) = worktrees
         .linked
         .iter()
-        .find(|wt| wt.head.branch() == Some(branch))
+        .find(|wt| wt.head.branch() == Some(&branch))
     {
         return match svc.layout.worktree_at(&wt.path) {
             Some(aw) => Ok(aw.name().clone()),
             None => Err(Error::CheckedOutElsewhere {
-                branch: branch.clone(),
+                branch,
                 path: wt.path.clone(),
             }),
         };
     }
     let name = match name {
         Some(name) => name,
-        None => AgentName::from_branch(branch)?,
+        None => AgentName::from_branch(&branch)?,
     };
-    let start = match svc.vcs.local_branch(repo, branch)? {
-        Some(local) => WorktreeStart::Branch(local),
-        None => match svc.vcs.remote_branch(repo, branch)? {
-            Some(remote) => WorktreeStart::TrackRemote(remote),
-            None => return Err(Error::BranchNotFound(branch.clone())),
-        },
+    let at = svc.layout.worktree(repo, name.clone());
+    if let Some(existing) = find_worktree(svc, &name)? {
+        // Only this repo's own path can be the branch's worktree: another
+        // repo's branches are its own. The scan above misses this path
+        // only when git can't read it.
+        if existing.path() != at.path() {
+            return Err(Error::NameTaken {
+                name,
+                on: svc
+                    .vcs
+                    .head(existing.path())
+                    .ok()
+                    .and_then(|h| h.branch().cloned()),
+            });
+        }
+        let Ok(head) = svc.vcs.head(existing.path()) else {
+            return Err(Error::Occupied(existing.path().to_path_buf()));
+        };
+        if head.branch() == Some(&branch) {
+            return Ok(name);
+        }
+        return Err(Error::NameTaken {
+            name,
+            on: head.branch().cloned(),
+        });
+    }
+    let start = match fetch {
+        Fetch::PullRequest(_) => {
+            svc.vcs.fetch(repo, fetch)?;
+            match svc.vcs.remote_branch(repo, &branch)? {
+                Some(remote) => WorktreeStart::AtRemote(remote),
+                None => return Err(Error::BranchNotFound(branch)),
+            }
+        }
+        Fetch::Branch(_) => {
+            if let Some(local) = svc.vcs.local_branch(repo, &branch)? {
+                WorktreeStart::Branch(local)
+            } else {
+                let mut remote = svc.vcs.remote_branch(repo, &branch)?;
+                if remote.is_none() {
+                    svc.vcs.fetch(repo, fetch)?;
+                    remote = svc.vcs.remote_branch(repo, &branch)?;
+                }
+                match remote {
+                    Some(remote) => WorktreeStart::TrackRemote(remote),
+                    None => return Err(Error::BranchNotFound(branch)),
+                }
+            }
+        }
     };
-    create_worktree(svc, repo, &svc.layout.worktree(repo, name.clone()), &start)?;
+    create_worktree(svc, repo, &at, &start)?;
+    if listable(repo).is_ok() {
+        svc.store.list_repo(repo)?;
+    }
     Ok(name)
+}
+
+/// Checks `target` out as the agent `name` in `repo` and plans reaching
+/// it with no prompt, as `checkout` then `attach` would. A pull request
+/// from the repo itself is its branch, so the agent can push to it. One
+/// from a fork is its head under `pr/N`.
+pub fn checkout_launch(
+    svc: Services<'_>,
+    repo: &RepoRoot,
+    target: &Checkout,
+    name: Option<AgentName>,
+    harness: &dyn Harness,
+) -> Result<Launch> {
+    let fetch = match target {
+        Checkout::Branch(branch) => Fetch::Branch(branch.clone()),
+        Checkout::PullRequest(pr) => {
+            let head = svc.forge.pull_request_head(pr)?;
+            if head.cross_repository {
+                Fetch::PullRequest(pr.number)
+            } else {
+                Fetch::Branch(head.branch)
+            }
+        }
+    };
+    let name = checkout_from(svc, repo, &fetch, name)?;
+    let plan = plan(svc, &name, Some(repo))?;
+    execute(svc, plan, None, harness)
 }
 
 /// Something a removal would destroy that exists nowhere else.

@@ -11,7 +11,7 @@ use agent_core::names::{AgentName, BranchName, Prompt, SessionName};
 use agent_core::ops::{self, Backend, Consent, Delivery, Launch, Removed, Services};
 use agent_core::paths::{self, Layout, RepoRoot, WorktreeState};
 use agent_core::ports::{Harness, HarnessId, Listing, Unlisting};
-use agent_git::Git;
+use agent_git::{Git, GitHub};
 use agent_harness::Registry;
 use agent_store::FsStore;
 use agent_zellij::Zellij;
@@ -160,6 +160,7 @@ fn backend() -> Result<Backend> {
     let exe = std::env::current_exe().context("locating the agent binary")?;
     Ok(Backend {
         vcs: Box::new(Git),
+        forge: Box::new(GitHub),
         host: Box::new(host),
         harnesses: Box::new(Registry::new(&paths::home()?)),
         store: Box::new(store),

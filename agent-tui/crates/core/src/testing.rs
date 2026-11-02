@@ -8,13 +8,13 @@ use std::time::SystemTime;
 
 use crate::activity::{Activity, Reported};
 use crate::model::{Head, Running, Worktree};
-use crate::names::{BranchName, Prompt, SessionName};
+use crate::names::{BranchName, Prompt, PullRequest, SessionName};
 use crate::paths::{AgentWorktree, RepoRoot};
 use crate::ports::{
-    AgentRecord, BranchState, ClientControl, Harness, HarnessError, HarnessId, Harnesses,
-    HostError, LaunchCtx, Listing, LocalBranch, PaneCommand, PendingPrompt, RemoteBranch,
-    RepoWorktrees, Seen, SessionHost, SessionInfo, SessionStatus, Store, StoreError, Unlisting,
-    Vcs, WorktreeFacts, WorktreeStart,
+    AgentRecord, BranchState, ClientControl, Fetch, Forge, Harness, HarnessError, HarnessId,
+    Harnesses, HostError, LaunchCtx, Listing, LocalBranch, PaneCommand, PendingPrompt,
+    PullRequestHead, RemoteBranch, RepoWorktrees, Seen, SessionHost, SessionInfo, SessionStatus,
+    Store, StoreError, Unlisting, Vcs, WorktreeFacts, WorktreeStart,
 };
 use crate::process::{CommandError, LaunchSpec};
 
@@ -31,6 +31,13 @@ pub struct FakeVcs {
     pub not_repos: Mutex<Vec<PathBuf>>,
     /// Paths inside some other repo than `root`.
     pub other_repos: Mutex<HashMap<PathBuf, RepoRoot>>,
+    /// Branches on origin that a fetch would bring in.
+    pub on_origin: Mutex<Vec<BranchName>>,
+    pub fetched: Mutex<Vec<BranchName>>,
+    /// Pull request numbers origin has a `refs/pull/N/head` for.
+    pub pull_requests: Mutex<Vec<u64>>,
+    /// Every fetch fails, as with no network.
+    pub offline: Mutex<bool>,
 }
 
 impl FakeVcs {
@@ -44,6 +51,10 @@ impl FakeVcs {
             deleted: Mutex::default(),
             not_repos: Mutex::default(),
             other_repos: Mutex::default(),
+            on_origin: Mutex::default(),
+            fetched: Mutex::default(),
+            pull_requests: Mutex::default(),
+            offline: Mutex::default(),
         }
     }
 
@@ -79,11 +90,13 @@ impl Vcs for FakeVcs {
         Ok(Some(self.root.clone()))
     }
 
-    fn worktrees(&self, _: &RepoRoot) -> Result<RepoWorktrees, CommandError> {
+    fn worktrees(&self, repo: &RepoRoot) -> Result<RepoWorktrees, CommandError> {
         let heads = self.heads.lock().expect("lock");
+        let others = self.other_repos.lock().expect("lock");
         let linked = heads
             .iter()
             .filter(|(p, _)| p.as_path() != self.root.path())
+            .filter(|(p, _)| others.get(p.as_path()).unwrap_or(&self.root) == repo)
             .map(|(path, head)| Worktree {
                 path: path.clone(),
                 head: head.clone(),
@@ -112,7 +125,7 @@ impl Vcs for FakeVcs {
         &self,
         _: &RepoRoot,
         at: &AgentWorktree,
-        _: &WorktreeStart,
+        start: &WorktreeStart,
     ) -> Result<(), CommandError> {
         std::fs::create_dir_all(at.path()).expect("creates");
         let admin = self
@@ -126,7 +139,14 @@ impl Vcs for FakeVcs {
             format!("gitdir: {}\n", admin.display()),
         )
         .expect("writes");
-        self.set_head(at.path(), Head::Detached);
+        let head = match start {
+            WorktreeStart::DefaultBase => Head::Detached,
+            WorktreeStart::Branch(local) => Head::Branch(local.name().clone()),
+            WorktreeStart::TrackRemote(remote) | WorktreeStart::AtRemote(remote) => {
+                Head::Branch(remote.name().clone())
+            }
+        };
+        self.set_head(at.path(), head);
         Ok(())
     }
 
@@ -146,9 +166,28 @@ impl Vcs for FakeVcs {
     fn remote_branch(
         &self,
         _: &RepoRoot,
-        _: &BranchName,
+        branch: &BranchName,
     ) -> Result<Option<RemoteBranch>, CommandError> {
-        Ok(None)
+        let fetched = self.fetched.lock().expect("lock").contains(branch);
+        Ok(fetched.then(|| RemoteBranch::found(branch.clone())))
+    }
+
+    fn fetch(&self, _: &RepoRoot, what: &Fetch) -> Result<(), CommandError> {
+        if *self.offline.lock().expect("lock") {
+            return Err(CommandError::Failed {
+                command: "git fetch".into(),
+                status: "exit status: 128".into(),
+                stderr: "fatal: unable to access origin: Could not resolve host".into(),
+            });
+        }
+        let known = match what {
+            Fetch::Branch(branch) => self.on_origin.lock().expect("lock").contains(branch),
+            Fetch::PullRequest(number) => self.pull_requests.lock().expect("lock").contains(number),
+        };
+        if known {
+            self.fetched.lock().expect("lock").push(what.branch());
+        }
+        Ok(())
     }
 
     fn branch_state(&self, _: &RepoRoot, branch: &BranchName) -> Result<BranchState, CommandError> {
@@ -191,6 +230,27 @@ impl Vcs for FakeVcs {
             .expect("lock")
             .push(branch.name().clone());
         Ok(())
+    }
+}
+
+#[derive(Default)]
+/// Pull requests and the heads behind them.
+pub struct FakeForge {
+    pub heads: Mutex<HashMap<PullRequest, PullRequestHead>>,
+}
+
+impl Forge for FakeForge {
+    fn pull_request_head(&self, pr: &PullRequest) -> Result<PullRequestHead, CommandError> {
+        self.heads
+            .lock()
+            .expect("lock")
+            .get(pr)
+            .cloned()
+            .ok_or_else(|| CommandError::Failed {
+                command: "gh pr view".into(),
+                status: "exit status: 1".into(),
+                stderr: format!("no pull request {pr}"),
+            })
     }
 }
 

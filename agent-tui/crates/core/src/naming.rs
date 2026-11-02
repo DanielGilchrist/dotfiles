@@ -1,7 +1,7 @@
 //! Suggested agent names from a prompt: a linked issue's identifier and
 //! title if there is one, otherwise the prompt's meaningful words.
 
-use crate::names::{AgentName, MAX_SESSION_LEN};
+use crate::names::{AgentName, Checkout, MAX_SESSION_LEN};
 
 /// Words that carry no meaning in a name: articles, pronouns, and the way
 /// people talk to an agent ("can you figure out what's going on here").
@@ -216,6 +216,15 @@ pub fn suggest(prompt: &str) -> Option<Suggestion> {
     })
 }
 
+/// The name for an agent checking `target` out: `pr-482` for a pull
+/// request, else the branch cut to fit.
+pub fn for_checkout(target: &Checkout) -> Option<AgentName> {
+    match target {
+        Checkout::Branch(branch) => AgentName::from_branch(branch).ok(),
+        Checkout::PullRequest(pr) => format!("pr-{}", pr.number).parse().ok(),
+    }
+}
+
 /// The question to ask a harness's model for a name for `task`.
 pub fn question(task: &crate::names::Prompt) -> crate::names::Prompt {
     format!(
@@ -253,6 +262,24 @@ mod tests {
                 .map(|n| n.0)
                 .as_deref(),
             Some("pay-9")
+        );
+    }
+
+    #[test]
+    fn a_checkout_is_named_by_its_pr_number_or_its_branch_cut_to_fit() {
+        let pr: Checkout = "https://github.com/acme/api/pull/482/files"
+            .parse()
+            .expect("parses");
+        assert_eq!(
+            for_checkout(&pr).map(|n| n.to_string()).as_deref(),
+            Some("pr-482")
+        );
+        let branch: Checkout = "axel-chargebee-webhook-handler-classes"
+            .parse()
+            .expect("parses");
+        assert_eq!(
+            for_checkout(&branch).map(|n| n.to_string()).as_deref(),
+            Some("axel-chargebee")
         );
     }
 

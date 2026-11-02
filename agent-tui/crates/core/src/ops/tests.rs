@@ -3,12 +3,14 @@ use std::sync::atomic::Ordering;
 
 use super::*;
 use crate::model::Head;
-use crate::ports::{SessionInfo, SessionStatus};
-use crate::testing::{FakeHarnesses, FakeHost, FakeVcs, MemStore};
+use crate::names::PullRequest;
+use crate::ports::{LocalBranch, PullRequestHead, SessionInfo, SessionStatus};
+use crate::testing::{FakeForge, FakeHarnesses, FakeHost, FakeVcs, MemStore};
 
 struct World {
     _dir: tempfile::TempDir,
     vcs: FakeVcs,
+    forge: FakeForge,
     host: FakeHost,
     store: MemStore,
     harnesses: FakeHarnesses,
@@ -23,6 +25,7 @@ impl World {
         std::fs::create_dir_all(&root).expect("creates");
         Self {
             vcs: FakeVcs::new(&root),
+            forge: FakeForge::default(),
             layout: Layout::new(dir.path().join("w")).expect("absolute"),
             host: FakeHost::default(),
             store: MemStore::default(),
@@ -35,6 +38,7 @@ impl World {
     fn svc(&self) -> Services<'_> {
         Services {
             vcs: &self.vcs,
+            forge: &self.forge,
             host: &self.host,
             store: &self.store,
             harnesses: &self.harnesses,
@@ -79,6 +83,156 @@ fn prompt(s: &str) -> Prompt {
 
 fn branch(s: &str) -> BranchName {
     s.parse().expect("parses")
+}
+
+#[test]
+fn checkout_fetches_a_branch_it_doesnt_know_and_refuses_one_it_cant_find() {
+    let w = World::new();
+    let repo = w.vcs.root.clone();
+    w.vcs.deleted.lock().expect("lock").push(branch("pushed"));
+    w.vcs.deleted.lock().expect("lock").push(branch("nowhere"));
+    w.vcs.on_origin.lock().expect("lock").push(branch("pushed"));
+    let name = checkout(w.svc(), &repo, &branch("pushed"), None).expect("succeeds");
+    assert_eq!(name, agent("pushed"));
+    assert_eq!(
+        w.vcs
+            .head(w.layout.worktree(&repo, name).path())
+            .expect("succeeds"),
+        Head::Branch(branch("pushed"))
+    );
+    assert!(matches!(
+        checkout(w.svc(), &repo, &branch("nowhere"), None),
+        Err(Error::BranchNotFound(b)) if b == branch("nowhere")
+    ));
+}
+
+#[test]
+fn checkout_of_an_already_fetched_branch_works_offline() {
+    let w = World::new();
+    let repo = w.vcs.root.clone();
+    w.vcs.deleted.lock().expect("lock").push(branch("pushed"));
+    w.vcs.fetched.lock().expect("lock").push(branch("pushed"));
+    *w.vcs.offline.lock().expect("lock") = true;
+    let name = checkout(w.svc(), &repo, &branch("pushed"), None).expect("origin/pushed is local");
+    assert_eq!(name, agent("pushed"));
+}
+
+#[test]
+fn checkout_cuts_long_branches_to_a_name_and_refuses_a_name_on_another_branch() {
+    let w = World::new();
+    let repo = w.vcs.root.clone();
+    let long = branch("axel-chargebee-webhook-handler-classes");
+    assert_eq!(
+        checkout(w.svc(), &repo, &long, None).expect("succeeds"),
+        agent("axel-chargebee")
+    );
+    assert_eq!(
+        checkout(w.svc(), &repo, &long, None).expect("succeeds"),
+        agent("axel-chargebee"),
+        "a branch already checked out attaches to its worktree"
+    );
+    let other = branch("axel-chargebee-refund-flow");
+    assert!(matches!(
+        checkout(w.svc(), &repo, &other, None),
+        Err(Error::NameTaken { name, on: Some(on) }) if name == agent("axel-chargebee") && on == long
+    ));
+}
+
+fn pull_request(link: &str) -> (Checkout, PullRequest) {
+    let target: Checkout = link.parse().expect("parses");
+    let Checkout::PullRequest(request) = &target else {
+        panic!("a pull request");
+    };
+    (target.clone(), request.clone())
+}
+
+#[test]
+fn a_pull_request_from_the_repo_is_checked_out_by_its_branch() {
+    let w = World::new();
+    let repo = w.vcs.root.clone();
+    let (target, request) = pull_request("https://github.com/acme/api/pull/482");
+    w.vcs
+        .deleted
+        .lock()
+        .expect("lock")
+        .push(branch("feature/x"));
+    w.vcs
+        .on_origin
+        .lock()
+        .expect("lock")
+        .push(branch("feature/x"));
+    w.forge.heads.lock().expect("lock").insert(
+        request,
+        PullRequestHead {
+            branch: branch("feature/x"),
+            cross_repository: false,
+        },
+    );
+    let launch = checkout_launch(w.svc(), &repo, &target, Some(agent("pr-482")), w.harness())
+        .expect("succeeds");
+    assert_eq!(launch.session, session("pr-482"));
+    assert_eq!(
+        w.vcs
+            .head(w.layout.worktree(&repo, agent("pr-482")).path())
+            .expect("succeeds"),
+        Head::Branch(branch("feature/x"))
+    );
+    let (unknown, _) = pull_request("https://github.com/acme/api/pull/1");
+    assert!(checkout_launch(w.svc(), &repo, &unknown, None, w.harness()).is_err());
+}
+
+#[test]
+fn a_fork_pull_request_is_fetched_by_its_pull_ref_whatever_origin_calls_its_branch() {
+    let w = World::new();
+    let repo = w.vcs.root.clone();
+    let (target, request) = pull_request("https://github.com/acme/api/pull/7");
+    w.vcs.deleted.lock().expect("lock").push(branch("main"));
+    w.vcs.fetched.lock().expect("lock").push(branch("main"));
+    w.vcs.pull_requests.lock().expect("lock").push(7);
+    w.forge.heads.lock().expect("lock").insert(
+        request,
+        PullRequestHead {
+            branch: branch("main"),
+            cross_repository: true,
+        },
+    );
+    let launch = checkout_launch(w.svc(), &repo, &target, None, w.harness()).expect("succeeds");
+    assert_eq!(launch.session, session("pr-7"));
+    assert_eq!(
+        w.vcs
+            .head(w.layout.worktree(&repo, agent("pr-7")).path())
+            .expect("succeeds"),
+        Head::Branch(branch("pr/7")),
+        "origin's main is the base repo's, not the fork's"
+    );
+    assert_eq!(
+        *w.vcs.fetched.lock().expect("lock"),
+        [branch("main"), branch("pr/7")]
+    );
+}
+
+#[test]
+fn a_branch_checked_out_by_another_repos_agent_is_not_this_repos() {
+    let w = World::new();
+    let other = RepoRoot::new(w.layout.root().join("../src/web")).expect("absolute");
+    let wt = w.layout.worktree(&other, agent("develop"));
+    w.vcs
+        .add_worktree(
+            &other,
+            &wt,
+            &WorktreeStart::Branch(LocalBranch::found(branch("develop"))),
+        )
+        .expect("succeeds");
+    w.vcs
+        .other_repos
+        .lock()
+        .expect("lock")
+        .insert(wt.path().to_path_buf(), other);
+    let result = checkout(w.svc(), &w.vcs.root, &branch("develop"), None);
+    assert!(
+        matches!(result, Err(Error::NameTaken { .. })),
+        "web's develop is not api's develop: {result:?}"
+    );
 }
 
 #[test]

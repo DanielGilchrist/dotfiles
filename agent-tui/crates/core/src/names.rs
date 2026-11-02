@@ -24,6 +24,8 @@ pub enum NameError {
     InvalidSession(String),
     #[error("'{0}' is not a valid git branch name")]
     InvalidBranch(String),
+    #[error("not a pull request link: github.com/<owner>/<repo>/pull/<number>")]
+    InvalidPullRequest,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -219,6 +221,65 @@ impl Prompt {
     }
 }
 
+/// A pull request on GitHub, by its link.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PullRequest {
+    pub owner: String,
+    pub repo: String,
+    pub number: u64,
+}
+
+impl PullRequest {
+    /// `owner/repo`, as `gh --repo` takes it.
+    pub fn slug(&self) -> String {
+        format!("{}/{}", self.owner, self.repo)
+    }
+}
+
+impl fmt::Display for PullRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}#{}", self.slug(), self.number)
+    }
+}
+
+/// What to check out for an agent: a branch, or the branch behind a pull
+/// request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Checkout {
+    Branch(BranchName),
+    PullRequest(PullRequest),
+}
+
+impl FromStr for Checkout {
+    type Err = NameError;
+
+    /// A GitHub link is a pull request (anything else under github.com is
+    /// an error, not a branch); the rest is a branch name.
+    fn from_str(s: &str) -> Result<Self, NameError> {
+        let s = s.trim().trim_matches(|c: char| matches!(c, '<' | '>'));
+        let Some(rest) = s.split("github.com/").nth(1) else {
+            return s.parse().map(Self::Branch);
+        };
+        let invalid = || NameError::InvalidPullRequest;
+        let mut parts = rest.split('/');
+        let owner = parts.next().filter(|p| !p.is_empty()).ok_or_else(invalid)?;
+        let repo = parts.next().filter(|p| !p.is_empty()).ok_or_else(invalid)?;
+        if parts.next() != Some("pull") {
+            return Err(invalid());
+        }
+        let number = parts
+            .next()
+            .and_then(|n| n.split(['#', '?']).next())
+            .and_then(|n| n.parse().ok())
+            .ok_or_else(invalid)?;
+        Ok(Self::PullRequest(PullRequest {
+            owner: owner.to_string(),
+            repo: repo.to_string(),
+            number,
+        }))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -298,5 +359,32 @@ mod tests {
             AgentName::from_branch(&cased).expect("succeeds").as_str(),
             "feature-add-thing"
         );
+    }
+
+    #[test]
+    fn a_checkout_is_a_pull_request_link_or_a_branch() {
+        let pr: Checkout = "https://github.com/acme/api/pull/482/files"
+            .parse()
+            .expect("parses");
+        assert_eq!(
+            pr,
+            Checkout::PullRequest(PullRequest {
+                owner: "acme".into(),
+                repo: "api".into(),
+                number: 482,
+            })
+        );
+        let branch: Checkout = "user/fix-ci".parse().expect("parses");
+        assert_eq!(
+            branch,
+            Checkout::Branch("user/fix-ci".parse().expect("parses"))
+        );
+        assert!(
+            "https://github.com/acme/api/issues/5"
+                .parse::<Checkout>()
+                .is_err()
+        );
+        assert!("https://github.com/acme/api".parse::<Checkout>().is_err());
+        assert!("".parse::<Checkout>().is_err());
     }
 }

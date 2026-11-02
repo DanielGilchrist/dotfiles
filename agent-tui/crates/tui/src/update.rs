@@ -17,10 +17,10 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent
 use ratatui::layout::Position;
 
 use crate::model::{
-    Answer, Chord, Confirm, Cursor, Direction, Edge, Enter, Field, Focus, Follow, INFO_TTL,
-    Inspection, Intent, Mode, Model, NamingState, NewAgent, Overlay, Pane, Panel, Phase, Query,
-    Reach, StatusKind, Submission, TerminalFocus, Ticket, View, WorkRoom, fuzzy_match, match_rank,
-    repo_matches, unlisted,
+    Answer, Chord, Confirm, Cursor, Direction, Edge, Enter, Field, Focus, Follow, FormKind,
+    INFO_TTL, Inspection, Intent, Mode, Model, NamingState, NewAgent, Overlay, Pane, Panel, Phase,
+    Query, Reach, StatusKind, Submission, TerminalFocus, Ticket, View, WorkRoom, fuzzy_match,
+    match_rank, repo_matches, unlisted,
 };
 use crate::worker::{Job, Msg, Outcome};
 
@@ -304,6 +304,15 @@ fn on_launched(m: &mut Model, ticket: Ticket, result: Result<Launch, String>) ->
             if matches!(&m.overlay, Overlay::New(form) if matches!(form.phase, Phase::Submitting { ticket: t, .. } if t == ticket))
             {
                 m.overlay = Overlay::None;
+            }
+            // A checkout reaches the worktree already on its branch, whatever
+            // name the form had.
+            if let Some(
+                Follow::Submitted { name, ticket: t } | Follow::Backgrounded { name, ticket: t },
+            ) = &mut m.follow
+                && *t == ticket
+            {
+                name.clone_from(&launch.session);
             }
             // A backgrounded launch no longer has the pane waiting on it, so
             // this connects nothing; its follow previews it instead.
@@ -681,7 +690,8 @@ fn on_nav_key(m: &mut Model, key: KeyEvent) -> Vec<Effect> {
                 })];
             }
         }
-        KeyCode::Char('n') => open_new_form(m),
+        KeyCode::Char('n') => open_form(m, FormKind::New),
+        KeyCode::Char('c') => open_form(m, FormKind::Checkout),
         KeyCode::Char('r') => {
             if let Some(entry) = selected {
                 match m.replyable(&entry).cloned() {
@@ -787,7 +797,7 @@ fn run_action(m: &mut Model, target: &SessionName, action: &Action) -> Vec<Effec
     }
 }
 
-fn open_new_form(m: &mut Model) {
+fn open_form(m: &mut Model, kind: FormKind) {
     let default_repo = m
         .selected()
         .and_then(|(repo, _)| repo.key().root().cloned())
@@ -796,7 +806,7 @@ fn open_new_form(m: &mut Model) {
                 .and_then(|s| s.containing(&m.start_dir))
                 .and_then(|(r, _)| r.key().root().cloned())
         });
-    m.overlay = Overlay::New(Box::new(NewAgent::new(default_repo)));
+    m.overlay = Overlay::New(Box::new(NewAgent::new(kind, default_repo)));
 }
 
 /// Plans removing the selected agent; the confirmation opens when the plan
@@ -1136,7 +1146,7 @@ fn on_new_key(m: &mut Model, key: &KeyEvent) -> Vec<Effect> {
     match key.code {
         KeyCode::Esc => m.overlay = Overlay::None,
         KeyCode::Enter if !alt => return submit(m),
-        _ if ctrl(key, 'e') => {
+        _ if ctrl(key, 'e') && form.kind == FormKind::New => {
             let Overlay::New(form) = &mut m.overlay else {
                 return Vec::new();
             };
@@ -1144,8 +1154,12 @@ fn on_new_key(m: &mut Model, key: &KeyEvent) -> Vec<Effect> {
             return vec![Effect::EditTask(form.task.clone())];
         }
         _ => edit_form(m, |form| match key.code {
-            KeyCode::Enter if form.focus == Field::Task => form.task.push('\n'),
-            _ if ctrl(key, 'j') && form.focus == Field::Task => form.task.push('\n'),
+            KeyCode::Enter if form.focus == Field::Task && form.kind == FormKind::New => {
+                form.task.push('\n');
+            }
+            _ if ctrl(key, 'j') && form.focus == Field::Task && form.kind == FormKind::New => {
+                form.task.push('\n');
+            }
             _ if ctrl(key, 'r') => form.name.clear(),
             _ if ctrl(key, 'u') => match form.focus {
                 Field::Task => form.task.clear(),
@@ -1316,7 +1330,7 @@ mod tests {
 
     use super::*;
     use crate::fixtures::{asking, name, reported, wt};
-    use crate::model::{Launchable, NameCheck, Row};
+    use crate::model::{Blocked, Launchable, NameCheck, Row};
 
     fn snapshot(sessions: Vec<SessionInfo>, pins: &[&str]) -> agent_core::model::Snapshot {
         let obs = Observation {
@@ -1916,6 +1930,234 @@ mod tests {
 
     fn open_form(m: &mut Model) {
         update(m, key(KeyCode::Char('n')));
+    }
+
+    #[test]
+    fn c_opens_the_checkout_form_and_names_the_agent_from_the_branch_or_link() {
+        let mut m = model(&[]);
+        update(&mut m, key(KeyCode::Char('c')));
+        assert_eq!(form(&m).kind, FormKind::Checkout);
+        assert_eq!(derived(&m).suggestion, None);
+        assert!(matches!(
+            derived(&m).submission,
+            Submission::Blocked(Blocked::Target(_))
+        ));
+
+        type_text(&mut m, "axel/chargebee-webhook-handler-classes");
+        let d = derived(&m);
+        assert_eq!(d.name, "axel-chargebee");
+        assert_eq!(
+            d.suggestion.map(|s| s.source),
+            Some(crate::model::NameSource::Branch)
+        );
+        assert!(matches!(
+            d.submission,
+            Submission::Ready(Launchable::Checkout {
+                target: agent_core::names::Checkout::Branch(_),
+                ..
+            })
+        ));
+
+        update(&mut m, key(KeyCode::Esc));
+        update(&mut m, key(KeyCode::Char('c')));
+        update(
+            &mut m,
+            Msg::Paste("https://github.com/acme/api/pull/482".into()),
+        );
+        let d = derived(&m);
+        assert_eq!(d.name, "pr-482");
+        assert_eq!(
+            d.suggestion.map(|s| s.source),
+            Some(crate::model::NameSource::Link)
+        );
+
+        update(&mut m, key(KeyCode::Esc));
+        update(&mut m, key(KeyCode::Char('c')));
+        type_text(&mut m, "https://github.com/acme/api/issues/5");
+        assert!(matches!(
+            derived(&m).submission,
+            Submission::Blocked(Blocked::Target(_))
+        ));
+        assert!(
+            matches!(form(&m).naming.state, NamingState::Idle),
+            "never asks the model"
+        );
+    }
+
+    #[test]
+    fn a_name_already_an_agent_attaches_on_its_branch_and_is_refused_on_another() {
+        let on_branch = |path: &str, branch: &str| agent_core::model::Worktree {
+            path: path.into(),
+            head: agent_core::model::Head::Branch(branch.parse().expect("parses")),
+        };
+        let obs = Observation {
+            sessions: vec![SessionInfo {
+                name: name("fix"),
+                status: SessionStatus::Live {
+                    cwd: Some("/w/api/fix".into()),
+                },
+            }],
+            repos: vec![(
+                root("/src/api"),
+                RepoWorktrees {
+                    main: wt("/src/api"),
+                    linked: vec![on_branch("/w/api/fix", "feature/x"), wt("/w/api/idle")],
+                },
+            )],
+            warnings: Vec::new(),
+        };
+        let snapshot = assemble(&obs, &Layout::new("/w".into()).expect("absolute"), &[]).0;
+        let mut m = Model::new(
+            "/w/api/fix/src".into(),
+            None,
+            "claude".parse().expect("parses"),
+            "claude".into(),
+        );
+        update(&mut m, Msg::Snapshot(Ok((snapshot, Vec::new()))));
+        update(&mut m, key(KeyCode::Char('c')));
+        type_text(&mut m, "feature/x");
+        update(&mut m, key(KeyCode::Tab));
+        type_text(&mut m, "fix");
+        assert!(matches!(
+            derived(&m).submission,
+            Submission::Ready(Launchable::Checkout { .. })
+        ));
+        update(&mut m, key(KeyCode::BackTab));
+        type_text(&mut m, "-old");
+        assert!(matches!(
+            derived(&m).submission,
+            Submission::Blocked(Blocked::OnAnotherBranch(Some(on))) if on.as_str() == "feature/x"
+        ));
+        update(&mut m, key(KeyCode::Enter));
+        assert!(
+            matches!(form(&m).phase, Phase::Editing),
+            "refused before the worker"
+        );
+
+        update(&mut m, key(KeyCode::Esc));
+        update(&mut m, key(KeyCode::Char('c')));
+        update(
+            &mut m,
+            Msg::Paste("https://github.com/acme/api/pull/9".into()),
+        );
+        update(&mut m, key(KeyCode::Tab));
+        type_text(&mut m, "fix");
+        assert!(
+            matches!(
+                derived(&m).submission,
+                Submission::Ready(Launchable::Checkout { .. })
+            ),
+            "a pull request's branch isn't known until the worker asks"
+        );
+    }
+
+    #[test]
+    fn a_name_that_is_an_agent_in_another_repo_is_refused() {
+        let mut m = model(&[]);
+        update(&mut m, key(KeyCode::Char('c')));
+        type_text(&mut m, "fix-ci");
+        update(&mut m, key(KeyCode::Tab));
+        type_text(&mut m, "fix");
+        update(&mut m, key(KeyCode::Tab));
+        type_text(&mut m, "web");
+        assert!(matches!(
+            derived(&m).submission,
+            Submission::Blocked(Blocked::InAnotherRepo(repo)) if repo == "api"
+        ));
+    }
+
+    #[test]
+    fn a_pull_request_link_picks_the_repo_it_names_while_nothing_is_typed() {
+        let mut m = model(&[]);
+        update(&mut m, key(KeyCode::Char('c')));
+        update(
+            &mut m,
+            Msg::Paste("https://github.com/acme/web/pull/9".into()),
+        );
+        assert_eq!(
+            derived(&m).repo_input,
+            crate::model::RepoInput::Default(Some(root("/src/web")))
+        );
+        update(&mut m, key(KeyCode::Tab));
+        update(&mut m, key(KeyCode::Tab));
+        type_text(&mut m, "api");
+        assert!(matches!(
+            derived(&m).repo_input,
+            crate::model::RepoInput::Search(Some(found)) if found == root("/src/api")
+        ));
+
+        update(&mut m, key(KeyCode::Esc));
+        update(&mut m, key(KeyCode::Char('c')));
+        update(
+            &mut m,
+            Msg::Paste("https://github.com/acme/other/pull/9".into()),
+        );
+        assert_eq!(
+            derived(&m).repo_input,
+            crate::model::RepoInput::Default(Some(root("/src/api"))),
+            "an unknown repo keeps the selected one"
+        );
+    }
+
+    #[test]
+    fn enter_in_the_checkout_form_submits_a_checkout_in_the_chosen_repo() {
+        let mut m = model(&[]);
+        update(&mut m, key(KeyCode::Char('c')));
+        type_text(&mut m, "fix-ci");
+        let effects = update(&mut m, key(KeyCode::Enter));
+        let Some(Effect::Job(Job::Launch { launch, ticket, .. })) = effects.first() else {
+            panic!("launches");
+        };
+        assert_eq!(
+            *launch,
+            Launchable::Checkout {
+                name: name("fix-ci").to_string().parse().expect("parses"),
+                repo: crate::model::RepoChoice::Known(root("/src/api")),
+                target: "fix-ci".parse().expect("parses"),
+            }
+        );
+        assert!(matches!(form(&m).phase, Phase::Submitting { .. }));
+        assert_eq!(m.launching, vec![(*ticket, name("fix-ci"))]);
+        update(
+            &mut m,
+            Msg::Launched {
+                ticket: *ticket,
+                result: Err("branch fix-ci not found locally or on origin".into()),
+            },
+        );
+        assert!(matches!(form(&m).phase, Phase::Editing));
+        assert_eq!(
+            form(&m).error.as_deref(),
+            Some("branch fix-ci not found locally or on origin")
+        );
+    }
+
+    #[test]
+    fn a_checkout_that_reaches_another_worktree_is_followed_by_its_real_name() {
+        let mut m = model(&[]);
+        update(&mut m, key(KeyCode::Char('c')));
+        type_text(&mut m, "feature/x");
+        let effects = update(&mut m, key(KeyCode::Enter));
+        let Some(Effect::Job(Job::Launch { ticket, .. })) = effects.first() else {
+            panic!("launches");
+        };
+        let ticket = *ticket;
+        update(&mut m, key(KeyCode::Esc));
+        assert!(matches!(m.follow, Some(Follow::Backgrounded { .. })));
+        update(
+            &mut m,
+            Msg::Launched {
+                ticket,
+                result: Ok(Launch {
+                    session: name("idle"),
+                    spec: agent_core::process::LaunchSpec::new("zellij"),
+                    delivery: agent_core::ops::Delivery::None,
+                }),
+            },
+        );
+        assert!(
+            matches!(&m.follow, Some(Follow::Backgrounded { name: n, .. }) if *n == name("idle"))
+        );
     }
 
     #[test]

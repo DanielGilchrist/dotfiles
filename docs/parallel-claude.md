@@ -67,6 +67,7 @@ types into the embedded session. `?` shows every key.
 | `Tab` / `⇧Tab` | Cycle [1]'s tabs: the repo, all agents, pinned. The title names them where the width allows, the active one bold, and the footer's `Tab` hint names the next |
 | `m` | Pin / unpin (pinned agents get their own tab) |
 | `n` | New agent form: prompt (`⌃E` edits it in $EDITOR), name (suggested from the prompt or a Linear/GitHub link), repo (listed, from the catalogue, or a path) |
+| `c` | Check out for review: a branch name or a GitHub PR link, name (suggested from it), repo (a PR link picks the repo it names). Fetches the branch if git doesn't know it, asks `gh` for a PR's branch (a fork's PR lands on a `pr/N` branch), and attaches instead if an agent already has the branch checked out |
 | `p` | Repo picker: `⏎` focuses a listed repo, or adds one from the catalogue or by a typed path (`~/code/foo`) |
 | `e` | Open the agent's worktree in $EDITOR, or in Changes the file under the cursor |
 | `r` | Reply without attaching, once its turn is over and nothing is asking |
@@ -187,7 +188,7 @@ success = "green"    # finished turns, added lines
 | `agent attach <name> --no-prompt` | Start without a prompt. |
 | `agent attach <name> --repo <path>` | Repo for a new worktree (default: the one containing the cwd). |
 | `agent attach … --headless` | Prepare everything but print `headless_session:`, `headless_cwd:` and `headless_cmd:` (fish-quoted) instead of attaching. |
-| `agent checkout <branch>` / `agent co` | Attach the worktree for a branch, creating it from the local or `origin/` branch. The name is the branch's words joined with `-`, cut at the last word that fits 20 characters (`--name` overrides). |
+| `agent checkout <branch>` / `agent co` | Attach the worktree for a branch, creating it from the local or `origin/` branch (fetched first if unknown). The name is the branch's words joined with `-`, cut at the last word that fits 20 characters (`--name` overrides). |
 | `agent repo` | Attach or start the repo session. Run inside an agent worktree, it attaches that agent instead, even with `--repo`. |
 | `agent rm [<name>]` | Remove session, worktree and branch (name inferred from the cwd). Refuses if anything would be lost: uncommitted files, unpushed or unmerged commits. Run from inside the agent's own session, it finishes in the background. |
 | `agent rm --force [<name>]` | Same, discarding work. |

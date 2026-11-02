@@ -5,7 +5,7 @@ use std::time::SystemTime;
 use agent_core::actions::Kind;
 use agent_core::config::Keys;
 use agent_core::model::{Entry, EntryKind, Head};
-use agent_core::names::SessionName;
+use agent_core::names::{Checkout, SessionName};
 use agent_core::ops::Deletes;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
@@ -15,7 +15,7 @@ use ratatui::widgets::{Block, BorderType, Clear, Padding, Paragraph};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::model::{
-    AgentStatus, Blocked, Confirm, Derived, Enter, Field, Focus, Launchable, Load, Model,
+    AgentStatus, Blocked, Confirm, Derived, Enter, Field, Focus, FormKind, Launchable, Load, Model,
     NameCheck, NameSource, NamingState, NewAgent, OfferEffect, Overlay, Pane, Panel, Phase,
     Proposal, Pulse, Query, Reach, RepoInput, Row, StatusKind, Submission, Turn, View, Waiting,
     WorkRoom, fuzzy_match, invalid_chars, repo_matches,
@@ -56,7 +56,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
             ),
             ("Tab ⇧Tab", "next / previous tab: repo, agents, pinned"),
             ("m", "pin / unpin"),
-            ("n", "new agent"),
+            ("n c", "new agent, or check out a branch / PR for review"),
             ("e", "open in $EDITOR, the file in [3]"),
             ("r", "reply without attaching"),
             ("d", "kill session"),
@@ -528,6 +528,11 @@ fn draw_terminal(frame: &mut Frame<'_>, m: &Model, area: Rect) {
     if let Pane::Connected(c) = &m.pane {
         let show_cursor = matches!(m.focus(), Focus::Agent(_)) && c.term.modes().cursor_visible;
         c.term.render(area, frame.buffer_mut(), show_cursor);
+        return;
+    }
+    // An overlay clears only its own area, so a centred line would show
+    // through beside it.
+    if !matches!(m.overlay, Overlay::None) {
         return;
     }
     let action = |key: &'static str, text: String| {
@@ -1002,7 +1007,28 @@ fn draw_new(frame: &mut Frame<'_>, m: &Model, form: &NewAgent) {
         field_width,
         task_rows,
     ));
-    lines.push(Line::raw(""));
+    // What's wrong with the branch sits under it, live for a pasted link
+    // and after ⏎ for anything else, since a branch is invalid mid-word.
+    let target_problem = match (form.kind, &derived.submission) {
+        (FormKind::Checkout, Submission::Blocked(Blocked::Target(why)))
+            if form.task.contains("github.com") || form.error.is_some() =>
+        {
+            Some(why.clone())
+        }
+        _ => None,
+    };
+    match &target_problem {
+        Some(why) => lines.extend(
+            wrap(why, inner.saturating_sub(8))
+                .into_iter()
+                .map(|row| Line::from(vec![indent(), Span::styled(row, red)])),
+        ),
+        None => lines.push(Line::raw("")),
+    }
+    let error = form
+        .error
+        .as_ref()
+        .filter(|e| target_problem.as_ref() != Some(e));
 
     // Name: the suggestion DIM with where it came from until one is typed;
     // typed characters that don't fit or aren't allowed are Red.
@@ -1014,13 +1040,26 @@ fn draw_new(frame: &mut Frame<'_>, m: &Model, form: &NewAgent) {
             Some(suggestion) => {
                 name.push(Span::styled(suggestion.name.clone(), dim()));
                 let from = match suggestion.source {
+                    NameSource::Link
+                        if form.kind == FormKind::New
+                            && matches!(form.task.trim().parse(), Ok(Checkout::PullRequest(_))) =>
+                    {
+                        "from the link · Esc then c checks it out".to_string()
+                    }
                     NameSource::Link => "from the link".to_string(),
                     NameSource::Words => "from the prompt".to_string(),
+                    NameSource::Branch => "from the branch".to_string(),
                     NameSource::Model => format!("named by {}", m.harness_label),
                 };
                 source.push(Span::styled(from, dim()));
             }
-            None => name.push(Span::styled("from the prompt, or type one", dim())),
+            None => name.push(Span::styled(
+                match form.kind {
+                    FormKind::New => "from the prompt, or type one",
+                    FormKind::Checkout => "from the branch, or type one",
+                },
+                dim(),
+            )),
         }
         if let NamingState::Asking = form.naming.state {
             source = vec![Span::styled(
@@ -1041,57 +1080,115 @@ fn draw_new(frame: &mut Frame<'_>, m: &Model, form: &NewAgent) {
     }
     lines.push(justify(name, source, inner));
 
-    let message = match (&form.phase, &form.error, check) {
+    let message = match (&form.phase, error, check) {
         (Phase::Submitting { .. }, ..) | (_, None, NameCheck::Empty | NameCheck::Free(_)) => None,
-        (_, Some(error), _) => Some(Span::styled(error.clone(), red)),
-        (_, None, NameCheck::TooLong { bytes }) => Some(Span::styled(
-            format!("{} over zellij's limit", bytes - max),
-            red,
-        )),
-        (_, None, NameCheck::Invalid(why)) => Some(Span::styled(why.clone(), red)),
-        (_, None, NameCheck::Own) => Some(Span::styled("this TUI runs in that session", yellow)),
-        (_, None, NameCheck::MainCheckout { repo }) => Some(Span::styled(
-            format!("{repo}'s main checkout: select it in the list and press ⏎"),
+        (_, Some(error), _) => Some((error.clone(), red)),
+        (_, None, NameCheck::TooLong { bytes }) => {
+            Some((format!("{} over zellij's limit", bytes - max), red))
+        }
+        (_, None, NameCheck::Invalid(why)) => Some((why.clone(), red)),
+        (_, None, NameCheck::Own) => Some(("this TUI runs in that session".into(), yellow)),
+        (_, None, NameCheck::MainCheckout { repo }) => Some((
+            match form.kind {
+                FormKind::New => {
+                    format!("{repo}'s main checkout: select it in the list and press ⏎")
+                }
+                FormKind::Checkout => format!("{repo}'s main checkout: pick another name"),
+            },
             yellow,
         )),
         (_, None, NameCheck::Live { .. } | NameCheck::Exited { .. } | NameCheck::Idle { .. }) => {
-            let text = match &derived.submission {
+            let (text, style) = match &derived.submission {
+                Submission::Ready(Launchable::Checkout {
+                    target: Checkout::Branch(_),
+                    ..
+                }) => ("already on that branch · ⏎ attaches", yellow),
+                Submission::Ready(Launchable::Checkout {
+                    target: Checkout::PullRequest(_),
+                    ..
+                }) => (
+                    "already an agent · ⏎ attaches if its branch is the PR's",
+                    yellow,
+                ),
+                Submission::Blocked(
+                    refused @ (Blocked::OnAnotherBranch(_) | Blocked::InAnotherRepo(_)),
+                ) => {
+                    let text = match refused {
+                        Blocked::InAnotherRepo(repo) => format!("already an agent in {repo}"),
+                        Blocked::OnAnotherBranch(Some(on)) => format!("already an agent on {on}"),
+                        _ => "already an agent on a detached HEAD".to_string(),
+                    };
+                    lines.push(justify(
+                        vec![indent(), Span::styled(text, red)],
+                        vec![Span::styled(format!("{}/{max}", derived.name.len()), dim())],
+                        inner,
+                    ));
+                    lines.push(Line::raw(""));
+                    lines.push(repo_line(m, form, &derived, &fields, inner));
+                    return finish_form(frame, form, &derived, lines, width);
+                }
                 Submission::Ready(Launchable::Attach { task: Some(_), .. }) => {
-                    "already running: the prompt will be typed into it"
+                    ("already running: the prompt will be typed into it", yellow)
                 }
                 Submission::Ready(Launchable::Attach { task: None, .. }) => {
-                    "already running · ⏎ attaches"
+                    ("already running · ⏎ attaches", yellow)
                 }
-                Submission::Ready(Launchable::Resurrect(_)) => "exited · ⏎ resurrects it",
+                Submission::Ready(Launchable::Resurrect(_)) => ("exited · ⏎ resurrects it", yellow),
                 Submission::Blocked(Blocked::ExitedWithPrompt) => {
-                    "exited, so clear the prompt to resurrect it"
+                    ("exited, so clear the prompt to resurrect it", yellow)
                 }
-                Submission::Ready(Launchable::Start { .. }) => "an idle worktree · ⏎ starts it",
-                Submission::Ready(Launchable::Create { .. }) | Submission::Blocked(_) => "",
+                Submission::Ready(Launchable::Start { .. }) => {
+                    ("an idle worktree · ⏎ starts it", yellow)
+                }
+                Submission::Ready(Launchable::Create { .. }) | Submission::Blocked(_) => {
+                    ("", yellow)
+                }
             };
-            Some(Span::styled(text, yellow))
+            Some((text.to_string(), style))
         }
     };
     let length = derived.name.len();
     let counter_style = if length > max { red } else { dim() };
     let counter = vec![Span::styled(format!("{length}/{max}"), counter_style)];
-    if message.is_some() || length > 0 {
-        let mut row = vec![indent()];
-        row.extend(message);
-        lines.push(justify(row, counter, inner));
+    // Worker errors can be long, so they wrap under the name rather than
+    // being cut, with the counter beside the first row.
+    let rows: Vec<String> = match &message {
+        Some((text, _)) => wrap(text, inner.saturating_sub(8 + counter[0].width() + 1)),
+        None => Vec::new(),
+    };
+    if !rows.is_empty() || length > 0 {
+        let style = message.as_ref().map_or(dim(), |(_, style)| *style);
+        let mut rows = rows.into_iter();
+        let mut first = vec![indent()];
+        first.extend(rows.next().map(|row| Span::styled(row, style)));
+        lines.push(justify(first, counter, inner));
+        lines.extend(rows.map(|row| Line::from(vec![indent(), Span::styled(row, style)])));
     }
     lines.push(Line::raw(""));
 
     lines.push(repo_line(m, form, &derived, &fields, inner));
+    finish_form(frame, form, &derived, lines, width);
+}
 
-    let keys = form_keys(form, &derived, usize::from(width).saturating_sub(4));
-
+/// Draws the assembled form, sized to its lines.
+fn finish_form(
+    frame: &mut Frame<'_>,
+    form: &NewAgent,
+    derived: &Derived,
+    lines: Vec<Line<'static>>,
+    width: u16,
+) {
+    let keys = form_keys(form, derived, usize::from(width).saturating_sub(4));
     let height = u16::try_from(lines.len())
         .unwrap_or(u16::MAX)
         .saturating_add(2);
     let area = overlay_area(frame, width, height);
     clear_around(frame, area);
-    let block = overlay_block("New agent", keys, dim()).padding(Padding::horizontal(1));
+    let title = match form.kind {
+        FormKind::New => "New agent",
+        FormKind::Checkout => "Check out for review",
+    };
+    let block = overlay_block(title, keys, dim()).padding(Padding::horizontal(1));
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
@@ -1145,10 +1242,16 @@ fn task_lines(
     };
     let hidden = rows.len().saturating_sub(task_rows);
     rows.drain(..hidden);
+    let (label, placeholder) = match form.kind {
+        FormKind::New => (
+            "prompt",
+            format!("first message for {harness_label} (optional)"),
+        ),
+        FormKind::Checkout => ("branch", "a branch, or a GitHub PR link".to_string()),
+    };
     if rows.is_empty() {
-        let placeholder = format!("first message for {harness_label} (optional)");
         lines.push(Line::from(vec![
-            fields.label(Field::Task, "prompt"),
+            fields.label(Field::Task, label),
             fields.cursor(Field::Task),
             Span::styled(placeholder, dim()),
         ]));
@@ -1156,7 +1259,7 @@ fn task_lines(
         let last = rows.len() - 1;
         for (i, row) in rows.into_iter().enumerate() {
             let lead = match (i, hidden) {
-                (0, 0) => fields.label(Field::Task, "prompt"),
+                (0, 0) => fields.label(Field::Task, label),
                 (0, n) => Span::styled(format!("{:<8}", format!("↑{n}")), dim()),
                 _ => Span::raw(" ".repeat(8)),
             };
@@ -1198,8 +1301,21 @@ fn repo_line(
                 Some(root) => repo.push(Span::styled(root.name().into_owned(), dim())),
                 None => repo.push(Span::styled("none selected", dim())),
             }
-            if fields.focus == Some(Field::Repo) {
-                right.push(Span::styled("type to search · ~/path", dim()));
+            let linked = match form.task.trim().parse() {
+                Ok(Checkout::PullRequest(pr)) if form.kind == FormKind::Checkout => Some(pr),
+                _ => None,
+            };
+            match linked {
+                Some(pr) if root.as_ref().is_none_or(|root| root.name() != pr.repo) => {
+                    right.push(Span::styled(
+                        format!("the link is {}", pr.slug()),
+                        Style::new().fg(Color::Yellow),
+                    ));
+                }
+                _ if fields.focus == Some(Field::Repo) => {
+                    right.push(Span::styled("type to search · ~/path", dim()));
+                }
+                _ => {}
             }
         }
         RepoInput::Search(found) => {
@@ -1274,10 +1390,12 @@ fn form_keys<'a>(form: &'a NewAgent, derived: &Derived, room: usize) -> Vec<Span
             None => ranked("Tab", "next", 4),
         },
     );
-    if form.focus == Field::Task {
-        hints.push(ranked("⌃J", "newline", 5));
+    if form.kind == FormKind::New {
+        if form.focus == Field::Task {
+            hints.push(ranked("⌃J", "newline", 5));
+        }
+        hints.push(ranked("⌃E", "open in $EDITOR", 3));
     }
-    hints.push(ranked("⌃E", "open in $EDITOR", 3));
     hints.push(ranked("Esc", "cancel", 9));
     let used = |hints: &[Hint<'_>]| hints.iter().map(|h| line_width(&h.spans)).sum::<usize>();
     while hints.len() > 2 && used(&hints) > room {

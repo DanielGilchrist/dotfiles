@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::activity::{Activity, Reported};
 use crate::model::{Head, Presence, Running, Worktree};
-use crate::names::{BranchName, Prompt, SessionName};
+use crate::names::{BranchName, Prompt, PullRequest, SessionName};
 use crate::paths::{AgentWorktree, RepoRoot};
 use crate::process::{CommandError, LaunchSpec};
 
@@ -149,6 +149,10 @@ pub enum WorktreeStart {
     Branch(LocalBranch),
     /// A new local branch tracking origin's.
     TrackRemote(RemoteBranch),
+    /// A local branch at origin's, tracking nothing: the remote-tracking
+    /// branch is a fetched pull request head, which no push could update.
+    /// An old local branch of that name is reset to it.
+    AtRemote(RemoteBranch),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -191,6 +195,10 @@ pub trait Vcs: Send + Sync {
         repo: &RepoRoot,
         branch: &BranchName,
     ) -> Result<Option<RemoteBranch>, CommandError>;
+    /// Fetches one ref from origin into its remote-tracking branch, so a
+    /// branch pushed since the last fetch, or a pull request's head, can
+    /// be found. A ref origin lacks is nothing fetched, not a failure.
+    fn fetch(&self, repo: &RepoRoot, what: &Fetch) -> Result<(), CommandError>;
     fn branch_state(
         &self,
         repo: &RepoRoot,
@@ -205,6 +213,49 @@ pub trait Vcs: Send + Sync {
     /// What a worktree has done since it forked from the default branch,
     /// without taking locks the agent working in it might need.
     fn facts(&self, worktree: &Path) -> Result<WorktreeFacts, CommandError>;
+}
+
+/// What to fetch from origin, and the remote-tracking branch it lands in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Fetch {
+    /// The branch itself, into `origin/<branch>`.
+    Branch(BranchName),
+    /// A pull request's head, by the `refs/pull/N/head` ref GitHub keeps
+    /// on the base repo, into `origin/pr/N`. A fork's branch has no name
+    /// of its own on origin, and one it shares with a base branch would
+    /// be the wrong code.
+    PullRequest(u64),
+}
+
+impl Fetch {
+    /// The remote-tracking branch the fetch fills.
+    pub fn branch(&self) -> BranchName {
+        match self {
+            Self::Branch(branch) => branch.clone(),
+            Self::PullRequest(number) => pull_request_branch(*number),
+        }
+    }
+}
+
+/// `pr/N`: the local name a pull request's head is reviewed under.
+pub fn pull_request_branch(number: u64) -> BranchName {
+    format!("pr/{number}")
+        .parse()
+        .unwrap_or_else(|_| unreachable!("pr/<digits> is a valid branch name"))
+}
+
+/// Where a pull request's commits live.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullRequestHead {
+    pub branch: BranchName,
+    /// Opened from a fork, so `branch` names nothing on origin.
+    pub cross_repository: bool,
+}
+
+/// The code host, for what git alone can't answer.
+pub trait Forge: Send + Sync {
+    /// The branch a pull request was opened from, and whether from a fork.
+    fn pull_request_head(&self, pr: &PullRequest) -> Result<PullRequestHead, CommandError>;
 }
 
 /// Where a live session's terminal is, when the host could tell.

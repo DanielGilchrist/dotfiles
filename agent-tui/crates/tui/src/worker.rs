@@ -469,6 +469,15 @@ fn run(backend: &Arc<Backend>, job: Job, msgs: &Sender<Msg>) -> Option<Msg> {
                     ops::create(svc, &name, &repo, task.as_ref(), svc.harness(&harness)?)
                 }
                 Launchable::Attach { name, task } => ops::join(svc, &name.session(), task.as_ref()),
+                Launchable::Checkout { name, repo, target } => {
+                    let repo = match repo {
+                        RepoChoice::Known(root) => root,
+                        RepoChoice::Path(path) => {
+                            ops::repo_for(svc, &path)?.ok_or(ops::Error::NotARepo(path))?
+                        }
+                    };
+                    ops::checkout_launch(svc, &repo, &target, Some(name), svc.harness(&harness)?)
+                }
                 Launchable::Resurrect(name) => ops::join(svc, &name.session(), None),
                 Launchable::Start { at, task } => {
                     ops::start(svc, &at, svc.harness(&harness)?, task)
