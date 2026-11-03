@@ -3,6 +3,9 @@ gui:
   skipStashWarning: true
 git:
   parseEmoji: true
+  autoStashOnPull: true
+  pull:
+    mode: rebase
   diffRenderers:
     - command: difft --color=always
       type: extDiff
