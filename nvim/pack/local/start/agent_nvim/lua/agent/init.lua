@@ -149,11 +149,6 @@ local function open_agent_terminal(name, cmd)
   return Snacks.terminal.open(cmd, {
     win = {
       position = "right",
-      -- The attach runs inside the terminal, so give zellij a beat to
-      -- connect before forcing the resize that makes claude fit this viewport.
-      on_win = function()
-        vim.defer_fn(function() zellij.nudge_resize(name) end, 500)
-      end,
       on_buf = function(self)
         for _, direction in ipairs({ "h", "j", "k", "l" }) do
           vim.keymap.set(
