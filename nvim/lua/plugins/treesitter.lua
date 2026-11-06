@@ -40,9 +40,27 @@ return {
       callback = register_custom_parsers,
     })
 
+    local treesitter = require("nvim-treesitter")
+
     vim.api.nvim_create_autocmd("FileType", {
-      callback = function()
-        pcall(vim.treesitter.start)
+      callback = function(args)
+        local lang = vim.treesitter.language.get_lang(args.match)
+        local missing = lang
+          and not vim.list_contains(treesitter.get_installed(), lang)
+          and vim.list_contains(treesitter.get_available(), lang)
+
+        if missing then
+          treesitter.install(lang):await(function()
+            vim.schedule(function()
+              if vim.api.nvim_buf_is_valid(args.buf) then
+                pcall(vim.treesitter.start, args.buf)
+              end
+            end)
+          end)
+          return
+        end
+
+        pcall(vim.treesitter.start, args.buf)
       end,
     })
 

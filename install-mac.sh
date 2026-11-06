@@ -96,6 +96,7 @@ echo "Installing packages..."
 
 install_brew_package fish
 install_brew_cask wezterm@nightly wezterm
+defaults write com.github.wez.wezterm ApplePressAndHoldEnabled -bool false
 install_brew_package neovim nvim
 install_brew_package gh
 gh extension install dlvhdr/gh-dash

@@ -144,6 +144,7 @@
     ".claude/rules/**",
     "AGENTS.md"
   ],
+  "theme": "dark",
   "idleCompaction": false,
   "skipAutoPermissionPrompt": true,
   "defaultMode": "acceptEdits",

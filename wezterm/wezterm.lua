@@ -60,6 +60,7 @@ local misc = {
     bottom = 0,
   },
   native_macos_fullscreen_mode = true,
+  window_decorations = "TITLE|RESIZE|MACOS_USE_BACKGROUND_COLOR_AS_TITLEBAR_COLOR",
   -- window_background_opacity = 0.90,
   -- macos_window_background_blur = 20,
 

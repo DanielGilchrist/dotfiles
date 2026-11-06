@@ -30,6 +30,7 @@ set -gx RAINFROG_CONFIG "$CONFIG_DIR/rainfrog"
 set -gx ASDF_CONFIG_FILE "$CONFIG_DIR/.asdfrc"
 set -gx ASDF_GOLANG_MOD_VERSION_ENABLED true
 set -gx ASDF_NODEJS_LEGACY_FILE_DYNAMIC_STRATEGY latest_installed
+set -gx RUBY_CONFIGURE_OPTS --with-openssl-dir=/opt/homebrew/opt/openssl@3
 set -gx OPENCODE_DISABLE_CLAUDE_CODE true
 
 set -gx PATH $HOME/.asdf/shims $PATH
