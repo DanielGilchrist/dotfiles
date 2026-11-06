@@ -2,7 +2,7 @@ return {
   "saghen/blink.cmp",
   dependencies = { "saghen/blink.lib" },
   event = { "InsertEnter", "CmdlineEnter" },
-  build = function() require("blink.cmp").build():pwait() end,
+  build = "cargo build --release",
   opts = {
     keymap = {
       preset = "enter",
