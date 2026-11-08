@@ -877,6 +877,14 @@ pub enum Overlay {
         to: SessionName,
         text: String,
     },
+    /// A comment being typed on lines of a diff, for an agent's draft review.
+    Comment {
+        to: SessionName,
+        lines: Vec<crate::review::LineInfo>,
+        text: String,
+        /// Whether it edits a comment already in the draft.
+        edits: bool,
+    },
     /// Working out what removing `name` would lose; the confirmation
     /// replaces this when the answer arrives.
     Planning {

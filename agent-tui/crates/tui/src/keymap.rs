@@ -87,6 +87,8 @@ pub struct Situation {
     pub subagent_row: bool,
     /// [0] reads a diff: a file's, a folder's or a commit's.
     pub diff: bool,
+    /// The selected agent has comments drafted on its diffs.
+    pub draft: bool,
     pub left_agent: bool,
     pub can_edit_checkout: bool,
     pub has_actions: bool,
@@ -148,6 +150,7 @@ impl Situation {
                 m.hover(),
                 Some(crate::document::Hover::Diff(_) | crate::document::Hover::Folder(_))
             ),
+            draft: entry.is_some_and(|e| m.drafts.contains_key(e.name())),
             left_agent,
             can_edit_checkout: selected.is_some(),
             has_actions: entry.is_some() && !m.actions.is_empty(),
@@ -406,7 +409,10 @@ pub const BINDINGS: &[Binding] = &[
     Binding::new(
         &["i"],
         EVERYWHERE,
-        RankBy(|s| (s.on_agent && matches!(s.ctx, Ctx::Turn | Ctx::Changes | Ctx::Main)).then_some(8)),
+        RankBy(|s| {
+            (s.on_agent && matches!(s.ctx, Ctx::Turn | Ctx::Changes | Ctx::Main))
+                .then_some(if s.diff { 4 } else { 8 })
+        }),
         By(|s| s.on_agent.then_some("attach")),
         "Attach the selected agent from any panel, so the nav key returns to where you were.",
     ),
@@ -414,7 +420,7 @@ pub const BINDINGS: &[Binding] = &[
         &["s"],
         EVERYWHERE,
         RankBy(|s| s.can_send.then_some(7)),
-        By(|s| s.on_agent.then_some("send")),
+        By(|s| s.on_agent.then_some(if s.draft { "send review" } else { "send" })),
         "Compose a message to the selected agent without attaching. It is sent now if the agent is at rest, otherwise queued until it is.",
     ),
     Binding::new(
@@ -523,7 +529,14 @@ pub const BINDINGS: &[Binding] = &[
     ),
     Binding::new(
         &["c"],
-        PANELS,
+        Ctxs::of(&[Ctx::Main]),
+        RankBy(|s| s.diff.then_some(8)),
+        By(|s| s.diff.then_some("comment")),
+        "Add a comment on the line, or the selected lines, to this agent's review. s sends every comment as one message, now if the agent is at rest, otherwise queued until it is.",
+    ),
+    Binding::new(
+        &["c"],
+        Ctxs::of(&[Ctx::Agents, Ctx::Turn, Ctx::Changes]),
         Hidden,
         Say("check out"),
         "Check out a branch or a GitHub PR link for review in its own worktree.",
@@ -713,6 +726,7 @@ mod tests {
             tree: true,
             subagent_row: true,
             diff: false,
+            draft: false,
             left_agent: true,
             can_edit_checkout: true,
             has_actions: true,

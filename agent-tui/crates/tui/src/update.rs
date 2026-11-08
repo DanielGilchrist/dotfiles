@@ -167,8 +167,10 @@ fn step(m: &mut Model, msg: Msg) -> Vec<Effect> {
             });
             Vec::new()
         }
-        Msg::Paste(text) if matches!(m.overlay, Overlay::Talk { .. }) => {
-            if let Overlay::Talk { text: typed, .. } = &mut m.overlay {
+        Msg::Paste(text) if matches!(m.overlay, Overlay::Talk { .. } | Overlay::Comment { .. }) => {
+            if let Overlay::Talk { text: typed, .. } | Overlay::Comment { text: typed, .. } =
+                &mut m.overlay
+            {
                 typed.push_str(&sanitize_paste(&text).replace('\r', ""));
             }
             Vec::new()
@@ -773,6 +775,83 @@ fn edit_transcript(m: &mut Model) -> Option<Vec<Effect>> {
     }
 }
 
+/// Puts a comment on `lines` into `to`'s draft, replacing the one that is
+/// already on the first of them. Empty text deletes that one instead.
+fn add_comment(
+    m: &mut Model,
+    to: &SessionName,
+    lines: &[crate::review::LineInfo],
+    text: &str,
+    edits: bool,
+) {
+    let refs: Vec<&crate::review::LineInfo> = lines.iter().collect();
+    let Some(comment) = crate::review::Comment::on(&refs, text.trim().to_string()) else {
+        return;
+    };
+    let draft = m.drafts.entry(to.clone()).or_default();
+    let at = draft
+        .iter()
+        .position(|c| c.path == comment.path && c.at == comment.at);
+    match (at, text.trim().is_empty()) {
+        (Some(i), true) => {
+            draft.remove(i);
+        }
+        (None, true) => {
+            let _ = edits;
+            m.info("type a comment first · Esc closes");
+            m.overlay = Overlay::Comment {
+                to: to.clone(),
+                lines: lines.to_vec(),
+                text: String::new(),
+                edits,
+            };
+            return;
+        }
+        (Some(i), false) => draft[i] = comment,
+        (None, false) => draft.push(comment),
+    }
+    if m.drafts.get(to).is_some_and(Vec::is_empty) {
+        m.drafts.remove(to);
+    }
+    m.diff_view.anchor = None;
+    let n = m.drafts.get(to).map_or(0, Vec::len);
+    m.info(format!(
+        "{n} comment{} drafted for {to} · s sends them",
+        if n == 1 { "" } else { "s" }
+    ));
+}
+
+/// Opens the comment box on the cursor's lines, filled with the comment
+/// already on them.
+fn open_comment(m: &mut Model) {
+    let Some(name) = m.selected_entry().map(|e| e.name().clone()) else {
+        return;
+    };
+    let (from, to) = m.diff_view.span();
+    let lines: Vec<crate::review::LineInfo> = m
+        .docs
+        .lines()
+        .get(from..=to)
+        .unwrap_or_default()
+        .iter()
+        .filter(|l| l.selectable())
+        .cloned()
+        .collect();
+    let Some(first) = lines.first() else {
+        return;
+    };
+    let existing = m
+        .drafts
+        .get(&name)
+        .and_then(|d| d.iter().find(|c| c.covers(first)));
+    m.overlay = Overlay::Comment {
+        to: name,
+        text: existing.map(|c| c.text.clone()).unwrap_or_default(),
+        edits: existing.is_some(),
+        lines,
+    };
+}
+
 /// Keys for [0] while it reads a diff: the line cursor, hunk jumps and
 /// editing at the line. `None` leaves the key to the plain document keys.
 fn diff_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
@@ -803,6 +882,10 @@ fn diff_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
                 -half
             });
             m.diff_view.follow_page = true;
+            return Some(effects);
+        }
+        KeyCode::Char('c') => {
+            open_comment(m);
             return Some(effects);
         }
         KeyCode::Char('e') => {
@@ -1081,7 +1164,8 @@ fn on_nav_key(m: &mut Model, key: KeyEvent) -> Vec<Effect> {
     }
     match key.code {
         KeyCode::Char('q') => {
-            let queued: usize = m.outboxes.values().map(|o| o.queue.len()).sum();
+            let queued: usize = m.outboxes.values().map(|o| o.queue.len()).sum::<usize>()
+                + m.drafts.values().map(Vec::len).sum::<usize>();
             if queued == 0 {
                 return vec![Effect::Quit];
             }
@@ -1151,7 +1235,7 @@ fn on_nav_key(m: &mut Model, key: KeyEvent) -> Vec<Effect> {
             }
         }
         KeyCode::Char('n') => open_form(m, FormKind::New),
-        KeyCode::Char('c') => open_form(m, FormKind::Checkout),
+        KeyCode::Char('c') if !m.main_focused() => open_form(m, FormKind::Checkout),
         KeyCode::Char('s') => {
             if let Some(entry) = selected {
                 open_talk(m, entry.name());
@@ -1337,11 +1421,18 @@ fn open_peek(m: &mut Model) {
 
 /// Queues a message for its agent and sends the first one that can go.
 fn talk(m: &mut Model, to: SessionName, text: String) -> Vec<Effect> {
-    let Ok(prompt) = text.parse::<Prompt>() else {
+    let draft = m.drafts.get(&to).cloned().unwrap_or_default();
+    let message = if draft.is_empty() {
+        text.clone()
+    } else {
+        crate::review::review_message(&text, &draft)
+    };
+    let Ok(prompt) = message.parse::<Prompt>() else {
         m.info("type a message first · Esc closes");
         m.overlay = Overlay::Talk { to, text };
         return Vec::new();
     };
+    m.drafts.remove(&to);
     m.outboxes
         .entry(to.clone())
         .or_default()
@@ -1694,6 +1785,37 @@ fn on_overlay_key(m: &mut Model, key: KeyEvent) -> Vec<Effect> {
                     _ => {}
                 }
                 m.overlay = Overlay::Talk { to, text };
+                Vec::new()
+            }
+        },
+        Overlay::Comment {
+            to,
+            lines,
+            mut text,
+            edits,
+        } => match key.code {
+            KeyCode::Esc => Vec::new(),
+            KeyCode::Enter => {
+                add_comment(m, &to, &lines, &text, edits);
+                Vec::new()
+            }
+            _ => {
+                match key.code {
+                    KeyCode::Backspace => {
+                        text.pop();
+                    }
+                    _ if ctrl(&key, 'u') => text.clear(),
+                    KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        text.push(c);
+                    }
+                    _ => {}
+                }
+                m.overlay = Overlay::Comment {
+                    to,
+                    lines,
+                    text,
+                    edits,
+                };
                 Vec::new()
             }
         },
@@ -5521,5 +5643,55 @@ mod tests {
             m.log_view.navs.values().next().and_then(|n| n.cursor),
             Some(4)
         );
+    }
+
+    #[test]
+    fn comments_on_diff_lines_make_a_draft_that_s_sends_as_one_review() {
+        use crate::review::{Comment, LineInfo, LineKind};
+        let mut m = delegating();
+        let name = m.selected_entry().expect("selected").name().clone();
+        let line = |text: &str, new: usize| LineInfo {
+            row: 0,
+            height: 1,
+            path: "a.rs".into(),
+            kind: LineKind::Added,
+            old: None,
+            new: Some(new),
+            text: text.into(),
+            edit: new,
+        };
+        let lines = vec![line("+let x = 3;", 4)];
+        add_comment(&mut m, &name, &lines, "Use the limit.", false);
+        add_comment(&mut m, &name, &[line("+more", 9)], "Why?", false);
+        assert_eq!(m.drafts[&name].len(), 2);
+
+        add_comment(&mut m, &name, &lines, "Use the configured limit.", true);
+        assert_eq!(
+            m.drafts[&name].len(),
+            2,
+            "the same line replaces its comment"
+        );
+        assert_eq!(m.drafts[&name][0].text, "Use the configured limit.");
+
+        add_comment(&mut m, &name, &[line("+more", 9)], "", true);
+        assert_eq!(
+            m.drafts[&name].len(),
+            1,
+            "empty text on a commented line deletes it"
+        );
+
+        update(&mut m, key(KeyCode::Char('s')));
+        assert!(matches!(m.overlay, Overlay::Talk { .. }));
+        update(&mut m, key(KeyCode::Char('o')));
+        update(&mut m, key(KeyCode::Enter));
+        assert!(m.drafts.is_empty(), "the draft clears once it is queued");
+        let queued = &m.outboxes[&name].queue;
+        let sent: &str = queued.back().expect("queued").as_ref();
+        assert!(sent.starts_with("Review comments."), "{sent}");
+        assert!(
+            sent.contains("\n\no\n\na.rs:4\n> +let x = 3;\nUse the configured limit."),
+            "{sent}"
+        );
+        let _ = Comment::on(&[&line("+x", 1)], String::new());
     }
 }

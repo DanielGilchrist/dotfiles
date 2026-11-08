@@ -3476,6 +3476,34 @@ mod tests {
     }
 
     #[test]
+    fn c_drafts_a_comment_on_the_line_and_the_footer_fits_the_diff_keys_at_100_columns() {
+        use crossterm::event::KeyCode;
+        let mut m = on_a_loaded_diff();
+        let footer = footer_of(&mut m, (100, 30));
+        for hint in ["c comment", "e edit line", "[/] hunk", "Esc back"] {
+            assert!(footer.contains(hint), "{hint}: {footer}");
+        }
+        press(&mut m, KeyCode::Char('j'));
+        press(&mut m, KeyCode::Char('c'));
+        assert!(matches!(m.overlay, crate::model::Overlay::Comment { .. }));
+        let text = screen(&render(&mut m, (140, 40))).join("\n");
+        assert!(
+            text.contains("Comment · crates/tui/src/view/sidebar.rs:"),
+            "{text}"
+        );
+        for c in "Why?".chars() {
+            press(&mut m, KeyCode::Char(c));
+        }
+        press(&mut m, KeyCode::Enter);
+        assert!(matches!(m.overlay, crate::model::Overlay::None));
+        assert_eq!(m.drafts.values().map(Vec::len).sum::<usize>(), 1);
+        press(&mut m, KeyCode::Char('k'));
+        let text = screen(&render(&mut m, (140, 40))).join("\n");
+        assert!(text.contains("✎"), "a commented line is marked\n{text}");
+        assert!(text.contains("1 comment"), "{text}");
+    }
+
+    #[test]
     fn clicks_and_the_wheel_work_on_tree_rows() {
         let mut m = tree_fleet();
         render(&mut m, (100, 50));

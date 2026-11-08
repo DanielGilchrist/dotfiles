@@ -164,7 +164,6 @@ pub fn file(lines: &[LineInfo], from: usize, forward: bool) -> Option<usize> {
 }
 
 /// `path:42`, `path:10-14`, or for removed lines `path:7 (removed)`.
-#[allow(dead_code)]
 pub fn label(path: &Path, selected: &[&LineInfo]) -> String {
     let edits: Vec<usize> = selected.iter().map(|l| l.edit).collect();
     let (Some(first), Some(last)) = (edits.first(), edits.last()) else {
@@ -192,10 +191,8 @@ pub struct Comment {
 }
 
 /// Quoted lines kept per comment.
-#[allow(dead_code)]
 const QUOTED: usize = 6;
 
-#[allow(dead_code)]
 impl Comment {
     pub fn on(selected: &[&LineInfo], text: String) -> Option<Self> {
         let first = selected.first()?;
@@ -220,7 +217,6 @@ impl Comment {
 
 /// The message sent to an agent for a draft: the nvim review format, with
 /// each comment's quoted lines so it finds the code after the lines drift.
-#[allow(dead_code)]
 pub fn review_message(overview: &str, comments: &[Comment]) -> String {
     let mut out = String::from("Review comments. Work through each one.\n");
     let overview = overview.trim();

@@ -61,7 +61,8 @@ types into the embedded session. `?` shows every key.
 | `⏎` | In [1], attach the agent (start or resurrect it if needed) or focus the repo. In [2] and [3], open the item in [0] (on a folder in [3], open or close it). In the peek, attach |
 | `i` | Attach the selected agent from any panel |
 | `0` | Same as `⏎` in [1], [2] and [3] |
-| `s` | Send a message without attaching: now if the agent is at rest, otherwise queued. `⌃X` clears the queue (`t` says `send is s now`) |
+| `s` | Send a message without attaching: now if the agent is at rest, otherwise queued. `⌃X` clears the queue (`t` says `send is s now`). With review comments drafted for the agent it reads `send review`: the comments go as one message after your typed overview |
+| `j` `k` `[` `]` `e` `c` | With [0] on a diff: move a line cursor, jump hunks, open the file at the line in $EDITOR, and comment on the line (`c`). Comments collect in a per-agent draft, marked `✎`, until `s` sends them |
 | `v` | Peek: a read-only float of the agent's terminal. `⏎` or `i` attaches, `s` sends, `Esc` or `v` closes |
 | `⌃\` | Back to NAV from an agent. Twice goes to the previous agent |
 | `h` `l`, `⇧Tab` `Tab` | Previous / next left panel ([1], [2], [3]), also from [0] |
@@ -77,7 +78,7 @@ types into the embedded session. `?` shows every key.
 | `Space` / `/` | Switcher (fuzzy), `⌃N ⌃P` to move |
 | `m` | Pin / unpin (pinned agents get their own tab) |
 | `n` | New agent form: prompt (`⌃E` edits it in $EDITOR), name (suggested from the prompt or a Linear/GitHub link), repo (listed, from the catalogue, or a path) |
-| `c` | Check out for review: a branch name or a GitHub PR link, name (suggested from it), repo (a PR link picks the repo it names). Fetches the branch if git doesn't know it, asks `gh` for a PR's branch (a fork's PR lands on a `pr/N` branch), and attaches instead if an agent already has the branch checked out |
+| `c` | In [1], [2] and [3]: check out for review: a branch name or a GitHub PR link, name (suggested from it), repo (a PR link picks the repo it names). Fetches the branch if git doesn't know it, asks `gh` for a PR's branch (a fork's PR lands on a `pr/N` branch), and attaches instead if an agent already has the branch checked out |
 | `p` | Repo picker: `⏎` focuses a listed repo, or adds one from the catalogue or by a typed path (`~/code/foo`) |
 | `` ` `` | In [3], switch between the directory tree (default) and the flat file list |
 | `-` `=` | In [3]'s tree, close / open every folder |
