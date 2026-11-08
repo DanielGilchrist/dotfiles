@@ -1773,7 +1773,7 @@ mod tests {
         for size in SIZES {
             for agents in FLEETS {
                 let mut m = fleet(agents);
-                m.toggle_view();
+                m.show_view(View::Overview);
                 render(&mut m, size);
                 for _ in 0..agents.min(12) {
                     let before = heights(&m);
@@ -1825,15 +1825,15 @@ mod tests {
         );
         assert_eq!(
             text(&super::super::sidebar_title(&m, 30)),
-            "[1] heucris… · Agents · Pinned"
+            "[1] Agents · heucris… · Pinned"
         );
         assert_eq!(
             text(&super::super::sidebar_title(&m, 40)),
-            "[1] heucristic0 · Agents · Pinned"
+            "[1] Agents · heucristic0 · Pinned"
         );
-        m.toggle_view();
+        m.show_view(View::Overview);
         assert_eq!(text(&super::super::sidebar_title(&m, 29)), "[1] Agents");
-        m.toggle_view();
+        m.show_view(View::Pinned);
         assert_eq!(text(&super::super::sidebar_title(&m, 29)), "[1] Pinned");
         for width in [29, 30, 40] {
             let before = text(&super::super::sidebar_title(&m, width)).contains('·');
@@ -1850,7 +1850,7 @@ mod tests {
     #[test]
     fn repo_children_are_indented_under_their_repo() {
         let mut m = fleet(8);
-        m.toggle_view();
+        m.show_view(View::Overview);
         let lines = texts(&laid(&mut m, (200, 50)).list.lines);
         let repo = lines
             .iter()
@@ -1873,7 +1873,7 @@ mod tests {
     fn a_selection_leaving_needs_you_keeps_its_row_when_the_list_scrolls() {
         let size = (80, 24);
         let mut m = fleet(80);
-        m.toggle_view();
+        m.show_view(View::Overview);
         render(&mut m, size);
         let agent = name("auth-refresh-2");
         m.set_cursor(Cursor::Entry(agent.clone()));
@@ -1903,7 +1903,7 @@ mod tests {
     #[test]
     fn the_agent_panel_shows_state_tree_and_staleness() {
         let mut m = fleet(8);
-        m.toggle_view();
+        m.show_view(View::Overview);
         let mut activities = m.activities.clone().expect("succeeds");
         activities.insert(
             name("payroll-fix-3"),
@@ -1978,7 +1978,7 @@ mod tests {
     #[test]
     fn readiness_opens_changes_and_shows_without_files() {
         let mut m = fleet(8);
-        m.toggle_view();
+        m.show_view(View::Overview);
         m.set_cursor(Cursor::Entry(name("payroll-fix-3")));
         let first = laid(&mut m, (200, 50));
         let (panel, _) = first.changes.as_ref().expect("[3] shows");
@@ -2021,7 +2021,7 @@ mod tests {
     #[test]
     fn the_turn_panel_is_a_row_for_the_turn_then_one_per_subagent() {
         let mut m = fleet(8);
-        m.toggle_view();
+        m.show_view(View::Overview);
         m.set_cursor(Cursor::Entry(name("obs-layout-4")));
         let first = laid(&mut m, (200, 50));
         let lines = agent_lines(&first);
@@ -2114,7 +2114,7 @@ mod tests {
     #[test]
     fn focusing_a_lower_panel_never_moves_the_list() {
         let mut m = fleet(20);
-        m.toggle_view();
+        m.show_view(View::Overview);
         m.set_cursor(Cursor::Entry(name("obs-layout-4")));
         let before = laid(&mut m, (80, 24));
         let offset = m.scroll.offset;
@@ -2142,7 +2142,7 @@ mod tests {
     fn the_readiness_row_never_eats_the_file_rows() {
         for height in 12..=24 {
             let mut m = fleet(8);
-            m.toggle_view();
+            m.show_view(View::Overview);
             m.set_cursor(Cursor::Entry(name("payroll-fix-3")));
             let laid = laid(&mut m, (80, height));
             let Some((panel, changes)) = laid.changes.as_ref() else {
@@ -2734,7 +2734,7 @@ mod tests {
     #[test]
     fn a_repo_row_shows_its_checkouts_in_the_main_view() {
         let mut m = fleet(10);
-        m.toggle_view();
+        m.show_view(View::Overview);
         let key = m
             .snapshot()
             .expect("loaded")

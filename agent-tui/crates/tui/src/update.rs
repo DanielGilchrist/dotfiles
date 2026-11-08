@@ -2234,6 +2234,7 @@ mod tests {
             "claude".parse().expect("parses"),
             "claude".into(),
         );
+        m.view = crate::model::View::Focus;
         m.visibility = Visibility::All;
         update(
             &mut m,
@@ -2273,7 +2274,7 @@ mod tests {
     #[test]
     fn overview_expands_only_the_selected_repo_and_collapses_single_entry_repos() {
         let mut m = model(&[]);
-        update(&mut m, key(KeyCode::Char(']')));
+        update(&mut m, key(KeyCode::Char('[')));
         let rows = m.rows();
         assert_eq!(rows.len(), 5, "{rows:?}");
         assert!(
@@ -2284,7 +2285,7 @@ mod tests {
     #[test]
     fn enter_on_a_repo_row_focuses_it() {
         let mut m = model(&[]);
-        update(&mut m, key(KeyCode::Char(']')));
+        update(&mut m, key(KeyCode::Char('[')));
         update(&mut m, key(KeyCode::Char('g')));
         assert!(matches!(m.cursor(), Some(Cursor::Repo(_))));
         update(&mut m, key(KeyCode::Enter));
@@ -2593,7 +2594,7 @@ mod tests {
             "the same agent keeps [2]"
         );
         update(&mut m, key(KeyCode::Esc));
-        update(&mut m, key(KeyCode::Char(']')));
+        update(&mut m, key(KeyCode::Char('[')));
         update(&mut m, key(KeyCode::Char('g')));
         assert!(matches!(m.cursor(), Some(Cursor::Repo(_))));
         update(&mut m, key(KeyCode::Char('2')));
@@ -2697,9 +2698,9 @@ mod tests {
         let mut m = model(&["fix"]);
         with_changes(&mut m, 3);
         with_turn(&mut m);
-        update(&mut m, key(KeyCode::Char(']')));
-        assert_eq!(m.view, View::Overview);
         update(&mut m, key(KeyCode::Char('[')));
+        assert_eq!(m.view, View::Overview);
+        update(&mut m, key(KeyCode::Char(']')));
         assert_eq!(m.view, View::Focus);
         update(&mut m, key(KeyCode::Char('2')));
         update(&mut m, key(KeyCode::Char(']')));
@@ -2901,6 +2902,7 @@ mod tests {
             "claude".parse().expect("parses"),
             "claude".into(),
         );
+        m.view = crate::model::View::Focus;
         m.visibility = Visibility::All;
         update(&mut m, Msg::Snapshot(Ok((snapshot, Vec::new()))));
         update(&mut m, key(KeyCode::Char('c')));
@@ -3422,6 +3424,7 @@ mod tests {
             "claude".parse().expect("parses"),
             "claude".into(),
         );
+        m.view = crate::model::View::Focus;
         m.visibility = Visibility::All;
         m.follow = Some(Follow::Restored(name("web")));
         update(
@@ -3456,6 +3459,7 @@ mod tests {
             "claude".parse().expect("parses"),
             "claude".into(),
         );
+        m.view = crate::model::View::Focus;
         m.visibility = Visibility::All;
         m.follow = Some(Follow::Restored(name("web")));
         update(
@@ -3486,6 +3490,7 @@ mod tests {
             "claude".parse().expect("parses"),
             "claude".into(),
         );
+        m.view = crate::model::View::Focus;
         m.visibility = Visibility::All;
         update(
             &mut m,
@@ -3549,7 +3554,7 @@ mod tests {
             "asking beats an older done"
         );
         assert_eq!(m.attention().title(), "◆1 ✓1 · agent");
-        update(&mut m, key(KeyCode::Char(']')));
+        update(&mut m, key(KeyCode::Char('[')));
         let rows = m.rows();
         assert_eq!(rows[0], Row::Header(crate::model::Group::NeedsYou));
         assert_eq!(
@@ -3572,7 +3577,7 @@ mod tests {
     fn the_selection_follows_an_agent_into_and_out_of_needs_you() {
         use agent_core::activity::State;
         let mut m = two_live();
-        update(&mut m, key(KeyCode::Char(']')));
+        update(&mut m, key(KeyCode::Char('[')));
         m.set_cursor(Cursor::Entry(name("fix")));
         update(
             &mut m,
@@ -3590,11 +3595,11 @@ mod tests {
     }
 
     #[test]
-    fn tab_cycles_repo_agents_pinned_and_back() {
+    fn tab_cycles_agents_repo_pinned_and_back() {
         let mut m = model(&["fix"]);
-        assert_eq!(m.view, View::Focus);
+        m.view = View::Overview;
         update(&mut m, key(KeyCode::Char(']')));
-        assert_eq!(m.view, View::Overview);
+        assert_eq!(m.view, View::Focus);
         update(&mut m, key(KeyCode::Char(']')));
         assert_eq!(m.view, View::Pinned);
         assert_eq!(
@@ -3603,18 +3608,29 @@ mod tests {
             "the selected agent is pinned, so it stays selected"
         );
         update(&mut m, key(KeyCode::Char(']')));
-        assert_eq!(m.view, View::Focus);
-        assert_eq!(m.cursor(), Some(&Cursor::Entry(name("fix"))));
+        assert_eq!(m.view, View::Overview);
         update(&mut m, key(KeyCode::Char('[')));
         assert_eq!(m.view, View::Pinned);
         update(&mut m, key(KeyCode::Char('[')));
+        assert_eq!(m.view, View::Focus);
+        update(&mut m, key(KeyCode::Char('[')));
+        assert_eq!(m.view, View::Overview);
+    }
+
+    #[test]
+    fn a_new_model_starts_on_the_agents_tab() {
+        let m = Model::new(
+            "/".into(),
+            None,
+            "claude".parse().expect("parses"),
+            "claude".into(),
+        );
         assert_eq!(m.view, View::Overview);
     }
 
     #[test]
     fn the_pinned_tab_lists_pins_then_the_other_agents_that_need_you() {
         let mut m = model(&["api"]);
-        update(&mut m, key(KeyCode::Char(']')));
         update(&mut m, key(KeyCode::Char(']')));
         let pin = Row::Entry {
             name: name("api"),
@@ -3649,7 +3665,6 @@ mod tests {
     fn a_waiting_pin_stays_in_its_place_on_the_pinned_tab() {
         let mut m = model(&["fix"]);
         update(&mut m, key(KeyCode::Char(']')));
-        update(&mut m, key(KeyCode::Char(']')));
         update(
             &mut m,
             Msg::Activities(HashMap::from([(name("fix"), asking("rm?", 5))])),
@@ -3667,7 +3682,6 @@ mod tests {
     #[test]
     fn an_empty_pinned_tab_selects_nothing_and_a_repo_pick_leaves_it() {
         let mut m = model(&[]);
-        update(&mut m, key(KeyCode::Char(']')));
         update(&mut m, key(KeyCode::Char(']')));
         assert_eq!(m.rows(), Vec::new());
         assert_eq!(m.cursor(), None, "nothing to select");
@@ -3690,7 +3704,6 @@ mod tests {
         );
         m.set_cursor(Cursor::Entry(name("api")));
         update(&mut m, key(KeyCode::Char(']')));
-        update(&mut m, key(KeyCode::Char(']')));
         assert_eq!(m.view, View::Pinned);
         assert_eq!(
             m.cursor(),
@@ -3702,7 +3715,6 @@ mod tests {
     #[test]
     fn selecting_an_agent_the_pinned_tab_lacks_moves_to_the_agents_tab() {
         let mut m = model(&["api"]);
-        update(&mut m, key(KeyCode::Char(']')));
         update(&mut m, key(KeyCode::Char(']')));
         m.set_cursor(Cursor::Entry(name("fix")));
         assert_eq!(m.view, View::Overview);
@@ -3722,15 +3734,15 @@ mod tests {
         let mut m = model(&["api"]);
         assert_eq!(m.cursor(), Some(&Cursor::Entry(name("fix"))));
         update(&mut m, key(KeyCode::Char(']')));
-        update(&mut m, key(KeyCode::Char(']')));
         assert_eq!(m.cursor(), Some(&Cursor::Entry(name("api"))));
+        update(&mut m, key(KeyCode::Char(']')));
         update(&mut m, key(KeyCode::Char(']')));
         assert_eq!(m.view, View::Focus);
         assert_eq!(m.cursor(), Some(&Cursor::Entry(name("fix"))));
 
-        update(&mut m, key(KeyCode::Char(']')));
-        update(&mut m, key(KeyCode::Char(']')));
+        update(&mut m, key(KeyCode::Char('[')));
         m.set_cursor(Cursor::Entry(name("api")));
+        update(&mut m, key(KeyCode::Char(']')));
         update(&mut m, key(KeyCode::Char(']')));
         assert_eq!(
             m.cursor(),
@@ -3747,7 +3759,6 @@ mod tests {
             Msg::Activities(HashMap::from([(name("fix"), asking("rm?", 5))])),
         );
         m.set_cursor(Cursor::Entry(name("idle")));
-        update(&mut m, key(KeyCode::Char(']')));
         update(&mut m, key(KeyCode::Char(']')));
         assert_eq!(m.view, View::Pinned);
         assert_eq!(m.cursor(), Some(&Cursor::Entry(name("web"))));
@@ -3801,6 +3812,7 @@ mod tests {
             "claude".parse().expect("parses"),
             "claude".into(),
         );
+        m.view = crate::model::View::Focus;
         m.visibility = Visibility::All;
         update(
             &mut m,
@@ -3811,7 +3823,6 @@ mod tests {
             Msg::Activities(HashMap::from([(name("fix"), asking("rm?", 5))])),
         );
         m.set_cursor(Cursor::Entry(name("tools")));
-        update(&mut m, key(KeyCode::Char(']')));
         update(&mut m, key(KeyCode::Char(']')));
         let pin = Cursor::Entry(name("api"));
         assert_eq!(
@@ -3824,6 +3835,7 @@ mod tests {
             Msg::Snapshot(Ok((snapshot_with_tools(false), Vec::new()))),
         );
         assert_eq!(m.cursor(), Some(&pin));
+        update(&mut m, key(KeyCode::Char(']')));
         update(&mut m, key(KeyCode::Char(']')));
         assert_eq!(m.view, View::Focus);
         assert_eq!(m.cursor(), Some(&pin), "the gone agent is forgotten");
@@ -3936,10 +3948,10 @@ mod tests {
     #[test]
     fn overview_drops_repos_with_nothing_listed_and_the_pinned_tab_keeps_every_pin() {
         let mut m = filtered(&["web"]);
-        update(&mut m, key(KeyCode::Char(']')));
+        update(&mut m, key(KeyCode::Char('[')));
         assert_eq!(m.view, View::Overview);
         assert_eq!(listed(&m), ["repo /src/api", "fix"], "web has no session");
-        update(&mut m, key(KeyCode::Char(']')));
+        update(&mut m, key(KeyCode::Char('[')));
         assert_eq!(m.view, View::Pinned);
         assert_eq!(listed(&m), ["web"], "pins show whatever their state");
         assert_eq!(m.hidden(), 0, "the filter doesn't apply here");

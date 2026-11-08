@@ -152,16 +152,16 @@ pub enum Direction {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum View {
-    /// One repo.
-    Focus,
     /// Every repo.
     Overview,
+    /// One repo.
+    Focus,
     /// The pinned agents.
     Pinned,
 }
 
 impl View {
-    pub const ALL: [Self; 3] = [Self::Focus, Self::Overview, Self::Pinned];
+    pub const ALL: [Self; 3] = [Self::Overview, Self::Focus, Self::Pinned];
 
     fn index(self) -> usize {
         Self::ALL.iter().position(|v| *v == self).unwrap_or(0)
@@ -1098,7 +1098,7 @@ impl Model {
     ) -> Self {
         Self {
             load: Load::Pending,
-            view: View::Focus,
+            view: View::Overview,
             pane: Pane::Empty,
             overlay: Overlay::None,
             mru: Vec::new(),
@@ -2276,6 +2276,13 @@ impl Model {
     #[cfg(test)]
     pub fn toggle_view(&mut self) {
         self.cycle_view(Direction::Forward);
+    }
+
+    #[cfg(test)]
+    pub fn show_view(&mut self, view: View) {
+        while self.view != view {
+            self.cycle_view(Direction::Forward);
+        }
     }
 
     /// Moves to the next or previous tab, keeping the selected agent when

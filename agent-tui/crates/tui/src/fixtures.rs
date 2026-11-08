@@ -250,6 +250,7 @@ pub fn fleet(n: usize) -> Model {
         "claude".parse().expect("parses"),
         "claude".into(),
     );
+    m.view = crate::model::View::Focus;
     update(&mut m, Msg::Snapshot(Ok((snapshot, Vec::new()))));
     m.activities = Some(activities);
     m.facts = facts_of;
