@@ -1537,6 +1537,8 @@ fn draw_talk(frame: &mut Frame<'_>, m: &Model, to: &SessionName, text: &str) {
     };
     let title = if ready {
         format!("Send to {to}")
+    } else if m.awaiting_report(to) {
+        format!("Send to {to} · queues until it reports")
     } else {
         format!("Send to {to} · queues until it's at rest")
     };

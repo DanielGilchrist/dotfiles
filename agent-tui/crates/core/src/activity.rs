@@ -267,7 +267,17 @@ pub struct Activity {
     /// processes that don't descend from it are from a session it replaced.
     #[serde(default)]
     pub launcher: Option<u32>,
+    /// When the current session was launched through `agent`, which records
+    /// it before the harness starts. Absent for sessions an older binary
+    /// started.
+    #[serde(default)]
+    pub launched: Option<SystemTime>,
 }
+
+/// How much earlier than a bound a launch may be recorded and still count
+/// as the session the bound is about: the TUI notices a session a moment
+/// after it is launched.
+pub const LAUNCH_SLACK: Duration = Duration::from_secs(15);
 
 /// How long a session that just reported starting must stay quiet before
 /// typed text is safe: a startup dialog (trust, resume) fires no hook.
@@ -291,6 +301,7 @@ impl Activity {
             subagents: BTreeMap::new(),
             booting: false,
             launcher: None,
+            launched: None,
         });
         let booting = matches!(
             reported,
@@ -302,6 +313,7 @@ impl Activity {
         );
         if let Event::Launched { pid } = &reported.event {
             activity.launcher = *pid;
+            activity.launched = Some(now);
         }
         let before = activity.state.clone();
         let answered = activity.answer(&reported);
@@ -560,17 +572,23 @@ impl Activity {
             && self.running() == 0
     }
 
-    /// [`Self::at_rest`], and the harness has reported after `not_before`
-    /// (the session was live by then, so this isn't a record of an earlier
-    /// run), and a session that only just reported starting has had
-    /// [`BOOT_QUIET`] to show a dialog.
+    /// [`Self::at_rest`], the bound is met, and a session that only just
+    /// reported starting has had [`BOOT_QUIET`] to show a dialog.
     pub fn ready_for_text(&self, not_before: Option<SystemTime>, now: SystemTime) -> bool {
         self.at_rest()
-            && not_before.is_none_or(|t| self.heard > t)
+            && self.bound_met(not_before)
             && !(self.booting
                 && now
                     .duration_since(self.heard)
                     .is_ok_and(|quiet| quiet < BOOT_QUIET))
+    }
+
+    /// The record can't be from before the session `not_before` marks: it
+    /// has launched since (so its own boot state is authoritative), or the
+    /// harness has reported after it.
+    pub fn bound_met(&self, not_before: Option<SystemTime>) -> bool {
+        not_before
+            .is_none_or(|t| self.heard > t || self.launched.is_some_and(|l| l + LAUNCH_SLACK >= t))
     }
 
     /// How many subagents are still running.
@@ -639,6 +657,8 @@ struct Stored {
     booting: bool,
     #[serde(default)]
     launcher: Option<u32>,
+    #[serde(default)]
+    launched: Option<SystemTime>,
 }
 
 #[derive(Deserialize)]
@@ -666,6 +686,7 @@ impl From<Stored> for Activity {
             subagents,
             booting,
             launcher,
+            launched,
         } = stored;
         let state = match state {
             StoredState::Current(state) => state,
@@ -689,6 +710,7 @@ impl From<Stored> for Activity {
             subagents,
             booting,
             launcher,
+            launched,
         }
     }
 }
@@ -1228,6 +1250,25 @@ mod tests {
             !a.ready_for_text(Some(at(20)), at(30)),
             "a record from an earlier run"
         );
+    }
+
+    #[test]
+    fn a_launch_at_or_after_the_bound_makes_the_record_its_own_authority() {
+        let a = run(vec![
+            (20, main(Event::Launched { pid: Some(7) })),
+            (30, main(finished(&[]))),
+        ]);
+        assert!(a.launched.is_some());
+        assert!(a.ready_for_text(Some(at(25)), at(100)));
+        assert!(a.ready_for_text(Some(at(20 + LAUNCH_SLACK.as_secs())), at(100)));
+        assert!(
+            !a.ready_for_text(Some(at(500)), at(900)),
+            "a launch far before the bound doesn't count"
+        );
+        let a = run(vec![(10, main(finished(&[])))]);
+        assert!(a.launched.is_none());
+        assert!(!a.ready_for_text(Some(at(20)), at(1000)), "no lapse");
+        assert!(!a.bound_met(Some(at(20))));
     }
 
     #[test]

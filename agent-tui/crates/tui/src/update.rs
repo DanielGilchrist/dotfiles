@@ -1183,6 +1183,8 @@ fn talk(m: &mut Model, to: SessionName, text: String) -> Vec<Effect> {
     let effects = flush(m);
     if m.outboxes.get(&to).is_some_and(|o| o.in_flight) {
         m.info(format!("sent to {to}"));
+    } else if m.awaiting_report(&to) {
+        m.info(format!("queued · waiting for {to} to report"));
     } else {
         m.info(format!("queued for {to} · sends when it's at rest"));
     }
@@ -4797,7 +4799,7 @@ mod tests {
     }
 
     #[test]
-    fn a_resting_agent_that_stays_quiet_gets_the_message_once_the_bound_lapses() {
+    fn a_launchless_record_stays_queued_until_a_new_hook_with_no_lapse() {
         let mut m = crate::fixtures::fleet(10);
         set_state(&mut m, AGENT, done(), 1);
         live_since(&mut m, 2);
@@ -4805,8 +4807,40 @@ mod tests {
             replies(&talk_to(&mut m, AGENT, "rebase")),
             Vec::<String>::new()
         );
-        live_since(&mut m, 90);
-        assert_eq!(replies(&tick(&mut m)), ["rebase"]);
+        assert!(m.awaiting_report(&name(AGENT)));
+        assert!(
+            m.status
+                .as_ref()
+                .is_some_and(|s| s.text.contains("waiting for"))
+        );
+        std::thread::sleep(Duration::from_millis(5));
+        assert_eq!(replies(&tick(&mut m)), Vec::<String>::new());
+        assert_eq!(replies(&report(&mut m, reported(done(), 0))), ["rebase"]);
+    }
+
+    #[test]
+    fn a_quiet_agent_launched_before_the_tui_saw_it_live_sends_at_rest() {
+        let mut m = crate::fixtures::fleet(10);
+        let mut a = reported(done(), 20);
+        a.launched = Some(SystemTime::now() - Duration::from_secs(25));
+        report(&mut m, a);
+        live_since(&mut m, 20);
+        assert_eq!(replies(&talk_to(&mut m, AGENT, "rebase")), ["rebase"]);
+    }
+
+    #[test]
+    fn a_booting_record_never_sends_within_the_quiet_time() {
+        let mut m = crate::fixtures::fleet(10);
+        let mut a = reported(done(), 1);
+        a.launched = Some(SystemTime::now() - Duration::from_secs(1));
+        a.booting = true;
+        report(&mut m, a);
+        live_since(&mut m, 30);
+        assert_eq!(
+            replies(&talk_to(&mut m, AGENT, "rebase")),
+            Vec::<String>::new()
+        );
+        assert_eq!(replies(&tick(&mut m)), Vec::<String>::new());
     }
 
     #[test]

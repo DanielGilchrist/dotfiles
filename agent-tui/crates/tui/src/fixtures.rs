@@ -39,6 +39,7 @@ pub fn reported(state: State, secs_ago: u64) -> Activity {
         subagents: BTreeMap::new(),
         booting: false,
         launcher: None,
+        launched: None,
     }
 }
 

@@ -26,10 +26,6 @@ pub const INFO_TTL: Duration = Duration::from_secs(4);
 /// How long the prompt must be still before the model is asked.
 pub const NAMING_DEBOUNCE: Duration = Duration::from_millis(900);
 /// Prompts this short are named from their words; asking isn't worth it.
-/// How long after a session's start a message waits for a report to postdate
-/// it. A session at rest reports nothing until it's spoken to, so the wait
-/// can't be forever.
-const BOUND_LAPSES: Duration = Duration::from_secs(60);
 const NAMING_MIN_WORDS: usize = 3;
 
 /// The sidebar panel `j`/`k` act on in NAV, and how far it has moved.
@@ -1666,13 +1662,20 @@ impl Model {
     }
 
     /// The moment a hook report has to postdate before typing into `name`
-    /// is safe: its session's latest start as far as this TUI knows, until
-    /// [`BOUND_LAPSES`] have passed.
+    /// is safe: its session's latest start as far as this TUI knows. A
+    /// record that has itself launched since doesn't need it.
     pub fn not_before(&self, name: &SessionName) -> Option<SystemTime> {
         let seen = self.live_since.get(name).copied().flatten();
         let launched = self.launched_at.get(name).copied();
         seen.max(launched)
-            .filter(|t| t.elapsed().is_ok_and(|age| age < BOUND_LAPSES))
+    }
+
+    /// `name` is at rest but hasn't reported since its session started and
+    /// never recorded a launch, so nothing can tell a restart from a record
+    /// left by an earlier run.
+    pub fn awaiting_report(&self, name: &SessionName) -> bool {
+        self.activity(name)
+            .is_some_and(|a| a.at_rest() && !a.bound_met(self.not_before(name)))
     }
 
     /// Whether text typed now into `name` can't answer a prompt as far as
