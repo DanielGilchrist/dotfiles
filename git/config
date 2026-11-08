@@ -45,6 +45,9 @@
 [help]
   autocorrect = prompt
 
+[pull]
+  rebase = true
+
 [push]
   default = simple
   autoSetupRemote = true
