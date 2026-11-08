@@ -110,6 +110,8 @@ pub enum Effect {
     Quit,
     /// Ring the terminal's bell.
     Bell,
+    /// Put text on the clipboard through the terminal (OSC 52).
+    Copy(String),
     /// Ask the terminal the TUI runs in to set a user variable.
     TerminalEvent {
         name: EventName,
@@ -775,6 +777,23 @@ fn edit_transcript(m: &mut Model) -> Option<Vec<Effect>> {
     }
 }
 
+/// Copies `text` to the clipboard and says so.
+fn copy(m: &mut Model, text: String) -> Vec<Effect> {
+    if text.is_empty() {
+        m.info("nothing to copy");
+        return Vec::new();
+    }
+    let shown: String = text
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .chars()
+        .take(40)
+        .collect();
+    m.info(format!("copied {shown}"));
+    vec![Effect::Copy(text)]
+}
+
 /// Puts a comment on `lines` into `to`'s draft, replacing the one that is
 /// already on the first of them. Empty text deletes that one instead.
 fn add_comment(
@@ -888,6 +907,16 @@ fn branch_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
             m.diff_view.owner = None;
             return Some(effects);
         }
+        KeyCode::Char('y') => {
+            let line = lines.get(at)?;
+            let text = match line.kind {
+                crate::review::LineKind::Commit => {
+                    line.text.split(' ').next().unwrap_or_default().to_string()
+                }
+                _ => line.path.to_string_lossy().into_owned(),
+            };
+            return Some(copy(m, text));
+        }
         KeyCode::Char('e') => {
             let line = lines.get(at)?;
             if line.kind != crate::review::LineKind::Entry {
@@ -958,6 +987,27 @@ fn diff_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
         KeyCode::Char('c') => {
             open_comment(m);
             return Some(effects);
+        }
+        KeyCode::Char('y') => {
+            let (from, to) = m.diff_view.span();
+            let selected: Vec<&crate::review::LineInfo> = lines
+                .get(from..=to)
+                .unwrap_or_default()
+                .iter()
+                .filter(|l| l.selectable())
+                .collect();
+            let text = if m.diff_view.anchor.is_some() {
+                selected
+                    .iter()
+                    .map(|l| l.text.chars().skip(1).collect::<String>())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            } else {
+                let line = lines.get(at)?;
+                crate::review::label(&line.path, &[line])
+            };
+            m.diff_view.anchor = None;
+            return Some(copy(m, text));
         }
         KeyCode::Char('V') => {
             m.diff_view.anchor = match m.diff_view.anchor {
@@ -1059,6 +1109,11 @@ fn log_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
             nav.all = false;
             nav.open.clear();
         }
+        KeyCode::Char('y') => {
+            let text = crate::log::entry_text(entries.get(at)?);
+            nav.cursor = Some(at);
+            return Some(copy(m, text));
+        }
         KeyCode::Char('e') => {
             let root = m.selected_entry()?.path()?.to_path_buf();
             let title = m
@@ -1092,6 +1147,19 @@ fn sanitize_paste(text: &str) -> String {
 /// Keys that choose the panel `j`/`k` act on, and those a panel gives its
 /// own meaning. `None` leaves the key to NAV.
 fn on_panel_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
+    if m.main_focused()
+        && code == KeyCode::Char('y')
+        && let Some(crate::document::Hover::Turn(name)) = m.hover()
+    {
+        let message = m
+            .selected_entry()
+            .and_then(|e| crate::view::turn_message(m, e));
+        let Some(text) = message else {
+            m.info(format!("{name} has no message to copy"));
+            return Some(Vec::new());
+        };
+        return Some(copy(m, text));
+    }
     if m.main_focused()
         && code == KeyCode::Esc
         && m.diff_view.anchor.is_some()
@@ -5811,5 +5879,30 @@ mod tests {
             "{sent}"
         );
         let _ = Comment::on(&[&line("+x", 1)], String::new());
+    }
+
+    #[test]
+    fn y_in_a_subagent_log_copies_the_entry_under_the_cursor() {
+        let mut m = delegating();
+        update(&mut m, key(KeyCode::Char('2')));
+        update(&mut m, key(KeyCode::Char('j')));
+        with_log(&mut m, true);
+        update(&mut m, key(KeyCode::Char('0')));
+        update(&mut m, key(KeyCode::Char('j')));
+        let effects = update(&mut m, key(KeyCode::Char('y')));
+        assert!(matches!(effects.as_slice(), [Effect::Copy(text)] if text == "one"));
+    }
+
+    #[test]
+    fn y_on_the_turn_copies_the_agents_message() {
+        let mut m = crate::fixtures::fleet(10);
+        m.set_cursor(Cursor::Entry(name("auth-refresh-2")));
+        update(&mut m, key(KeyCode::Char('2')));
+        update(&mut m, key(KeyCode::Char('0')));
+        let effects = update(&mut m, key(KeyCode::Char('y')));
+        assert!(
+            matches!(effects.as_slice(), [Effect::Copy(text)] if text.contains("token refresh")),
+            "the message is copied"
+        );
     }
 }

@@ -239,6 +239,27 @@ pub fn markdown(detail: &SubagentDetail, title: &str) -> (String, Vec<usize>) {
     (out, starts)
 }
 
+/// What `y` copies for an entry: the prompt or text, or a call's input and
+/// result.
+pub fn entry_text(entry: &Entry<'_>) -> String {
+    let call = |c: &Call| {
+        if c.output.is_empty() {
+            c.input.clone()
+        } else {
+            format!("{}\n\n{}", c.input, c.output)
+        }
+    };
+    match entry {
+        Entry::Prompt(text) | Entry::Said(text) => (*text).to_string(),
+        Entry::Call(c) => call(c),
+        Entry::Group { calls, .. } | Entry::Repeat(calls) => calls
+            .iter()
+            .map(|c| call(c))
+            .collect::<Vec<_>>()
+            .join("\n\n"),
+    }
+}
+
 /// A target as one plain line.
 pub fn target_text(target: &Target) -> String {
     match target {

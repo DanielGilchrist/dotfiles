@@ -62,6 +62,7 @@ types into the embedded session. `?` shows every key.
 | `i` | Attach the selected agent from any panel |
 | `0` | Same as `⏎` in [1], [2] and [3] |
 | `s` | Send a message without attaching: now if the agent is at rest, otherwise queued. `⌃X` clears the queue (`t` says `send is s now`). With review comments drafted for the agent it reads `send review`: the comments go as one message after your typed overview |
+| `y` | With [0] focused: copy to the clipboard through the terminal (OSC 52): `path:line` or the selected lines of a diff, a commit's sha, the agent's message, a subagent's log entry |
 | `⏎` | With [0] on the branch: open the commit (its files and diffs) or uncommitted file under the cursor, `Esc` goes back |
 | `j` `k` `[` `]` `J` `K` `V` `e` `c` | With [0] on a diff: move a line cursor, jump hunks and files, select a range (`V`), open the file at the line in $EDITOR, and comment on the line or range (`c`). Comments collect in a per-agent draft, marked `✎`, until `s` sends them |
 | `v` | Peek: a read-only float of the agent's terminal. `⏎` or `i` attaches, `s` sends, `Esc` or `v` closes |

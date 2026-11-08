@@ -1368,7 +1368,7 @@ pub(super) fn others_on(m: &Model, name: &SessionName, path: &Path) -> Vec<Strin
 }
 
 /// What the selected agent says about what it's doing, in full.
-pub(super) fn turn_message(m: &Model, entry: &Entry) -> Option<String> {
+pub(crate) fn turn_message(m: &Model, entry: &Entry) -> Option<String> {
     let status = m.status(entry);
     let heard = m.activity(entry.name()).map_or(m.now, |a| a.heard);
     Gist::of(&status, heard, m.now)?.message()
@@ -3625,6 +3625,27 @@ mod tests {
         assert!(m.main_focused());
         press(&mut m, KeyCode::Char('K'));
         assert_eq!(m.panel.listed(), before);
+    }
+
+    #[test]
+    fn y_copies_the_place_the_selected_lines_a_sha_and_a_log_entry() {
+        use crate::update::Effect;
+        use crossterm::event::KeyCode;
+        let copied = |effects: Vec<Effect>| match effects.as_slice() {
+            [Effect::Copy(text)] => text.clone(),
+            other => panic!("expected one copy, got {} effects", other.len()),
+        };
+        let mut m = on_a_loaded_diff();
+        press(&mut m, KeyCode::Char('j'));
+        press(&mut m, KeyCode::Char('j'));
+        assert_eq!(
+            copied(press(&mut m, KeyCode::Char('y'))),
+            "crates/tui/src/view/sidebar.rs:21"
+        );
+        press(&mut m, KeyCode::Char('V'));
+        press(&mut m, KeyCode::Char('j'));
+        assert_eq!(copied(press(&mut m, KeyCode::Char('y'))), "one\ntwo");
+        assert!(m.diff_view.anchor.is_none());
     }
 
     #[test]

@@ -26,6 +26,7 @@ use crate::update::{Pick, Picks, Unusable, picker_matches, switcher_matches};
 mod log;
 mod page;
 mod sidebar;
+pub(crate) use sidebar::turn_message;
 
 const SIDEBAR_MAX: u16 = 48;
 const SIDEBAR_MIN: u16 = 28;

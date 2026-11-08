@@ -76,6 +76,21 @@ fn base64(bytes: &[u8]) -> String {
     out
 }
 
+/// Most bytes of text sent to the clipboard, which terminals cap.
+const COPY_MAX: usize = 70_000;
+
+/// `OSC 52`: sets the clipboard through the terminal.
+fn copy_to_clipboard(terminal: &mut DefaultTerminal, text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut end = text.len().min(COPY_MAX);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let backend = terminal.backend_mut();
+    write!(backend, "\x1b]52;c;{}\x07", base64(&text.as_bytes()[..end]))?;
+    backend.flush()
+}
+
 /// `OSC 1337 SetUserVar`, which wezterm and iTerm2 hand to their config.
 fn set_user_var(terminal: &mut DefaultTerminal, name: &str, value: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
@@ -409,6 +424,11 @@ impl Runtime {
                         Err(e) => m.error(format!("{label}: {e:#}")),
                     }
                     m.schedule_preview();
+                }
+                Effect::Copy(text) => {
+                    if let Err(e) = copy_to_clipboard(terminal, &text) {
+                        m.error(format!("copying: {e}"));
+                    }
                 }
                 Effect::Bell => {
                     use std::io::Write;

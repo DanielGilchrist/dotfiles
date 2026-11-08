@@ -89,6 +89,12 @@ pub struct Situation {
     pub diff: bool,
     /// [0] reads the branch.
     pub branch: bool,
+    /// [0] reads the turn document.
+    pub turn: bool,
+    /// A range of diff lines is selected.
+    pub selecting: bool,
+    /// The branch cursor is on a commit.
+    pub commit_row: bool,
     /// The selected agent has comments drafted on its diffs.
     pub draft: bool,
     pub left_agent: bool,
@@ -157,6 +163,13 @@ impl Situation {
                 )
             ),
             branch: matches!(m.hover(), Some(crate::document::Hover::Branch(_))),
+            turn: matches!(m.hover(), Some(crate::document::Hover::Turn(_))),
+            selecting: m.diff_view.anchor.is_some(),
+            commit_row: m
+                .docs
+                .lines()
+                .get(m.diff_view.cursor)
+                .is_some_and(|l| l.kind == crate::review::LineKind::Commit),
             draft: entry.is_some_and(|e| m.drafts.contains_key(e.name())),
             left_agent,
             can_edit_checkout: selected.is_some(),
@@ -342,6 +355,29 @@ pub const BINDINGS: &[Binding] = &[
         Hidden,
         By(|s| s.tree.then_some("fold all / unfold all")),
         "Collapse every folder in [3], or expand them all.",
+    ),
+    Binding::new(
+        &["y"],
+        Ctxs::of(&[Ctx::Main]),
+        RankBy(|s| {
+            if s.branch {
+                Some(5)
+            } else {
+                (s.diff || s.turn || s.subagent_row).then_some(3)
+            }
+        }),
+        By(|s| {
+            if s.branch {
+                Some(if s.commit_row { "copy sha" } else { "copy path" })
+            } else if s.diff {
+                Some(if s.selecting { "copy lines" } else { "copy path:line" })
+            } else if s.turn {
+                Some("copy message")
+            } else {
+                s.subagent_row.then_some("copy entry")
+            }
+        }),
+        "Copy to the clipboard through the terminal (OSC 52): path:line or the selected lines of a diff, a commit's sha or an uncommitted file's path, the agent's message, or a subagent's log entry.",
     ),
     Binding::new(
         &["V"],
@@ -756,6 +792,9 @@ mod tests {
             subagent_row: true,
             diff: false,
             branch: false,
+            turn: false,
+            selecting: false,
+            commit_row: false,
             draft: false,
             left_agent: true,
             can_edit_checkout: true,

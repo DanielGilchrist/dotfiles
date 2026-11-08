@@ -468,24 +468,6 @@ impl Documents {
         self.rows.as_ref().map_or(&[], |(_, _, rows)| rows)
     }
 
-    /// Rows for the document under `key` at `width`, built once.
-    pub fn rows(
-        &mut self,
-        key: &Key,
-        width: usize,
-        build: impl FnOnce() -> Vec<Line<'static>>,
-    ) -> &[Line<'static>] {
-        if !self
-            .rows
-            .as_ref()
-            .is_some_and(|(k, w, _)| k == key && *w == width)
-        {
-            self.rows = Some((key.clone(), width, build()));
-            self.lines = Vec::new();
-        }
-        self.rows.as_ref().map_or(&[], |(_, _, rows)| rows)
-    }
-
     /// Whether what's shown is for an earlier cursor position and the read
     /// is taking long enough to say so.
     pub fn loading(&self, now: Instant) -> bool {
