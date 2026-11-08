@@ -2897,6 +2897,43 @@ mod tests {
     }
 
     #[test]
+    fn enter_keeps_the_help_filter_and_hands_j_k_back_and_q_or_question_mark_close() {
+        use crate::update::update;
+        use crate::worker::Msg;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let press = |m: &mut Model, code| {
+            update(m, Msg::Key(KeyEvent::new(code, KeyModifiers::NONE)));
+        };
+        let mut m = open_help(Focused::Agents);
+        for c in "peek".chars() {
+            press(&mut m, KeyCode::Char(c));
+        }
+        let text = screen(&render(&mut m, (100, 30))).join("\n");
+        assert!(text.contains("keep filter"), "{text}");
+        press(&mut m, KeyCode::Enter);
+        assert!(
+            matches!(&m.overlay, Overlay::Help(h) if h.filter == "peek" && !h.typing),
+            "the filter stays and typing stops"
+        );
+        press(&mut m, KeyCode::Char('j'));
+        assert!(matches!(&m.overlay, Overlay::Help(h) if h.filter == "peek"));
+        for code in [KeyCode::Char('q'), KeyCode::Char('?'), KeyCode::Esc] {
+            let mut m = open_help(Focused::Agents);
+            press(&mut m, KeyCode::Char('x'));
+            press(&mut m, KeyCode::Enter);
+            press(&mut m, code);
+            assert!(matches!(m.overlay, Overlay::None), "{code:?} closes");
+        }
+        let mut m = open_help(Focused::Agents);
+        press(&mut m, KeyCode::Char('/'));
+        press(&mut m, KeyCode::Char('q'));
+        assert!(
+            matches!(&m.overlay, Overlay::Help(h) if h.filter == "q"),
+            "q is a letter while typing"
+        );
+    }
+
+    #[test]
     fn the_help_scrolls_at_80_by_24_and_follows_the_selection() {
         use crate::update::update;
         use crate::worker::Msg;

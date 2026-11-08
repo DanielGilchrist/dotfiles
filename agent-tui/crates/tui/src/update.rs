@@ -1461,7 +1461,9 @@ fn on_help_key(m: &Model, help: &mut HelpState, key: &KeyEvent) -> bool {
         help.selected = help.selected.saturating_add_signed(by).min(last);
     };
     match key.code {
-        KeyCode::Esc if help.filter.is_empty() && !help.typing => return false,
+        KeyCode::Esc if !help.typing => return false,
+        KeyCode::Char('?' | 'q') if !help.typing => return false,
+        KeyCode::Enter => help.typing = false,
         KeyCode::Esc => {
             help.filter.clear();
             help.typing = false;

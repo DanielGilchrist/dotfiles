@@ -1771,16 +1771,16 @@ fn draw_help(frame: &mut Frame<'_>, m: &Model, state: &HelpState) {
     );
 
     if describe > 0 {
-        let escape = if state.typing || !state.filter.is_empty() {
-            "clear filter"
+        let keys: &[(&str, &str)] = if state.typing {
+            &[("⏎", "keep filter"), ("Esc", "clear filter")]
         } else {
-            "close"
+            &[("/", "filter"), ("? q Esc", "close")]
         };
         let block = Block::bordered()
             .border_type(BorderType::Rounded)
             .border_style(dim())
             .title_top(Line::styled(" Description ", bold()).left_aligned())
-            .title_bottom(Line::from(hints(&[("Esc", escape)])).right_aligned());
+            .title_bottom(Line::from(hints(keys)).right_aligned());
         let inner = block.inner(describe_area);
         frame.render_widget(block, describe_area);
         let text = help.get(selected).map_or("", |row| row.long);
