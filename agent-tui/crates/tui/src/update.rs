@@ -5,27 +5,29 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use agent_core::actions::{Action, CommandLine, Context, EventName, Invocation};
-use agent_core::activity::{Activity, AgentId, State as ActivityState, TranscriptRef};
+use agent_core::activity::{Activity, AgentId, State, TranscriptRef};
 use agent_core::config::ControlKey;
 use agent_core::model::{Entry, EntryState, RepoKey, Snapshot};
 use agent_core::names::{CarriageReturn, InvalidPrompt, Prompt, SessionName, clean};
 use agent_core::ops::{Approved, Launch};
 use agent_core::paths::{RepoRoot, Typed, typed_path};
-use agent_core::ports::{ClientId, Listing, Log, TurnDetail};
+use agent_core::ports::{ActivityDetail, ClientId, Listing, Log};
 use agent_term::{CellPos, encode_key, encode_mouse};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind};
 use ratatui::layout::Position;
 
 use crate::document::{Documents, Key};
 use crate::keymap::Situation;
-use crate::log::Nav;
+use crate::log::{EntryKey, Nav};
 use crate::model::{
-    Answer, Areas, Chord, CommentDraft, Confirm, Cursor, DirCheck, Direction, Drawn, Edge, Enter,
-    Field, Focus, Follow, FormKind, HelpState, INFO_TTL, Inspection, Intent, Listed, LogKey, Mode,
-    Model, Moment, NamingState, NewAgent, Outbox, Overlay, Pane, Panel, Phase, Query, Reach,
-    RepoInput, Screen, StatusKind, Submission, TerminalFocus, Ticket, TurnRow, Unreachable, View,
-    WorkRoom, fuzzy_match, match_rank, repo_matches, unlisted,
+    ActivityFiles, ActivityRow, Answer, Areas, Chord, CommentDraft, Confirm, Cursor, DirCheck,
+    Direction, Drawn, Edge, Enter, Field, Focus, Follow, FormKind, HelpState, INFO_TTL, Inspected,
+    Inspection, Intent, Listed, LogKey, Missing, Mode, Model, Moment, NamingState, NewAgent,
+    Outbox, Overlay, Pane, Panel, Phase, Query, Reach, RepoInput, Screen, StatusKind, Submission,
+    TerminalFocus, Ticket, Unreachable, View, WorkRoom, fuzzy_match, match_rank, repo_matches,
+    unlisted,
 };
+use crate::touched::{Baseline, TouchedFile};
 use crate::track::{LiveSince, Release, Seen};
 use crate::tree::ChangesView;
 use crate::worker::{Job, Msg, Outcome, SendError};
@@ -35,7 +37,7 @@ use crate::worker::{Job, Msg, Outcome, SendError};
 const SEEN_AFTER: Duration = Duration::from_secs(3);
 /// At most one bell this often.
 const BELL_EVERY: Duration = Duration::from_secs(10);
-/// A turn this long rings when it finishes; shorter ones you were probably
+/// An activity this long rings when it finishes; shorter ones you were probably
 /// watching.
 const LONG_TURN: Duration = Duration::from_secs(30);
 /// An agent's git facts refresh on its activity, at most this often.
@@ -83,6 +85,8 @@ pub enum Effect {
     Inspect {
         name: SessionName,
         worktree: PathBuf,
+        /// How many events the agent has reported.
+        events: Option<u64>,
     },
     /// Read a diff or a branch log in a worktree.
     ReadDocument {
@@ -97,8 +101,8 @@ pub enum Effect {
         id: AgentId,
         workdir: PathBuf,
     },
-    /// Read the current turn of an agent working in `workdir`.
-    ReadTurn {
+    /// Read the current activity of an agent working in `workdir`.
+    ReadActivity {
         name: SessionName,
         workdir: PathBuf,
         /// Where its hooks last said the transcript is.
@@ -249,18 +253,13 @@ fn step(m: &mut Model, msg: Msg) -> Vec<Effect> {
             m.terminal = focus;
             Vec::new()
         }
-        Msg::Inspected { name, facts } => {
-            if m.tracked(&name).is_some_and(|t| t.inspection.is_some()) {
-                m.set_facts(&name, facts);
-            }
-            Vec::new()
-        }
+        Msg::Inspected { name, read } => on_inspected(m, &name, read),
         Msg::Document { key, result } => {
             m.docs.loaded(&key, result, m.clock.mono);
             Vec::new()
         }
-        Msg::Turn { name, turn } => {
-            on_turn(m, &name, turn);
+        Msg::Activity { name, detail } => {
+            on_activity(m, &name, detail);
             Vec::new()
         }
         Msg::Subagent { name, id, detail } => {
@@ -276,18 +275,27 @@ fn step(m: &mut Model, msg: Msg) -> Vec<Effect> {
     }
 }
 
-/// An agent's turn was read. A new prompt starts the cursor over.
-fn on_turn(m: &mut Model, name: &SessionName, turn: Result<Option<TurnDetail>, String>) {
+/// Git facts about an agent's worktree were read, unless it is no longer
+/// asked about.
+fn on_inspected(m: &mut Model, name: &SessionName, read: Result<Inspected, String>) -> Vec<Effect> {
+    if m.tracked(name).is_some_and(|t| t.inspection.is_some()) {
+        m.set_facts(name, read);
+    }
+    Vec::new()
+}
+
+/// An agent's activity was read. A new prompt starts the cursor over.
+fn on_activity(m: &mut Model, name: &SessionName, detail: Result<Option<ActivityDetail>, String>) {
     let Some(tracked) = m.agents.get_mut(name) else {
         return;
     };
-    let watch = &mut tracked.turn;
-    if let (Some(Ok(Some(old))), Ok(Some(new))) = (&watch.watch.log, &turn)
+    let watch = &mut tracked.activity_view;
+    if let (Some(Ok(Some(old))), Ok(Some(new))) = (&watch.watch.log, &detail)
         && old.mark != new.mark
     {
         watch.watch.nav = Nav::default();
     }
-    watch.watch.log = Some(turn);
+    watch.watch.log = Some(detail);
 }
 
 fn on_paste(m: &mut Model, text: &str) -> Vec<Effect> {
@@ -331,7 +339,7 @@ fn first_warning(warnings: &[String], hint: &str) -> String {
 
 fn on_snapshot(m: &mut Model, snapshot: Snapshot, warnings: Vec<String>) {
     m.load(snapshot);
-    m.hold_turn_row();
+    m.hold_activity_row();
     track_live(m);
     forget_gone(m);
     if !warnings.is_empty() && warnings != m.last_warnings {
@@ -506,7 +514,7 @@ fn tick_effects(m: &mut Model) -> Vec<Effect> {
     effects.extend(preview(m));
     effects.extend(inspect(m));
     effects.extend(read_subagent(m));
-    effects.extend(read_turn(m));
+    effects.extend(read_activity(m));
     effects.extend(read_document(m));
     effects.extend(check_dir(m));
     effects
@@ -635,11 +643,57 @@ fn on_activities(m: &mut Model, activities: HashMap<SessionName, Activity>) -> V
         let allowed = m.last_bell.map_or(m.clock.mono, |at| at + BELL_EVERY);
         m.bell_due = Some(m.bell_due.map_or(allowed, |due| due.min(allowed)));
     }
+    note_baselines(m, &activities);
     m.activities = Some(activities);
-    m.hold_turn_row();
+    m.hold_activity_row();
     m.revalidate();
     release_holds(m);
     flush(m)
+}
+
+/// Notes the changed files of every agent whose prompt began an activity, to
+/// tell later what the activity touched. An agent first seen working counts.
+/// The facts are only a snapshot when they were asked for after the agent's
+/// last report before the prompt (or they lack what it did then) and no later
+/// than the event that carried the prompt (or they include what this
+/// activity did, which can be reported in the same poll).
+/// Otherwise nothing is noted.
+fn note_baselines(m: &mut Model, next: &HashMap<SessionName, Activity>) {
+    let Some(previous) = &m.activities else {
+        return;
+    };
+    let began: Vec<(SessionName, Baseline)> = next
+        .iter()
+        .filter_map(|(name, now)| {
+            let before = previous.get(name);
+            let began = match before {
+                Some(before) => now.has_new_prompt_since(before),
+                None => now.has_taken_a_prompt(),
+            };
+            began.then(|| (name.clone(), baseline_since(m, name, before, now)))
+        })
+        .collect();
+    for (name, baseline) in began {
+        m.track(&name).baseline = baseline;
+    }
+}
+
+fn baseline_since(
+    m: &Model,
+    name: &SessionName,
+    before: Option<&Activity>,
+    now: &Activity,
+) -> Baseline {
+    let read = m
+        .tracked(name)
+        .and_then(|t| t.facts.as_ref())
+        .and_then(|r| r.as_ref().ok());
+    let current = read.is_some_and(|r| {
+        r.asked_events.is_some_and(|asked| {
+            before.is_none_or(|before| asked >= before.events) && asked <= now.prompt_event
+        })
+    });
+    Baseline::of(read.filter(|_| current).map(|r| &r.facts))
 }
 
 /// Drops what's known about subagents their agents no longer list.
@@ -647,8 +701,8 @@ fn forget_subagents(m: &mut Model) {
     let Some(activities) = &m.activities else {
         return;
     };
-    let cursor = match m.panel.turn_row() {
-        Some(TurnRow::Subagent { by, id }) => Some((by, id)),
+    let cursor = match m.panel.activity_row() {
+        Some(ActivityRow::Subagent { by, id }) => Some((by, id)),
         _ => None,
     };
     for (name, tracked) in &mut m.agents {
@@ -705,43 +759,43 @@ fn read_subagent(m: &mut Model) -> Option<Effect> {
     Some(Effect::ReadSubagent { name, id, workdir })
 }
 
-/// Asks for the current turn of the agent whose turn [0] shows: when it is
+/// Asks for the current activity of the agent whose activity [0] shows: when it is
 /// first shown, soon after the agent reports something, and every few
 /// seconds while it works.
-fn read_turn(m: &mut Model) -> Option<Effect> {
-    let Some(crate::document::Hover::Turn(name)) = m.hover() else {
+fn read_activity(m: &mut Model) -> Option<Effect> {
+    let Some(crate::document::Hover::Activity(name)) = m.hover() else {
         return None;
     };
     let workdir = selected_root(m)?;
     let activity = m.activity(&name)?;
     let (events, at) = (activity.events, activity.transcript.clone());
     let now = m.clock.mono;
-    let growing = m.turn_running(&name);
+    let growing = m.activity_running(&name);
     if !m
         .tracked(&name)
-        .is_none_or(|t| t.turn.watch.due(events, growing, now))
+        .is_none_or(|t| t.activity_view.watch.due(events, growing, now))
     {
         return None;
     }
-    m.track(&name).turn.watch.asked(events, now);
-    Some(Effect::ReadTurn { name, workdir, at })
+    m.track(&name).activity_view.watch.asked(events, now);
+    Some(Effect::ReadActivity { name, workdir, at })
 }
 
 /// Notes the agent in front of the user as seen once it has been there for
-/// `after`, with the terminal focused: its turn in [0], or its terminal in
-/// the pane. Only the peek float shows a terminal over a turn, and what it
+/// `after`, with the terminal focused: its activity in [0], or its terminal in
+/// the pane. Only the peek float shows a terminal over an activity, and what it
 /// covers isn't in front of them, so the pane wins. What the agent did since
-/// is new to them, and a finished turn they haven't looked at is
+/// is new to them, and a finished activity they haven't looked at is
 /// acknowledged, so the `✓` and the `since you looked` marker clear together.
 fn look(m: &mut Model, after: Duration) -> Option<Job> {
     let now = m.clock.mono;
     let focused = m.terminal != TerminalFocus::Unfocused;
     let viewing = match m.hover() {
-        Some(crate::document::Hover::Turn(name)) if focused => Some(name),
+        Some(crate::document::Hover::Activity(name)) if focused => Some(name),
         _ => None,
     };
     for (name, tracked) in &mut m.agents {
-        let looked = &mut tracked.turn.looked;
+        let looked = &mut tracked.activity_view.looked;
         if viewing.as_ref() == Some(name) {
             looked.since.get_or_insert(now);
         } else {
@@ -750,7 +804,7 @@ fn look(m: &mut Model, after: Duration) -> Option<Job> {
     }
     let steady = viewing.filter(|name| {
         m.tracked(name)
-            .and_then(|t| t.turn.looked.since)
+            .and_then(|t| t.activity_view.looked.since)
             .is_some_and(|since| now.saturating_duration_since(since) >= after)
     });
     let watching = m
@@ -762,11 +816,11 @@ fn look(m: &mut Model, after: Duration) -> Option<Job> {
     let front = watching.or(steady).filter(|_| focused);
     if let Some(name) = &front {
         let wall = m.clock.wall;
-        m.track(name).turn.looked.seen = Some(wall);
+        m.track(name).activity_view.looked.seen = Some(wall);
     }
     let name = front?;
     let activity = m.activity(&name)?;
-    let ActivityState::Done { .. } = activity.state else {
+    let State::Done { .. } = activity.state else {
         return None;
     };
     let mark = (name.clone(), activity.events);
@@ -844,7 +898,11 @@ fn inspect(m: &mut Model) -> Vec<Effect> {
     due.into_iter()
         .map(|(name, worktree, events)| {
             m.track(&name).inspection = Some(Inspection { events, at: now });
-            Effect::Inspect { name, worktree }
+            Effect::Inspect {
+                name,
+                worktree,
+                events,
+            }
         })
         .collect()
 }
@@ -858,7 +916,7 @@ fn bell(m: &mut Model) -> Option<Effect> {
 }
 
 /// Whether an agent newly needs the user: asking, failed, or finished a
-/// turn that took a while. Not the agent being typed into or the TUI's own
+/// activity that took a while. Not the agent being typed into or the TUI's own
 /// session, and nothing on the first report, when all of it is old news.
 fn newly_waiting(m: &Model, next: &HashMap<SessionName, Activity>) -> bool {
     let Some(previous) = m.activities.as_ref() else {
@@ -878,12 +936,12 @@ fn newly_waiting(m: &Model, next: &HashMap<SessionName, Activity>) -> bool {
                 .any(|ask| before.is_none_or(|b| !b.asks.contains(ask)));
             asks_anew
                 || match (&activity.state, before.map(|b| (&b.state, b.since))) {
-                    (ActivityState::Failed { .. }, Some((ActivityState::Failed { .. }, _)))
-                    | (ActivityState::Done { .. }, Some((ActivityState::Done { .. }, _))) => false,
-                    (ActivityState::Failed { .. }, _) => true,
+                    (State::Failed { .. }, Some((State::Failed { .. }, _)))
+                    | (State::Done { .. }, Some((State::Done { .. }, _))) => false,
+                    (State::Failed { .. }, _) => true,
                     (
-                        ActivityState::Done { .. },
-                        Some((ActivityState::Working { .. } | ActivityState::Delegating, started)),
+                        State::Done { .. },
+                        Some((State::Working { .. } | State::Delegating, started)),
                     ) => activity.since.duration_since(started).unwrap_or_default() >= LONG_TURN,
                     _ => false,
                 }
@@ -1329,116 +1387,216 @@ fn diff_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
     Some(Vec::new())
 }
 
-/// Scrolls [0] so the log entry `at` of subagent `key` shows, as the last
-/// draw laid it out.
-fn reveal_entry(areas: &Areas, docs: &mut Documents, key: &LogKey, at: usize) {
+/// Scrolls [0] so the log entry `entry` of `key` shows, as the last draw
+/// laid it out.
+fn reveal_entry(areas: &Areas, docs: &mut Documents, key: &LogKey, entry: &EntryKey) {
     if let Some(main) = areas.main.as_ref().filter(|a| a.nav.as_ref() == Some(key)) {
-        main.reveal_entry(docs, at);
+        main.reveal_entry(docs, entry);
     }
 }
 
 /// The log [0] reads, with what moves over it.
 struct OpenLog<'a> {
-    detail: &'a Log,
+    source: Source<'a>,
     nav: &'a mut Nav,
-    entries: Vec<crate::log::Entry<'a>>,
+    entries: Vec<(crate::log::Entry<'a>, EntryKey)>,
     /// Whether it is still growing, so its cursor starts at the end and
     /// moving there follows it.
     running: bool,
 }
 
-/// The log `key` names, if it was read.
-fn open_log<'a>(m: &'a mut Model, key: &LogKey) -> Option<OpenLog<'a>> {
-    match key {
-        LogKey::Subagent((name, id)) => {
-            let watch = &mut m.agents.get_mut(name)?.subagents.get_mut(id)?.watch;
-            let Some(Ok(Some(detail))) = &watch.log else {
-                return None;
-            };
-            Some(OpenLog {
+/// What a log is read from, which decides how it is written as Markdown.
+enum Source<'a> {
+    Subagent(&'a Log),
+    Activity {
+        detail: &'a ActivityDetail,
+        closing: Option<&'a str>,
+        /// The files it lists as entries.
+        touched: &'a [TouchedFile],
+    },
+}
+
+impl Source<'_> {
+    fn markdown(&self, title: &str) -> (String, Vec<NonZeroUsize>) {
+        match self {
+            Self::Subagent(detail) => crate::log::markdown(detail, title),
+            Self::Activity {
                 detail,
-                entries: crate::log::entries(detail),
-                running: !matches!(detail.outcome, agent_core::ports::Outcome::Finished { .. }),
-                nav: &mut watch.nav,
-            })
-        }
-        LogKey::Turn(name) => {
-            let (closing, running) = (m.closing(name), m.turn_running(name));
-            let watch = &mut m.agents.get_mut(name)?.turn.watch;
-            let Some(Ok(Some(turn))) = &watch.log else {
-                return None;
-            };
-            Some(OpenLog {
-                detail: &turn.log,
-                entries: crate::log::turn_entries(&turn.log, closing.as_deref())
-                    .into_iter()
-                    .map(|(entry, _)| entry)
-                    .collect(),
-                running,
-                nav: &mut watch.nav,
-            })
+                closing,
+                touched,
+            } => crate::log::activity_markdown(detail, title, *closing, touched),
         }
     }
 }
 
-/// Keys for [0] while it reads a log, a subagent's or the current turn: the
-/// entry cursor, folds and, for a subagent, the transcript in the editor.
-/// `None` leaves the key to the plain document keys.
-fn log_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
-    let key = match m.hover()? {
-        crate::document::Hover::Subagent(name, id) => LogKey::Subagent((name, id)),
-        crate::document::Hover::Turn(name) => LogKey::Turn(name),
-        _ => return None,
+/// What the model knows of an agent's activity that opening its log needs.
+struct ActivityNow {
+    running: bool,
+    closing: Option<String>,
+}
+
+type Agents = HashMap<SessionName, crate::model::Tracked>;
+
+/// The subagent's log, if it was read.
+fn open_subagent_log<'a>(
+    agents: &'a mut Agents,
+    name: &SessionName,
+    id: &AgentId,
+) -> Option<OpenLog<'a>> {
+    let watch = &mut agents.get_mut(name)?.subagents.get_mut(id)?.watch;
+    let Some(Ok(Some(detail))) = &watch.log else {
+        return None;
     };
-    let editing = match &key {
-        LogKey::Subagent((name, id)) if code == KeyCode::Char('e') => {
-            let root = selected_root(m)?;
+    Some(OpenLog {
+        source: Source::Subagent(detail),
+        entries: crate::log::entries(detail),
+        running: !matches!(detail.outcome, agent_core::ports::Outcome::Finished { .. }),
+        nav: &mut watch.nav,
+    })
+}
+
+/// The agent's current activity, if it was read, with the files it lists.
+fn open_activity_log<'a>(
+    agents: &'a mut Agents,
+    name: &SessionName,
+    now: &'a ActivityNow,
+    touched: &'a [TouchedFile],
+) -> Option<OpenLog<'a>> {
+    let watch = &mut agents.get_mut(name)?.activity_view.watch;
+    let Some(Ok(Some(detail))) = &watch.log else {
+        return None;
+    };
+    let closing = now.closing.as_deref();
+    Some(OpenLog {
+        entries: crate::log::activity_entries(&detail.log, closing, touched).flat(),
+        source: Source::Activity {
+            detail,
+            closing,
+            touched,
+        },
+        running: now.running,
+        nav: &mut watch.nav,
+    })
+}
+
+/// The checkout, title and file name for writing the log `key` names out
+/// for `$EDITOR`.
+fn transcript_target(m: &Model, key: &LogKey) -> Option<(PathBuf, String, String)> {
+    let root = selected_root(m)?;
+    Some(match key {
+        LogKey::Subagent((name, id)) => {
             let title = m
                 .subagent_rows()
                 .into_iter()
                 .find(|(held, _)| *held == id)
                 .and_then(|(_, s)| s.description.clone())
                 .unwrap_or_else(|| "subagent".into());
-            Some((root, title, format!("{}-{}", name.as_str(), id.as_str())))
+            (root, title, format!("{}-{}", name.as_str(), id.as_str()))
         }
-        LogKey::Turn(_) if code == KeyCode::Char('e') => return None,
-        _ => None,
+        LogKey::Activity(name) => (
+            root,
+            format!("Activity · {name}"),
+            format!("{}-activity", name.as_str()),
+        ),
+    })
+}
+
+/// Takes [0] where the entry `⏎` was pressed on points, and says why when
+/// it can't.
+fn follow(m: &mut Model, jump: crate::log::Jump) -> Vec<Effect> {
+    let Some(spot) = m.activity_spot() else {
+        return Vec::new();
     };
-    let OpenLog {
-        detail,
-        nav,
-        entries,
-        running,
-    } = open_log(m, &key)?;
-    let last = entries.len().checked_sub(1)?;
-    let at = nav
-        .cursor
-        .unwrap_or(if running { last } else { 0 })
-        .min(last);
-    let mut effects = Vec::new();
+    let result = match jump {
+        crate::log::Jump::Subagent(id) => m.open_subagent(spot, &id),
+        crate::log::Jump::File(path) => m.open_diff(spot, &path),
+    };
+    if let Err(missing) = result {
+        m.info(missing.to_string());
+    }
+    Vec::new()
+}
+
+/// Keys for [0] while it reads a log, a subagent's or the current activity: the
+/// entry cursor, folds, the transcript in the editor and, in an activity, `⏎`
+/// on a call or file that leads somewhere. `None` leaves the key to the
+/// plain document keys.
+fn log_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
+    let files = m.activity_files.take();
+    let handled = read_log(m, code, files.as_ref());
+    m.activity_files = files;
+    handled
+}
+
+fn log_of(m: &Model) -> Option<LogKey> {
+    match m.hover()? {
+        crate::document::Hover::Subagent(name, id) => Some(LogKey::Subagent((name, id))),
+        crate::document::Hover::Activity(name) => Some(LogKey::Activity(name)),
+        _ => None,
+    }
+}
+
+/// Moves the cursor of an open log for a key that moves it, and the document
+/// with it. `None` for a key that doesn't.
+fn walk(
+    code: KeyCode,
+    open: &mut OpenLog<'_>,
+    at: usize,
+    (docs, areas, key): (&mut Documents, &Areas, &LogKey),
+) -> Option<()> {
+    let last = open.entries.len().checked_sub(1)?;
+    let to = match code {
+        KeyCode::Char('j') | KeyCode::Down => (at + 1).min(last),
+        KeyCode::Char('k') | KeyCode::Up => at.saturating_sub(1),
+        KeyCode::Char('g') | KeyCode::Home => 0,
+        KeyCode::Char('G') | KeyCode::End => last,
+        _ => return None,
+    };
+    let to_key = open.entries[to].1.clone();
+    open.nav.cursor = Some(to_key.clone());
     match code {
         KeyCode::Char('j') | KeyCode::Down => {
-            let to = (at + 1).min(last);
-            nav.cursor = Some(to);
-            if running && at + 1 >= last {
-                m.docs.scroll_to_end();
+            if open.running && at + 1 >= last {
+                docs.scroll_to_end();
             }
-            reveal_entry(&m.areas, &mut m.docs, &key, to);
+            reveal_entry(areas, docs, key, &to_key);
         }
         KeyCode::Char('k') | KeyCode::Up => {
-            let to = at.saturating_sub(1);
-            nav.cursor = Some(to);
-            reveal_entry(&m.areas, &mut m.docs, &key, to);
-            m.docs.pause();
+            reveal_entry(areas, docs, key, &to_key);
+            docs.pause();
         }
-        KeyCode::Char('g') | KeyCode::Home => {
-            nav.cursor = Some(0);
-            m.docs.scroll_to_start();
+        KeyCode::Char('g') | KeyCode::Home => docs.scroll_to_start(),
+        _ => docs.scroll_to_end(),
+    }
+    Some(())
+}
+
+fn read_log(m: &mut Model, code: KeyCode, files: Option<&ActivityFiles>) -> Option<Vec<Effect>> {
+    let key = log_of(m)?;
+    let editing = if code == KeyCode::Char('e') {
+        transcript_target(m, &key)
+    } else {
+        None
+    };
+    let now;
+    let (mut open, jump) = match &key {
+        LogKey::Subagent((name, id)) => (open_subagent_log(&mut m.agents, name, id)?, None),
+        LogKey::Activity(name) => {
+            now = ActivityNow {
+                running: m.activity_running(name),
+                closing: m.closing(name),
+            };
+            let files = files.filter(|f| &f.agent == name);
+            let listed = files.map_or(&[][..], ActivityFiles::listed);
+            let open = open_activity_log(&mut m.agents, name, &now, listed)?;
+            (open, files.and_then(|f| f.jump.clone()))
         }
-        KeyCode::Char('G') | KeyCode::End => {
-            nav.cursor = Some(last);
-            m.docs.scroll_to_end();
-        }
+    };
+    let at = open.nav.at(open.running, &open.entries);
+    if walk(code, &mut open, at, (&mut m.docs, &m.areas, &key)).is_some() {
+        return Some(Vec::new());
+    }
+    match code {
         KeyCode::PageDown | KeyCode::PageUp => {
             let half = m.doc_half_page() * 2;
             m.docs.scroll_by(if code == KeyCode::PageDown {
@@ -1449,33 +1607,43 @@ fn log_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
             m.follow_page();
         }
         KeyCode::Enter => {
-            nav.cursor = Some(at);
-            nav.toggle(at);
+            let entry_key = open.entries[at].1.clone();
+            open.nav.cursor = Some(entry_key.clone());
+            match jump {
+                Some(jump) => return Some(follow(m, jump)),
+                None => open.nav.toggle(entry_key),
+            }
         }
-        KeyCode::Char('=') => nav.all = true,
+        KeyCode::Char('=') => open.nav.all = true,
         KeyCode::Char('-') => {
-            nav.all = false;
-            nav.open.clear();
+            open.nav.all = false;
+            open.nav.open.clear();
         }
         KeyCode::Char('y') => {
-            let text = crate::log::entry_text(entries.get(at)?);
-            nav.cursor = Some(at);
+            let text = crate::log::entry_text(&open.entries[at].0);
+            open.nav.cursor = Some(open.entries[at].1.clone());
             return Some(copy(m, text));
         }
-        KeyCode::Char('e') => {
-            let (root, title, name) = editing?;
-            let (text, starts) = crate::log::markdown(detail, &title);
-            let line = starts.get(at).copied().unwrap_or(NonZeroUsize::MIN);
-            effects.push(Effect::Edit(Open::Transcript {
-                root,
-                name,
-                text,
-                line,
-            }));
-        }
+        KeyCode::Char('e') => return Some(edit_log(&open.source, editing?, at)),
         _ => return None,
     }
-    Some(effects)
+    Some(Vec::new())
+}
+
+/// Opens the log as Markdown at its entry number `at`.
+fn edit_log(
+    source: &Source<'_>,
+    (root, title, name): (PathBuf, String, String),
+    at: usize,
+) -> Vec<Effect> {
+    let (text, starts) = source.markdown(&title);
+    let line = starts.get(at).copied().unwrap_or(NonZeroUsize::MIN);
+    vec![Effect::Edit(Open::Transcript {
+        root,
+        name,
+        text,
+        line,
+    })]
 }
 
 /// Control characters other than newlines and tabs could end a bracketed
@@ -1495,7 +1663,7 @@ fn on_panel_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
     }
     match m.panel.list() {
         Listed::Agents => agents_key(m, code),
-        Listed::Agent { .. } => turn_key(m, code),
+        Listed::Agent { .. } => activity_key(m, code),
         Listed::Changes { .. } => changes_key(m, code),
     }
 }
@@ -1504,12 +1672,12 @@ fn on_panel_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
 /// leave [0] first.
 fn on_document_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
     if code == KeyCode::Char('y')
-        && let Some(crate::document::Hover::Turn(name)) = m.hover()
-        && !m.turn_has_log(&name)
+        && let Some(crate::document::Hover::Activity(name)) = m.hover()
+        && !m.activity_has_log(&name)
     {
         let message = m
             .selected_entry()
-            .and_then(|e| crate::view::turn_message(m, e));
+            .and_then(|e| crate::view::activity_message(m, e));
         let Some(text) = message else {
             m.info(format!("{name} has no message to copy"));
             return Some(Vec::new());
@@ -1532,6 +1700,13 @@ fn on_document_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
     }
     if code == KeyCode::Esc && m.opened.take().is_some() {
         m.diff_view.owner = None;
+        return Some(Vec::new());
+    }
+    if code == KeyCode::Esc
+        && let Some(spot) = m.panel.back().cloned()
+    {
+        m.changes_scope = spot.scope;
+        m.panel = spot.panel();
         return Some(Vec::new());
     }
     if let Some(effects) = log_key(m, code)
@@ -1572,12 +1747,12 @@ fn focus_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
             if m.selected_entry()
                 .is_some_and(|e| m.activity(e.name()).is_none()) =>
         {
-            m.info("no turn recorded · d then ⏎ restarts it through agent");
+            m.info("no activity recorded · d then ⏎ restarts it through agent");
         }
-        (KeyCode::Char('2'), _) => m.panel = Panel::turn(),
+        (KeyCode::Char('2'), _) => m.panel = Panel::activity(),
         (KeyCode::Char('3'), _) if m.change_rows() == 0 => m.info("no files to move to"),
-        (KeyCode::Char('3'), _) if m.work_room == WorkRoom::TooShort => {
-            m.info("no room for [3] at this height");
+        (KeyCode::Char('3'), _) if m.require_room().is_err() => {
+            m.info(Missing::Room.to_string());
         }
         (KeyCode::Char('3'), _) => m.panel = Panel::Changes { file: 0 },
         _ => return None,
@@ -1602,7 +1777,7 @@ fn agents_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
     }
 }
 
-fn turn_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
+fn activity_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
     match code {
         KeyCode::Enter | KeyCode::Char('0') if m.hover().is_some() => Some(open_document(m)),
         KeyCode::Char('e') => edit_transcript(m),
@@ -1747,7 +1922,7 @@ fn half_page(m: &mut Model, direction: Direction) {
         Direction::Back => -1,
     };
     match m.panel {
-        Panel::Changes { .. } | Panel::Agent { .. } | Panel::Main(_) => {
+        Panel::Changes { .. } | Panel::Agent { .. } | Panel::Main(..) => {
             m.docs.scroll_by(sign * m.doc_half_page());
             if m.main_focused() {
                 m.follow_page();
@@ -1984,7 +2159,7 @@ fn open_talk(m: &mut Model, name: &SessionName) {
         Err(Unreachable::NotRunning) => m.info(format!("{name} isn't running · ⏎ starts it")),
         Err(Unreachable::Own) => m.info(format!("{name} is where this TUI runs")),
         Err(Unreachable::Unreported) => m.info(format!(
-            "{name} reports no activity, so its turn's end can't be known · ⏎ attaches"
+            "{name} reports no hooks, so when it finishes can't be known · ⏎ attaches"
         )),
     }
 }
@@ -2740,7 +2915,7 @@ fn on_lower_panel(
         let row = row_at(&m.areas.agent_rows);
         m.panel.leave_document();
         if !matches!(m.panel, Panel::Agent { .. }) {
-            m.panel = Panel::turn();
+            m.panel = Panel::activity();
         }
         if let Some(row) = row {
             m.point_at_row(|_, _| row);
@@ -2929,7 +3104,7 @@ mod tests {
             Some("idle"),
             "stops at the end rather than wrapping"
         );
-        m.panel = Panel::turn();
+        m.panel = Panel::activity();
         paged(&mut m, 6);
         update(
             &mut m,
@@ -3242,7 +3417,7 @@ mod tests {
         assert_eq!(order, ["api", "idle", "fix", "web"]);
     }
 
-    fn with_turn(m: &mut Model) {
+    fn with_activity(m: &mut Model) {
         let mut all = m.activities.take().unwrap_or_default();
         for agent in ["fix", "api"] {
             all.insert(
@@ -3260,7 +3435,7 @@ mod tests {
         let changed: Vec<agent_core::ports::Change> = (0..files)
             .map(|i| agent_core::ports::Change::untracked(format!("src/f{i}.rs")))
             .collect();
-        m.set_facts(
+        m.set_test_facts(
             &name("fix"),
             Ok(agent_core::ports::WorktreeFacts {
                 pending: changed.clone(),
@@ -3285,7 +3460,7 @@ mod tests {
                 )
             })
             .collect();
-        m.set_facts(
+        m.set_test_facts(
             &name("fix"),
             Ok(agent_core::ports::WorktreeFacts {
                 pending: changed.clone(),
@@ -3345,7 +3520,7 @@ mod tests {
             Change::tracked(path, Lines::Counted { added, removed: 0 }, state)
         };
         let edited = TrackedState::Unstaged(Edit::Modified);
-        m.set_facts(
+        m.set_test_facts(
             &name("fix"),
             Ok(agent_core::ports::WorktreeFacts {
                 ahead: 3,
@@ -3417,7 +3592,7 @@ mod tests {
             branch: "main".parse().expect("parses"),
             base: "origin/main".parse().expect("parses"),
         };
-        m.set_facts(&name("fix"), Ok(facts));
+        m.set_test_facts(&name("fix"), Ok(facts));
         assert_eq!(hint(&m), "tab: unpushed");
     }
 
@@ -3483,7 +3658,7 @@ mod tests {
         m.panel = Panel::Changes { file: 2 };
         update(&mut m, key(KeyCode::Enter));
         assert!(
-            matches!(m.panel, Panel::Main(_)),
+            matches!(m.panel, Panel::Main(..)),
             "a file still opens its diff"
         );
     }
@@ -3610,11 +3785,11 @@ mod tests {
                 m,
                 Msg::Inspected {
                     name: name("fix"),
-                    facts: Ok(agent_core::ports::WorktreeFacts {
+                    read: Ok(Inspected::of(agent_core::ports::WorktreeFacts {
                         pending: changed.clone(),
                         changed,
                         ..crate::fixtures::unchanged()
-                    }),
+                    })),
                 },
             );
         };
@@ -3744,9 +3919,9 @@ mod tests {
     fn number_keys_focus_panels_and_esc_returns_to_the_list() {
         let mut m = model(&[]);
         with_changes(&mut m, 3);
-        with_turn(&mut m);
+        with_activity(&mut m);
         update(&mut m, key(KeyCode::Char('2')));
-        assert_eq!(m.panel, Panel::turn());
+        assert_eq!(m.panel, Panel::activity());
         update(&mut m, key(KeyCode::Char('3')));
         assert_eq!(m.panel, Panel::Changes { file: 0 });
         assert!(update(&mut m, key(KeyCode::Esc)).is_empty());
@@ -3767,7 +3942,7 @@ mod tests {
     fn j_and_k_move_within_the_focused_panel() {
         let mut m = model(&[]);
         with_changes(&mut m, 3);
-        with_turn(&mut m);
+        with_activity(&mut m);
         update(&mut m, key(KeyCode::Char('3')));
         for _ in 0..5 {
             update(&mut m, key(KeyCode::Char('j')));
@@ -3791,8 +3966,8 @@ mod tests {
         update(&mut m, key(KeyCode::Char('2')));
         update(&mut m, key(KeyCode::Char('j')));
         update(&mut m, key(KeyCode::Char('j')));
-        assert_eq!(m.panel, Panel::turn());
-        assert_eq!(m.row_at(), 0, "[2] has only its turn row");
+        assert_eq!(m.panel, Panel::activity());
+        assert_eq!(m.row_at(), 0, "[2] has only its activity row");
         update(&mut m, key(KeyCode::Char('1')));
         update(&mut m, key(KeyCode::Char('j')));
         assert_eq!(
@@ -3806,14 +3981,14 @@ mod tests {
     fn panels_fall_back_to_the_list() {
         let mut m = model(&[]);
         with_changes(&mut m, 3);
-        with_turn(&mut m);
+        with_activity(&mut m);
         update(&mut m, key(KeyCode::Char('3')));
         update(&mut m, key(KeyCode::Char('}')));
         assert_eq!(m.panel, Panel::Agents, "a new selection starts in [1]");
         update(&mut m, key(KeyCode::Char('{')));
         update(&mut m, key(KeyCode::Char('2')));
         m.revalidate();
-        assert_eq!(m.panel, Panel::turn(), "the same agent keeps [2]");
+        assert_eq!(m.panel, Panel::activity(), "the same agent keeps [2]");
         update(&mut m, key(KeyCode::Esc));
         update(&mut m, key(KeyCode::Char('[')));
         update(&mut m, key(KeyCode::Char('g')));
@@ -3826,9 +4001,9 @@ mod tests {
     fn tab_cycles_the_panels_and_wraps() {
         let mut m = model(&[]);
         with_changes(&mut m, 3);
-        with_turn(&mut m);
+        with_activity(&mut m);
         update(&mut m, key(KeyCode::Tab));
-        assert_eq!(m.panel, Panel::turn());
+        assert_eq!(m.panel, Panel::activity());
         update(&mut m, key(KeyCode::Tab));
         assert_eq!(m.panel, Panel::Changes { file: 0 });
         update(&mut m, key(KeyCode::Tab));
@@ -3836,16 +4011,16 @@ mod tests {
         update(&mut m, key(KeyCode::BackTab));
         assert_eq!(m.panel, Panel::Changes { file: 0 });
         update(&mut m, key(KeyCode::BackTab));
-        assert_eq!(m.panel, Panel::turn());
+        assert_eq!(m.panel, Panel::activity());
     }
 
     #[test]
     fn h_and_l_move_between_the_left_panels_like_shift_tab_and_tab() {
         let mut m = model(&[]);
         with_changes(&mut m, 3);
-        with_turn(&mut m);
+        with_activity(&mut m);
         update(&mut m, key(KeyCode::Char('l')));
-        assert_eq!(m.panel, Panel::turn());
+        assert_eq!(m.panel, Panel::activity());
         update(&mut m, key(KeyCode::Char('l')));
         assert_eq!(m.panel, Panel::Changes { file: 0 });
         update(&mut m, key(KeyCode::Char('l')));
@@ -3853,11 +4028,14 @@ mod tests {
         update(&mut m, key(KeyCode::Char('h')));
         assert_eq!(m.panel, Panel::Changes { file: 0 });
         update(&mut m, key(KeyCode::Char('h')));
-        assert_eq!(m.panel, Panel::turn());
-        m.panel = Panel::Main(crate::model::Origin::Turn {
-            offset: 0,
-            row: crate::model::TurnRow::Turn,
-        });
+        assert_eq!(m.panel, Panel::activity());
+        m.panel = Panel::Main(
+            crate::model::Origin::Activity {
+                offset: 0,
+                row: crate::model::ActivityRow::Main,
+            },
+            None,
+        );
         update(&mut m, key(KeyCode::Char('l')));
         assert_eq!(m.panel, Panel::Changes { file: 0 });
     }
@@ -3879,13 +4057,13 @@ mod tests {
         let mut m = model(&[]);
         with_changes(&mut m, 3);
         update(&mut m, key(KeyCode::Tab));
-        assert_eq!(m.panel, Panel::Changes { file: 0 }, "no turn recorded");
+        assert_eq!(m.panel, Panel::Changes { file: 0 }, "no activity recorded");
         update(&mut m, key(KeyCode::Tab));
         assert_eq!(m.panel, Panel::Agents);
         with_changes(&mut m, 0);
-        with_turn(&mut m);
+        with_activity(&mut m);
         update(&mut m, key(KeyCode::BackTab));
-        assert_eq!(m.panel, Panel::turn(), "no files");
+        assert_eq!(m.panel, Panel::activity(), "no files");
         m.work_room = WorkRoom::TooShort;
         with_changes(&mut m, 3);
         update(&mut m, key(KeyCode::Tab));
@@ -3896,14 +4074,17 @@ mod tests {
     fn tab_from_a_document_goes_to_the_panel_after_its_origin() {
         let mut m = model(&[]);
         with_changes(&mut m, 3);
-        with_turn(&mut m);
-        m.panel = Panel::Main(crate::model::Origin::Turn {
-            offset: 0,
-            row: crate::model::TurnRow::Turn,
-        });
+        with_activity(&mut m);
+        m.panel = Panel::Main(
+            crate::model::Origin::Activity {
+                offset: 0,
+                row: crate::model::ActivityRow::Main,
+            },
+            None,
+        );
         update(&mut m, key(KeyCode::Tab));
         assert_eq!(m.panel, Panel::Changes { file: 0 });
-        m.panel = Panel::Main(crate::model::Origin::Changes { file: 0 });
+        m.panel = Panel::Main(crate::model::Origin::Changes { file: 0 }, None);
         update(&mut m, key(KeyCode::Tab));
         assert_eq!(m.panel, Panel::Agents);
     }
@@ -3924,7 +4105,7 @@ mod tests {
     fn brackets_cycle_the_tabs_of_the_list_only() {
         let mut m = model(&["fix"]);
         with_changes(&mut m, 3);
-        with_turn(&mut m);
+        with_activity(&mut m);
         update(&mut m, key(KeyCode::Char('[')));
         assert_eq!(m.view, View::Overview);
         update(&mut m, key(KeyCode::Char(']')));
@@ -3932,7 +4113,7 @@ mod tests {
         update(&mut m, key(KeyCode::Char('2')));
         update(&mut m, key(KeyCode::Char(']')));
         assert_eq!(m.view, View::Focus, "[2] has no tabs");
-        assert_eq!(m.panel, Panel::turn());
+        assert_eq!(m.panel, Panel::activity());
     }
 
     #[test]
@@ -4763,7 +4944,7 @@ mod tests {
             &mut m,
             Msg::Inspected {
                 name: name("fix"),
-                facts: Err("not a git repository".into()),
+                read: (Err("not a git repository".into())).map(Inspected::of),
             },
         );
         update(&mut m, key(KeyCode::Char('x')));
@@ -5272,7 +5453,7 @@ mod tests {
     }
 
     #[test]
-    fn a_long_turn_finishing_elsewhere_rings_once() {
+    fn a_long_activity_finishing_elsewhere_rings_once() {
         use agent_core::activity::State;
         let mut m = two_live();
         m.activities.get_or_insert_default().insert(
@@ -5402,7 +5583,7 @@ mod tests {
     }
 
     #[test]
-    fn focusing_the_turn_puts_a_cursor_on_its_rows_and_reads_the_subagent_it_is_on() {
+    fn focusing_the_activity_puts_a_cursor_on_its_rows_and_reads_the_subagent_it_is_on() {
         let mut m = delegating();
         assert_eq!(m.subagent_rows().len(), 3);
         assert!(
@@ -5411,10 +5592,10 @@ mod tests {
         );
 
         update(&mut m, key(KeyCode::Char('2')));
-        assert_eq!(m.row_at(), 0, "the turn row first");
+        assert_eq!(m.row_at(), 0, "the activity row first");
         assert!(
             reads(tick(&mut m)).is_empty(),
-            "the turn needs no transcript"
+            "the activity needs no transcript"
         );
         update(&mut m, key(KeyCode::Char('j')));
         assert_eq!(
@@ -5439,17 +5620,21 @@ mod tests {
         assert_eq!(m.row_at(), 0);
         update(&mut m, key(KeyCode::Char('k')));
         assert_eq!(m.row_at(), 0);
-        assert_eq!(m.panel, Panel::turn(), "j moves the cursor, not a scroll");
+        assert_eq!(
+            m.panel,
+            Panel::activity(),
+            "j moves the cursor, not a scroll"
+        );
     }
 
     #[test]
     fn the_cursor_row_lives_in_the_panel_and_goes_when_the_panel_is_left_and_refocused() {
         let mut m = delegating();
         update(&mut m, key(KeyCode::Char('2')));
-        assert_eq!(m.panel, Panel::turn());
+        assert_eq!(m.panel, Panel::activity());
         update(&mut m, key(KeyCode::Char('j')));
         let Panel::Agent {
-            row: TurnRow::Subagent { by, id },
+            row: ActivityRow::Subagent { by, id },
             ..
         } = m.panel.clone()
         else {
@@ -5466,9 +5651,9 @@ mod tests {
         update(&mut m, key(KeyCode::Enter));
         assert!(m.main_focused());
         assert_eq!(
-            m.panel.turn_row().and_then(|row| match row {
-                TurnRow::Subagent { id, .. } => Some(id.clone()),
-                TurnRow::Turn => None,
+            m.panel.activity_row().and_then(|row| match row {
+                ActivityRow::Subagent { id, .. } => Some(id.clone()),
+                ActivityRow::Main => None,
             }),
             Some(id),
             "the cursor stays on its row while [0] has the keys"
@@ -5477,9 +5662,13 @@ mod tests {
         update(&mut m, key(KeyCode::Esc));
         update(&mut m, key(KeyCode::Esc));
         assert_eq!(m.panel, Panel::Agents);
-        assert_eq!(m.panel.turn_row(), None);
+        assert_eq!(m.panel.activity_row(), None);
         update(&mut m, key(KeyCode::Char('2')));
-        assert_eq!(m.panel, Panel::turn(), "refocusing starts on the turn");
+        assert_eq!(
+            m.panel,
+            Panel::activity(),
+            "refocusing starts on the activity"
+        );
     }
 
     #[test]
@@ -5495,7 +5684,7 @@ mod tests {
             .subagents
             .remove(&id);
         update(&mut m, Msg::Activities(cleared));
-        let Some(TurnRow::Subagent { by, id }) = m.panel.turn_row() else {
+        let Some(ActivityRow::Subagent { by, id }) = m.panel.activity_row() else {
             panic!("the cursor stays on the row");
         };
         assert!(
@@ -5506,7 +5695,11 @@ mod tests {
         );
 
         m.set_cursor(Cursor::Entry(name("auth-refresh-2")));
-        assert_eq!(m.panel.turn_row(), None, "another selection drops the row");
+        assert_eq!(
+            m.panel.activity_row(),
+            None,
+            "another selection drops the row"
+        );
         assert_eq!(m.subagent_rows().len(), 0);
     }
 
@@ -5522,7 +5715,7 @@ mod tests {
             &mut m,
             Msg::Inspected {
                 name: stranger.clone(),
-                facts: Ok(facts),
+                read: Ok(Inspected::of(facts)),
             },
         );
         assert!(m.tracked(&stranger).is_none());
@@ -5554,7 +5747,7 @@ mod tests {
         update(&mut m, key(KeyCode::Char('j')));
         assert_eq!(m.subagent_rows().len(), 2, "gone once the cursor moved on");
         assert!(
-            matches!(m.panel.turn_row(), Some(TurnRow::Subagent { id: held, .. }) if *held != id)
+            matches!(m.panel.activity_row(), Some(ActivityRow::Subagent { id: held, .. }) if *held != id)
         );
         assert!(m.watched(&(agent, id)).is_none());
     }
@@ -5622,23 +5815,29 @@ mod tests {
     }
 
     #[test]
-    fn with_only_a_turn_there_is_one_row_and_zero_or_enter_open_its_document() {
+    fn with_only_an_activity_there_is_one_row_and_zero_or_enter_open_its_document() {
         let mut m = crate::fixtures::fleet(10);
         m.set_cursor(Cursor::Entry(name("rate-limit-1")));
         update(&mut m, key(KeyCode::Char('2')));
         update(&mut m, key(KeyCode::Char('j')));
         assert_eq!(m.row_at(), 0, "nowhere to go");
-        assert!(matches!(m.hover(), Some(crate::document::Hover::Turn(_))));
+        assert!(matches!(
+            m.hover(),
+            Some(crate::document::Hover::Activity(_))
+        ));
         assert_eq!(reads(tick(&mut m)), [""; 0]);
         update(&mut m, key(KeyCode::Enter));
         assert!(m.main_focused());
     }
 
     #[test]
-    fn j_and_k_in_the_turn_pick_what_zero_opens() {
+    fn j_and_k_in_the_activity_pick_what_zero_opens() {
         let mut m = delegating();
         update(&mut m, key(KeyCode::Char('2')));
-        assert!(matches!(m.hover(), Some(crate::document::Hover::Turn(_))));
+        assert!(matches!(
+            m.hover(),
+            Some(crate::document::Hover::Activity(_))
+        ));
         update(&mut m, key(KeyCode::Char('j')));
         assert!(matches!(
             m.hover(),
@@ -5653,7 +5852,7 @@ mod tests {
     }
 
     #[test]
-    fn an_agent_with_no_report_has_no_turn_to_focus() {
+    fn an_agent_with_no_report_has_no_activity_to_focus() {
         let mut m = crate::fixtures::fleet(10);
         m.set_cursor(Cursor::Entry(name("payroll-fix-11")));
         let live_without_report = m
@@ -5665,7 +5864,7 @@ mod tests {
             assert!(
                 m.status
                     .as_ref()
-                    .is_some_and(|s| s.text.contains("no turn recorded"))
+                    .is_some_and(|s| s.text.contains("no activity recorded"))
             );
         }
     }
@@ -5990,7 +6189,7 @@ mod tests {
         assert!(
             m.status
                 .as_ref()
-                .is_some_and(|s| s.text.contains("reports no activity")),
+                .is_some_and(|s| s.text.contains("reports no hooks")),
             "says why"
         );
         let mut m = model(&[]);
@@ -6284,7 +6483,7 @@ mod tests {
             _ => panic!("facts"),
         };
         for who in [&kept, &gone] {
-            m.set_facts(who, Ok(facts.clone()));
+            m.set_test_facts(who, Ok(facts.clone()));
             let tracked = m.track(who);
             tracked.collapsed.insert("src".into());
             tracked.draft = vec![drafted("a.rs", "+x")];
@@ -6361,12 +6560,12 @@ mod tests {
             _ => panic!("facts"),
         };
         let again = name("removed-agent");
-        m.set_facts(&again, Ok(facts.clone()));
+        m.set_test_facts(&again, Ok(facts.clone()));
         let first = m.tracked(&again).expect("tracked").generation;
         m.track(&again).listed();
         forget_gone(&mut m);
         assert!(m.tracked(&again).is_none());
-        m.set_facts(&again, Ok(facts));
+        m.set_test_facts(&again, Ok(facts));
         assert!(m.tracked(&again).expect("tracked").generation > first);
     }
 
@@ -6618,7 +6817,7 @@ mod tests {
         update(&mut m, key(KeyCode::Char('v')));
         update(&mut m, key(KeyCode::Esc));
         assert!(!m.peeking());
-        assert_eq!(m.panel, Panel::turn(), "Esc closed only the peek");
+        assert_eq!(m.panel, Panel::activity(), "Esc closed only the peek");
     }
 
     #[test]
@@ -6673,13 +6872,13 @@ mod tests {
     }
 
     #[test]
-    fn e_on_a_subagent_row_opens_its_transcript_and_on_the_turn_row_the_checkout() {
+    fn e_on_a_subagent_row_opens_its_transcript_and_on_the_activity_row_the_checkout() {
         let mut m = delegating();
         update(&mut m, key(KeyCode::Char('2')));
         let effects = update(&mut m, key(KeyCode::Char('e')));
         assert!(
             matches!(effects.as_slice(), [Effect::Edit(Open::Checkout(_))]),
-            "the turn row"
+            "the activity row"
         );
 
         update(&mut m, key(KeyCode::Char('j')));
@@ -6739,24 +6938,28 @@ mod tests {
         update(&mut m, key(KeyCode::Char('j')));
         assert_eq!(
             nav(&m).cursor,
-            Some(1),
-            "a finished log starts at the prompt"
+            Some(EntryKey::Log(0)),
+            "a finished log starts at the prompt, so one step is its first entry"
         );
         update(&mut m, key(KeyCode::Char('j')));
         update(&mut m, key(KeyCode::Enter));
-        assert!(nav(&m).is_open(2));
+        assert!(nav(&m).is_open(&EntryKey::Log(1)));
         update(&mut m, key(KeyCode::Enter));
-        assert!(!nav(&m).is_open(2));
+        assert!(!nav(&m).is_open(&EntryKey::Log(1)));
         update(&mut m, key(KeyCode::Char('=')));
-        assert!(nav(&m).is_open(4));
+        assert!(nav(&m).is_open(&EntryKey::Log(3)));
         update(&mut m, key(KeyCode::Char('-')));
-        assert!(!nav(&m).is_open(4));
+        assert!(!nav(&m).is_open(&EntryKey::Log(3)));
         update(&mut m, key(KeyCode::Char('G')));
-        assert_eq!(nav(&m).cursor, Some(4));
+        assert_eq!(nav(&m).cursor, Some(EntryKey::Log(3)));
         update(&mut m, key(KeyCode::Char('j')));
-        assert_eq!(nav(&m).cursor, Some(4), "stops at the last entry");
+        assert_eq!(
+            nav(&m).cursor,
+            Some(EntryKey::Log(3)),
+            "stops at the last entry"
+        );
         update(&mut m, key(KeyCode::Char('g')));
-        assert_eq!(nav(&m).cursor, Some(0));
+        assert_eq!(nav(&m).cursor, Some(EntryKey::Prompt));
 
         update(&mut m, key(KeyCode::Char('j')));
         update(&mut m, key(KeyCode::Char('j')));
@@ -6786,8 +6989,8 @@ mod tests {
                 .values()
                 .flat_map(|t| t.subagents.values())
                 .next()
-                .and_then(|w| w.watch.nav.cursor),
-            Some(4)
+                .and_then(|w| w.watch.nav.cursor.clone()),
+            Some(EntryKey::Log(3))
         );
     }
 
@@ -6850,7 +7053,7 @@ mod tests {
     }
 
     #[test]
-    fn y_on_the_turn_copies_the_agents_message() {
+    fn y_on_the_activity_copies_the_agents_message() {
         let mut m = crate::fixtures::fleet(10);
         m.set_cursor(Cursor::Entry(name("auth-refresh-2")));
         update(&mut m, key(KeyCode::Char('2')));
@@ -6868,11 +7071,11 @@ mod tests {
         m
     }
 
-    fn turn_reads(effects: Vec<Effect>) -> Vec<(String, Option<String>)> {
+    fn activity_reads(effects: Vec<Effect>) -> Vec<(String, Option<String>)> {
         effects
             .into_iter()
             .filter_map(|e| match e {
-                Effect::ReadTurn { name, at, workdir } => Some((
+                Effect::ReadActivity { name, at, workdir } => Some((
                     format!("{name} {}", workdir.display()),
                     at.map(|a| a.as_str().to_string()),
                 )),
@@ -6882,7 +7085,8 @@ mod tests {
     }
 
     #[test]
-    fn the_turn_is_asked_for_through_an_effect_only_while_it_is_shown_and_when_it_may_have_moved() {
+    fn the_activity_is_asked_for_through_an_effect_only_while_it_is_shown_and_when_it_may_have_moved()
+     {
         let mut m = at_work();
         m.activities
             .as_mut()
@@ -6890,30 +7094,30 @@ mod tests {
             .expect("reports")
             .transcript = Some(TranscriptRef::new("/p/s.jsonl"));
         assert!(
-            turn_reads(tick(&mut m)).is_empty(),
+            activity_reads(tick(&mut m)).is_empty(),
             "[0] shows the terminal, which needs no transcript"
         );
 
         update(&mut m, key(KeyCode::Char('2')));
         assert_eq!(
-            turn_reads(tick(&mut m)),
+            activity_reads(tick(&mut m)),
             [(
                 "payroll-fix-3 /w/heucristic0/payroll-fix-3".to_string(),
                 Some("/p/s.jsonl".to_string())
             )],
             "the checkout and the transcript the hooks named, for the worker"
         );
-        assert!(turn_reads(tick(&mut m)).is_empty(), "once");
+        assert!(activity_reads(tick(&mut m)).is_empty(), "once");
 
         let again = |m: &mut Model, back: Duration| {
             m.track(&name("payroll-fix-3"))
-                .turn
+                .activity_view
                 .watch
                 .read
                 .as_mut()
                 .expect("read")
                 .at -= back;
-            turn_reads(tick(m)).len()
+            activity_reads(tick(m)).len()
         };
         assert_eq!(again(&mut m, LOG_REFRESH), 0, "nothing was reported");
         assert_eq!(
@@ -6929,76 +7133,87 @@ mod tests {
             .events += 1;
         assert_eq!(again(&mut m, LOG_REFRESH), 1, "soon after it reports");
         assert_eq!(
-            turn_reads(tick(&mut m)).len() + again(&mut m, Duration::ZERO),
+            activity_reads(tick(&mut m)).len() + again(&mut m, Duration::ZERO),
             0,
             "not before the interval"
         );
     }
 
     #[test]
-    fn a_finished_turn_is_read_again_only_when_its_agent_reports_something() {
+    fn a_finished_activity_is_read_again_only_when_its_agent_reports_something() {
         let mut m = crate::fixtures::fleet(10);
         m.set_cursor(Cursor::Entry(name("auth-refresh-2")));
         update(&mut m, key(KeyCode::Char('2')));
-        assert_eq!(turn_reads(tick(&mut m)).len(), 1);
+        assert_eq!(activity_reads(tick(&mut m)).len(), 1);
         let who = name("auth-refresh-2");
-        m.track(&who).turn.watch.read.as_mut().expect("read").at -= LOG_SLOW_REFRESH * 3;
+        m.track(&who)
+            .activity_view
+            .watch
+            .read
+            .as_mut()
+            .expect("read")
+            .at -= LOG_SLOW_REFRESH * 3;
         assert!(
-            turn_reads(tick(&mut m)).is_empty(),
+            activity_reads(tick(&mut m)).is_empty(),
             "its transcript can still grow, but only a report says so"
         );
     }
 
     #[test]
-    fn an_answer_replaces_the_turn_and_a_new_turn_starts_the_cursor_over() {
+    fn an_answer_replaces_the_activity_and_a_new_activity_starts_the_cursor_over() {
         let mut m = at_work();
         let who = name("payroll-fix-3");
-        let turn = |mark: &str| {
-            let mut turn = crate::log::fixtures::turn(vec![crate::log::fixtures::said("one")]);
-            turn.mark = Some(agent_core::ports::TurnMark::new(mark));
-            turn
+        let detail = |mark: &str| {
+            let mut detail =
+                crate::log::fixtures::activity_of(vec![crate::log::fixtures::said("one")]);
+            detail.mark = Some(agent_core::ports::ActivityMark::new(mark));
+            detail
         };
         update(
             &mut m,
-            Msg::Turn {
+            Msg::Activity {
                 name: who.clone(),
-                turn: Ok(Some(turn("p1"))),
+                detail: Ok(Some(detail("p1"))),
             },
         );
-        m.track(&who).turn.watch.nav.cursor = Some(1);
+        m.track(&who).activity_view.watch.nav.cursor = Some(EntryKey::Log(1));
         update(
             &mut m,
-            Msg::Turn {
+            Msg::Activity {
                 name: who.clone(),
-                turn: Ok(Some(turn("p1"))),
+                detail: Ok(Some(detail("p1"))),
             },
         );
         assert_eq!(
-            m.track(&who).turn.watch.nav.cursor,
-            Some(1),
-            "the same turn, grown"
+            m.track(&who).activity_view.watch.nav.cursor,
+            Some(EntryKey::Log(1)),
+            "the same activity, grown"
         );
         update(
             &mut m,
-            Msg::Turn {
+            Msg::Activity {
                 name: who.clone(),
-                turn: Ok(Some(turn("p2"))),
+                detail: Ok(Some(detail("p2"))),
             },
         );
-        assert_eq!(m.track(&who).turn.watch.nav.cursor, None, "a new prompt");
+        assert_eq!(
+            m.track(&who).activity_view.watch.nav.cursor,
+            None,
+            "a new prompt"
+        );
         update(
             &mut m,
-            Msg::Turn {
+            Msg::Activity {
                 name: who.clone(),
-                turn: Err("denied".into()),
+                detail: Err("denied".into()),
             },
         );
-        assert!(m.turn(&who).is_none());
+        assert!(m.activity_detail(&who).is_none());
         update(
             &mut m,
-            Msg::Turn {
+            Msg::Activity {
                 name: name("nobody"),
-                turn: Ok(None),
+                detail: Ok(None),
             },
         );
         assert!(
@@ -7025,14 +7240,14 @@ mod tests {
     }
 
     #[test]
-    fn the_turn_log_has_the_entry_cursor_folds_follow_and_copy_a_subagent_log_has() {
+    fn the_activity_log_has_the_entry_cursor_folds_follow_and_copy_a_subagent_log_has() {
         let mut m = at_work();
         let who = name("payroll-fix-3");
-        m.set_turn(&who, Ok(Some(crate::log::fixtures::turn(story()))));
+        m.set_activity(&who, Ok(Some(crate::log::fixtures::activity_of(story()))));
         update(&mut m, key(KeyCode::Char('2')));
         update(&mut m, key(KeyCode::Char('0')));
         let nav = |m: &Model| {
-            m.nav(&LogKey::Turn(who.clone()))
+            m.nav(&LogKey::Activity(who.clone()))
                 .cloned()
                 .unwrap_or_default()
         };
@@ -7040,25 +7255,32 @@ mod tests {
         update(&mut m, key(KeyCode::Char('k')));
         assert_eq!(
             nav(&m).cursor,
-            Some(3),
-            "a working turn starts on its last entry: prompt, two folded phases, then three said and one call"
+            Some(EntryKey::Log(4)),
+            "a working activity starts on its last entry: prompt, two folded phases, then three said and one call"
         );
         let paused = !m.docs.following();
         assert!(paused, "up pauses the follow");
         update(&mut m, key(KeyCode::Char('g')));
-        assert_eq!(nav(&m).cursor, Some(0));
+        assert_eq!(nav(&m).cursor, Some(EntryKey::Prompt));
         update(&mut m, key(KeyCode::Char('j')));
         update(&mut m, key(KeyCode::Enter));
-        assert!(nav(&m).is_open(1), "⏎ opens the folded phase");
+        assert!(
+            nav(&m).is_open(&EntryKey::Log(0)),
+            "⏎ opens the folded phase"
+        );
         update(&mut m, key(KeyCode::Enter));
-        assert!(!nav(&m).is_open(1));
+        assert!(!nav(&m).is_open(&EntryKey::Log(0)));
         update(&mut m, key(KeyCode::Char('=')));
-        assert!(nav(&m).is_open(2));
+        assert!(nav(&m).is_open(&EntryKey::Log(2)));
         update(&mut m, key(KeyCode::Char('-')));
-        assert!(!nav(&m).is_open(2));
+        assert!(!nav(&m).is_open(&EntryKey::Log(2)));
         update(&mut m, key(KeyCode::Char('G')));
         update(&mut m, key(KeyCode::Char('j')));
-        assert_eq!(nav(&m).cursor, Some(4), "stops at the last entry");
+        assert_eq!(
+            nav(&m).cursor,
+            Some(EntryKey::Log(5)),
+            "stops at the last entry"
+        );
 
         update(&mut m, key(KeyCode::Char('g')));
         update(&mut m, key(KeyCode::Char('j')));
@@ -7070,11 +7292,11 @@ mod tests {
     }
 
     #[test]
-    fn y_on_a_turn_with_no_log_still_copies_the_agents_message() {
+    fn y_on_an_activity_with_no_log_still_copies_the_agents_message() {
         let mut m = crate::fixtures::fleet(10);
         m.set_cursor(Cursor::Entry(name("auth-refresh-2")));
         update(&mut m, key(KeyCode::Char('2')));
-        m.set_turn(&name("auth-refresh-2"), Ok(None));
+        m.set_activity(&name("auth-refresh-2"), Ok(None));
         update(&mut m, key(KeyCode::Char('0')));
         let effects = update(&mut m, key(KeyCode::Char('y')));
         assert!(
@@ -7083,7 +7305,7 @@ mod tests {
     }
 
     #[test]
-    fn the_turn_counts_as_seen_after_a_few_steady_seconds_in_front_of_the_user() {
+    fn the_activity_counts_as_seen_after_a_few_steady_seconds_in_front_of_the_user() {
         let mut m = at_work();
         let who = name("payroll-fix-3");
         let base = m.clock;
@@ -7093,31 +7315,35 @@ mod tests {
         };
         let now = moved(0);
         tick_at(&mut m, now);
-        assert_eq!(m.track(&who).turn.looked.seen, None, "not on screen");
+        assert_eq!(
+            m.track(&who).activity_view.looked.seen,
+            None,
+            "not on screen"
+        );
 
         update(&mut m, key(KeyCode::Char('2')));
         let start = moved(1);
         tick_at(&mut m, start);
         let almost = moved(3);
         tick_at(&mut m, almost);
-        assert_eq!(m.track(&who).turn.looked.seen, None, "only 2s");
+        assert_eq!(m.track(&who).activity_view.looked.seen, None, "only 2s");
         let steady = moved(5);
         tick_at(&mut m, steady);
-        assert_eq!(m.track(&who).turn.looked.seen, Some(steady.wall));
+        assert_eq!(m.track(&who).activity_view.looked.seen, Some(steady.wall));
 
         update(&mut m, key(KeyCode::Esc));
         let later = moved(60);
         tick_at(&mut m, later);
         assert_eq!(
-            m.track(&who).turn.looked.seen,
+            m.track(&who).activity_view.looked.seen,
             Some(steady.wall),
             "frozen when it left the screen"
         );
-        assert_eq!(m.track(&who).turn.looked.since, None);
+        assert_eq!(m.track(&who).activity_view.looked.since, None);
     }
 
     #[test]
-    fn reading_a_finished_turn_acknowledges_it_as_the_marker_clears() {
+    fn reading_a_finished_activity_acknowledges_it_as_the_marker_clears() {
         let mut m = crate::fixtures::fleet(10);
         let who = name("auth-refresh-2");
         m.set_cursor(Cursor::Entry(who.clone()));
@@ -7136,7 +7362,7 @@ mod tests {
         assert!(!acknowledged(tick_at(&mut m, at(2))), "not yet 3s");
         let effects = tick_at(&mut m, at(4));
         assert!(acknowledged(effects), "the same dwell time as the marker");
-        assert_eq!(m.track(&who).turn.looked.seen, Some(at(4).wall));
+        assert_eq!(m.track(&who).activity_view.looked.seen, Some(at(4).wall));
         assert!(!acknowledged(tick_at(&mut m, at(6))), "once per report");
     }
 
@@ -7159,7 +7385,7 @@ mod tests {
     }
 
     #[test]
-    fn a_peeked_terminal_is_what_is_seen_over_the_turn_behind_it_whatever_the_agents_order() {
+    fn a_peeked_terminal_is_what_is_seen_over_the_activity_behind_it_whatever_the_agents_order() {
         for _ in 0..8 {
             let mut m = crate::fixtures::fleet(10);
             m.set_cursor(Cursor::Entry(name("auth-refresh-2")));
@@ -7173,7 +7399,7 @@ mod tests {
             };
             tick_at(&mut m, at(0));
             tick_at(&mut m, at(5));
-            let seen = |m: &mut Model, who: &str| m.track(&name(who)).turn.looked.seen;
+            let seen = |m: &mut Model, who: &str| m.track(&name(who)).activity_view.looked.seen;
             assert_eq!(seen(&mut m, "obs-layout-4"), Some(at(5).wall), "the pane");
             assert_eq!(seen(&mut m, "auth-refresh-2"), None, "covered by the peek");
         }
@@ -7197,9 +7423,9 @@ mod tests {
             !effects
                 .iter()
                 .any(|e| matches!(e, Effect::Job(Job::Acknowledge(_)))),
-            "a turn on an unattended screen isn't read"
+            "an activity on an unattended screen isn't read"
         );
-        assert_eq!(m.track(&who).turn.looked.seen, None);
+        assert_eq!(m.track(&who).activity_view.looked.seen, None);
         m.terminal = TerminalFocus::Focused;
         let effects = tick_at(&mut m, at(11));
         assert!(
@@ -7215,5 +7441,511 @@ mod tests {
                 .any(|e| matches!(e, Effect::Job(Job::Acknowledge(_)))),
             "it counts once the window has been back for the dwell"
         );
+    }
+
+    mod links {
+        use super::*;
+        use crate::document::Hover;
+        use crate::fixtures::{facts, modified};
+        use crate::log::fixtures::{activity_of, bash, delegate, done, edit, said};
+        use crate::model::{ActivitySpot, Opened};
+        use crate::touched::Baseline;
+        use crate::tree::ChangesScope;
+        use agent_core::ports::{CallState, LogEntry, Progress};
+
+        const WHO: &str = "obs-layout-4";
+        const ROOT: &str = "/w/heucristic0/obs-layout-4";
+
+        fn ok() -> CallState {
+            done(agent_core::ports::Summary::NoOutput)
+        }
+
+        fn who() -> SessionName {
+            name(WHO)
+        }
+
+        /// [0] focused on the activity of the delegating agent, whose log is `log`.
+        fn reading(log: Vec<LogEntry>) -> Model {
+            let mut m = crate::fixtures::fleet(10);
+            m.set_cursor(Cursor::Entry(who()));
+            m.set_activity(&who(), Ok(Some(activity_of(log))));
+            update(&mut m, key(KeyCode::Char('2')));
+            update(&mut m, key(KeyCode::Char('0')));
+            m
+        }
+
+        fn on_entry(m: &mut Model, at: EntryKey) {
+            m.track(&who()).activity_view.watch.nav.cursor = Some(at);
+            m.settle();
+        }
+
+        fn cursor(m: &Model) -> Option<EntryKey> {
+            m.tracked(&who())
+                .and_then(|t| t.activity_view.watch.nav.cursor.clone())
+        }
+
+        fn said_by_the_status_bar(m: &Model) -> String {
+            m.status
+                .as_ref()
+                .map(|s| s.text.clone())
+                .unwrap_or_default()
+        }
+
+        /// Entries: the prompt, then said, the Agent call, the edit and a
+        /// command, at log indexes 0 to 3.
+        fn delegating_log(agent: Option<&str>) -> Vec<LogEntry> {
+            vec![
+                said("go"),
+                delegate("QA pass", agent),
+                edit(&format!("{ROOT}/src/a.rs")),
+                bash("ls", ok()),
+            ]
+        }
+
+        const AGENT_CALL: EntryKey = EntryKey::Log(1);
+        const EDIT_CALL: EntryKey = EntryKey::Log(2);
+
+        fn spot_of(m: &Model) -> Option<ActivitySpot> {
+            m.activity_spot()
+        }
+
+        #[test]
+        fn enter_on_an_agent_call_opens_its_subagents_log_and_escape_returns_to_the_activity_spot()
+        {
+            let mut m = reading(delegating_log(Some("s1")));
+            let spot = spot_of(&m).expect("on the activity");
+            on_entry(&mut m, AGENT_CALL);
+            update(&mut m, key(KeyCode::Enter));
+            assert_eq!(
+                m.subagent_selected(),
+                Some((who(), AgentId::new("s1"))),
+                "[2]'s cursor is on the subagent the call started"
+            );
+            assert!(matches!(m.hover(), Some(Hover::Subagent(..))));
+            assert_eq!(m.panel.back(), Some(&spot));
+
+            update(&mut m, key(KeyCode::Esc));
+            assert!(matches!(m.hover(), Some(Hover::Activity(_))));
+            assert_eq!(spot_of(&m), Some(spot), "the same panel, offset and row");
+            assert_eq!(m.panel.back(), None);
+            assert_eq!(cursor(&m), Some(AGENT_CALL), "the cursor is where it was");
+            update(&mut m, key(KeyCode::Esc));
+            assert!(matches!(m.panel, Panel::Agent { .. }), "then to [2]");
+        }
+
+        #[test]
+        fn enter_on_an_agent_call_with_no_known_subagent_folds_it_like_any_entry() {
+            let mut m = reading(delegating_log(None));
+            on_entry(&mut m, AGENT_CALL);
+            update(&mut m, key(KeyCode::Enter));
+            assert!(
+                m.tracked(&who())
+                    .is_some_and(|t| t.activity_view.watch.nav.is_open(&AGENT_CALL))
+            );
+            assert!(matches!(m.hover(), Some(Hover::Activity(_))));
+        }
+
+        #[test]
+        fn enter_on_a_call_whose_subagent_is_no_longer_listed_says_so_and_stays() {
+            let mut m = reading(delegating_log(Some("gone")));
+            on_entry(&mut m, AGENT_CALL);
+            update(&mut m, key(KeyCode::Enter));
+            assert!(said_by_the_status_bar(&m).contains("isn't listed any more"));
+            assert!(matches!(m.hover(), Some(Hover::Activity(_))));
+            assert_eq!(m.panel.back(), None);
+        }
+
+        #[test]
+        fn enter_on_an_edit_call_shows_the_file_in_the_tab_that_lists_it_and_escape_restores_the_tab()
+         {
+            let mut m = reading(delegating_log(None));
+            m.set_test_facts(&who(), Ok(facts(Vec::new(), vec![modified("src/a.rs")])));
+            let spot = spot_of(&m).expect("on the activity");
+            assert_eq!(spot.scope, ChangesScope::Uncommitted);
+            on_entry(&mut m, EDIT_CALL);
+            update(&mut m, key(KeyCode::Enter));
+            assert_eq!(m.changes_scope, ChangesScope::Since);
+            assert_eq!(
+                m.file_under_cursor().map(|(_, file)| file),
+                Some(PathBuf::from("src/a.rs")),
+                "the absolute path the call named is the file in the checkout"
+            );
+            assert!(matches!(m.hover(), Some(Hover::Diff(_))));
+
+            update(&mut m, key(KeyCode::Esc));
+            assert!(matches!(m.hover(), Some(Hover::Activity(_))));
+            assert_eq!(spot_of(&m), Some(spot));
+            assert_eq!(
+                m.changes_scope,
+                ChangesScope::Uncommitted,
+                "the tab [3] had"
+            );
+            assert_eq!(cursor(&m), Some(EDIT_CALL));
+        }
+
+        #[test]
+        fn a_file_in_a_closed_folder_is_shown_with_its_folders_opened() {
+            let mut m = reading(delegating_log(None));
+            m.changes_view = ChangesView::Tree;
+            m.set_test_facts(&who(), Ok(facts(vec![modified("src/a.rs")], Vec::new())));
+            m.track(&who()).collapsed.insert(PathBuf::from("src"));
+            on_entry(&mut m, EDIT_CALL);
+            update(&mut m, key(KeyCode::Enter));
+            assert_eq!(
+                m.file_under_cursor().map(|(_, file)| file),
+                Some(PathBuf::from("src/a.rs"))
+            );
+            assert!(m.tracked(&who()).is_some_and(|t| t.collapsed.is_empty()));
+        }
+
+        #[test]
+        fn a_touched_file_git_does_not_list_says_so_and_leaves_the_activity_where_it_was() {
+            let mut m = reading(delegating_log(None));
+            m.set_test_facts(&who(), Ok(facts(Vec::new(), Vec::new())));
+            on_entry(&mut m, EDIT_CALL);
+            update(&mut m, key(KeyCode::Enter));
+            assert!(said_by_the_status_bar(&m).contains("src/a.rs has no diff in [3]"));
+            assert!(matches!(m.hover(), Some(Hover::Activity(_))));
+            assert_eq!(m.panel.back(), None);
+        }
+
+        #[test]
+        fn a_file_when_there_is_no_room_for_changes_says_so() {
+            let mut m = reading(delegating_log(None));
+            m.set_test_facts(&who(), Ok(facts(vec![modified("src/a.rs")], Vec::new())));
+            m.work_room = crate::model::WorkRoom::TooShort;
+            on_entry(&mut m, EDIT_CALL);
+            update(&mut m, key(KeyCode::Enter));
+            assert_eq!(said_by_the_status_bar(&m), "no room for [3] at this height");
+            assert!(matches!(m.hover(), Some(Hover::Activity(_))));
+        }
+
+        #[test]
+        fn an_activity_still_delegating_counts_its_touched_files_but_lists_none() {
+            let m = reading(delegating_log(None));
+            assert_eq!(m.touched(&who()).map(<[_]>::len), Some(1));
+            assert_eq!(m.listed(&who()), Some(&[][..]));
+        }
+
+        fn settled() -> (Model, SessionName) {
+            let mut m = crate::fixtures::fleet(10);
+            let agent = name("auth-refresh-2");
+            m.set_cursor(Cursor::Entry(agent.clone()));
+            let mut detail = activity_of(vec![
+                said("go"),
+                edit("/w/heucristic0/auth-refresh-2/src/b.rs"),
+                bash("ls", ok()),
+            ]);
+            detail.progress = Progress::Finished { took: None };
+            m.set_activity(&agent, Ok(Some(detail)));
+            m.set_test_facts(&agent, Ok(facts(vec![modified("src/b.rs")], Vec::new())));
+            update(&mut m, key(KeyCode::Char('2')));
+            update(&mut m, key(KeyCode::Char('0')));
+            (m, agent)
+        }
+
+        #[test]
+        fn a_settled_activity_lists_its_touched_files_and_enter_on_one_opens_its_diff() {
+            let (mut m, agent) = settled();
+            assert_eq!(m.listed(&agent).map(<[_]>::len), Some(1));
+            m.track(&agent).activity_view.watch.nav.cursor =
+                Some(EntryKey::Touched("src/b.rs".into()));
+            m.settle();
+            update(&mut m, key(KeyCode::Enter));
+            assert!(
+                matches!(m.hover(), Some(Hover::Diff(key)) if key.change.path == Path::new("src/b.rs"))
+            );
+        }
+
+        #[test]
+        fn e_on_the_activity_writes_it_as_markdown_at_the_entry_under_the_cursor() {
+            let mut m = reading(delegating_log(None));
+            on_entry(&mut m, EDIT_CALL);
+            let effects = update(&mut m, key(KeyCode::Char('e')));
+            let [
+                Effect::Edit(Open::Transcript {
+                    text, line, name, ..
+                }),
+            ] = effects.as_slice()
+            else {
+                panic!("one transcript to open")
+            };
+            assert_eq!(name, "obs-layout-4-activity");
+            assert_eq!(
+                text.lines().nth(line.get() - 1),
+                Some(format!("### Edit {ROOT}/src/a.rs").as_str())
+            );
+            assert!(text.contains("### Prompt"), "{text}");
+        }
+
+        #[test]
+        fn the_markdown_of_an_activity_has_the_closing_message_and_touched_files_before_the_calls()
+        {
+            let (mut m, agent) = settled();
+            m.track(&agent).activity_view.watch.nav.cursor =
+                Some(EntryKey::Touched("src/b.rs".into()));
+            let effects = update(&mut m, key(KeyCode::Char('e')));
+            let [Effect::Edit(Open::Transcript { text, line, .. })] = effects.as_slice() else {
+                panic!("one transcript to open")
+            };
+            assert_eq!(
+                text.lines().nth(line.get() - 1),
+                Some("- `src/b.rs` (+2 \u{2212}1)"),
+                "{text}"
+            );
+            let at = |needle: &str| {
+                text.find(needle)
+                    .unwrap_or_else(|| panic!("{needle}\n{text}"))
+            };
+            assert!(at("### Prompt") < at("### Closing message"));
+            assert!(at("### Closing message") < at("### Touched files"));
+            assert!(at("### Touched files") < at("## Calls"));
+        }
+
+        /// The agent's next report, with `prompts` prompts taken in all.
+        fn prompted(m: &mut Model, agent: &SessionName, state: State, prompts: u64) {
+            let mut next = m.activities.clone().expect("reports");
+            let activity = next.get_mut(agent).expect("reports");
+            activity.state = state;
+            if prompts > activity.prompts {
+                activity.prompt_event = activity.events + 1;
+            }
+            activity.prompts = prompts;
+            activity.events += 1;
+            update(m, Msg::Activities(next));
+        }
+
+        fn working() -> State {
+            State::Working { tools: Vec::new() }
+        }
+
+        fn finished() -> State {
+            State::Done { summary: None }
+        }
+
+        /// Facts as read when the agent had reported `events`.
+        fn asked_at(
+            m: &mut Model,
+            agent: &SessionName,
+            events: u64,
+            pending: Vec<agent_core::ports::Change>,
+        ) {
+            let read = Inspected {
+                asked_events: Some(events),
+                ..Inspected::of(facts(pending, Vec::new()))
+            };
+            m.set_facts(agent, Ok(read));
+        }
+
+        /// The agent reading its activity, which has begun with `old.rs` dirty.
+        fn begun() -> (Model, SessionName) {
+            let mut m = crate::fixtures::fleet(10);
+            let agent = name("auth-refresh-2");
+            let events = m.activity(&agent).expect("reports").events;
+            asked_at(&mut m, &agent, events, vec![modified("old.rs")]);
+            prompted(&mut m, &agent, working(), 2);
+            m.set_cursor(Cursor::Entry(agent.clone()));
+            m.set_activity(&agent, Ok(Some(activity_of(Vec::new()))));
+            update(&mut m, key(KeyCode::Char('2')));
+            (m, agent)
+        }
+
+        fn paths(files: Option<&[crate::touched::TouchedFile]>) -> Vec<&str> {
+            files
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|f| f.path.to_str())
+                .collect()
+        }
+
+        #[test]
+        fn a_prompt_snapshots_the_changed_files_and_only_later_changes_count() {
+            let (mut m, agent) = begun();
+            let now = facts(vec![modified("old.rs"), modified("sed.rs")], Vec::new());
+            m.set_test_facts(&agent, Ok(now));
+            m.settle();
+            assert_eq!(
+                paths(m.touched(&agent)),
+                ["sed.rs"],
+                "old.rs was already dirty"
+            );
+            assert_eq!(
+                m.listed(&agent),
+                Some(&[][..]),
+                "a working activity only counts"
+            );
+            prompted(&mut m, &agent, finished(), 2);
+            m.settle();
+            assert_eq!(paths(m.listed(&agent)), ["sed.rs"]);
+        }
+
+        #[test]
+        fn the_same_words_typed_again_begin_a_new_activity_and_a_fresh_snapshot() {
+            let (mut m, agent) = begun();
+            prompted(&mut m, &agent, finished(), 2);
+            let events = m.activity(&agent).expect("reports").events;
+            let both = vec![modified("old.rs"), modified("sed.rs")];
+            asked_at(&mut m, &agent, events, both.clone());
+            prompted(&mut m, &agent, working(), 3);
+            asked_at(&mut m, &agent, events + 1, both);
+            m.settle();
+            assert!(
+                paths(m.touched(&agent)).is_empty(),
+                "sed.rs belongs to the activity before"
+            );
+        }
+
+        #[test]
+        fn waking_after_rest_or_a_handback_keeps_the_snapshot_of_the_activity() {
+            let (mut m, agent) = begun();
+            let snapshot = m.track(&agent).baseline.clone();
+            m.set_test_facts(&agent, Ok(facts(Vec::new(), Vec::new())));
+            prompted(&mut m, &agent, State::Delegating, 2);
+            prompted(&mut m, &agent, working(), 2);
+            prompted(&mut m, &agent, finished(), 2);
+            prompted(&mut m, &agent, working(), 2);
+            assert_eq!(m.track(&agent).baseline, snapshot);
+            assert_ne!(snapshot, Baseline::Unknown);
+        }
+
+        #[test]
+        fn facts_asked_before_the_agents_last_report_or_after_the_prompt_are_not_a_snapshot() {
+            let agent = name("auth-refresh-2");
+            for (asked, why) in [(0, "before its last report"), (9, "after the prompt")] {
+                let mut m = crate::fixtures::fleet(10);
+                asked_at(&mut m, &agent, asked, vec![modified("old.rs")]);
+                prompted(&mut m, &agent, working(), 2);
+                assert_eq!(m.track(&agent).baseline, Baseline::Unknown, "{why}");
+            }
+            let mut m = crate::fixtures::fleet(10);
+            m.set_test_facts(&agent, Ok(facts(vec![modified("old.rs")], Vec::new())));
+            prompted(&mut m, &agent, working(), 2);
+            assert_eq!(
+                m.track(&agent).baseline,
+                Baseline::Unknown,
+                "facts that don't say when they were asked"
+            );
+        }
+
+        #[test]
+        fn edits_reported_in_the_same_poll_as_the_prompt_are_not_in_the_snapshot() {
+            let agent = name("auth-refresh-2");
+            let reported = m_events();
+            for (asked_at_event, taken) in [(reported + 3, false), (reported, true)] {
+                let mut m = crate::fixtures::fleet(10);
+                let mut next = m.activities.clone().expect("reports");
+                let activity = next.get_mut(&agent).expect("reports");
+                activity.state = working();
+                activity.prompts += 1;
+                activity.prompt_event = reported + 1;
+                activity.events = reported + 4;
+                asked_at(&mut m, &agent, asked_at_event, vec![modified("old.rs")]);
+                update(&mut m, Msg::Activities(next));
+                assert_eq!(
+                    m.track(&agent).baseline != Baseline::Unknown,
+                    taken,
+                    "a read asked at event {asked_at_event} of a prompt at {} and edits to {}",
+                    reported + 1,
+                    reported + 4
+                );
+            }
+        }
+
+        /// The events the fleet's agent had reported before the test's prompt.
+        fn m_events() -> u64 {
+            let m = crate::fixtures::fleet(10);
+            m.activity(&name("auth-refresh-2")).expect("reports").events
+        }
+
+        #[test]
+        fn an_agent_first_seen_mid_activity_has_no_snapshot_and_one_that_appears_later_does() {
+            let mut m = crate::fixtures::fleet(10);
+            let all = m.activities.take().expect("reports");
+            update(&mut m, Msg::Activities(all.clone()));
+            assert_eq!(m.track(&who()).baseline, Baseline::Unknown);
+
+            let newcomer = name("auth-refresh-2");
+            let mut without = all.clone();
+            without.remove(&newcomer);
+            update(&mut m, Msg::Activities(without));
+            let events = all[&newcomer].events;
+            asked_at(&mut m, &newcomer, events, vec![modified("old.rs")]);
+            update(&mut m, Msg::Activities(all));
+            assert_ne!(m.track(&newcomer).baseline, Baseline::Unknown);
+        }
+
+        #[test]
+        fn escape_after_moving_on_to_another_agents_document_does_not_jump_to_the_old_activity() {
+            let mut m = reading(delegating_log(None));
+            m.set_test_facts(&who(), Ok(facts(vec![modified("src/a.rs")], Vec::new())));
+            on_entry(&mut m, EDIT_CALL);
+            update(&mut m, key(KeyCode::Enter));
+            assert!(m.panel.back().is_some());
+
+            update(&mut m, key(KeyCode::Char('l')));
+            let other = name("auth-refresh-2");
+            m.set_cursor(Cursor::Entry(other.clone()));
+            update(&mut m, key(KeyCode::Char('2')));
+            update(&mut m, key(KeyCode::Char('0')));
+            assert!(m.panel.in_main());
+            update(&mut m, key(KeyCode::Esc));
+            assert!(
+                matches!(m.panel, Panel::Agent { .. }),
+                "back to [2], not to the first agent's activity: {:?}",
+                m.panel
+            );
+        }
+
+        #[test]
+        fn selecting_another_agent_forgets_the_way_back_before_any_key() {
+            let mut m = reading(delegating_log(None));
+            m.set_test_facts(&who(), Ok(facts(vec![modified("src/a.rs")], Vec::new())));
+            on_entry(&mut m, EDIT_CALL);
+            update(&mut m, key(KeyCode::Enter));
+            assert!(m.panel.back().is_some());
+            m.set_cursor(Cursor::Entry(name("auth-refresh-2")));
+            m.settle();
+            assert_eq!(m.panel.back(), None);
+        }
+
+        #[test]
+        fn escape_closes_an_open_commit_before_it_returns_to_the_activity() {
+            let mut m = reading(delegating_log(None));
+            m.set_test_facts(&who(), Ok(facts(vec![modified("src/a.rs")], Vec::new())));
+            on_entry(&mut m, EDIT_CALL);
+            update(&mut m, key(KeyCode::Enter));
+            m.opened = Some(Opened::Commit {
+                sha: "abc".into(),
+                subject: "s".into(),
+            });
+            update(&mut m, key(KeyCode::Esc));
+            assert!(m.opened.is_none());
+            assert!(m.panel.back().is_some(), "still where the jump put it");
+            update(&mut m, key(KeyCode::Esc));
+            assert!(matches!(m.hover(), Some(Hover::Activity(_))));
+        }
+
+        #[test]
+        fn a_checkout_reached_through_a_symlink_is_one_file_in_the_activity() {
+            let mut m = reading(vec![
+                said("go"),
+                edit("/real/obs-layout-4/src/a.rs"),
+                edit(&format!("{ROOT}/src/a.rs")),
+            ]);
+            let read = Inspected {
+                real_root: Some("/real/obs-layout-4".into()),
+                ..Inspected::of(facts(vec![modified("src/a.rs")], Vec::new()))
+            };
+            m.set_facts(&who(), Ok(read));
+            m.settle();
+            assert_eq!(paths(m.touched(&who())), ["src/a.rs"]);
+        }
+
+        #[test]
+        fn the_files_of_another_agents_activity_are_not_this_ones() {
+            let m = reading(delegating_log(None));
+            assert_eq!(m.touched(&name("auth-refresh-2")), None);
+            assert_eq!(m.listed(&name("auth-refresh-2")), None);
+        }
     }
 }

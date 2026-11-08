@@ -1,4 +1,4 @@
-//! Transcript records for the tests of the parser and the turn reader.
+//! Transcript records for the tests of the parser and the activity reader.
 
 pub fn record(kind: &str, at: &str, content: &str, extra: &str) -> String {
     format!(r#"{{"type":"{kind}","timestamp":"{at}"{extra},"message":{{"content":{content}}}}}"#)
@@ -25,7 +25,7 @@ pub fn result_of(id: &str, text: &str, error: bool, at: &str, extra: &str) -> St
     )
 }
 
-/// A tool result of the turn `prompt_id` belongs to.
+/// A tool result of the activity `prompt_id` belongs to.
 pub fn answer(prompt_id: &str, id: &str, text: &str, at: &str) -> String {
     result_of(
         id,

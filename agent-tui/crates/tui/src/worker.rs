@@ -14,11 +14,11 @@ use agent_core::model::{Removable, Running, Snapshot, Startable};
 use agent_core::names::{AgentName, Prompt, SessionName};
 use agent_core::ops::{self, Approved, Backend, Launch, RemovalPlan, Removed};
 use agent_core::paths::RepoRoot;
-use agent_core::ports::{ClientId, FileDiff, HarnessId, HostError, Log, TurnDetail, WorktreeFacts};
+use agent_core::ports::{ActivityDetail, ClientId, FileDiff, HarnessId, HostError, Log};
 use crossterm::event::{KeyEvent, MouseEvent};
 
 use crate::document::{Doc, Key, assemble};
-use crate::model::{Found, Launchable, RepoChoice, Ticket};
+use crate::model::{Found, Inspected, Launchable, RepoChoice, Ticket};
 
 /// How much of a failed action's stderr is read for its last line.
 const STDERR_TAIL: u64 = 64 * 1024;
@@ -86,7 +86,7 @@ pub enum Msg {
     /// Git facts about an agent's worktree.
     Inspected {
         name: SessionName,
-        facts: Result<WorktreeFacts, String>,
+        read: Result<Inspected, String>,
     },
     /// A document, read for `key`.
     Document {
@@ -100,11 +100,11 @@ pub enum Msg {
         id: AgentId,
         detail: Result<Option<Log>, String>,
     },
-    /// An agent's current turn, or `None` when its harness has no record of
+    /// An agent's current activity, or `None` when its harness has no record of
     /// one.
-    Turn {
+    Activity {
         name: SessionName,
-        turn: Result<Option<TurnDetail>, String>,
+        detail: Result<Option<ActivityDetail>, String>,
     },
 }
 
@@ -183,7 +183,7 @@ pub enum Job {
         name: SessionName,
         own: Option<ClientId>,
     },
-    /// The user saw an agent's finished turn.
+    /// The user saw an agent's finished activity.
     Acknowledge(SessionName),
     /// Start a configured action's process; a failure is reported when it exits.
     Run {
@@ -234,7 +234,7 @@ pub struct Workers {
     pub jobs: Sender<Job>,
     inspector: Arc<Inspector>,
     subagents: Arc<SubagentReader>,
-    turns: Arc<TurnReader>,
+    activities: Arc<ActivityReader>,
     documents: Arc<DocumentReader>,
     namer: Arc<Namer>,
     pub refresh: Sender<()>,
@@ -243,8 +243,9 @@ pub struct Workers {
 
 impl Workers {
     /// Asks for git facts about an agent's worktree.
-    pub fn inspect(&self, name: SessionName, worktree: PathBuf) {
-        self.inspector.request(name, worktree);
+    /// `events` is how many the agent has reported, which the answer carries.
+    pub fn inspect(&self, name: SessionName, worktree: PathBuf, events: Option<u64>) {
+        self.inspector.request(name, (worktree, events));
     }
 
     /// Asks for a document about the agent's `worktree`.
@@ -260,10 +261,10 @@ impl Workers {
         self.subagents.request((name, id), workdir);
     }
 
-    /// Asks for what the agent working in `workdir` has done this turn, from
+    /// Asks for what the agent working in `workdir` has done this activity, from
     /// the transcript its hooks named.
-    pub fn read_turn(&self, name: SessionName, workdir: PathBuf, at: Option<TranscriptRef>) {
-        self.turns.request(name, (workdir, at));
+    pub fn read_activity(&self, name: SessionName, workdir: PathBuf, at: Option<TranscriptRef>) {
+        self.activities.request(name, (workdir, at));
     }
 
     /// Asks the harness's model to name `prompt`. A request still waiting
@@ -346,7 +347,7 @@ impl<K: Clone + Eq + std::hash::Hash, V> Queue<K, V> {
 }
 
 /// Reads git facts on [`INSPECTORS`] threads.
-type Inspector = Queue<SessionName, PathBuf>;
+type Inspector = Queue<SessionName, (PathBuf, Option<u64>)>;
 
 fn spawn_inspectors(backend: &Arc<Backend>, msgs: &Sender<Msg>) -> Arc<Inspector> {
     let inspector = Arc::new(Inspector::new());
@@ -356,10 +357,18 @@ fn spawn_inspectors(backend: &Arc<Backend>, msgs: &Sender<Msg>) -> Arc<Inspector
         let msgs = msgs.clone();
         thread::spawn(move || {
             loop {
-                let (name, worktree) = inspector.next();
-                let facts = backend.vcs.facts(&worktree).map_err(|e| describe(&e));
+                let (name, (worktree, asked_events)) = inspector.next();
+                let read = backend
+                    .vcs
+                    .facts(&worktree)
+                    .map(|facts| Inspected {
+                        facts,
+                        real_root: std::fs::canonicalize(&worktree).ok(),
+                        asked_events,
+                    })
+                    .map_err(|e| describe(&e));
                 inspector.done(&name);
-                if msgs.send(Msg::Inspected { name, facts }).is_err() {
+                if msgs.send(Msg::Inspected { name, read }).is_err() {
                     return;
                 }
             }
@@ -431,8 +440,8 @@ fn harness_of<'a>(backend: &'a Backend, name: &SessionName) -> &'a dyn agent_cor
 /// Reads subagent transcripts.
 type SubagentReader = Queue<(SessionName, AgentId), PathBuf>;
 
-/// Reads agents' current turns.
-type TurnReader = Queue<SessionName, (PathBuf, Option<TranscriptRef>)>;
+/// Reads agents' current activities.
+type ActivityReader = Queue<SessionName, (PathBuf, Option<TranscriptRef>)>;
 
 /// Serves a queue of transcript reads on [`SUBAGENT_READERS`] threads.
 /// `read` asks the harness of the session `session` names and says what came
@@ -481,15 +490,15 @@ fn spawn_subagent_readers(backend: &Arc<Backend>, msgs: &Sender<Msg>) -> Arc<Sub
     )
 }
 
-fn spawn_turn_readers(backend: &Arc<Backend>, msgs: &Sender<Msg>) -> Arc<TurnReader> {
+fn spawn_activity_readers(backend: &Arc<Backend>, msgs: &Sender<Msg>) -> Arc<ActivityReader> {
     spawn_log_readers(
         backend,
         msgs,
         |name| name,
-        |harness, name, (workdir, at)| Msg::Turn {
+        |harness, name, (workdir, at)| Msg::Activity {
             name: name.clone(),
-            turn: harness
-                .turn(&workdir, at.as_ref())
+            detail: harness
+                .activity_detail(&workdir, at.as_ref())
                 .map_err(|e| describe(&e)),
         },
     )
@@ -567,7 +576,7 @@ pub fn spawn(backend: Arc<Backend>, sources: Sources, msgs: Sender<Msg>) -> Work
 
     let inspector = spawn_inspectors(&backend, &msgs);
     let subagents = spawn_subagent_readers(&backend, &msgs);
-    let turns = spawn_turn_readers(&backend, &msgs);
+    let activities = spawn_activity_readers(&backend, &msgs);
     let documents = spawn_document_readers(&backend, &msgs);
     let namer = {
         let backend = Arc::clone(&backend);
@@ -603,7 +612,7 @@ pub fn spawn(backend: Arc<Backend>, sources: Sources, msgs: Sender<Msg>) -> Work
         jobs,
         inspector,
         subagents,
-        turns,
+        activities,
         documents,
         namer,
         refresh,

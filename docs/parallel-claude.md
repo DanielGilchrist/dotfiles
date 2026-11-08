@@ -62,13 +62,14 @@ types into the embedded session. `?` shows every key.
 | `i` | Attach the selected agent from any panel |
 | `0` | Same as `⏎` in [1], [2] and [3] |
 | `s` | Send a message without attaching: now if the agent is at rest, otherwise queued. `⌃X` clears the queue (`t` says `send is s now`). With review comments drafted for the agent it reads `send review`: the comments go as one message after your typed overview |
+| `⏎` | With [0] on the activity: fold the entry under the cursor. On an Agent call that started a subagent it opens that subagent's log, and on an edit call or a touched file it opens the file's diff in [3]. `Esc` goes back to the activity |
 | `y` | With [0] focused: copy to the clipboard through the terminal (OSC 52): `path:line` or the selected lines of a diff, a commit's sha, the agent's message, a subagent's log entry |
 | `⏎` | With [0] on the branch: open the commit (its files and diffs) or uncommitted file under the cursor, `Esc` goes back |
 | `j` `k` `[` `]` `J` `K` `V` `e` `c` | With [0] on a diff: move a line cursor, jump hunks and files, select a range (`V`), open the file at the line in $EDITOR, and comment on the line or range (`c`). Comments collect in a per-agent draft, marked `✎`, until `s` sends them |
 | `v` | Peek: a read-only float of the agent's terminal. `⏎` or `i` attaches, `s` sends, `Esc` or `v` closes |
 | `⌃\` | Back to NAV from an agent. Twice goes to the previous agent |
 | `h` `l`, `⇧Tab` `Tab` | Previous / next left panel ([1], [2], [3]), also from [0] |
-| `1` `2` `3` | Focus the list [1], the turn and Changes panels. Focusing [2] or [3] expands it only as far as its content needs: from the other lower panel's spare rows first, then the list, and only then does the other panel collapse to its title line (at the smallest sizes the collapse can leave it a few blank rows) |
+| `1` `2` `3` | Focus the list [1], the activity and Changes panels. Focusing [2] or [3] expands it only as far as its content needs: from the other lower panel's spare rows first, then the list, and only then does the other panel collapse to its title line (at the smallest sizes the collapse can leave it a few blank rows) |
 | `Esc` | Back one level: [0] to its panel, [2] or [3] to [1], and from [1] to the agent you left |
 | `j k g G`, `↓ ↑ Home End` | Move in the focused panel, or scroll [0] when it has the keys |
 | `J` `K` | Scroll [0] from [2] or [3] without focusing it |
@@ -84,7 +85,7 @@ types into the embedded session. `?` shows every key.
 | `p` | Repo picker: `⏎` focuses a listed repo, or adds one from the catalogue or by a typed path (`~/code/foo`) |
 | `` ` `` | In [3], switch between the directory tree (default) and the flat file list |
 | `-` `=` | In [3]'s tree, close / open every folder |
-| `e` | Edit: the agent's checkout in $EDITOR, in [3] the file (or folder) under the cursor, in [2] a subagent's transcript, and in [0] on a subagent's log the transcript as Markdown at the entry under the cursor |
+| `e` | Edit: the agent's checkout in $EDITOR, in [3] the file (or folder) under the cursor, in [2] a subagent's transcript, and in [0] on a subagent's log or the activity, the transcript as Markdown at the entry under the cursor |
 | `d` / `D` | Kill the session / remove session, worktree and branch (confirms, lists anything that would be lost) |
 | `x` | Run a configured action on the selected agent (see below) |
 | `a` | Attach the agent that needs you most (asking, failed, then finished) |
@@ -101,21 +102,21 @@ passed with `--settings` (your own settings stay untouched), recorded by
 
 - `◆` asking you (a permission prompt or a question)
 - `!` failed (rate limited, overloaded)
-- `✓` finished a turn you haven't looked at
-- spinner: working, including a finished turn still waiting on background subagents (`↳n` counts them). It stops, dimmed with `?`, after 5 minutes of silence with no tool running
+- `✓` finished an activity you haven't looked at
+- spinner: working, including a finished activity still waiting on background subagents (`↳n` counts them). It stops, dimmed with `?`, after 5 minutes of silence with no tool running
 - `●` idle, `○` exited, `·` no session
 
 The Agents tab opens with a **Needs you** group, the status bar and terminal
 title show `◆ ! ✓` counts, and a bell rings when an agent you're not
 typing into starts waiting. Each agent's card has a second line saying
 what it's doing or what it said (the question, the tool, the last
-message), when there's room. Under the list, panel [2] lists the turn and
+message), when there's room. Under the list, panel [2] lists the activity and
 its subagents and panel [3] lists the work in two tabs, `[` `]` to switch: `Uncommitted` (the default) lists only files with uncommitted state counted against the last commit, and `Branch` what this branch changes compared with where it left origin/main, like a PR plus your uncommitted work (on the trunk the tab is `Unpushed`: commits not yet on origin plus uncommitted work, which a push empties). The second tab's first row is a short branch summary (`↑27 · 4 uncommitted`, `↓n` when behind), and hovering it shows the branch in [0]: titled `Unpushed · main vs origin/main` or `Branch · fix-thing vs origin/main`, then its commits and uncommitted files. `Uncommitted` lists only its files and the panel's corner counts them. Files carry lazygit's status code (staged letter green, unstaged red, `??` untracked, nothing for committed-only files, a `●` on folders holding uncommitted files), a `∩` on any file another agent
 in the repo changed too, and `∩ n` in the title counting them. The right pane
 [0] shows what the cursor in the focused panel is on: the agent's terminal
-for [1], the turn document or a subagent's log for [2] (a status row, the prompt, what it said and a row per call with failures spelled out, its report first once finished; it follows the tail until you scroll up and `G` resumes; with [0] focused `j` `k` move over entries, `⏎` expands one and `=` `-` expand or collapse all). The turn row reads the main transcript the same way: its current turn cut at your last prompt, the agent's words and calls with every phase but the latest folded to one `▸` row, the whole question pinned on top while it asks, its closing message once done, and a `since you looked` marker. An agent whose harness keeps no transcript shows the prompt, message and subagents instead, and the branch, a file's diff, or a folder's files with each diff under its own header (up to 20 files) for [3], with who else changed the file in its title. Clicking a row of [2] or [3] puts the cursor there, and the wheel scrolls.
+for [1], the activity document or a subagent's log for [2] (a status row, the prompt, what it said and a row per call with failures spelled out, its report first once finished; it follows the tail until you scroll up and `G` resumes; with [0] focused `j` `k` move over entries, `⏎` expands one and `=` `-` expand or collapse all). The activity row reads the main transcript the same way: its current activity cut at your last prompt, the agent's words and calls with every phase but the latest folded to one `▸` row, the whole question pinned on top while it asks, its closing message once done, and a `since you looked` marker. An agent whose harness keeps no transcript shows the prompt, message and subagents instead, and the branch, a file's diff, or a folder's files with each diff under its own header (up to 20 files) for [3], with who else changed the file in its title. Clicking a row of [2] or [3] puts the cursor there, and the wheel scrolls.
 When the selected agent asks while you read, a banner at the top of [0] says
-so and `i` answers it (the turn view pins the whole question instead). An agent whose terminal isn't showing still counts for
+so and `i` answers it (the activity view pins the whole question instead). An agent whose terminal isn't showing still counts for
 `a`, the bell and the status counts, and doesn't clear its `✓` while you
 read its diff.
 Agents started before this existed report nothing until restarted: `d`
@@ -178,7 +179,7 @@ accent = "#89b4fa"   # focused borders and titles, the selection, badges
 dim = "#6c7086"      # secondary text, or "faint" for the terminal's own
 warning = "yellow"   # asking you, shared terminals, files others changed
 error = "red"        # failures, errors, removed lines
-success = "green"    # finished turns, added lines
+success = "green"    # finished activities, added lines
 ```
 
 `NO_COLOR` turns every colour off, whatever `[theme]` says.

@@ -191,13 +191,13 @@ pub enum MainEvent {
     /// The context was compacted.
     Compacted,
     Prompted(Input),
-    /// The turn ended. `summary` is the agent's last message, and `running`
+    /// The activity ended. `summary` is the agent's last message, and `running`
     /// the background subagents it's still waiting on.
     Finished {
         summary: Option<String>,
         running: Vec<Background>,
     },
-    /// The turn ended in an error (rate limited, overloaded…).
+    /// The activity ended in an error (rate limited, overloaded…).
     Failed(String),
     /// The session ended.
     Ended,
@@ -295,7 +295,7 @@ pub enum Input {
     Notification,
 }
 
-/// A background subagent a finished turn is still waiting on.
+/// A background subagent a finished activity is still waiting on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Background {
     pub id: AgentId,
@@ -314,10 +314,10 @@ pub enum State {
     Working {
         tools: Vec<Tool>,
     },
-    /// The turn ended but background subagents are still running, so
-    /// another turn follows when they report back.
+    /// The activity ended but background subagents are still running, so
+    /// another activity follows when they report back.
     Delegating,
-    /// Finished a turn the user hasn't looked at yet.
+    /// Finished an activity the user hasn't looked at yet.
     Done {
         summary: Option<String>,
     },
@@ -510,6 +510,12 @@ pub struct Activity {
     pub state: State,
     pub since: SystemTime,
     pub prompt: Option<String>,
+    /// How many prompts from the user the agent has taken, which tells one
+    /// activity from the next whatever the words were.
+    pub prompts: u64,
+    /// The count of events that included the last prompt of the user's, so
+    /// what was reported after it can be told from what came with it.
+    pub prompt_event: u64,
     /// When the harness last reported anything.
     pub heard: SystemTime,
     /// Counts the harness's reports, so a view can show progress as it
@@ -533,12 +539,26 @@ pub const LAUNCH_SLACK: Duration = Duration::from_secs(15);
 pub const BOOT_QUIET: Duration = Duration::from_secs(5);
 
 impl Activity {
+    /// Whether the user's prompt began an activity since `before`. A subagent
+    /// handing its result back to an activity that is still going, or the same
+    /// session starting again, takes no prompt of the user's.
+    pub fn has_new_prompt_since(&self, before: &Self) -> bool {
+        self.prompts != before.prompts
+    }
+
+    /// Whether the user has given the agent a prompt.
+    pub fn has_taken_a_prompt(&self) -> bool {
+        self.prompts > 0
+    }
+
     /// What an agent that has reported nothing yet is taken to be doing.
     pub fn fresh(now: SystemTime) -> Self {
         Self {
             state: State::Working { tools: Vec::new() },
             since: now,
             prompt: None,
+            prompts: 0,
+            prompt_event: 0,
             heard: now,
             events: 0,
             asks: Vec::new(),
@@ -626,6 +646,8 @@ impl Activity {
             MainEvent::Prompted(input) => {
                 if let Input::User(text) = input {
                     self.prompt = Some(text);
+                    self.prompts += 1;
+                    self.prompt_event = self.events + 1;
                     self.subagents
                         .retain(|_, s| s.launch == Launch::Background && s.is_running());
                     let subagents = &self.subagents;
@@ -760,7 +782,7 @@ impl Activity {
         });
     }
 
-    /// The finished turn's background subagents replace the ones tracked.
+    /// The finished activity's background subagents replace the ones tracked.
     fn track_background(&mut self, running: &[Background], now: SystemTime) {
         self.subagents
             .retain(|id, s| !s.is_running() || running.iter().any(|b| &b.id == id));
@@ -801,7 +823,7 @@ impl Activity {
         self.asks.clear();
     }
 
-    /// Its turn is over with nothing running and nothing asked, so nothing
+    /// Its activity is over with nothing running and nothing asked, so nothing
     /// can open a prompt that typed text would answer.
     pub fn at_rest(&self) -> bool {
         matches!(self.state, State::Idle | State::Done { .. })
@@ -843,7 +865,7 @@ impl Activity {
         self.asks.first()
     }
 
-    /// The user has looked at it: a finished turn stops being news. This
+    /// The user has looked at it: a finished activity stops being news. This
     /// isn't news from the harness, so it doesn't count as hearing from it.
     #[must_use]
     pub fn acknowledged(self, now: SystemTime) -> Self {
@@ -887,6 +909,10 @@ struct Stored {
     state: StoredState,
     since: SystemTime,
     prompt: Option<String>,
+    #[serde(default)]
+    prompts: u64,
+    #[serde(default)]
+    prompt_event: u64,
     heard: SystemTime,
     events: u64,
     #[serde(default)]
@@ -913,6 +939,8 @@ struct Written {
     state: State,
     since: SystemTime,
     prompt: Option<String>,
+    prompts: u64,
+    prompt_event: u64,
     heard: SystemTime,
     events: u64,
     asks: Vec<Ask>,
@@ -934,6 +962,8 @@ impl From<Activity> for Written {
             state: activity.state,
             since: activity.since,
             prompt: activity.prompt,
+            prompts: activity.prompts,
+            prompt_event: activity.prompt_event,
             heard: activity.heard,
             events: activity.events,
             asks: activity.asks,
@@ -1043,6 +1073,8 @@ impl From<Stored> for Activity {
             state,
             since,
             prompt,
+            prompts,
+            prompt_event,
             heard,
             events,
             mut asks,
@@ -1069,6 +1101,8 @@ impl From<Stored> for Activity {
             state,
             since,
             prompt,
+            prompts,
+            prompt_event,
             heard,
             events,
             asks,
@@ -1209,7 +1243,42 @@ mod tests {
     }
 
     #[test]
-    fn a_turn_works_through_tools_and_finishes_unseen() {
+    fn only_a_prompt_from_the_user_begins_an_activity_even_when_it_repeats_the_words() {
+        let working = run(vec![
+            (0, main(MainEvent::Started)),
+            (1, main(user("fix it"))),
+        ]);
+        let next = |before: &Activity, event: MainEvent| {
+            Activity::next(Some(before.clone()), main(event), at(9))
+        };
+        let done = next(&working, finished(&[]));
+        assert!(
+            !done.has_new_prompt_since(&working),
+            "finishing is not beginning"
+        );
+        assert!(next(&working, user("and this")).has_new_prompt_since(&working));
+        assert!(
+            next(&done, user("fix it")).has_new_prompt_since(&done),
+            "the same words again"
+        );
+
+        let delegating = next(&working, finished(&["a"]));
+        let back = next(&delegating, MainEvent::Prompted(Input::Notification));
+        assert!(
+            !back.has_new_prompt_since(&delegating),
+            "a subagent's result"
+        );
+        let woken = next(&done, MainEvent::Prompted(Input::Notification));
+        assert!(!woken.has_new_prompt_since(&done), "a wake-up after rest");
+        let restarted = next(&done, MainEvent::Started);
+        assert!(
+            !restarted.has_new_prompt_since(&done),
+            "the session starting again"
+        );
+    }
+
+    #[test]
+    fn an_activity_works_through_tools_and_finishes_unseen() {
         let activity = run(vec![
             (0, main(MainEvent::Started)),
             (10, main(user("fix it"))),
@@ -1342,7 +1411,7 @@ mod tests {
         assert_eq!(
             (delegating.state.clone(), questions(&delegating)),
             (State::Delegating, vec!["Bash: cargo test"]),
-            "a background subagent's prompt outlives the turn"
+            "a background subagent's prompt outlives the activity"
         );
         let done = Activity::next(Some(delegating), main(finished(&[])), at(7));
         assert_eq!(questions(&done), [""; 0], "its subagent is gone");
@@ -1397,7 +1466,7 @@ mod tests {
     }
 
     #[test]
-    fn a_turn_left_waiting_on_background_subagents_is_delegating_until_they_report_back() {
+    fn an_activity_left_waiting_on_background_subagents_is_delegating_until_they_report_back() {
         let delegating = run(vec![
             (0, main(user("review it"))),
             (1, main(start("t", "Agent"))),
@@ -1439,7 +1508,7 @@ mod tests {
     }
 
     #[test]
-    fn a_subagent_asking_after_the_turn_stays_delegating() {
+    fn a_subagent_asking_after_the_activity_stays_delegating() {
         let asking = run(vec![
             (0, sub("a", launched("t"))),
             (1, main(finished(&["a"]))),
@@ -1496,7 +1565,7 @@ mod tests {
     }
 
     #[test]
-    fn an_interrupted_turns_foreground_subagents_are_dropped_by_the_next_prompt() {
+    fn the_foreground_subagents_of_an_interrupted_activity_are_dropped_by_the_next_prompt() {
         let next = run(vec![
             (0, main(start("t", "Agent"))),
             (1, sub("a", started())),
@@ -1543,7 +1612,7 @@ mod tests {
         let stopped = run(vec![(0, sub("a", launched("t"))), (9, main(finished(&[])))]);
         assert!(
             stopped.subagents.is_empty(),
-            "the turn's end says what's still running"
+            "the activity's end says what's still running"
         );
     }
 
@@ -1731,7 +1800,7 @@ mod tests {
     }
 
     #[test]
-    fn only_a_finished_turn_with_nothing_running_is_at_rest() {
+    fn only_a_finished_activity_with_nothing_running_is_at_rest() {
         assert!(run(vec![(0, main(finished(&[])))]).at_rest());
         assert!(!run(vec![(0, main(user("go")))]).at_rest(), "working");
         assert!(

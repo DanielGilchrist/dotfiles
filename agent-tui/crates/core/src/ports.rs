@@ -800,14 +800,14 @@ pub trait Harness: Send + Sync {
         let _ = (workdir, id);
         Ok(None)
     }
-    /// The agent's current turn, cut at its last prompt, or `None` when the
+    /// The agent's current activity, cut at its last prompt, or `None` when the
     /// harness keeps no record of one. `at` is where the hooks last said the
     /// transcript is. Reads files: call it off the UI thread.
-    fn turn(
+    fn activity_detail(
         &self,
         workdir: &Path,
         at: Option<&TranscriptRef>,
-    ) -> Result<Option<TurnDetail>, HarnessError> {
+    ) -> Result<Option<ActivityDetail>, HarnessError> {
         let _ = (workdir, at);
         Ok(None)
     }
@@ -819,27 +819,27 @@ pub fn ends_with_report(log: &[LogEntry], said: &str) -> bool {
     matches!(log.last(), Some(LogEntry::Said { text, .. }) if said.starts_with(text.as_str()))
 }
 
-/// Which turn a [`TurnDetail`] is, as the harness tells turns apart. A new
+/// Which activity a [`ActivityDetail`] is, as the harness tells activities apart. A new
 /// prompt makes a new mark.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TurnMark(String);
+pub struct ActivityMark(String);
 
-impl TurnMark {
+impl ActivityMark {
     pub fn new(id: impl Into<String>) -> Self {
         Self(id.into())
     }
 }
 
-/// An agent's current turn: its log, and what only the agent itself has.
+/// An agent's current activity: its log, and what only the agent itself has.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TurnDetail {
+pub struct ActivityDetail {
     pub log: Log,
-    /// Which turn it is, when the harness could tell.
-    pub mark: Option<TurnMark>,
+    /// Which activity it is, when the harness could tell.
+    pub mark: Option<ActivityMark>,
     pub progress: Progress,
 }
 
-/// How far a turn got, with what only that stage has.
+/// How far an activity got, with what only that stage has.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Progress {
     /// Still going, and waiting on the user's answer if it asked.
@@ -873,7 +873,7 @@ pub struct Choice {
     pub description: String,
 }
 
-/// What an agent (a subagent, or the main agent's current turn) was told and
+/// What an agent (a subagent, or the main agent's current activity) was told and
 /// what it has done since, for a log.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Log {
@@ -927,14 +927,16 @@ pub enum LogEntry {
 }
 
 /// What a tool call does, as far as a view treats calls differently.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CallKind {
     /// Reads or searches, which repeats a lot and folds.
     Explore,
     /// Changes a file.
     Edit,
-    /// Hands work to a subagent.
-    Delegate,
+    /// Hands work to a subagent, which its result names once it has one.
+    Delegate {
+        spawned: Option<AgentId>,
+    },
     /// Puts a question to the user.
     Ask,
     Other,
@@ -952,6 +954,28 @@ pub struct Call {
     /// The whole input and result, cut, for expanding.
     pub input: String,
     pub output: String,
+}
+
+impl Call {
+    /// The subagent a call that hands work off started.
+    pub fn spawned(&self) -> Option<&AgentId> {
+        match &self.kind {
+            CallKind::Delegate { spawned } => spawned.as_ref(),
+            CallKind::Explore | CallKind::Edit | CallKind::Ask | CallKind::Other => None,
+        }
+    }
+
+    /// The file a call that changes one is aimed at, unless it failed.
+    pub fn touched(&self) -> Option<&str> {
+        match (&self.kind, &self.target, &self.state) {
+            (CallKind::Edit, Target::Path { path, .. }, state)
+                if !matches!(state, CallState::Failed { .. }) =>
+            {
+                Some(path)
+            }
+            _ => None,
+        }
+    }
 }
 
 /// What a tool is acting on.
@@ -1105,7 +1129,7 @@ pub trait Store: Send + Sync {
     fn forget(&self, name: &SessionName) -> Result<(), StoreError>;
     /// Applies what `name`'s harness reported to its activity.
     fn report(&self, name: &SessionName, event: Reported) -> Result<(), StoreError>;
-    /// The user has looked at `name`: a finished turn stops being news.
+    /// The user has looked at `name`: a finished activity stops being news.
     fn acknowledge(&self, name: &SessionName) -> Result<(), StoreError>;
     /// Every agent's latest activity.
     fn activities(&self) -> Result<HashMap<SessionName, Activity>, StoreError>;

@@ -7,12 +7,21 @@ use crate::model::{Model, Panel, Reach, View, Visibility};
 use crate::tree::{ChangesScope, ChangesView, Node};
 use agent_core::ports::Compared;
 
+/// What the activity document in [0] is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivityDoc {
+    /// The hooks' account, with no log to move over.
+    Hooks,
+    /// A log with entries to move over.
+    Log,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ctx {
     /// [1], the fleet.
     Agents,
-    /// [2], the turn.
-    Turn,
+    /// [2], the activity.
+    Activity,
     /// [3], Changes.
     Changes,
     /// [0] with the keys.
@@ -25,7 +34,7 @@ impl Ctx {
     pub fn name(self) -> &'static str {
         match self {
             Self::Agents => "[1] Agents",
-            Self::Turn => "[2] Turn",
+            Self::Activity => "[2] Activity",
             Self::Changes => "[3] Changes",
             Self::Main => "[0] Main",
             Self::Peek => "Peek",
@@ -60,10 +69,16 @@ impl Ctxs {
     }
 }
 
-const PANELS: Ctxs = Ctxs::of(&[Ctx::Agents, Ctx::Turn, Ctx::Changes, Ctx::Main]);
-const EVERYWHERE: Ctxs = Ctxs::of(&[Ctx::Agents, Ctx::Turn, Ctx::Changes, Ctx::Main, Ctx::Peek]);
+const PANELS: Ctxs = Ctxs::of(&[Ctx::Agents, Ctx::Activity, Ctx::Changes, Ctx::Main]);
+const EVERYWHERE: Ctxs = Ctxs::of(&[
+    Ctx::Agents,
+    Ctx::Activity,
+    Ctx::Changes,
+    Ctx::Main,
+    Ctx::Peek,
+]);
 const AGENTS: Ctxs = Ctxs::of(&[Ctx::Agents]);
-const LISTS: Ctxs = Ctxs::of(&[Ctx::Turn, Ctx::Changes]);
+const LISTS: Ctxs = Ctxs::of(&[Ctx::Activity, Ctx::Changes]);
 
 /// What the bindings' labels and ranks depend on, read once from the model.
 #[derive(Debug, Clone)]
@@ -89,10 +104,10 @@ pub struct Situation {
     pub diff: bool,
     /// [0] reads the branch.
     pub branch: bool,
-    /// [0] reads the turn document.
-    pub turn: bool,
-    /// The turn document is a log with entries to move over.
-    pub turn_log: bool,
+    /// [0] reads the activity document, and what kind it is.
+    pub activity: Option<ActivityDoc>,
+    /// Where `⏎` takes [0] from the activity's entry under the cursor.
+    pub jump: Option<crate::log::Jump>,
     /// A range of diff lines is selected.
     pub selecting: bool,
     /// The branch cursor is on a commit.
@@ -110,13 +125,22 @@ pub struct Situation {
 }
 
 impl Situation {
+    /// [0] has the keys on an activity that has a log.
+    fn reads_activity(&self) -> bool {
+        self.ctx == Ctx::Main && self.activity == Some(ActivityDoc::Log)
+    }
+
+    fn reads_log(&self) -> bool {
+        self.activity == Some(ActivityDoc::Log)
+    }
+
     pub fn of(m: &Model) -> Self {
         let ctx = match m.panel {
             _ if m.peeking() => Ctx::Peek,
             Panel::Agents => Ctx::Agents,
-            Panel::Agent { .. } => Ctx::Turn,
+            Panel::Agent { .. } => Ctx::Activity,
             Panel::Changes { .. } => Ctx::Changes,
-            Panel::Main(_) => Ctx::Main,
+            Panel::Main(..) => Ctx::Main,
         };
         let selected = m.selected();
         let entry = selected.and_then(|(_, e)| e);
@@ -165,8 +189,14 @@ impl Situation {
                 )
             ),
             branch: matches!(m.hover(), Some(crate::document::Hover::Branch(_))),
-            turn: matches!(m.hover(), Some(crate::document::Hover::Turn(_))),
-            turn_log: matches!(m.hover(), Some(crate::document::Hover::Turn(name)) if m.turn_has_log(&name)),
+            activity: match m.hover() {
+                Some(crate::document::Hover::Activity(name)) if m.activity_has_log(&name) => {
+                    Some(ActivityDoc::Log)
+                }
+                Some(crate::document::Hover::Activity(_)) => Some(ActivityDoc::Hooks),
+                _ => None,
+            },
+            jump: m.activity_jump().cloned(),
             selecting: m.diff_view.anchor.is_some(),
             commit_row: m
                 .docs
@@ -187,7 +217,7 @@ impl Situation {
                 ChangesScope::Since => {
                     let trunk = entry
                         .and_then(|e| m.facts(e.name()))
-                        .and_then(|f| f.as_ref().ok())
+                        .and_then(Result::ok)
                         .is_some_and(|f| matches!(f.compared, Compared::Trunk { .. }));
                     if trunk {
                         "tab: unpushed"
@@ -310,7 +340,7 @@ pub const BINDINGS: &[Binding] = &[
             Some(false) if s.ctx == Ctx::Changes => Some("expand"),
             _ => s.hover.then_some("open"),
         }),
-        "Open the item under the cursor in [0] and move the keys there: the turn, a subagent's transcript, a diff or the branch. On a folder in [3] it collapses or expands the folder, and 0 opens its file list.",
+        "Open the item under the cursor in [0] and move the keys there: the activity, a subagent's transcript, a diff or the branch. On a folder in [3] it collapses or expands the folder, and 0 opens its file list.",
     )
     .with(&["0"]),
     Binding::new(
@@ -366,7 +396,7 @@ pub const BINDINGS: &[Binding] = &[
             if s.branch {
                 Some(5)
             } else {
-                (s.diff || s.turn || s.subagent_row).then_some(3)
+                (s.diff || s.activity.is_some() || s.subagent_row).then_some(3)
             }
         }),
         By(|s| {
@@ -374,9 +404,9 @@ pub const BINDINGS: &[Binding] = &[
                 Some(if s.commit_row { "copy sha" } else { "copy path" })
             } else if s.diff {
                 Some(if s.selecting { "copy lines" } else { "copy path:line" })
-            } else if s.turn_log {
+            } else if s.reads_log() {
                 Some("copy entry")
-            } else if s.turn {
+            } else if s.activity.is_some() {
                 Some("copy message")
             } else {
                 s.subagent_row.then_some("copy entry")
@@ -407,30 +437,34 @@ pub const BINDINGS: &[Binding] = &[
     ),
     Binding::new(
         &["e"],
-        Ctxs::of(&[Ctx::Turn, Ctx::Main]),
-        RankBy(|s| s.subagent_row.then_some(7)),
-        By(|s| s.subagent_row.then_some("edit transcript")),
-        "Open the subagent's transcript as Markdown in $EDITOR. From [0] it opens at the entry under the cursor.",
+        Ctxs::of(&[Ctx::Activity, Ctx::Main]),
+        RankBy(|s| (s.subagent_row || s.reads_activity()).then_some(7)),
+        By(|s| (s.subagent_row || s.reads_activity()).then_some("edit transcript")),
+        "Open the subagent's transcript, or from [0] the activity, as Markdown in $EDITOR, at the entry under the cursor.",
     ),
     Binding::new(
         &["⏎"],
         Ctxs::of(&[Ctx::Main]),
-        RankBy(|s| (s.subagent_row || s.turn_log).then_some(8)),
-        By(|s| (s.subagent_row || s.turn_log).then_some("fold")),
-        "Expand or collapse the log entry under the cursor: the whole prompt or text, a call's input and result, or a run of calls.",
+        RankBy(|s| (s.subagent_row || s.reads_log()).then_some(8)),
+        By(|s| match s.jump {
+            Some(crate::log::Jump::Subagent(_)) => Some("open subagent"),
+            Some(crate::log::Jump::File(_)) => Some("open diff"),
+            None => (s.subagent_row || s.reads_log()).then_some("fold"),
+        }),
+        "Expand or collapse the log entry under the cursor: the whole prompt or text, a call's input and result, or a run of calls. On an Agent call that started a subagent it opens the subagent's log, and on an edit or a touched file it opens the file's diff in [3]. Esc goes back to the activity.",
     ),
     Binding::new(
         &["=", "-"],
         Ctxs::of(&[Ctx::Main]),
         Hidden,
-        By(|s| (s.subagent_row || s.turn_log).then_some("expand all / collapse all")),
-        "Expand every entry of a log, or collapse them all. Folded phases of a turn open too.",
+        By(|s| (s.subagent_row || s.reads_log()).then_some("expand all / collapse all")),
+        "Expand every entry of a log, or collapse them all. Folded phases of an activity open too.",
     ),
     Binding::new(
         &["e"],
         Ctxs::of(&[Ctx::Agents, Ctx::Main]),
         RankBy(|s| (s.ctx == Ctx::Agents).then_some(0)),
-        By(|s| (s.can_edit_checkout && !(s.ctx == Ctx::Main && (s.subagent_row || s.diff))).then_some("edit checkout")),
+        By(|s| (s.can_edit_checkout && !(s.ctx == Ctx::Main && (s.subagent_row || s.diff || s.reads_activity()))).then_some("edit checkout")),
         "Open the agent's checkout (or the repo's) in $EDITOR.",
     ),
     Binding::new(
@@ -463,10 +497,10 @@ pub const BINDINGS: &[Binding] = &[
     ),
     Binding::new(
         &["Esc"],
-        Ctxs::of(&[Ctx::Turn, Ctx::Changes, Ctx::Main]),
+        Ctxs::of(&[Ctx::Activity, Ctx::Changes, Ctx::Main]),
         At(9),
         Say("back"),
-        "Go one level out: a focused document in [0] returns to its panel, [2] and [3] return to [1].",
+        "Go one level out: a focused document in [0] returns to its panel, or to the activity it was opened from. [2] and [3] return to [1].",
     ),
     Binding::new(
         &["Esc"],
@@ -479,7 +513,7 @@ pub const BINDINGS: &[Binding] = &[
         &["i"],
         EVERYWHERE,
         RankBy(|s| {
-            (s.on_agent && matches!(s.ctx, Ctx::Turn | Ctx::Changes | Ctx::Main))
+            (s.on_agent && matches!(s.ctx, Ctx::Activity | Ctx::Changes | Ctx::Main))
                 .then_some(if s.diff { 4 } else { 8 })
         }),
         By(|s| s.on_agent.then_some("attach")),
@@ -522,7 +556,7 @@ pub const BINDINGS: &[Binding] = &[
         PANELS,
         Hidden,
         Say("focus panel"),
-        "Focus [1] the fleet, [2] the turn or [3] Changes.",
+        "Focus [1] the fleet, [2] the activity or [3] Changes.",
     ),
     Binding::new(
         &["j", "k"],
@@ -606,7 +640,7 @@ pub const BINDINGS: &[Binding] = &[
     ),
     Binding::new(
         &["c"],
-        Ctxs::of(&[Ctx::Agents, Ctx::Turn, Ctx::Changes]),
+        Ctxs::of(&[Ctx::Agents, Ctx::Activity, Ctx::Changes]),
         Hidden,
         Say("check out"),
         "Check out a branch or a GitHub PR link for review in its own worktree.",
@@ -807,8 +841,8 @@ mod tests {
             subagent_row: true,
             diff: false,
             branch: false,
-            turn: false,
-            turn_log: false,
+            activity: None,
+            jump: None,
             selecting: false,
             commit_row: false,
             draft: false,
@@ -832,10 +866,51 @@ mod tests {
         };
         assert_eq!(label(Ctx::Agents), Some("tab: agents"));
         assert_eq!(label(Ctx::Changes), Some("tab: branch"));
-        assert_eq!(label(Ctx::Turn), None);
+        assert_eq!(label(Ctx::Activity), None);
     }
 
-    const CTXS: [Ctx; 5] = [Ctx::Agents, Ctx::Turn, Ctx::Changes, Ctx::Main, Ctx::Peek];
+    const CTXS: [Ctx; 5] = [
+        Ctx::Agents,
+        Ctx::Activity,
+        Ctx::Changes,
+        Ctx::Main,
+        Ctx::Peek,
+    ];
+
+    #[test]
+    fn enter_in_the_activity_names_where_it_goes_and_e_edits_its_transcript_not_the_checkout() {
+        use crate::log::Jump;
+        use agent_core::activity::AgentId;
+        let on_an_activity = |jump| Situation {
+            subagent_row: false,
+            activity: Some(ActivityDoc::Log),
+            jump,
+            ..situation(Ctx::Main)
+        };
+        let enter = |s: &Situation| {
+            footer(s, "⌃\\")
+                .into_iter()
+                .find(|h| h.keys == "⏎")
+                .map(|h| h.label)
+        };
+        assert_eq!(enter(&on_an_activity(None)), Some("fold"));
+        assert_eq!(
+            enter(&on_an_activity(Some(Jump::Subagent(AgentId::new("a"))))),
+            Some("open subagent")
+        );
+        assert_eq!(
+            enter(&on_an_activity(Some(Jump::File("a.rs".into())))),
+            Some("open diff")
+        );
+        let help = help(&on_an_activity(None), "⌃\\", "");
+        let labels: Vec<_> = help.local.iter().chain(&help.global).collect();
+        assert!(
+            labels
+                .iter()
+                .any(|r| r.keys == "e" && r.label == "edit transcript")
+        );
+        assert!(labels.iter().all(|r| r.label != "edit checkout"));
+    }
 
     #[test]
     fn the_footer_never_repeats_a_hint_in_any_context() {
@@ -868,10 +943,10 @@ mod tests {
                 .collect();
             assert_eq!(all.len(), help.local.len() + help.global.len());
         }
-        let turn = help(&situation(Ctx::Turn), "⌃\\", "");
-        assert!(turn.local.iter().any(|r| r.label == "open"));
-        assert!(turn.local.iter().any(|r| r.label == "edit transcript"));
-        assert!(turn.global.iter().all(|r| r.label != "open"));
+        let detail = help(&situation(Ctx::Activity), "⌃\\", "");
+        assert!(detail.local.iter().any(|r| r.label == "open"));
+        assert!(detail.local.iter().any(|r| r.label == "edit transcript"));
+        assert!(detail.global.iter().all(|r| r.label != "open"));
         let agents = help(&situation(Ctx::Agents), "⌃\\", "");
         assert!(agents.local.iter().any(|r| r.label == "attach"));
         assert!(agents.local.iter().all(|r| r.label != "edit file"));

@@ -1,29 +1,30 @@
 //! A subagent's log as rows: a pinned status row, then the prompt, what it
 //! said and its calls, or for a finished one its report first.
 
+use std::path::Path;
 use std::time::{Duration, SystemTime};
 
 use agent_core::activity::ToolId;
 use agent_core::activity::{Subagent, SubagentStatus};
 use agent_core::ports::{
-    Call, CallState, Excerpt, Log, LogEntry, Outcome, Progress, Summary, Target, TurnDetail,
+    ActivityDetail, Call, CallState, Excerpt, Log, LogEntry, Outcome, Progress, Summary, Target,
 };
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 
+use super::page::count_spans;
+use super::sidebar::file_marker;
 use super::{
     SPINNER, accent, ago, bold, dim, error, fit, justify, line_width, success, truncate_end,
     truncate_start, warning, wrap,
 };
 use crate::log::{
-    Entry, Nav, Phase, agent_count, call_count, delegates, entries, error_count, failing,
-    files_touched, target_text, time_of, turn_entries, unrecovered_count,
+    Entry, EntryKey, EntryRows, Nav, Phase, activity_entries, agent_count, call_count, delegates,
+    entries, error_count, failing, target_text, time_of, unrecovered_count,
 };
 use crate::model::Asking;
+use crate::touched::{Now, Roots, TouchedFile};
 
-/// A call or a line of text sits within this many columns, so it stays near
-/// its result on a wide screen.
-pub(super) const CAP: usize = 100;
 /// Below this width the summary column and tool names shrink.
 const WIDE: usize = 100;
 const SUMMARY_WIDE: usize = 32;
@@ -39,15 +40,15 @@ pub(super) struct Context<'a> {
     pub now: SystemTime,
     pub spinner: &'static str,
     /// The agent's checkout, to show paths inside it relative.
-    pub checkout: Option<&'a str>,
+    pub roots: Option<&'a Roots>,
     pub home: Option<&'a str>,
 }
 
 pub(super) struct Rendered {
     pub pinned: Vec<Line<'static>>,
     pub rows: Vec<Line<'static>>,
-    /// Each entry's first row and row count in `rows`.
-    pub layout: Vec<(usize, usize)>,
+    /// Each entry's rows.
+    pub layout: Vec<EntryRows>,
     pub finished: bool,
 }
 
@@ -58,6 +59,16 @@ pub(super) fn span(d: Duration) -> String {
         0..60 => format!("{secs}s"),
         60..3600 => format!("{}m{:02}s", secs / 60, secs % 60),
         _ => format!("{}h{:02}m", secs / 3600, secs % 3600 / 60),
+    }
+}
+
+/// `12`, or `12+` when the log starts after the transcript does.
+fn call_total(detail: &Log) -> String {
+    let n = call_count(detail);
+    if detail.truncated {
+        format!("{n}+")
+    } else {
+        n.to_string()
     }
 }
 
@@ -116,16 +127,13 @@ fn failure_text(code: Option<i32>) -> String {
 }
 
 fn unwind(path: &str, ctx: &Context<'_>) -> String {
-    if let Some(rest) = ctx
-        .checkout
-        .and_then(|root| path.strip_prefix(root))
-        .and_then(|rest| rest.strip_prefix('/'))
-    {
-        return rest.to_string();
+    let path = Path::new(path);
+    if let Some(rest) = ctx.roots.and_then(|roots| roots.strip(path)) {
+        return rest.to_string_lossy().into_owned();
     }
-    match ctx.home.and_then(|home| path.strip_prefix(home)) {
-        Some(rest) if rest.starts_with('/') => format!("~{rest}"),
-        _ => path.to_string(),
+    match ctx.home.and_then(|home| path.strip_prefix(home).ok()) {
+        Some(rest) => format!("~/{}", rest.display()),
+        None => path.to_string_lossy().into_owned(),
     }
 }
 
@@ -154,7 +162,6 @@ fn indented(indent: usize, spans: Vec<Span<'static>>) -> Line<'static> {
 #[allow(clippy::struct_excessive_bools)]
 struct Rows<'a, 'b> {
     ctx: &'a Context<'b>,
-    cap: usize,
     narrow: bool,
     /// Whether the subagent is still going, so its last call is live.
     live: bool,
@@ -186,7 +193,7 @@ impl Rows<'_, '_> {
     }
 
     fn rule(&mut self, label: &str) {
-        let room = self.cap.saturating_sub(1);
+        let room = self.ctx.columns.saturating_sub(1);
         let text = format!("{label} ");
         let rule = "─".repeat(room.saturating_sub(text.chars().count()));
         self.out.push(Line::from(vec![
@@ -197,7 +204,7 @@ impl Rows<'_, '_> {
     }
 
     fn text_rows(&mut self, text: &str, indent: usize) {
-        let width = self.cap.saturating_sub(1 + indent).max(1);
+        let width = self.ctx.columns.saturating_sub(1 + indent).max(1);
         for row in wrap(&tame(text), width) {
             self.push(indented(indent, vec![Span::raw(row)]));
         }
@@ -208,14 +215,14 @@ impl Rows<'_, '_> {
         self.push(Line::from(vec![gutter(), Span::styled("Report", bold())]));
         self.text_rows(report, 2);
         self.blank();
-        self.rule(&format!("Activity · {}", calls_label(detail)));
+        self.rule(&format!("Calls · {}", call_total(detail)));
     }
 
     fn prompt(&mut self, prompt: &str, open: bool) {
         let prompt = tame(prompt);
         let lead = Span::styled("›", accent());
         if open {
-            let width = self.cap.saturating_sub(3).max(1);
+            let width = self.ctx.columns.saturating_sub(3).max(1);
             for (i, row) in wrap(&prompt, width).into_iter().enumerate() {
                 let first = if i == 0 { lead.clone() } else { Span::raw(" ") };
                 self.push(Line::from(vec![
@@ -229,7 +236,7 @@ impl Rows<'_, '_> {
         }
         let first = prompt.lines().next().unwrap_or_default();
         let more = prompt.lines().count().saturating_sub(1);
-        let room = self.cap.saturating_sub(3);
+        let room = self.ctx.columns.saturating_sub(3);
         self.push(Line::from(vec![
             gutter(),
             lead,
@@ -248,7 +255,7 @@ impl Rows<'_, '_> {
     }
 
     fn said(&mut self, text: &str, open: bool) {
-        let width = self.cap.saturating_sub(1).max(1);
+        let width = self.ctx.columns.saturating_sub(1).max(1);
         let rows = wrap(&tame(text), width);
         let shown = if open {
             rows.len()
@@ -398,21 +405,23 @@ impl Rows<'_, '_> {
         let used = line_width(&left);
         let right_width = line_width(&right);
         let room = self
-            .cap
+            .ctx
+            .columns
             .saturating_sub(used + right_width + 2 + suffix.as_ref().map_or(0, Span::width));
         left.extend(label.unwrap_or_else(|| self.target_spans(&call.target, room)));
         let left = fit(
             left,
-            self.cap
+            self.ctx
+                .columns
                 .saturating_sub(right_width + 2 + suffix.as_ref().map_or(0, Span::width)),
         );
         let mut left = left;
         left.extend(suffix);
-        self.push(justify(left, right, self.cap));
+        self.push(justify(left, right, self.ctx.columns));
     }
 
     fn excerpt_rows(&mut self, excerpt: &Excerpt, style: ratatui::style::Style, more: &str) {
-        let width = self.cap.saturating_sub(7);
+        let width = self.ctx.columns.saturating_sub(7);
         for (i, line) in excerpt.lines.iter().enumerate() {
             let lead = if i == 0 { "    ⎿ " } else { "      " };
             self.push(Line::from(vec![
@@ -429,7 +438,7 @@ impl Rows<'_, '_> {
     }
 
     fn detail_rows(&mut self, call: &Call) {
-        let width = self.cap.saturating_sub(6).max(1);
+        let width = self.ctx.columns.saturating_sub(6).max(1);
         for row in wrap(&tame(&call.input), width) {
             self.push(indented(4, vec![Span::raw(row)]));
         }
@@ -513,7 +522,7 @@ impl Rows<'_, '_> {
         let name = if self.narrow { 5 } else { 6 };
         let head = format!("{:<name$} {} {noun}  ", tool, calls.len());
         let used = 3 + 2 + head.chars().count() + total.chars().count() + 2;
-        let room = self.cap.saturating_sub(used);
+        let room = self.ctx.columns.saturating_sub(used);
         let shown = names_fit(&names, room);
         self.push(justify(
             vec![
@@ -525,7 +534,7 @@ impl Rows<'_, '_> {
                 Span::styled(shown, dim()),
             ],
             vec![Span::styled(total, dim())],
-            self.cap,
+            self.ctx.columns,
         ));
     }
 }
@@ -718,9 +727,9 @@ fn working_row(
     )
 }
 
-/// What kind of turn [0] is showing, with what the status row needs of the
+/// What kind of activity [0] is showing, with what the status row needs of the
 /// agent's own state.
-pub(super) enum TurnState<'a> {
+pub(super) enum ActivityStage<'a> {
     Working {
         since: SystemTime,
         /// Quiet long enough that the spinner should stand still.
@@ -752,20 +761,24 @@ pub(super) enum TurnState<'a> {
     },
 }
 
-impl TurnState<'_> {
+impl ActivityStage<'_> {
     fn finished(&self) -> bool {
         matches!(self, Self::Done { .. } | Self::Failed { .. })
     }
 }
 
-pub(super) struct TurnView<'a> {
-    pub state: TurnState<'a>,
-    /// What the agent ended the turn with, shown on top of its activity.
+pub(super) struct ActivityView<'a> {
+    pub state: ActivityStage<'a>,
+    /// What the agent ended the activity with, shown on top of its activity.
     pub closing: Option<&'a str>,
-    /// The last moment the user had the turn in front of them.
+    /// The last moment the user had the activity in front of them.
     pub looked: Option<SystemTime>,
     /// The panel's height, which the question may take half of.
     pub height: usize,
+    /// The files the activity touched, which the status row counts.
+    pub touched: &'a [TouchedFile],
+    /// The ones it lists as rows.
+    pub listed: &'a [TouchedFile],
 }
 
 impl Rows<'_, '_> {
@@ -819,12 +832,45 @@ impl Rows<'_, '_> {
                 }
             }
             Entry::Phase(phase) => self.phase(phase),
+            Entry::Touched(file) => self.touched(file),
         }
         (started, self.out.len() - started)
     }
 
+    /// A touched file as [3] shows it: its marker and path, then the counts.
+    fn touched(&mut self, file: &TouchedFile) {
+        let mut left = vec![gutter(), Span::raw("  ")];
+        let right = match &file.now {
+            Now::Changed(change) => {
+                left.extend(file_marker(change.state()));
+                count_spans(change.kind)
+            }
+            Now::Clean => {
+                left.push(Span::raw("   "));
+                vec![Span::styled("no difference", dim())]
+            }
+            Now::Unknown => {
+                left.push(Span::raw("   "));
+                Vec::new()
+            }
+        };
+        let used = line_width(&left) + line_width(&right) + 2;
+        let path = unwind(&file.path.to_string_lossy(), self.ctx);
+        left.push(Span::raw(truncate_start(
+            &tame(&path),
+            self.ctx.columns.saturating_sub(used),
+        )));
+        self.push(justify(left, right, self.ctx.columns));
+    }
+
+    /// The rows of the entry `key` names, as the layout remembers them.
+    fn keyed(&mut self, key: EntryKey, entry: &Entry<'_>, last: bool, nav: &Nav) -> EntryRows {
+        let (start, len) = self.entry(entry, last, nav.is_open(&key));
+        EntryRows { key, start, len }
+    }
+
     fn queued(&mut self, text: &str) {
-        let width = self.cap.saturating_sub(3).max(1);
+        let width = self.ctx.columns.saturating_sub(3).max(1);
         for (i, row) in wrap(&tame(text), width).into_iter().enumerate() {
             let lead = if i == 0 {
                 Span::styled("›", accent())
@@ -865,7 +911,7 @@ impl Rows<'_, '_> {
             right.push(Span::raw("  "));
             right.extend(note);
         }
-        let room = self.cap.saturating_sub(line_width(&right) + 5);
+        let room = self.ctx.columns.saturating_sub(line_width(&right) + 5);
         self.push(justify(
             vec![
                 gutter(),
@@ -874,7 +920,7 @@ impl Rows<'_, '_> {
                 Span::raw(truncate_end(heading.trim(), room)),
             ],
             right,
-            self.cap,
+            self.ctx.columns,
         ));
     }
 }
@@ -938,13 +984,11 @@ pub(super) fn render(
         .is_some_and(|d| d >= STUCK);
     let stale = live && idle && silent;
     let narrow = ctx.columns < WIDE;
-    let cap = ctx.columns.min(CAP);
     let status = status_row(detail, subagent, ctx, live, stale, narrow);
-    let pinned = status_rows(status, cap);
+    let pinned = status_rows(status, ctx.columns);
 
     let mut rows = Rows {
         ctx,
-        cap,
         narrow,
         live,
         stale,
@@ -956,17 +1000,17 @@ pub(super) fn render(
     };
     let mut layout = Vec::new();
     let all = entries(detail);
-    let last_call = all.len().saturating_sub(1);
+    let last = all.len().saturating_sub(1);
     let report = match &detail.outcome {
         Outcome::Finished { report } => report.as_deref().filter(|_| finished),
         Outcome::Running | Outcome::Stopped { .. } => None,
     };
-    let has_prompt = matches!(all.first(), Some(Entry::Prompt(_)));
+    let has_prompt = matches!(all.first(), Some((Entry::Prompt(_), _)));
     if let (false, Some(report)) = (has_prompt, report) {
         rows.report(report, detail);
     }
-    for (at, entry) in all.iter().enumerate() {
-        layout.push(rows.entry(entry, at == last_call, nav.is_open(at)));
+    for (at, (entry, key)) in all.into_iter().enumerate() {
+        layout.push(rows.keyed(key, &entry, at == last, nav));
         if let (0, true, Some(report)) = (at, has_prompt, report) {
             rows.report(report, detail);
         }
@@ -986,50 +1030,49 @@ fn strip_emphasis(text: &str) -> String {
 }
 
 /// The status row and the rule under it, which stay on top.
-fn status_rows(status: Vec<Span<'static>>, cap: usize) -> Vec<Line<'static>> {
+fn status_rows(status: Vec<Span<'static>>, width: usize) -> Vec<Line<'static>> {
     vec![
         Line::from(
             std::iter::once(gutter())
-                .chain(fit(status, cap.saturating_sub(1)))
+                .chain(fit(status, width.saturating_sub(1)))
                 .collect::<Vec<_>>(),
         ),
-        rule_row(cap),
+        rule_row(width),
     ]
 }
 
-fn rule_row(cap: usize) -> Line<'static> {
+fn rule_row(width: usize) -> Line<'static> {
     Line::from(vec![
         gutter(),
-        Span::styled("─".repeat(cap.saturating_sub(1)), dim()),
+        Span::styled("─".repeat(width.saturating_sub(1)), dim()),
     ])
 }
 
-/// The main agent's current turn: a status row (and the question while it
+/// The main agent's current activity: a status row (and the question while it
 /// asks) on top, then the prompt, the agent's closing message once it's
 /// done, and the log with its older phases folded.
-pub(super) fn render_turn(
-    turn: &TurnDetail,
-    view: &TurnView<'_>,
+pub(super) fn render_activity(
+    detail: &ActivityDetail,
+    view: &ActivityView<'_>,
     nav: &Nav,
     ctx: &Context<'_>,
 ) -> Rendered {
     let narrow = ctx.columns < WIDE;
-    let cap = ctx.columns.min(CAP);
     let finished = view.state.finished();
-    let status = turn_status(turn, view, ctx, narrow);
-    let mut pinned = status_rows(status, cap);
+    let status = activity_status(detail, view, ctx, narrow);
+    let mut pinned = status_rows(status, ctx.columns);
     let mut rows = Rows {
         ctx,
-        cap,
         narrow,
         live: !finished,
         stale: matches!(
             view.state,
-            TurnState::Working { stale: true, .. } | TurnState::Delegating { stale: true, .. }
+            ActivityStage::Working { stale: true, .. }
+                | ActivityStage::Delegating { stale: true, .. }
         ),
         parallel: true,
         waiting: match &view.state {
-            TurnState::Asking {
+            ActivityStage::Asking {
                 asking: Some(Asking::Choice { call, .. } | Asking::Permission { call }),
                 ..
             } => Some(call.clone()),
@@ -1039,66 +1082,8 @@ pub(super) fn render_turn(
         out: Vec::new(),
         after_rule: false,
     };
-    if let TurnState::Asking {
-        question,
-        asking,
-        by,
-        ..
-    } = &view.state
-    {
-        let block = question_rows(
-            turn,
-            &Pinned {
-                question,
-                asking: *asking,
-                by: by.as_deref(),
-            },
-            (view.height * 3 / 4).saturating_sub(3),
-            &rows,
-        );
-        pinned.splice(1..1, std::iter::once(Line::raw("")).chain(block));
-    }
-
-    let all = turn_entries(&turn.log, view.closing);
-    let last = all.len().saturating_sub(1);
-    let mut layout = Vec::new();
-    let has_prompt = matches!(all.first(), Some((Entry::Prompt(_), _)));
-    let calls = calls_label(&turn.log);
-    let closing = |rows: &mut Rows<'_, '_>| {
-        if let Some(text) = view.closing {
-            rows.blank();
-            rows.text_rows(&strip_emphasis(text), 0);
-            rows.blank();
-            rows.rule(&format!("Activity · {calls}"));
-        }
-    };
-    if !has_prompt {
-        closing(&mut rows);
-    }
-    let mut marked = false;
-    for (index, (entry, from)) in all.iter().enumerate() {
-        if let Some(looked) = view.looked
-            && !marked
-            && turn
-                .log
-                .log
-                .get(*from)
-                .and_then(time_of)
-                .is_some_and(|at| at > looked)
-            && all[..index]
-                .iter()
-                .any(|(e, _)| !matches!(e, Entry::Prompt(_)))
-        {
-            marked = true;
-            let ago = ctx.now.duration_since(looked).map(span).unwrap_or_default();
-            rows.blank();
-            rows.rule(&format!("since you looked · {ago}"));
-        }
-        layout.push(rows.entry(entry, index == last, nav.is_open(index)));
-        if index == 0 && has_prompt {
-            closing(&mut rows);
-        }
-    }
+    pin_question(&mut pinned, detail, view, &rows);
+    let layout = activity_rows(&mut rows, detail, view, nav);
     Rendered {
         pinned,
         rows: rows.out,
@@ -1107,8 +1092,121 @@ pub(super) fn render_turn(
     }
 }
 
-/// What the status row quotes about a turn, before it picks a state.
-struct TurnFigures<'a> {
+/// The whole question an agent asks, pinned under its status row.
+fn pin_question(
+    pinned: &mut Vec<Line<'static>>,
+    detail: &ActivityDetail,
+    view: &ActivityView<'_>,
+    rows: &Rows<'_, '_>,
+) {
+    if let ActivityStage::Asking {
+        question,
+        asking,
+        by,
+        ..
+    } = &view.state
+    {
+        let block = question_rows(
+            detail,
+            &Pinned {
+                question,
+                asking: *asking,
+                by: by.as_deref(),
+            },
+            (view.height * 3 / 4).saturating_sub(3),
+            rows,
+        );
+        pinned.splice(1..1, std::iter::once(Line::raw("")).chain(block));
+    }
+}
+
+/// The index of the first entry of an activity's calls the user hasn't seen
+/// since they `looked`, which is never the first.
+fn unseen_from(
+    detail: &ActivityDetail,
+    calls: &[(Entry<'_>, usize)],
+    looked: Option<SystemTime>,
+) -> Option<usize> {
+    let looked = looked?;
+    calls
+        .iter()
+        .enumerate()
+        .skip(1)
+        .find(|(_, (_, from))| {
+            detail
+                .log
+                .log
+                .get(*from)
+                .and_then(time_of)
+                .is_some_and(|at| at > looked)
+        })
+        .map(|(index, _)| index)
+}
+
+impl Rows<'_, '_> {
+    /// The files an activity touched under their heading, a row each.
+    fn touched_block(&mut self, files: &[TouchedFile], nav: &Nav) -> Vec<EntryRows> {
+        let mut layout = Vec::new();
+        if files.is_empty() {
+            return layout;
+        }
+        self.blank();
+        self.push(Line::from(vec![
+            gutter(),
+            Span::styled("Touched files", bold()),
+        ]));
+        for file in files {
+            let key = EntryKey::Touched(file.path.clone());
+            layout.push(self.keyed(key, &Entry::Touched(file), false, nav));
+        }
+        layout
+    }
+
+    /// The rule that says where what the user hasn't seen begins.
+    fn since_rule(&mut self, looked: SystemTime) {
+        let ago = self.ctx.now.duration_since(looked).map(span);
+        self.blank();
+        self.rule(&format!("since you looked · {}", ago.unwrap_or_default()));
+    }
+}
+
+/// An activity's scrolling rows in the order of its entries: the prompt, the
+/// closing message, the files touched, then the calls.
+fn activity_rows(
+    rows: &mut Rows<'_, '_>,
+    detail: &ActivityDetail,
+    view: &ActivityView<'_>,
+    nav: &Nav,
+) -> Vec<EntryRows> {
+    let all = activity_entries(&detail.log, view.closing, view.listed);
+    let mut layout = Vec::new();
+    if let Some(prompt) = all.prompt {
+        layout.push(rows.keyed(EntryKey::Prompt, &Entry::Prompt(prompt), false, nav));
+    }
+    if let Some(text) = view.closing {
+        rows.blank();
+        rows.text_rows(&strip_emphasis(text), 0);
+    }
+    layout.extend(rows.touched_block(all.touched, nav));
+    if view.closing.is_some() || !all.touched.is_empty() {
+        rows.blank();
+        rows.rule(&format!("Calls · {}", call_total(&detail.log)));
+    }
+    let unseen = unseen_from(detail, &all.activity, view.looked);
+    let last = all.activity.len().saturating_sub(1);
+    for (index, (entry, from)) in all.activity.iter().enumerate() {
+        if let (Some(at), Some(looked)) = (unseen, view.looked)
+            && at == index
+        {
+            rows.since_rule(looked);
+        }
+        layout.push(rows.keyed(EntryKey::Log(*from), entry, index == last, nav));
+    }
+    layout
+}
+
+/// What the status row quotes about an activity, before it picks a state.
+struct ActivityFigures<'a> {
     log: &'a Log,
     calls: Span<'static>,
     errors: usize,
@@ -1120,8 +1218,8 @@ struct TurnFigures<'a> {
     narrow: bool,
 }
 
-impl TurnFigures<'_> {
-    /// `1 error`, which says whether it was recovered from once the turn
+impl ActivityFigures<'_> {
+    /// `1 error`, which says whether it was recovered from once the activity
     /// is done.
     fn errors(&self, recovered: Option<bool>) -> Option<Span<'static>> {
         let n = self.errors;
@@ -1166,23 +1264,23 @@ fn spinner_span(stale: bool, ctx: &Context<'_>) -> Span<'static> {
     }
 }
 
-/// How the turn reads on the status row.
-fn turn_status(
-    turn: &TurnDetail,
-    view: &TurnView<'_>,
+/// How the activity reads on the status row.
+fn activity_status(
+    detail: &ActivityDetail,
+    view: &ActivityView<'_>,
     ctx: &Context<'_>,
     narrow: bool,
 ) -> Vec<Span<'static>> {
-    let log = &turn.log;
+    let log = &detail.log;
     let since = match view.state {
-        TurnState::Working { since, .. } => Some(since),
+        ActivityStage::Working { since, .. } => Some(since),
         _ => None,
     };
-    let figures = TurnFigures {
+    let figures = ActivityFigures {
         log,
         calls: Span::styled(calls_label(log), dim()),
         errors: error_count(log),
-        files: files_touched(log),
+        files: view.touched.len(),
         agents: agent_count(log),
         working: since
             .and_then(|from| ctx.now.duration_since(from).ok())
@@ -1191,24 +1289,30 @@ fn turn_status(
         narrow,
     };
     match &view.state {
-        TurnState::Working { stale, running, .. } => working_turn_row(&figures, *stale, *running),
-        TurnState::Asking {
+        ActivityStage::Working { stale, running, .. } => {
+            working_activity_row(&figures, *stale, *running)
+        }
+        ActivityStage::Asking {
             since,
             question,
             asking,
             by,
-        } => asking_turn_row(&figures, *since, question, *asking, by.as_deref()),
-        TurnState::Delegating {
+        } => asking_activity_row(&figures, *since, question, *asking, by.as_deref()),
+        ActivityStage::Delegating {
             running,
             quiet,
             stale,
-        } => delegating_turn_row(&figures, *running, *quiet, *stale),
-        TurnState::Done { seen } => done_turn_row(turn, &figures, *seen),
-        TurnState::Failed { reason, since } => failed_turn_row(&figures, reason, *since),
+        } => delegating_activity_row(&figures, *running, *quiet, *stale),
+        ActivityStage::Done { seen } => done_activity_row(detail, &figures, *seen),
+        ActivityStage::Failed { reason, since } => failed_activity_row(&figures, reason, *since),
     }
 }
 
-fn working_turn_row(figures: &TurnFigures<'_>, stale: bool, running: usize) -> Vec<Span<'static>> {
+fn working_activity_row(
+    figures: &ActivityFigures<'_>,
+    stale: bool,
+    running: usize,
+) -> Vec<Span<'static>> {
     let narrow = figures.narrow;
     if let Some(reason) = failing(figures.log) {
         let spans = vec![
@@ -1249,8 +1353,8 @@ fn working_turn_row(figures: &TurnFigures<'_>, stale: bool, running: usize) -> V
     )
 }
 
-fn asking_turn_row(
-    figures: &TurnFigures<'_>,
+fn asking_activity_row(
+    figures: &ActivityFigures<'_>,
     since: SystemTime,
     question: &str,
     asking: Option<&Asking>,
@@ -1272,7 +1376,7 @@ fn asking_turn_row(
         (_, Some(by)) => format!("↳ {by}"),
         _ => first(question),
     };
-    let width = ctx.columns.min(CAP);
+    let width = ctx.columns;
     let room = width.saturating_sub(line_width(&spans) + 1);
     if !figures.narrow && room > about.chars().count() + ANSWER_HINT.len() + 3 {
         let used = line_width(&spans) + about.chars().count();
@@ -1290,8 +1394,8 @@ fn asking_turn_row(
 
 const ANSWER_HINT: &str = "i answer in the terminal";
 
-fn delegating_turn_row(
-    figures: &TurnFigures<'_>,
+fn delegating_activity_row(
+    figures: &ActivityFigures<'_>,
     running: usize,
     quiet: Duration,
     stale: bool,
@@ -1308,9 +1412,13 @@ fn delegating_turn_row(
     )
 }
 
-fn done_turn_row(turn: &TurnDetail, figures: &TurnFigures<'_>, seen: bool) -> Vec<Span<'static>> {
+fn done_activity_row(
+    detail: &ActivityDetail,
+    figures: &ActivityFigures<'_>,
+    seen: bool,
+) -> Vec<Span<'static>> {
     let log = figures.log;
-    let took = match turn.progress {
+    let took = match detail.progress {
         Progress::Finished { took } => took.map(span),
         Progress::Running { .. } | Progress::Stopped => None,
     };
@@ -1342,8 +1450,8 @@ fn done_turn_row(turn: &TurnDetail, figures: &TurnFigures<'_>, seen: bool) -> Ve
     )
 }
 
-fn failed_turn_row(
-    figures: &TurnFigures<'_>,
+fn failed_activity_row(
+    figures: &ActivityFigures<'_>,
     reason: &str,
     since: SystemTime,
 ) -> Vec<Span<'static>> {
@@ -1360,7 +1468,7 @@ fn failed_turn_row(
     with_tail(spans, extras)
 }
 
-/// A quiet delegating turn says so from this long.
+/// A quiet delegating activity says so from this long.
 const QUIET_FROM: Duration = Duration::from_secs(30);
 
 /// What the pinned question block draws.
@@ -1375,13 +1483,13 @@ struct Pinned<'a> {
 /// what the agent said before it, or a subagent's question. At most
 /// `budget` rows.
 fn question_rows(
-    turn: &TurnDetail,
+    detail: &ActivityDetail,
     pinned: &Pinned<'_>,
     budget: usize,
     rows: &Rows<'_, '_>,
 ) -> Vec<Line<'static>> {
     let budget = budget.max(6);
-    let width = rows.cap.saturating_sub(1).max(1);
+    let width = rows.ctx.columns.saturating_sub(1).max(1);
     let mut out: Vec<Line<'static>> = Vec::new();
     match pinned.asking {
         Some(Asking::Choice { questions, .. }) => {
@@ -1392,7 +1500,7 @@ fn question_rows(
                 choice_rows(question, rows, &mut out);
             }
         }
-        Some(Asking::Permission { call }) => permission_rows(turn, call, rows, &mut out),
+        Some(Asking::Permission { call }) => permission_rows(detail, call, rows, &mut out),
         Some(Asking::Subagent(_)) | None => {
             if let Some(by) = pinned.by {
                 out.push(Line::from(vec![
@@ -1434,7 +1542,7 @@ struct Columns {
     /// Room for a description beside its label, or `None` when it goes
     /// under it.
     beside: Option<usize>,
-    cap: usize,
+    width: usize,
 }
 
 impl Columns {
@@ -1447,12 +1555,12 @@ impl Columns {
             .max()
             .unwrap_or(0)
             .min(OPTION_LABEL);
-        let room = rows.cap.saturating_sub(lead + label + 3);
+        let room = rows.ctx.columns.saturating_sub(lead + label + 3);
         Self {
             lead,
             label,
             beside: (!rows.narrow && room >= OPTION_BESIDE).then_some(room),
-            cap: rows.cap,
+            width: rows.ctx.columns,
         }
     }
 }
@@ -1464,7 +1572,7 @@ fn choice_rows(
     rows: &Rows<'_, '_>,
     out: &mut Vec<Line<'static>>,
 ) {
-    let width = rows.cap.saturating_sub(1).max(1);
+    let width = rows.ctx.columns.saturating_sub(1).max(1);
     out.extend(
         wrap(&tame(&question.text), width)
             .into_iter()
@@ -1503,22 +1611,22 @@ fn option_rows(
         lead,
         label: label_width,
         beside,
-        cap,
+        width,
     } = *columns;
     let number = Span::styled(number.to_string(), bold());
-    let label = truncate_end(&tame(label), label_width.max(OTHER.len()).min(cap));
+    let label = truncate_end(&tame(label), label_width.max(OTHER.len()).min(width));
     let Some(room) = beside else {
         out.push(Line::from(vec![
             gutter(),
             number,
             Span::raw("  "),
-            Span::raw(truncate_end(&label, cap.saturating_sub(lead))),
+            Span::raw(truncate_end(&label, width.saturating_sub(lead))),
         ]));
-        let rows = wrap(&tame(description), cap.saturating_sub(lead).max(1));
+        let rows = wrap(&tame(description), width.saturating_sub(lead).max(1));
         for (at, row) in rows.iter().take(NARROW_DESCRIPTION).enumerate() {
             let cut = at + 1 == NARROW_DESCRIPTION && rows.len() > NARROW_DESCRIPTION;
             let row = if cut {
-                let kept: String = row.chars().take(cap.saturating_sub(lead + 1)).collect();
+                let kept: String = row.chars().take(width.saturating_sub(lead + 1)).collect();
                 format!("{kept}…")
             } else {
                 row.clone()
@@ -1565,19 +1673,25 @@ const BESIDE_DESCRIPTION: usize = 4;
 const NARROW_DESCRIPTION: usize = 2;
 
 fn permission_rows(
-    turn: &TurnDetail,
+    detail: &ActivityDetail,
     waiting: &ToolId,
     rows: &Rows<'_, '_>,
     out: &mut Vec<Line<'static>>,
 ) {
-    let width = rows.cap.saturating_sub(1).max(1);
-    let Some((at, call)) = turn.log.log.iter().enumerate().find_map(|(at, e)| match e {
-        LogEntry::Called(call) if call.id == *waiting => Some((at, call)),
-        _ => None,
-    }) else {
+    let width = rows.ctx.columns.saturating_sub(1).max(1);
+    let Some((at, call)) = detail
+        .log
+        .log
+        .iter()
+        .enumerate()
+        .find_map(|(at, e)| match e {
+            LogEntry::Called(call) if call.id == *waiting => Some((at, call)),
+            _ => None,
+        })
+    else {
         return;
     };
-    let said = turn.log.log[..at].iter().rev().find_map(|e| match e {
+    let said = detail.log.log[..at].iter().rev().find_map(|e| match e {
         LogEntry::Said { text, .. } => Some(text),
         _ => None,
     });

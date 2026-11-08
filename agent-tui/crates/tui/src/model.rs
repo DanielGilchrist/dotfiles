@@ -5,7 +5,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use agent_core::actions::Actions;
 use agent_core::activity::{
-    Activity, AgentId, Answer as AskedBy, Origin as Asker, State as ActivityState, Subagent, ToolId,
+    Activity, AgentId, Answer as AskedBy, Origin as Asker, State, Subagent, ToolId,
 };
 use agent_core::config::Keys;
 use agent_core::model::{
@@ -15,7 +15,7 @@ use agent_core::names::{AgentName, BranchName, Checkout, Prompt, SessionName};
 use agent_core::ops::{Approved, Hazardous, RemovalPlan};
 use agent_core::paths::{RepoRoot, Typed, typed_path};
 use agent_core::ports::{
-    CallKind, Change, FileState, HarnessId, Progress, Readiness, TurnDetail, Uncommitted,
+    ActivityDetail, CallKind, Change, FileState, HarnessId, Progress, Readiness, Uncommitted,
     WorktreeFacts,
 };
 use agent_term::{Emulator, Terminal};
@@ -24,8 +24,9 @@ use ratatui::layout::Rect;
 use crate::document::{BranchKey, CommitKey, DiffKey, Documents, FolderKey, Hover, Key};
 use crate::log::Nav;
 use crate::palette::Palette;
+use crate::touched::{self, Roots, TouchedFile};
 use crate::track::{CachedTree, LiveSince};
-pub use crate::track::{Outbox, Tracked, Watched};
+pub use crate::track::{Inspected, Outbox, Tracked, Watched};
 use crate::tree::{self, ChangesScope, ChangesView, Node, TreeRow};
 
 pub const PREVIEW_DEBOUNCE: Duration = Duration::from_millis(150);
@@ -42,26 +43,50 @@ pub enum Panel {
     /// [1]: they move the selection.
     Agents,
     /// [2]: they scroll the selected agent's details down `offset` rows
-    /// and move the cursor over the turn and its subagents.
-    Agent { offset: usize, row: TurnRow },
+    /// and move the cursor over the activity and its subagents.
+    Agent { offset: usize, row: ActivityRow },
     /// [3]: they move the cursor over the selected agent's changed files.
     Changes { file: usize },
     /// The keys are in the document [0] shows for the list panel it came
-    /// from, whose cursor still says which document.
-    Main(Origin),
+    /// from, whose cursor still says which document. The activity it was sent
+    /// from by one of its entries, if it was, is where `Esc` returns to.
+    Main(Origin, Option<ActivitySpot>),
+}
+
+/// Where the activity in [0] was when one of its entries took [0] elsewhere.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActivitySpot {
+    pub agent: SessionName,
+    pub offset: usize,
+    pub row: ActivityRow,
+    /// The tab [3] showed, which opening a diff may have changed.
+    pub scope: ChangesScope,
+}
+
+impl ActivitySpot {
+    /// The panel with the keys back on the activity.
+    pub fn panel(self) -> Panel {
+        Panel::Main(
+            Origin::Activity {
+                offset: self.offset,
+                row: self.row,
+            },
+            None,
+        )
+    }
 }
 
 /// The list panel a focused document in [0] came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Origin {
-    Turn { offset: usize, row: TurnRow },
+    Activity { offset: usize, row: ActivityRow },
     Changes { file: usize },
 }
 
 /// The row [2]'s cursor is on.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TurnRow {
-    Turn,
+pub enum ActivityRow {
+    Main,
     /// A subagent of the agent `by`.
     Subagent {
         by: SessionName,
@@ -74,38 +99,38 @@ pub enum TurnRow {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Listed<'a> {
     Agents,
-    Agent { offset: usize, row: &'a TurnRow },
+    Agent { offset: usize, row: &'a ActivityRow },
     Changes { file: usize },
 }
 
 impl Origin {
     fn into_panel(self) -> Panel {
         match self {
-            Self::Turn { offset, row } => Panel::Agent { offset, row },
+            Self::Activity { offset, row } => Panel::Agent { offset, row },
             Self::Changes { file } => Panel::Changes { file },
         }
     }
 }
 
 impl Panel {
-    /// [2] with the cursor on the turn, scrolled to the top.
-    pub const fn turn() -> Self {
+    /// [2] with the cursor on the activity, scrolled to the top.
+    pub const fn activity() -> Self {
         Self::Agent {
             offset: 0,
-            row: TurnRow::Turn,
+            row: ActivityRow::Main,
         }
     }
 
     pub fn list(&self) -> Listed<'_> {
         match self {
             Self::Agents => Listed::Agents,
-            Self::Agent { offset, row } | Self::Main(Origin::Turn { offset, row }) => {
+            Self::Agent { offset, row } | Self::Main(Origin::Activity { offset, row }, _) => {
                 Listed::Agent {
                     offset: *offset,
                     row,
                 }
             }
-            Self::Changes { file } | Self::Main(Origin::Changes { file }) => {
+            Self::Changes { file } | Self::Main(Origin::Changes { file }, _) => {
                 Listed::Changes { file: *file }
             }
         }
@@ -114,8 +139,8 @@ impl Panel {
     /// Takes the focus from the document, leaving the list panel it came
     /// from.
     pub fn leave_document(&mut self) {
-        if let Self::Main(_) = self
-            && let Self::Main(from) = std::mem::replace(self, Self::Agents)
+        if let Self::Main(..) = self
+            && let Self::Main(from, _) = std::mem::replace(self, Self::Agents)
         {
             *self = from.into_panel();
         }
@@ -123,10 +148,10 @@ impl Panel {
 
     fn origin(self) -> Option<Origin> {
         match self {
-            Self::Agent { offset, row } | Self::Main(Origin::Turn { offset, row }) => {
-                Some(Origin::Turn { offset, row })
+            Self::Agent { offset, row } | Self::Main(Origin::Activity { offset, row }, _) => {
+                Some(Origin::Activity { offset, row })
             }
-            Self::Changes { file } | Self::Main(Origin::Changes { file }) => {
+            Self::Changes { file } | Self::Main(Origin::Changes { file }, _) => {
                 Some(Origin::Changes { file })
             }
             Self::Agents => None,
@@ -137,40 +162,56 @@ impl Panel {
     /// focus on its document survives when the list panel does.
     pub fn with_list(self, list: Self) -> Self {
         match (self, list.origin()) {
-            (Self::Main(_), Some(from)) => Self::Main(from),
+            (Self::Main(_, back), Some(from)) => Self::Main(from, back),
             (_, from) => from.map_or(Self::Agents, Origin::into_panel),
+        }
+    }
+
+    /// The activity the document in [0] was opened from, if one of its entries
+    /// sent it here.
+    pub fn back(&self) -> Option<&ActivitySpot> {
+        match self {
+            Self::Main(_, back) => back.as_ref(),
+            Self::Agents | Self::Agent { .. } | Self::Changes { .. } => None,
+        }
+    }
+
+    /// Forgets the way back to the activity.
+    pub fn forget_back(&mut self) {
+        if let Self::Main(_, back) = self {
+            *back = None;
         }
     }
 
     /// Puts the keys in the panel's document. [1] has none.
     pub fn focus_document(&mut self) {
         let from = match std::mem::replace(self, Self::Agents) {
-            Self::Agent { offset, row } => Origin::Turn { offset, row },
+            Self::Agent { offset, row } => Origin::Activity { offset, row },
             Self::Changes { file } => Origin::Changes { file },
             panel => {
                 *self = panel;
                 return;
             }
         };
-        *self = Self::Main(from);
+        *self = Self::Main(from, None);
     }
 
     pub fn in_main(&self) -> bool {
-        matches!(self, Self::Main(_))
+        matches!(self, Self::Main(..))
     }
 
     /// The row of [2]'s cursor, while [2] or its document has the keys.
-    pub fn turn_row(&self) -> Option<&TurnRow> {
+    pub fn activity_row(&self) -> Option<&ActivityRow> {
         match self.list() {
             Listed::Agent { row, .. } => Some(row),
             Listed::Agents | Listed::Changes { .. } => None,
         }
     }
 
-    fn turn_row_mut(&mut self) -> Option<&mut TurnRow> {
+    fn activity_row_mut(&mut self) -> Option<&mut ActivityRow> {
         match self {
-            Self::Agent { row, .. } | Self::Main(Origin::Turn { row, .. }) => Some(row),
-            Self::Agents | Self::Changes { .. } | Self::Main(Origin::Changes { .. }) => None,
+            Self::Agent { row, .. } | Self::Main(Origin::Activity { row, .. }, _) => Some(row),
+            Self::Agents | Self::Changes { .. } | Self::Main(Origin::Changes { .. }, _) => None,
         }
     }
 }
@@ -526,7 +567,7 @@ pub enum AgentStatus {
         failure: Failure,
         since: SystemTime,
     },
-    /// Finished a turn the user hasn't looked at.
+    /// Finished an activity the user hasn't looked at.
     Done {
         summary: Option<String>,
         since: SystemTime,
@@ -541,7 +582,7 @@ pub struct Inspection {
     pub at: Instant,
 }
 
-/// Why a turn failed, as far as the harness's reason says.
+/// Why an activity failed, as far as the harness's reason says.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Failure {
     RateLimit,
@@ -591,7 +632,7 @@ pub enum Doing {
         name: String,
         target: Option<Target>,
     },
-    /// Its turn ended and it waits on this many background subagents.
+    /// Its activity ended and it waits on this many background subagents.
     Delegating(NonZeroUsize),
     /// Its subagents finished and it's about to take their results.
     HandingBack,
@@ -988,9 +1029,8 @@ pub struct MainLayout {
     pub height: usize,
     /// A log, which follows its end.
     pub tails: bool,
-    /// A log's entries: each one's first row and row count, and the log
-    /// they belong to.
-    pub entries: Vec<(usize, usize)>,
+    /// A log's entries and their rows, and the log they belong to.
+    pub entries: Vec<crate::log::EntryRows>,
     pub nav: Option<LogKey>,
     /// The document, if it is a diff whose lines the cursor moves over.
     pub diff: Option<crate::document::Slot>,
@@ -1003,19 +1043,20 @@ impl MainLayout {
     }
 
     /// The entry on screen's first row, or the last one.
-    pub fn entry_at(&self, top: usize) -> usize {
+    pub fn entry_at(&self, top: usize) -> Option<crate::log::EntryKey> {
         self.entries
             .iter()
-            .position(|&(start, len)| start + len > top)
-            .unwrap_or(self.entries.len().saturating_sub(1))
+            .find(|e| e.start + e.len > top)
+            .or_else(|| self.entries.last())
+            .map(|e| e.key.clone())
     }
 
-    /// Scrolls `docs` so the log's entry `at` shows.
-    pub fn reveal_entry(&self, docs: &mut Documents, at: usize) {
-        let Some(&(start, len)) = self.entries.get(at) else {
+    /// Scrolls `docs` so the log's entry `key` shows.
+    pub fn reveal_entry(&self, docs: &mut Documents, key: &crate::log::EntryKey) {
+        let Some(rows) = self.entries.iter().find(|e| &e.key == key) else {
             return;
         };
-        docs.reveal(start, start + len, self.height);
+        docs.reveal(rows.start, rows.start + rows.len, self.height);
     }
 }
 
@@ -1098,11 +1139,61 @@ pub enum Opened {
     File { path: PathBuf, state: FileState },
 }
 
+/// Why the activity view couldn't take [0] where an entry points.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Missing {
+    /// The subagent isn't one its agent lists any more.
+    Subagent,
+    /// Neither tab of [3] lists the file.
+    File(PathBuf),
+    /// [3] isn't shown at this height.
+    Room,
+}
+
+impl std::fmt::Display for Missing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Subagent => f.write_str("that subagent isn't listed any more"),
+            Self::File(path) => write!(f, "{} has no diff in [3]", path.display()),
+            Self::Room => f.write_str("no room for [3] at this height"),
+        }
+    }
+}
+
+/// What the activity in [0] has that takes more than a lookup to work out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActivityFiles {
+    pub agent: SessionName,
+    pub touched: Vec<TouchedFile>,
+    /// Whether the activity lists them as rows or leaves the status row to
+    /// count them.
+    pub shown: Shown,
+    pub jump: Option<crate::log::Jump>,
+}
+
+/// How an activity says the files it touched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shown {
+    /// The activity is going, so its status row only counts them.
+    Counted,
+    Listed,
+}
+
+impl ActivityFiles {
+    /// The files the activity lists as rows.
+    pub fn listed(&self) -> &[TouchedFile] {
+        match self.shown {
+            Shown::Listed => &self.touched,
+            Shown::Counted => &[],
+        }
+    }
+}
+
 /// A subagent by its agent and its id.
 pub type SubagentKey = (SessionName, AgentId);
 
 /// What an agent that waits on the user is asking about, as far as its
-/// turn can place the question.
+/// activity can place the question.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Asking {
     /// A call that puts questions to the user.
@@ -1117,11 +1208,11 @@ pub enum Asking {
 }
 
 /// A log [0] reads and the cursor moves over: a subagent's, or the current
-/// turn of an agent.
+/// activity of an agent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LogKey {
     Subagent(SubagentKey),
-    Turn(SessionName),
+    Activity(SessionName),
 }
 
 pub enum Load {
@@ -1187,7 +1278,7 @@ pub struct Model {
     pub changes_scope: ChangesScope,
     /// What is known about each agent, dropped when it leaves the snapshot.
     pub agents: HashMap<SessionName, Tracked>,
-    /// The finished turn last marked seen, so it's marked once.
+    /// The finished activity last marked seen, so it's marked once.
     pub acknowledged: Option<(SessionName, u64)>,
     pub last_bell: Option<Instant>,
     /// A bell held back by the rate limit, to ring when it allows.
@@ -1202,6 +1293,9 @@ pub struct Model {
     pub diff_view: crate::review::DiffView,
     /// What the branch view opened in [0], until `Esc` goes back to it.
     pub opened: Option<Opened>,
+    /// What the activity in [0] has that takes more than a lookup, as of the
+    /// last message.
+    pub activity_files: Option<ActivityFiles>,
     /// The agent whose terminal the peek float shows.
     pub peek: Option<SessionName>,
     /// What the main view [0] reads when it isn't the terminal.
@@ -1261,6 +1355,7 @@ impl Model {
             facts_reads: 0,
             diff_view: crate::review::DiffView::default(),
             opened: None,
+            activity_files: None,
             peek: None,
             docs: Documents::default(),
             screen: Screen::Split,
@@ -1348,7 +1443,7 @@ impl Model {
 
     fn move_in_panel_by(&mut self, delta: isize, wrap: Wrap) {
         match &self.panel {
-            Panel::Main(_) => {}
+            Panel::Main(..) => {}
             Panel::Agents => self.move_cursor_by(delta, wrap),
             Panel::Agent { .. } => {
                 self.point_at_row(|at, last| at.saturating_add_signed(delta).min(last));
@@ -1378,7 +1473,7 @@ impl Model {
 
     pub fn panel_to_edge(&mut self, edge: Edge) {
         match &self.panel {
-            Panel::Main(_) => {}
+            Panel::Main(..) => {}
             Panel::Agents => self.move_to_edge(edge),
             Panel::Agent { .. } => {
                 self.point_at_row(|_, last| match edge {
@@ -1453,7 +1548,7 @@ impl Model {
     pub fn nav(&self, key: &LogKey) -> Option<&Nav> {
         match key {
             LogKey::Subagent(key) => self.watched(key).map(|w| &w.watch.nav),
-            LogKey::Turn(name) => self.agents.get(name).map(|t| &t.turn.watch.nav),
+            LogKey::Activity(name) => self.agents.get(name).map(|t| &t.activity_view.watch.nav),
         }
     }
 
@@ -1465,24 +1560,23 @@ impl Model {
                 .subagents
                 .get_mut(id)
                 .map(|w| &mut w.watch.nav),
-            LogKey::Turn(name) => self.agents.get_mut(name).map(|t| &mut t.turn.watch.nav),
+            LogKey::Activity(name) => self
+                .agents
+                .get_mut(name)
+                .map(|t| &mut t.activity_view.watch.nav),
         }
     }
 
-    /// Whether `name` is at work on its turn, so its log grows: working,
+    /// Whether `name` is at work on its activity, so its log grows: working,
     /// delegating or waiting on an answer.
-    pub fn turn_running(&self, name: &SessionName) -> bool {
+    pub fn activity_running(&self, name: &SessionName) -> bool {
         self.activity(name).is_some_and(|a| {
-            a.waiting().is_some()
-                || matches!(
-                    a.state,
-                    ActivityState::Working { .. } | ActivityState::Delegating
-                )
+            a.waiting().is_some() || matches!(a.state, State::Working { .. } | State::Delegating)
         })
     }
 
-    /// What `name` is asking about, matched by tool id to its turn. `None`
-    /// when it asks nothing or the turn hasn't caught up with the ask.
+    /// What `name` is asking about, matched by tool id to its activity. `None`
+    /// when it asks nothing or the activity hasn't caught up with the ask.
     pub fn asking(&self, name: &SessionName) -> Option<Asking> {
         let ask = self.activity(name)?.waiting()?;
         if let Asker::Subagent(id) = &ask.asker {
@@ -1491,8 +1585,8 @@ impl Model {
         let AskedBy::ToolEnding(call) = &ask.answered_by else {
             return None;
         };
-        let turn = self.turn(name)?;
-        if let Progress::Running { asked: Some(asked) } = &turn.progress
+        let detail = self.activity_detail(name)?;
+        if let Progress::Running { asked: Some(asked) } = &detail.progress
             && asked.call == *call
         {
             return Some(Asking::Choice {
@@ -1500,7 +1594,8 @@ impl Model {
                 questions: asked.questions.clone(),
             });
         }
-        turn.log
+        detail
+            .log
             .log
             .iter()
             .find_map(|e| match e {
@@ -1511,41 +1606,40 @@ impl Model {
             .map(|c| Asking::Permission { call: c.id.clone() })
     }
 
-    /// What `name` ended its turn with, once it has: the message its hook
+    /// What `name` ended its activity with, once it has: the message its hook
     /// reported, or else the transcript's last line. It is shown apart from
-    /// the turn's log.
+    /// the activity's log.
     pub fn closing(&self, name: &SessionName) -> Option<String> {
-        let reported = || match &self.turn(name)?.log.outcome {
+        let reported = || match &self.activity_detail(name)?.log.outcome {
             agent_core::ports::Outcome::Finished { report } => report.clone(),
             _ => None,
         };
         match &self.activity(name)?.state {
-            ActivityState::Done { summary } => summary.clone().or_else(reported),
-            ActivityState::Idle | ActivityState::Exited => reported(),
-            ActivityState::Working { .. }
-            | ActivityState::Delegating
-            | ActivityState::Failed { .. } => None,
+            State::Done { summary } => summary.clone().or_else(reported),
+            State::Idle | State::Exited => reported(),
+            State::Working { .. } | State::Delegating | State::Failed { .. } => None,
         }
     }
 
-    /// Whether [0] has a log of `name`'s turn to move over, as opposed to the
+    /// Whether [0] has a log of `name`'s activity to move over, as opposed to the
     /// hooks' account of it.
-    pub fn turn_has_log(&self, name: &SessionName) -> bool {
-        self.turn(name)
+    pub fn activity_has_log(&self, name: &SessionName) -> bool {
+        self.activity_detail(name)
             .is_some_and(|t| t.log.prompt.is_some() || !t.log.log.is_empty())
     }
 
-    /// `name`'s current turn as last read, if it was read and found.
-    pub fn turn(&self, name: &SessionName) -> Option<&TurnDetail> {
-        match self.agents.get(name)?.turn.watch.log.as_ref()? {
-            Ok(Some(turn)) => Some(turn),
+    /// `name`'s current activity as last read, if it was read and found.
+    pub fn activity_detail(&self, name: &SessionName) -> Option<&ActivityDetail> {
+        match self.agents.get(name)?.activity_view.watch.log.as_ref()? {
+            Ok(Some(detail)) => Some(detail),
             Ok(None) | Err(_) => None,
         }
     }
 
     /// `name`'s git facts, or why they couldn't be read, as last read.
-    pub fn facts(&self, name: &SessionName) -> Option<&Result<WorktreeFacts, String>> {
-        self.agents.get(name)?.facts.as_ref()
+    pub fn facts(&self, name: &SessionName) -> Option<Result<&WorktreeFacts, &String>> {
+        let read = self.agents.get(name)?.facts.as_ref()?;
+        Some(read.as_ref().map(|i| &i.facts))
     }
 
     /// The comments drafted on diffs for `name`, until sent.
@@ -1570,26 +1664,32 @@ impl Model {
     /// Records `name`'s freshly read facts: the generation moves on, the
     /// closed folders that no longer exist are forgotten, and [3]'s cursor
     /// stays on the row it was on.
-    pub fn set_facts(&mut self, name: &SessionName, facts: Result<WorktreeFacts, String>) {
+    pub fn set_facts(&mut self, name: &SessionName, read: Result<Inspected, String>) {
         let selected = self.selected_entry().is_some_and(|e| e.name() == name);
         let anchor = selected.then(|| self.changes_anchor()).flatten();
         self.facts_reads += 1;
         let generation = self.facts_reads;
         let tracked = self.track(name);
         tracked.generation = generation;
-        match &facts {
-            Ok(facts) => {
-                let mut existing = tree::folders(&facts.changed);
-                existing.extend(tree::folders(&facts.pending));
+        match &read {
+            Ok(read) => {
+                let mut existing = tree::folders(&read.facts.changed);
+                existing.extend(tree::folders(&read.facts.pending));
                 tracked.collapsed.retain(|p| existing.contains(p));
             }
             Err(_) => tracked.collapsed.clear(),
         }
-        tracked.facts = Some(facts);
+        tracked.facts = Some(read);
         if let Some(anchor) = anchor {
             self.refresh_tree();
             self.restore_changes_anchor(&anchor);
         }
+    }
+
+    /// Facts as if they had been read, for tests that don't care how.
+    #[cfg(test)]
+    pub fn set_test_facts(&mut self, name: &SessionName, facts: Result<WorktreeFacts, String>) {
+        self.set_facts(name, facts.map(Inspected::of));
     }
 
     /// What [3]'s row `row` is, none for the branch row.
@@ -1645,7 +1745,7 @@ impl Model {
 
     fn set_changes_file(&mut self, to: usize) {
         match &mut self.panel {
-            Panel::Changes { file } | Panel::Main(Origin::Changes { file }) => *file = to,
+            Panel::Changes { file } | Panel::Main(Origin::Changes { file }, _) => *file = to,
             _ => {}
         }
     }
@@ -1654,6 +1754,16 @@ impl Model {
     /// stands for it: the first under it, or the folder that holds it.
     /// Whether there was one.
     fn point_changes_at(&mut self, path: &Path) -> bool {
+        let row = self.changes_row_of(path);
+        if let Some(row) = row {
+            self.set_changes_file(row);
+        }
+        row.is_some()
+    }
+
+    /// The row of [3] that stands for `path`: its own, the first under it, or
+    /// the folder that holds it.
+    fn changes_row_of(&self, path: &Path) -> Option<usize> {
         let skip = usize::from(self.branch_row());
         let list = self.change_list();
         let at = list
@@ -1665,15 +1775,13 @@ impl Model {
                     path.starts_with(&r.path) && matches!(r.node, Node::Folder { .. })
                 })
             });
-        if let Some(at) = at {
-            self.set_changes_file(at + skip);
-        }
-        at.is_some()
+        at.map(|at| at + skip)
     }
 
     /// What [3]'s cursor is on, if [3] has it.
     pub fn changes_anchor(&self) -> Option<RowId> {
-        let (Panel::Changes { file } | Panel::Main(Origin::Changes { file })) = self.panel else {
+        let (Panel::Changes { file } | Panel::Main(Origin::Changes { file }, _)) = self.panel
+        else {
             return None;
         };
         let row = file.min(self.change_rows().checked_sub(1)?);
@@ -1686,7 +1794,8 @@ impl Model {
     /// Puts [3]'s cursor back on `anchor` after the list changed under it,
     /// or on the nearest row when it's gone.
     pub fn restore_changes_anchor(&mut self, anchor: &RowId) {
-        let (Panel::Changes { file } | Panel::Main(Origin::Changes { file })) = self.panel else {
+        let (Panel::Changes { file } | Panel::Main(Origin::Changes { file }, _)) = self.panel
+        else {
             return;
         };
         let found = match anchor {
@@ -1710,6 +1819,120 @@ impl Model {
         };
         let row = file.min(self.change_rows().checked_sub(1)?);
         self.change_row(row).map(|r| r.path)
+    }
+
+    /// Moves the keys from the activity at `spot` to [3] on `file`, so [0] shows
+    /// its diff. The tab that lists the file is the one shown, and the
+    /// folders above it open. `Esc` comes back to the activity.
+    pub fn open_diff(&mut self, spot: ActivitySpot, file: &Path) -> Result<(), Missing> {
+        self.require_room()?;
+        let name = spot.agent.clone();
+        let Some(Ok(facts)) = self.facts(&name) else {
+            return Err(Missing::File(file.to_path_buf()));
+        };
+        let scope = [self.changes_scope, self.changes_scope.toggled()]
+            .into_iter()
+            .find(|scope| scope.lists(facts, file))
+            .ok_or_else(|| Missing::File(file.to_path_buf()))?;
+        self.changes_scope = scope;
+        let above: Vec<PathBuf> = file.ancestors().skip(1).map(Path::to_path_buf).collect();
+        self.track(&name).open_folders(&above);
+        self.refresh_tree();
+        let row = self
+            .changes_row_of(file)
+            .ok_or_else(|| Missing::File(file.to_path_buf()))?;
+        self.panel = Panel::Main(Origin::Changes { file: row }, Some(spot));
+        self.opened = None;
+        Ok(())
+    }
+
+    /// Whether [3] is shown at this height, which the keys that move to it
+    /// need.
+    pub fn require_room(&self) -> Result<(), Missing> {
+        match self.work_room {
+            WorkRoom::Fits => Ok(()),
+            WorkRoom::TooShort => Err(Missing::Room),
+        }
+    }
+
+    /// Where the activity in [0] is, if the keys are on it.
+    pub fn activity_spot(&self) -> Option<ActivitySpot> {
+        let Panel::Main(Origin::Activity { offset, row }, _) = &self.panel else {
+            return None;
+        };
+        Some(ActivitySpot {
+            agent: self.selected_entry()?.name().clone(),
+            offset: *offset,
+            row: row.clone(),
+            scope: self.changes_scope,
+        })
+    }
+
+    /// Where `name`'s checkout is, for telling paths in it from others.
+    pub fn roots(&self, name: &SessionName) -> Option<Roots> {
+        let (_, entry) = self.snapshot()?.entry(name)?;
+        let real = match self.tracked(name)?.facts.as_ref()? {
+            Ok(read) => read.real_root.clone(),
+            Err(_) => None,
+        };
+        Some(Roots::new(entry.path()?, real))
+    }
+
+    /// Works out what the activity in [0] has that takes more than a lookup,
+    /// once per message: the files it touched and where `⏎` would go.
+    fn read_activity_files(&self, name: &SessionName) -> Option<ActivityFiles> {
+        let detail = self.activity_detail(name)?;
+        let roots = self.roots(name)?;
+        let tracked = self.tracked(name)?;
+        let facts = tracked
+            .facts
+            .as_ref()
+            .and_then(|r| r.as_ref().ok())
+            .map(|i| &i.facts);
+        let touched = touched::files(&detail.log, &roots, facts, &tracked.baseline);
+        let running = self.activity_running(name);
+        let shown = if running {
+            Shown::Counted
+        } else {
+            Shown::Listed
+        };
+        let mut files = ActivityFiles {
+            agent: name.clone(),
+            touched,
+            shown,
+            jump: None,
+        };
+        let closing = self.closing(name);
+        let entries =
+            crate::log::activity_entries(&detail.log, closing.as_deref(), files.listed()).flat();
+        files.jump = (!entries.is_empty())
+            .then(|| tracked.activity_view.watch.nav.at(running, &entries))
+            .and_then(|at| entries.get(at))
+            .and_then(|(entry, _)| crate::log::jump_of(entry, &roots));
+        Some(files)
+    }
+
+    /// What the activity in [0] has that takes more than a lookup, when it
+    /// is `name`'s.
+    pub fn activity_files(&self, name: &SessionName) -> Option<&ActivityFiles> {
+        self.activity_files.as_ref().filter(|f| &f.agent == name)
+    }
+
+    /// The files `name`'s activity touched, when it is the activity in [0].
+    #[cfg(test)]
+    pub fn touched(&self, name: &SessionName) -> Option<&[TouchedFile]> {
+        Some(&self.activity_files(name)?.touched)
+    }
+
+    /// The files the activity lists as rows, when it is the activity in [0].
+    #[cfg(test)]
+    pub fn listed(&self, name: &SessionName) -> Option<&[TouchedFile]> {
+        Some(self.activity_files(name)?.listed())
+    }
+
+    /// Where `⏎` would take [0] from the entry under the activity's cursor.
+    pub fn activity_jump(&self) -> Option<&crate::log::Jump> {
+        self.activity_files.as_ref()?.jump.as_ref()
     }
 
     /// Switches [3] between the tree and the flat list, keeping the cursor
@@ -1742,13 +1965,11 @@ impl Model {
         let Some(name) = self.selected_entry().map(|e| e.name().clone()) else {
             return;
         };
-        let closed = &mut self.track(&name).collapsed;
+        let tracked = self.track(&name);
         if matches!(folder.node, Node::Folder { open: false }) {
-            for path in &folder.chain {
-                closed.remove(path);
-            }
+            tracked.open_folders(&folder.chain);
         } else {
-            closed.insert(folder.path);
+            tracked.collapsed.insert(folder.path);
         }
         self.refresh_tree();
     }
@@ -1848,7 +2069,7 @@ impl Model {
             Hover::Branch(key) => Key::Branch(key),
             Hover::Folder(key) => Key::Folder(key),
             Hover::Commit(key) => Key::Commit(key),
-            Hover::Turn(_) | Hover::Subagent(..) | Hover::Repo(_) => return None,
+            Hover::Activity(_) | Hover::Subagent(..) | Hover::Repo(_) => return None,
         };
         Some((key, root))
     }
@@ -1932,7 +2153,7 @@ impl Model {
         if let Some(key) = key
             && let Some(nav) = self.nav_mut(&key)
         {
-            nav.cursor = Some(entry);
+            nav.cursor = entry;
         }
     }
 
@@ -1951,8 +2172,19 @@ impl Model {
         if hover.is_none() {
             self.panel.leave_document();
         }
+        if let Some(spot) = self.panel.back()
+            && self
+                .selected_entry()
+                .is_none_or(|e| e.name() != &spot.agent)
+        {
+            self.panel.forget_back();
+        }
         self.docs.settle(hover.as_ref(), self.clock.mono);
         self.refresh_tree();
+        self.activity_files = match &hover {
+            Some(Hover::Activity(name)) => self.read_activity_files(name),
+            _ => None,
+        };
     }
 
     /// Builds the selected agent's tree if its facts, the view, the scope
@@ -2027,15 +2259,15 @@ impl Model {
             };
         }
         match &activity.state {
-            ActivityState::Idle | ActivityState::Exited => AgentStatus::Idle,
-            ActivityState::Working { .. } | ActivityState::Delegating => {
+            State::Idle | State::Exited => AgentStatus::Idle,
+            State::Working { .. } | State::Delegating => {
                 let pulse = if activity.stale(self.clock.wall) {
                     Pulse::Stale
                 } else {
                     Pulse::Steady
                 };
                 let doing = match (&activity.state, activity.current_tool()) {
-                    (ActivityState::Delegating, _) => NonZeroUsize::new(activity.running())
+                    (State::Delegating, _) => NonZeroUsize::new(activity.running())
                         .map_or(Doing::HandingBack, Doing::Delegating),
                     (_, Some(tool)) => Doing::Tool {
                         name: tool.name.clone(),
@@ -2049,11 +2281,11 @@ impl Model {
                     pulse,
                 }
             }
-            ActivityState::Failed { reason } => AgentStatus::Failed {
+            State::Failed { reason } => AgentStatus::Failed {
                 failure: Failure::of(reason),
                 since,
             },
-            ActivityState::Done { summary } => AgentStatus::Done {
+            State::Done { summary } => AgentStatus::Done {
                 summary: summary.clone(),
                 since,
             },
@@ -2122,7 +2354,7 @@ impl Model {
             return Vec::new();
         };
         let mut rows: Vec<_> = activity.subagents.iter().collect();
-        if let Some(TurnRow::Subagent { by, id }) = self.panel.turn_row()
+        if let Some(ActivityRow::Subagent { by, id }) = self.panel.activity_row()
             && by == entry.name()
             && !activity.subagents.contains_key(id)
             && let Some(held) = self
@@ -2140,8 +2372,8 @@ impl Model {
     /// Keeps the subagent under [2]'s cursor as its agent last listed it,
     /// marks it finished once the activity drops it, and forgets it when the
     /// cursor has left its agent or its live session.
-    pub fn hold_turn_row(&mut self) {
-        let Some(TurnRow::Subagent { by, id }) = self.panel.turn_row() else {
+    pub fn hold_activity_row(&mut self) {
+        let Some(ActivityRow::Subagent { by, id }) = self.panel.activity_row() else {
             return;
         };
         let live = self
@@ -2169,10 +2401,10 @@ impl Model {
         }
     }
 
-    /// Where [2]'s cursor is among its rows: 0 is the turn, then the
-    /// subagents. The turn while it points at a subagent that's gone.
+    /// Where [2]'s cursor is among its rows: 0 is the activity, then the
+    /// subagents. The activity while it points at a subagent that's gone.
     pub fn row_at(&self) -> usize {
-        let Some(TurnRow::Subagent { id, .. }) = self.panel.turn_row() else {
+        let Some(ActivityRow::Subagent { id, .. }) = self.panel.activity_row() else {
             return 0;
         };
         self.subagent_rows()
@@ -2191,21 +2423,43 @@ impl Model {
             _ => None,
         };
         let Some((by, id)) = pointed else {
-            if let Some(row) = self.panel.turn_row_mut() {
-                *row = TurnRow::Turn;
+            if let Some(row) = self.panel.activity_row_mut() {
+                *row = ActivityRow::Main;
             }
             return;
         };
         self.track(&by).subagents.entry(id.clone()).or_default();
-        if let Some(row) = self.panel.turn_row_mut() {
-            *row = TurnRow::Subagent { by, id };
+        if let Some(row) = self.panel.activity_row_mut() {
+            *row = ActivityRow::Subagent { by, id };
         }
-        self.hold_turn_row();
+        self.hold_activity_row();
+    }
+
+    /// Points [0] at the subagent `id`, as [2]'s cursor on it would, from
+    /// the activity at `spot`. `Esc` comes back to the activity.
+    pub fn open_subagent(&mut self, spot: ActivitySpot, id: &AgentId) -> Result<(), Missing> {
+        if !self.subagent_rows().iter().any(|(listed, _)| *listed == id) {
+            return Err(Missing::Subagent);
+        }
+        let by = spot.agent.clone();
+        self.panel = Panel::Main(
+            Origin::Activity {
+                offset: spot.offset,
+                row: ActivityRow::Subagent {
+                    by: by.clone(),
+                    id: id.clone(),
+                },
+            },
+            Some(spot),
+        );
+        self.track(&by).subagents.entry(id.clone()).or_default();
+        self.hold_activity_row();
+        Ok(())
     }
 
     /// The subagent [2]'s cursor is on, while [2] is focused.
     pub fn subagent_selected(&self) -> Option<(SessionName, AgentId)> {
-        self.panel.turn_row()?;
+        self.panel.activity_row()?;
         let name = self.selected_entry()?.name().clone();
         let rows = self.subagent_rows();
         let (id, _) = rows.get(self.row_at().checked_sub(1)?)?;
@@ -2230,7 +2484,7 @@ impl Model {
                 let name = entry.name().clone();
                 Some(match self.subagent_selected() {
                     Some((_, id)) => Hover::Subagent(name, id),
-                    None => Hover::Turn(name),
+                    None => Hover::Activity(name),
                 })
             }
         }
@@ -3682,7 +3936,7 @@ impl Model {
         };
         self.panel = Panel::Agent {
             offset,
-            row: TurnRow::Subagent {
+            row: ActivityRow::Subagent {
                 by,
                 id: AgentId::new(id),
             },
@@ -3703,9 +3957,13 @@ impl Model {
             .log = Some(log);
     }
 
-    /// `name`'s current turn as if it had been read.
-    pub fn set_turn(&mut self, name: &SessionName, turn: Result<Option<TurnDetail>, String>) {
-        self.track(name).turn.watch.log = Some(turn);
+    /// `name`'s current activity as if it had been read.
+    pub fn set_activity(
+        &mut self,
+        name: &SessionName,
+        detail: Result<Option<ActivityDetail>, String>,
+    ) {
+        self.track(name).activity_view.watch.log = Some(detail);
     }
 
     /// How many subagents are being watched across every agent.

@@ -141,7 +141,7 @@ pub struct Theme {
     pub warning: Colour,
     /// Failures, errors, removed lines.
     pub error: Colour,
-    /// Finished turns, added lines.
+    /// Finished activities, added lines.
     pub success: Colour,
 }
 

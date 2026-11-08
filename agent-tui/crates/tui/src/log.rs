@@ -1,16 +1,21 @@
-//! A log as [0] reads it, a subagent's or the main agent's current turn:
+//! A log as [0] reads it, a subagent's or the main agent's current activity:
 //! entries (the prompt, what it said, calls, runs of calls folded together,
-//! a turn's older phases folded to a row), how it is going, the cursor and
+//! an activity's older phases folded to a row), how it is going, the cursor and
 //! what is expanded, and the transcript written out for `$EDITOR`.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::fmt::Write;
+use std::fmt::{self, Write};
 use std::num::NonZeroUsize;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use agent_core::ports::{
-    Call, CallKind, CallState, Log, LogEntry, Outcome, Target, ends_with_report,
+    ActivityDetail, Call, CallKind, CallState, Log, LogEntry, Outcome, Target, ends_with_report,
 };
+
+use agent_core::activity::{AgentId, TranscriptRef};
+
+use crate::touched::{Now, Roots, TouchedFile};
 
 /// Consecutive successful explore calls of one tool fold into one row.
 const GROUP_AT: usize = 3;
@@ -38,9 +43,11 @@ pub enum Entry<'a> {
     /// The same tool and target more than once in a row. The last call's
     /// outcome stands for all.
     Repeat(Vec<&'a Call>),
-    /// A finished stretch of a turn folded to one row: what the agent said
+    /// A finished stretch of an activity folded to one row: what the agent said
     /// and the calls under it, which open with the cursor.
     Phase(Phase<'a>),
+    /// A file the activity touched.
+    Touched(&'a TouchedFile),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,7 +64,11 @@ impl<'a> Entry<'a> {
             Self::Call(call) => vec![call],
             Self::Group { calls, .. } | Self::Repeat(calls) => calls.clone(),
             Self::Phase(phase) => phase.entries.iter().flat_map(Self::calls).collect(),
-            Self::Prompt(_) | Self::Said(_) | Self::Queued(_) | Self::Compacted => Vec::new(),
+            Self::Prompt(_)
+            | Self::Said(_)
+            | Self::Queued(_)
+            | Self::Compacted
+            | Self::Touched(_) => Vec::new(),
         }
     }
 }
@@ -66,20 +77,45 @@ fn explored(call: &Call) -> bool {
     call.kind == CallKind::Explore && matches!(call.state, CallState::Done { .. })
 }
 
-pub fn entries(detail: &Log) -> Vec<Entry<'_>> {
-    indexed(detail.prompt.as_deref(), &detail.log)
+/// What names an entry whatever else is listed with it: the log entry it
+/// starts at, or the path of a touched file. A cursor and a fold keep to
+/// their entry when others come and go.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum EntryKey {
+    Prompt,
+    Touched(PathBuf),
+    Log(usize),
+}
+
+/// An entry's rows in a view.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EntryRows {
+    pub key: EntryKey,
+    pub start: usize,
+    pub len: usize,
+}
+
+/// A subagent's entries, the prompt first, each with its key.
+pub fn entries(detail: &Log) -> Vec<(Entry<'_>, EntryKey)> {
+    let prompt = detail
+        .prompt
+        .as_deref()
+        .filter(|p| !p.is_empty())
+        .map(|p| (Entry::Prompt(p), EntryKey::Prompt));
+    prompt
         .into_iter()
-        .map(|(entry, _)| entry)
+        .chain(
+            indexed(&detail.log)
+                .into_iter()
+                .map(|(entry, from)| (entry, EntryKey::Log(from))),
+        )
         .collect()
 }
 
-/// The entries of `log` after `prompt`, each with the index of the first log
-/// entry it stands for. The prompt stands for index 0.
-fn indexed<'a>(prompt: Option<&'a str>, log: &'a [LogEntry]) -> Vec<(Entry<'a>, usize)> {
+/// The entries of `log`, each with the index of the first log entry it
+/// stands for.
+fn indexed(log: &[LogEntry]) -> Vec<(Entry<'_>, usize)> {
     let mut out = Vec::new();
-    if let Some(prompt) = prompt.filter(|p| !p.is_empty()) {
-        out.push((Entry::Prompt(prompt), 0));
-    }
     let mut at = 0;
     while at < log.len() {
         let call = match &log[at] {
@@ -141,7 +177,7 @@ fn indexed<'a>(prompt: Option<&'a str>, log: &'a [LogEntry]) -> Vec<(Entry<'a>, 
     out
 }
 
-/// What a turn's log is made of: loose entries, and stretches that each
+/// What an activity's log is made of: loose entries, and stretches that each
 /// begin with something the agent said.
 enum Piece<'a> {
     Loose(Entry<'a>, usize),
@@ -174,12 +210,44 @@ fn unrecovered(log: &[LogEntry]) -> HashSet<usize> {
         .collect()
 }
 
-/// A turn's entries: its prompt, then the log with every phase but the
-/// latest folded to one entry. A phase stays open while it holds a running
-/// call or a failure nothing has succeeded after. The index beside each
-/// entry is the first log entry it stands for. `closing` is the message the
-/// turn ended with, which the view shows apart from the log.
-pub fn turn_entries<'a>(detail: &'a Log, closing: Option<&str>) -> Vec<(Entry<'a>, usize)> {
+/// An activity's entries in the order they are shown.
+pub struct ActivityEntries<'a> {
+    pub prompt: Option<&'a str>,
+    /// The files the activity touched, when the view lists them.
+    pub touched: &'a [TouchedFile],
+    /// The log with every phase but the latest folded to one entry, each
+    /// with the index of the first log entry it stands for.
+    pub activity: Vec<(Entry<'a>, usize)>,
+}
+
+impl<'a> ActivityEntries<'a> {
+    /// Every entry the cursor moves over, in order, with its key.
+    pub fn flat(&self) -> Vec<(Entry<'a>, EntryKey)> {
+        self.prompt
+            .map(|p| (Entry::Prompt(p), EntryKey::Prompt))
+            .into_iter()
+            .chain(
+                self.touched
+                    .iter()
+                    .map(|f| (Entry::Touched(f), EntryKey::Touched(f.path.clone()))),
+            )
+            .chain(
+                self.activity
+                    .iter()
+                    .map(|(entry, from)| (entry.clone(), EntryKey::Log(*from))),
+            )
+            .collect()
+    }
+}
+
+/// An activity's entries. A phase stays open while it holds a running call or a
+/// failure nothing has succeeded after. `closing` is the message the activity
+/// ended with, which the view shows apart from the log.
+pub fn activity_entries<'a>(
+    detail: &'a Log,
+    closing: Option<&str>,
+    touched: &'a [TouchedFile],
+) -> ActivityEntries<'a> {
     let log = match closing {
         Some(closing) if ends_with_report(&detail.log, closing) => {
             &detail.log[..detail.log.len() - 1]
@@ -188,28 +256,25 @@ pub fn turn_entries<'a>(detail: &'a Log, closing: Option<&str>) -> Vec<(Entry<'a
     };
     let mut pieces: Vec<Piece<'a>> = Vec::new();
     let mut out = Vec::new();
-    for (entry, at) in indexed(detail.prompt.as_deref(), log) {
-        match entry {
-            Entry::Prompt(_) => out.push((entry, at)),
-            Entry::Queued(_) | Entry::Compacted => pieces.push(Piece::Loose(entry, at)),
-            Entry::Said(_) => pieces.push(Piece::Stretch {
+    for (entry, at) in indexed(log) {
+        match &log[at] {
+            LogEntry::Queued { .. } | LogEntry::Compacted => pieces.push(Piece::Loose(entry, at)),
+            LogEntry::Said { .. } => pieces.push(Piece::Stretch {
                 entries: vec![(entry, at)],
                 from: at,
                 to: at + 1,
             }),
-            Entry::Call(_) | Entry::Group { .. } | Entry::Repeat(_) | Entry::Phase(_) => {
-                match pieces.last_mut() {
-                    Some(Piece::Stretch { entries, to, .. }) => {
-                        *to = at + entry.calls().len();
-                        entries.push((entry, at));
-                    }
-                    _ => pieces.push(Piece::Stretch {
-                        to: at + entry.calls().len(),
-                        from: at,
-                        entries: vec![(entry, at)],
-                    }),
+            LogEntry::Called(_) => match pieces.last_mut() {
+                Some(Piece::Stretch { entries, to, .. }) => {
+                    *to = at + entry.calls().len();
+                    entries.push((entry, at));
                 }
-            }
+                _ => pieces.push(Piece::Stretch {
+                    to: at + entry.calls().len(),
+                    from: at,
+                    entries: vec![(entry, at)],
+                }),
+            },
         }
     }
     let latest = pieces
@@ -250,7 +315,11 @@ pub fn turn_entries<'a>(detail: &'a Log, closing: Option<&str>) -> Vec<(Entry<'a
             }
         }
     }
-    out
+    ActivityEntries {
+        prompt: detail.prompt.as_deref().filter(|p| !p.is_empty()),
+        touched,
+        activity: out,
+    }
 }
 
 fn calls(detail: &Log) -> impl Iterator<Item = &Call> {
@@ -286,20 +355,35 @@ pub fn agent_count(detail: &Log) -> usize {
 pub fn delegates(calls: &[&Call]) -> usize {
     calls
         .iter()
-        .filter(|c| c.kind == CallKind::Delegate)
+        .filter(|c| matches!(c.kind, CallKind::Delegate { .. }))
         .count()
 }
 
-/// How many distinct files its edits and writes aimed at.
-pub fn files_touched(detail: &Log) -> usize {
-    calls(detail)
-        .filter(|c| c.kind == CallKind::Edit)
-        .filter_map(|c| match &c.target {
-            Target::Path { path, .. } => Some(path.as_str()),
-            _ => None,
-        })
-        .collect::<HashSet<_>>()
-        .len()
+/// Where `⏎` takes the keys from an entry of the activity, instead of folding it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Jump {
+    /// The subagent a call started.
+    Subagent(AgentId),
+    /// A file's diff, by its path in the checkout.
+    File(PathBuf),
+}
+
+pub fn jump_of(entry: &Entry<'_>, roots: &Roots) -> Option<Jump> {
+    let call = match entry {
+        Entry::Call(call) => call,
+        Entry::Repeat(calls) => calls.last()?,
+        Entry::Touched(file) => return Some(Jump::File(file.path.clone())),
+        Entry::Prompt(_)
+        | Entry::Said(_)
+        | Entry::Queued(_)
+        | Entry::Compacted
+        | Entry::Group { .. }
+        | Entry::Phase(_) => return None,
+    };
+    call.spawned().cloned().map(Jump::Subagent).or_else(|| {
+        call.touched()
+            .map(|path| Jump::File(roots.within(Path::new(path))))
+    })
 }
 
 /// A short name for a call, to say what keeps failing.
@@ -356,32 +440,42 @@ pub fn failing(detail: &Log) -> Option<String> {
         .then(|| format!("{failed} of the last {WINDOW} calls failed"))
 }
 
-/// The cursor and what is expanded, for one subagent.
+/// The cursor and what is expanded, for one log.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Nav {
-    pub cursor: Option<usize>,
-    pub open: BTreeSet<usize>,
+    pub cursor: Option<EntryKey>,
+    pub open: BTreeSet<EntryKey>,
     pub all: bool,
 }
 
 impl Nav {
-    pub fn is_open(&self, entry: usize) -> bool {
-        self.all || self.open.contains(&entry)
+    /// Where the cursor is among `entries`, which are not empty. A log
+    /// still growing starts at its end, one that is over at its start, and
+    /// so does a cursor whose entry is gone.
+    pub fn at(&self, running: bool, entries: &[(Entry<'_>, EntryKey)]) -> usize {
+        let default = if running { entries.len() - 1 } else { 0 };
+        self.cursor
+            .as_ref()
+            .and_then(|key| entries.iter().position(|(_, k)| k == key))
+            .unwrap_or(default)
     }
 
-    pub fn toggle(&mut self, entry: usize) {
+    pub fn is_open(&self, key: &EntryKey) -> bool {
+        self.all || self.open.contains(key)
+    }
+
+    pub fn toggle(&mut self, key: EntryKey) {
         if self.all {
             self.all = false;
             self.open.clear();
-        } else if !self.open.remove(&entry) {
-            self.open.insert(entry);
+        } else if !self.open.remove(&key) {
+            self.open.insert(key);
         }
     }
 }
 
-/// `text` in a code fence long enough that no run of backticks inside it
-/// ends the fence early.
-fn fenced(text: &str) -> String {
+/// The longest run of backticks in `text`.
+fn backticks(text: &str) -> usize {
     let mut longest = 0;
     let mut run = 0;
     for c in text.chars() {
@@ -392,64 +486,181 @@ fn fenced(text: &str) -> String {
             run = 0;
         }
     }
-    let fence = "`".repeat((longest + 1).max(3));
+    longest
+}
+
+/// `text` as an inline code span that no backtick inside it can end early.
+fn code_span(text: &str) -> String {
+    let tick = "`".repeat(backticks(text) + 1);
+    let pad = if text.starts_with('`') || text.ends_with('`') {
+        " "
+    } else {
+        ""
+    };
+    format!("{tick}{pad}{text}{pad}{tick}")
+}
+
+/// `text` in a code fence long enough that no run of backticks inside it
+/// ends the fence early.
+fn fenced(text: &str) -> String {
+    let fence = "`".repeat((backticks(text) + 1).max(3));
     format!("{fence}\n{text}\n{fence}")
+}
+
+/// One entry of a log as Markdown.
+fn entry_markdown(entry: &Entry<'_>) -> String {
+    let mut text = String::new();
+    let single = |text: &mut String, call: &Call| {
+        let _ = write!(text, "### {} {}\n\n", call.tool, target_text(&call.target));
+        let _ = write!(text, "{}\n\n", fenced(&call.input));
+        if !call.output.is_empty() {
+            let _ = write!(text, "Result:\n\n{}\n\n", fenced(&call.output));
+        }
+    };
+    match entry {
+        Entry::Prompt(prompt) => {
+            let _ = write!(text, "### Prompt\n\n{prompt}\n\n");
+        }
+        Entry::Said(said) => {
+            let _ = write!(text, "{said}\n\n");
+        }
+        Entry::Queued(said) => {
+            let _ = write!(text, "### Queued message\n\n{said}\n\n");
+        }
+        Entry::Compacted => text.push_str("Conversation compacted.\n\n"),
+        Entry::Call(call) => single(&mut text, call),
+        Entry::Group { calls, .. } | Entry::Repeat(calls) => {
+            for call in calls {
+                single(&mut text, call);
+            }
+        }
+        Entry::Phase(phase) => {
+            for inner in &phase.entries {
+                text.push_str(&entry_markdown(inner));
+            }
+        }
+        Entry::Touched(file) => {
+            let path = file.path.to_string_lossy();
+            let _ = writeln!(text, "- {}{}", code_span(&path), touched_note(file));
+        }
+    }
+    text
+}
+
+fn touched_note(file: &TouchedFile) -> String {
+    use agent_core::ports::{ChangeKind, Lines};
+    let kind = match &file.now {
+        Now::Changed(change) => change.kind,
+        Now::Clean => return " (no difference now)".into(),
+        Now::Unknown => return String::new(),
+    };
+    match kind {
+        ChangeKind::Untracked => " (new)".into(),
+        ChangeKind::Tracked {
+            lines: Lines::Counted { added, removed },
+            ..
+        } => format!(" (+{added} \u{2212}{removed})"),
+        ChangeKind::Tracked {
+            lines: Lines::Binary,
+            ..
+        } => " (binary)".into(),
+        ChangeKind::Tracked {
+            lines: Lines::Unknown,
+            ..
+        } => String::new(),
+    }
+}
+
+/// A Markdown document, and the line each entry written to it starts on.
+struct Document {
+    text: String,
+    newlines: usize,
+    starts: Vec<NonZeroUsize>,
+}
+
+impl fmt::Write for Document {
+    fn write_str(&mut self, text: &str) -> fmt::Result {
+        self.newlines += text.matches('\n').count();
+        self.text.push_str(text);
+        Ok(())
+    }
+}
+
+impl Document {
+    /// A document titled `title`, noting where the raw transcript is.
+    fn header(title: &str, transcript: &TranscriptRef) -> Self {
+        let mut doc = Self {
+            text: String::new(),
+            newlines: 0,
+            starts: Vec::new(),
+        };
+        let _ = write!(doc, "# {title}\n\n");
+        if !transcript.as_str().is_empty() {
+            let _ = write!(
+                doc,
+                "Raw transcript: {}\n\n",
+                code_span(transcript.as_str())
+            );
+        }
+        doc
+    }
+
+    fn entry(&mut self, entry: &Entry<'_>) {
+        self.starts
+            .push(NonZeroUsize::MIN.saturating_add(self.newlines));
+        let _ = write!(self, "{}", entry_markdown(entry));
+    }
 }
 
 /// The transcript as Markdown for `$EDITOR`, and the line each entry starts
 /// on, in the order [`entries`] lists them.
 pub fn markdown(detail: &Log, title: &str) -> (String, Vec<NonZeroUsize>) {
-    let mut out = String::new();
-    let mut starts = Vec::new();
-    let _ = write!(out, "# {title}\n\n");
-    if !detail.transcript.as_str().is_empty() {
-        let _ = write!(out, "Raw transcript: `{}`\n\n", detail.transcript.as_str());
-    }
+    let mut doc = Document::header(title, &detail.transcript);
     if let Outcome::Finished {
         report: Some(report),
     } = &detail.outcome
     {
-        let _ = write!(out, "## Report\n\n{report}\n\n");
+        let _ = write!(doc, "## Report\n\n{report}\n\n");
     }
-    out.push_str("## Activity\n\n");
-    let mut newlines = out.matches('\n').count();
-    for entry in entries(detail) {
-        starts.push(NonZeroUsize::MIN.saturating_add(newlines));
-        let mut text = String::new();
-        let single = |text: &mut String, call: &Call| {
-            let _ = write!(text, "### {} {}\n\n", call.tool, target_text(&call.target));
-            let _ = write!(text, "{}\n\n", fenced(&call.input));
-            if !call.output.is_empty() {
-                let _ = write!(text, "Result:\n\n{}\n\n", fenced(&call.output));
-            }
-        };
-        match entry {
-            Entry::Prompt(prompt) => {
-                let _ = write!(text, "### Prompt\n\n{prompt}\n\n");
-            }
-            Entry::Said(said) => {
-                let _ = write!(text, "{said}\n\n");
-            }
-            Entry::Queued(said) => {
-                let _ = write!(text, "### Queued message\n\n{said}\n\n");
-            }
-            Entry::Compacted => text.push_str("Conversation compacted.\n\n"),
-            Entry::Call(call) => single(&mut text, call),
-            Entry::Group { calls, .. } | Entry::Repeat(calls) => {
-                for call in calls {
-                    single(&mut text, call);
-                }
-            }
-            Entry::Phase(phase) => {
-                for call in phase.entries.iter().flat_map(Entry::calls) {
-                    single(&mut text, call);
-                }
-            }
-        }
-        newlines += text.matches('\n').count();
-        out.push_str(&text);
+    let _ = write!(doc, "## Calls\n\n");
+    for (entry, _) in entries(detail) {
+        doc.entry(&entry);
     }
-    (out, starts)
+    (doc.text, doc.starts)
+}
+
+/// An activity as Markdown for `$EDITOR`: its prompt, the closing message, the
+/// files it touched, then the activity, and the line each entry of
+/// [`ActivityEntries::flat`] starts on.
+pub fn activity_markdown(
+    detail: &ActivityDetail,
+    title: &str,
+    closing: Option<&str>,
+    touched: &[TouchedFile],
+) -> (String, Vec<NonZeroUsize>) {
+    let all = activity_entries(&detail.log, closing, touched);
+    let mut doc = Document::header(title, &detail.log.transcript);
+    let _ = write!(doc, "## Activity\n\n");
+    if let Some(prompt) = all.prompt {
+        doc.entry(&Entry::Prompt(prompt));
+    }
+    if let Some(closing) = closing {
+        let _ = write!(doc, "### Closing message\n\n{closing}\n\n");
+    }
+    if !all.touched.is_empty() {
+        let _ = write!(doc, "### Touched files\n\n");
+    }
+    for file in all.touched {
+        doc.entry(&Entry::Touched(file));
+    }
+    if !all.touched.is_empty() {
+        let _ = writeln!(doc);
+    }
+    let _ = write!(doc, "## Calls\n\n");
+    for (entry, _) in &all.activity {
+        doc.entry(entry);
+    }
+    (doc.text, doc.starts)
 }
 
 /// What `y` copies for an entry: the prompt or text, or a call's input and
@@ -477,6 +688,7 @@ pub fn entry_text(entry: &Entry<'_>) -> String {
             .map(entry_text)
             .collect::<Vec<_>>()
             .join("\n\n"),
+        Entry::Touched(file) => file.path.to_string_lossy().into_owned(),
     }
 }
 
@@ -511,7 +723,7 @@ pub fn target_text(target: &Target) -> String {
 pub(crate) mod fixtures {
     use super::*;
     use agent_core::activity::ToolId;
-    use agent_core::ports::{Excerpt, Outcome, Summary, TurnDetail};
+    use agent_core::ports::{ActivityDetail, Excerpt, Outcome, Summary};
 
     pub fn call(tool: &str, target: Target, state: CallState) -> Call {
         Call {
@@ -520,7 +732,7 @@ pub(crate) mod fixtures {
             kind: match tool {
                 "Read" | "Grep" | "Glob" | "LS" => CallKind::Explore,
                 "Edit" | "MultiEdit" | "Write" | "NotebookEdit" => CallKind::Edit,
-                "Agent" | "Task" => CallKind::Delegate,
+                "Agent" | "Task" => CallKind::Delegate { spawned: None },
                 "AskUserQuestion" => CallKind::Ask,
                 _ => CallKind::Other,
             },
@@ -530,6 +742,39 @@ pub(crate) mod fixtures {
             input: "input".into(),
             output: "output".into(),
         }
+    }
+
+    pub fn edit(path: &str) -> LogEntry {
+        LogEntry::Called(Box::new(call(
+            "Edit",
+            Target::Path {
+                path: path.into(),
+                range: None,
+            },
+            CallState::Done {
+                summary: Summary::Diff {
+                    added: 1,
+                    removed: 1,
+                },
+                took: None,
+            },
+        )))
+    }
+
+    pub fn delegate(task: &str, agent: Option<&str>) -> LogEntry {
+        LogEntry::Called(Box::new(Call {
+            kind: CallKind::Delegate {
+                spawned: agent.map(agent_core::activity::AgentId::new),
+            },
+            ..call(
+                "Agent",
+                Target::Task(task.into()),
+                CallState::Done {
+                    summary: Summary::NoOutput,
+                    took: None,
+                },
+            )
+        }))
     }
 
     pub fn read(path: &str) -> LogEntry {
@@ -569,13 +814,13 @@ pub(crate) mod fixtures {
         }
     }
 
-    pub fn turn(log: Vec<LogEntry>) -> agent_core::ports::TurnDetail {
-        agent_core::ports::TurnDetail {
+    pub fn activity_of(log: Vec<LogEntry>) -> agent_core::ports::ActivityDetail {
+        agent_core::ports::ActivityDetail {
             log: Log {
                 prompt: Some("Fix the statusline.".into()),
                 ..detail(log)
             },
-            mark: Some(agent_core::ports::TurnMark::new("p1")),
+            mark: Some(agent_core::ports::ActivityMark::new("p1")),
             progress: agent_core::ports::Progress::Running { asked: None },
         }
     }
@@ -630,7 +875,7 @@ pub(crate) mod fixtures {
         done(Summary::Diff { added, removed })
     }
 
-    /// A turn of four phases: reading, a first edit, a hand-off to two
+    /// An activity of four phases: reading, a first edit, a hand-off to two
     /// subagents, and a failing headless run that is being fixed.
     pub fn story(now: SystemTime) -> Vec<LogEntry> {
         let mut log = vec![said_at(
@@ -715,9 +960,13 @@ pub(crate) mod fixtures {
         log
     }
 
-    pub fn turn_at(now: SystemTime, mut log: Vec<LogEntry>, tail: Option<LogEntry>) -> TurnDetail {
+    pub fn activity_at(
+        now: SystemTime,
+        mut log: Vec<LogEntry>,
+        tail: Option<LogEntry>,
+    ) -> ActivityDetail {
         log.extend(tail);
-        TurnDetail {
+        ActivityDetail {
             log: agent_core::ports::Log {
                 prompt: Some(
                     "Are you able to run manual QA/UX/quality tests?\nOr have the adversarial agent do so."
@@ -727,7 +976,7 @@ pub(crate) mod fixtures {
                 last_heard: Some(before(now, 5)),
                 ..detail(log)
             },
-            ..crate::log::fixtures::turn(Vec::new())
+            ..crate::log::fixtures::activity_of(Vec::new())
         }
     }
 
@@ -757,7 +1006,7 @@ mod tests {
         assert_eq!(entries(&two).len(), 1 + 3);
         let three = detail(vec![read("/a"), read("/b"), read("/c"), said("x")]);
         let found = entries(&three);
-        assert!(matches!(&found[1], Entry::Group { tool: "Read", calls } if calls.len() == 3));
+        assert!(matches!(&found[1].0, Entry::Group { tool: "Read", calls } if calls.len() == 3));
         assert_eq!(found.len(), 3);
     }
 
@@ -775,7 +1024,7 @@ mod tests {
         assert!(
             entries(&d)
                 .iter()
-                .all(|e| !matches!(e, Entry::Group { .. }))
+                .all(|(e, _)| !matches!(e, Entry::Group { .. }))
         );
     }
 
@@ -791,8 +1040,8 @@ mod tests {
             bash("ls", ok),
         ]);
         let found = entries(&d);
-        assert!(matches!(&found[1], Entry::Repeat(calls) if calls.len() == 2));
-        assert!(matches!(&found[2], Entry::Call(_)));
+        assert!(matches!(&found[1].0, Entry::Repeat(calls) if calls.len() == 2));
+        assert!(matches!(&found[2].0, Entry::Call(_)));
     }
 
     #[test]
@@ -874,13 +1123,56 @@ mod tests {
 
     #[test]
     fn toggling_with_all_open_collapses_everything() {
+        let (two, three) = (EntryKey::Log(2), EntryKey::Log(3));
         let mut nav = Nav::default();
-        nav.toggle(2);
-        assert!(nav.is_open(2) && !nav.is_open(3));
+        nav.toggle(two.clone());
+        assert!(nav.is_open(&two) && !nav.is_open(&three));
         nav.all = true;
-        assert!(nav.is_open(3));
-        nav.toggle(2);
-        assert!(!nav.is_open(2) && !nav.is_open(3));
+        assert!(nav.is_open(&three));
+        nav.toggle(two.clone());
+        assert!(!nav.is_open(&two) && !nav.is_open(&three));
+    }
+
+    fn flat<'a>(
+        detail: &'a ActivityDetail,
+        touched: &'a [TouchedFile],
+    ) -> Vec<(Entry<'a>, EntryKey)> {
+        activity_entries(&detail.log, Some("All done."), touched).flat()
+    }
+
+    #[test]
+    fn the_cursor_and_an_open_fold_keep_their_entries_when_touched_files_come_and_go() {
+        let detail = activity_of(vec![
+            said("one"),
+            bash("a", ok()),
+            said("two"),
+            bash("b", ok()),
+            said("All done."),
+        ]);
+        let file = |path: &str| TouchedFile {
+            path: path.into(),
+            now: Now::Unknown,
+        };
+        let two = [file("a.rs"), file("b.rs")];
+        let three = [file("a.rs"), file("b.rs"), file("c.rs")];
+        let mut nav = Nav {
+            cursor: Some(EntryKey::Log(2)),
+            open: [EntryKey::Log(0)].into(),
+            all: false,
+        };
+        let (before, after) = (flat(&detail, &two), flat(&detail, &three));
+        let (was, now) = (nav.at(false, &before), nav.at(false, &after));
+        assert_eq!(was + 1, now, "one more row above, so one position down");
+        assert_eq!(after[now].1, EntryKey::Log(2), "still on the same phase");
+        assert!(
+            nav.is_open(&EntryKey::Log(0)),
+            "and the fold is still the first phase"
+        );
+        nav.cursor = Some(EntryKey::Touched("b.rs".into()));
+        assert_eq!(
+            after[nav.at(false, &after)].1,
+            EntryKey::Touched("b.rs".into())
+        );
     }
 
     #[test]
@@ -924,28 +1216,29 @@ mod tests {
         }
     }
 
-    fn shapes(found: &[(Entry<'_>, usize)]) -> Vec<String> {
-        found
-            .iter()
-            .map(|(entry, from)| {
-                let kind = match entry {
-                    Entry::Prompt(_) => "prompt",
-                    Entry::Said(_) => "said",
-                    Entry::Queued(_) => "queued",
-                    Entry::Compacted => "compacted",
-                    Entry::Call(_) => "call",
-                    Entry::Group { .. } => "group",
-                    Entry::Repeat(_) => "repeat",
-                    Entry::Phase(_) => "phase",
-                };
-                format!("{kind}@{from}")
-            })
-            .collect()
+    fn shapes(found: &ActivityEntries<'_>) -> Vec<String> {
+        let prompt = found.prompt.map(|_| "prompt@0".to_string());
+        let touched = found.touched.iter().map(|_| "touched".to_string());
+        let activity = found.activity.iter().map(|(entry, from)| {
+            let kind = match entry {
+                Entry::Prompt(_) => "prompt",
+                Entry::Said(_) => "said",
+                Entry::Queued(_) => "queued",
+                Entry::Compacted => "compacted",
+                Entry::Call(_) => "call",
+                Entry::Group { .. } => "group",
+                Entry::Repeat(_) => "repeat",
+                Entry::Phase(_) => "phase",
+                Entry::Touched(_) => "touched",
+            };
+            format!("{kind}@{from}")
+        });
+        prompt.into_iter().chain(touched).chain(activity).collect()
     }
 
     #[test]
     fn every_phase_but_the_latest_folds_to_one_entry_that_remembers_where_it_starts() {
-        let turn = turn(vec![
+        let detail = activity_of(vec![
             said("one"),
             bash("a", ok()),
             bash("b", ok()),
@@ -954,20 +1247,20 @@ mod tests {
             said("three"),
             bash("d", ok()),
         ]);
-        let found = turn_entries(&turn.log, None);
+        let found = activity_entries(&detail.log, None, &[]);
         assert_eq!(
             shapes(&found),
             ["prompt@0", "phase@0", "phase@3", "said@5", "call@6"]
         );
-        let (Entry::Phase(first), _) = &found[1] else {
-            panic!("{:?}", found[1]);
+        let (Entry::Phase(first), _) = &found.activity[0] else {
+            panic!("{:?}", found.activity[0]);
         };
         assert_eq!(first.entries.len(), 3, "its words and both calls");
     }
 
     #[test]
     fn a_phase_stays_open_for_a_running_call_or_a_failure_nothing_has_followed() {
-        let running_early = turn(vec![
+        let running_early = activity_of(vec![
             said("one"),
             running(),
             said("two"),
@@ -976,49 +1269,53 @@ mod tests {
             bash("d", ok()),
         ]);
         assert_eq!(
-            shapes(&turn_entries(&running_early.log, None)),
+            shapes(&activity_entries(&running_early.log, None, &[])),
             [
                 "prompt@0", "said@0", "call@1", "phase@2", "said@4", "call@5"
             ],
             "parallel work in an older phase isn't hidden"
         );
 
-        let failure_stands = turn(vec![
+        let failure_stands = activity_of(vec![
             said("one"),
             bash("a", failed()),
             said("two"),
             bash("b", failed()),
         ]);
         assert_eq!(
-            shapes(&turn_entries(&failure_stands.log, None)),
+            shapes(&activity_entries(&failure_stands.log, None, &[])),
             ["prompt@0", "said@0", "call@1", "said@2", "call@3"]
         );
 
-        let recovered = turn(vec![
+        let recovered = activity_of(vec![
             said("one"),
             bash("a", failed()),
             said("two"),
             bash("b", ok()),
         ]);
         assert_eq!(
-            shapes(&turn_entries(&recovered.log, None)),
+            shapes(&activity_entries(&recovered.log, None, &[])),
             ["prompt@0", "phase@0", "said@2", "call@3"],
             "a failure a later success followed is history"
         );
     }
 
     #[test]
-    fn a_turn_with_a_closing_message_folds_every_phase_and_leaves_the_message_out() {
-        let turn = turn(vec![
+    fn an_activity_with_a_closing_message_folds_every_phase_and_leaves_the_message_out() {
+        let detail = activity_of(vec![
             said("one"),
             bash("a", ok()),
             said("two"),
             bash("b", ok()),
             said("All done. Three files changed."),
         ]);
-        let found = turn_entries(&turn.log, Some("All done. Three files changed. And more."));
+        let found = activity_entries(
+            &detail.log,
+            Some("All done. Three files changed. And more."),
+            &[],
+        );
         assert_eq!(shapes(&found), ["prompt@0", "phase@0", "phase@2"]);
-        let unmatched = turn_entries(&turn.log, Some("something else"));
+        let unmatched = activity_entries(&detail.log, Some("something else"), &[]);
         assert_eq!(
             shapes(&unmatched),
             ["prompt@0", "phase@0", "phase@2", "phase@4"],
@@ -1028,7 +1325,7 @@ mod tests {
 
     #[test]
     fn queued_messages_and_compactions_end_a_phase_and_never_fold() {
-        let turn = turn(vec![
+        let detail = activity_of(vec![
             said("one"),
             bash("a", ok()),
             LogEntry::Queued {
@@ -1039,7 +1336,7 @@ mod tests {
             bash("b", ok()),
         ]);
         assert_eq!(
-            shapes(&turn_entries(&turn.log, None)),
+            shapes(&activity_entries(&detail.log, None, &[])),
             ["prompt@0", "phase@0", "queued@2", "compacted@3", "call@4"]
         );
     }
@@ -1048,7 +1345,7 @@ mod tests {
     fn a_phase_knows_how_long_it_took_from_its_first_step_to_the_next_phases() {
         use std::time::{Duration, SystemTime};
         let at = |secs| Some(SystemTime::UNIX_EPOCH + Duration::from_secs(secs));
-        let turn = turn(vec![
+        let detail = activity_of(vec![
             LogEntry::Said {
                 text: "one".into(),
                 at: at(100),
@@ -1059,36 +1356,22 @@ mod tests {
                 at: at(190),
             },
         ]);
-        let found = turn_entries(&turn.log, None);
-        let (Entry::Phase(first), _) = &found[1] else {
-            panic!("{:?}", found[1]);
+        let found = activity_entries(&detail.log, None, &[]);
+        let (Entry::Phase(first), _) = &found.activity[0] else {
+            panic!("{:?}", found.activity[0]);
         };
         assert_eq!(first.took, Some(Duration::from_secs(90)));
     }
 
     #[test]
-    fn counts_of_files_agents_and_unrecovered_failures() {
-        let edit = |path: &str| {
-            LogEntry::Called(Box::new(call(
-                "Edit",
-                Target::Path {
-                    path: path.into(),
-                    range: None,
-                },
-                ok(),
-            )))
-        };
+    fn counts_of_agents_and_unrecovered_failures() {
         let agent = LogEntry::Called(Box::new(call("Agent", Target::Task("qa".into()), ok())));
         let detail = detail(vec![
-            edit("/a.rs"),
-            edit("/a.rs"),
-            edit("/b.rs"),
             agent,
             bash("x", failed()),
             bash("y", ok()),
             bash("z", failed()),
         ]);
-        assert_eq!(files_touched(&detail), 2);
         assert_eq!(agent_count(&detail), 1);
         assert_eq!((error_count(&detail), unrecovered_count(&detail)), (2, 1));
     }

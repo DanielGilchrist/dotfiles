@@ -47,6 +47,11 @@ impl ChangesScope {
         }
     }
 
+    /// Whether this scope lists `path`.
+    pub fn lists(self, facts: &agent_core::ports::WorktreeFacts, path: &std::path::Path) -> bool {
+        self.of(facts).iter().any(|c| c.path == path)
+    }
+
     /// The files of `facts` in this scope.
     pub fn of(self, facts: &agent_core::ports::WorktreeFacts) -> &[Change] {
         match self {

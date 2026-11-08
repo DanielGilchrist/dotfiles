@@ -1,4 +1,4 @@
-//! The current turn of a Claude Code transcript: the last prompt the user
+//! The current activity of a Claude Code transcript: the last prompt the user
 //! typed and everything after it.
 
 use std::io;
@@ -6,16 +6,18 @@ use std::path::Path;
 use std::time::SystemTime;
 
 use agent_core::activity::TranscriptRef;
-use agent_core::ports::{Asked, Log, Outcome, Progress, TurnDetail, TurnMark, ends_with_report};
+use agent_core::ports::{
+    ActivityDetail, ActivityMark, Asked, Log, Outcome, Progress, ends_with_report,
+};
 use serde_json::Value;
 
 use crate::{TAIL_BYTES, TAIL_BYTES_MAX, long, read_tail, text_of, transcript};
 
-/// What the user typed to start a turn.
+/// What the user typed to start an activity.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Opening {
     pub text: String,
-    /// The `promptId` every record of the turn's user messages shares.
+    /// The `promptId` every record of the activity's user messages shares.
     pub id: String,
     pub at: Option<SystemTime>,
 }
@@ -26,7 +28,7 @@ pub(crate) struct Cut {
     pub opening: Option<Opening>,
     /// Where its record starts in the text, or 0 without one.
     pub from: usize,
-    /// The turn's `promptId`: the prompt's, or the first one seen when the
+    /// The activity's `promptId`: the prompt's, or the first one seen when the
     /// prompt itself was left unread.
     pub id: Option<String>,
 }
@@ -35,11 +37,11 @@ pub(crate) struct Cut {
 /// prompt: a local command's output and an interrupt's marker.
 const NOT_PROMPTS: &[&str] = &["<local-command-", "[Request interrupted by user"];
 
-/// What a user record says when it opens a turn.
+/// What a user record says when it opens an activity.
 enum Said {
     /// The user's own words.
     Typed(String),
-    /// A slash command. It opens a turn only if work follows it.
+    /// A slash command. It opens an activity only if work follows it.
     Command(String),
 }
 
@@ -103,7 +105,7 @@ fn is_meta(record: &Value) -> bool {
 /// Finds the last prompt in `text`, whole records one per line. A slash
 /// command counts once work follows it: the expansion the harness adds as a
 /// meta message, or the agent's own reply. One that only prints (`/model`,
-/// `/clear`) leaves the turn it interrupted alone.
+/// `/clear`) leaves the activity it interrupted alone.
 pub(crate) fn cut(text: &str) -> Cut {
     const USER: &str = r#""type":"user""#;
     const ASSISTANT: &str = r#""type":"assistant""#;
@@ -170,9 +172,9 @@ pub(crate) fn cut(text: &str) -> Cut {
     }
 }
 
-/// The current turn in the transcript at `path`, read from its end. `None`
+/// The current activity in the transcript at `path`, read from its end. `None`
 /// when the user hasn't said anything in it yet.
-pub(crate) fn read(path: &Path) -> io::Result<Option<TurnDetail>> {
+pub(crate) fn read(path: &Path) -> io::Result<Option<ActivityDetail>> {
     let mut file = std::fs::File::open(path)?;
     let len = file.metadata()?.len();
     let mut window = TAIL_BYTES;
@@ -213,7 +215,7 @@ pub(crate) fn read(path: &Path) -> io::Result<Option<TurnDetail>> {
         Some(opening) => (Some(opening.text), opening.at),
         None => (None, None),
     };
-    Ok(Some(TurnDetail {
+    Ok(Some(ActivityDetail {
         log: Log {
             prompt,
             log: std::mem::take(&mut parsed.log),
@@ -224,7 +226,7 @@ pub(crate) fn read(path: &Path) -> io::Result<Option<TurnDetail>> {
             last_heard: parsed.last_heard,
             truncated,
         },
-        mark: cut.id.filter(|id| !id.is_empty()).map(TurnMark::new),
+        mark: cut.id.filter(|id| !id.is_empty()).map(ActivityMark::new),
         progress,
     }))
 }
@@ -236,7 +238,7 @@ mod tests {
     use agent_core::activity::ToolId;
     use agent_core::ports::{CallState, LogEntry};
 
-    /// An earlier turn, then every kind of user record that isn't a prompt,
+    /// An earlier activity, then every kind of user record that isn't a prompt,
     /// then the real one.
     fn history() -> Vec<String> {
         vec![
@@ -298,7 +300,7 @@ mod tests {
         );
         assert!(
             !text[cut.from..].contains("an old answer"),
-            "nothing of the earlier turn is in the cut"
+            "nothing of the earlier activity is in the cut"
         );
     }
 
@@ -324,7 +326,7 @@ mod tests {
     }
 
     #[test]
-    fn with_the_prompt_out_of_reach_the_turn_is_known_by_its_first_prompt_id() {
+    fn with_the_prompt_out_of_reach_the_activity_is_known_by_its_first_prompt_id() {
         let text = [
             answer("p9", "a", "x", "2026-11-08T10:00:03.000Z"),
             answer("p9", "b", "y", "2026-11-08T10:00:04.000Z"),
@@ -342,7 +344,7 @@ mod tests {
     }
 
     #[test]
-    fn a_turn_in_progress_is_its_log_with_the_running_call_open() {
+    fn an_activity_in_progress_is_its_log_with_the_running_call_open() {
         let dir = tempfile::tempdir().expect("a temp dir");
         let mut lines = history();
         lines.push(use_of(
@@ -351,25 +353,25 @@ mod tests {
             r#"{"command":"cargo test"}"#,
             "2026-11-08T10:00:04.000Z",
         ));
-        let turn = read(&write(dir.path(), &lines))
+        let detail = read(&write(dir.path(), &lines))
             .expect("reads")
-            .expect("a turn");
-        assert_eq!(turn.log.prompt.as_deref(), Some("fix the statusline"));
-        assert_eq!(turn.mark, Some(TurnMark::new("p3")));
-        assert_eq!(turn.log.outcome, Outcome::Running);
-        assert_eq!(turn.progress, Progress::Running { asked: None });
-        assert!(!turn.log.truncated);
+            .expect("an activity");
+        assert_eq!(detail.log.prompt.as_deref(), Some("fix the statusline"));
+        assert_eq!(detail.mark, Some(ActivityMark::new("p3")));
+        assert_eq!(detail.log.outcome, Outcome::Running);
+        assert_eq!(detail.progress, Progress::Running { asked: None });
+        assert!(!detail.log.truncated);
         assert_eq!(
-            turn.log.started,
+            detail.log.started,
             transcript::parse_time("2026-11-08T10:00:00.000Z")
         );
         let [
             LogEntry::Said { text, .. },
             LogEntry::Called(read),
             LogEntry::Called(bash),
-        ] = turn.log.log.as_slice()
+        ] = detail.log.log.as_slice()
         else {
-            panic!("{:?}", turn.log.log);
+            panic!("{:?}", detail.log.log);
         };
         assert_eq!(text, "Reading the provider first.");
         assert!(matches!(read.state, CallState::Done { .. }));
@@ -382,17 +384,17 @@ mod tests {
         let mut lines = history();
         lines.push(said("2026-11-08T10:00:09.000Z", "All fixed."));
         lines.push(ended("2026-11-08T10:00:10.000Z", 10_000));
-        let turn = read(&write(dir.path(), &lines))
+        let detail = read(&write(dir.path(), &lines))
             .expect("reads")
-            .expect("a turn");
+            .expect("an activity");
         assert_eq!(
-            turn.progress,
+            detail.progress,
             Progress::Finished {
                 took: Some(std::time::Duration::from_secs(10))
             }
         );
         assert_eq!(
-            turn.log.outcome,
+            detail.log.outcome,
             Outcome::Finished {
                 report: Some("All fixed.".into())
             }
@@ -406,16 +408,16 @@ mod tests {
         ));
         let again = read(&write(dir.path(), &lines))
             .expect("reads")
-            .expect("a turn");
+            .expect("an activity");
         assert_eq!(
             (again.progress, again.log.outcome),
             (Progress::Running { asked: None }, Outcome::Running),
-            "work after the record means the turn went on"
+            "work after the record means the activity went on"
         );
     }
 
     #[test]
-    fn an_ended_turn_whose_last_step_was_a_call_has_no_closing_message() {
+    fn an_ended_activity_whose_last_step_was_a_call_has_no_closing_message() {
         let dir = tempfile::tempdir().expect("a temp dir");
         let mut lines = history();
         lines.push(use_of(
@@ -425,10 +427,10 @@ mod tests {
             "2026-11-08T10:00:05.000Z",
         ));
         lines.push(ended("2026-11-08T10:00:06.000Z", 6000));
-        let turn = read(&write(dir.path(), &lines))
+        let detail = read(&write(dir.path(), &lines))
             .expect("reads")
-            .expect("a turn");
-        assert_eq!(turn.log.outcome, Outcome::Finished { report: None });
+            .expect("an activity");
+        assert_eq!(detail.log.outcome, Outcome::Finished { report: None });
     }
 
     #[test]
@@ -450,10 +452,10 @@ mod tests {
             r#"{"type":"system","subtype":"compact_boundary","timestamp":"2026-11-08T10:00:06.000Z"}"#
                 .to_string(),
         );
-        let turn = read(&write(dir.path(), &lines))
+        let detail = read(&write(dir.path(), &lines))
             .expect("reads")
-            .expect("a turn");
-        let tail = &turn.log.log[2..];
+            .expect("an activity");
+        let tail = &detail.log.log[2..];
         assert!(
             matches!(tail, [LogEntry::Queued { text, .. }, LogEntry::Compacted] if text == "also check lsp.lua"),
             "{tail:?}"
@@ -471,11 +473,11 @@ mod tests {
             input,
             "2026-11-08T10:00:04.000Z",
         ));
-        let turn = read(&write(dir.path(), &lines))
+        let detail = read(&write(dir.path(), &lines))
             .expect("reads")
-            .expect("a turn");
-        let Progress::Running { asked: Some(asked) } = &turn.progress else {
-            panic!("{:?}", turn.progress);
+            .expect("an activity");
+        let Progress::Running { asked: Some(asked) } = &detail.progress else {
+            panic!("{:?}", detail.progress);
         };
         assert_eq!(asked.call, ToolId::new("q"));
         let [question] = asked.questions.as_slice() else {
@@ -496,7 +498,7 @@ mod tests {
         lines.push(answer("p3", "q", "answered", "2026-11-08T10:00:30.000Z"));
         let answered = read(&write(dir.path(), &lines))
             .expect("reads")
-            .expect("a turn");
+            .expect("an activity");
         assert_eq!(
             answered.progress,
             Progress::Running { asked: None },
@@ -505,7 +507,7 @@ mod tests {
     }
 
     #[test]
-    fn no_prompt_anywhere_is_no_turn() {
+    fn no_prompt_anywhere_is_no_activity() {
         let dir = tempfile::tempdir().expect("a temp dir");
         let path = write(
             dir.path(),
@@ -518,7 +520,7 @@ mod tests {
     }
 
     #[test]
-    fn a_long_turn_widens_the_read_until_its_prompt_and_a_longer_one_starts_truncated() {
+    fn a_long_activity_widens_the_read_until_its_prompt_and_a_longer_one_starts_truncated() {
         let dir = tempfile::tempdir().expect("a temp dir");
         let filler = |n: usize| {
             let text = "x".repeat(1000);
@@ -528,27 +530,30 @@ mod tests {
         };
         let mut lines = vec![typed("p1", "2026-11-08T10:00:00.000Z", "start")];
         lines.extend(filler(1500));
-        let turn = read(&write(dir.path(), &lines))
+        let detail = read(&write(dir.path(), &lines))
             .expect("reads")
-            .expect("a turn");
+            .expect("an activity");
         assert_eq!(
-            turn.log.prompt.as_deref(),
+            detail.log.prompt.as_deref(),
             Some("start"),
             "found beyond the first megabyte"
         );
-        assert!(turn.log.truncated, "the log keeps only its newest entries");
+        assert!(
+            detail.log.truncated,
+            "the log keeps only its newest entries"
+        );
 
         let mut lines = vec![typed("p1", "2026-11-08T10:00:00.000Z", "start")];
         lines.extend(filler(9000));
-        let turn = read(&write(dir.path(), &lines))
+        let detail = read(&write(dir.path(), &lines))
             .expect("reads")
-            .expect("a turn");
-        assert_eq!(turn.log.prompt, None, "beyond the widest read");
-        assert!(turn.log.truncated);
+            .expect("an activity");
+        assert_eq!(detail.log.prompt, None, "beyond the widest read");
+        assert!(detail.log.truncated);
     }
 
     #[test]
-    fn a_slash_command_starts_a_turn_when_work_follows_it_and_not_when_it_only_prints() {
+    fn a_slash_command_starts_an_activity_when_work_follows_it_and_not_when_it_only_prints() {
         let command = |at: &str, text: &str| typed("c", at, text);
         let skill = command(
             "2026-11-08T10:05:00.000Z",
@@ -583,7 +588,7 @@ mod tests {
         assert_eq!(
             found.opening.map(|o| o.text).as_deref(),
             Some("fix the statusline"),
-            "printing something doesn't end the turn it came in the middle of"
+            "printing something doesn't end the activity it came in the middle of"
         );
 
         let mut lines = history();
@@ -606,13 +611,13 @@ mod tests {
             r#"{"type":"attachment","timestamp":"2026-11-08T10:00:04.000Z","attachment":{"type":"queued_command","prompt":[{"type":"text","text":"look at this"},{"type":"image","source":{}}]}}"#
                 .to_string(),
         );
-        let turn = read(&write(dir.path(), &lines))
+        let detail = read(&write(dir.path(), &lines))
             .expect("reads")
-            .expect("a turn");
+            .expect("an activity");
         assert!(
-            matches!(turn.log.log.last(), Some(LogEntry::Queued { text, .. }) if text == "look at this"),
+            matches!(detail.log.log.last(), Some(LogEntry::Queued { text, .. }) if text == "look at this"),
             "{:?}",
-            turn.log.log
+            detail.log.log
         );
     }
 }

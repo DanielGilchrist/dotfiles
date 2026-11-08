@@ -9,16 +9,16 @@ use agent_core::activity::{
 };
 use agent_core::names::Prompt;
 use agent_core::ports::{
-    Harness, HarnessError, HarnessId, Harnesses, LaunchCtx, Log, Outcome, PendingPrompt, Seen,
-    TurnDetail, ends_with_report,
+    ActivityDetail, Harness, HarnessError, HarnessId, Harnesses, LaunchCtx, Log, Outcome,
+    PendingPrompt, Seen, ends_with_report,
 };
 use agent_core::process::{LaunchSpec, quiet};
 use serde::Deserialize;
 
+mod activity;
 #[cfg(test)]
 mod fixtures;
 mod transcript;
-mod turn;
 
 const ASK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
@@ -220,7 +220,11 @@ impl Claude {
     /// named, if it is a transcript file under the projects directory, and
     /// otherwise the one
     /// `launch` would resume.
-    fn turn_file(&self, workdir: &Path, at: Option<&TranscriptRef>) -> io::Result<Option<PathBuf>> {
+    fn activity_file(
+        &self,
+        workdir: &Path,
+        at: Option<&TranscriptRef>,
+    ) -> io::Result<Option<PathBuf>> {
         let projects = self.projects.canonicalize().ok();
         let named = at
             .and_then(|at| at.path().canonicalize().ok())
@@ -239,7 +243,7 @@ impl Claude {
     /// worktree was created that the user has spoken in. Older ones belong
     /// to a previous agent that used the same name. `/clear` starts a new
     /// transcript, so the newest is the one the user means, and a launch
-    /// that died before any message leaves one with no user turn, which is
+    /// that died before any message leaves one with no user prompt, which is
     /// skipped.
     fn resumable(&self, workdir: &Path) -> io::Result<Option<String>> {
         let born = std::fs::metadata(workdir)?
@@ -253,7 +257,7 @@ impl Claude {
         recent.retain(|(modified, _)| *modified >= born);
         recent.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
         for (_, path) in recent {
-            if !has_user_turn(&path)? {
+            if !has_user_prompt(&path)? {
                 continue;
             }
             if let Some(id) = path.file_stem().and_then(|s| s.to_str()) {
@@ -390,21 +394,21 @@ impl Harness for Claude {
             })
     }
 
-    /// The turn in the transcript the hooks last named, or failing that the
+    /// The activity in the transcript the hooks last named, or failing that the
     /// worktree's newest conversation.
-    fn turn(
+    fn activity_detail(
         &self,
         workdir: &Path,
         at: Option<&TranscriptRef>,
-    ) -> Result<Option<TurnDetail>, HarnessError> {
+    ) -> Result<Option<ActivityDetail>, HarnessError> {
         let context = |source| HarnessError {
-            context: "reading the transcript of the current turn".into(),
+            context: "reading the transcript of the current activity".into(),
             source,
         };
-        let Some(file) = self.turn_file(workdir, at).map_err(context)? else {
+        let Some(file) = self.activity_file(workdir, at).map_err(context)? else {
             return Ok(None);
         };
-        turn::read(&file).map_err(context)
+        activity::read(&file).map_err(context)
     }
 
     /// Bracketed paste keeps a multi-line prompt as one message; Enter submits it.
@@ -496,8 +500,8 @@ impl<R: BufRead> Iterator for LinePrefixes<R> {
 }
 
 /// Whether the user has said anything in the transcript at `path`. The
-/// first user turn comes early, so this reads little of a long file.
-fn has_user_turn(path: &Path) -> io::Result<bool> {
+/// first user prompt comes early, so this reads little of a long file.
+fn has_user_prompt(path: &Path) -> io::Result<bool> {
     const MARKER: &[u8] = br#""type":"user""#;
     let file = std::fs::File::open(path)?;
     for line in LinePrefixes::new(io::BufReader::new(file), LINE_PREFIX_BYTES) {
@@ -1055,7 +1059,7 @@ fn permission_request(tool: String, input: &Lenient<ToolInput>) -> Routed {
 
 const DEFAULT_SUBAGENT_KIND: &str = "subagent";
 
-/// The subagents a finished turn left running. Other background work
+/// The subagents a finished activity left running. Other background work
 /// (shells, monitors) doesn't hand anything back to the agent. A task that
 /// can't be read is skipped without hiding the others.
 fn background_subagents(tasks: &[Lenient<BackgroundTask>]) -> Vec<Background> {
@@ -1398,19 +1402,19 @@ mod tests {
     }
 
     #[test]
-    fn a_user_turn_after_a_huge_record_is_still_found() {
+    fn a_user_prompt_after_a_huge_record_is_still_found() {
         let dir = tempfile::tempdir().expect("a temp dir");
         let path = dir.path().join("t.jsonl");
         let huge = "y".repeat(usize::try_from(LINE_PREFIX_BYTES).expect("fits") * 3);
         std::fs::write(&path, format!("{{\"type\":\"queue\",\"x\":\"{huge}\"}}\n"))
             .expect("writes");
-        assert!(!has_user_turn(&path).expect("reads"));
+        assert!(!has_user_prompt(&path).expect("reads"));
         let mut file = std::fs::OpenOptions::new()
             .append(true)
             .open(&path)
             .expect("opens");
         std::io::Write::write_all(&mut file, br#"{"type":"user","message":{}}"#).expect("writes");
-        assert!(has_user_turn(&path).expect("reads"));
+        assert!(has_user_prompt(&path).expect("reads"));
     }
 
     #[test]
@@ -1661,7 +1665,7 @@ mod tests {
                 .expect("an event")
                 .transcript,
             None,
-            "whichever file a subagent's hooks name, it isn't the agent's turn"
+            "whichever file a subagent's hooks name, it isn't the agent's activity"
         );
         assert_eq!(
             claude_event(&tool("")).expect("an event").transcript,
@@ -1670,7 +1674,7 @@ mod tests {
     }
 
     #[test]
-    fn the_turn_is_read_from_the_named_transcript_or_else_the_newest_conversation() {
+    fn the_activity_is_read_from_the_named_transcript_or_else_the_newest_conversation() {
         let home = tempfile::tempdir().expect("a temp dir");
         let work = tempfile::tempdir().expect("a temp dir");
         let claude = Claude::with_program(home.path(), "/usr/bin/true".into());
@@ -1690,15 +1694,15 @@ mod tests {
         let sneaky = format!("{}/../../elsewhere.jsonl", claude.projects.display());
         std::fs::write(dir.join("found.jsonl"), prompt("from the newest")).expect("writes");
 
-        let turn = |at: Option<&TranscriptRef>| {
+        let detail = |at: Option<&TranscriptRef>| {
             claude
-                .turn(work.path(), at)
+                .activity_detail(work.path(), at)
                 .expect("reads")
                 .and_then(|t| t.log.prompt)
         };
         let at = TranscriptRef::new(named.to_string_lossy());
-        assert_eq!(turn(Some(&at)).as_deref(), Some("from the hooks"));
-        assert_eq!(turn(None).as_deref(), Some("from the newest"));
+        assert_eq!(detail(Some(&at)).as_deref(), Some("from the hooks"));
+        assert_eq!(detail(None).as_deref(), Some("from the newest"));
         for refused in [
             "relative.jsonl",
             "/etc/passwd",
@@ -1707,7 +1711,7 @@ mod tests {
             sneaky.as_str(),
         ] {
             assert_eq!(
-                turn(Some(&TranscriptRef::new(refused))).as_deref(),
+                detail(Some(&TranscriptRef::new(refused))).as_deref(),
                 Some("from the newest"),
                 "{refused} isn't a transcript to read"
             );

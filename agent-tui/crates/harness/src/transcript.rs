@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::fmt::Write;
 use std::time::{Duration, SystemTime};
 
-use agent_core::activity::ToolId;
+use agent_core::activity::{AgentId, ToolId};
 use agent_core::ports::{
     Call, CallKind, CallState, Choice, Excerpt, LogEntry, Question, Summary, Target,
 };
@@ -41,7 +41,7 @@ pub(crate) struct Parsed {
     /// Entries older than [`LOG_ENTRIES`] were dropped.
     pub dropped: bool,
     pub stopped: Option<String>,
-    /// How long the turn took, while nothing has followed the record that
+    /// How long the activity took, while nothing has followed the record that
     /// says it ended.
     pub took: Option<Duration>,
     /// The call that asks the user questions and has no answer yet, with its
@@ -64,7 +64,7 @@ pub(crate) fn parse(text: &str) -> Parsed {
             .and_then(parse_time);
         out.last_heard = out.last_heard.max(at);
         let kind = record.get("type").and_then(Value::as_str);
-        note_turn_record(&mut out, &record, at);
+        note_activity_record(&mut out, &record, at);
         if kind == Some("assistant") {
             out.took = None;
             if record.get("isApiErrorMessage").and_then(Value::as_bool) == Some(true) {
@@ -130,15 +130,7 @@ pub(crate) fn parse(text: &str) -> Parsed {
                     let Some(LogEntry::Called(call)) = out.log.get_mut(index) else {
                         continue;
                     };
-                    let text = part.get("content").map(crate::text_of).unwrap_or_default();
-                    let is_error = part.get("is_error").and_then(Value::as_bool) == Some(true);
-                    let result = record.get("toolUseResult");
-                    let took = call
-                        .started
-                        .zip(at)
-                        .and_then(|(from, to)| to.duration_since(from).ok());
-                    call.state = outcome(&call.tool, &text, is_error, result, took);
-                    call.output = text.chars().take(OUTPUT).collect();
+                    record_result(call, part, record.get("toolUseResult"), at);
                 }
                 _ => {}
             }
@@ -150,9 +142,29 @@ pub(crate) fn parse(text: &str) -> Parsed {
     out
 }
 
-/// The records that say how the turn went rather than what the agent did:
+/// Records how `call` came out from the `tool_result` part that answers it
+/// and the record's `toolUseResult`.
+fn record_result(call: &mut Call, part: &Value, result: Option<&Value>, at: Option<SystemTime>) {
+    let text = part.get("content").map(crate::text_of).unwrap_or_default();
+    let is_error = part.get("is_error").and_then(Value::as_bool) == Some(true);
+    let took = call
+        .started
+        .zip(at)
+        .and_then(|(from, to)| to.duration_since(from).ok());
+    call.state = outcome(&call.tool, &text, is_error, result, took);
+    call.output = text.chars().take(OUTPUT).collect();
+    if let CallKind::Delegate { spawned } = &mut call.kind {
+        *spawned = result
+            .and_then(|r| r.get("agentId"))
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .map(AgentId::new);
+    }
+}
+
+/// The records that say how the activity went rather than what the agent did:
 /// how long it took, a compaction, a message the user queued.
-fn note_turn_record(out: &mut Parsed, record: &Value, at: Option<SystemTime>) {
+fn note_activity_record(out: &mut Parsed, record: &Value, at: Option<SystemTime>) {
     let kind = record.get("type").and_then(Value::as_str);
     match (kind, record.get("subtype").and_then(Value::as_str)) {
         (Some("system"), Some("turn_duration")) => {
@@ -228,7 +240,7 @@ fn kind_of(tool: &str) -> CallKind {
     match tool {
         "Read" | "Grep" | "Glob" | "LS" => CallKind::Explore,
         "Edit" | "MultiEdit" | "Write" | "NotebookEdit" => CallKind::Edit,
-        "Agent" | "Task" => CallKind::Delegate,
+        "Agent" | "Task" => CallKind::Delegate { spawned: None },
         "AskUserQuestion" => CallKind::Ask,
         _ => CallKind::Other,
     }
@@ -870,17 +882,108 @@ mod tests {
         ]
         .join("\n");
         let parsed = parse(&text);
-        let kinds: Vec<_> = calls(&parsed).iter().map(|c| c.kind).collect();
+        let kinds: Vec<_> = calls(&parsed).iter().map(|c| c.kind.clone()).collect();
         assert_eq!(
             kinds,
             [
                 CallKind::Edit,
-                CallKind::Delegate,
+                CallKind::Delegate { spawned: None },
                 CallKind::Ask,
                 CallKind::Explore,
                 CallKind::Other
             ]
         );
         assert!(!calls(&parsed)[4].tool.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn a_delegating_call_names_its_subagent_once_its_result_does_and_not_before() {
+        let text = [
+            use_of(
+                "a",
+                "Agent",
+                r#"{"description":"qa"}"#,
+                "2026-11-08T10:00:00.000Z",
+            ),
+            use_of(
+                "b",
+                "Agent",
+                r#"{"description":"review"}"#,
+                "2026-11-08T10:00:01.000Z",
+            ),
+            use_of(
+                "c",
+                "Agent",
+                r#"{"description":"lint"}"#,
+                "2026-11-08T10:00:02.000Z",
+            ),
+            result_of(
+                "a",
+                "launched",
+                false,
+                "2026-11-08T10:00:03.000Z",
+                r#","toolUseResult":{"status":"async_launched","agentId":"a1"}"#,
+            ),
+            result_of(
+                "c",
+                "done",
+                false,
+                "2026-11-08T10:00:04.000Z",
+                r#","toolUseResult":{"status":"completed","agentId":""}"#,
+            ),
+        ]
+        .join("\n");
+        let parsed = parse(&text);
+        let spawned: Vec<_> = calls(&parsed)
+            .iter()
+            .map(|c| c.spawned().cloned())
+            .collect();
+        assert_eq!(spawned, [Some(AgentId::new("a1")), None, None]);
+    }
+
+    #[test]
+    fn only_a_call_that_changes_a_file_and_did_not_fail_touches_it() {
+        let text = [
+            use_of(
+                "a",
+                "Edit",
+                r#"{"file_path":"/w/a.rs"}"#,
+                "2026-11-08T10:00:00.000Z",
+            ),
+            use_of(
+                "b",
+                "NotebookEdit",
+                r#"{"notebook_path":"/w/n.ipynb"}"#,
+                "2026-11-08T10:00:01.000Z",
+            ),
+            use_of(
+                "c",
+                "Edit",
+                r#"{"file_path":"/w/c.rs"}"#,
+                "2026-11-08T10:00:02.000Z",
+            ),
+            use_of(
+                "d",
+                "Read",
+                r#"{"file_path":"/w/d.rs"}"#,
+                "2026-11-08T10:00:03.000Z",
+            ),
+            result_of("c", "no match", true, "2026-11-08T10:00:04.000Z", ""),
+        ]
+        .join("\n");
+        let parsed = parse(&text);
+        let touched: Vec<_> = calls(&parsed)
+            .iter()
+            .map(|c| c.touched().map(str::to_string))
+            .collect();
+        assert_eq!(
+            touched,
+            [
+                Some("/w/a.rs".into()),
+                Some("/w/n.ipynb".into()),
+                None,
+                None
+            ]
+        );
     }
 }

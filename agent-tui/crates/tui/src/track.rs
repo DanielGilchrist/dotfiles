@@ -8,10 +8,11 @@ use std::time::{Duration, Instant, SystemTime};
 
 use agent_core::activity::{AgentId, Subagent};
 use agent_core::names::Prompt;
-use agent_core::ports::{Log, TurnDetail, WorktreeFacts};
+use agent_core::ports::{ActivityDetail, Log, WorktreeFacts};
 
 use crate::log::Nav;
 use crate::model::Inspection;
+use crate::touched::Baseline;
 use crate::tree::{ChangesScope, ChangesView, TreeRow};
 
 /// The tree built for an agent, rebuilt only when its facts, the view or
@@ -37,7 +38,7 @@ pub enum LiveSince {
 #[derive(Default)]
 pub struct Tracked {
     /// Its git facts, or why they couldn't be read, as last read.
-    pub facts: Option<Result<WorktreeFacts, String>>,
+    pub facts: Option<Result<Inspected, String>>,
     /// How many times its facts have been read, which tells a document read
     /// from them that they may have changed.
     pub generation: u64,
@@ -57,15 +58,49 @@ pub struct Tracked {
     pub seen: Seen,
     /// The subagents being watched, dropped with the agent.
     pub subagents: HashMap<AgentId, Watched>,
-    /// Its current turn, as [0] last read it.
-    pub turn: TurnWatch,
+    /// Its current activity, as [0] last read it.
+    pub activity_view: ActivityWatch,
+    /// Its changed files when that activity began.
+    pub baseline: Baseline,
 }
 
-/// What is known about an agent's current turn, and how far the user had
+/// What reading an agent's worktree found, and when in its reports it was
+/// asked for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Inspected {
+    pub facts: WorktreeFacts,
+    /// The checkout with symlinks resolved.
+    pub real_root: Option<PathBuf>,
+    /// How many events the agent had reported when the read was asked for.
+    pub asked_events: Option<u64>,
+}
+
+impl Inspected {
+    /// Facts with nothing else known about the read.
+    #[cfg(test)]
+    pub fn of(facts: WorktreeFacts) -> Self {
+        Self {
+            facts,
+            real_root: None,
+            asked_events: None,
+        }
+    }
+}
+
+impl Tracked {
+    /// Opens the folders in `folders`, which are closed or not.
+    pub fn open_folders(&mut self, folders: &[PathBuf]) {
+        for folder in folders {
+            self.collapsed.remove(folder);
+        }
+    }
+}
+
+/// What is known about an agent's current activity, and how far the user had
 /// got when they last looked.
 #[derive(Default)]
-pub struct TurnWatch {
-    pub watch: Watch<TurnDetail>,
+pub struct ActivityWatch {
+    pub watch: Watch<ActivityDetail>,
     pub looked: Looked,
 }
 
@@ -117,12 +152,12 @@ impl<T> Watch<T> {
     }
 }
 
-/// Whether the turn is in front of the user, and when they last saw it.
+/// Whether the activity is in front of the user, and when they last saw it.
 #[derive(Debug, Default)]
 pub struct Looked {
-    /// When [0] began showing the turn, while it does.
+    /// When [0] began showing the activity, while it does.
     pub since: Option<Instant>,
-    /// The last moment the turn view or the terminal had been in front of
+    /// The last moment the activity view or the terminal had been in front of
     /// them for a few seconds. What the agent did after is
     /// new to them.
     pub seen: Option<SystemTime>,

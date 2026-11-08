@@ -55,6 +55,8 @@ pub fn reported(state: State, secs_ago: u64) -> Activity {
         state,
         since,
         prompt: Some("go".into()),
+        prompts: 1,
+        prompt_event: 1,
         heard: since,
         events: 1,
         ..Activity::fresh(since)
@@ -160,7 +162,7 @@ fn session(k: usize, cwd: &str, name: &SessionName) -> Option<SessionInfo> {
     })
 }
 
-fn facts(k: usize) -> WorktreeFacts {
+fn fleet_facts(k: usize) -> WorktreeFacts {
     let files = [
         (
             "src/triage/flow.ts",
@@ -220,6 +222,27 @@ pub fn unchanged() -> WorktreeFacts {
     })
 }
 
+/// A worktree with `pending` files uncommitted and `changed` since the fork.
+pub fn facts(pending: Vec<Change>, changed: Vec<Change>) -> WorktreeFacts {
+    WorktreeFacts {
+        pending,
+        changed,
+        ..unchanged()
+    }
+}
+
+/// A file committed with two lines added and one removed.
+pub fn modified(path: &str) -> Change {
+    Change::tracked(
+        path,
+        Lines::Counted {
+            added: 2,
+            removed: 1,
+        },
+        TrackedState::Committed,
+    )
+}
+
 /// `n` uncommitted files with no counts.
 pub fn pending_files(n: usize) -> Vec<Change> {
     (0..n)
@@ -257,7 +280,7 @@ pub fn fleet(n: usize) -> Model {
             if k % 10 == 0 {
                 pins.push(entry.clone());
             }
-            facts_of.insert(entry, Ok(facts(k)));
+            facts_of.insert(entry, Ok(fleet_facts(k)));
         }
         repos.push((
             RepoRoot::new(main.clone().into()).expect("absolute"),
@@ -291,7 +314,7 @@ pub fn fleet(n: usize) -> Model {
     update(&mut m, Msg::Snapshot(Ok((snapshot, Vec::new()))));
     m.activities = Some(activities);
     for (name, facts) in facts_of {
-        m.track(&name).facts = Some(facts);
+        m.track(&name).facts = Some(facts.map(crate::model::Inspected::of));
     }
     m.revalidate();
     m.changes_view = crate::tree::ChangesView::Flat;

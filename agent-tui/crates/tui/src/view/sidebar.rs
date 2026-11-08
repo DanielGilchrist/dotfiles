@@ -1,5 +1,5 @@
 //! The sidebar, three panels stacked lazygit-style: [1] the fleet as
-//! cards, [2] the selected agent's turn, [3] its work in git.
+//! cards, [2] the selected agent's activity, [3] its work in git.
 
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
@@ -188,7 +188,7 @@ impl<'a> Gist<'a> {
         (fitted, shown)
     }
 
-    /// All of what the agent says about this, for [0]'s turn document.
+    /// All of what the agent says about this, for [0]'s activity document.
     /// Delegating has none, since the subagents say more.
     fn message(&self) -> Option<String> {
         Some(match self {
@@ -513,15 +513,15 @@ impl<'m> Deck<'m> {
             .collect()
     }
 
-    /// [2]'s rows: the turn, then one per subagent, and the row the cursor
+    /// [2]'s rows: the activity, then one per subagent, and the row the cursor
     /// is on while [2] has the keys. What they say is [0]'s to show.
-    fn turn_rows(&self, entry: &Entry) -> (Vec<Line<'static>>, Option<usize>) {
+    fn activity_rows(&self, entry: &Entry) -> (Vec<Line<'static>>, Option<usize>) {
         let m = self.m;
         let Some(activity) = m.activity(entry.name()) else {
             return (Vec::new(), None);
         };
         let cursor = matches!(m.panel.list(), Listed::Agent { .. }).then(|| m.row_at());
-        let mut rows = vec![Line::raw(turn_row(
+        let mut rows = vec![Line::raw(activity_row(
             activity.prompt.as_deref(),
             self.content,
             cursor == Some(0),
@@ -537,9 +537,9 @@ impl<'m> Deck<'m> {
     }
 }
 
-/// The turn row: `› ` and the prompt's first line, cut to `width`. The mark
+/// The activity row: `› ` and the prompt's first line, cut to `width`. The mark
 /// for the cursor takes the place of the panel's padding.
-fn turn_row(prompt: Option<&str>, width: usize, selected: bool) -> String {
+fn activity_row(prompt: Option<&str>, width: usize, selected: bool) -> String {
     let first = prompt
         .and_then(|p| p.lines().map(str::trim).find(|l| !l.is_empty()))
         .unwrap_or("no prompt yet");
@@ -1010,7 +1010,7 @@ struct Laid {
     list: Panel,
     hits: Vec<(u16, Cursor)>,
     scroll: ListScroll,
-    /// [2], while an agent with a turn is selected.
+    /// [2], while an agent with an activity is selected.
     agent: Option<Panel>,
     agent_rows: Vec<(u16, usize)>,
     change_rows: Vec<(u16, usize)>,
@@ -1175,31 +1175,31 @@ struct Lower {
     room: WorkRoom,
 }
 
-/// How many of `rest` rows [2] and [3] get, for a turn with `turn_rows`
+/// How many of `rest` rows [2] and [3] get, for an activity with `activity_rows`
 /// rows and `work_rows` rows of work. [2] is sized to its rows up to
 /// [`AGENT_ROWS`], and [3] has what's left. [3] keeps its readiness row and
 /// three files, or what it has of them, and [2] a row, so when both can't
 /// fit [2] takes everything.
-fn budget(rest: usize, turn_rows: usize, work_rows: usize) -> (usize, usize) {
-    let want_turn = if turn_rows == 0 {
+fn budget(rest: usize, activity_rows: usize, work_rows: usize) -> (usize, usize) {
+    let want_activity = if activity_rows == 0 {
         0
     } else {
-        2 + turn_rows.min(AGENT_ROWS)
+        2 + activity_rows.min(AGENT_ROWS)
     };
-    let turn_floor = if turn_rows == 0 { 0 } else { 3 };
+    let activity_floor = if activity_rows == 0 { 0 } else { 3 };
     let work_least = if work_rows == 0 {
         0
     } else {
         (2 + work_rows).min(2 + READINESS_ROW + CHANGES_MIN)
     };
-    if work_rows > 0 && rest >= turn_floor + work_least {
-        let turn_height = if turn_floor == 0 {
+    if work_rows > 0 && rest >= activity_floor + work_least {
+        let activity_height = if activity_floor == 0 {
             0
         } else {
-            want_turn.min(rest - work_least)
+            want_activity.min(rest - work_least)
         };
-        (turn_height, rest - turn_height)
-    } else if turn_floor > 0 && rest >= turn_floor {
+        (activity_height, rest - activity_height)
+    } else if activity_floor > 0 && rest >= activity_floor {
         (rest, 0)
     } else {
         (0, 0)
@@ -1212,10 +1212,10 @@ fn budget(rest: usize, turn_rows: usize, work_rows: usize) -> (usize, usize) {
 fn lower_panels(deck: &Deck<'_>, repo: &Repo, entry: &Entry, area: Rect) -> Lower {
     let m = deck.m;
     let rest = usize::from(area.height);
-    let (turn, turn_cursor) = deck.turn_rows(entry);
+    let (detail, activity_cursor) = deck.activity_rows(entry);
     let work = work_of(m, entry);
     let work_rows = work.as_ref().map_or(0, Work::rows);
-    let (turn_height, work_height) = budget(rest, turn.len(), work_rows);
+    let (activity_height, work_height) = budget(rest, detail.len(), work_rows);
     let at = |y: usize, height: usize| {
         Rect::new(
             area.x,
@@ -1228,34 +1228,34 @@ fn lower_panels(deck: &Deck<'_>, repo: &Repo, entry: &Entry, area: Rect) -> Lowe
     let mut focus = Focused::Agents;
     let mut agent_rows = Vec::new();
     let mut change_rows = Vec::new();
-    let agent = (turn_height > 0).then(|| {
-        let inside = turn_height - 2;
-        let first = match (m.panel.list(), turn_cursor) {
+    let agent = (activity_height > 0).then(|| {
+        let inside = activity_height - 2;
+        let first = match (m.panel.list(), activity_cursor) {
             (
                 Listed::Agent {
                     offset,
-                    row: turn_row,
+                    row: activity_row,
                 },
                 Some(row),
             ) => {
-                let first = scroll(offset, row, inside, turn.len());
+                let first = scroll(offset, row, inside, detail.len());
                 focus = Focused::Agent {
                     offset: first,
-                    row: turn_row.clone(),
+                    row: activity_row.clone(),
                 };
                 first
             }
             _ => 0,
         };
-        let lines: Vec<Line<'static>> = turn.into_iter().skip(first).take(inside).collect();
-        let top = at(0, turn_height).y + 1;
+        let lines: Vec<Line<'static>> = detail.into_iter().skip(first).take(inside).collect();
+        let top = at(0, activity_height).y + 1;
         agent_rows = (0..lines.len())
             .map(|i| (top + u16::try_from(i).unwrap_or(0), first + i))
             .collect();
-        pad(at(0, turn_height), lines)
+        pad(at(0, activity_height), lines)
     });
     let changes = work.filter(|_| work_height > 0).map(|work| {
-        let area = at(turn_height, work_height);
+        let area = at(activity_height, work_height);
         let inside = work_height - 2;
         let cursor = match m.panel.list() {
             Listed::Changes { file } => {
@@ -1401,13 +1401,13 @@ pub(super) fn others_on(m: &Model, name: &SessionName, path: &Path) -> Vec<Strin
 }
 
 /// What the selected agent says about what it's doing, in full.
-pub(crate) fn turn_message(m: &Model, entry: &Entry) -> Option<String> {
+pub(crate) fn activity_message(m: &Model, entry: &Entry) -> Option<String> {
     let status = m.status(entry);
     let heard = m.activity(entry.name()).map_or(m.clock.wall, |a| a.heard);
     Gist::of(&status, heard, m.clock.wall)?.message()
 }
 
-/// The agent's subagents as tree rows, for [0]'s turn document.
+/// The agent's subagents as tree rows, for [0]'s activity document.
 pub(super) fn subagent_rows(m: &Model, entry: &Entry, width: usize) -> Vec<Line<'static>> {
     m.activity(entry.name()).map_or_else(Vec::new, |a| {
         tree(
@@ -1505,7 +1505,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, m: &Model, area: Rect, border: Style, 
             .changes
             .as_ref()
             .map_or(0, |(p, _)| usize::from(p.area.height)),
-        Focused::Main(_) => 0,
+        Focused::Main(..) => 0,
     }
     .saturating_sub(2);
     out.areas.agent_panel = laid.agent.as_ref().map_or(Rect::default(), |p| p.area);
@@ -1516,7 +1516,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, m: &Model, area: Rect, border: Style, 
     let list = panel(title, corner, style_of(agents), nav && agents);
     frame.render_widget(Paragraph::new(laid.list.lines).block(list), laid.list.area);
     if let Some(Panel { area, lines }) = laid.agent {
-        let title = vec![Span::raw("[2] "), Span::styled("Turn", bold())];
+        let title = vec![Span::raw("[2] "), Span::styled("Activity", bold())];
         let block = panel(title, Vec::new(), style_of(agent), nav && agent);
         frame.render_widget(Paragraph::new(lines).block(block), area);
     }
@@ -1583,20 +1583,20 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     #[test]
-    fn the_turn_is_sized_to_its_rows_and_the_work_gets_the_rest() {
+    fn the_activity_is_sized_to_its_rows_and_the_work_gets_the_rest() {
         assert_eq!(budget(30, 3, 20), (5, 25));
         assert_eq!(budget(30, 40, 20), (8, 22));
         assert_eq!(budget(30, 0, 20), (0, 30));
     }
 
     #[test]
-    fn the_work_keeps_its_least_before_the_turn_takes_more_than_its_floor() {
+    fn the_work_keeps_its_least_before_the_activity_takes_more_than_its_floor() {
         assert_eq!(budget(9, 10, 20), (3, 6));
         assert_eq!(budget(10, 10, 20), (4, 6));
     }
 
     #[test]
-    fn the_turn_takes_everything_when_both_cannot_fit() {
+    fn the_activity_takes_everything_when_both_cannot_fit() {
         assert_eq!(budget(8, 10, 20), (8, 0));
         assert_eq!(budget(3, 1, 20), (3, 0));
     }
@@ -1616,7 +1616,7 @@ mod tests {
     }
 
     #[test]
-    fn the_turn_alone_fills_the_room_when_there_is_no_work() {
+    fn the_activity_alone_fills_the_room_when_there_is_no_work() {
         assert_eq!(budget(10, 2, 0), (10, 0));
     }
 
@@ -1766,7 +1766,7 @@ mod tests {
     }
 
     #[test]
-    fn a_finished_turn_reads_its_first_line_and_says_all_of_it() {
+    fn a_finished_activity_reads_its_first_line_and_says_all_of_it() {
         let done = Gist::Done(Some("## **Done**\n\nAdded `retry`.\nTests pass."));
         assert_eq!(done.line(Form::Long, 40), ("Done".to_string(), Shown::Cut));
         assert_eq!(
@@ -1887,9 +1887,10 @@ mod tests {
         let mut m = fleet(10);
         m.set_cursor(Cursor::Entry(name("obs-layout-4")));
         m.changes_view = crate::tree::ChangesView::Flat;
-        let Some(Ok(facts)) = m.track(&name("obs-layout-4")).facts.as_mut() else {
+        let Some(Ok(read)) = m.track(&name("obs-layout-4")).facts.as_mut() else {
             panic!("facts")
         };
+        let facts = &mut read.facts;
         facts.ahead = 24;
         facts.compared = Compared::Branch {
             branch: branch_name("fix"),
@@ -2064,7 +2065,7 @@ mod tests {
         let panels = || {
             [
                 Focused::Agents,
-                Focused::turn(),
+                Focused::activity(),
                 Focused::Changes { file: 0 },
             ]
         };
@@ -2083,7 +2084,7 @@ mod tests {
                     let laid = laid(&mut m, size);
                     let column = column(&m, size);
                     let focused_lower = match laid.focus {
-                        Focused::Agents | Focused::Main(_) => None,
+                        Focused::Agents | Focused::Main(..) => None,
                         Focused::Agent { .. } => Some(1),
                         Focused::Changes { .. } => Some(2),
                     };
@@ -2357,7 +2358,7 @@ mod tests {
 
         let done = name("auth-refresh-2");
         m.set_cursor(Cursor::Entry(done.clone()));
-        m.set_facts(
+        m.set_test_facts(
             &done,
             Ok(WorktreeFacts {
                 ahead: 0,
@@ -2379,7 +2380,7 @@ mod tests {
     }
 
     #[test]
-    fn the_turn_panel_is_a_row_for_the_turn_then_one_per_subagent() {
+    fn the_activity_panel_is_a_row_for_the_activity_then_one_per_subagent() {
         let mut m = fleet(8);
         m.show_view(View::Overview);
         m.set_cursor(Cursor::Entry(name("obs-layout-4")));
@@ -2398,11 +2399,11 @@ mod tests {
             "no cursor mark while [1] has the keys"
         );
 
-        m.panel = Focused::turn();
+        m.panel = Focused::activity();
         let lines = agent_lines(&laid(&mut m, (200, 50)));
         assert!(
             lines[0].starts_with('▌'),
-            "the cursor starts on the turn\n{}",
+            "the cursor starts on the activity\n{}",
             lines.join("\n")
         );
         m.point_at_subagent("s1");
@@ -2434,7 +2435,7 @@ mod tests {
         for size in SIZES {
             for (panel, overlay) in [
                 (Focused::Agents, Overlay::None),
-                (Focused::turn(), Overlay::None),
+                (Focused::activity(), Overlay::None),
                 (
                     Focused::Agents,
                     Overlay::Help(crate::model::HelpState::default()),
@@ -2484,7 +2485,7 @@ mod tests {
             .iter()
             .position(|l| text(l).contains("obs-layout-4"))
             .expect("selected");
-        m.panel = Focused::turn();
+        m.panel = Focused::activity();
         laid(&mut m, (80, 24));
         assert_eq!(m.scroll.offset, offset, "the 3-row window isn't remembered");
         m.panel = Focused::Agents;
@@ -2521,12 +2522,12 @@ mod tests {
                 "{height} rows: {files} file rows under readiness\n{}",
                 rows.join("\n")
             );
-            let turn = laid.agent.as_ref().expect("[2] shows");
+            let detail = laid.agent.as_ref().expect("[2] shows");
             let list_clamped = list_room(height - 1) <= LIST_MIN;
             assert!(
-                list_clamped || usize::from(turn.area.height) >= 3,
+                list_clamped || usize::from(detail.area.height) >= 3,
                 "{height} rows: [2] is {} tall",
-                turn.area.height
+                detail.area.height
             );
         }
     }
@@ -2644,7 +2645,7 @@ mod tests {
     }
 
     #[test]
-    fn the_turn_cursor_marks_a_subagent_and_scrolls_to_keep_it_in_view() {
+    fn the_activity_cursor_marks_a_subagent_and_scrolls_to_keep_it_in_view() {
         let mut m = fleet(8);
         m.set_cursor(Cursor::Entry(name("obs-layout-4")));
         let rows = screen(&render(&mut m, (200, 50)));
@@ -2654,7 +2655,7 @@ mod tests {
                 .any(|r| r.contains('▌') && r.contains(['├', '└']))
         );
 
-        m.panel = Focused::turn();
+        m.panel = Focused::activity();
         m.point_at_subagent("s1");
         let rows = screen(&render(&mut m, (200, 50)));
         let marked: Vec<&String> = rows
@@ -2819,12 +2820,12 @@ mod tests {
     }
 
     #[test]
-    fn the_turn_document_shows_the_whole_prompt_message_and_subagents() {
+    fn the_activity_document_shows_the_whole_prompt_message_and_subagents() {
         let mut m = fleet(10);
         m.set_cursor(Cursor::Entry(name("auth-refresh-2")));
-        m.panel = Focused::turn();
+        m.panel = Focused::activity();
         let text = screen(&render(&mut m, (100, 30))).join("\n");
-        assert!(text.contains("[0] Turn"), "{text}");
+        assert!(text.contains("[0] Activity"), "{text}");
         assert!(text.contains("› go"), "{text}");
         assert!(
             text.contains("Added token refresh with retry and a 401 interceptor."),
@@ -2836,7 +2837,7 @@ mod tests {
         );
 
         m.set_cursor(Cursor::Entry(name("obs-layout-4")));
-        m.panel = Focused::turn();
+        m.panel = Focused::activity();
         let text = screen(&render(&mut m, (100, 30))).join("\n");
         assert!(text.contains("Subagents"), "{text}");
         assert!(text.contains("Reverting memo edit"), "{text}");
@@ -2846,7 +2847,7 @@ mod tests {
     fn a_stopped_subagent_says_stopped_and_why() {
         let mut m = fleet(10);
         m.set_cursor(Cursor::Entry(name("obs-layout-4")));
-        m.panel = Focused::turn();
+        m.panel = Focused::activity();
         m.point_at_subagent("s1");
         let mut detail = log_of(2, false);
         detail.outcome = agent_core::ports::Outcome::Stopped {
@@ -2863,7 +2864,7 @@ mod tests {
     fn a_subagents_log_follows_its_tail_and_pauses_when_scrolled_up() {
         let mut m = fleet(10);
         m.set_cursor(Cursor::Entry(name("obs-layout-4")));
-        m.panel = Focused::turn();
+        m.panel = Focused::activity();
         m.point_at_subagent("s1");
         let loading = screen(&render(&mut m, (100, 30))).join("\n");
         assert!(
@@ -2917,7 +2918,7 @@ mod tests {
         );
         let rule = text
             .lines()
-            .position(|l| l.contains("Activity ·"))
+            .position(|l| l.contains("Calls ·"))
             .expect("an activity rule");
         let report = text
             .lines()
@@ -2934,7 +2935,7 @@ mod tests {
     fn a_subagent_without_a_transcript_says_so() {
         let mut m = fleet(10);
         m.set_cursor(Cursor::Entry(name("obs-layout-4")));
-        m.panel = Focused::turn();
+        m.panel = Focused::activity();
         m.point_at_subagent("s1");
         m.set_log((name("obs-layout-4"), AgentId::new("s1")), Ok(None));
         let text = screen(&render(&mut m, (100, 30))).join("\n");
@@ -3040,9 +3041,12 @@ mod tests {
             m.hover(),
             Some(crate::document::Hover::Subagent(..))
         ));
-        let turn_y = m.areas.agent_rows[0].0;
-        click(&mut m, 5, turn_y, left());
-        assert!(matches!(m.hover(), Some(crate::document::Hover::Turn(_))));
+        let activity_y = m.areas.agent_rows[0].0;
+        click(&mut m, 5, activity_y, left());
+        assert!(matches!(
+            m.hover(),
+            Some(crate::document::Hover::Activity(_))
+        ));
 
         render(&mut m, (100, 30));
         let terminal = m.areas.terminal;
@@ -3150,7 +3154,7 @@ mod tests {
     fn a_running_call_reads_how_long_it_has_run() {
         let mut m = fleet(10);
         m.set_cursor(Cursor::Entry(name("obs-layout-4")));
-        m.panel = Focused::turn();
+        m.panel = Focused::activity();
         m.point_at_subagent("s1");
         let mut all = m.activities.take().expect("reported");
         let agent = name("obs-layout-4");
@@ -3194,7 +3198,7 @@ mod tests {
     fn the_footer_ranks_hints_fits_what_it_can_and_never_repeats() {
         for panel in [
             Focused::Agents,
-            Focused::turn(),
+            Focused::activity(),
             Focused::Changes { file: 0 },
         ] {
             let mut counts = Vec::new();
@@ -3253,7 +3257,7 @@ mod tests {
     fn the_help_lists_local_keys_before_global_ones_for_each_panel() {
         for (panel, title) in [
             (Focused::Agents, "[1] Agents"),
-            (Focused::turn(), "[2] Turn"),
+            (Focused::activity(), "[2] Activity"),
             (Focused::Changes { file: 0 }, "[3] Changes"),
         ] {
             let mut m = open_help(panel);
@@ -3372,9 +3376,10 @@ mod tests {
         let mut m = fleet(10);
         m.set_cursor(Cursor::Entry(name("obs-layout-4")));
         m.changes_view = crate::tree::ChangesView::Tree;
-        let Some(Ok(facts)) = m.track(&name("obs-layout-4")).facts.as_mut() else {
+        let Some(Ok(read)) = m.track(&name("obs-layout-4")).facts.as_mut() else {
             panic!("facts")
         };
+        let facts = &mut read.facts;
         facts.changed = [
             ("crates/tui/src/lib.rs", 2, 1),
             ("crates/tui/src/model.rs", 10, 2),
@@ -3547,7 +3552,7 @@ mod tests {
     fn reading_a_log() -> Model {
         let mut m = fleet(10);
         m.set_cursor(Cursor::Entry(name("obs-layout-4")));
-        m.panel = Focused::turn();
+        m.panel = Focused::activity();
         m.point_at_subagent("s1");
         m.set_log(
             (name("obs-layout-4"), AgentId::new("s1")),
@@ -3568,16 +3573,19 @@ mod tests {
 
     #[test]
     fn nav_keys_do_something_exactly_where_the_keymap_table_says() {
-        use crate::model::{Origin, TurnRow};
+        use crate::model::{ActivityRow, Origin};
         let contexts: [(Ctx, fn() -> Model); 7] = [
             (Ctx::Agents, tree_fleet),
-            (Ctx::Turn, || in_panel(Focused::turn())),
+            (Ctx::Activity, || in_panel(Focused::activity())),
             (Ctx::Changes, || in_panel(Focused::Changes { file: 0 })),
             (Ctx::Main, || {
-                in_panel(Focused::Main(Origin::Turn {
-                    offset: 0,
-                    row: TurnRow::Turn,
-                }))
+                in_panel(Focused::Main(
+                    Origin::Activity {
+                        offset: 0,
+                        row: ActivityRow::Main,
+                    },
+                    None,
+                ))
             }),
             (Ctx::Main, on_a_loaded_diff),
             (Ctx::Main, reading_a_log),
@@ -3589,7 +3597,13 @@ mod tests {
         ];
         let keys = probed_keys();
         let mut wrong = Vec::new();
-        for ctx in [Ctx::Agents, Ctx::Turn, Ctx::Changes, Ctx::Main, Ctx::Peek] {
+        for ctx in [
+            Ctx::Agents,
+            Ctx::Activity,
+            Ctx::Changes,
+            Ctx::Main,
+            Ctx::Peek,
+        ] {
             let mut handled = std::collections::BTreeSet::new();
             for (_, build) in contexts.iter().filter(|(c, _)| *c == ctx) {
                 for key in &keys {
@@ -3944,22 +3958,22 @@ mod tests {
         assert!(text.contains("▼ docs"), "{text}");
     }
 
-    mod turn {
+    mod detail {
         use std::time::Duration;
 
         use agent_core::activity::{Answer, Ask, Origin, State, Tool, ToolId};
         use agent_core::ports::{
-            Asked, CallState, Choice, LogEntry, Outcome, Progress, Question, Summary, Target,
-            TurnDetail,
+            ActivityDetail, Asked, CallState, Choice, LogEntry, Outcome, Progress, Question,
+            Summary, Target,
         };
 
         use super::*;
-        use crate::log::fixtures::{before, call_at, done, said_at, story, turn_at};
+        use crate::log::fixtures::{activity_at, before, call_at, done, said_at, story};
 
         fn at(m: &mut Model, agent: &str, size: (u16, u16)) -> SessionName {
             let who = name(agent);
             m.set_cursor(Cursor::Entry(who.clone()));
-            m.panel = Focused::turn();
+            m.panel = Focused::activity();
             let _ = size;
             who
         }
@@ -3997,7 +4011,7 @@ mod tests {
                 }],
             };
             activity.since = m.clock.wall - Duration::from_secs(372);
-            let turn = turn_at(
+            let detail = activity_at(
                 m.clock.wall,
                 story(m.clock.wall),
                 Some(call_at(
@@ -4011,12 +4025,12 @@ mod tests {
                     12,
                 )),
             );
-            m.set_turn(&who, Ok(Some(turn)));
+            m.set_activity(&who, Ok(Some(detail)));
             who
         }
 
         #[test]
-        fn a_working_turn_shows_progress_older_phases_folded_and_the_current_one_whole() {
+        fn a_working_activity_shows_progress_older_phases_folded_and_the_current_one_whole() {
             let mut m = fleet(10);
             working(&mut m, "payroll-fix-3");
             for size in [(140, 40), (70, 26)] {
@@ -4065,7 +4079,16 @@ mod tests {
             let who = working(&mut m, "payroll-fix-3");
             m.panel.focus_document();
             render(&mut m, (140, 40));
-            m.track(&who).turn.watch.nav.open.insert(2);
+            let second = {
+                let detail = m.activity_detail(&who).expect("read");
+                crate::log::activity_entries(&detail.log, None, &[]).activity[1].1
+            };
+            m.track(&who)
+                .activity_view
+                .watch
+                .nav
+                .open
+                .insert(crate::log::EntryKey::Log(second));
             let text = page(&mut m, (140, 40)).join("\n");
             assert!(text.contains("wiring it into lsp.lua."), "{text}");
             assert!(text.contains("lsp.lua") && text.contains("Edit"), "{text}");
@@ -4116,13 +4139,13 @@ mod tests {
                     90,
                 ),
             ];
-            let mut turn = turn_at(m.clock.wall, log, Some(running));
+            let mut detail = activity_at(m.clock.wall, log, Some(running));
             if !questions.is_empty() {
-                turn.progress = Progress::Running {
+                detail.progress = Progress::Running {
                     asked: Some(Asked { call, questions }),
                 };
             }
-            m.set_turn(&who, Ok(Some(turn)));
+            m.set_activity(&who, Ok(Some(detail)));
             who
         }
 
@@ -4145,7 +4168,7 @@ mod tests {
         }
 
         #[test]
-        fn an_asking_turn_pins_the_whole_question_with_its_options_and_replaces_the_banner() {
+        fn an_asking_activity_pins_the_whole_question_with_its_options_and_replaces_the_banner() {
             let mut m = fleet(10);
             let ask = call_at(
                 m.clock.wall,
@@ -4177,6 +4200,45 @@ mod tests {
                     .find(|r| r.contains("waiting"))
                     .unwrap_or_else(|| panic!("{text}"));
                 assert!(waiting.contains("AskUserQuestion"), "{waiting}");
+            }
+        }
+
+        #[test]
+        fn at_any_width_from_one_to_thirty_an_activity_draws_without_overflowing_its_pane() {
+            let mut working_agent = fleet(10);
+            working(&mut working_agent, "payroll-fix-3");
+            let mut asking_agent = fleet(10);
+            let ask = call_at(
+                asking_agent.clock.wall,
+                "q",
+                "AskUserQuestion",
+                Target::None,
+                CallState::Running,
+                120,
+            );
+            asking(&mut asking_agent, "payroll-fix-3", grid(), ask);
+            let mut done_agent = fleet(10);
+            touching(
+                &mut done_agent,
+                "auth-refresh-2",
+                Progress::Finished {
+                    took: Some(Duration::from_secs(520)),
+                },
+            );
+            for (which, m) in [
+                ("working", &mut working_agent),
+                ("asking", &mut asking_agent),
+                ("done with touched files", &mut done_agent),
+            ] {
+                for width in 1..=30u16 {
+                    let rows = page(m, (width, 24));
+                    for row in &rows {
+                        assert!(
+                            row.chars().count() <= usize::from(width),
+                            "{which} at {width}: {row:?}"
+                        );
+                    }
+                }
             }
         }
 
@@ -4222,12 +4284,12 @@ mod tests {
                 )
             };
             let who = asking(m, "payroll-fix-3", Vec::new(), run("p1", "rm -rf target"));
-            let turn = m.track(&who).turn.watch.log.take();
-            let Some(Ok(Some(mut turn))) = turn else {
-                panic!("a turn");
+            let detail = m.track(&who).activity_view.watch.log.take();
+            let Some(Ok(Some(mut detail))) = detail else {
+                panic!("an activity");
             };
-            turn.log.log.insert(0, run("p0", "sleep 600"));
-            m.set_turn(&who, Ok(Some(turn)));
+            detail.log.log.insert(0, run("p0", "sleep 600"));
+            m.set_activity(&who, Ok(Some(detail)));
             who
         }
 
@@ -4302,10 +4364,10 @@ mod tests {
                 20,
             );
             let who = asking(&mut m, "payroll-fix-3", Vec::new(), ask);
-            let Some(Ok(Some(turn))) = m.track(&who).turn.watch.log.as_mut() else {
-                panic!("a turn");
+            let Some(Ok(Some(detail))) = m.track(&who).activity_view.watch.log.as_mut() else {
+                panic!("an activity");
             };
-            let LogEntry::Called(call) = turn.log.log.last_mut().expect("a call") else {
+            let LogEntry::Called(call) = detail.log.log.last_mut().expect("a call") else {
                 panic!("a call");
             };
             call.input = r#"{"questions":[{"question":"raw"}]}"#.into();
@@ -4315,7 +4377,7 @@ mod tests {
         }
 
         #[test]
-        fn a_working_turns_elapsed_time_is_the_agents_not_the_old_prompts() {
+        fn the_elapsed_time_of_a_working_activity_is_the_agents_not_the_old_prompts() {
             let mut m = fleet(10);
             let who = working(&mut m, "payroll-fix-3");
             let activity = m
@@ -4337,13 +4399,13 @@ mod tests {
             let mut m = fleet(10);
             let who = at(&mut m, "auth-refresh-2", (140, 40));
             let wall = m.clock.wall;
-            let mut turn = turn_at(
+            let mut detail = activity_at(
                 wall,
                 vec![said_at(wall, "reading \u{1b}[31mred\u{1b}[0m text", 30)],
                 None,
             );
-            turn.log.prompt = Some("do it \u{7}now".into());
-            m.set_turn(&who, Ok(Some(turn)));
+            detail.log.prompt = Some("do it \u{7}now".into());
+            m.set_activity(&who, Ok(Some(detail)));
             let text = page(&mut m, (140, 40)).join("\n");
             assert!(
                 !text.contains('\u{1b}') && !text.contains('\u{7}'),
@@ -4357,16 +4419,16 @@ mod tests {
         }
 
         #[test]
-        fn a_finished_turn_leads_with_its_closing_message_and_folds_all_its_phases() {
+        fn a_finished_activity_leads_with_its_closing_message_and_folds_all_its_phases() {
             let mut m = fleet(10);
             let who = at(&mut m, "auth-refresh-2", (140, 40));
-            let turn = TurnDetail {
+            let detail = ActivityDetail {
                 progress: Progress::Finished {
                     took: Some(Duration::from_secs(520)),
                 },
-                ..turn_at(m.clock.wall, story(m.clock.wall), None)
+                ..activity_at(m.clock.wall, story(m.clock.wall), None)
             };
-            m.set_turn(&who, Ok(Some(turn)));
+            m.set_activity(&who, Ok(Some(detail)));
             for size in [(140, 40), (70, 26)] {
                 let rows = page(&mut m, size);
                 let text = rows.join("\n");
@@ -4382,7 +4444,7 @@ mod tests {
                     .expect("shown");
                 let activity = rows
                     .iter()
-                    .position(|r| r.contains("Activity ·"))
+                    .position(|r| r.contains("Calls ·"))
                     .unwrap_or_else(|| panic!("{text}"));
                 assert!(message < activity, "{text}");
                 assert!(
@@ -4394,8 +4456,153 @@ mod tests {
             }
         }
 
+        fn touching(m: &mut Model, agent: &str, state: Progress) -> SessionName {
+            use agent_core::ports::{Change, Lines, TrackedState};
+            let who = at(m, agent, (140, 40));
+            let detail = ActivityDetail {
+                progress: state,
+                ..activity_at(m.clock.wall, story(m.clock.wall), None)
+            };
+            m.set_activity(&who, Ok(Some(detail)));
+            let pending = vec![
+                Change::untracked("nvim/lua/heucristic/status.lua"),
+                Change::tracked(
+                    "nvim/plugin/lsp.lua",
+                    Lines::Counted {
+                        added: 1,
+                        removed: 1,
+                    },
+                    TrackedState::Unstaged(Edit::Modified),
+                ),
+            ];
+            m.set_test_facts(&who, Ok(crate::fixtures::facts(pending, Vec::new())));
+            who
+        }
+
         #[test]
-        fn an_idle_agent_shows_its_last_turn_as_finished_without_the_check() {
+        fn a_finished_activity_lists_the_files_it_touched_with_changes_markers_and_counts_before_its_activity()
+         {
+            let mut m = fleet(10);
+            touching(
+                &mut m,
+                "auth-refresh-2",
+                Progress::Finished {
+                    took: Some(Duration::from_secs(520)),
+                },
+            );
+            for size in [(140, 40), (70, 26)] {
+                let rows = page(&mut m, size);
+                let text = rows.join("\n");
+                let at = |needle: &str| {
+                    rows.iter()
+                        .position(|r| r.contains(needle))
+                        .unwrap_or_else(|| panic!("{needle}\n{text}"))
+                };
+                let (message, heading, activity) =
+                    (at("14 tests pass."), at("Touched files"), at("Calls ·"));
+                assert!(message < heading && heading < activity, "{size:?}\n{text}");
+                let lsp = at("lsp.lua");
+                let status = at("/status.lua");
+                assert!(heading < status && status < lsp && lsp < activity, "{text}");
+                assert!(
+                    rows[lsp].contains(" M nvim/plugin/lsp.lua"),
+                    "{}",
+                    rows[lsp]
+                );
+                assert!(rows[lsp].contains("+1 −1"), "{}", rows[lsp]);
+                assert!(rows[status].contains("?? "), "{}", rows[status]);
+                assert!(
+                    size.0 < 100 || rows[status].contains("nvim/lua/heucristic/status.lua"),
+                    "{}",
+                    rows[status]
+                );
+                assert!(rows[status].trim_end().ends_with("new"), "{}", rows[status]);
+                assert!(size.0 < 100 || rows[0].contains("2 files"), "{text}");
+            }
+        }
+
+        #[test]
+        fn a_working_activity_only_counts_its_touched_files_on_the_status_row() {
+            let mut m = fleet(10);
+            touching(&mut m, "payroll-fix-3", Progress::Running { asked: None });
+            let activity = m
+                .activities
+                .as_mut()
+                .and_then(|a| a.get_mut(&name("payroll-fix-3")))
+                .expect("reports");
+            activity.state = State::Working { tools: Vec::new() };
+            let text = page(&mut m, (140, 40)).join("\n");
+            assert!(!text.contains("Touched files"), "{text}");
+            assert!(text.contains("2 files"), "{text}");
+        }
+
+        #[test]
+        fn a_touched_file_git_no_longer_differs_in_says_so_and_a_cursor_on_one_is_marked() {
+            let mut m = fleet(10);
+            let who = touching(&mut m, "auth-refresh-2", Progress::Finished { took: None });
+            m.set_test_facts(&who, Ok(crate::fixtures::facts(Vec::new(), Vec::new())));
+            m.panel.focus_document();
+            render(&mut m, (140, 40));
+            m.track(&who).activity_view.watch.nav.cursor = Some(crate::log::EntryKey::Touched(
+                "nvim/lua/heucristic/status.lua".into(),
+            ));
+            let rows = page(&mut m, (140, 40));
+            let row = rows
+                .iter()
+                .find(|r| r.contains("nvim/lua/heucristic/status.lua"))
+                .expect("listed");
+            assert!(row.contains("no difference"), "{row}");
+            assert!(row.starts_with('▌'), "the cursor's gutter\n{row}");
+        }
+
+        #[test]
+        fn at_180_columns_text_wraps_at_the_panes_width_and_counts_sit_at_its_right_edge() {
+            let mut m = fleet(10);
+            let who = at(&mut m, "auth-refresh-2", (180, 40));
+            let long = "word ".repeat(40).trim_end().to_string();
+            m.activities
+                .as_mut()
+                .and_then(|a| a.get_mut(&who))
+                .expect("reports")
+                .state = State::Done {
+                summary: Some(long.clone()),
+            };
+            m.set_activity(
+                &who,
+                Ok(Some(ActivityDetail {
+                    progress: Progress::Finished { took: None },
+                    ..activity_at(m.clock.wall, story(m.clock.wall), None)
+                })),
+            );
+            let rows = page(&mut m, (180, 40));
+            let width = rows[0].chars().count();
+            assert!(width > 130, "the pane is wide: {width}");
+            let message = rows
+                .iter()
+                .find(|r| r.contains("word word"))
+                .expect("the message");
+            let first = message.trim().chars().count();
+            assert!(
+                (width - 8..width).contains(&first),
+                "filled to the pane's width ({width}), not wrapped at 100: {first}\n{message}"
+            );
+            let phase = rows
+                .iter()
+                .find(|r| r.contains("+4 −2"))
+                .expect("a phase row");
+            assert!(
+                phase.trim_end().chars().count() >= width - 2,
+                "the count is at the right edge\n{phase}"
+            );
+            let rule = rows
+                .iter()
+                .find(|r| r.contains("Calls ·"))
+                .expect("the rule");
+            assert!(rule.trim_end().chars().count() >= width - 2, "{rule}");
+        }
+
+        #[test]
+        fn an_idle_agent_shows_its_last_activity_as_finished_without_the_check() {
             let mut m = fleet(10);
             let who = at(&mut m, "payroll-fix-3", (140, 40));
             let activity = m
@@ -4404,15 +4611,15 @@ mod tests {
                 .and_then(|a| a.get_mut(&who))
                 .expect("reports");
             activity.state = State::Idle;
-            let mut turn = turn_at(
+            let mut detail = activity_at(
                 m.clock.wall,
                 story(m.clock.wall),
                 Some(said_at(m.clock.wall, "All fixed.", 10)),
             );
-            turn.log.outcome = Outcome::Finished {
+            detail.log.outcome = Outcome::Finished {
                 report: Some("All fixed.".into()),
             };
-            m.set_turn(&who, Ok(Some(turn)));
+            m.set_activity(&who, Ok(Some(detail)));
             let rows = page(&mut m, (140, 40));
             assert!(
                 rows[0].contains("● finished") && !rows[0].contains('✓'),
@@ -4423,12 +4630,12 @@ mod tests {
         }
 
         #[test]
-        fn a_failed_turn_says_why_and_keeps_its_last_calls_open() {
+        fn a_failed_activity_says_why_and_keeps_its_last_calls_open() {
             let mut m = fleet(10);
             let who = at(&mut m, "rate-limit-1", (140, 40));
-            m.set_turn(
+            m.set_activity(
                 &who,
-                Ok(Some(turn_at(m.clock.wall, story(m.clock.wall), None))),
+                Ok(Some(activity_at(m.clock.wall, story(m.clock.wall), None))),
             );
             let rows = page(&mut m, (140, 40));
             assert!(
@@ -4443,7 +4650,7 @@ mod tests {
         }
 
         #[test]
-        fn a_turn_not_yet_started_says_so_in_the_middle_and_a_failed_read_says_why() {
+        fn an_activity_not_yet_started_says_so_in_the_middle_and_a_failed_read_says_why() {
             let mut m = fleet(10);
             let who = at(&mut m, "payroll-fix-3", (140, 40));
             let activity = m
@@ -4453,16 +4660,16 @@ mod tests {
                 .expect("reports");
             activity.prompt = None;
             activity.state = State::Idle;
-            m.set_turn(&who, Ok(None));
+            m.set_activity(&who, Ok(None));
             let rows = page(&mut m, (100, 30));
             let at = rows
                 .iter()
-                .position(|r| r.contains("no turn yet · s send"))
+                .position(|r| r.contains("no activity yet · s send"))
                 .unwrap_or_else(|| panic!("{}", rows.join("\n")));
             assert!(at > 5 && at < rows.len() - 5, "in the middle, row {at}");
             assert!(rows[at].starts_with(' '), "centred across");
 
-            m.set_turn(&who, Err("reading the transcript: denied".into()));
+            m.set_activity(&who, Err("reading the transcript: denied".into()));
             let rows = page(&mut m, (100, 30));
             assert!(
                 rows.iter()
@@ -4474,7 +4681,7 @@ mod tests {
         fn what_happened_since_the_user_looked_is_marked_once() {
             let mut m = fleet(10);
             let who = working(&mut m, "payroll-fix-3");
-            m.track(&who).turn.looked.seen = Some(before(m.clock.wall, 200));
+            m.track(&who).activity_view.looked.seen = Some(before(m.clock.wall, 200));
             let rows = page(&mut m, (140, 40));
             let text = rows.join("\n");
             let marker = rows
@@ -4496,10 +4703,10 @@ mod tests {
             );
             assert_eq!(text.matches("since you looked").count(), 1);
 
-            m.track(&who).turn.looked.seen = Some(before(m.clock.wall, 1));
+            m.track(&who).activity_view.looked.seen = Some(before(m.clock.wall, 1));
             let text = page(&mut m, (140, 40)).join("\n");
             assert!(!text.contains("since you looked"), "nothing is new\n{text}");
-            m.track(&who).turn.looked.seen = None;
+            m.track(&who).activity_view.looked.seen = None;
             let text = page(&mut m, (140, 40)).join("\n");
             assert!(
                 !text.contains("since you looked"),
@@ -4508,7 +4715,7 @@ mod tests {
         }
 
         #[test]
-        fn queued_messages_stay_under_the_turn() {
+        fn queued_messages_stay_under_the_activity() {
             let mut m = fleet(10);
             let who = working(&mut m, "payroll-fix-3");
             m.track(&who).outbox = Some(crate::track::Outbox::new(

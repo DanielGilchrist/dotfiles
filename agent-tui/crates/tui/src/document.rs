@@ -206,8 +206,8 @@ pub enum Hover {
     Folder(FolderKey),
     /// A commit opened from the branch view.
     Commit(CommitKey),
-    /// [2]'s turn row.
-    Turn(SessionName),
+    /// [2]'s activity row.
+    Activity(SessionName),
     /// A subagent row in [2].
     Subagent(SessionName, AgentId),
     /// A repo row in [1]: nothing to read, but a summary to show.
@@ -221,7 +221,7 @@ enum Item {
     Branch(SessionName),
     Folder(SessionName, PathBuf),
     Commit(SessionName, String),
-    Turn(SessionName),
+    Activity(SessionName),
     Subagent(SessionName, AgentId),
     Repo(RepoKey),
 }
@@ -233,7 +233,7 @@ impl Hover {
             Self::Branch(key) => Item::Branch(key.name.clone()),
             Self::Folder(key) => Item::Folder(key.name.clone(), key.path.clone()),
             Self::Commit(key) => Item::Commit(key.name.clone(), key.sha.clone()),
-            Self::Turn(name) => Item::Turn(name.clone()),
+            Self::Activity(name) => Item::Activity(name.clone()),
             Self::Subagent(name, id) => Item::Subagent(name.clone(), id.clone()),
             Self::Repo(key) => Item::Repo(key.clone()),
         }
@@ -246,7 +246,7 @@ impl Hover {
             Self::Branch(key) => Some(Key::Branch(key.clone())),
             Self::Folder(key) => Some(Key::Folder(key.clone())),
             Self::Commit(key) => Some(Key::Commit(key.clone())),
-            Self::Turn(_) | Self::Subagent(..) | Self::Repo(_) => None,
+            Self::Activity(_) | Self::Subagent(..) | Self::Repo(_) => None,
         }
     }
 }
@@ -829,7 +829,7 @@ mod tests {
         assert_eq!(docs.place(44, 10, true), 25, "back where it was");
         assert!(docs.paused());
 
-        docs.settle(Some(&Hover::Turn("fix".parse().expect("parses"))), t0);
+        docs.settle(Some(&Hover::Activity("fix".parse().expect("parses"))), t0);
         docs.place(44, 10, false);
         docs.settle(Some(&log()), t0);
         assert_eq!(
@@ -871,7 +871,7 @@ mod tests {
         assert_eq!(docs.place(44, 10, true), 0);
         assert!(docs.paused());
 
-        docs.settle(Some(&Hover::Turn("fix".parse().expect("parses"))), t0);
+        docs.settle(Some(&Hover::Activity("fix".parse().expect("parses"))), t0);
         assert_eq!(docs.place(44, 10, false), 0, "a document opens at the top");
         assert!(
             !docs.following() && !docs.paused(),

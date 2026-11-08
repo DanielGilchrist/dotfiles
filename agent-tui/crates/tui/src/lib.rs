@@ -4,6 +4,7 @@ mod log;
 mod model;
 mod palette;
 mod review;
+mod touched;
 mod track;
 mod tree;
 mod update;
@@ -356,7 +357,11 @@ impl Runtime {
             match effect {
                 Effect::Quit => return Ok(Flow::Quit),
                 Effect::Job(job) => self.send(job)?,
-                Effect::Inspect { name, worktree } => self.workers.inspect(name, worktree),
+                Effect::Inspect {
+                    name,
+                    worktree,
+                    events,
+                } => self.workers.inspect(name, worktree, events),
                 Effect::ReadDocument {
                     key,
                     worktree,
@@ -365,8 +370,8 @@ impl Runtime {
                 Effect::ReadSubagent { name, id, workdir } => {
                     self.workers.read_subagent(name, id, workdir);
                 }
-                Effect::ReadTurn { name, workdir, at } => {
-                    self.workers.read_turn(name, workdir, at);
+                Effect::ReadActivity { name, workdir, at } => {
+                    self.workers.read_activity(name, workdir, at);
                 }
                 Effect::SuggestName {
                     prompt,
