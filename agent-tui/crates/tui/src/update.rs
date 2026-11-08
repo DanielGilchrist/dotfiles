@@ -2345,6 +2345,7 @@ mod tests {
             .map(|i| agent_core::ports::Change {
                 path: format!("src/f{i}.rs").into(),
                 lines: agent_core::ports::Lines::Untracked,
+                state: agent_core::ports::FileState::Committed,
             })
             .collect();
         m.set_facts(
@@ -2365,6 +2366,7 @@ mod tests {
                     added: 2,
                     removed: 1,
                 },
+                state: agent_core::ports::FileState::Committed,
             })
             .collect();
         m.set_facts(
@@ -2583,6 +2585,7 @@ mod tests {
                 .map(|p| agent_core::ports::Change {
                     path: (*p).into(),
                     lines: agent_core::ports::Lines::Untracked,
+                    state: agent_core::ports::FileState::Committed,
                 })
                 .collect();
             update(

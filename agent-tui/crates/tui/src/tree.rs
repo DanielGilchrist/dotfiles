@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use agent_core::ports::{Change, Lines};
+use agent_core::ports::{Change, FileState, Lines};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ChangesView {
@@ -30,10 +30,25 @@ pub struct Counts {
     pub removed: usize,
     pub new: usize,
     pub binary: usize,
+    /// Files with something in the index, and with something only in the
+    /// working tree (untracked ones included).
+    pub staged: usize,
+    pub unstaged: usize,
 }
 
 impl Counts {
     fn of(change: &Change) -> Self {
+        let pending = Self {
+            staged: usize::from(change.state.staged().is_some()),
+            unstaged: usize::from(
+                change.state.unstaged().is_some() || change.state == FileState::Untracked,
+            ),
+            ..Self::default()
+        };
+        pending.plus(Self::lines_of(change))
+    }
+
+    fn lines_of(change: &Change) -> Self {
         match change.lines {
             Lines::Counted { added, removed } => Self {
                 added,
@@ -57,6 +72,8 @@ impl Counts {
             removed: self.removed + other.removed,
             new: self.new + other.new,
             binary: self.binary + other.binary,
+            staged: self.staged + other.staged,
+            unstaged: self.unstaged + other.unstaged,
         }
     }
 }
@@ -82,6 +99,9 @@ pub struct TreeRow {
     /// `path`: a chain row stands for all of them. Empty for files.
     pub chain: Vec<PathBuf>,
     pub counts: Counts,
+    /// A file's state against the last commit; `Committed` for folders,
+    /// whose `counts` say what's pending under them.
+    pub state: FileState,
 }
 
 #[derive(Default)]
@@ -131,6 +151,7 @@ fn emit(
             path: path.clone(),
             chain,
             counts: child.counts(changes),
+            state: FileState::Committed,
         });
         if open {
             emit(child, &path, depth + 1, changes, collapsed, out);
@@ -146,6 +167,7 @@ fn emit(
             path: changes[*i].path.clone(),
             chain: Vec::new(),
             counts: Counts::of(&changes[*i]),
+            state: changes[*i].state,
         });
     }
 }
@@ -166,6 +188,7 @@ pub fn build(changes: &[Change], view: ChangesView, collapsed: &HashSet<PathBuf>
                     path: change.path.clone(),
                     chain: Vec::new(),
                     counts: Counts::of(change),
+                    state: change.state,
                 });
             }
         }
@@ -213,6 +236,7 @@ mod tests {
         Change {
             path: path.into(),
             lines: Lines::Counted { added, removed },
+            state: FileState::Committed,
         }
     }
 
@@ -225,6 +249,7 @@ mod tests {
             Change {
                 path: "nvim/lsp/new.lua".into(),
                 lines: Lines::Untracked,
+                state: FileState::Untracked,
             },
             change("nvim/lua/a.lua", 5, 0),
         ]

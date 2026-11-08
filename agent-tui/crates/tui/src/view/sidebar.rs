@@ -10,7 +10,7 @@ use std::time::SystemTime;
 use agent_core::activity::Subagent;
 use agent_core::model::{Entry, Head, Repo, RepoKey, Snapshot};
 use agent_core::names::SessionName;
-use agent_core::ports::{DiffStat, Readiness, WorktreeFacts};
+use agent_core::ports::{DiffStat, Edit, FileState, Readiness, WorktreeFacts};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
@@ -726,6 +726,45 @@ fn count_cells(counts: Counts, folder: bool) -> (Span<'static>, String) {
     (Span::styled(added, style), removed)
 }
 
+/// Columns the marker and its space take before a row's name.
+const MARKER_WIDTH: usize = 3;
+
+fn edit_letter(edit: Edit) -> &'static str {
+    match edit {
+        Edit::Modified => "M",
+        Edit::Added => "A",
+        Edit::Deleted => "D",
+    }
+}
+
+/// Lazygit's `XY` code before a file's name: the staged letter in the
+/// success colour, the unstaged one in the error colour, `??` for a file
+/// git isn't tracking, and a DIM `·` for one already committed. A folder
+/// shows a `●` in each column that has something pending under it.
+fn marker(row: &TreeRow) -> Vec<Span<'static>> {
+    let cell = |text: Option<&'static str>, colour| match text {
+        Some(text) => Span::styled(text, Style::new().fg(colour)),
+        None => Span::raw(" "),
+    };
+    let (palette_ok, palette_err) = (palette().success, palette().error);
+    let mut spans = match row.node {
+        Node::Folder { .. } => vec![
+            cell((row.counts.staged > 0).then_some("●"), palette_ok),
+            cell((row.counts.unstaged > 0).then_some("●"), palette_err),
+        ],
+        Node::File(_) => match row.state {
+            FileState::Committed => vec![Span::styled("·", dim()), Span::raw(" ")],
+            FileState::Untracked => vec![Span::styled("??", Style::new().fg(palette_err))],
+            state => vec![
+                cell(state.staged().map(edit_letter), palette_ok),
+                cell(state.unstaged().map(edit_letter), palette_err),
+            ],
+        },
+    };
+    spans.push(Span::raw(" "));
+    spans
+}
+
 /// [3]'s rows: `head` (the readiness row) when there is one, then `list`,
 /// the changed files flat in `diff --numstat` order or as a tree of
 /// folders, with counts in columns, each after a gutter. A file in `shared`
@@ -779,7 +818,7 @@ fn changes(
             let style = if folder { dim() } else { red };
             right.push(Span::styled(format!(" {removed:<removed_width$}"), style));
         }
-        let room = width.saturating_sub(line_width(&right) + 1);
+        let room = width.saturating_sub(line_width(&right) + 1 + MARKER_WIDTH);
         let left = match row.node {
             Node::Folder { open } => {
                 let arrow = if open { "▼ " } else { "▶ " };
@@ -801,6 +840,7 @@ fn changes(
             }
             Node::File(_) => vec![Span::raw(tail(&row.label, room))],
         };
+        let left: Vec<Span<'static>> = marker(row).into_iter().chain(left).collect();
         let mut line = justify(left, right, width);
         line.spans.insert(0, gutter(skip + i));
         all.push(line);
@@ -1652,8 +1692,9 @@ mod tests {
         let change = |path: &str, lines| agent_core::ports::Change {
             path: path.into(),
             lines,
+            state: agent_core::ports::FileState::Committed,
         };
-        WorktreeFacts {
+        let mut facts = WorktreeFacts {
             changed: vec![
                 change(
                     "a/src/payroll/calc.ts",
@@ -1673,7 +1714,20 @@ mod tests {
                 change("notes.md", Lines::Untracked),
             ],
             ..WorktreeFacts::default()
+        };
+        let states = [
+            FileState::Both {
+                staged: Edit::Modified,
+                unstaged: Edit::Modified,
+            },
+            FileState::Staged(Edit::Added),
+            FileState::Committed,
+            FileState::Untracked,
+        ];
+        for (change, state) in facts.changed.iter_mut().zip(states) {
+            change.state = state;
         }
+        facts
     }
 
     #[test]
@@ -1683,10 +1737,10 @@ mod tests {
         assert_eq!(
             texts(&changes(&flat(&facts), &none, None, 34, 4, None)),
             [
-                " src/payroll/calc.ts        +98 −52",
-                " src/payroll/calc.test.ts   +24    ",
-                " logo.png                   bin    ",
-                " notes.md                   new    ",
+                " MM src/payroll/calc.ts     +98 −52",
+                " A  payroll/calc.test.ts    +24    ",
+                " ·  logo.png                bin    ",
+                " ?? notes.md                new    ",
             ]
         );
         let short = changes(&flat(&facts), &none, None, 34, 3, None);
@@ -1695,11 +1749,68 @@ mod tests {
         assert_eq!(
             texts(&cursor),
             [
-                " logo.png                   bin    ",
-                "▌notes.md                   new    ",
+                " ·  logo.png                bin    ",
+                "▌?? notes.md                new    ",
             ],
             "the rows scroll to keep the cursor in view"
         );
+    }
+
+    #[test]
+    fn markers_colour_the_staged_and_unstaged_parts() {
+        let facts = facts();
+        let rows = flat(&facts);
+        let colours = |row: &TreeRow| -> Vec<(String, Option<Color>)> {
+            marker(row)
+                .into_iter()
+                .map(|s| (s.content.to_string(), s.style.fg))
+                .collect()
+        };
+        let ok = Some(palette().success);
+        let err = Some(palette().error);
+        assert_eq!(
+            colours(&rows[0]),
+            [("M".into(), ok), ("M".into(), err), (" ".into(), None)]
+        );
+        assert_eq!(
+            colours(&rows[1]),
+            [("A".into(), ok), (" ".into(), None), (" ".into(), None)]
+        );
+        assert_eq!(colours(&rows[3]), [("??".into(), err), (" ".into(), None)]);
+    }
+
+    #[test]
+    fn folders_mark_what_is_pending_under_them() {
+        let mut facts = facts();
+        facts.changed[0].path = "a/calc.ts".into();
+        facts.changed[1].path = "b/new.ts".into();
+        facts.changed[2].path = "c/old.png".into();
+        let rows = crate::tree::build(
+            &facts.changed,
+            crate::tree::ChangesView::Tree,
+            &HashSet::new(),
+        );
+        let folder = |label: &str| {
+            let row = rows.iter().find(|r| r.label == label).expect("a row");
+            marker(row)
+                .into_iter()
+                .map(|s| s.content.to_string())
+                .collect::<String>()
+        };
+        assert_eq!(folder("a"), "●● ");
+        assert_eq!(folder("b"), "●  ");
+        assert_eq!(folder("c"), "   ");
+    }
+
+    #[test]
+    fn markers_never_push_a_row_past_the_width() {
+        let facts = facts();
+        let none = HashMap::new();
+        for width in [20, 26, 34, 60] {
+            for line in changes(&flat(&facts), &none, None, width, 4, None) {
+                assert!(line.width() <= width + 1, "{width}: {:?}", text(&line));
+            }
+        }
     }
 
     #[test]
@@ -2987,6 +3098,7 @@ mod tests {
         .map(|(p, added, removed)| agent_core::ports::Change {
             path: p.into(),
             lines: Lines::Counted { added, removed },
+            state: agent_core::ports::FileState::Committed,
         })
         .collect();
         m

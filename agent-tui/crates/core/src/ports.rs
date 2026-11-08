@@ -40,6 +40,46 @@ pub struct WorktreeFacts {
 pub struct Change {
     pub path: PathBuf,
     pub lines: Lines,
+    pub state: FileState,
+}
+
+/// What was done to a file in the index or the working tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Edit {
+    Modified,
+    Added,
+    Deleted,
+}
+
+/// Where a changed file stands against the last commit, as `git status`
+/// reports it. A file only in the fork diff and clean now is `Committed`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileState {
+    Committed,
+    Untracked,
+    Staged(Edit),
+    Unstaged(Edit),
+    Both { staged: Edit, unstaged: Edit },
+}
+
+impl FileState {
+    pub fn is_committed(self) -> bool {
+        self == Self::Committed
+    }
+
+    pub fn staged(self) -> Option<Edit> {
+        match self {
+            Self::Staged(edit) | Self::Both { staged: edit, .. } => Some(edit),
+            Self::Committed | Self::Untracked | Self::Unstaged(_) => None,
+        }
+    }
+
+    pub fn unstaged(self) -> Option<Edit> {
+        match self {
+            Self::Unstaged(edit) | Self::Both { unstaged: edit, .. } => Some(edit),
+            Self::Committed | Self::Untracked | Self::Staged(_) => None,
+        }
+    }
 }
 
 /// A changed file as a diff, for reading.

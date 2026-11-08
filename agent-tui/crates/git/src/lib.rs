@@ -8,8 +8,8 @@ use agent_core::model::{Head, Worktree};
 use agent_core::names::{BranchName, NameError, PullRequest};
 use agent_core::paths::{AgentWorktree, RepoRoot};
 use agent_core::ports::{
-    BranchLog, BranchState, Change, Fetch, FileDiff, Forge, Lines, LocalBranch, PullRequestHead,
-    RemoteBranch, RepoWorktrees, Vcs, WorktreeFacts, WorktreeStart,
+    BranchLog, BranchState, Change, Edit, Fetch, FileDiff, FileState, Forge, Lines, LocalBranch,
+    PullRequestHead, RemoteBranch, RepoWorktrees, Vcs, WorktreeFacts, WorktreeStart,
 };
 use agent_core::process::{self, CommandError};
 
@@ -105,6 +105,7 @@ fn parse_numstat(out: &str) -> Vec<Change> {
             Some(Change {
                 path: PathBuf::from(path),
                 lines,
+                state: FileState::Committed,
             })
         })
         .collect()
@@ -119,6 +120,31 @@ fn parse_status(out: &str) -> Vec<(String, PathBuf)> {
             (!path.is_empty()).then(|| (code.to_string(), PathBuf::from(path)))
         })
         .collect()
+}
+
+fn edit_of(code: char) -> Option<Edit> {
+    match code {
+        'A' => Some(Edit::Added),
+        'D' => Some(Edit::Deleted),
+        'M' | 'T' | 'R' | 'C' | 'U' => Some(Edit::Modified),
+        _ => None,
+    }
+}
+
+/// A porcelain `XY` code: `X` is the index, `Y` the working tree.
+fn parse_state(code: &str) -> FileState {
+    if code == "??" {
+        return FileState::Untracked;
+    }
+    let mut chars = code.chars();
+    let staged = chars.next().and_then(edit_of);
+    let unstaged = chars.next().and_then(edit_of);
+    match (staged, unstaged) {
+        (Some(staged), Some(unstaged)) => FileState::Both { staged, unstaged },
+        (Some(edit), None) => FileState::Staged(edit),
+        (None, Some(edit)) => FileState::Unstaged(edit),
+        (None, None) => FileState::Committed,
+    }
 }
 
 fn parse_error(cmd: &Command, detail: impl Into<String>) -> CommandError {
@@ -464,10 +490,23 @@ impl Vcs for Git {
             .map(|(_, path)| Change {
                 path: path.clone(),
                 lines: Lines::Untracked,
+                state: FileState::Untracked,
             });
+        let states: std::collections::HashMap<&Path, FileState> = status
+            .iter()
+            .map(|(code, path)| (path.as_path(), parse_state(code)))
+            .collect();
+        let with_state = |mut changed: Vec<Change>| {
+            for change in &mut changed {
+                if let Some(state) = states.get(change.path.as_path()) {
+                    change.state = *state;
+                }
+            }
+            changed
+        };
         let dirty = status.len();
         let Some(base) = Self::default_base(worktree)? else {
-            let mut changed = Self::numstat(worktree, "HEAD")?;
+            let mut changed = with_state(Self::numstat(worktree, "HEAD")?);
             changed.extend(untracked);
             return Ok(WorktreeFacts {
                 changed,
@@ -492,7 +531,7 @@ impl Vcs for Git {
                 Some((behind.trim().parse().ok()?, ahead.trim().parse().ok()?))
             })
             .ok_or_else(|| parse_error(&cmd, format!("expected two counts, got {counts:?}")))?;
-        let mut changed = Self::numstat(worktree, &fork)?;
+        let mut changed = with_state(Self::numstat(worktree, &fork)?);
         changed.extend(untracked);
         Ok(WorktreeFacts {
             ahead,
@@ -773,11 +812,13 @@ mod tests {
                     lines: Lines::Counted {
                         added: 1,
                         removed: 0
-                    }
+                    },
+                    state: FileState::Unstaged(Edit::Modified)
                 },
                 Change {
                     path: "new.txt".into(),
-                    lines: Lines::Untracked
+                    lines: Lines::Untracked,
+                    state: FileState::Untracked
                 },
             ],
             "uncommitted and untracked work counts too"
@@ -921,14 +962,47 @@ mod tests {
                     lines: Lines::Counted {
                         added: 3,
                         removed: 1
-                    }
+                    },
+                    state: FileState::Committed
                 },
                 Change {
                     path: "logo.png".into(),
-                    lines: Lines::Binary
+                    lines: Lines::Binary,
+                    state: FileState::Committed
                 },
             ]
         );
+    }
+
+    #[test]
+    fn status_codes_parse_into_states() {
+        use Edit::*;
+        let cases = [
+            ("??", FileState::Untracked),
+            (" M", FileState::Unstaged(Modified)),
+            ("M ", FileState::Staged(Modified)),
+            ("A ", FileState::Staged(Added)),
+            ("D ", FileState::Staged(Deleted)),
+            (" D", FileState::Unstaged(Deleted)),
+            (
+                "MM",
+                FileState::Both {
+                    staged: Modified,
+                    unstaged: Modified,
+                },
+            ),
+            (
+                "AM",
+                FileState::Both {
+                    staged: Added,
+                    unstaged: Modified,
+                },
+            ),
+            ("  ", FileState::Committed),
+        ];
+        for (code, state) in cases {
+            assert_eq!(parse_state(code), state, "{code:?}");
+        }
     }
 
     #[test]

@@ -108,7 +108,7 @@ typing into starts waiting. Each agent's card has a second line saying
 what it's doing or what it said (the question, the tool, the last
 message), when there's room. Under the list, panel [2] lists the turn and
 its subagents and panel [3] lists the work: whether it's ready to merge
-(`2 uncommitted · ↑2`), the files it changed, a `∩` on any file another agent
+(`2 uncommitted · ↑2`), the files it changed with lazygit's status code before each (staged letter green, unstaged red, `??` untracked, a dim `·` for committed and clean, a `●` on folders holding uncommitted files), a `∩` on any file another agent
 in the repo changed too, and `∩ n` in the title counting them. The right pane
 [0] shows what the cursor in the focused panel is on: the agent's terminal
 for [1], the turn document or a subagent's transcript for [2] (it follows

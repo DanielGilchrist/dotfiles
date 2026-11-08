@@ -185,6 +185,7 @@ fn facts(k: usize) -> WorktreeFacts {
             .map(|(path, lines)| Change {
                 path: (*path).into(),
                 lines: *lines,
+                state: agent_core::ports::FileState::Committed,
             })
             .collect(),
         dirty: k % 4,
