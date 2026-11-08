@@ -14,10 +14,10 @@ use agent_core::model::{Removable, Running, Snapshot, Startable};
 use agent_core::names::{AgentName, Prompt, SessionName};
 use agent_core::ops::{self, Approved, Backend, Launch, RemovalPlan, Removed};
 use agent_core::paths::RepoRoot;
-use agent_core::ports::{ClientId, HarnessId, HostError, SubagentDetail, WorktreeFacts};
+use agent_core::ports::{ClientId, FileDiff, HarnessId, HostError, SubagentDetail, WorktreeFacts};
 use crossterm::event::{KeyEvent, MouseEvent};
 
-use crate::document::{Doc, Key};
+use crate::document::{Doc, Key, assemble};
 use crate::model::{Launchable, RepoChoice, Ticket};
 
 /// How much of a failed action's stderr is read for its last line.
@@ -239,13 +239,11 @@ impl Workers {
     }
 
     /// Asks for a document about the agent's `worktree`.
-    pub fn read_document(&self, key: Key, worktree: PathBuf) {
-        let at = match &key {
-            Key::Diff(diff) => Some(diff.path.clone()),
-            Key::Branch(_) => None,
-        };
+    /// `reuse` holds diffs already read, for a folder's to take.
+    pub fn read_document(&self, key: Key, worktree: PathBuf, reuse: Vec<(PathBuf, FileDiff)>) {
+        let at = key.slot().1;
         self.documents
-            .request((key.name().clone(), at), (worktree, key));
+            .request((key.name().clone(), at), (worktree, key, reuse));
     }
 
     /// Asks for what subagent `id` of an agent working in `workdir` has done.
@@ -347,7 +345,8 @@ fn spawn_inspectors(backend: &Arc<Backend>, msgs: &Sender<Msg>) -> Arc<Inspector
 
 /// Reads documents (diffs and branch logs) on [`DOCUMENT_READERS`] threads,
 /// one per agent and file at a time.
-type DocumentReader = Queue<(SessionName, Option<PathBuf>), (PathBuf, Key)>;
+type DocumentReader =
+    Queue<(SessionName, Option<PathBuf>), (PathBuf, Key, Vec<(PathBuf, FileDiff)>)>;
 
 fn spawn_document_readers(backend: &Arc<Backend>, msgs: &Sender<Msg>) -> Arc<DocumentReader> {
     let reader = Arc::new(DocumentReader::new());
@@ -357,13 +356,19 @@ fn spawn_document_readers(backend: &Arc<Backend>, msgs: &Sender<Msg>) -> Arc<Doc
         let msgs = msgs.clone();
         thread::spawn(move || {
             loop {
-                let (at, (worktree, key)) = reader.next();
+                let (at, (worktree, key, reuse)) = reader.next();
                 let result = match &key {
                     Key::Diff(diff) => backend
                         .vcs
                         .file_diff(&worktree, &diff.path, diff.lines, diff.base)
                         .map(Doc::Diff),
                     Key::Branch(_) => backend.vcs.branch_log(&worktree).map(Doc::Branch),
+                    Key::Folder(folder) => Ok(Doc::Folder(assemble(&folder.files, reuse, |c| {
+                        backend
+                            .vcs
+                            .file_diff(&worktree, &c.path, c.lines, folder.base)
+                            .map_err(|e| describe(&e))
+                    }))),
                 }
                 .map_err(|e| describe(&e));
                 reader.done(&at);

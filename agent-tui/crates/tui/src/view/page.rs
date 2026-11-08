@@ -7,11 +7,11 @@ use std::time::Instant;
 use agent_core::activity::AgentId;
 use agent_core::model::{Head, RepoKey};
 use agent_core::names::SessionName;
-use agent_core::ports::{BranchLog, Change, Compared, FileDiff, Lines};
+use agent_core::ports::{BranchLog, Compared, FileDiff, Lines};
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_width::UnicodeWidthChar;
 
 use super::log;
 use super::sidebar::{fits_beside, others_on, status_line, subagent_rows, turn_message};
@@ -19,7 +19,7 @@ use super::{
     accent, bold, dim, error, fit, justify, line_width, spinner, success, truncate_end,
     truncate_start, warning, wrap,
 };
-use crate::document::{BranchKey, DiffKey, Doc, FolderKey, Hover, Resolved};
+use crate::document::{BranchKey, DiffKey, Doc, FolderDocs, FolderKey, Hover, Key, Resolved};
 use crate::model::{AgentStatus, Model, SubagentKey};
 
 /// [0]'s title, what its top border says on the right, its bottom-right
@@ -257,7 +257,7 @@ fn diff_body(m: &mut Model, hover: &DiffKey, columns: usize, budget: usize) -> B
             let (key, loaded) = (key.clone(), loaded.clone());
             m.docs.rows(&key, columns, || match loaded.as_ref() {
                 Ok(Doc::Diff(diff)) => diff_rows(Ok(diff), columns),
-                Ok(Doc::Branch(_)) => Vec::new(),
+                Ok(Doc::Branch(_) | Doc::Folder(_)) => Vec::new(),
                 Err(e) => diff_rows(Err(e), columns),
             });
             Rows::Cached
@@ -302,77 +302,47 @@ fn diff_body(m: &mut Model, hover: &DiffKey, columns: usize, budget: usize) -> B
     }
 }
 
-/// A folder: the files changed under it with their counts. The list comes
-/// from the git facts already read, so nothing waits on git (a combined
-/// diff would be one more read per folder).
-fn folder_body(m: &Model, key: &FolderKey, columns: usize, budget: usize) -> Body {
-    let files: Vec<&Change> = m
-        .changes()
-        .iter()
-        .filter(|c| c.path.starts_with(&key.path))
-        .collect();
+/// A folder: a compact list of the files changed under it with their
+/// markers and counts, then each file's diff under its own header, in the
+/// tree's order. The list comes from the git facts already read, so it shows
+/// at once. The diffs follow when they have been read.
+fn folder_body(m: &mut Model, hover: &FolderKey, columns: usize, budget: usize) -> Body {
+    let rows = match m.docs.resolve() {
+        Resolved::Current(key, loaded) | Resolved::Stale(key, loaded) => {
+            let (key, loaded) = (key.clone(), loaded.clone());
+            m.docs
+                .rows(&key, columns, || match (&key, loaded.as_ref()) {
+                    (Key::Folder(folder), Ok(Doc::Folder(docs))) => {
+                        folder_rows(folder, Some(Ok(docs)), columns)
+                    }
+                    (Key::Folder(folder), Err(e)) => folder_rows(folder, Some(Err(e)), columns),
+                    _ => Vec::new(),
+                });
+            Rows::Cached
+        }
+        Resolved::Missing => Rows::Built(folder_rows(hover, None, columns)),
+    };
     let (mut added, mut removed) = (0, 0);
-    let cells: Vec<(String, Span<'static>, String)> = files
-        .iter()
-        .map(|c| {
-            let rel = c
-                .path
-                .strip_prefix(&key.path)
-                .unwrap_or(&c.path)
-                .to_string_lossy()
-                .into_owned();
-            match c.lines {
-                Lines::Counted {
-                    added: a,
-                    removed: r,
-                } => {
-                    added += a;
-                    removed += r;
-                    (
-                        rel,
-                        Span::styled(
-                            if a > 0 {
-                                format!("+{a}")
-                            } else {
-                                String::new()
-                            },
-                            success(),
-                        ),
-                        if r > 0 {
-                            format!("−{r}")
-                        } else {
-                            String::new()
-                        },
-                    )
-                }
-                Lines::Binary => (rel, Span::styled("bin", dim()), String::new()),
-                Lines::Untracked => (rel, Span::styled("new", dim()), String::new()),
-            }
-        })
-        .collect();
-    let plus = cells.iter().map(|(_, a, _)| a.width()).max().unwrap_or(0);
-    let minus = cells.iter().map(|(_, _, r)| r.width()).max().unwrap_or(0);
-    let rows: Vec<Line<'static>> = cells
-        .into_iter()
-        .map(|(rel, a, r)| {
-            let mut right = vec![Span::styled(format!("{:>plus$}", a.content), a.style)];
-            if minus > 0 {
-                right.push(Span::styled(format!(" {r:<minus$}"), error()));
-            }
-            let room = columns.saturating_sub(line_width(&right) + 1);
-            justify(vec![Span::raw(truncate_start(&rel, room))], right, columns)
-        })
-        .collect();
+    for change in &hover.files {
+        if let Lines::Counted {
+            added: a,
+            removed: r,
+        } = change.lines
+        {
+            added += a;
+            removed += r;
+        }
+    }
     let mut title = vec![
         Span::raw("[0] "),
         Span::styled(
             truncate_start(
-                &format!("{}/", key.path.display()),
+                &format!("{}/", hover.path.display()),
                 budget.saturating_sub(24).max(12),
             ),
             bold(),
         ),
-        Span::styled(format!(" {} files", files.len()), dim()),
+        Span::styled(format!(" {} files", hover.files.len()), dim()),
     ];
     for (count, text, style) in [
         (added, format!(" +{added}"), success()),
@@ -382,7 +352,87 @@ fn folder_body(m: &Model, key: &FolderKey, columns: usize, budget: usize) -> Bod
             title.push(Span::styled(text, style));
         }
     }
-    Body::built(title, rows)
+    Body {
+        rows,
+        ..Body::built(title, Vec::new())
+    }
+}
+
+fn count_spans(lines: Lines) -> Vec<Span<'static>> {
+    match lines {
+        Lines::Counted { added, removed } => {
+            let mut spans = Vec::new();
+            if added > 0 {
+                spans.push(Span::styled(format!("+{added}"), success()));
+            }
+            if removed > 0 {
+                if !spans.is_empty() {
+                    spans.push(Span::raw(" "));
+                }
+                spans.push(Span::styled(format!("−{removed}"), error()));
+            }
+            spans
+        }
+        Lines::Binary => vec![Span::styled("bin", dim())],
+        Lines::Untracked => vec![Span::styled("new", dim())],
+    }
+}
+
+/// The folder's file list, then a section per file read so far.
+fn folder_rows(
+    folder: &FolderKey,
+    docs: Option<Result<&FolderDocs, &String>>,
+    columns: usize,
+) -> Vec<Line<'static>> {
+    let mut rows: Vec<Line<'static>> = Vec::new();
+    for change in &folder.files {
+        let rel = change
+            .path
+            .strip_prefix(&folder.path)
+            .unwrap_or(&change.path)
+            .to_string_lossy()
+            .into_owned();
+        let mut left = super::sidebar::file_marker(change.state);
+        let right = count_spans(change.lines);
+        let room = columns.saturating_sub(line_width(&left) + line_width(&right) + 1);
+        left.push(Span::raw(truncate_start(&rel, room)));
+        rows.push(justify(left, right, columns));
+    }
+    let docs = match docs {
+        Some(Ok(docs)) => docs,
+        Some(Err(e)) => {
+            rows.push(Line::raw(""));
+            rows.extend(diff_rows(Err(e), columns));
+            return rows;
+        }
+        None => return rows,
+    };
+    for file in &docs.files {
+        rows.push(Line::raw(""));
+        rows.push(Line::styled("─".repeat(columns), dim()));
+        let mut head = vec![Span::styled(
+            truncate_start(
+                &file.change.path.to_string_lossy(),
+                columns.saturating_sub(12).max(12),
+            ),
+            bold(),
+        )];
+        let counts = count_spans(file.change.lines);
+        if !counts.is_empty() {
+            head.push(Span::raw("  "));
+            head.extend(counts);
+        }
+        rows.push(Line::from(head));
+        rows.extend(diff_rows(file.diff.as_ref(), columns));
+    }
+    if docs.more_files > 0 {
+        rows.push(Line::raw(""));
+        rows.push(Line::styled(
+            format!("+{} more files, open one to see its diff", docs.more_files),
+            dim(),
+        ));
+    }
+    rows
 }
 
 /// The branch: how far it is from shipping, its commits and the files not
@@ -400,7 +450,7 @@ fn branch_body(m: &mut Model, key: &BranchKey, columns: usize) -> Body {
             let (key, loaded) = (key.clone(), loaded.clone());
             m.docs.rows(&key, columns, || match loaded.as_ref() {
                 Ok(Doc::Branch(log)) => branch_rows(log, &compared, behind, columns),
-                Ok(Doc::Diff(_)) => Vec::new(),
+                Ok(Doc::Diff(_) | Doc::Folder(_)) => Vec::new(),
                 Err(e) => vec![Line::styled(
                     e.lines().next().unwrap_or_default().to_string(),
                     error(),

@@ -742,25 +742,39 @@ fn edit_letter(edit: Edit) -> &'static str {
 /// git isn't tracking, and nothing for one already committed. A folder
 /// shows a `●` in each column that has something pending under it.
 fn marker(row: &TreeRow) -> Vec<Span<'static>> {
-    let cell = |text: Option<&'static str>, colour| match text {
-        Some(text) => Span::styled(text, Style::new().fg(colour)),
-        None => Span::raw(" "),
-    };
-    let (palette_ok, palette_err) = (palette().success, palette().error);
     let mut spans = match row.node {
         Node::Folder { .. } => vec![
-            cell((row.counts.staged > 0).then_some("●"), palette_ok),
-            cell((row.counts.unstaged > 0).then_some("●"), palette_err),
+            marker_cell((row.counts.staged > 0).then_some("●"), palette().success),
+            marker_cell((row.counts.unstaged > 0).then_some("●"), palette().error),
         ],
-        Node::File(_) => match row.state {
-            FileState::Committed => vec![Span::raw("  ")],
-            FileState::Untracked => vec![Span::styled("??", Style::new().fg(palette_err))],
-            state => vec![
-                cell(state.staged().map(edit_letter), palette_ok),
-                cell(state.unstaged().map(edit_letter), palette_err),
-            ],
-        },
+        Node::File(_) => file_code(row.state),
     };
+    spans.push(Span::raw(" "));
+    spans
+}
+
+fn marker_cell(text: Option<&'static str>, colour: ratatui::style::Color) -> Span<'static> {
+    match text {
+        Some(text) => Span::styled(text, Style::new().fg(colour)),
+        None => Span::raw(" "),
+    }
+}
+
+fn file_code(state: FileState) -> Vec<Span<'static>> {
+    let (palette_ok, palette_err) = (palette().success, palette().error);
+    match state {
+        FileState::Committed => vec![Span::raw("  ")],
+        FileState::Untracked => vec![Span::styled("??", Style::new().fg(palette_err))],
+        state => vec![
+            marker_cell(state.staged().map(edit_letter), palette_ok),
+            marker_cell(state.unstaged().map(edit_letter), palette_err),
+        ],
+    }
+}
+
+/// A file's lazygit code and a space, for lists outside [3].
+pub(super) fn file_marker(state: FileState) -> Vec<Span<'static>> {
+    let mut spans = file_code(state);
     spans.push(Span::raw(" "));
     spans
 }
@@ -3325,6 +3339,58 @@ mod tests {
         assert!(
             !text.contains("docs/design.md ") || !text.contains("design.md  +1"),
             "only its own files"
+        );
+    }
+
+    #[test]
+    fn a_folder_lists_its_files_then_a_section_per_file_and_says_how_many_were_left_out() {
+        use crate::document::{Doc, FolderDocs, FolderFile};
+        use agent_core::ports::FileDiff;
+        let mut m = tree_fleet();
+        m.panel = Focused::Changes { file: 0 };
+        m.settle_main();
+        let before = screen(&render(&mut m, (140, 40))).join("\n");
+        assert!(
+            before.contains("view/sidebar.rs"),
+            "the list shows at once\n{before}"
+        );
+        assert!(!before.contains("@@"), "{before}");
+
+        std::thread::sleep(crate::document::REST + std::time::Duration::from_millis(20));
+        let key = m.docs.due(std::time::Instant::now()).expect("due");
+        let crate::document::Key::Folder(folder) = &key else {
+            panic!("a folder is read as a folder");
+        };
+        assert_eq!(
+            folder.base,
+            agent_core::ports::DiffBase::Head,
+            "the Uncommitted tab reads against HEAD"
+        );
+        let files = folder
+            .files
+            .iter()
+            .map(|change| FolderFile {
+                change: change.clone(),
+                diff: Ok(FileDiff::Text {
+                    lines: vec!["@@ -1 +1 @@".into(), "-old".into(), "+new".into()],
+                    more: 0,
+                }),
+            })
+            .collect();
+        m.docs.loaded(
+            &key,
+            Ok(Doc::Folder(FolderDocs {
+                files,
+                more_files: 4,
+            })),
+        );
+        m.settle_main();
+        let text = screen(&render(&mut m, (140, 80))).join("\n");
+        assert_eq!(text.matches("@@ -1 +1 @@").count(), 3, "{text}");
+        assert!(text.contains("+new"), "{text}");
+        assert!(
+            text.contains("+4 more files, open one to see its diff"),
+            "{text}"
         );
     }
 

@@ -333,7 +333,11 @@ impl Runtime {
                 Effect::Quit => return Ok(Flow::Quit),
                 Effect::Job(job) => self.send(job)?,
                 Effect::Inspect { name, worktree } => self.workers.inspect(name, worktree),
-                Effect::ReadDocument { key, worktree } => self.workers.read_document(key, worktree),
+                Effect::ReadDocument {
+                    key,
+                    worktree,
+                    reuse,
+                } => self.workers.read_document(key, worktree, reuse),
                 Effect::ReadSubagent { name, id, workdir } => {
                     self.workers.read_subagent(name, id, workdir);
                 }

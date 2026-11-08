@@ -1211,6 +1211,24 @@ impl Model {
     }
 
     /// The selected agent's files in the scope [3] shows, as last read.
+    /// The changed files under `folder` in the order [3]'s tree lists them:
+    /// folders first, then files by name.
+    pub fn folder_files(&self, folder: &Path) -> Vec<Change> {
+        let under: Vec<Change> = self
+            .changes()
+            .iter()
+            .filter(|c| c.path.starts_with(folder))
+            .cloned()
+            .collect();
+        crate::tree::build(&under, crate::tree::ChangesView::Tree, &HashSet::new())
+            .into_iter()
+            .filter_map(|row| match row.node {
+                crate::tree::Node::File(i) => under.get(i).cloned(),
+                crate::tree::Node::Folder { .. } => None,
+            })
+            .collect()
+    }
+
     pub fn changes(&self) -> &[Change] {
         match self.selected_entry().and_then(|e| self.facts.get(e.name())) {
             Some(Ok(facts)) => self.changes_scope.of(facts),
@@ -1517,11 +1535,16 @@ impl Model {
         let folder = self.folder_under_cursor().map(|r| r.path);
         let hover = match (row, self.change_at(row), self.facts.get(&name)) {
             (_, None, _) if folder.is_none() && !self.branch_row() => return None,
-            (_, None, _) if folder.is_some() => Hover::Folder(FolderKey {
-                name,
-                path: folder.unwrap_or_default(),
-                generation,
-            }),
+            (_, None, _) if folder.is_some() => {
+                let path = folder.unwrap_or_default();
+                Hover::Folder(FolderKey {
+                    files: self.folder_files(&path),
+                    base: self.changes_scope.diff_base(),
+                    name,
+                    path,
+                    generation,
+                })
+            }
             (_, Some(change), _) => Hover::Diff(DiffKey {
                 name,
                 path: change.path.clone(),
@@ -1549,9 +1572,8 @@ impl Model {
         let key = match hover {
             Hover::Diff(key) => Key::Diff(key),
             Hover::Branch(key) => Key::Branch(key),
-            Hover::Turn(_) | Hover::Subagent(..) | Hover::Repo(_) | Hover::Folder(_) => {
-                return None;
-            }
+            Hover::Folder(key) => Key::Folder(key),
+            Hover::Turn(_) | Hover::Subagent(..) | Hover::Repo(_) => return None,
         };
         Some((key, root))
     }

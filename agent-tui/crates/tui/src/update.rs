@@ -77,6 +77,8 @@ pub enum Effect {
     ReadDocument {
         key: Key,
         worktree: PathBuf,
+        /// Diffs already read, for a folder's to take.
+        reuse: Vec<(PathBuf, agent_core::ports::FileDiff)>,
     },
     /// Read what a subagent of an agent working in `workdir` has done.
     ReadSubagent {
@@ -473,7 +475,18 @@ fn read_document(m: &mut Model) -> Option<Effect> {
     let (key, worktree) = m.hovered_document()?;
     let due = m.docs.due(Instant::now())?;
     debug_assert_eq!(due, key);
-    Some(Effect::ReadDocument { key: due, worktree })
+    let reuse = match &due {
+        Key::Folder(folder) => {
+            m.docs
+                .cached_diffs(&folder.name, folder.base, folder.generation, &folder.files)
+        }
+        Key::Diff(_) | Key::Branch(_) => Vec::new(),
+    };
+    Some(Effect::ReadDocument {
+        key: due,
+        worktree,
+        reuse,
+    })
 }
 
 /// Asks for what the subagent under [2]'s cursor has done: when it's first
@@ -4563,6 +4576,7 @@ mod tests {
                 Effect::ReadDocument {
                     key: Key::Diff(key),
                     worktree,
+                    ..
                 } => Some(format!("{} {}", key.path.display(), worktree.display())),
                 _ => None,
             })

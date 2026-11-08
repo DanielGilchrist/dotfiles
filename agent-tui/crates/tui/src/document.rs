@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use agent_core::activity::AgentId;
 use agent_core::model::RepoKey;
 use agent_core::names::SessionName;
-use agent_core::ports::{BranchLog, Compared, DiffBase, FileDiff, Lines};
+use agent_core::ports::{BranchLog, Change, Compared, DiffBase, FileDiff, Lines};
 use ratatui::text::Line;
 
 /// The cursor must rest on a file this long before its diff is asked for, so
@@ -39,13 +39,71 @@ pub struct DiffKey {
     pub generation: u64,
 }
 
-/// A folder in [3]: the files under it are listed from the git facts, so
-/// nothing is read for it.
+/// A folder in [3]: the files under it from the git facts, in the tree's
+/// order, and what their diffs are read against. A newer generation of the
+/// facts is another document.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FolderKey {
     pub name: SessionName,
     pub path: PathBuf,
+    pub files: Vec<Change>,
+    pub base: DiffBase,
     pub generation: u64,
+}
+
+/// Files of a folder whose diffs are read, at most.
+pub const FOLDER_FILES: usize = 20;
+/// Diff lines of a folder kept in all, over its files.
+pub const FOLDER_LINES: usize = 5000;
+
+/// One file's section of a folder's diff.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FolderFile {
+    pub change: Change,
+    pub diff: Result<FileDiff, String>,
+}
+
+/// A folder's diffs: the first files that fit the budget, and how many
+/// were left out.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FolderDocs {
+    pub files: Vec<FolderFile>,
+    pub more_files: usize,
+}
+
+/// The diffs of `files` in order until [`FOLDER_FILES`] files or
+/// [`FOLDER_LINES`] lines are reached. `reuse` holds diffs already read,
+/// and `read` reads the rest.
+pub fn assemble(
+    files: &[Change],
+    mut reuse: Vec<(PathBuf, FileDiff)>,
+    mut read: impl FnMut(&Change) -> Result<FileDiff, String>,
+) -> FolderDocs {
+    let mut out = FolderDocs::default();
+    let mut used = 0;
+    for (at, change) in files.iter().enumerate() {
+        if at >= FOLDER_FILES || used >= FOLDER_LINES {
+            out.more_files = files.len() - at;
+            break;
+        }
+        let mut diff = match reuse.iter().position(|(path, _)| *path == change.path) {
+            Some(i) => Ok(reuse.swap_remove(i).1),
+            None => read(change),
+        };
+        if let Ok(FileDiff::Text { lines, more }) = &mut diff {
+            let room = FOLDER_LINES - used;
+            if lines.len() > room {
+                *more += lines.len() - room;
+                lines.truncate(room);
+            }
+            used += lines.len();
+        }
+        out.files.push(FolderFile {
+            change: change.clone(),
+            diff,
+        });
+    }
+    out
 }
 
 /// A branch's log: whose it is and the counts it was read at, so a branch
@@ -66,6 +124,7 @@ pub struct BranchKey {
 pub enum Key {
     Diff(DiffKey),
     Branch(BranchKey),
+    Folder(FolderKey),
 }
 
 /// What one read answers: an agent's file, or its branch. A newer read for
@@ -77,6 +136,7 @@ impl Key {
         match self {
             Self::Diff(key) => (key.name.clone(), Some(key.path.clone())),
             Self::Branch(key) => (key.name.clone(), None),
+            Self::Folder(key) => (key.name.clone(), Some(key.path.clone())),
         }
     }
 
@@ -84,6 +144,7 @@ impl Key {
         match self {
             Self::Diff(key) => &key.name,
             Self::Branch(key) => &key.name,
+            Self::Folder(key) => &key.name,
         }
     }
 }
@@ -93,14 +154,24 @@ impl Key {
 pub enum Doc {
     Diff(FileDiff),
     Branch(BranchLog),
+    Folder(FolderDocs),
 }
 
 impl Doc {
     /// Roughly how much memory it holds.
     fn bytes(&self) -> usize {
+        let text = |diff: &FileDiff| match diff {
+            FileDiff::Text { lines, .. } => lines.iter().map(String::len).sum(),
+            FileDiff::Binary { .. } => 0,
+        };
         match self {
-            Self::Diff(FileDiff::Text { lines, .. }) => lines.iter().map(String::len).sum(),
-            Self::Diff(FileDiff::Binary { .. }) => 0,
+            Self::Diff(diff) => text(diff),
+            Self::Folder(docs) => docs
+                .files
+                .iter()
+                .filter_map(|f| f.diff.as_ref().ok())
+                .map(text)
+                .sum(),
             Self::Branch(log) => {
                 log.commits.iter().map(String::len).sum::<usize>() + log.uncommitted.len() * 64
             }
@@ -153,7 +224,8 @@ impl Hover {
         match self {
             Self::Diff(key) => Some(Key::Diff(key.clone())),
             Self::Branch(key) => Some(Key::Branch(key.clone())),
-            Self::Turn(_) | Self::Subagent(..) | Self::Repo(_) | Self::Folder(_) => None,
+            Self::Folder(key) => Some(Key::Folder(key.clone())),
+            Self::Turn(_) | Self::Subagent(..) | Self::Repo(_) => None,
         }
     }
 }
@@ -301,6 +373,31 @@ impl Documents {
         {
             self.cache.remove(0);
         }
+    }
+
+    /// Diffs of `files` already read in this base and facts generation, to
+    /// reuse in a folder's.
+    pub fn cached_diffs(
+        &self,
+        name: &SessionName,
+        base: DiffBase,
+        generation: u64,
+        files: &[Change],
+    ) -> Vec<(PathBuf, FileDiff)> {
+        self.cache
+            .iter()
+            .filter_map(|e| match (&e.key, e.loaded.as_ref()) {
+                (Key::Diff(key), Ok(Doc::Diff(diff)))
+                    if key.name == *name && key.base == base && key.generation == generation =>
+                {
+                    files
+                        .iter()
+                        .any(|c| c.path == key.path && c.lines == key.lines)
+                        .then(|| (key.path.clone(), diff.clone()))
+                }
+                _ => None,
+            })
+            .collect()
     }
 
     /// What [0] has for the hovered document.
@@ -650,5 +747,79 @@ mod tests {
             34,
             "returning to a log starts at its tail"
         );
+    }
+
+    fn change(path: &str) -> Change {
+        Change {
+            path: path.into(),
+            lines: Lines::Counted {
+                added: 1,
+                removed: 0,
+            },
+            state: agent_core::ports::FileState::Committed,
+        }
+    }
+
+    fn text(n: usize) -> FileDiff {
+        FileDiff::Text {
+            lines: vec!["+x".into(); n],
+            more: 0,
+        }
+    }
+
+    #[test]
+    fn a_folder_reads_at_most_twenty_files_and_reuses_what_is_already_read() {
+        let files: Vec<Change> = (0..25).map(|i| change(&format!("d/f{i:02}"))).collect();
+        let mut reads = Vec::new();
+        let docs = assemble(&files, vec![("d/f01".into(), text(2))], |c| {
+            reads.push(c.path.clone());
+            Ok(text(1))
+        });
+        assert_eq!(docs.files.len(), FOLDER_FILES);
+        assert_eq!(docs.more_files, 5);
+        assert!(
+            !reads.contains(&PathBuf::from("d/f01")),
+            "the cached one is reused"
+        );
+        assert_eq!(reads.len(), FOLDER_FILES - 1);
+        assert_eq!(docs.files[1].diff, Ok(text(2)));
+    }
+
+    #[test]
+    fn a_folder_stops_at_the_line_budget_and_counts_the_files_left_out() {
+        let files: Vec<Change> = (0..4).map(|i| change(&format!("d/f{i}"))).collect();
+        let docs = assemble(&files, Vec::new(), |_| Ok(text(2000)));
+        assert_eq!(docs.files.len(), 3);
+        assert_eq!(docs.more_files, 1);
+        let last = &docs.files[2].diff;
+        assert!(
+            matches!(last, Ok(FileDiff::Text { lines, more }) if lines.len() == 1000 && *more == 1000),
+            "the file that crosses the budget is cut and says how much"
+        );
+        let failing = assemble(&files[..1], Vec::new(), |_| Err("boom".into()));
+        assert_eq!(failing.files[0].diff, Err("boom".into()));
+    }
+
+    #[test]
+    fn cached_file_diffs_are_offered_only_for_the_same_base_generation_and_counts() {
+        let mut docs = Documents::default();
+        let k = key("d/a", 1);
+        let t0 = Instant::now();
+        docs.settle(Some(&Hover::Diff(k.clone())), t0);
+        let due = docs.due(t0 + REST).expect("due");
+        docs.loaded(&due, Ok(diff("a")));
+        let files = [change("d/a")];
+        let name = k.name.clone();
+        assert_eq!(docs.cached_diffs(&name, DiffBase::Fork, 0, &files).len(), 1);
+        assert_eq!(docs.cached_diffs(&name, DiffBase::Head, 0, &files), []);
+        assert_eq!(docs.cached_diffs(&name, DiffBase::Fork, 1, &files), []);
+        let changed = [Change {
+            lines: Lines::Counted {
+                added: 2,
+                removed: 0,
+            },
+            ..change("d/a")
+        }];
+        assert_eq!(docs.cached_diffs(&name, DiffBase::Fork, 0, &changed), []);
     }
 }
