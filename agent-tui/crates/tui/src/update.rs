@@ -476,7 +476,8 @@ fn acknowledge(m: &mut Model, after: Duration) -> Option<Job> {
     let c = m
         .pane
         .connection()
-        .filter(|c| c.opened.elapsed() >= after)?;
+        .filter(|c| c.opened.elapsed() >= after)
+        .filter(|_| m.terminal_visible())?;
     if m.terminal == TerminalFocus::Unfocused {
         return None;
     }
@@ -685,6 +686,22 @@ fn sanitize_paste(text: &str) -> String {
 /// Keys that choose the panel `j`/`k` act on, and those a panel gives its
 /// own meaning. `None` leaves the key to NAV.
 fn on_panel_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
+    if m.main_focused() {
+        match code {
+            KeyCode::Esc | KeyCode::Char('1' | '2' | '3') => m.focus_main = false,
+            KeyCode::Char('j') | KeyCode::Down => m.docs.scroll_by(1),
+            KeyCode::Char('k') | KeyCode::Up => m.docs.scroll_by(-1),
+            KeyCode::Char('g') | KeyCode::Home => m.docs.scroll_to_start(),
+            KeyCode::Char('G') | KeyCode::End => m.docs.scroll_to_end(),
+            KeyCode::PageDown => m.docs.scroll_by(m.docs.half_page() * 2),
+            KeyCode::PageUp => m.docs.scroll_by(-m.docs.half_page() * 2),
+            KeyCode::Enter | KeyCode::Char('l' | '0') => {}
+            _ => return None,
+        }
+        if !matches!(code, KeyCode::Char('1' | '2' | '3')) {
+            return Some(Vec::new());
+        }
+    }
     match (code, m.panel) {
         (KeyCode::Esc | KeyCode::Char('1'), Panel::Agent { .. } | Panel::Changes { .. }) => {
             m.panel = Panel::Agents;
@@ -715,7 +732,21 @@ fn on_panel_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
             m.panel = Panel::Changes { file: 0 };
             Some(Vec::new())
         }
-        (KeyCode::Char('e') | KeyCode::Enter, Panel::Changes { .. }) => m
+        (KeyCode::Enter | KeyCode::Char('l' | '0'), Panel::Changes { .. })
+            if m.hovered_diff().is_some() =>
+        {
+            m.focus_main = true;
+            Some(Vec::new())
+        }
+        (KeyCode::Char('0'), Panel::Agent { .. }) => {
+            m.info("[2] has no document to open yet");
+            Some(Vec::new())
+        }
+        (KeyCode::Char('0'), Panel::Agents) => m
+            .selected_entry()
+            .map(|e| e.name().clone())
+            .map(|name| activate(m, &name)),
+        (KeyCode::Char('e'), Panel::Changes { .. }) => m
             .file_under_cursor()
             .map(|(root, file)| vec![Effect::Edit(Open::File { root, file })]),
         _ => None,
@@ -744,7 +775,12 @@ fn on_nav_key(m: &mut Model, key: KeyEvent) -> Vec<Effect> {
     }
     match key.code {
         KeyCode::Char('q') => return vec![Effect::Quit],
-        KeyCode::Esc | KeyCode::Char('i') => return enter_agent(m),
+        KeyCode::Esc => return enter_agent(m),
+        KeyCode::Char('i') => {
+            if let Some(entry) = selected {
+                return activate(m, entry.name());
+            }
+        }
         KeyCode::Enter | KeyCode::Char('l') => match (m.cursor().cloned(), selected) {
             (Some(Cursor::Repo(key)), _) => {
                 m.view = View::Focus;
@@ -843,7 +879,7 @@ fn on_nav_key(m: &mut Model, key: KeyEvent) -> Vec<Effect> {
         },
         KeyCode::Char('D') => return request_removal(m),
         KeyCode::Char('a') => {
-            let here = m.pane.session().cloned();
+            let here = m.visible_session().cloned();
             let next = m
                 .needs_you()
                 .into_iter()
@@ -1391,6 +1427,10 @@ fn on_mouse(m: &mut Model, mouse: MouseEvent) -> Vec<Effect> {
             mouse.kind,
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
         );
+        if clicked && m.hovered_diff().is_some() {
+            m.focus_main = true;
+            return Vec::new();
+        }
         if scrolling && m.hovered_diff().is_some() {
             let up = matches!(mouse.kind, MouseEventKind::ScrollUp);
             m.docs.scroll_by(if up { -SCROLL } else { SCROLL });
@@ -3490,5 +3530,123 @@ mod tests {
         m.docs.page = 10;
         update(&mut m, key(KeyCode::Char('J')));
         assert_eq!(m.docs.scroll, 0, "the terminal doesn't scroll from NAV");
+    }
+
+    fn on_changes(name_of: &str) -> Model {
+        let mut m = crate::fixtures::fleet(10);
+        m.set_cursor(Cursor::Entry(name(name_of)));
+        update(&mut m, key(KeyCode::Char('3')));
+        m.docs.page = 10;
+        m
+    }
+
+    fn edits(effects: &[Effect]) -> usize {
+        effects
+            .iter()
+            .filter(|e| matches!(e, Effect::Edit(_)))
+            .count()
+    }
+
+    #[test]
+    fn enter_in_changes_focuses_the_document_and_escape_goes_back_one_level_at_a_time() {
+        let mut m = on_changes("obs-layout-4");
+        assert!(!m.main_focused());
+        let effects = update(&mut m, key(KeyCode::Enter));
+        assert_eq!(edits(&effects), 0, "enter no longer opens the editor");
+        assert!(m.main_focused());
+
+        update(&mut m, key(KeyCode::Char('j')));
+        update(&mut m, key(KeyCode::Char('j')));
+        assert_eq!(
+            m.docs.scroll, 2,
+            "j scrolls the document, not the file list"
+        );
+        assert!(matches!(m.panel, Panel::Changes { file: 0 }));
+        update(&mut m, key(KeyCode::Char('G')));
+        assert_eq!(m.docs.scroll, usize::MAX);
+        update(&mut m, key(KeyCode::Char('g')));
+        assert_eq!(m.docs.scroll, 0);
+        update(&mut m, key(KeyCode::PageDown));
+        assert_eq!(m.docs.scroll, 10, "a page of [0]");
+
+        update(&mut m, key(KeyCode::Esc));
+        assert!(!m.main_focused());
+        assert!(matches!(m.panel, Panel::Changes { file: 0 }), "back to [3]");
+        update(&mut m, key(KeyCode::Char('j')));
+        assert!(
+            matches!(m.panel, Panel::Changes { file: 1 }),
+            "j moves the files again"
+        );
+        update(&mut m, key(KeyCode::Esc));
+        assert_eq!(m.panel, Panel::Agents, "then to [1]");
+    }
+
+    #[test]
+    fn zero_focuses_the_document_from_changes_and_one_gives_the_terminal_back() {
+        let mut m = on_changes("obs-layout-4");
+        update(&mut m, key(KeyCode::Char('0')));
+        assert!(m.main_focused());
+        update(&mut m, key(KeyCode::Char('0')));
+        assert!(m.main_focused(), "nothing more to focus");
+        update(&mut m, key(KeyCode::Char('1')));
+        assert!(!m.main_focused());
+        assert_eq!(m.panel, Panel::Agents);
+        assert!(m.terminal_visible());
+
+        let mut m = on_changes("obs-layout-4");
+        update(&mut m, key(KeyCode::Enter));
+        update(&mut m, key(KeyCode::Char('3')));
+        assert!(!m.main_focused(), "choosing a panel leaves the document");
+        assert!(matches!(m.panel, Panel::Changes { .. }));
+    }
+
+    #[test]
+    fn e_still_opens_the_file_from_changes_and_from_its_document() {
+        let mut m = on_changes("obs-layout-4");
+        assert_eq!(edits(&update(&mut m, key(KeyCode::Char('e')))), 1);
+        update(&mut m, key(KeyCode::Enter));
+        assert_eq!(edits(&update(&mut m, key(KeyCode::Char('e')))), 1);
+    }
+
+    #[test]
+    fn i_types_to_the_selected_agent_from_anywhere_and_keeps_the_place_it_left() {
+        let mut m = on_changes("obs-layout-4");
+        update(&mut m, key(KeyCode::Enter));
+        let effects = update(&mut m, key(KeyCode::Char('i')));
+        assert!(
+            effects.iter().any(|e| matches!(
+                e,
+                Effect::Attach {
+                    intent: Intent::Activate,
+                    ..
+                }
+            )),
+            "i goes to AGENT on the selected agent"
+        );
+        assert!(
+            m.main_focused(),
+            "and the diff is where escape from AGENT returns to"
+        );
+
+        let mut m = crate::fixtures::fleet(10);
+        m.set_cursor(Cursor::Entry(name("obs-layout-4")));
+        let effects = update(&mut m, key(KeyCode::Char('0')));
+        assert!(
+            effects.iter().any(|e| matches!(e, Effect::Attach { .. })),
+            "0 in [1] is AGENT"
+        );
+    }
+
+    #[test]
+    fn an_agents_terminal_counts_as_in_the_pane_only_while_it_shows() {
+        let mut m = crate::fixtures::fleet(10);
+        m.set_cursor(Cursor::Entry(name("obs-layout-4")));
+        m.pane = Pane::Connecting {
+            name: name("obs-layout-4"),
+            ticket: m.ticket(),
+        };
+        assert_eq!(m.visible_session(), Some(&name("obs-layout-4")));
+        update(&mut m, key(KeyCode::Char('3')));
+        assert_eq!(m.visible_session(), None, "its diff is on screen instead");
     }
 }

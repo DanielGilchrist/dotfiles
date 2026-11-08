@@ -5,13 +5,15 @@ use std::time::Instant;
 
 use agent_core::ports::{FileDiff, Lines};
 use ratatui::layout::Rect;
-use ratatui::style::Style;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthChar;
 
 use super::sidebar::{fits_beside, status_line};
-use super::{bold, dim, error, line_width, success, truncate_start};
-use crate::model::Model;
+use super::{
+    bold, dim, error, justify, line_width, success, truncate_end, truncate_start, warning,
+};
+use crate::model::{AgentStatus, Model};
 
 /// [0]'s title, what its top border says on the right, its bottom-right
 /// corner and its rows.
@@ -27,8 +29,15 @@ pub(super) struct Page {
 /// the whole panel's.
 pub(super) fn diff(m: &mut Model, area: Rect, width: usize, border: Style) -> Option<Page> {
     let (hover, _) = m.hovered_diff()?;
-    let height = usize::from(area.height);
     let columns = usize::from(area.width);
+    // An agent that asks takes the top row, since it needs an answer and
+    // the document doesn't. It never switches [0] to the terminal itself.
+    let question = m.selected_entry().and_then(|e| match m.status(e) {
+        AgentStatus::Asking { question, .. } => Some(question),
+        _ => None,
+    });
+    let reserved = if question.is_some() { 2 } else { 0 };
+    let height = usize::from(area.height).saturating_sub(reserved);
     let rows = m
         .docs
         .shown()
@@ -37,7 +46,22 @@ pub(super) fn diff(m: &mut Model, area: Rect, width: usize, border: Style) -> Op
     let top = m.docs.scroll.min(rows.len().saturating_sub(height));
     m.docs.scroll = top;
     m.docs.page = height;
-    let lines: Vec<Line<'static>> = rows.iter().skip(top).take(height).cloned().collect();
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    if let Some(question) = question {
+        let ask = "i answer";
+        let room = columns.saturating_sub(ask.len() + 3);
+        let text = question.lines().next().unwrap_or_default().trim();
+        lines.push(justify(
+            vec![
+                Span::styled("◆ ", warning().add_modifier(Modifier::BOLD)),
+                Span::styled(truncate_end(text, room), warning()),
+            ],
+            vec![Span::raw(ask)],
+            columns,
+        ));
+        lines.push(Line::raw(""));
+    }
+    lines.extend(rows.iter().skip(top).take(height).cloned());
 
     let mut title = vec![
         Span::raw("[0] "),

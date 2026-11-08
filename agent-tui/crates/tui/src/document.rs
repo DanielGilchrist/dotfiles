@@ -118,6 +118,15 @@ impl Documents {
         self.scroll = self.scroll.saturating_add_signed(delta);
     }
 
+    pub fn scroll_to_start(&mut self) {
+        self.scroll = 0;
+    }
+
+    /// Past the last row, which drawing clamps to it.
+    pub fn scroll_to_end(&mut self) {
+        self.scroll = usize::MAX;
+    }
+
     /// Half the rows of [0], at least one.
     pub fn half_page(&self) -> isize {
         isize::try_from(self.page / 2).unwrap_or(isize::MAX).max(1)

@@ -920,6 +920,9 @@ pub struct Model {
     pub subagent_reads: HashMap<SubagentKey, SubagentRead>,
     /// What the main view [0] reads when it isn't the terminal.
     pub docs: Documents,
+    /// Whether the keys go to the document in [0] rather than the panel
+    /// that picked it.
+    pub focus_main: bool,
 }
 
 impl Model {
@@ -971,6 +974,7 @@ impl Model {
             subagent_logs: HashMap::new(),
             subagent_reads: HashMap::new(),
             docs: Documents::default(),
+            focus_main: false,
         }
     }
 
@@ -1104,8 +1108,26 @@ impl Model {
         Some((key, entry.path()?.to_path_buf()))
     }
 
+    /// Whether the keys go to the document in [0].
+    pub fn main_focused(&self) -> bool {
+        self.focus_main && self.hovered_diff().is_some()
+    }
+
+    /// Whether [0] shows the terminal rather than a document.
+    pub fn terminal_visible(&self) -> bool {
+        self.hovered_diff().is_none()
+    }
+
+    /// The agent whose terminal [0] shows, if it shows one.
+    pub fn visible_session(&self) -> Option<&SessionName> {
+        self.pane.session().filter(|_| self.terminal_visible())
+    }
+
     /// Points the main view at what the cursor is on.
     pub fn settle_main(&mut self) {
+        if !matches!(self.panel, Panel::Agent { .. } | Panel::Changes { .. }) {
+            self.focus_main = false;
+        }
         let hover = self.hovered_diff().map(|(key, _)| key);
         self.docs.settle(hover, Instant::now());
     }

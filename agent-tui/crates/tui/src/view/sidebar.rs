@@ -487,7 +487,7 @@ impl<'m> Deck<'m> {
     }
 
     fn in_pane(&self, entry: &Entry) -> bool {
-        self.m.pane.session() == Some(entry.name())
+        self.m.visible_session() == Some(entry.name())
     }
 
     /// Files this agent changed that others in its repo changed too, with
@@ -3323,5 +3323,42 @@ mod tests {
                 .fg,
             Color::Green
         );
+    }
+
+    #[test]
+    fn an_asking_agent_opens_a_banner_over_its_diff_and_a_focused_document_takes_the_border() {
+        let mut m = fleet(10);
+        m.set_cursor(Cursor::Entry(name("rate-limit-9")));
+        m.panel = Focused::Changes { file: 0 };
+        m.settle_main();
+        std::thread::sleep(crate::document::REST + std::time::Duration::from_millis(20));
+        let key = m.docs.due(std::time::Instant::now()).expect("due");
+        m.docs.loaded(
+            &key,
+            Ok(agent_core::ports::FileDiff::Text {
+                lines: vec!["@@ -1 +1 @@".into(), "+added".into()],
+                more: 0,
+            }),
+        );
+        let terminal = render(&mut m, (100, 30));
+        let rows = screen(&terminal);
+        let at = rows
+            .iter()
+            .position(|r| r.contains("i answer"))
+            .expect("a banner");
+        assert!(rows[at].contains("◆ Bash: pnpm test"), "{}", rows[at]);
+        assert!(
+            rows[at + 2].contains("@@ -1 +1 @@"),
+            "the diff follows after a blank row\n{}",
+            rows.join("\n")
+        );
+        let area = m.areas.terminal;
+        let border = |terminal: &Terminal<TestBackend>| {
+            terminal.backend().buffer()[(area.x - 2, area.y - 1)].fg
+        };
+        assert_ne!(border(&terminal), Color::Cyan, "[3] has the keys");
+        m.focus_main = true;
+        let terminal = render(&mut m, (100, 30));
+        assert_eq!(border(&terminal), Color::Cyan, "[0] has them now");
     }
 }

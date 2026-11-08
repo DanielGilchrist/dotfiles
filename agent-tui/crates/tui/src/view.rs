@@ -44,10 +44,13 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
         " NAV ",
         &[
             ("⏎ l", "attach, resurrect or start"),
-            ("Esc i", "back to [1], then to the agent"),
+            ("Esc", "back one level, then to the agent"),
+            ("i", "type to the selected agent, from anywhere"),
+            ("0", "attach from [1], focus [0] from [2] [3]"),
             ("1 2 3", "focus agents, turn, changes"),
             ("j k", "move, or scroll [2] [3]"),
-            ("⌃D ⌃U", "half a page"),
+            ("⌃D ⌃U", "half a page, of [0] from [3]"),
+            ("J K", "scroll [0] from [3]"),
             ("g G", "first / last"),
             ("[ ]", "previous / next repo"),
             (".", "show every checkout, or only those running"),
@@ -329,7 +332,7 @@ pub fn draw(frame: &mut Frame<'_>, m: &mut Model) {
         m.panel = Panel::Agents;
     }
 
-    let pane_focused = matches!(m.focus(), Focus::Agent(_));
+    let pane_focused = matches!(m.focus(), Focus::Agent(_)) || m.main_focused();
     // Padding keeps the agent's own full-width rules off our border. The
     // terminal's rect never depends on what [0] shows, so switching between
     // it and a document never resizes the agent's pty.
@@ -366,7 +369,7 @@ pub fn draw(frame: &mut Frame<'_>, m: &mut Model) {
 }
 
 fn sidebar_focused(m: &Model) -> bool {
-    matches!(m.focus(), Focus::Nav(_))
+    matches!(m.focus(), Focus::Nav(_)) && !m.main_focused()
 }
 
 /// Border styles for the sidebar and pane: Cyan on the panel keys go to,
@@ -375,6 +378,7 @@ fn focus_styles(m: &Model) -> (Style, Style) {
     let accent = accent();
     match m.focus() {
         Focus::Agent(_) => (dim(), accent),
+        Focus::Nav(_) if m.main_focused() => (dim(), accent),
         Focus::Nav(_) => (accent, dim()),
         Focus::Overlay(_) => (dim(), dim()),
     }
@@ -635,18 +639,24 @@ fn draw_status_bar(frame: &mut Frame<'_>, m: &Model, area: Rect) {
         let selected = m.selected();
         let entry = selected.and_then(|(_, e)| e);
         match m.panel {
-            Panel::Changes { .. } => {
-                hints.extend([
-                    ranked("e", "edit file", 8),
-                    ranked("J/K", "scroll", 8),
-                    ranked("Esc", "agents", 7),
-                ]);
-            }
-            Panel::Agent { .. } => hints.push(ranked("Esc", "agents", 7)),
+            _ if m.main_focused() => hints.extend([
+                ranked("j/k", "scroll", 8),
+                ranked("G", "end", 6),
+                ranked("i", "type", 8),
+                ranked("Esc", "back", 9),
+            ]),
+            Panel::Changes { .. } => hints.extend([
+                ranked("⏎", "diff", 9),
+                ranked("J/K", "scroll", 8),
+                ranked("e", "edit", 7),
+                ranked("i", "type", 8),
+                ranked("Esc", "back", 9),
+            ]),
+            Panel::Agent { .. } => hints.extend([ranked("i", "type", 8), ranked("Esc", "back", 9)]),
             Panel::Agents => {}
         }
         match (selected, entry.map(|e| m.reach(e))) {
-            _ if matches!(m.panel, Panel::Changes { .. }) => {}
+            _ if matches!(m.panel, Panel::Changes { .. }) || m.main_focused() => {}
             (Some((_, None)), _) => hints.push(ranked("⏎", "focus", 7)),
             (
                 _,
