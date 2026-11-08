@@ -151,7 +151,7 @@ impl Situation {
             toggle_worth_showing: m.visibility == Visibility::All || m.hidden() > 0,
             next_changes_tab: match m.changes_scope.toggled() {
                 ChangesScope::Uncommitted => "tab: uncommitted",
-                ChangesScope::Since => "tab: since base",
+                ChangesScope::Since => "tab: changes",
             },
             next_tab: match m.view.next() {
                 View::Focus => "tab: repo",
@@ -335,7 +335,7 @@ pub const BINDINGS: &[Binding] = &[
         Ctxs::of(&[Ctx::Changes]),
         RankBy(|_| Some(4)),
         By(|s| Some(s.next_changes_tab)),
-        "Cycle [3]'s tabs: the uncommitted files, counted against the last commit, and everything since the fork from the default branch. The choice lasts for the session.",
+        "Cycle [3]'s tabs: Uncommitted, the files not yet committed, counted against the last commit, and Changes, everything since the fork from the default branch. The choice lasts for the session.",
     ),
     Binding::new(
         &["."],
@@ -667,7 +667,7 @@ mod tests {
             toggle: Some("show all"),
             toggle_worth_showing: true,
             next_tab: "tab: agents",
-            next_changes_tab: "tab: since base",
+            next_changes_tab: "tab: changes",
         }
     }
 
@@ -680,7 +680,7 @@ mod tests {
                 .and_then(|b| b.label_in(&situation(ctx)))
         };
         assert_eq!(label(Ctx::Agents), Some("tab: agents"));
-        assert_eq!(label(Ctx::Changes), Some("tab: since base"));
+        assert_eq!(label(Ctx::Changes), Some("tab: changes"));
         assert_eq!(label(Ctx::Turn), None);
     }
 

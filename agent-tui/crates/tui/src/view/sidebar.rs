@@ -652,8 +652,9 @@ fn tree(
 }
 
 /// The branch row: `↑24 unpushed · 4 uncommitted`, each part left out when
-/// it's zero, then `behind n` when the default branch moved on.
-fn branch_summary(facts: &WorktreeFacts) -> Line<'static> {
+/// it's zero, then `behind n` when the default branch moved on. On the
+/// Changes tab it opens with what it compares against: `vs main · …`.
+fn branch_summary(facts: &WorktreeFacts, scope: ChangesScope) -> Line<'static> {
     let mut parts: Vec<Vec<Span<'static>>> = Vec::new();
     if facts.ahead > 0 {
         parts.push(vec![
@@ -667,12 +668,22 @@ fn branch_summary(facts: &WorktreeFacts) -> Line<'static> {
     if facts.behind > 0 {
         parts.push(vec![Span::raw(format!("behind {}", facts.behind))]);
     }
-    if parts.is_empty() {
-        return Line::raw("nothing to commit or push");
-    }
     let mut spans = Vec::new();
+    if scope == ChangesScope::Since {
+        spans.push(Span::raw(format!(
+            "vs {}",
+            base_name(facts.base.as_deref())
+        )));
+        if parts.is_empty() {
+            spans.push(Span::styled(" · ", dim()));
+        }
+    }
+    if parts.is_empty() {
+        spans.push(Span::raw("nothing to commit or push"));
+        return Line::from(spans);
+    }
     for (i, part) in parts.into_iter().enumerate() {
-        if i > 0 {
+        if i > 0 || scope == ChangesScope::Since {
             spans.push(Span::styled(" · ", dim()));
         }
         spans.extend(part);
@@ -882,8 +893,6 @@ struct Changes {
     diff: DiffStat,
     shared: usize,
     scope: ChangesScope,
-    /// What the second tab is called.
-    since: String,
 }
 
 /// The list's lines with the row each belongs to, the selected card's
@@ -1134,7 +1143,9 @@ impl Work<'_> {
 fn work_of<'m>(m: &'m Model, entry: &Entry) -> Option<Work<'m>> {
     match m.facts.get(entry.name()) {
         Some(Ok(facts)) => {
-            let head = m.branch_row().then(|| branch_summary(facts));
+            let head = m
+                .branch_row()
+                .then(|| branch_summary(facts, m.changes_scope));
             let list = m.change_list();
             (!list.is_empty() || head.is_some()).then_some(Work::Facts { facts, head, list })
         }
@@ -1251,7 +1262,6 @@ fn lower_panels(deck: &Deck<'_>, repo: &Repo, entry: &Entry, area: Rect) -> Lowe
                     diff: DiffStat::default(),
                     shared: 0,
                     scope: m.changes_scope,
-                    since: since_label(None),
                 },
             ),
         }
@@ -1283,22 +1293,22 @@ fn summary(
         },
         shared: shared.len(),
         scope,
-        since: since_label(facts.base.as_deref()),
     }
 }
 
-/// The second tab of [3]: `Since main`.
-fn since_label(base: Option<&str>) -> String {
-    format!("Since {}", base.unwrap_or("fork"))
+/// What the Changes tab compares against: `main`, or `fork` when git can't
+/// name the default branch.
+fn base_name(base: Option<&str>) -> &str {
+    base.unwrap_or("fork")
 }
 
 /// `[3]` then its tabs as [1]'s title has them: the active one BOLD, a DIM
 /// `·` between. They all show while they fit `width`, else only the active
 /// one, so moving the cursor never changes the form.
-fn changes_tabs(scope: ChangesScope, since: &str, width: usize) -> Vec<Span<'static>> {
+fn changes_tabs(scope: ChangesScope, width: usize) -> Vec<Span<'static>> {
     let tabs = [
         (ChangesScope::Uncommitted, "Uncommitted".to_string()),
-        (ChangesScope::Since, since.to_string()),
+        (ChangesScope::Since, "Changes".to_string()),
     ];
     let all = 4 + tabs.iter().map(|(_, n)| n.width()).sum::<usize>() + 3 * (tabs.len() - 1);
     if width < all {
@@ -1498,11 +1508,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, m: &mut Model, area: Rect, border: Sty
     }
     if let Some((Panel { area, lines }, changes)) = laid.changes {
         let (added, removed) = counts_text(changes.diff.added, changes.diff.removed);
-        let mut title = changes_tabs(
-            changes.scope,
-            &changes.since,
-            usize::from(area.width).saturating_sub(4),
-        );
+        let mut title = changes_tabs(changes.scope, usize::from(area.width).saturating_sub(4));
         for (count, colour) in [(added, palette().success), (removed, palette().error)] {
             if !count.is_empty() {
                 title.push(Span::raw(" "));
@@ -1702,12 +1708,15 @@ mod tests {
     #[test]
     fn the_branch_row_reads_unpushed_and_uncommitted_and_leaves_out_zeros() {
         let read = |ahead, dirty, behind| {
-            text(&branch_summary(&WorktreeFacts {
-                ahead,
-                dirty,
-                behind,
-                ..WorktreeFacts::default()
-            }))
+            text(&branch_summary(
+                &WorktreeFacts {
+                    ahead,
+                    dirty,
+                    behind,
+                    ..WorktreeFacts::default()
+                },
+                ChangesScope::Uncommitted,
+            ))
         };
         assert_eq!(read(24, 4, 0), "↑24 unpushed · 4 uncommitted");
         assert_eq!(read(0, 2, 0), "2 uncommitted");
@@ -1717,22 +1726,51 @@ mod tests {
     }
 
     #[test]
+    fn the_changes_tab_row_names_what_it_compares_against() {
+        let read = |base: Option<&str>, ahead, dirty, behind| {
+            text(&branch_summary(
+                &WorktreeFacts {
+                    ahead,
+                    dirty,
+                    behind,
+                    base: base.map(Into::into),
+                    ..WorktreeFacts::default()
+                },
+                ChangesScope::Since,
+            ))
+        };
+        assert_eq!(
+            read(Some("main"), 24, 4, 0),
+            "vs main · ↑24 unpushed · 4 uncommitted"
+        );
+        assert_eq!(
+            read(Some("main"), 0, 2, 3),
+            "vs main · 2 uncommitted · behind 3"
+        );
+        assert_eq!(
+            read(Some("main"), 0, 0, 0),
+            "vs main · nothing to commit or push"
+        );
+        assert_eq!(read(None, 1, 0, 0), "vs fork · ↑1 unpushed");
+    }
+
+    #[test]
     fn changes_title_shows_both_tabs_while_they_fit_and_only_the_active_one_below_that() {
         use crate::tree::ChangesScope::{Since, Uncommitted};
-        let title = |scope, width| text(&Line::from(changes_tabs(scope, "Since main", width)));
-        assert_eq!(title(Uncommitted, 40), "[3] Uncommitted · Since main");
-        assert_eq!(title(Since, 28), "[3] Uncommitted · Since main");
-        assert_eq!(title(Uncommitted, 27), "[3] Uncommitted");
-        assert_eq!(title(Since, 27), "[3] Since main");
+        let title = |scope, width| text(&Line::from(changes_tabs(scope, width)));
+        assert_eq!(title(Uncommitted, 40), "[3] Uncommitted · Changes");
+        assert_eq!(title(Since, 25), "[3] Uncommitted · Changes");
+        assert_eq!(title(Uncommitted, 24), "[3] Uncommitted");
+        assert_eq!(title(Since, 24), "[3] Changes");
         let bold_of = |scope| {
-            changes_tabs(scope, "Since main", 40)
+            changes_tabs(scope, 40)
                 .into_iter()
                 .filter(|s| s.style.add_modifier.contains(Modifier::BOLD))
                 .map(|s| s.content.to_string())
                 .collect::<Vec<_>>()
         };
         assert_eq!(bold_of(Uncommitted), ["Uncommitted"]);
-        assert_eq!(bold_of(Since), ["Since main"]);
+        assert_eq!(bold_of(Since), ["Changes"]);
     }
 
     #[test]
@@ -1768,7 +1806,10 @@ mod tests {
             m.toggle_changes_scope();
         }
         assert_eq!(shown[0].0, " ↑24 unpushed · 4 uncommitted");
-        assert_eq!(shown[1].0, shown[0].0, "the branch row leads both tabs");
+        assert_eq!(
+            shown[1].0, " vs main · ↑24 unpushed · 4 uncommitted",
+            "the branch row leads both tabs"
+        );
         assert_eq!(shown[0].1, 1);
         assert_eq!((shown[0].2, shown[0].3), (2, 0));
         assert_eq!(shown[0].4, 2, "the branch row and one file");
