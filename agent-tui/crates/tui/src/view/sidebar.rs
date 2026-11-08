@@ -10,7 +10,7 @@ use std::time::SystemTime;
 use agent_core::activity::Subagent;
 use agent_core::model::{Entry, Head, Repo, RepoKey, Snapshot};
 use agent_core::names::SessionName;
-use agent_core::ports::{DiffStat, Lines, Readiness, WorktreeFacts};
+use agent_core::ports::{DiffStat, Readiness, WorktreeFacts};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
@@ -27,6 +27,7 @@ use crate::model::{
     AgentStatus, Cursor, Doing, Extent, Failure, Fold, ListScroll, Model, Panel as Focused, Place,
     Pulse, Row, Target, WorkRoom,
 };
+use crate::tree::{Counts, Node, TreeRow};
 
 /// Rows [2] keeps inside its border however long the list is.
 const DETAIL_MIN: usize = 4;
@@ -681,7 +682,7 @@ fn readiness(readiness: Readiness) -> Line<'static> {
 }
 
 /// `+a −r`, leaving out a side that's zero.
-fn counts(added: usize, removed: usize) -> (String, String) {
+fn counts_text(added: usize, removed: usize) -> (String, String) {
     let added = if added > 0 {
         format!("+{added}")
     } else {
@@ -707,41 +708,54 @@ fn tail(path: &str, width: usize) -> String {
         .unwrap_or_else(|| truncate_start(basename(path), width))
 }
 
-/// [3]'s rows: `head` (the readiness row) when there is one, then a row per
-/// changed file in `diff --numstat` order with its counts in columns, each
-/// after a gutter. A file in `shared` (one another agent changed too)
-/// carries a Yellow `∩` before its counts. With a cursor (a row index) the
-/// rows scroll to keep it in view and its gutter is marked. Without one the
-/// last row says how many more when they don't all fit in `rows`.
+/// The counts at the right of a row: `+a` and `−r`, or `new` or `bin` when
+/// no line counts exist. A folder's are DIM.
+fn count_cells(counts: Counts, folder: bool) -> (Span<'static>, String) {
+    let (added, removed) = counts_text(counts.added, counts.removed);
+    if added.is_empty() && removed.is_empty() {
+        let word = if counts.new > 0 {
+            "new"
+        } else if counts.binary > 0 {
+            "bin"
+        } else {
+            ""
+        };
+        return (Span::styled(word, dim()), String::new());
+    }
+    let style = if folder { dim() } else { success() };
+    (Span::styled(added, style), removed)
+}
+
+/// [3]'s rows: `head` (the readiness row) when there is one, then `list`,
+/// the changed files flat in `diff --numstat` order or as a tree of
+/// folders, with counts in columns, each after a gutter. A file in `shared`
+/// (one another agent changed too) carries a Yellow `∩` before its counts.
+/// With a cursor (a row index) the rows scroll to keep it in view and its
+/// gutter is marked. Without one the last row says how many more when they
+/// don't all fit in `rows`.
 fn changes(
-    facts: &WorktreeFacts,
+    list: &[TreeRow],
     shared: &HashMap<PathBuf, Vec<&Entry>>,
     head: Option<Line<'static>>,
     width: usize,
     rows: usize,
     cursor: Option<usize>,
 ) -> Vec<Line<'static>> {
-    let changed = &facts.changed;
     let gutter = |row: usize| match cursor {
         Some(at) if at == row => Span::styled("▌", accent()),
         _ => Span::raw(" "),
     };
-    let green = success();
     let red = error();
-    let columns: Vec<(Span<'static>, String)> = changed
+    let columns: Vec<(Span<'static>, String)> = list
         .iter()
-        .map(|change| match change.lines {
-            Lines::Counted { added, removed } => {
-                let (added, removed) = counts(added, removed);
-                (Span::styled(added, green), removed)
-            }
-            Lines::Binary => (Span::styled("bin", dim()), String::new()),
-            Lines::Untracked => (Span::styled("new", dim()), String::new()),
-        })
+        .map(|row| count_cells(row.counts, matches!(row.node, Node::Folder { .. })))
         .collect();
     let added_width = columns.iter().map(|(a, _)| a.width()).max().unwrap_or(0);
     let removed_width = columns.iter().map(|(_, r)| r.width()).max().unwrap_or(0);
-    let any_shared = changed.iter().any(|c| shared.contains_key(&c.path));
+    let is_shared =
+        |row: &TreeRow| matches!(row.node, Node::File(_)) && shared.contains_key(&row.path);
+    let any_shared = list.iter().any(is_shared);
+    let tree = list.iter().any(|r| matches!(r.node, Node::Folder { .. }));
     let skip = usize::from(head.is_some());
     let mut all: Vec<Line<'static>> = Vec::new();
     if let Some(head) = head {
@@ -749,9 +763,10 @@ fn changes(
         line.spans[0] = gutter(0);
         all.push(line);
     }
-    for (i, (change, (added, removed))) in changed.iter().zip(columns).enumerate() {
+    for (i, (row, (added, removed))) in list.iter().zip(columns).enumerate() {
+        let folder = matches!(row.node, Node::Folder { .. });
         let mut right = Vec::new();
-        if shared.contains_key(&change.path) {
+        if is_shared(row) {
             right.push(Span::styled("∩ ", warning()));
         } else if any_shared {
             right.push(Span::raw("  "));
@@ -761,11 +776,32 @@ fn changes(
             added.style,
         ));
         if removed_width > 0 {
-            right.push(Span::styled(format!(" {removed:<removed_width$}"), red));
+            let style = if folder { dim() } else { red };
+            right.push(Span::styled(format!(" {removed:<removed_width$}"), style));
         }
         let room = width.saturating_sub(line_width(&right) + 1);
-        let path = tail(&change.path.to_string_lossy(), room);
-        let mut line = justify(vec![Span::raw(path)], right, width);
+        let left = match row.node {
+            Node::Folder { open } => {
+                let arrow = if open { "▼ " } else { "▶ " };
+                let indent = "  ".repeat(row.depth);
+                let label = truncate_start(
+                    &row.label,
+                    room.saturating_sub(indent.width() + arrow.width()),
+                );
+                vec![
+                    Span::raw(indent),
+                    Span::styled(arrow, dim()),
+                    Span::raw(label),
+                ]
+            }
+            Node::File(_) if tree => {
+                let indent = "  ".repeat(row.depth);
+                let label = truncate_start(&row.label, room.saturating_sub(indent.width() + 2));
+                vec![Span::raw(format!("{indent}  {label}"))]
+            }
+            Node::File(_) => vec![Span::raw(tail(&row.label, room))],
+        };
+        let mut line = justify(left, right, width);
         line.spans.insert(0, gutter(skip + i));
         all.push(line);
     }
@@ -1037,6 +1073,7 @@ enum Work<'a> {
     Facts {
         facts: &'a WorktreeFacts,
         head: Option<Line<'static>>,
+        list: Vec<TreeRow>,
     },
     Unreadable(String),
 }
@@ -1045,7 +1082,7 @@ impl Work<'_> {
     /// The rows [3]'s cursor can be on.
     fn rows(&self) -> usize {
         match self {
-            Self::Facts { facts, head } => usize::from(head.is_some()) + facts.changed.len(),
+            Self::Facts { head, list, .. } => usize::from(head.is_some()) + list.len(),
             Self::Unreadable(_) => 1,
         }
     }
@@ -1056,7 +1093,8 @@ fn work_of<'m>(m: &'m Model, entry: &Entry) -> Option<Work<'m>> {
     match m.facts.get(entry.name()) {
         Some(Ok(facts)) => {
             let head = m.branch_row().then(|| readiness(facts.readiness()));
-            (!facts.changed.is_empty() || head.is_some()).then_some(Work::Facts { facts, head })
+            let list = m.change_list();
+            (!list.is_empty() || head.is_some()).then_some(Work::Facts { facts, head, list })
         }
         Some(Err(e)) => Some(Work::Unreadable(format!("git: {}", first_line(e).0))),
         None => None,
@@ -1154,9 +1192,9 @@ fn lower_panels(deck: &Deck<'_>, repo: &Repo, entry: &Entry, area: Rect) -> Lowe
             .map(|i| (top + u16::try_from(i).unwrap_or(0), first + i))
             .collect();
         match work {
-            Work::Facts { facts, head } => {
+            Work::Facts { facts, head, list } => {
                 let shared = deck.overlaps(repo, entry);
-                let lines = changes(facts, &shared, head, deck.content, inside, cursor);
+                let lines = changes(&list, &shared, head, deck.content, inside, cursor);
                 (Panel { area, lines }, summary(facts, &shared))
             }
             Work::Unreadable(text) => (
@@ -1367,7 +1405,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, m: &mut Model, area: Rect, border: Sty
         frame.render_widget(Paragraph::new(lines).block(block), area);
     }
     if let Some((Panel { area, lines }, changes)) = laid.changes {
-        let (added, removed) = counts(changes.diff.added, changes.diff.removed);
+        let (added, removed) = counts_text(changes.diff.added, changes.diff.removed);
         let mut title = vec![Span::raw("[3] "), Span::styled("Changes", bold())];
         for (count, colour) in [(added, palette().success), (removed, palette().error)] {
             if !count.is_empty() {
@@ -1411,6 +1449,16 @@ pub(super) fn pad_title(mut spans: Vec<Span<'static>>) -> Vec<Span<'static>> {
 
 #[cfg(test)]
 mod tests {
+    use agent_core::ports::Lines;
+
+    fn flat(facts: &WorktreeFacts) -> Vec<TreeRow> {
+        crate::tree::build(
+            &facts.changed,
+            crate::tree::ChangesView::Flat,
+            &std::collections::HashSet::new(),
+        )
+    }
+
     use std::collections::{HashMap, HashSet};
 
     use agent_core::activity::{AgentId, State};
@@ -1633,7 +1681,7 @@ mod tests {
         let facts = facts();
         let none = HashMap::new();
         assert_eq!(
-            texts(&changes(&facts, &none, None, 34, 4, None)),
+            texts(&changes(&flat(&facts), &none, None, 34, 4, None)),
             [
                 " src/payroll/calc.ts        +98 −52",
                 " src/payroll/calc.test.ts   +24    ",
@@ -1641,9 +1689,9 @@ mod tests {
                 " notes.md                   new    ",
             ]
         );
-        let short = changes(&facts, &none, None, 34, 3, None);
+        let short = changes(&flat(&facts), &none, None, 34, 3, None);
         assert_eq!(texts(&short)[2], " +2 more");
-        let cursor = changes(&facts, &none, None, 34, 2, Some(3));
+        let cursor = changes(&flat(&facts), &none, None, 34, 2, Some(3));
         assert_eq!(
             texts(&cursor),
             [
@@ -2139,7 +2187,7 @@ mod tests {
             .entry(&name("auth-refresh-2"))
             .expect("in the fleet");
         let shared = HashMap::from([(PathBuf::from("logo.png"), vec![entry])]);
-        let lines = texts(&changes(&facts, &shared, None, 34, 4, None));
+        let lines = texts(&changes(&flat(&facts), &shared, None, 34, 4, None));
         let column = |line: &str, at: &str| {
             line.find(at)
                 .map(|byte| line[..byte].chars().count())
@@ -2883,5 +2931,113 @@ mod tests {
         for expected in ["attach", "edit checkout", "send", "peek", "switch", "new"] {
             assert!(text.contains(expected), "{expected}\n{text}");
         }
+    }
+
+    fn tree_fleet() -> Model {
+        let mut m = fleet(10);
+        m.set_cursor(Cursor::Entry(name("obs-layout-4")));
+        m.changes_view = crate::tree::ChangesView::Tree;
+        let Some(Ok(facts)) = m.facts.get_mut(&name("obs-layout-4")) else {
+            panic!("facts")
+        };
+        facts.changed = [
+            ("crates/tui/src/lib.rs", 2, 1),
+            ("crates/tui/src/model.rs", 10, 2),
+            ("crates/tui/src/view/sidebar.rs", 4, 0),
+            ("docs/design.md", 1, 1),
+        ]
+        .into_iter()
+        .map(|(p, added, removed)| agent_core::ports::Change {
+            path: p.into(),
+            lines: Lines::Counted { added, removed },
+        })
+        .collect();
+        m
+    }
+
+    #[test]
+    fn the_tree_compresses_chains_indents_and_sums_folder_counts() {
+        let mut m = tree_fleet();
+        let text = screen(&render(&mut m, (100, 50))).join("\n");
+        assert!(text.contains("▼ crates/tui/src"), "{text}");
+        assert!(text.contains("▼ view"), "{text}");
+        assert!(text.contains("▼ docs"), "{text}");
+        assert!(text.contains("+16 −3"), "the folder sums its files\n{text}");
+        let rows = screen(&render(&mut m, (100, 50)));
+        let indent = |needle: &str| rows.iter().find_map(|r| r.find(needle)).expect(needle);
+        assert!(indent("lib.rs") > indent("crates/tui/src") - 2);
+        assert!(indent("sidebar.rs") > indent("lib.rs"));
+    }
+
+    #[test]
+    fn folder_counts_are_dim_and_file_counts_are_coloured() {
+        let mut m = tree_fleet();
+        let terminal = render(&mut m, (100, 50));
+        let buffer = terminal.backend().buffer();
+        let rows = screen(&terminal);
+        let at = |needle: &str| {
+            let y = rows.iter().position(|r| r.contains(needle)).expect(needle);
+            let x = rows[y].rfind('+').expect("a count");
+            buffer[(u16::try_from(x).expect("x"), u16::try_from(y).expect("y"))].clone()
+        };
+        let folder = at("▼ crates/tui/src");
+        let file = at("lib.rs");
+        assert_ne!(folder.fg, file.fg);
+    }
+
+    #[test]
+    fn a_folder_in_main_lists_the_files_under_it_with_counts() {
+        let mut m = tree_fleet();
+        m.panel = Focused::Changes { file: 1 };
+        let text = screen(&render(&mut m, (140, 40))).join("\n");
+        assert!(text.contains("[0] crates/tui/src/"), "{text}");
+        assert!(text.contains("3 files"), "{text}");
+        assert!(text.contains("view/sidebar.rs"), "{text}");
+        assert!(
+            !text.contains("docs/design.md ") || !text.contains("design.md  +1"),
+            "only its own files"
+        );
+    }
+
+    #[test]
+    fn clicks_and_the_wheel_work_on_tree_rows() {
+        let mut m = tree_fleet();
+        render(&mut m, (100, 50));
+        let (y, row) = m.areas.change_rows[3];
+        assert_eq!(row, 3);
+        click(&mut m, 5, y, left());
+        assert_eq!(m.panel, Focused::Changes { file: 3 });
+        assert_eq!(
+            m.change_row(3).map(|r| r.label),
+            Some("sidebar.rs".to_string())
+        );
+        assert!(matches!(m.hover(), Some(crate::document::Hover::Diff(_))));
+        let (y, _) = m.areas.change_rows[1];
+        click(&mut m, 5, y, left());
+        assert!(matches!(m.hover(), Some(crate::document::Hover::Folder(_))));
+        click(&mut m, 5, y, crossterm::event::MouseEventKind::ScrollDown);
+        assert_eq!(m.panel, Focused::Changes { file: 2 });
+    }
+
+    #[test]
+    fn a_folded_folder_shows_a_closed_arrow_and_the_rows_below_move_up() {
+        let mut m = tree_fleet();
+        m.panel = Focused::Changes { file: 1 };
+        crate::update::update(
+            &mut m,
+            crate::worker::Msg::Key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Enter,
+                crossterm::event::KeyModifiers::NONE,
+            )),
+        );
+        let rows = screen(&render(&mut m, (100, 50)));
+        let text = rows
+            .iter()
+            .map(|r| r.chars().take(30).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("▶ crates/tui/src"), "{text}");
+        assert!(!text.contains("lib.rs"), "{text}");
+        assert!(text.contains("▼ docs"), "{text}");
     }
 }

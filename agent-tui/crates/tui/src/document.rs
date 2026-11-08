@@ -36,6 +36,15 @@ pub struct DiffKey {
     pub generation: u64,
 }
 
+/// A folder in [3]: the files under it are listed from the git facts, so
+/// nothing is read for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FolderKey {
+    pub name: SessionName,
+    pub path: PathBuf,
+    pub generation: u64,
+}
+
 /// A branch's log: whose it is and the counts it was read at, so a branch
 /// that gained a commit or a dirty file is a different document.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,6 +111,8 @@ pub enum Hover {
     Diff(DiffKey),
     /// [3]'s readiness row.
     Branch(BranchKey),
+    /// A folder in [3].
+    Folder(FolderKey),
     /// [2]'s turn row.
     Turn(SessionName),
     /// A subagent row in [2].
@@ -115,6 +126,7 @@ pub enum Hover {
 enum Item {
     File(SessionName, PathBuf),
     Branch(SessionName),
+    Folder(SessionName, PathBuf),
     Turn(SessionName),
     Subagent(SessionName, AgentId),
     Repo(RepoKey),
@@ -125,6 +137,7 @@ impl Hover {
         match self {
             Self::Diff(key) => Item::File(key.name.clone(), key.path.clone()),
             Self::Branch(key) => Item::Branch(key.name.clone()),
+            Self::Folder(key) => Item::Folder(key.name.clone(), key.path.clone()),
             Self::Turn(name) => Item::Turn(name.clone()),
             Self::Subagent(name, id) => Item::Subagent(name.clone(), id.clone()),
             Self::Repo(key) => Item::Repo(key.clone()),
@@ -136,7 +149,7 @@ impl Hover {
         match self {
             Self::Diff(key) => Some(Key::Diff(key.clone())),
             Self::Branch(key) => Some(Key::Branch(key.clone())),
-            Self::Turn(_) | Self::Subagent(..) | Self::Repo(_) => None,
+            Self::Turn(_) | Self::Subagent(..) | Self::Repo(_) | Self::Folder(_) => None,
         }
     }
 }

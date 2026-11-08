@@ -7,18 +7,18 @@ use std::time::Instant;
 use agent_core::activity::AgentId;
 use agent_core::model::{Head, RepoKey};
 use agent_core::names::SessionName;
-use agent_core::ports::{BranchLog, FileDiff, Lines, LogEntry};
+use agent_core::ports::{BranchLog, Change, FileDiff, Lines, LogEntry};
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use unicode_width::UnicodeWidthChar;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::sidebar::{fits_beside, others_on, status_line, subagent_rows, turn_message};
 use super::{
     ago, bold, dim, error, fit, justify, line_width, spinner, success, truncate_end,
     truncate_start, warning, wrap,
 };
-use crate::document::{BranchKey, DiffKey, Doc, Hover, Resolved};
+use crate::document::{BranchKey, DiffKey, Doc, FolderKey, Hover, Resolved};
 use crate::model::{AgentStatus, Model};
 
 /// [0]'s title, what its top border says on the right, its bottom-right
@@ -85,6 +85,7 @@ pub(super) fn page(m: &mut Model, area: Rect, width: usize, border: Style) -> Op
     let body = match &hover {
         Hover::Diff(key) => diff_body(m, key, columns, budget),
         Hover::Branch(key) => branch_body(m, key, columns),
+        Hover::Folder(key) => folder_body(m, key, columns, budget),
         Hover::Turn(name) => turn_body(m, name, columns)?,
         Hover::Subagent(name, id) => log_body(m, name, id, columns),
         Hover::Repo(key) => repo_body(m, key, columns)?,
@@ -229,6 +230,89 @@ fn diff_body(m: &mut Model, hover: &DiffKey, columns: usize, budget: usize) -> B
         tails: false,
         loading: false,
     }
+}
+
+/// A folder: the files changed under it with their counts. The list comes
+/// from the git facts already read, so nothing waits on git (a combined
+/// diff would be one more read per folder).
+fn folder_body(m: &Model, key: &FolderKey, columns: usize, budget: usize) -> Body {
+    let files: Vec<&Change> = m
+        .changes()
+        .iter()
+        .filter(|c| c.path.starts_with(&key.path))
+        .collect();
+    let (mut added, mut removed) = (0, 0);
+    let cells: Vec<(String, Span<'static>, String)> = files
+        .iter()
+        .map(|c| {
+            let rel = c
+                .path
+                .strip_prefix(&key.path)
+                .unwrap_or(&c.path)
+                .to_string_lossy()
+                .into_owned();
+            match c.lines {
+                Lines::Counted {
+                    added: a,
+                    removed: r,
+                } => {
+                    added += a;
+                    removed += r;
+                    (
+                        rel,
+                        Span::styled(
+                            if a > 0 {
+                                format!("+{a}")
+                            } else {
+                                String::new()
+                            },
+                            success(),
+                        ),
+                        if r > 0 {
+                            format!("−{r}")
+                        } else {
+                            String::new()
+                        },
+                    )
+                }
+                Lines::Binary => (rel, Span::styled("bin", dim()), String::new()),
+                Lines::Untracked => (rel, Span::styled("new", dim()), String::new()),
+            }
+        })
+        .collect();
+    let plus = cells.iter().map(|(_, a, _)| a.width()).max().unwrap_or(0);
+    let minus = cells.iter().map(|(_, _, r)| r.width()).max().unwrap_or(0);
+    let rows: Vec<Line<'static>> = cells
+        .into_iter()
+        .map(|(rel, a, r)| {
+            let mut right = vec![Span::styled(format!("{:>plus$}", a.content), a.style)];
+            if minus > 0 {
+                right.push(Span::styled(format!(" {r:<minus$}"), error()));
+            }
+            let room = columns.saturating_sub(line_width(&right) + 1);
+            justify(vec![Span::raw(truncate_start(&rel, room))], right, columns)
+        })
+        .collect();
+    let mut title = vec![
+        Span::raw("[0] "),
+        Span::styled(
+            truncate_start(
+                &format!("{}/", key.path.display()),
+                budget.saturating_sub(24).max(12),
+            ),
+            bold(),
+        ),
+        Span::styled(format!(" {} files", files.len()), dim()),
+    ];
+    for (count, text, style) in [
+        (added, format!(" +{added}"), success()),
+        (removed, format!(" −{removed}"), error()),
+    ] {
+        if count > 0 {
+            title.push(Span::styled(text, style));
+        }
+    }
+    Body::built(title, rows)
 }
 
 /// The branch: how far it is from shipping, its commits and the files not

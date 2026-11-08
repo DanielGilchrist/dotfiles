@@ -58,7 +58,7 @@ types into the embedded session. `?` shows every key.
 
 | Key | Action |
 |---|---|
-| `⏎` | In [1], attach the agent (start or resurrect it if needed) or focus the repo. In [2] and [3], open the item in [0]. In the peek, attach |
+| `⏎` | In [1], attach the agent (start or resurrect it if needed) or focus the repo. In [2] and [3], open the item in [0] (on a folder in [3], open or close it). In the peek, attach |
 | `i` | Attach the selected agent from any panel |
 | `0` | Same as `⏎` in [1], [2] and [3] |
 | `s` | Send a message without attaching: now if the agent is at rest, otherwise queued. `⌃X` clears the queue (`t` says `send is s now`) |
@@ -79,7 +79,9 @@ types into the embedded session. `?` shows every key.
 | `n` | New agent form: prompt (`⌃E` edits it in $EDITOR), name (suggested from the prompt or a Linear/GitHub link), repo (listed, from the catalogue, or a path) |
 | `c` | Check out for review: a branch name or a GitHub PR link, name (suggested from it), repo (a PR link picks the repo it names). Fetches the branch if git doesn't know it, asks `gh` for a PR's branch (a fork's PR lands on a `pr/N` branch), and attaches instead if an agent already has the branch checked out |
 | `p` | Repo picker: `⏎` focuses a listed repo, or adds one from the catalogue or by a typed path (`~/code/foo`) |
-| `e` | Edit: the agent's checkout in $EDITOR, in [3] the file under the cursor, in [2] a subagent's transcript |
+| `` ` `` | In [3], switch between the directory tree (default) and the flat file list |
+| `-` `=` | In [3]'s tree, close / open every folder |
+| `e` | Edit: the agent's checkout in $EDITOR, in [3] the file (or folder) under the cursor, in [2] a subagent's transcript |
 | `d` / `D` | Kill the session / remove session, worktree and branch (confirms, lists anything that would be lost) |
 | `x` | Run a configured action on the selected agent (see below) |
 | `a` | Attach the agent that needs you most (asking, failed, then finished) |

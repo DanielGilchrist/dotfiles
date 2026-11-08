@@ -1,0 +1,295 @@
+//! [3]'s rows: the changed files flat in numstat order, or as a directory
+//! tree with folders first and single-child folder chains on one row.
+
+use std::collections::{BTreeMap, HashSet};
+use std::path::{Path, PathBuf};
+
+use agent_core::ports::{Change, Lines};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ChangesView {
+    #[default]
+    Tree,
+    Flat,
+}
+
+impl ChangesView {
+    pub fn toggled(self) -> Self {
+        match self {
+            Self::Tree => Self::Flat,
+            Self::Flat => Self::Tree,
+        }
+    }
+}
+
+/// Lines changed under a row: the counted files' sums, and how many files
+/// are new or binary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Counts {
+    pub added: usize,
+    pub removed: usize,
+    pub new: usize,
+    pub binary: usize,
+}
+
+impl Counts {
+    fn of(change: &Change) -> Self {
+        match change.lines {
+            Lines::Counted { added, removed } => Self {
+                added,
+                removed,
+                ..Self::default()
+            },
+            Lines::Binary => Self {
+                binary: 1,
+                ..Self::default()
+            },
+            Lines::Untracked => Self {
+                new: 1,
+                ..Self::default()
+            },
+        }
+    }
+
+    fn plus(self, other: Self) -> Self {
+        Self {
+            added: self.added + other.added,
+            removed: self.removed + other.removed,
+            new: self.new + other.new,
+            binary: self.binary + other.binary,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Node {
+    /// The change at this index of the agent's changed files.
+    File(usize),
+    Folder {
+        open: bool,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TreeRow {
+    pub node: Node,
+    pub depth: usize,
+    /// A file's name, or a folder's chain of names (`crates/tui/src`).
+    pub label: String,
+    /// The whole path from the checkout's root.
+    pub path: PathBuf,
+    pub counts: Counts,
+}
+
+#[derive(Default)]
+struct Dir {
+    dirs: BTreeMap<String, Dir>,
+    files: Vec<(String, usize)>,
+}
+
+impl Dir {
+    fn counts(&self, changes: &[Change]) -> Counts {
+        let own = self.files.iter().fold(Counts::default(), |c, (_, i)| {
+            c.plus(Counts::of(&changes[*i]))
+        });
+        self.dirs
+            .values()
+            .fold(own, |c, d| c.plus(d.counts(changes)))
+    }
+}
+
+fn emit(
+    dir: &Dir,
+    base: &Path,
+    depth: usize,
+    changes: &[Change],
+    collapsed: &HashSet<PathBuf>,
+    out: &mut Vec<TreeRow>,
+) {
+    for (name, child) in &dir.dirs {
+        let mut label = name.clone();
+        let mut path = base.join(name);
+        let mut child = child;
+        while child.files.is_empty() && child.dirs.len() == 1 {
+            let Some((next, only)) = child.dirs.iter().next() else {
+                break;
+            };
+            label = format!("{label}/{next}");
+            path = path.join(next);
+            child = only;
+        }
+        let open = !collapsed.contains(&path);
+        out.push(TreeRow {
+            node: Node::Folder { open },
+            depth,
+            label,
+            path: path.clone(),
+            counts: child.counts(changes),
+        });
+        if open {
+            emit(child, &path, depth + 1, changes, collapsed, out);
+        }
+    }
+    let mut files: Vec<&(String, usize)> = dir.files.iter().collect();
+    files.sort_by_key(|(name, _)| name.to_lowercase());
+    for (name, i) in files {
+        out.push(TreeRow {
+            node: Node::File(*i),
+            depth,
+            label: name.clone(),
+            path: changes[*i].path.clone(),
+            counts: Counts::of(&changes[*i]),
+        });
+    }
+}
+
+/// The rows [3] lists. `collapsed` holds the paths of the folders that are
+/// closed; a folder it doesn't name is open, so one that appears starts open.
+pub fn build(changes: &[Change], view: ChangesView, collapsed: &HashSet<PathBuf>) -> Vec<TreeRow> {
+    let mut out = Vec::new();
+    match view {
+        ChangesView::Flat => {
+            for (i, change) in changes.iter().enumerate() {
+                out.push(TreeRow {
+                    node: Node::File(i),
+                    depth: 0,
+                    label: change.path.to_string_lossy().into_owned(),
+                    path: change.path.clone(),
+                    counts: Counts::of(change),
+                });
+            }
+        }
+        ChangesView::Tree => {
+            let mut root = Dir::default();
+            for (i, change) in changes.iter().enumerate() {
+                let parts: Vec<String> = change
+                    .path
+                    .components()
+                    .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                    .collect();
+                let Some((file, folders)) = parts.split_last() else {
+                    continue;
+                };
+                let mut dir = &mut root;
+                for folder in folders {
+                    dir = dir.dirs.entry(folder.clone()).or_default();
+                }
+                dir.files.push((file.clone(), i));
+            }
+            emit(&root, Path::new(""), 0, changes, collapsed, &mut out);
+        }
+    }
+    out
+}
+
+/// Every folder the tree has, closed or not, for collapsing them all.
+pub fn folders(changes: &[Change]) -> HashSet<PathBuf> {
+    build(changes, ChangesView::Tree, &HashSet::new())
+        .into_iter()
+        .filter(|r| matches!(r.node, Node::Folder { .. }))
+        .map(|r| r.path)
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn change(path: &str, added: usize, removed: usize) -> Change {
+        Change {
+            path: path.into(),
+            lines: Lines::Counted { added, removed },
+        }
+    }
+
+    fn sample() -> Vec<Change> {
+        vec![
+            change("README.md", 1, 0),
+            change("crates/tui/src/update.rs", 12, 3),
+            change("crates/tui/src/view/sidebar.rs", 4, 1),
+            change("crates/tui/src/lib.rs", 2, 2),
+            Change {
+                path: "nvim/lsp/new.lua".into(),
+                lines: Lines::Untracked,
+            },
+            change("nvim/lua/a.lua", 5, 0),
+        ]
+    }
+
+    fn labels(rows: &[TreeRow]) -> Vec<(usize, &str)> {
+        rows.iter().map(|r| (r.depth, r.label.as_str())).collect()
+    }
+
+    #[test]
+    fn single_child_chains_share_a_row_and_folders_sort_before_files() {
+        let rows = build(&sample(), ChangesView::Tree, &HashSet::new());
+        assert_eq!(
+            labels(&rows),
+            [
+                (0, "crates/tui/src"),
+                (1, "view"),
+                (2, "sidebar.rs"),
+                (1, "lib.rs"),
+                (1, "update.rs"),
+                (0, "nvim"),
+                (1, "lsp"),
+                (2, "new.lua"),
+                (1, "lua"),
+                (2, "a.lua"),
+                (0, "README.md"),
+            ]
+        );
+    }
+
+    #[test]
+    fn folders_sum_what_is_under_them() {
+        let rows = build(&sample(), ChangesView::Tree, &HashSet::new());
+        let src = &rows[0];
+        assert_eq!(src.path, PathBuf::from("crates/tui/src"));
+        assert_eq!((src.counts.added, src.counts.removed), (18, 6));
+        let nvim = rows.iter().find(|r| r.label == "nvim").expect("nvim");
+        assert_eq!((nvim.counts.added, nvim.counts.new), (5, 1));
+    }
+
+    #[test]
+    fn a_closed_folder_hides_its_rows_and_a_new_folder_starts_open() {
+        let closed: HashSet<PathBuf> = ["crates/tui/src".into()].into();
+        let rows = build(&sample(), ChangesView::Tree, &closed);
+        assert_eq!(rows[0].node, Node::Folder { open: false });
+        assert_eq!(rows[1].label, "nvim");
+        let mut more = sample();
+        more.push(change("docs/design.md", 1, 1));
+        let rows = build(&more, ChangesView::Tree, &closed);
+        assert!(
+            rows.iter()
+                .any(|r| r.label == "docs" && r.node == Node::Folder { open: true })
+        );
+    }
+
+    #[test]
+    fn flat_keeps_numstat_order_and_full_paths() {
+        let rows = build(&sample(), ChangesView::Flat, &HashSet::new());
+        assert_eq!(rows.len(), 6);
+        assert_eq!(rows[1].label, "crates/tui/src/update.rs");
+        assert!(rows.iter().all(|r| matches!(r.node, Node::File(_))));
+    }
+
+    #[test]
+    fn every_folder_is_found_for_collapse_all() {
+        let all = folders(&sample());
+        for expected in [
+            "crates/tui/src",
+            "crates/tui/src/view",
+            "nvim",
+            "nvim/lsp",
+            "nvim/lua",
+        ] {
+            assert!(all.contains(Path::new(expected)), "{expected}");
+        }
+        let rows = build(&sample(), ChangesView::Tree, &all);
+        assert_eq!(
+            labels(&rows),
+            [(0, "crates/tui/src"), (0, "nvim"), (0, "README.md")]
+        );
+    }
+}

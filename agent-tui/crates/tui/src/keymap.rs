@@ -4,6 +4,7 @@
 //! on is in this table.
 
 use crate::model::{Model, Panel, Reach, View, Visibility};
+use crate::tree::{ChangesView, Node};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ctx {
@@ -79,6 +80,9 @@ pub struct Situation {
     pub paused: bool,
     pub hover: bool,
     pub file_row: bool,
+    /// Whether the folder under [3]'s cursor is open.
+    pub folder: Option<bool>,
+    pub tree: bool,
     pub subagent_row: bool,
     pub left_agent: bool,
     pub can_edit_checkout: bool,
@@ -130,6 +134,10 @@ impl Situation {
             paused: m.docs.paused(),
             hover: m.hover().is_some(),
             file_row: m.file_under_cursor().is_some(),
+            folder: m
+                .folder_under_cursor()
+                .map(|r| matches!(r.node, Node::Folder { open: true })),
+            tree: m.changes_view == ChangesView::Tree,
             subagent_row: m.subagent_selected().is_some(),
             left_agent,
             can_edit_checkout: selected.is_some(),
@@ -248,8 +256,12 @@ pub const BINDINGS: &[Binding] = &[
         &["⏎"],
         LISTS,
         RankBy(|s| s.hover.then_some(9)),
-        By(|s| s.hover.then_some("open")),
-        "Open the item under the cursor in [0] and move the keys there: the turn, a subagent's transcript, a diff or the branch.",
+        By(|s| match s.folder {
+            Some(true) if s.ctx == Ctx::Changes => Some("collapse"),
+            Some(false) if s.ctx == Ctx::Changes => Some("expand"),
+            _ => s.hover.then_some("open"),
+        }),
+        "Open the item under the cursor in [0] and move the keys there: the turn, a subagent's transcript, a diff or the branch. On a folder in [3] it collapses or expands the folder, and 0 opens its file list.",
     )
     .with(&["0"]),
     Binding::new(
@@ -269,9 +281,27 @@ pub const BINDINGS: &[Binding] = &[
     Binding::new(
         &["e"],
         Ctxs::of(&[Ctx::Changes]),
-        RankBy(|s| s.file_row.then_some(7)),
-        By(|s| s.file_row.then_some("edit file")),
-        "Open the file under the cursor in $EDITOR.",
+        RankBy(|s| (s.file_row || s.folder.is_some()).then_some(7)),
+        By(|s| match (s.file_row, s.folder) {
+            (true, _) => Some("edit file"),
+            (_, Some(_)) => Some("edit folder"),
+            _ => None,
+        }),
+        "Open the file under the cursor in $EDITOR, or on a folder the editor with that folder as its directory.",
+    ),
+    Binding::new(
+        &["`"],
+        Ctxs::of(&[Ctx::Changes]),
+        RankBy(|_| Some(3)),
+        By(|s| Some(if s.tree { "flat" } else { "tree" })),
+        "Switch [3] between the directory tree and the flat list of files. The choice lasts for the session.",
+    ),
+    Binding::new(
+        &["-", "="],
+        Ctxs::of(&[Ctx::Changes]),
+        Hidden,
+        By(|s| s.tree.then_some("fold all / unfold all")),
+        "Collapse every folder in [3], or expand them all.",
     ),
     Binding::new(
         &["e"],
@@ -615,6 +645,8 @@ mod tests {
             paused: false,
             hover: true,
             file_row: true,
+            folder: Some(true),
+            tree: true,
             subagent_row: true,
             left_agent: true,
             can_edit_checkout: true,

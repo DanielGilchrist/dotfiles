@@ -254,5 +254,6 @@ pub fn fleet(n: usize) -> Model {
     m.activities = Some(activities);
     m.facts = facts_of;
     m.revalidate();
+    m.changes_view = crate::tree::ChangesView::Flat;
     m
 }

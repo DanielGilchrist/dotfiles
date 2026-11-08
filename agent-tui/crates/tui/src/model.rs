@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
@@ -16,8 +16,9 @@ use agent_core::ports::{Change, HarnessId, Readiness, SubagentDetail, WorktreeFa
 use agent_term::{Emulator, Terminal};
 use ratatui::layout::Rect;
 
-use crate::document::{BranchKey, DiffKey, Documents, Hover, Key};
+use crate::document::{BranchKey, DiffKey, Documents, FolderKey, Hover, Key};
 use crate::palette::Palette;
+use crate::tree::{self, ChangesView, Node, TreeRow};
 
 pub const PREVIEW_DEBOUNCE: Duration = Duration::from_millis(150);
 pub const INFO_TTL: Duration = Duration::from_secs(4);
@@ -1039,6 +1040,11 @@ pub struct Model {
     /// How many times each agent's git facts have been read, which tells a
     /// document read from them that they may have changed.
     pub facts_generation: HashMap<SessionName, u64>,
+    /// How [3] lists the changed files, for the whole session.
+    pub changes_view: ChangesView,
+    /// The folders each agent's [3] has closed. A folder that isn't named
+    /// is open, so one that appears starts open.
+    pub collapsed: HashMap<SessionName, HashSet<PathBuf>>,
     /// Each agent's git facts, or why they couldn't be read, as last read.
     pub facts: HashMap<SessionName, Result<WorktreeFacts, String>>,
     /// When each agent's facts were last asked for.
@@ -1118,6 +1124,8 @@ impl Model {
             now: SystemTime::now(),
             facts: HashMap::new(),
             facts_generation: HashMap::new(),
+            changes_view: ChangesView::default(),
+            collapsed: HashMap::new(),
             inspections: HashMap::new(),
             acknowledged: None,
             last_bell: None,
@@ -1259,13 +1267,111 @@ impl Model {
 
     /// The rows [3]'s cursor moves over: the branch, then the files.
     pub fn change_rows(&self) -> usize {
-        usize::from(self.branch_row()) + self.changes().len()
+        usize::from(self.branch_row()) + self.change_list().len()
     }
 
-    /// The file on [3]'s row `row`, none for the branch row.
+    /// The folders and files [3] lists under the readiness row.
+    pub fn change_list(&self) -> Vec<TreeRow> {
+        let none = HashSet::new();
+        let collapsed = self
+            .selected_entry()
+            .and_then(|e| self.collapsed.get(e.name()))
+            .unwrap_or(&none);
+        tree::build(self.changes(), self.changes_view, collapsed)
+    }
+
+    /// What [3]'s row `row` is, none for the branch row.
+    pub fn change_row(&self, row: usize) -> Option<TreeRow> {
+        let at = row.checked_sub(usize::from(self.branch_row()))?;
+        self.change_list().into_iter().nth(at)
+    }
+
+    /// The file on [3]'s row `row`, none for the branch row and folders.
     pub fn change_at(&self, row: usize) -> Option<&Change> {
-        self.changes()
-            .get(row.checked_sub(usize::from(self.branch_row()))?)
+        match self.change_row(row)?.node {
+            Node::File(i) => self.changes().get(i),
+            Node::Folder { .. } => None,
+        }
+    }
+
+    /// The folder under [3]'s cursor.
+    pub fn folder_under_cursor(&self) -> Option<TreeRow> {
+        let Panel::Changes { file } = self.panel.listed() else {
+            return None;
+        };
+        let row = file.min(self.change_rows().checked_sub(1)?);
+        self.change_row(row)
+            .filter(|r| matches!(r.node, Node::Folder { .. }))
+    }
+
+    /// Moves [3]'s cursor to the row for `path`, or the first row under it
+    /// when it has none.
+    fn point_changes_at(&mut self, path: &Path) {
+        let skip = usize::from(self.branch_row());
+        let list = self.change_list();
+        let at = list
+            .iter()
+            .position(|r| r.path == path)
+            .or_else(|| list.iter().position(|r| r.path.starts_with(path)))
+            .or_else(|| {
+                list.iter().position(|r| {
+                    path.starts_with(&r.path) && matches!(r.node, Node::Folder { .. })
+                })
+            });
+        if let (Some(at), Panel::Changes { file }) = (at, &mut self.panel) {
+            *file = at + skip;
+        }
+    }
+
+    /// The path of the row [3]'s cursor is on, if it's a file or folder.
+    fn changes_cursor_path(&self) -> Option<PathBuf> {
+        let Panel::Changes { file } = self.panel.listed() else {
+            return None;
+        };
+        let row = file.min(self.change_rows().checked_sub(1)?);
+        self.change_row(row).map(|r| r.path)
+    }
+
+    /// Switches [3] between the tree and the flat list, keeping the cursor
+    /// on the same file.
+    pub fn toggle_changes_view(&mut self) {
+        let was = self.changes_cursor_path();
+        self.changes_view = self.changes_view.toggled();
+        if let Some(path) = was {
+            self.point_changes_at(&path);
+        }
+    }
+
+    /// Opens or closes the folder under [3]'s cursor.
+    pub fn toggle_folder(&mut self) {
+        let Some(folder) = self.folder_under_cursor() else {
+            return;
+        };
+        let Some(name) = self.selected_entry().map(|e| e.name().clone()) else {
+            return;
+        };
+        let closed = self.collapsed.entry(name).or_default();
+        if !closed.remove(&folder.path) {
+            closed.insert(folder.path);
+        }
+    }
+
+    /// Closes every folder of the selected agent, or opens them all, and
+    /// keeps the cursor on the row it was on, or the folder that holds it.
+    pub fn fold_all(&mut self, close: bool) {
+        let Some(name) = self.selected_entry().map(|e| e.name().clone()) else {
+            return;
+        };
+        let was = self.changes_cursor_path();
+        let all = if close {
+            tree::folders(self.changes())
+        } else {
+            HashSet::new()
+        };
+        self.collapsed.insert(name, all);
+        if let Some(path) = was {
+            self.point_changes_at(&path);
+        }
     }
 
     /// What [3]'s cursor is on and the checkout it's in, unless the keys are
@@ -1282,7 +1388,13 @@ impl Model {
         let root = entry.path()?.to_path_buf();
         let name = entry.name().clone();
         let generation = self.facts_generation.get(&name).copied().unwrap_or(0);
+        let folder = self.folder_under_cursor().map(|r| r.path);
         let hover = match (row, self.change_at(row), self.facts.get(&name)) {
+            (_, None, _) if folder.is_some() => Hover::Folder(FolderKey {
+                name,
+                path: folder.unwrap_or_default(),
+                generation,
+            }),
             (_, Some(change), _) => Hover::Diff(DiffKey {
                 name,
                 path: change.path.clone(),
@@ -1308,7 +1420,9 @@ impl Model {
         let key = match hover {
             Hover::Diff(key) => Key::Diff(key),
             Hover::Branch(key) => Key::Branch(key),
-            Hover::Turn(_) | Hover::Subagent(..) | Hover::Repo(_) => return None,
+            Hover::Turn(_) | Hover::Subagent(..) | Hover::Repo(_) | Hover::Folder(_) => {
+                return None;
+            }
         };
         Some((key, root))
     }

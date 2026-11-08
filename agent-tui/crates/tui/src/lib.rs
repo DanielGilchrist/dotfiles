@@ -2,6 +2,7 @@ mod document;
 mod keymap;
 mod model;
 mod palette;
+mod tree;
 mod update;
 mod view;
 mod worker;

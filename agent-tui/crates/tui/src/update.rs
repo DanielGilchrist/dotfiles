@@ -25,6 +25,7 @@ use crate::model::{
     TerminalFocus, Ticket, Unreachable, View, WorkRoom, fuzzy_match, match_rank, repo_matches,
     unlisted,
 };
+use crate::tree::ChangesView;
 use crate::worker::{Job, Msg, Outcome, SendError};
 
 /// How long the pane shows a finished agent, terminal focused, before it
@@ -799,6 +800,38 @@ fn on_panel_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
         (KeyCode::Char('3'), _) => {
             m.panel = Panel::Changes { file: 0 };
             Some(Vec::new())
+        }
+        (KeyCode::Enter, Panel::Changes { .. }) if m.folder_under_cursor().is_some() => {
+            m.toggle_folder();
+            Some(Vec::new())
+        }
+        (KeyCode::Char('`'), Panel::Changes { .. }) => {
+            m.toggle_changes_view();
+            Some(Vec::new())
+        }
+        (KeyCode::Char('-' | '='), Panel::Changes { .. })
+            if m.changes_view == ChangesView::Flat =>
+        {
+            m.info("the flat list has no folders · ` shows the tree");
+            Some(Vec::new())
+        }
+        (KeyCode::Char(c @ ('-' | '=')), Panel::Changes { .. }) => {
+            m.fold_all(c == '-');
+            Some(Vec::new())
+        }
+        (KeyCode::Char('e'), Panel::Changes { .. }) if m.folder_under_cursor().is_some() => {
+            let root = m
+                .selected_entry()
+                .and_then(|e| e.path())
+                .map(Path::to_path_buf);
+            let folder = m.folder_under_cursor().map(|r| r.path);
+            match root.zip(folder).map(|(root, folder)| root.join(folder)) {
+                Some(dir) if dir.is_dir() => Some(vec![Effect::Edit(Open::Checkout(dir))]),
+                _ => {
+                    m.info("that folder is gone from the checkout");
+                    Some(Vec::new())
+                }
+            }
         }
         (KeyCode::Enter | KeyCode::Char('0'), Panel::Changes { .. } | Panel::Agent { .. })
             if m.hover().is_some() =>
@@ -2197,6 +2230,7 @@ mod tests {
             &mut m,
             Msg::Snapshot(Ok((snapshot(sessions, pins), Vec::new()))),
         );
+        m.changes_view = ChangesView::Flat;
         m
     }
 
@@ -2308,6 +2342,167 @@ mod tests {
                 ..Default::default()
             }),
         );
+    }
+
+    fn with_paths(m: &mut Model, paths: &[&str]) {
+        let changed = paths
+            .iter()
+            .map(|p| agent_core::ports::Change {
+                path: (*p).into(),
+                lines: agent_core::ports::Lines::Counted {
+                    added: 2,
+                    removed: 1,
+                },
+            })
+            .collect();
+        m.facts.insert(
+            name("fix"),
+            Ok(agent_core::ports::WorktreeFacts {
+                changed,
+                ..Default::default()
+            }),
+        );
+    }
+
+    fn tree_labels(m: &Model) -> Vec<String> {
+        m.change_list().into_iter().map(|r| r.label).collect()
+    }
+
+    const PATHS: [&str; 5] = [
+        "a/b/one.rs",
+        "a/b/two.rs",
+        "a/c/three.rs",
+        "top.rs",
+        "z/deep/er/four.rs",
+    ];
+
+    #[test]
+    fn the_tree_is_the_default_and_a_backtick_switches_to_the_flat_list_and_back() {
+        assert_eq!(
+            Model::new(
+                "/".into(),
+                None,
+                "claude".parse().expect("parses"),
+                "claude".into()
+            )
+            .changes_view,
+            ChangesView::Tree
+        );
+        let mut m = model(&[]);
+        m.changes_view = ChangesView::Tree;
+        with_paths(&mut m, &PATHS);
+        m.panel = Panel::Changes { file: 0 };
+        assert_eq!(tree_labels(&m)[0], "a");
+        m.panel = Panel::Changes { file: 8 };
+        assert_eq!(tree_labels(&m)[8], "top.rs");
+        update(&mut m, key(KeyCode::Char('`')));
+        assert_eq!(m.changes_view, ChangesView::Flat);
+        assert_eq!(
+            m.panel,
+            Panel::Changes { file: 3 },
+            "the cursor stays on top.rs"
+        );
+        update(&mut m, key(KeyCode::Char('`')));
+        assert_eq!(m.changes_view, ChangesView::Tree);
+        assert_eq!(m.panel, Panel::Changes { file: 8 });
+    }
+
+    #[test]
+    fn enter_on_a_folder_folds_it_and_the_cursor_stays_on_it() {
+        let mut m = model(&[]);
+        m.changes_view = ChangesView::Tree;
+        with_paths(&mut m, &PATHS);
+        m.panel = Panel::Changes { file: 1 };
+        assert_eq!(
+            tree_labels(&m),
+            [
+                "a",
+                "b",
+                "one.rs",
+                "two.rs",
+                "c",
+                "three.rs",
+                "z/deep/er",
+                "four.rs",
+                "top.rs"
+            ]
+        );
+        update(&mut m, key(KeyCode::Enter));
+        assert_eq!(
+            m.panel,
+            Panel::Changes { file: 1 },
+            "Enter folds instead of opening [0]"
+        );
+        assert_eq!(
+            tree_labels(&m),
+            ["a", "b", "c", "three.rs", "z/deep/er", "four.rs", "top.rs"]
+        );
+        update(&mut m, key(KeyCode::Enter));
+        assert_eq!(tree_labels(&m).len(), 9);
+        m.panel = Panel::Changes { file: 2 };
+        update(&mut m, key(KeyCode::Enter));
+        assert!(
+            matches!(m.panel, Panel::Main(_)),
+            "a file still opens its diff"
+        );
+    }
+
+    #[test]
+    fn dash_folds_everything_equals_opens_everything_and_the_state_is_per_agent() {
+        let mut m = model(&[]);
+        m.changes_view = ChangesView::Tree;
+        with_paths(&mut m, &PATHS);
+        m.panel = Panel::Changes { file: 2 };
+        update(&mut m, key(KeyCode::Char('-')));
+        assert_eq!(tree_labels(&m), ["a", "z/deep/er", "top.rs"]);
+        assert_eq!(
+            m.panel,
+            Panel::Changes { file: 0 },
+            "the cursor goes to the folder holding its row"
+        );
+        with_paths(&mut m, &["a/b/one.rs", "new/file.rs", "top.rs"]);
+        assert_eq!(
+            tree_labels(&m),
+            ["a/b", "new", "file.rs", "top.rs"],
+            "a closed folder stays closed while the files change and a new one starts open"
+        );
+        update(&mut m, key(KeyCode::Char('=')));
+        assert_eq!(tree_labels(&m).len(), 5);
+        let other = name("api");
+        assert!(
+            m.collapsed
+                .get(&other)
+                .is_none_or(std::collections::HashSet::is_empty)
+        );
+    }
+
+    #[test]
+    fn dash_in_the_flat_list_says_there_are_no_folders() {
+        let mut m = model(&[]);
+        with_paths(&mut m, &PATHS);
+        m.panel = Panel::Changes { file: 0 };
+        update(&mut m, key(KeyCode::Char('-')));
+        assert!(
+            m.status
+                .as_ref()
+                .is_some_and(|s| s.text.contains("no folders"))
+        );
+    }
+
+    #[test]
+    fn a_folder_row_is_not_a_file_for_e_and_reads_as_a_folder_in_main() {
+        let mut m = model(&[]);
+        m.changes_view = ChangesView::Tree;
+        with_paths(&mut m, &PATHS);
+        m.panel = Panel::Changes { file: 0 };
+        assert!(m.file_under_cursor().is_none());
+        assert!(
+            matches!(m.hover(), Some(crate::document::Hover::Folder(k)) if k.path == std::path::Path::new("a"))
+        );
+        update(&mut m, key(KeyCode::Char('e')));
+        assert!(m.status.is_some(), "a folder missing from disk says so");
+        m.panel = Panel::Changes { file: 2 };
+        assert!(m.file_under_cursor().is_some());
     }
 
     #[test]
