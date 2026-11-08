@@ -11,10 +11,11 @@ use crate::model::{Head, Running, Worktree};
 use crate::names::{BranchName, Prompt, PullRequest, SessionName};
 use crate::paths::{AgentWorktree, RepoRoot};
 use crate::ports::{
-    AgentRecord, BranchLog, BranchState, ClientControl, DiffBase, Fetch, FileDiff, Forge, Harness,
-    HarnessError, HarnessId, Harnesses, HostError, LaunchCtx, Lines, Listing, LocalBranch,
-    PaneCommand, PendingPrompt, PullRequestHead, RemoteBranch, RepoWorktrees, Seen, SessionHost,
-    SessionInfo, SessionStatus, Store, StoreError, Unlisting, Vcs, WorktreeFacts, WorktreeStart,
+    AgentRecord, BranchLog, BranchState, Change, Checkout, ClientControl, Compared, DiffBase,
+    Fetch, FileDiff, Forge, Harness, HarnessError, HarnessId, Harnesses, HostError, LaunchCtx,
+    Listing, LocalBranch, PaneCommand, PendingPrompt, PullRequestHead, RemoteBranch, RepoWorktrees,
+    Seen, SessionHost, SessionInfo, SessionStatus, Store, StoreError, Unlisting, Vcs,
+    WorktreeFacts, WorktreeStart,
 };
 use crate::process::{CommandError, LaunchSpec};
 
@@ -221,20 +222,16 @@ impl Vcs for FakeVcs {
     }
 
     fn facts(&self, _: &Path) -> Result<WorktreeFacts, CommandError> {
-        Ok(WorktreeFacts::default())
+        Ok(WorktreeFacts::unchanged(Compared::NoBase {
+            checkout: Checkout::Detached("0000000".into()),
+        }))
     }
 
     fn branch_log(&self, _: &Path) -> Result<BranchLog, CommandError> {
         Ok(BranchLog::default())
     }
 
-    fn file_diff(
-        &self,
-        _: &Path,
-        _: &Path,
-        _: Lines,
-        _: DiffBase,
-    ) -> Result<FileDiff, CommandError> {
+    fn file_diff(&self, _: &Path, _: &Change, _: DiffBase) -> Result<FileDiff, CommandError> {
         Ok(FileDiff::Text {
             lines: Vec::new(),
             more: 0,

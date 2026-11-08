@@ -6,7 +6,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::fmt::Write;
 use std::num::NonZeroUsize;
 
-use agent_core::ports::{Call, CallState, LogEntry, SubagentDetail, Target};
+use agent_core::ports::{Call, CallState, LogEntry, Outcome, SubagentDetail, Target};
 
 /// Consecutive successful calls of these tools fold into one row.
 const EXPLORE: [&str; 4] = ["Read", "Grep", "Glob", "LS"];
@@ -35,7 +35,7 @@ pub enum Entry<'a> {
 }
 
 fn explored(call: &Call) -> bool {
-    EXPLORE.contains(&call.tool.as_str()) && matches!(call.state, CallState::Done(_))
+    EXPLORE.contains(&call.tool.as_str()) && matches!(call.state, CallState::Done { .. })
 }
 
 pub fn entries(detail: &SubagentDetail) -> Vec<Entry<'_>> {
@@ -132,7 +132,7 @@ pub fn failing(detail: &SubagentDetail) -> Option<String> {
                 let streak = streaks.entry(key).or_insert((0, at));
                 *streak = (streak.0 + 1, at);
             }
-            CallState::Done(_) | CallState::Flagged { .. } => {
+            CallState::Done { .. } | CallState::Flagged { .. } => {
                 streaks.remove(&key);
             }
             CallState::Running => {}
@@ -224,7 +224,10 @@ pub fn markdown(detail: &SubagentDetail, title: &str) -> (String, Vec<NonZeroUsi
     if !detail.transcript.as_os_str().is_empty() {
         let _ = write!(out, "Raw transcript: `{}`\n\n", detail.transcript.display());
     }
-    if let Some(report) = &detail.report {
+    if let Outcome::Finished {
+        report: Some(report),
+    } = &detail.outcome
+    {
         let _ = write!(out, "## Report\n\n{report}\n\n");
     }
     out.push_str("## Activity\n\n");
@@ -310,16 +313,17 @@ pub fn target_text(target: &Target) -> String {
 #[cfg(test)]
 pub(crate) mod fixtures {
     use super::*;
-    use agent_core::ports::{Excerpt, Summary};
+    use agent_core::activity::ToolId;
+    use agent_core::ports::{Excerpt, Outcome, Summary};
+    use std::path::PathBuf;
 
     pub fn call(tool: &str, target: Target, state: CallState) -> Call {
         Call {
-            id: String::new(),
+            id: ToolId::new(""),
             tool: tool.into(),
             target,
             state,
             started: None,
-            took: None,
             input: "input".into(),
             output: "output".into(),
         }
@@ -332,7 +336,10 @@ pub(crate) mod fixtures {
                 path: path.into(),
                 range: None,
             },
-            CallState::Done(Summary::Lines(10)),
+            CallState::Done {
+                summary: Summary::Lines(10),
+                took: None,
+            },
         ))
     }
 
@@ -344,6 +351,7 @@ pub(crate) mod fixtures {
         CallState::Failed {
             code: Some(101),
             excerpt: Excerpt::default(),
+            took: None,
         }
     }
 
@@ -358,7 +366,12 @@ pub(crate) mod fixtures {
         SubagentDetail {
             prompt: "Do it.".into(),
             log,
-            ..SubagentDetail::default()
+            transcript: PathBuf::new(),
+            outcome: Outcome::Running,
+            model: None,
+            started: None,
+            last_heard: None,
+            truncated: false,
         }
     }
 }
@@ -367,7 +380,7 @@ pub(crate) mod fixtures {
 mod tests {
     use super::fixtures::*;
     use super::*;
-    use agent_core::ports::Summary;
+    use agent_core::ports::{Outcome, Summary};
 
     #[test]
     fn three_explore_calls_fold_and_two_do_not() {
@@ -399,7 +412,10 @@ mod tests {
 
     #[test]
     fn the_same_call_in_a_row_repeats_and_keeps_its_latest_outcome_last() {
-        let ok = CallState::Done(Summary::NoOutput);
+        let ok = CallState::Done {
+            summary: Summary::NoOutput,
+            took: None,
+        };
         let d = detail(vec![
             bash("cargo build", failed()),
             bash("cargo build", ok.clone()),
@@ -417,7 +433,10 @@ mod tests {
         assert_eq!(failing(&d).as_deref(), Some("cargo build failed 3 times"));
         let ok = bash(
             "cargo build -p agent-tui",
-            CallState::Done(Summary::NoOutput),
+            CallState::Done {
+                summary: Summary::NoOutput,
+                took: None,
+            },
         );
         let healed = detail(vec![build(), build(), ok, build()]);
         assert_eq!(failing(&healed), None);
@@ -427,7 +446,15 @@ mod tests {
 
     #[test]
     fn three_of_the_last_five_calls_failing_reads_as_failing_but_old_failures_do_not() {
-        let ok = || bash("ls", CallState::Done(Summary::NoOutput));
+        let ok = || {
+            bash(
+                "ls",
+                CallState::Done {
+                    summary: Summary::NoOutput,
+                    took: None,
+                },
+            )
+        };
         let mixed = detail(vec![
             bash("a", failed()),
             ok(),
@@ -444,7 +471,15 @@ mod tests {
             bash("a", failed()),
             bash("a", failed()),
         ];
-        old.extend((0..6).map(|i| bash(&format!("ok{i}"), CallState::Done(Summary::NoOutput))));
+        old.extend((0..6).map(|i| {
+            bash(
+                &format!("ok{i}"),
+                CallState::Done {
+                    summary: Summary::NoOutput,
+                    took: None,
+                },
+            )
+        }));
         assert_eq!(failing(&detail(old)), None);
     }
 
@@ -452,7 +487,13 @@ mod tests {
     fn the_markdown_says_where_each_entry_starts() {
         let d = detail(vec![
             said("Hello."),
-            bash("ls", CallState::Done(Summary::NoOutput)),
+            bash(
+                "ls",
+                CallState::Done {
+                    summary: Summary::NoOutput,
+                    took: None,
+                },
+            ),
         ]);
         let (text, starts) = markdown(&d, "Title");
         let lines: Vec<&str> = text.lines().collect();
@@ -481,12 +522,17 @@ mod tests {
         let mut c = call(
             "Bash",
             Target::Command("x".into()),
-            CallState::Done(Summary::NoOutput),
+            CallState::Done {
+                summary: Summary::NoOutput,
+                took: None,
+            },
         );
         c.input = "echo '```'".into();
         c.output = "````\nout".into();
         let mut d = detail(vec![LogEntry::Called(c)]);
-        d.report = Some("done".into());
+        d.outcome = Outcome::Finished {
+            report: Some("done".into()),
+        };
         let (text, starts) = markdown(&d, "T");
         assert!(text.contains("````\necho '```'\n````\n"), "{text}");
         assert!(text.contains("`````\n````\nout\n`````\n"), "{text}");

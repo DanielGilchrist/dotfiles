@@ -2,6 +2,7 @@
 //! cursor over them, and the comments a reviewer drafts for an agent.
 
 use agent_core::names::{CarriageReturn, clean};
+use agent_core::ports::FileState;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
@@ -11,8 +12,8 @@ pub enum LineKind {
     Header,
     /// A commit in the branch view; its `text` is the log line.
     Commit,
-    /// An uncommitted file in the branch view; its `text` is its status.
-    Entry,
+    /// An uncommitted file in the branch view; its `text` is its status code.
+    Entry(FileState),
     Added,
     Removed,
     Context,

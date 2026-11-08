@@ -360,7 +360,7 @@ fn spawn_document_readers(backend: &Arc<Backend>, msgs: &Sender<Msg>) -> Arc<Doc
                 let result = match &key {
                     Key::Diff(diff) => backend
                         .vcs
-                        .file_diff(&worktree, &diff.path, diff.lines, diff.base)
+                        .file_diff(&worktree, &diff.change, diff.base)
                         .map(Doc::Diff),
                     Key::Branch(_) => backend.vcs.branch_log(&worktree).map(Doc::Branch),
                     Key::Commit(commit) => {
@@ -377,7 +377,7 @@ fn spawn_document_readers(backend: &Arc<Backend>, msgs: &Sender<Msg>) -> Arc<Doc
                     Key::Folder(folder) => Ok(Doc::Folder(assemble(&folder.files, reuse, |c| {
                         backend
                             .vcs
-                            .file_diff(&worktree, &c.path, c.lines, folder.base)
+                            .file_diff(&worktree, c, folder.base)
                             .map_err(|e| describe(&e))
                     }))),
                 }

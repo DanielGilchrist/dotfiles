@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use agent_core::activity::AgentId;
 use agent_core::model::RepoKey;
 use agent_core::names::SessionName;
-use agent_core::ports::{BranchLog, Change, Compared, DiffBase, FileDiff, Lines};
+use agent_core::ports::{BranchLog, Change, Compared, DiffBase, FileDiff};
 use ratatui::text::Line;
 
 use crate::review::LineInfo;
@@ -31,8 +31,7 @@ const ERROR_TTL: Duration = Duration::from_secs(5);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiffKey {
     pub name: SessionName,
-    pub path: PathBuf,
-    pub lines: Lines,
+    pub change: Change,
     /// What the diff is read against, so the same file in the other view
     /// of [3] is another document.
     pub base: DiffBase,
@@ -146,7 +145,7 @@ pub type Slot = (SessionName, Option<PathBuf>);
 impl Key {
     pub fn slot(&self) -> Slot {
         match self {
-            Self::Diff(key) => (key.name.clone(), Some(key.path.clone())),
+            Self::Diff(key) => (key.name.clone(), Some(key.change.path.clone())),
             Self::Branch(key) => (key.name.clone(), None),
             Self::Folder(key) => (key.name.clone(), Some(key.path.clone())),
             Self::Commit(key) => (
@@ -230,7 +229,7 @@ enum Item {
 impl Hover {
     fn item(&self) -> Item {
         match self {
-            Self::Diff(key) => Item::File(key.name.clone(), key.path.clone()),
+            Self::Diff(key) => Item::File(key.name.clone(), key.change.path.clone()),
             Self::Branch(key) => Item::Branch(key.name.clone()),
             Self::Folder(key) => Item::Folder(key.name.clone(), key.path.clone()),
             Self::Commit(key) => Item::Commit(key.name.clone(), key.sha.clone()),
@@ -416,8 +415,8 @@ impl Documents {
                 {
                     files
                         .iter()
-                        .any(|c| c.path == key.path && c.lines == key.lines)
-                        .then(|| (key.path.clone(), diff.clone()))
+                        .any(|c| c.path == key.change.path && c.kind == key.change.kind)
+                        .then(|| (key.change.path.clone(), diff.clone()))
                 }
                 _ => None,
             })
@@ -547,12 +546,16 @@ impl Documents {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_core::ports::{Checkout, Lines, TrackedState};
 
     fn key(path: &str, added: usize) -> DiffKey {
         DiffKey {
             name: "fix".parse().expect("parses"),
-            path: path.into(),
-            lines: Lines::Counted { added, removed: 0 },
+            change: Change::tracked(
+                path,
+                Lines::Counted { added, removed: 0 },
+                TrackedState::Committed,
+            ),
             base: DiffBase::Fork,
             generation: 0,
         }
@@ -567,7 +570,7 @@ mod tests {
 
     fn path_of(docs: &Documents) -> Option<PathBuf> {
         match docs.shown.as_ref().map(|(k, _)| k) {
-            Some(Key::Diff(key)) => Some(key.path.clone()),
+            Some(Key::Diff(key)) => Some(key.change.path.clone()),
             _ => None,
         }
     }
@@ -637,7 +640,7 @@ mod tests {
         }
         assert_eq!(docs.cache.len(), CACHE);
         assert!(docs.cache.iter().all(|e| {
-            !matches!(&e.key, Key::Diff(d) if d.path.as_path() == std::path::Path::new("f0"))
+            !matches!(&e.key, Key::Diff(d) if d.change.path.as_path() == std::path::Path::new("f0"))
         }));
     }
 
@@ -667,7 +670,9 @@ mod tests {
                 ahead: 1,
                 behind: 0,
                 dirty: 0,
-                compared: Compared::default(),
+                compared: Compared::NoBase {
+                    checkout: Checkout::Detached("abc1234".into()),
+                },
                 generation: 0,
             })),
             t0 + REST * 3,
@@ -782,14 +787,14 @@ mod tests {
     }
 
     fn change(path: &str) -> Change {
-        Change {
-            path: path.into(),
-            lines: Lines::Counted {
+        Change::tracked(
+            path,
+            Lines::Counted {
                 added: 1,
                 removed: 0,
             },
-            state: agent_core::ports::FileState::Committed,
-        }
+            TrackedState::Committed,
+        )
     }
 
     fn text(n: usize) -> FileDiff {
@@ -845,13 +850,14 @@ mod tests {
         assert_eq!(docs.cached_diffs(&name, DiffBase::Fork, 0, &files).len(), 1);
         assert_eq!(docs.cached_diffs(&name, DiffBase::Head, 0, &files), []);
         assert_eq!(docs.cached_diffs(&name, DiffBase::Fork, 1, &files), []);
-        let changed = [Change {
-            lines: Lines::Counted {
+        let changed = [Change::tracked(
+            "d/a",
+            Lines::Counted {
                 added: 2,
                 removed: 0,
             },
-            ..change("d/a")
-        }];
+            TrackedState::Committed,
+        )];
         assert_eq!(docs.cached_diffs(&name, DiffBase::Fork, 0, &changed), []);
     }
 }

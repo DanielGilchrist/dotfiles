@@ -5,13 +5,13 @@ use std::io;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
-use crate::activity::{Activity, AgentId, Reported};
+use crate::activity::{Activity, AgentId, Reported, ToolId};
 use crate::model::{Head, Presence, Running, Worktree};
-use crate::names::{BranchName, Prompt, PullRequest, SessionName};
+use crate::names::{BranchName, NameError, Prompt, PullRequest, SessionName};
 use crate::paths::{AgentWorktree, RepoRoot};
 use crate::process::{CommandError, LaunchSpec};
 
@@ -23,7 +23,7 @@ pub struct RepoWorktrees {
 }
 
 /// A worktree's work since it forked from the default branch.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorktreeFacts {
     /// Commits on top of the fork point.
     pub ahead: usize,
@@ -35,61 +35,89 @@ pub struct WorktreeFacts {
     pub pending: Vec<Change>,
     /// What the fork point is measured against, and from where.
     pub compared: Compared,
-    /// Modified, staged and untracked files.
-    pub dirty: usize,
 }
 
 /// What a worktree has checked out.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Checkout {
-    Branch(String),
+    Branch(BranchName),
     /// A detached HEAD, as its short sha.
     Detached(String),
 }
 
-/// Where a checkout stands against origin's default branch, which decides
-/// what [3]'s second tab means. `base` is the full remote ref, `origin/main`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Compared {
-    /// The local branch the base is a remote copy of: `main` on `origin/main`.
-    Trunk {
-        branch: String,
-        base: String,
-    },
-    Branch {
-        branch: String,
-        base: String,
-    },
-    Detached {
-        sha: String,
-        base: String,
-    },
-    /// No default branch to compare with. `head` is the branch or short sha.
-    NoBase {
-        head: String,
-    },
-}
-
-impl Default for Compared {
-    fn default() -> Self {
-        Self::NoBase {
-            head: String::new(),
+impl Checkout {
+    /// The branch or short sha.
+    pub fn head(&self) -> &str {
+        match self {
+            Self::Branch(branch) => branch.as_str(),
+            Self::Detached(sha) => sha,
         }
     }
 }
 
+/// A remote-tracking ref such as `origin/main`: a branch name behind a
+/// remote's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteRef(BranchName);
+
+impl RemoteRef {
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+
+    /// Whether this is `origin`'s copy of `branch`.
+    pub fn tracks(&self, branch: &BranchName) -> bool {
+        self.as_str().strip_prefix("origin/") == Some(branch.as_str())
+    }
+}
+
+impl FromStr for RemoteRef {
+    type Err = NameError;
+
+    fn from_str(s: &str) -> Result<Self, NameError> {
+        if !s.contains('/') {
+            return Err(NameError::InvalidBranch(s.into()));
+        }
+        s.parse().map(Self)
+    }
+}
+
+impl fmt::Display for RemoteRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Where a checkout stands against origin's default branch. `base` is the
+/// remote ref, `origin/main`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Compared {
+    /// The local branch the base is a remote copy of: `main` on `origin/main`.
+    Trunk {
+        branch: BranchName,
+        base: RemoteRef,
+    },
+    Branch {
+        branch: BranchName,
+        base: RemoteRef,
+    },
+    Detached {
+        sha: String,
+        base: RemoteRef,
+    },
+    /// No default branch to compare with.
+    NoBase {
+        checkout: Checkout,
+    },
+}
+
 impl Compared {
-    pub fn of(checkout: Checkout, base: Option<&str>) -> Self {
+    pub fn of(checkout: Checkout, base: Option<RemoteRef>) -> Self {
         match (checkout, base) {
-            (Checkout::Branch(head) | Checkout::Detached(head), None) => Self::NoBase { head },
-            (Checkout::Detached(sha), Some(base)) => Self::Detached {
-                sha,
-                base: base.to_string(),
-            },
+            (checkout, None) => Self::NoBase { checkout },
+            (Checkout::Detached(sha), Some(base)) => Self::Detached { sha, base },
             (Checkout::Branch(branch), Some(base)) => {
-                let tracks = base.strip_prefix("origin/") == Some(branch.as_str());
-                let base = base.to_string();
-                if tracks {
+                if base.tracks(&branch) {
                     Self::Trunk { branch, base }
                 } else {
                     Self::Branch { branch, base }
@@ -98,24 +126,16 @@ impl Compared {
         }
     }
 
-    /// The second tab's name.
-    pub fn tab(&self) -> &'static str {
-        match self {
-            Self::Trunk { .. } => "Unpushed",
-            Self::Branch { .. } | Self::Detached { .. } | Self::NoBase { .. } => "Branch",
-        }
-    }
-
-    /// The branch or short sha the first row opens with.
+    /// The branch or short sha the checkout is at.
     pub fn head(&self) -> &str {
         match self {
-            Self::Trunk { branch, .. } | Self::Branch { branch, .. } => branch,
+            Self::Trunk { branch, .. } | Self::Branch { branch, .. } => branch.as_str(),
             Self::Detached { sha, .. } => sha,
-            Self::NoBase { head } => head,
+            Self::NoBase { checkout } => checkout.head(),
         }
     }
 
-    pub fn base(&self) -> Option<&str> {
+    pub fn base(&self) -> Option<&RemoteRef> {
         match self {
             Self::Trunk { base, .. } | Self::Branch { base, .. } | Self::Detached { base, .. } => {
                 Some(base)
@@ -129,8 +149,54 @@ impl Compared {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Change {
     pub path: PathBuf,
-    pub lines: Lines,
-    pub state: FileState,
+    pub kind: ChangeKind,
+}
+
+/// A file git tracks has line counts and a state. One it doesn't has
+/// neither, since there is no diff to count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangeKind {
+    Untracked,
+    Tracked { lines: Lines, state: TrackedState },
+}
+
+impl Change {
+    pub fn tracked(path: impl Into<PathBuf>, lines: Lines, state: TrackedState) -> Self {
+        Self {
+            path: path.into(),
+            kind: ChangeKind::Tracked { lines, state },
+        }
+    }
+
+    pub fn untracked(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            kind: ChangeKind::Untracked,
+        }
+    }
+
+    /// A file that `git status` lists, before any diff was counted.
+    pub fn listed(file: &Uncommitted) -> Self {
+        match file.state.tracked() {
+            Some(state) => Self::tracked(file.path.clone(), Lines::Unknown, state),
+            None => Self::untracked(file.path.clone()),
+        }
+    }
+
+    pub fn state(&self) -> FileState {
+        match self.kind {
+            ChangeKind::Untracked => FileState::Untracked,
+            ChangeKind::Tracked { state, .. } => state.into(),
+        }
+    }
+
+    /// `None` for an untracked file.
+    pub fn lines(&self) -> Option<Lines> {
+        match self.kind {
+            ChangeKind::Untracked => None,
+            ChangeKind::Tracked { lines, .. } => Some(lines),
+        }
+    }
 }
 
 /// What was done to a file in the index or the working tree.
@@ -141,8 +207,23 @@ pub enum Edit {
     Deleted,
 }
 
+/// Where a file git tracks stands against the last commit. A file only in
+/// the fork diff and clean now is `Committed`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrackedState {
+    Committed,
+    Staged(Edit),
+    Unstaged(Edit),
+    Both {
+        staged: Edit,
+        unstaged: Edit,
+    },
+    /// Unmerged: both sides changed it, or one deleted what the other kept.
+    Conflicted,
+}
+
 /// Where a changed file stands against the last commit, as `git status`
-/// reports it. A file only in the fork diff and clean now is `Committed`.
+/// reports it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileState {
     Committed,
@@ -150,9 +231,34 @@ pub enum FileState {
     Staged(Edit),
     Unstaged(Edit),
     Both { staged: Edit, unstaged: Edit },
+    Conflicted,
+}
+
+impl From<TrackedState> for FileState {
+    fn from(state: TrackedState) -> Self {
+        match state {
+            TrackedState::Committed => Self::Committed,
+            TrackedState::Staged(edit) => Self::Staged(edit),
+            TrackedState::Unstaged(edit) => Self::Unstaged(edit),
+            TrackedState::Both { staged, unstaged } => Self::Both { staged, unstaged },
+            TrackedState::Conflicted => Self::Conflicted,
+        }
+    }
 }
 
 impl FileState {
+    /// `None` for a file git doesn't track.
+    pub fn tracked(self) -> Option<TrackedState> {
+        match self {
+            Self::Committed => Some(TrackedState::Committed),
+            Self::Untracked => None,
+            Self::Staged(edit) => Some(TrackedState::Staged(edit)),
+            Self::Unstaged(edit) => Some(TrackedState::Unstaged(edit)),
+            Self::Both { staged, unstaged } => Some(TrackedState::Both { staged, unstaged }),
+            Self::Conflicted => Some(TrackedState::Conflicted),
+        }
+    }
+
     pub fn is_committed(self) -> bool {
         self == Self::Committed
     }
@@ -160,14 +266,14 @@ impl FileState {
     pub fn staged(self) -> Option<Edit> {
         match self {
             Self::Staged(edit) | Self::Both { staged: edit, .. } => Some(edit),
-            Self::Committed | Self::Untracked | Self::Unstaged(_) => None,
+            Self::Committed | Self::Untracked | Self::Unstaged(_) | Self::Conflicted => None,
         }
     }
 
     pub fn unstaged(self) -> Option<Edit> {
         match self {
             Self::Unstaged(edit) | Self::Both { unstaged: edit, .. } => Some(edit),
-            Self::Committed | Self::Untracked | Self::Staged(_) => None,
+            Self::Committed | Self::Untracked | Self::Staged(_) | Self::Conflicted => None,
         }
     }
 }
@@ -188,8 +294,15 @@ pub enum FileDiff {
 pub struct BranchLog {
     /// One line per commit on top of the fork point, newest first.
     pub commits: Vec<String>,
-    /// Modified, staged and untracked files with their two-letter status.
-    pub uncommitted: Vec<(String, PathBuf)>,
+    /// Modified, staged and untracked files.
+    pub uncommitted: Vec<Uncommitted>,
+}
+
+/// A file with uncommitted state, as `git status` lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Uncommitted {
+    pub path: PathBuf,
+    pub state: FileState,
 }
 
 /// How a changed file's lines changed.
@@ -200,11 +313,28 @@ pub enum Lines {
         removed: usize,
     },
     Binary,
-    /// A new file git isn't tracking yet.
-    Untracked,
+    /// Listed by git status with nothing to count against `HEAD`, such as a
+    /// conflict or a staged edit reverted in the worktree.
+    Unknown,
 }
 
 impl WorktreeFacts {
+    /// A worktree with no commits of its own and nothing uncommitted.
+    pub fn unchanged(compared: Compared) -> Self {
+        Self {
+            ahead: 0,
+            behind: 0,
+            changed: Vec::new(),
+            pending: Vec::new(),
+            compared,
+        }
+    }
+
+    /// Modified, staged and untracked files.
+    pub fn dirty(&self) -> usize {
+        self.pending.len()
+    }
+
     /// Totals since the fork point.
     pub fn diff(&self) -> DiffStat {
         DiffStat::of(&self.changed)
@@ -219,7 +349,7 @@ impl WorktreeFacts {
     /// since nothing else is final until they're committed.
     pub fn readiness(&self) -> Readiness {
         match (
-            NonZeroUsize::new(self.dirty),
+            NonZeroUsize::new(self.dirty()),
             NonZeroUsize::new(self.ahead),
             NonZeroUsize::new(self.behind),
         ) {
@@ -261,9 +391,16 @@ pub struct DiffStat {
 impl DiffStat {
     pub fn of(changes: &[Change]) -> Self {
         let counted = || {
-            changes.iter().filter_map(|c| match c.lines {
-                Lines::Counted { added, removed } => Some((added, removed)),
-                Lines::Binary | Lines::Untracked => None,
+            changes.iter().filter_map(|c| match c.kind {
+                ChangeKind::Tracked {
+                    lines: Lines::Counted { added, removed },
+                    ..
+                } => Some((added, removed)),
+                ChangeKind::Tracked {
+                    lines: Lines::Binary | Lines::Unknown,
+                    ..
+                }
+                | ChangeKind::Untracked => None,
             })
         };
         Self {
@@ -397,15 +534,14 @@ pub trait Vcs: Send + Sync {
         let _ = (worktree, sha);
         Ok(Vec::new())
     }
-    /// `path`'s change against `base`: the last commit, or the fork point
-    /// from the default branch (committed and uncommitted together). `lines`
-    /// says what kind of change facts found, so a new untracked file is
-    /// shown whole. Slow on big diffs: call it off the UI thread.
+    /// `change`'s file against `base`: the last commit, or the fork point
+    /// from the default branch (committed and uncommitted together). A new
+    /// untracked file is shown whole. Slow on big diffs: call it off the UI
+    /// thread.
     fn file_diff(
         &self,
         worktree: &Path,
-        path: &Path,
-        lines: Lines,
+        change: &Change,
         base: DiffBase,
     ) -> Result<FileDiff, CommandError>;
 }
@@ -641,8 +777,6 @@ pub trait Harness: Send + Sync {
     fn event(&self, _payload: &str) -> Option<Reported> {
         None
     }
-    /// Whether the agent has recorded any activity in `workdir` since `since`,
-    /// i.e. a prompt queued then has been received.
     /// Evidence the agent was active after `pending` was queued, so it has
     /// seen the prompt.
     fn acknowledged(
@@ -673,18 +807,15 @@ pub trait Harness: Send + Sync {
 }
 
 /// What one subagent was told and what it has done since, for a log.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubagentDetail {
     /// What the agent told it to do.
     pub prompt: String,
-    /// Whether the harness records it as done.
-    pub finished: bool,
     /// The most recent entries, oldest first.
     pub log: Vec<LogEntry>,
     /// The file the harness keeps the whole transcript in.
     pub transcript: PathBuf,
-    /// What it handed back, or its last message once finished.
-    pub report: Option<String>,
+    pub outcome: Outcome,
     /// The model it runs, as the harness names it.
     pub model: Option<String>,
     /// The first record's time.
@@ -694,8 +825,20 @@ pub struct SubagentDetail {
     /// Whether the log starts after the transcript's start, so counts of
     /// calls are lower bounds.
     pub truncated: bool,
-    /// Why the transcript ends, when the API gave up on it.
-    pub stopped: Option<String>,
+}
+
+/// How far a subagent got, as its transcript records it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Outcome {
+    Running,
+    /// Done. The report is what it handed back, or its last message.
+    Finished {
+        report: Option<String>,
+    },
+    /// The transcript ends because the API gave up on it.
+    Stopped {
+        reason: String,
+    },
 }
 
 /// One step of a subagent's work.
@@ -711,13 +854,11 @@ pub enum LogEntry {
 /// A tool call, from the request to what came back.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Call {
-    pub id: String,
+    pub id: ToolId,
     pub tool: String,
     pub target: Target,
     pub state: CallState,
     pub started: Option<SystemTime>,
-    /// How long it took, once it has returned and both times are known.
-    pub took: Option<std::time::Duration>,
     /// The whole input and result, cut, for expanding.
     pub input: String,
     pub output: String,
@@ -749,20 +890,37 @@ pub enum Target {
 }
 
 /// Where a call stands. A running call has no outcome, and only a finished
-/// one can have failed.
+/// one can have failed or taken any time. `took` is known when both the
+/// request and the result carry a time.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CallState {
     Running,
-    Done(Summary),
+    Done {
+        summary: Summary,
+        took: Option<Duration>,
+    },
     Failed {
         code: Option<i32>,
         excerpt: Excerpt,
+        took: Option<Duration>,
     },
     /// Succeeded, but its output carries a failure line.
     Flagged {
         summary: Summary,
         excerpt: Excerpt,
+        took: Option<Duration>,
     },
+}
+
+impl CallState {
+    pub fn took(&self) -> Option<Duration> {
+        match self {
+            Self::Running => None,
+            Self::Done { took, .. } | Self::Failed { took, .. } | Self::Flagged { took, .. } => {
+                *took
+            }
+        }
+    }
 }
 
 /// What a finished call came to, in a few words.
@@ -891,11 +1049,14 @@ mod tests {
     use super::*;
 
     fn facts(dirty: usize, ahead: usize, behind: usize) -> WorktreeFacts {
+        let file = |n: usize| Change::untracked(format!("f{n}"));
         WorktreeFacts {
             ahead,
             behind,
-            dirty,
-            ..WorktreeFacts::default()
+            pending: (0..dirty).map(file).collect(),
+            ..WorktreeFacts::unchanged(Compared::NoBase {
+                checkout: Checkout::Detached("abc1234".into()),
+            })
         }
     }
 
@@ -924,6 +1085,100 @@ mod tests {
             facts(0, 0, 4).readiness(),
             Readiness::NothingAhead,
             "behind with nothing to ship is nothing to ship"
+        );
+    }
+
+    fn branch(name: &str) -> BranchName {
+        name.parse().expect("parses")
+    }
+
+    fn remote(name: &str) -> RemoteRef {
+        name.parse().expect("parses")
+    }
+
+    #[test]
+    fn a_checkout_is_compared_to_the_base_it_tracks_or_to_nothing() {
+        let origin_main = || Some(remote("origin/main"));
+        assert_eq!(
+            Compared::of(Checkout::Branch(branch("main")), origin_main()),
+            Compared::Trunk {
+                branch: branch("main"),
+                base: remote("origin/main")
+            }
+        );
+        assert_eq!(
+            Compared::of(Checkout::Branch(branch("fix")), origin_main()),
+            Compared::Branch {
+                branch: branch("fix"),
+                base: remote("origin/main")
+            }
+        );
+        assert_eq!(
+            Compared::of(Checkout::Detached("abc1234".into()), origin_main()),
+            Compared::Detached {
+                sha: "abc1234".into(),
+                base: remote("origin/main")
+            }
+        );
+        let unbased = Compared::of(Checkout::Branch(branch("wip")), None);
+        assert_eq!((unbased.head(), unbased.base()), ("wip", None));
+    }
+
+    #[test]
+    fn a_conflict_is_uncommitted_work_that_blocks_readiness() {
+        let mut facts = facts(0, 3, 0);
+        facts.pending.push(Change::tracked(
+            "a.rs",
+            Lines::Counted {
+                added: 0,
+                removed: 0,
+            },
+            TrackedState::Conflicted,
+        ));
+        assert_eq!(
+            facts.readiness(),
+            Readiness::Dirty {
+                dirty: n(1),
+                ahead: 3
+            }
+        );
+    }
+
+    #[test]
+    fn a_remote_ref_needs_a_remote_and_a_valid_branch() {
+        assert!("origin/main".parse::<RemoteRef>().is_ok());
+        assert!("main".parse::<RemoteRef>().is_err());
+        assert!("origin/a..b".parse::<RemoteRef>().is_err());
+    }
+
+    #[test]
+    fn a_call_has_taken_no_time_until_it_finishes() {
+        let took = Some(Duration::from_secs(2));
+        assert_eq!(CallState::Running.took(), None);
+        assert_eq!(
+            CallState::Done {
+                summary: Summary::NoOutput,
+                took
+            }
+            .took(),
+            took
+        );
+    }
+
+    #[test]
+    fn a_file_only_git_status_lists_has_no_counts_to_add() {
+        let listed = Change::listed(&Uncommitted {
+            path: "f.rs".into(),
+            state: FileState::Conflicted,
+        });
+        assert_eq!(listed.lines(), Some(Lines::Unknown));
+        assert_eq!(
+            DiffStat::of(&[listed]),
+            DiffStat {
+                files: 1,
+                added: 0,
+                removed: 0
+            }
         );
     }
 }

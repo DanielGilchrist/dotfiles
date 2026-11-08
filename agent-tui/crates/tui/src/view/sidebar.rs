@@ -661,8 +661,8 @@ fn compared_summary(facts: &WorktreeFacts) -> Line<'static> {
     if facts.behind > 0 {
         parts.push(format!("↓{}", facts.behind));
     }
-    if facts.dirty > 0 {
-        parts.push(format!("{} uncommitted", facts.dirty));
+    if facts.dirty() > 0 {
+        parts.push(format!("{} uncommitted", facts.dirty()));
     }
     if parts.is_empty() {
         let empty = match facts.compared {
@@ -729,7 +729,7 @@ fn count_cells(counts: Counts, folder: bool) -> (Span<'static>, String) {
 /// Columns the marker and its space take before a row's name.
 const MARKER_WIDTH: usize = 3;
 
-fn edit_letter(edit: Edit) -> &'static str {
+pub(super) fn edit_letter(edit: Edit) -> &'static str {
     match edit {
         Edit::Modified => "M",
         Edit::Added => "A",
@@ -765,6 +765,7 @@ fn file_code(state: FileState) -> Vec<Span<'static>> {
     match state {
         FileState::Committed => vec![Span::raw("  ")],
         FileState::Untracked => vec![Span::styled("??", Style::new().fg(palette_err))],
+        FileState::Conflicted => vec![Span::styled("UU", Style::new().fg(palette().warning))],
         state => vec![
             marker_cell(state.staged().map(edit_letter), palette_ok),
             marker_cell(state.unstaged().map(edit_letter), palette_err),
@@ -1266,7 +1267,7 @@ fn lower_panels(deck: &Deck<'_>, repo: &Repo, entry: &Entry, area: Rect) -> Lowe
                     diff: DiffStat::default(),
                     shared: 0,
                     scope: m.changes_scope,
-                    second: Compared::default().tab(),
+                    second: BRANCH_TAB,
                 },
             ),
         }
@@ -1285,6 +1286,17 @@ fn lower_panels(deck: &Deck<'_>, repo: &Repo, entry: &Entry, area: Rect) -> Lowe
     }
 }
 
+const BRANCH_TAB: &str = "Branch";
+
+/// The name of [3]'s second tab: what the checkout has to push on the
+/// trunk, otherwise what the branch changes.
+pub(super) fn second_tab(compared: &Compared) -> &'static str {
+    match compared {
+        Compared::Trunk { .. } => "Unpushed",
+        Compared::Branch { .. } | Compared::Detached { .. } | Compared::NoBase { .. } => BRANCH_TAB,
+    }
+}
+
 /// What [3]'s title says about `facts`.
 fn summary(
     facts: &WorktreeFacts,
@@ -1298,7 +1310,7 @@ fn summary(
         },
         shared: shared.len(),
         scope,
-        second: facts.compared.tab(),
+        second: second_tab(&facts.compared),
     }
 }
 
@@ -1720,23 +1732,30 @@ mod tests {
         );
     }
 
+    fn branch_name(name: &str) -> agent_core::names::BranchName {
+        name.parse().expect("parses")
+    }
+
+    fn detached(sha: &str) -> agent_core::ports::Checkout {
+        agent_core::ports::Checkout::Detached(sha.into())
+    }
+
     #[test]
     fn the_second_tab_row_is_short() {
         let branch = || Compared::Branch {
-            branch: "fix-thing".into(),
-            base: "origin/main".into(),
+            branch: branch_name("fix-thing"),
+            base: "origin/main".parse().expect("parses"),
         };
         let trunk = || Compared::Trunk {
-            branch: "main".into(),
-            base: "origin/main".into(),
+            branch: branch_name("main"),
+            base: "origin/main".parse().expect("parses"),
         };
         let read = |compared, ahead, dirty, behind| {
             text(&compared_summary(&WorktreeFacts {
                 ahead,
-                dirty,
                 behind,
-                compared,
-                ..WorktreeFacts::default()
+                pending: crate::fixtures::pending_files(dirty),
+                ..WorktreeFacts::unchanged(compared)
             }))
         };
         assert_eq!(read(branch(), 3, 2, 0), "↑3 · 2 uncommitted");
@@ -1746,33 +1765,41 @@ mod tests {
         assert_eq!(read(trunk(), 0, 4, 0), "4 uncommitted");
         assert_eq!(read(trunk(), 0, 0, 0), "nothing to push");
         assert_eq!(
-            read(Compared::NoBase { head: "wip".into() }, 0, 1, 0),
+            read(
+                Compared::NoBase {
+                    checkout: agent_core::ports::Checkout::Branch(branch_name("wip"))
+                },
+                0,
+                1,
+                0
+            ),
             "1 uncommitted"
         );
     }
 
     #[test]
     fn the_second_tab_is_named_for_where_the_checkout_is() {
-        let named = |compared: Compared| compared.tab();
         assert_eq!(
-            named(Compared::Trunk {
-                branch: "main".into(),
-                base: "origin/main".into()
+            second_tab(&Compared::Trunk {
+                branch: branch_name("main"),
+                base: "origin/main".parse().expect("parses")
             }),
             "Unpushed"
         );
         for other in [
             Compared::Branch {
-                branch: "x".into(),
-                base: "origin/main".into(),
+                branch: branch_name("x"),
+                base: "origin/main".parse().expect("parses"),
             },
             Compared::Detached {
                 sha: "abc".into(),
-                base: "origin/main".into(),
+                base: "origin/main".parse().expect("parses"),
             },
-            Compared::NoBase { head: "x".into() },
+            Compared::NoBase {
+                checkout: detached("x"),
+            },
         ] {
-            assert_eq!(named(other), "Branch");
+            assert_eq!(second_tab(&other), "Branch");
         }
     }
 
@@ -1801,11 +1828,13 @@ mod tests {
 
     #[test]
     fn each_tab_totals_its_own_files_and_only_the_second_leads_with_the_branch_row() {
-        use agent_core::ports::{Change, Lines};
-        let change = |path: &str, added, removed| Change {
-            path: path.into(),
-            lines: Lines::Counted { added, removed },
-            state: FileState::Committed,
+        use agent_core::ports::{Change, Lines, TrackedState};
+        let change = |path: &str, added, removed| {
+            Change::tracked(
+                path,
+                Lines::Counted { added, removed },
+                TrackedState::Committed,
+            )
         };
         let mut m = fleet(10);
         m.set_cursor(Cursor::Entry(name("obs-layout-4")));
@@ -1814,10 +1843,9 @@ mod tests {
             panic!("facts")
         };
         facts.ahead = 24;
-        facts.dirty = 4;
         facts.compared = Compared::Branch {
-            branch: "fix".into(),
-            base: "origin/main".into(),
+            branch: branch_name("fix"),
+            base: "origin/main".parse().expect("parses"),
         };
         facts.changed = vec![change("a.rs", 50, 5), change("b.rs", 7, 1)];
         facts.pending = vec![change("b.rs", 2, 0)];
@@ -1838,7 +1866,7 @@ mod tests {
             shown[0].0.trim(),
             "b.rs                                     +2"
         );
-        assert_eq!(shown[1].0, " ↑24 · 4 uncommitted");
+        assert_eq!(shown[1].0, " ↑24 · 1 uncommitted");
         assert_eq!(shown[0].1, 1);
         assert_eq!((shown[0].2, shown[0].3), (2, 0));
         assert_eq!(shown[0].4, 1, "one file");
@@ -1864,45 +1892,33 @@ mod tests {
     }
 
     fn facts() -> WorktreeFacts {
-        let change = |path: &str, lines| agent_core::ports::Change {
-            path: path.into(),
-            lines,
-            state: agent_core::ports::FileState::Committed,
-        };
-        let mut facts = WorktreeFacts {
+        use agent_core::ports::{Change, TrackedState};
+        WorktreeFacts {
             changed: vec![
-                change(
+                Change::tracked(
                     "a/src/payroll/calc.ts",
                     Lines::Counted {
                         added: 98,
                         removed: 52,
                     },
+                    TrackedState::Both {
+                        staged: Edit::Modified,
+                        unstaged: Edit::Modified,
+                    },
                 ),
-                change(
+                Change::tracked(
                     "a/src/payroll/calc.test.ts",
                     Lines::Counted {
                         added: 24,
                         removed: 0,
                     },
+                    TrackedState::Staged(Edit::Added),
                 ),
-                change("logo.png", Lines::Binary),
-                change("notes.md", Lines::Untracked),
+                Change::tracked("logo.png", Lines::Binary, TrackedState::Committed),
+                Change::untracked("notes.md"),
             ],
-            ..WorktreeFacts::default()
-        };
-        let states = [
-            FileState::Both {
-                staged: Edit::Modified,
-                unstaged: Edit::Modified,
-            },
-            FileState::Staged(Edit::Added),
-            FileState::Committed,
-            FileState::Untracked,
-        ];
-        for (change, state) in facts.changed.iter_mut().zip(states) {
-            change.state = state;
+            ..crate::fixtures::unchanged()
         }
-        facts
     }
 
     #[test]
@@ -1929,6 +1945,13 @@ mod tests {
             ],
             "the rows scroll to keep the cursor in view"
         );
+    }
+
+    #[test]
+    fn a_conflicted_file_shows_uu_in_the_warning_colour() {
+        let spans = file_marker(FileState::Conflicted);
+        assert_eq!(text(&Line::from(spans.clone())), "UU ");
+        assert_eq!(spans[0].style.fg, Some(palette().warning));
     }
 
     #[test]
@@ -2288,7 +2311,7 @@ mod tests {
             &done,
             Ok(WorktreeFacts {
                 ahead: 0,
-                ..WorktreeFacts::default()
+                ..crate::fixtures::unchanged()
             }),
         );
         let first = laid(&mut m, (200, 50));
@@ -2716,18 +2739,20 @@ mod tests {
         let mut log = Vec::new();
         for i in 0..entries {
             log.push(LogEntry::Called(Call {
-                id: format!("c{i}"),
+                id: agent_core::activity::ToolId::new(format!("c{i}")),
                 tool: "Edit".into(),
                 target: Target::Path {
                     path: format!("src/file{i}.rs"),
                     range: None,
                 },
-                state: CallState::Done(Summary::Diff {
-                    added: i,
-                    removed: 0,
-                }),
+                state: CallState::Done {
+                    summary: Summary::Diff {
+                        added: i,
+                        removed: 0,
+                    },
+                    took: None,
+                },
                 started: None,
-                took: None,
                 input: String::new(),
                 output: String::new(),
             }));
@@ -2738,10 +2763,15 @@ mod tests {
         log.push(bash("cargo test", CallState::Running));
         agent_core::ports::SubagentDetail {
             prompt: "Find every call site of roundCurrency.".into(),
-            finished,
+            outcome: if finished {
+                agent_core::ports::Outcome::Finished {
+                    report: Some("All done, three call sites.".to_string()),
+                }
+            } else {
+                agent_core::ports::Outcome::Running
+            },
             log,
-            report: finished.then(|| "All done, three call sites.".to_string()),
-            ..Default::default()
+            ..crate::log::fixtures::detail(Vec::new())
         }
     }
 
@@ -2767,6 +2797,24 @@ mod tests {
         let text = screen(&render(&mut m, (100, 30))).join("\n");
         assert!(text.contains("Subagents"), "{text}");
         assert!(text.contains("Reverting memo edit"), "{text}");
+    }
+
+    #[test]
+    fn a_stopped_subagent_says_stopped_and_why() {
+        let mut m = fleet(10);
+        m.set_cursor(Cursor::Entry(name("obs-layout-4")));
+        m.panel = Focused::Agent { offset: 0 };
+        m.subagent = Some(AgentId::new("s1"));
+        let mut detail = log_of(2, false);
+        detail.outcome = agent_core::ports::Outcome::Stopped {
+            reason: "API Error: overloaded".into(),
+        };
+        m.subagent_logs
+            .insert((name("obs-layout-4"), AgentId::new("s1")), Ok(Some(detail)));
+        let text = screen(&render(&mut m, (100, 30))).join("\n");
+        assert!(text.contains("stopped"), "{text}");
+        assert!(text.contains("API Error: overloaded"), "{text}");
+        assert!(!text.contains("no report"), "{text}");
     }
 
     #[test]
@@ -2864,7 +2912,10 @@ mod tests {
             &key,
             Ok(crate::document::Doc::Branch(BranchLog {
                 commits: vec!["abc1234 Fix the rounding".into()],
-                uncommitted: vec![(" M".into(), "src/a.rs".into())],
+                uncommitted: vec![agent_core::ports::Uncommitted {
+                    path: "src/a.rs".into(),
+                    state: FileState::Unstaged(Edit::Modified),
+                }],
             })),
         );
         let text = screen(&render(&mut m, (100, 30))).join("\n");
@@ -3287,10 +3338,12 @@ mod tests {
             ("docs/design.md", 1, 1),
         ]
         .into_iter()
-        .map(|(p, added, removed)| agent_core::ports::Change {
-            path: p.into(),
-            lines: Lines::Counted { added, removed },
-            state: agent_core::ports::FileState::Committed,
+        .map(|(p, added, removed)| {
+            agent_core::ports::Change::tracked(
+                p,
+                Lines::Counted { added, removed },
+                agent_core::ports::TrackedState::Committed,
+            )
         })
         .collect();
         facts.pending = facts.changed.clone();
@@ -3530,7 +3583,7 @@ mod tests {
     #[test]
     fn enter_on_a_commit_in_the_branch_opens_its_files_and_escape_goes_back() {
         use crate::document::{Doc, FolderDocs, FolderFile, Hover, Key};
-        use agent_core::ports::{BranchLog, Change, FileDiff, FileState, Lines};
+        use agent_core::ports::{BranchLog, Change, FileDiff, FileState, Lines, TrackedState};
         use crossterm::event::KeyCode;
         let mut m = fleet(10);
         m.set_cursor(Cursor::Entry(name("obs-layout-4")));
@@ -3546,7 +3599,10 @@ mod tests {
                     "abc1234 Fix the rounding".into(),
                     "def5678 Add tests".into(),
                 ],
-                uncommitted: vec![(" M".into(), "src/a.rs".into())],
+                uncommitted: vec![agent_core::ports::Uncommitted {
+                    path: "src/a.rs".into(),
+                    state: FileState::Unstaged(Edit::Modified),
+                }],
             })),
         );
         render(&mut m, (140, 40));
@@ -3571,14 +3627,14 @@ mod tests {
             .due(std::time::Instant::now())
             .expect("the commit is read");
         assert!(matches!(key, Key::Commit(_)));
-        let change = Change {
-            path: "src/a.rs".into(),
-            lines: Lines::Counted {
+        let change = Change::tracked(
+            "src/a.rs",
+            Lines::Counted {
                 added: 1,
                 removed: 0,
             },
-            state: FileState::Committed,
-        };
+            TrackedState::Committed,
+        );
         m.docs.loaded(
             &key,
             Ok(Doc::Folder(FolderDocs {

@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use agent_core::ports::{Change, FileState, Lines};
+use agent_core::ports::{Change, ChangeKind, FileState, Lines};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ChangesView {
@@ -72,10 +72,12 @@ pub struct Counts {
 
 impl Counts {
     fn of(change: &Change) -> Self {
+        let state = change.state();
         let pending = Self {
-            staged: usize::from(change.state.staged().is_some()),
+            staged: usize::from(state.staged().is_some()),
             unstaged: usize::from(
-                change.state.unstaged().is_some() || change.state == FileState::Untracked,
+                state.unstaged().is_some()
+                    || matches!(state, FileState::Untracked | FileState::Conflicted),
             ),
             ..Self::default()
         };
@@ -83,17 +85,27 @@ impl Counts {
     }
 
     fn lines_of(change: &Change) -> Self {
-        match change.lines {
-            Lines::Counted { added, removed } => Self {
+        match change.kind {
+            ChangeKind::Tracked {
+                lines: Lines::Counted { added, removed },
+                ..
+            } => Self {
                 added,
                 removed,
                 ..Self::default()
             },
-            Lines::Binary => Self {
+            ChangeKind::Tracked {
+                lines: Lines::Binary,
+                ..
+            } => Self {
                 binary: 1,
                 ..Self::default()
             },
-            Lines::Untracked => Self {
+            ChangeKind::Tracked {
+                lines: Lines::Unknown,
+                ..
+            } => Self::default(),
+            ChangeKind::Untracked => Self {
                 new: 1,
                 ..Self::default()
             },
@@ -201,7 +213,7 @@ fn emit(
             path: changes[*i].path.clone(),
             chain: Vec::new(),
             counts: Counts::of(&changes[*i]),
-            state: changes[*i].state,
+            state: changes[*i].state(),
         });
     }
 }
@@ -222,7 +234,7 @@ pub fn build(changes: &[Change], view: ChangesView, collapsed: &HashSet<PathBuf>
                     path: change.path.clone(),
                     chain: Vec::new(),
                     counts: Counts::of(change),
-                    state: change.state,
+                    state: change.state(),
                 });
             }
         }
@@ -265,13 +277,14 @@ pub fn folders(changes: &[Change]) -> HashSet<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_core::ports::TrackedState;
 
     fn change(path: &str, added: usize, removed: usize) -> Change {
-        Change {
-            path: path.into(),
-            lines: Lines::Counted { added, removed },
-            state: FileState::Committed,
-        }
+        Change::tracked(
+            path,
+            Lines::Counted { added, removed },
+            TrackedState::Committed,
+        )
     }
 
     fn sample() -> Vec<Change> {
@@ -280,11 +293,7 @@ mod tests {
             change("crates/tui/src/update.rs", 12, 3),
             change("crates/tui/src/view/sidebar.rs", 4, 1),
             change("crates/tui/src/lib.rs", 2, 2),
-            Change {
-                path: "nvim/lsp/new.lua".into(),
-                lines: Lines::Untracked,
-                state: FileState::Untracked,
-            },
+            Change::untracked("nvim/lsp/new.lua"),
             change("nvim/lua/a.lua", 5, 0),
         ]
     }

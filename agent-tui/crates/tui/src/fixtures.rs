@@ -11,7 +11,10 @@ use agent_core::discover::{Observation, assemble};
 use agent_core::model::{Head, Worktree};
 use agent_core::names::SessionName;
 use agent_core::paths::{Layout, RepoRoot};
-use agent_core::ports::{Change, Lines, RepoWorktrees, SessionInfo, SessionStatus, WorktreeFacts};
+use agent_core::ports::{
+    Change, Checkout, Compared, Lines, RepoWorktrees, SessionInfo, SessionStatus, TrackedState,
+    WorktreeFacts,
+};
 
 use crate::model::Model;
 use crate::update::update;
@@ -161,42 +164,41 @@ fn facts(k: usize) -> WorktreeFacts {
     let files = [
         (
             "src/triage/flow.ts",
-            Lines::Counted {
+            Some(Lines::Counted {
                 added: 9,
                 removed: 3,
-            },
+            }),
         ),
         (
             "src/triage/flow.test.ts",
-            Lines::Counted {
+            Some(Lines::Counted {
                 added: 75,
                 removed: 0,
-            },
+            }),
         ),
         (
             "src/shared/types.ts",
-            Lines::Counted {
+            Some(Lines::Counted {
                 added: 2,
                 removed: 0,
-            },
+            }),
         ),
-        ("assets/logo.png", Lines::Binary),
-        ("notes/plan.md", Lines::Untracked),
+        ("assets/logo.png", Some(Lines::Binary)),
+        ("notes/plan.md", None),
         (
             "crates/tui/src/view/sidebar.rs",
-            Lines::Counted {
+            Some(Lines::Counted {
                 added: 412,
                 removed: 120,
-            },
+            }),
         ),
     ];
     let changed: Vec<Change> = files
         .iter()
         .take(k % 7)
-        .map(|(path, lines)| Change {
-            path: (*path).into(),
-            lines: *lines,
-            state: agent_core::ports::FileState::Committed,
+        .map(|(path, lines)| match lines {
+            Some(lines) => Change::tracked(*path, *lines, TrackedState::Committed),
+            None => Change::untracked(*path),
         })
         .collect();
     WorktreeFacts {
@@ -204,12 +206,25 @@ fn facts(k: usize) -> WorktreeFacts {
         behind: k % 2,
         pending: changed.clone(),
         changed,
-        compared: agent_core::ports::Compared::Branch {
-            branch: "feature".into(),
-            base: "origin/main".into(),
+        compared: Compared::Branch {
+            branch: "feature".parse().expect("parses"),
+            base: "origin/main".parse().expect("parses"),
         },
-        dirty: k % 4,
     }
+}
+
+/// A worktree with nothing changed, on a detached checkout with no base.
+pub fn unchanged() -> WorktreeFacts {
+    WorktreeFacts::unchanged(Compared::NoBase {
+        checkout: Checkout::Detached("abc1234".into()),
+    })
+}
+
+/// `n` uncommitted files with no counts.
+pub fn pending_files(n: usize) -> Vec<Change> {
+    (0..n)
+        .map(|i| Change::untracked(format!("pending{i}")))
+        .collect()
 }
 
 /// `n` entries over repos of [`PER_REPO`] (each repo's main checkout, then

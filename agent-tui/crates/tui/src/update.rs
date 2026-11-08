@@ -508,7 +508,8 @@ fn read_subagent(m: &mut Model) -> Option<Effect> {
     let events = m.activity(&name)?.events;
     let now = Instant::now();
     let key = (name.clone(), id.clone());
-    if matches!(m.subagent_logs.get(&key), Some(Ok(Some(detail))) if detail.finished) {
+    if matches!(m.subagent_logs.get(&key), Some(Ok(Some(detail))) if matches!(detail.outcome, agent_core::ports::Outcome::Finished { .. }))
+    {
         return None;
     }
     let due = m.subagent_reads.get(&key).is_none_or(|last| {
@@ -919,9 +920,9 @@ fn branch_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
                         subject: subject.to_string(),
                     }
                 }
-                crate::review::LineKind::Entry => crate::model::Opened::File {
+                crate::review::LineKind::Entry(state) => crate::model::Opened::File {
                     path: line.path.clone(),
-                    code: line.text.clone(),
+                    state,
                 },
                 _ => return Some(effects),
             });
@@ -940,7 +941,7 @@ fn branch_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
         }
         KeyCode::Char('e') => {
             let line = lines.get(at)?;
-            if line.kind != crate::review::LineKind::Entry {
+            if !matches!(line.kind, crate::review::LineKind::Entry(_)) {
                 return None;
             }
             let root = m.selected_entry()?.path()?.to_path_buf();
@@ -1090,7 +1091,7 @@ fn log_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
     };
     let entries = crate::log::entries(detail);
     let last = entries.len().checked_sub(1)?;
-    let running = !detail.finished;
+    let running = !matches!(detail.outcome, agent_core::ports::Outcome::Finished { .. });
     let nav = m.log_view.navs.entry(key.clone()).or_default();
     let at = nav
         .cursor
@@ -2886,18 +2887,14 @@ mod tests {
 
     fn with_changes(m: &mut Model, files: usize) {
         let changed: Vec<agent_core::ports::Change> = (0..files)
-            .map(|i| agent_core::ports::Change {
-                path: format!("src/f{i}.rs").into(),
-                lines: agent_core::ports::Lines::Untracked,
-                state: agent_core::ports::FileState::Committed,
-            })
+            .map(|i| agent_core::ports::Change::untracked(format!("src/f{i}.rs")))
             .collect();
         m.set_facts(
             &name("fix"),
             Ok(agent_core::ports::WorktreeFacts {
                 pending: changed.clone(),
                 changed,
-                ..Default::default()
+                ..crate::fixtures::unchanged()
             }),
         );
     }
@@ -2905,13 +2902,15 @@ mod tests {
     fn with_paths(m: &mut Model, paths: &[&str]) {
         let changed: Vec<agent_core::ports::Change> = paths
             .iter()
-            .map(|p| agent_core::ports::Change {
-                path: (*p).into(),
-                lines: agent_core::ports::Lines::Counted {
-                    added: 2,
-                    removed: 1,
-                },
-                state: agent_core::ports::FileState::Committed,
+            .map(|p| {
+                agent_core::ports::Change::tracked(
+                    *p,
+                    agent_core::ports::Lines::Counted {
+                        added: 2,
+                        removed: 1,
+                    },
+                    agent_core::ports::TrackedState::Committed,
+                )
             })
             .collect();
         m.set_facts(
@@ -2919,7 +2918,7 @@ mod tests {
             Ok(agent_core::ports::WorktreeFacts {
                 pending: changed.clone(),
                 changed,
-                ..Default::default()
+                ..crate::fixtures::unchanged()
             }),
         );
     }
@@ -2968,28 +2967,25 @@ mod tests {
     }
 
     fn with_scopes(m: &mut Model) {
-        use agent_core::ports::{Change, Edit, FileState, Lines};
-        let change = |path: &str, added, state| Change {
-            path: path.into(),
-            lines: Lines::Counted { added, removed: 0 },
-            state,
+        use agent_core::ports::{Change, Edit, Lines, TrackedState};
+        let change = |path: &str, added, state| {
+            Change::tracked(path, Lines::Counted { added, removed: 0 }, state)
         };
-        let edited = FileState::Unstaged(Edit::Modified);
+        let edited = TrackedState::Unstaged(Edit::Modified);
         m.set_facts(
             &name("fix"),
             Ok(agent_core::ports::WorktreeFacts {
                 ahead: 3,
-                dirty: 1,
                 compared: agent_core::ports::Compared::Branch {
-                    branch: "fix".into(),
-                    base: "origin/main".into(),
+                    branch: "fix".parse().expect("parses"),
+                    base: "origin/main".parse().expect("parses"),
                 },
                 changed: vec![
-                    change("a/old.rs", 40, FileState::Committed),
+                    change("a/old.rs", 40, TrackedState::Committed),
                     change("a/hot.rs", 9, edited),
                 ],
                 pending: vec![change("a/hot.rs", 2, edited)],
-                ..Default::default()
+                ..crate::fixtures::unchanged()
             }),
         );
     }
@@ -3007,7 +3003,7 @@ mod tests {
         assert_eq!(m.changes_scope, crate::tree::ChangesScope::Since);
         assert_eq!(tree_labels(&m), ["a/old.rs", "a/hot.rs"]);
         assert_eq!(
-            m.change_at(1).map(|c| c.state),
+            m.change_at(1).map(agent_core::ports::Change::state),
             Some(agent_core::ports::FileState::Committed),
             "committed files carry no uncommitted state"
         );
@@ -3045,8 +3041,8 @@ mod tests {
             _ => panic!("facts"),
         };
         facts.compared = Compared::Trunk {
-            branch: "main".into(),
-            base: "origin/main".into(),
+            branch: "main".parse().expect("parses"),
+            base: "origin/main".parse().expect("parses"),
         };
         m.set_facts(&name("fix"), Ok(facts));
         assert_eq!(hint(&m), "tab: unpushed");
@@ -3240,11 +3236,7 @@ mod tests {
         let refreshed = |m: &mut Model, paths: &[&str]| {
             let changed: Vec<agent_core::ports::Change> = paths
                 .iter()
-                .map(|p| agent_core::ports::Change {
-                    path: (*p).into(),
-                    lines: agent_core::ports::Lines::Untracked,
-                    state: agent_core::ports::FileState::Committed,
-                })
+                .map(|p| agent_core::ports::Change::untracked(*p))
                 .collect();
             update(
                 m,
@@ -3253,7 +3245,7 @@ mod tests {
                     facts: Ok(agent_core::ports::WorktreeFacts {
                         pending: changed.clone(),
                         changed,
-                        ..Default::default()
+                        ..crate::fixtures::unchanged()
                     }),
                 },
             );
@@ -4922,7 +4914,7 @@ mod tests {
 
         let detail = agent_core::ports::SubagentDetail {
             prompt: "do it".into(),
-            ..Default::default()
+            ..crate::log::fixtures::detail(Vec::new())
         };
         update(
             &mut m,
@@ -5013,7 +5005,11 @@ mod tests {
                     key: Key::Diff(key),
                     worktree,
                     ..
-                } => Some(format!("{} {}", key.path.display(), worktree.display())),
+                } => Some(format!(
+                    "{} {}",
+                    key.change.path.display(),
+                    worktree.display()
+                )),
                 _ => None,
             })
             .collect()
@@ -5934,7 +5930,7 @@ mod tests {
             key_of,
             Ok(Some(agent_core::ports::SubagentDetail {
                 transcript: "/p/s/subagents/agent-a1.jsonl".into(),
-                ..Default::default()
+                ..crate::log::fixtures::detail(Vec::new())
             })),
         );
         let effects = update(&mut m, key(KeyCode::Char('e')));
@@ -5949,14 +5945,19 @@ mod tests {
         use crate::log::fixtures::{bash, detail, said};
         use agent_core::ports::{CallState, Summary};
         let (name, id) = m.subagent_selected().expect("a subagent is selected");
-        let ok = || CallState::Done(Summary::NoOutput);
+        let ok = || CallState::Done {
+            summary: Summary::NoOutput,
+            took: None,
+        };
         let mut d = detail(vec![
             said("one"),
             bash("ls", ok()),
             said("two"),
             bash("pwd", ok()),
         ]);
-        d.finished = finished;
+        if finished {
+            d.outcome = agent_core::ports::Outcome::Finished { report: None };
+        }
         m.subagent_logs
             .insert((name.clone(), id.clone()), Ok(Some(d)));
         (name, id)

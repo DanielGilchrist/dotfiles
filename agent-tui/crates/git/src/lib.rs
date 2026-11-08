@@ -1,6 +1,8 @@
+use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::str::FromStr;
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -8,9 +10,9 @@ use agent_core::model::{Head, Worktree};
 use agent_core::names::{BranchName, NameError, PullRequest};
 use agent_core::paths::{AgentWorktree, RepoRoot};
 use agent_core::ports::{
-    BranchLog, BranchState, Change, Checkout, Compared, DiffBase, Edit, Fetch, FileDiff, FileState,
-    Forge, Lines, LocalBranch, PullRequestHead, RemoteBranch, RepoWorktrees, Vcs, WorktreeFacts,
-    WorktreeStart,
+    BranchLog, BranchState, Change, ChangeKind, Checkout, Compared, DiffBase, Edit, Fetch,
+    FileDiff, FileState, Forge, Lines, LocalBranch, PullRequestHead, RemoteBranch, RemoteRef,
+    RepoWorktrees, TrackedState, Uncommitted, Vcs, WorktreeFacts, WorktreeStart,
 };
 use agent_core::process::{self, CommandError};
 
@@ -103,22 +105,24 @@ fn parse_numstat(out: &str) -> Vec<Change> {
                 (Ok(added), Ok(removed)) => Lines::Counted { added, removed },
                 _ => Lines::Binary,
             };
-            Some(Change {
-                path: PathBuf::from(path),
-                lines,
-                state: FileState::Committed,
-            })
+            Some(Change::tracked(path, lines, TrackedState::Committed))
         })
         .collect()
 }
 
 /// `git status --porcelain=v1 -z --no-renames` output: `XY path\0` per
 /// file.
-fn parse_status(out: &str) -> Vec<(String, PathBuf)> {
+fn parse_status(out: &str) -> Vec<Uncommitted> {
     out.split('\0')
         .filter_map(|entry| {
-            let (code, path) = (entry.get(..2)?, entry.get(3..)?);
-            (!path.is_empty()).then(|| (code.to_string(), PathBuf::from(path)))
+            let mut chars = entry.chars();
+            let (index, tree, space) = (chars.next()?, chars.next()?, chars.next()?);
+            let path = chars.as_str();
+            let state = parse_state(index, tree);
+            (space == ' ' && !path.is_empty() && !state.is_committed()).then(|| Uncommitted {
+                path: PathBuf::from(path),
+                state,
+            })
         })
         .collect()
 }
@@ -127,25 +131,31 @@ fn edit_of(code: char) -> Option<Edit> {
     match code {
         'A' => Some(Edit::Added),
         'D' => Some(Edit::Deleted),
-        'M' | 'T' | 'R' | 'C' | 'U' => Some(Edit::Modified),
+        'M' | 'T' | 'R' | 'C' => Some(Edit::Modified),
         _ => None,
     }
 }
 
-/// A porcelain `XY` code: `X` is the index, `Y` the working tree.
-fn parse_state(code: &str) -> FileState {
-    if code == "??" {
+/// A porcelain `XY` pair: `X` is the index, `Y` the working tree.
+fn parse_state(index: char, tree: char) -> FileState {
+    if (index, tree) == ('?', '?') {
         return FileState::Untracked;
     }
-    let mut chars = code.chars();
-    let staged = chars.next().and_then(edit_of);
-    let unstaged = chars.next().and_then(edit_of);
-    match (staged, unstaged) {
+    let unmerged = matches!((index, tree), ('A', 'A') | ('D', 'D')) || index == 'U' || tree == 'U';
+    if unmerged {
+        return FileState::Conflicted;
+    }
+    match (edit_of(index), edit_of(tree)) {
         (Some(staged), Some(unstaged)) => FileState::Both { staged, unstaged },
         (Some(edit), None) => FileState::Staged(edit),
         (None, Some(edit)) => FileState::Unstaged(edit),
         (None, None) => FileState::Committed,
     }
+}
+
+fn parsed<T: FromStr<Err = NameError>>(cmd: &Command, raw: &str) -> Result<T, CommandError> {
+    raw.parse()
+        .map_err(|e: NameError| parse_error(cmd, e.to_string()))
 }
 
 fn parse_error(cmd: &Command, detail: impl Into<String>) -> CommandError {
@@ -156,12 +166,12 @@ fn parse_error(cmd: &Command, detail: impl Into<String>) -> CommandError {
 }
 
 /// Runs a query whose exit code 1 means "no" (`rev-parse --verify --quiet`).
-fn query(mut cmd: Command) -> Result<bool, CommandError> {
-    let out = process::output(&mut cmd)?;
+fn query(cmd: &mut Command) -> Result<bool, CommandError> {
+    let out = process::output(cmd)?;
     match out.status.code() {
         Some(0) => Ok(true),
         Some(1) => Ok(false),
-        _ => Err(process::failed(&cmd, &out)),
+        _ => Err(process::failed(cmd, &out)),
     }
 }
 
@@ -216,7 +226,6 @@ impl Git {
         }
     }
 
-    /// `git diff --shortstat` of the working tree against `since`.
     /// Lines changed per file since `since`, committed or not.
     fn numstat(dir: &Path, since: &str) -> Result<Vec<Change>, CommandError> {
         let mut cmd = git(dir);
@@ -225,9 +234,8 @@ impl Git {
         Ok(parse_numstat(&out))
     }
 
-    /// Every modified, staged and untracked file, as `status` codes and
-    /// paths.
-    fn status(dir: &Path) -> Result<Vec<(String, PathBuf)>, CommandError> {
+    /// Every modified, staged and untracked file.
+    fn status(dir: &Path) -> Result<Vec<Uncommitted>, CommandError> {
         let mut cmd = git(dir);
         cmd.args([
             "status",
@@ -285,7 +293,9 @@ impl Git {
         let tracking = format!("refs/remotes/{remote}/{branch}");
         let mut verify = git(repo.path());
         verify.args(["rev-parse", "--verify", "--quiet", &tracking]);
-        if query(verify)? && Self::count(repo.path(), &[&format!("{tracking}..{branch}")])? == 0 {
+        if query(&mut verify)?
+            && Self::count(repo.path(), &[&format!("{tracking}..{branch}")])? == 0
+        {
             return Ok(BranchState::Safe);
         }
         Ok(BranchState::UpstreamGone { ahead })
@@ -296,9 +306,8 @@ impl Git {
         cmd.args(["symbolic-ref", "--quiet", "--short", "HEAD"]);
         let out = process::output(&mut cmd)?;
         if out.status.success() {
-            return Ok(Checkout::Branch(
-                String::from_utf8_lossy(&out.stdout).trim().to_string(),
-            ));
+            let name = String::from_utf8_lossy(&out.stdout);
+            return parsed(&cmd, name.trim()).map(Checkout::Branch);
         }
         let mut cmd = git(dir);
         cmd.args(["rev-parse", "--short", "HEAD"]);
@@ -309,7 +318,7 @@ impl Git {
 
     /// Origin's default branch, as seen from `dir` (any of the repo's
     /// worktrees: refs are shared).
-    fn default_base(dir: &Path) -> Result<Option<String>, CommandError> {
+    fn default_base(dir: &Path) -> Result<Option<RemoteRef>, CommandError> {
         let mut cmd = git(dir);
         cmd.args([
             "symbolic-ref",
@@ -319,18 +328,92 @@ impl Git {
         ]);
         let out = process::output(&mut cmd)?;
         if out.status.success() {
-            return Ok(Some(
-                String::from_utf8_lossy(&out.stdout).trim().to_string(),
-            ));
+            let name = String::from_utf8_lossy(&out.stdout);
+            return parsed(&cmd, name.trim()).map(Some);
         }
         for candidate in ["origin/main", "origin/master"] {
             let mut cmd = git(dir);
             cmd.args(["rev-parse", "--verify", "--quiet", candidate]);
-            if query(cmd)? {
-                return Ok(Some(candidate.into()));
+            if query(&mut cmd)? {
+                return parsed(&cmd, candidate).map(Some);
             }
         }
         Ok(None)
+    }
+
+    /// `changes` with the state `status` gives each file, and the untracked
+    /// files, which no diff lists, last.
+    fn overlay(changes: Vec<Change>, status: &[Uncommitted]) -> Vec<Change> {
+        let states: HashMap<&Path, TrackedState> = status
+            .iter()
+            .filter_map(|file| Some((file.path.as_path(), file.state.tracked()?)))
+            .collect();
+        let untracked = status
+            .iter()
+            .filter(|file| file.state == FileState::Untracked)
+            .map(|file| Change::untracked(file.path.clone()));
+        changes
+            .into_iter()
+            .map(|mut change| {
+                if let (ChangeKind::Tracked { state, .. }, Some(found)) =
+                    (&mut change.kind, states.get(change.path.as_path()))
+                {
+                    *state = *found;
+                }
+                change
+            })
+            .chain(untracked)
+            .collect()
+    }
+
+    /// Every file `status` lists, counted against the last commit where a
+    /// diff has counts for it. One with no diff left, such as a staged edit
+    /// reverted in the working tree, is still uncommitted work.
+    fn pending(dir: &Path, status: &[Uncommitted]) -> Result<Vec<Change>, CommandError> {
+        let mut changes = Self::overlay(Self::numstat(dir, "HEAD")?, status);
+        let counted: HashSet<PathBuf> = changes.iter().map(|c| c.path.clone()).collect();
+        changes.extend(
+            status
+                .iter()
+                .filter(|file| !counted.contains(&file.path))
+                .map(Change::listed),
+        );
+        Ok(changes)
+    }
+
+    /// Where HEAD forked from `base`.
+    fn fork_point(dir: &Path, base: &RemoteRef) -> Result<String, CommandError> {
+        let mut cmd = git(dir);
+        cmd.args(["merge-base", "HEAD", base.as_str()]);
+        Ok(process::run(&mut cmd)?.trim().to_string())
+    }
+
+    /// The files changed since the fork point from `base`, committed or not.
+    fn fork_changes(
+        dir: &Path,
+        base: &RemoteRef,
+        status: &[Uncommitted],
+    ) -> Result<Vec<Change>, CommandError> {
+        let fork = Self::fork_point(dir, base)?;
+        Ok(Self::overlay(Self::numstat(dir, &fork)?, status))
+    }
+
+    /// How many commits `base` is `(behind, ahead)` of HEAD's.
+    fn compare(dir: &Path, base: &RemoteRef) -> Result<(usize, usize), CommandError> {
+        let mut cmd = git(dir);
+        cmd.args([
+            "rev-list",
+            "--left-right",
+            "--count",
+            &format!("{base}...HEAD"),
+        ]);
+        let counts = process::run(&mut cmd)?;
+        counts
+            .split_once('\t')
+            .and_then(|(behind, ahead)| {
+                Some((behind.trim().parse().ok()?, ahead.trim().parse().ok()?))
+            })
+            .ok_or_else(|| parse_error(&cmd, format!("expected two counts, got {counts:?}")))
     }
 }
 
@@ -398,7 +481,7 @@ impl Vcs for Git {
             WorktreeStart::DefaultBase => {
                 cmd.arg("--detach").arg(at.path());
                 if let Some(base) = Self::default_base(repo.path())? {
-                    cmd.arg(base);
+                    cmd.arg(base.as_str());
                 }
             }
             WorktreeStart::Branch(local) => {
@@ -437,7 +520,7 @@ impl Vcs for Git {
         let mut cmd = git(repo.path());
         cmd.args(["rev-parse", "--verify", "--quiet"])
             .arg(format!("refs/heads/{branch}"));
-        Ok(query(cmd)?.then(|| LocalBranch::found(branch.clone())))
+        Ok(query(&mut cmd)?.then(|| LocalBranch::found(branch.clone())))
     }
 
     fn remote_branch(
@@ -448,7 +531,7 @@ impl Vcs for Git {
         let mut cmd = git(repo.path());
         cmd.args(["rev-parse", "--verify", "--quiet"])
             .arg(format!("refs/remotes/origin/{branch}"));
-        Ok(query(cmd)?.then(|| RemoteBranch::found(branch.clone())))
+        Ok(query(&mut cmd)?.then(|| RemoteBranch::found(branch.clone())))
     }
 
     fn fetch(&self, repo: &RepoRoot, what: &Fetch) -> Result<(), CommandError> {
@@ -501,67 +584,23 @@ impl Vcs for Git {
 
     fn facts(&self, worktree: &Path) -> Result<WorktreeFacts, CommandError> {
         let status = Self::status(worktree)?;
-        let untracked: Vec<Change> = status
-            .iter()
-            .filter(|(code, _)| code == "??")
-            .map(|(_, path)| Change {
-                path: path.clone(),
-                lines: Lines::Untracked,
-                state: FileState::Untracked,
-            })
-            .collect();
-        let states: std::collections::HashMap<&Path, FileState> = status
-            .iter()
-            .map(|(code, path)| (path.as_path(), parse_state(code)))
-            .collect();
-        let with_state = |mut changed: Vec<Change>| {
-            for change in &mut changed {
-                if let Some(state) = states.get(change.path.as_path()) {
-                    change.state = *state;
-                }
-            }
-            changed
-        };
-        let dirty = status.len();
-        let mut pending = with_state(Self::numstat(worktree, "HEAD")?);
-        pending.extend(untracked.iter().cloned());
+        let pending = Self::pending(worktree, &status)?;
         let base = Self::default_base(worktree)?;
-        let compared = Compared::of(Self::checkout(worktree)?, base.as_deref());
+        let compared = Compared::of(Self::checkout(worktree)?, base.clone());
         let Some(base) = base else {
             return Ok(WorktreeFacts {
                 changed: pending.clone(),
                 pending,
-                compared,
-                dirty,
-                ..WorktreeFacts::default()
+                ..WorktreeFacts::unchanged(compared)
             });
         };
-        let mut cmd = git(worktree);
-        cmd.args(["merge-base", "HEAD", &base]);
-        let fork = process::run(&mut cmd)?.trim().to_string();
-        let mut cmd = git(worktree);
-        cmd.args([
-            "rev-list",
-            "--left-right",
-            "--count",
-            &format!("{base}...HEAD"),
-        ]);
-        let counts = process::run(&mut cmd)?;
-        let (behind, ahead) = counts
-            .split_once('\t')
-            .and_then(|(behind, ahead)| {
-                Some((behind.trim().parse().ok()?, ahead.trim().parse().ok()?))
-            })
-            .ok_or_else(|| parse_error(&cmd, format!("expected two counts, got {counts:?}")))?;
-        let mut changed = with_state(Self::numstat(worktree, &fork)?);
-        changed.extend(untracked);
+        let (behind, ahead) = Self::compare(worktree, &base)?;
         Ok(WorktreeFacts {
             ahead,
             behind,
-            changed,
+            changed: Self::fork_changes(worktree, &base, &status)?,
             pending,
             compared,
-            dirty,
         })
     }
 
@@ -611,40 +650,37 @@ impl Vcs for Git {
     fn file_diff(
         &self,
         worktree: &Path,
-        path: &Path,
-        lines: Lines,
+        change: &Change,
         base: DiffBase,
     ) -> Result<FileDiff, CommandError> {
+        let path = change.path.as_path();
         let binary = || FileDiff::Binary {
             bytes: std::fs::metadata(worktree.join(path)).ok().map(|m| m.len()),
         };
-        if lines == Lines::Binary {
-            return Ok(binary());
-        }
         let mut cmd = git(worktree);
         cmd.args(["diff", "--no-color", "--no-ext-diff"]);
-        match lines {
-            Lines::Untracked => {
-                cmd.args(["--no-index", "--", "/dev/null"]).arg(path);
-            }
-            Lines::Counted { .. } | Lines::Binary => {
+        let untracked = match change.kind {
+            ChangeKind::Tracked {
+                lines: Lines::Binary,
+                ..
+            } => return Ok(binary()),
+            ChangeKind::Tracked { .. } => {
                 let since = match (base, Self::default_base(worktree)?) {
-                    (DiffBase::Fork, Some(default)) => {
-                        let mut merge = git(worktree);
-                        merge.args(["merge-base", "HEAD", &default]);
-                        process::run(&mut merge)?.trim().to_string()
-                    }
+                    (DiffBase::Fork, Some(default)) => Self::fork_point(worktree, &default)?,
                     (DiffBase::Fork, None) | (DiffBase::Head, _) => "HEAD".to_string(),
                 };
                 cmd.arg(since).arg("--").arg(path);
+                false
             }
-        }
+            ChangeKind::Untracked => {
+                cmd.args(["--no-index", "--", "/dev/null"]).arg(path);
+                true
+            }
+        };
         let (out, cut) = process::output_capped(&mut cmd, DIFF_TIMEOUT, DIFF_BYTES)?;
         // `--no-index` exits 1 when the files differ, and a diff cut short
         // has its command killed.
-        let ok = cut
-            || out.status.success()
-            || (lines == Lines::Untracked && out.status.code() == Some(1));
+        let ok = cut || out.status.success() || (untracked && out.status.code() == Some(1));
         if !ok {
             return Err(process::failed(&cmd, &out));
         }
@@ -776,21 +812,14 @@ fn split_commit(out: &str, cut: bool) -> Vec<(Change, FileDiff)> {
                     removed: lines.iter().filter(|l| l.starts_with('-')).count(),
                 },
             };
-            Some((
-                Change {
-                    path: PathBuf::from(path),
-                    lines,
-                    state: FileState::Committed,
-                },
-                diff,
-            ))
+            Some((Change::tracked(path, lines, TrackedState::Committed), diff))
         })
         .collect()
 }
 
 /// The hunks of `git diff` output, from the first `@@`, at most `keep` lines
-/// of them. `None` when git says the file is binary.
-/// A `cut` diff ended mid-line because it was too big to read whole.
+/// of them. `None` when git says the file is binary. A `cut` diff ended
+/// mid-line because it was too big to read whole.
 fn parse_diff(out: &str, keep: usize, cut: bool) -> Option<FileDiff> {
     let mut lines = out.lines().skip_while(|l| !l.starts_with("@@")).peekable();
     if lines.peek().is_none() && out.lines().any(|l| l.starts_with("Binary files")) {
@@ -818,6 +847,7 @@ fn parse_diff(out: &str, keep: usize, cut: bool) -> Option<FileDiff> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_core::ports::Readiness;
 
     #[test]
     fn fetching_a_ref_origin_lacks_is_nothing_fetched_not_a_failure() {
@@ -971,11 +1001,12 @@ mod tests {
             &["clone", "-q", origin.to_str().expect("succeeds"), "work"],
         );
         let compared = || Git.facts(&work).expect("succeeds").compared;
-        let base = || "origin/main".to_string();
+        let branch = |name: &str| -> BranchName { name.parse().expect("parses") };
+        let base = || -> RemoteRef { "origin/main".parse().expect("parses") };
         assert_eq!(
             compared(),
             Compared::Trunk {
-                branch: "main".into(),
+                branch: branch("main"),
                 base: base()
             }
         );
@@ -983,7 +1014,7 @@ mod tests {
         assert_eq!(
             compared(),
             Compared::Branch {
-                branch: "fix-thing".into(),
+                branch: branch("fix-thing"),
                 base: base()
             }
         );
@@ -995,7 +1026,7 @@ mod tests {
         assert_eq!(
             compared(),
             Compared::NoBase {
-                head: "main".into()
+                checkout: Checkout::Branch(branch("main"))
             }
         );
     }
@@ -1038,12 +1069,12 @@ mod tests {
         );
         git(&work, &["fetch", "-q"]);
         let facts = Git.facts(&work).expect("succeeds");
-        assert_eq!((facts.ahead, facts.behind, facts.dirty), (1, 1, 1));
+        assert_eq!((facts.ahead, facts.behind, facts.dirty()), (1, 1, 1));
         assert_eq!(
             facts.compared,
             Compared::Trunk {
-                branch: "main".into(),
-                base: "origin/main".into()
+                branch: "main".parse().expect("parses"),
+                base: "origin/main".parse().expect("parses")
             }
         );
         std::fs::write(work.join("new.txt"), "x\n").expect("writes");
@@ -1051,49 +1082,131 @@ mod tests {
         assert_eq!(
             facts.changed,
             [
-                Change {
-                    path: "a.txt".into(),
-                    lines: Lines::Counted {
+                Change::tracked(
+                    "a.txt",
+                    Lines::Counted {
                         added: 1,
                         removed: 0
                     },
-                    state: FileState::Unstaged(Edit::Modified)
-                },
-                Change {
-                    path: "b.txt".into(),
-                    lines: Lines::Counted {
+                    TrackedState::Unstaged(Edit::Modified)
+                ),
+                Change::tracked(
+                    "b.txt",
+                    Lines::Counted {
                         added: 1,
                         removed: 0
                     },
-                    state: FileState::Committed
-                },
-                Change {
-                    path: "new.txt".into(),
-                    lines: Lines::Untracked,
-                    state: FileState::Untracked
-                },
+                    TrackedState::Committed
+                ),
+                Change::untracked("new.txt"),
             ],
             "uncommitted and untracked work counts too"
         );
         assert_eq!(
             facts.pending,
             [
-                Change {
-                    path: "a.txt".into(),
-                    lines: Lines::Counted {
+                Change::tracked(
+                    "a.txt",
+                    Lines::Counted {
                         added: 0,
                         removed: 1
                     },
-                    state: FileState::Unstaged(Edit::Modified)
-                },
-                Change {
-                    path: "new.txt".into(),
-                    lines: Lines::Untracked,
-                    state: FileState::Untracked
-                },
+                    TrackedState::Unstaged(Edit::Modified)
+                ),
+                Change::untracked("new.txt"),
             ],
             "uncommitted files count against the last commit, committed ones are left out"
         );
+    }
+
+    fn repo_with(files: &[(&str, &str)]) -> (tempfile::TempDir, impl Fn(&[&str]) -> bool) {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().to_path_buf();
+        let git = move |args: &[&str]| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(&path)
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .output()
+                .expect("succeeds");
+            out.status.success()
+        };
+        assert!(git(&["init", "-q", "-b", "main"]));
+        for (name, text) in files {
+            std::fs::write(dir.path().join(name), text).expect("writes");
+            assert!(git(&["add", name]));
+        }
+        assert!(git(&["commit", "-q", "-m", "init"]));
+        (dir, git)
+    }
+
+    fn pending_states(dir: &Path) -> Vec<(String, FileState)> {
+        let facts = Git.facts(dir).expect("succeeds");
+        assert_eq!(facts.dirty(), facts.pending.len());
+        let mut states: Vec<_> = facts
+            .pending
+            .iter()
+            .map(|c| (c.path.display().to_string(), c.state()))
+            .collect();
+        states.sort_by(|a, b| a.0.cmp(&b.0));
+        states
+    }
+
+    #[test]
+    fn uncommitted_files_without_a_diff_against_head_still_count() {
+        let (dir, git) = repo_with(&[("a.txt", "one\n"), ("gone.txt", "x\n")]);
+        std::fs::write(dir.path().join("a.txt"), "two\n").expect("writes");
+        assert!(git(&["add", "a.txt"]));
+        std::fs::write(dir.path().join("a.txt"), "one\n").expect("writes");
+        std::fs::write(dir.path().join("new.txt"), "n\n").expect("writes");
+        assert!(git(&["add", "new.txt"]));
+        std::fs::remove_file(dir.path().join("new.txt")).expect("removes");
+        assert_eq!(
+            pending_states(dir.path()),
+            [
+                (
+                    "a.txt".to_string(),
+                    FileState::Both {
+                        staged: Edit::Modified,
+                        unstaged: Edit::Modified
+                    }
+                ),
+                (
+                    "new.txt".to_string(),
+                    FileState::Both {
+                        staged: Edit::Added,
+                        unstaged: Edit::Deleted
+                    }
+                ),
+            ],
+            "a staged edit reverted in the tree, and a staged add deleted from it"
+        );
+    }
+
+    #[test]
+    fn a_conflicted_merge_lists_each_unmerged_file_as_conflicted() {
+        let (dir, git) = repo_with(&[("f.txt", "x\n"), ("g.txt", "x\n")]);
+        assert!(git(&["checkout", "-q", "-b", "side"]));
+        std::fs::write(dir.path().join("f.txt"), "side\n").expect("writes");
+        assert!(git(&["commit", "-q", "-am", "side f"]));
+        assert!(git(&["rm", "-q", "g.txt"]));
+        assert!(git(&["commit", "-q", "-m", "side g"]));
+        assert!(git(&["checkout", "-q", "main"]));
+        std::fs::write(dir.path().join("f.txt"), "main\n").expect("writes");
+        std::fs::write(dir.path().join("g.txt"), "main\n").expect("writes");
+        assert!(git(&["commit", "-q", "-am", "main"]));
+        assert!(!git(&["merge", "-q", "side"]), "the merge conflicts");
+        assert_eq!(
+            pending_states(dir.path()),
+            [
+                ("f.txt".to_string(), FileState::Conflicted),
+                ("g.txt".to_string(), FileState::Conflicted),
+            ],
+            "UU and UD"
+        );
+        let facts = Git.facts(dir.path()).expect("succeeds");
+        assert!(matches!(facts.readiness(), Readiness::Dirty { .. }));
     }
 
     #[test]
@@ -1188,12 +1301,18 @@ mod tests {
         git(&work, &["commit", "-q", "-am", "two"]);
         std::fs::write(work.join("a.txt"), "one\ntwo\nthree\n").expect("writes");
         std::fs::write(work.join("new.txt"), "x\ny\n").expect("writes");
-        let counted = Lines::Counted {
-            added: 2,
-            removed: 0,
+        let tracked = |path: &str, lines| {
+            Change::tracked(path, lines, TrackedState::Unstaged(Edit::Modified))
         };
+        let counted = tracked(
+            "a.txt",
+            Lines::Counted {
+                added: 2,
+                removed: 0,
+            },
+        );
         let FileDiff::Text { lines, more } = Git
-            .file_diff(&work, Path::new("a.txt"), counted, DiffBase::Fork)
+            .file_diff(&work, &counted, DiffBase::Fork)
             .expect("succeeds")
         else {
             panic!("a text diff");
@@ -1205,7 +1324,7 @@ mod tests {
             "committed and uncommitted together"
         );
         let FileDiff::Text { lines, .. } = Git
-            .file_diff(&work, Path::new("a.txt"), counted, DiffBase::Head)
+            .file_diff(&work, &counted, DiffBase::Head)
             .expect("succeeds")
         else {
             panic!("a text diff");
@@ -1216,12 +1335,7 @@ mod tests {
             "only what's uncommitted"
         );
         let FileDiff::Text { lines, .. } = Git
-            .file_diff(
-                &work,
-                Path::new("new.txt"),
-                Lines::Untracked,
-                DiffBase::Fork,
-            )
+            .file_diff(&work, &Change::untracked("new.txt"), DiffBase::Fork)
             .expect("succeeds")
         else {
             panic!("a text diff");
@@ -1230,10 +1344,10 @@ mod tests {
         let log = Git.branch_log(&work).expect("succeeds");
         assert_eq!(log.commits.len(), 1);
         assert!(log.commits[0].ends_with(" two"), "{:?}", log.commits);
-        let files: Vec<&Path> = log.uncommitted.iter().map(|(_, p)| p.as_path()).collect();
+        let files: Vec<&Path> = log.uncommitted.iter().map(|f| f.path.as_path()).collect();
         assert_eq!(files, [Path::new("a.txt"), Path::new("new.txt")]);
         assert_eq!(
-            Git.file_diff(&work, Path::new("new.txt"), Lines::Binary, DiffBase::Fork)
+            Git.file_diff(&work, &tracked("new.txt", Lines::Binary), DiffBase::Fork)
                 .expect("succeeds"),
             FileDiff::Binary { bytes: Some(4) }
         );
@@ -1244,19 +1358,15 @@ mod tests {
         assert_eq!(
             parse_numstat("3\t1\tsrc/a b.rs\0-\t-\tlogo.png\0"),
             [
-                Change {
-                    path: "src/a b.rs".into(),
-                    lines: Lines::Counted {
+                Change::tracked(
+                    "src/a b.rs",
+                    Lines::Counted {
                         added: 3,
                         removed: 1
                     },
-                    state: FileState::Committed
-                },
-                Change {
-                    path: "logo.png".into(),
-                    lines: Lines::Binary,
-                    state: FileState::Committed
-                },
+                    TrackedState::Committed
+                ),
+                Change::tracked("logo.png", Lines::Binary, TrackedState::Committed),
             ]
         );
     }
@@ -1286,10 +1396,40 @@ mod tests {
                 },
             ),
             ("  ", FileState::Committed),
+            ("UU", FileState::Conflicted),
+            ("AA", FileState::Conflicted),
+            ("DD", FileState::Conflicted),
+            ("UD", FileState::Conflicted),
+            ("DU", FileState::Conflicted),
+            ("AU", FileState::Conflicted),
+            ("UA", FileState::Conflicted),
         ];
         for (code, state) in cases {
-            assert_eq!(parse_state(code), state, "{code:?}");
+            let mut chars = code.chars();
+            let (index, tree) = (chars.next().expect("two"), chars.next().expect("two"));
+            assert_eq!(parse_state(index, tree), state, "{code:?}");
         }
+    }
+
+    #[test]
+    fn status_lists_each_file_with_its_parsed_state() {
+        assert_eq!(
+            parse_status(" M src/a.rs\0A  new.rs\0?? notes/b.md\0"),
+            [
+                Uncommitted {
+                    path: "src/a.rs".into(),
+                    state: FileState::Unstaged(Edit::Modified)
+                },
+                Uncommitted {
+                    path: "new.rs".into(),
+                    state: FileState::Staged(Edit::Added)
+                },
+                Uncommitted {
+                    path: "notes/b.md".into(),
+                    state: FileState::Untracked
+                },
+            ]
+        );
     }
 
     #[test]
@@ -1403,14 +1543,14 @@ mod tests {
         assert_eq!(files.len(), 2);
         assert_eq!(files[0].0.path, PathBuf::from("src/a.rs"));
         assert_eq!(
-            files[0].0.lines,
-            Lines::Counted {
+            files[0].0.lines(),
+            Some(Lines::Counted {
                 added: 1,
                 removed: 1
-            }
+            })
         );
         assert_eq!(files[1].0.path, PathBuf::from("img.png"));
-        assert_eq!(files[1].0.lines, Lines::Binary);
+        assert_eq!(files[1].0.lines(), Some(Lines::Binary));
     }
 
     #[test]

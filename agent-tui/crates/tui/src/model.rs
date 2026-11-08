@@ -12,7 +12,9 @@ use agent_core::model::{
 use agent_core::names::{AgentName, BranchName, Checkout, Prompt, SessionName};
 use agent_core::ops::{Approved, Hazardous, RemovalPlan};
 use agent_core::paths::{RepoRoot, Typed, typed_path};
-use agent_core::ports::{Change, HarnessId, Lines, Readiness, SubagentDetail, WorktreeFacts};
+use agent_core::ports::{
+    Change, FileState, HarnessId, Readiness, SubagentDetail, Uncommitted, WorktreeFacts,
+};
 use agent_term::{Emulator, Terminal};
 use ratatui::layout::Rect;
 
@@ -1042,11 +1044,11 @@ pub struct SubagentRead {
 }
 
 /// What [0] opened from the branch view: a commit's diff, or the diff of an
-/// uncommitted file with its status code.
+/// uncommitted file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Opened {
     Commit { sha: String, subject: String },
-    File { path: PathBuf, code: String },
+    File { path: PathBuf, state: FileState },
 }
 
 /// A subagent by its agent and its id.
@@ -1630,17 +1632,12 @@ impl Model {
                     sha: sha.clone(),
                     subject: subject.clone(),
                 }),
-                Opened::File { path, code } => Hover::Diff(DiffKey {
+                Opened::File { path, state } => Hover::Diff(DiffKey {
                     name,
-                    path: path.clone(),
-                    lines: if code.trim() == "??" {
-                        Lines::Untracked
-                    } else {
-                        Lines::Counted {
-                            added: 0,
-                            removed: 0,
-                        }
-                    },
+                    change: Change::listed(&Uncommitted {
+                        path: path.clone(),
+                        state: *state,
+                    }),
                     base: agent_core::ports::DiffBase::Head,
                     generation,
                 }),
@@ -1662,8 +1659,7 @@ impl Model {
             }
             (_, Some(change), _) => Hover::Diff(DiffKey {
                 name,
-                path: change.path.clone(),
-                lines: change.lines,
+                change: change.clone(),
                 base: self.changes_scope.diff_base(),
                 generation,
             }),
@@ -1671,7 +1667,7 @@ impl Model {
                 name,
                 ahead: facts.ahead,
                 behind: facts.behind,
-                dirty: facts.dirty,
+                dirty: facts.dirty(),
                 compared: facts.compared.clone(),
                 generation,
             }),

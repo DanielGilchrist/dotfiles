@@ -8,14 +8,18 @@ use std::time::Instant;
 use agent_core::activity::AgentId;
 use agent_core::model::{Head, RepoKey};
 use agent_core::names::{CarriageReturn, SessionName, clean};
-use agent_core::ports::{BranchLog, Change, Compared, FileDiff, Lines};
+use agent_core::ports::{
+    BranchLog, Change, ChangeKind, Compared, Edit, FileDiff, FileState, Lines,
+};
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthChar;
 
 use super::log;
-use super::sidebar::{fits_beside, others_on, status_line, subagent_rows, turn_message};
+use super::sidebar::{
+    edit_letter, fits_beside, others_on, second_tab, status_line, subagent_rows, turn_message,
+};
 use super::{
     accent, bold, dim, error, fit, justify, line_width, spinner, success, truncate_end,
     truncate_start, warning, wrap,
@@ -356,17 +360,20 @@ fn diff_body(m: &mut Model, hover: &DiffKey, columns: usize, budget: usize) -> B
             let (key, loaded) = (key.clone(), loaded.clone());
             m.docs
                 .rows_with_lines(&key, columns, || match loaded.as_ref() {
-                    Ok(Doc::Diff(diff)) => diff_rows_info(&hover.path, Ok(diff), columns, 0),
+                    Ok(Doc::Diff(diff)) => diff_rows_info(&hover.change.path, Ok(diff), columns, 0),
                     Ok(Doc::Branch(_) | Doc::Folder(_)) => (Vec::new(), Vec::new()),
-                    Err(e) => diff_rows_info(&hover.path, Err(e), columns, 0),
+                    Err(e) => diff_rows_info(&hover.change.path, Err(e), columns, 0),
                 });
             Rows::Cached
         }
         Resolved::Missing => Rows::Built(Vec::new()),
     };
     let mut counts = Vec::new();
-    match hover.lines {
-        Lines::Counted { added, removed } => {
+    match hover.change.kind {
+        ChangeKind::Tracked {
+            lines: Lines::Counted { added, removed },
+            ..
+        } => {
             for (count, text, style) in [
                 (added, format!(" +{added}"), success()),
                 (removed, format!(" −{removed}"), error()),
@@ -376,13 +383,20 @@ fn diff_body(m: &mut Model, hover: &DiffKey, columns: usize, budget: usize) -> B
                 }
             }
         }
-        Lines::Binary => counts.push(Span::styled(" bin", dim())),
-        Lines::Untracked => counts.push(Span::styled(" new", dim())),
+        ChangeKind::Tracked {
+            lines: Lines::Binary,
+            ..
+        } => counts.push(Span::styled(" bin", dim())),
+        ChangeKind::Tracked {
+            lines: Lines::Unknown,
+            ..
+        } => {}
+        ChangeKind::Untracked => counts.push(Span::styled(" new", dim())),
     }
-    let others = others_on(m, &hover.name, &hover.path);
+    let others = others_on(m, &hover.name, &hover.change.path);
     let fixed = 4 + line_width(&counts);
     let path_room = budget.saturating_sub(fixed).max(12);
-    let path = truncate_start(&hover.path.to_string_lossy(), path_room);
+    let path = truncate_start(&hover.change.path.to_string_lossy(), path_room);
     let mut title = vec![Span::raw("[0] "), Span::styled(path, bold())];
     title.extend(counts);
     let left = budget.saturating_sub(line_width(&title) + 4);
@@ -425,10 +439,14 @@ fn folder_body(m: &mut Model, hover: &FolderKey, columns: usize, budget: usize) 
     };
     let (mut added, mut removed) = (0, 0);
     for change in &hover.files {
-        if let Lines::Counted {
-            added: a,
-            removed: r,
-        } = change.lines
+        if let ChangeKind::Tracked {
+            lines:
+                Lines::Counted {
+                    added: a,
+                    removed: r,
+                },
+            ..
+        } = change.kind
         {
             added += a;
             removed += r;
@@ -460,9 +478,12 @@ fn folder_body(m: &mut Model, hover: &FolderKey, columns: usize, budget: usize) 
     }
 }
 
-fn count_spans(lines: Lines) -> Vec<Span<'static>> {
-    match lines {
-        Lines::Counted { added, removed } => {
+fn count_spans(kind: ChangeKind) -> Vec<Span<'static>> {
+    match kind {
+        ChangeKind::Tracked {
+            lines: Lines::Counted { added, removed },
+            ..
+        } => {
             let mut spans = Vec::new();
             if added > 0 {
                 spans.push(Span::styled(format!("+{added}"), success()));
@@ -475,8 +496,15 @@ fn count_spans(lines: Lines) -> Vec<Span<'static>> {
             }
             spans
         }
-        Lines::Binary => vec![Span::styled("bin", dim())],
-        Lines::Untracked => vec![Span::styled("new", dim())],
+        ChangeKind::Tracked {
+            lines: Lines::Binary,
+            ..
+        } => vec![Span::styled("bin", dim())],
+        ChangeKind::Tracked {
+            lines: Lines::Unknown,
+            ..
+        } => Vec::new(),
+        ChangeKind::Untracked => vec![Span::styled("new", dim())],
     }
 }
 
@@ -506,8 +534,8 @@ fn section_rows(
             .unwrap_or(&change.path)
             .to_string_lossy()
             .into_owned();
-        let mut left = super::sidebar::file_marker(change.state);
-        let right = count_spans(change.lines);
+        let mut left = super::sidebar::file_marker(change.state());
+        let right = count_spans(change.kind);
         let room = columns.saturating_sub(line_width(&left) + line_width(&right) + 1);
         left.push(Span::raw(truncate_start(&rel, room)));
         rows.push(justify(left, right, columns));
@@ -531,7 +559,7 @@ fn section_rows(
             ),
             bold(),
         )];
-        let counts = count_spans(file.change.lines);
+        let counts = count_spans(file.change.kind);
         if !counts.is_empty() {
             head.push(Span::raw("  "));
             head.extend(counts);
@@ -590,7 +618,7 @@ fn commit_body(m: &mut Model, hover: &CommitKey, columns: usize) -> Body {
 fn branch_body(m: &mut Model, key: &BranchKey, columns: usize) -> Body {
     let title = vec![
         Span::raw("[0] "),
-        Span::styled(key.compared.tab(), bold()),
+        Span::styled(second_tab(&key.compared), bold()),
         Span::styled(format!(" · {}", compared_title(&key.compared)), dim()),
     ];
     let compared = key.compared.clone();
@@ -690,8 +718,15 @@ fn branch_rows(
             gutter(),
             Span::styled(format!("Uncommitted ({})", log.uncommitted.len()), dim()),
         ]));
-        for (code, path) in &log.uncommitted {
-            items.push(item(rows.len(), 1, path, review::LineKind::Entry, code));
+        for file in &log.uncommitted {
+            let (code, path) = (status_code(file.state), &file.path);
+            items.push(item(
+                rows.len(),
+                1,
+                path,
+                review::LineKind::Entry(file.state),
+                &code,
+            ));
             rows.push(Line::from(vec![
                 gutter(),
                 Span::styled(format!("{code} "), dim()),
@@ -710,6 +745,15 @@ fn branch_rows(
         ]));
     }
     (rows, items)
+}
+
+fn status_code(state: FileState) -> String {
+    let letter = |edit: Option<Edit>| edit.map_or(" ", edit_letter);
+    match state {
+        FileState::Untracked => "??".to_string(),
+        FileState::Conflicted => "UU".to_string(),
+        state => format!("{}{}", letter(state.staged()), letter(state.unstaged())),
+    }
 }
 
 fn compared_title(compared: &Compared) -> String {

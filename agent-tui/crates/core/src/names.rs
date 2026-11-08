@@ -170,7 +170,9 @@ impl FromStr for BranchName {
     type Err = NameError;
 
     fn from_str(s: &str) -> Result<Self, NameError> {
-        let forbidden = |c: char| c.is_control() || c.is_whitespace() || "~^:?*[\\".contains(c);
+        // git's own rules: only ASCII controls and the space are refused, so
+        // names with other Unicode whitespace or C1 controls are real branches.
+        let forbidden = |c: char| c < ' ' || c == '\x7f' || c == ' ' || "~^:?*[\\".contains(c);
         let bad_component = |c: &str| c.is_empty() || c.starts_with('.') || c.ends_with(".lock");
         let invalid = s.is_empty()
             || s == "@"
@@ -357,12 +359,21 @@ mod tests {
 
     #[test]
     fn branch_names_follow_check_ref_format() {
-        for ok in ["main", "feature/x", "fix-1.2", "user/a_b"] {
+        for ok in [
+            "main",
+            "feature/x",
+            "fix-1.2",
+            "user/a_b",
+            "a\u{a0}b",
+            "a\u{3000}b",
+            "a\u{85}b",
+            "a\u{2028}b",
+        ] {
             assert!(ok.parse::<BranchName>().is_ok(), "{ok}");
         }
         for bad in [
             "", "-x", "a..b", "a b", "a/", "/a", "a.lock", "a/.b", "@", "a@{1}", "a~1", "a.",
-            "a//b",
+            "a//b", "a\tb", "a\x7fb", "a\nb",
         ] {
             assert!(bad.parse::<BranchName>().is_err(), "{bad}");
         }

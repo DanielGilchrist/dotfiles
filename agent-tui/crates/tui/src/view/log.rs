@@ -4,7 +4,7 @@
 use std::time::{Duration, SystemTime};
 
 use agent_core::activity::{Subagent, SubagentStatus};
-use agent_core::ports::{Call, CallState, Excerpt, SubagentDetail, Summary, Target};
+use agent_core::ports::{Call, CallState, Excerpt, Outcome, SubagentDetail, Summary, Target};
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 
@@ -252,7 +252,7 @@ impl Rows<'_, '_> {
                 Span::styled(SPINNER[0], dim())
             }
             CallState::Running if self.is_live(call, last) => Span::raw(self.ctx.spinner),
-            CallState::Running | CallState::Done(_) => Span::styled("●", dim()),
+            CallState::Running | CallState::Done { .. } => Span::styled("●", dim()),
             CallState::Failed { .. } => Span::styled("!", error().add_modifier(Modifier::BOLD)),
             CallState::Flagged { .. } => Span::styled("●", warning()),
         }
@@ -293,7 +293,11 @@ impl Rows<'_, '_> {
         } else {
             SUMMARY_WIDE
         };
-        let took = call.took.filter(|d| d.as_secs() >= DURATION_FROM).map(span);
+        let took = call
+            .state
+            .took()
+            .filter(|d| d.as_secs() >= DURATION_FROM)
+            .map(span);
         let mut spans = match &call.state {
             CallState::Running => {
                 let ran = call
@@ -318,13 +322,15 @@ impl Rows<'_, '_> {
                 }
                 return spans;
             }
-            CallState::Done(summary) | CallState::Flagged { summary, .. } => summary_spans(summary),
+            CallState::Done { summary, .. } | CallState::Flagged { summary, .. } => {
+                summary_spans(summary)
+            }
             CallState::Failed { code, .. } => {
                 vec![Span::styled(failure_text(*code), error())]
             }
         };
         if self.narrow
-            && matches!(call.state, CallState::Done(_))
+            && matches!(call.state, CallState::Done { .. })
             && let Some(took) = &took
         {
             return vec![Span::styled(took.clone(), dim())];
@@ -421,7 +427,7 @@ impl Rows<'_, '_> {
         match &call.state {
             CallState::Failed { excerpt, .. } => self.excerpt_rows(excerpt, error(), "lines"),
             CallState::Flagged { excerpt, .. } => self.excerpt_rows(excerpt, warning(), "more"),
-            CallState::Running | CallState::Done(_) => {}
+            CallState::Running | CallState::Done { .. } => {}
         }
     }
 
@@ -443,9 +449,18 @@ impl Rows<'_, '_> {
         let (mut lines, mut matches, mut files) = (0, 0, 0);
         for call in calls {
             match &call.state {
-                CallState::Done(Summary::Lines(n)) => lines += n,
-                CallState::Done(Summary::Matches(n)) => matches += n,
-                CallState::Done(Summary::Files(n)) => files += n,
+                CallState::Done {
+                    summary: Summary::Lines(n),
+                    ..
+                } => lines += n,
+                CallState::Done {
+                    summary: Summary::Matches(n),
+                    ..
+                } => matches += n,
+                CallState::Done {
+                    summary: Summary::Files(n),
+                    ..
+                } => files += n,
                 _ => {}
             }
         }
@@ -550,13 +565,17 @@ fn status_row(
             spans.push(extra);
         }
     };
-    if finished && detail.report.is_some() {
+    if let (true, Outcome::Finished { report: Some(_) }) = (finished, &detail.outcome) {
         spans.push(Span::styled("✓", success().add_modifier(Modifier::BOLD)));
         spans.push(Span::raw(format!(
             " finished{}",
             took.map(|t| format!(" in {t}")).unwrap_or_default()
         )));
         tail(&mut spans, vec![Some(calls), error_span, model]);
+    } else if let Outcome::Stopped { reason: stopped } = &detail.outcome {
+        spans.push(Span::styled("!", error().add_modifier(Modifier::BOLD)));
+        spans.push(Span::raw(" stopped"));
+        tail(&mut spans, vec![Some(Span::raw(stopped.clone()))]);
     } else if finished {
         spans.push(Span::styled("●", dim()));
         spans.push(Span::styled(
@@ -574,10 +593,6 @@ fn status_row(
                 error_span,
             ],
         );
-    } else if let Some(stopped) = &detail.stopped {
-        spans.push(Span::styled("!", error().add_modifier(Modifier::BOLD)));
-        spans.push(Span::raw(" stopped"));
-        tail(&mut spans, vec![Some(Span::raw(stopped.clone()))]);
     } else if let Some(reason) = failing(detail) {
         spans.push(Span::styled("!", error().add_modifier(Modifier::BOLD)));
         spans.push(Span::styled(" failing", bold()));
@@ -628,7 +643,8 @@ pub(super) fn render(
     nav: &Nav,
     ctx: &Context<'_>,
 ) -> Rendered {
-    let finished = detail.finished || subagent.is_some_and(|s| !s.is_running());
+    let finished = matches!(detail.outcome, Outcome::Finished { .. })
+        || subagent.is_some_and(|s| !s.is_running());
     let live = !finished;
     let idle = subagent.is_none_or(|s| s.tools().is_empty())
         && !detail
@@ -667,7 +683,10 @@ pub(super) fn render(
     let mut layout = Vec::new();
     let all = entries(detail);
     let last_call = all.len().saturating_sub(1);
-    let report = detail.report.as_deref().filter(|_| finished);
+    let report = match &detail.outcome {
+        Outcome::Finished { report } => report.as_deref().filter(|_| finished),
+        Outcome::Running | Outcome::Stopped { .. } => None,
+    };
     let has_prompt = matches!(all.first(), Some(Entry::Prompt(_)));
     if let (false, Some(report)) = (has_prompt, report) {
         rows.report(report, detail);

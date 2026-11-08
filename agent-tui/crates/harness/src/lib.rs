@@ -8,7 +8,8 @@ use agent_core::activity::{
 };
 use agent_core::names::Prompt;
 use agent_core::ports::{
-    Harness, HarnessError, HarnessId, Harnesses, LaunchCtx, PendingPrompt, Seen, SubagentDetail,
+    Harness, HarnessError, HarnessId, Harnesses, LaunchCtx, LogEntry, Outcome, PendingPrompt, Seen,
+    SubagentDetail,
 };
 use agent_core::process::LaunchSpec;
 
@@ -446,31 +447,33 @@ fn read_subagent(transcript: &Path) -> io::Result<SubagentDetail> {
                 .and_then(transcript::parse_time)
         });
     let mut parsed = transcript::parse(&tail);
-    let report = match parsed.handed_back.take() {
-        Some(report) => Some(report),
-        None if finished => {
+    let outcome = match (parsed.handed_back.take(), finished) {
+        (Some(report), _) => Outcome::Finished {
+            report: Some(report),
+        },
+        (None, true) => {
             let said = parsed.last_said.take();
-            if let (Some(said), Some(agent_core::ports::LogEntry::Said { text, .. })) =
-                (&said, parsed.log.last())
+            if let (Some(said), Some(LogEntry::Said { text, .. })) = (&said, parsed.log.last())
                 && said.starts_with(text.as_str())
             {
                 parsed.log.pop();
             }
-            said
+            Outcome::Finished { report: said }
         }
-        None => None,
+        (None, false) => match parsed.stopped.take() {
+            Some(reason) => Outcome::Stopped { reason },
+            None => Outcome::Running,
+        },
     };
     Ok(SubagentDetail {
         prompt: parse_prompt(&head).unwrap_or_default(),
-        finished,
         log: parsed.log,
         transcript: transcript.to_path_buf(),
-        report,
+        outcome,
         model,
         started,
         last_heard: parsed.last_heard,
         truncated: parsed.dropped || !from_start,
-        stopped: parsed.stopped,
     })
 }
 
@@ -1001,7 +1004,12 @@ mod tests {
         )
         .expect("writes");
         let detail = read_subagent(&path).expect("reads");
-        assert_eq!(detail.report.as_deref(), Some("Done: all green."));
+        assert_eq!(
+            detail.outcome,
+            Outcome::Finished {
+                report: Some("Done: all green.".into())
+            }
+        );
         assert_eq!(detail.log, [], "the report isn't also an entry");
         assert_eq!(detail.model.as_deref(), Some("sonnet"));
         assert!(!detail.truncated);
@@ -1013,11 +1021,35 @@ mod tests {
 
         std::fs::remove_file(dir.path().join("agent-a1.meta.json")).expect("removes");
         let running = read_subagent(&path).expect("reads");
-        assert_eq!(running.report, None);
+        assert_eq!(running.outcome, Outcome::Running);
         assert_eq!(
             running.log.len(),
             1,
             "unfinished: its last words stay in the log"
+        );
+    }
+
+    #[test]
+    fn a_subagent_is_running_stopped_or_finished_and_never_two_at_once() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("agent-a1.jsonl");
+        let meta = dir.path().join("agent-a1.meta.json");
+        let first = r#"{"type":"user","timestamp":"2026-11-08T10:00:00.000Z","message":{"content":"Do it."}}"#;
+        let error = r#"{"type":"assistant","isApiErrorMessage":true,"timestamp":"2026-11-08T10:00:05.000Z","message":{"content":[{"type":"text","text":"API Error: overloaded"}]}}"#;
+        std::fs::write(&path, format!("{first}\n{error}\n")).expect("writes");
+        assert_eq!(
+            read_subagent(&path).expect("reads").outcome,
+            Outcome::Stopped {
+                reason: "API Error: overloaded".into()
+            }
+        );
+        std::fs::write(&meta, r#"{"finished":true}"#).expect("writes");
+        assert!(
+            matches!(
+                read_subagent(&path).expect("reads").outcome,
+                Outcome::Finished { .. }
+            ),
+            "a finished subagent isn't stopped"
         );
     }
 
@@ -1043,7 +1075,7 @@ mod tests {
             .expect("reads")
             .expect("found");
         assert_eq!(detail.prompt, "Review the diff.\nBe harsh.");
-        assert!(detail.finished);
+        assert!(matches!(detail.outcome, Outcome::Finished { .. }));
         assert_eq!(detail.log.len(), 2);
 
         std::fs::write(&transcript, "").expect("writes");

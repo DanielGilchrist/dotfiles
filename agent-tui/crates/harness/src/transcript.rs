@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::fmt::Write;
 use std::time::{Duration, SystemTime};
 
+use agent_core::activity::ToolId;
 use agent_core::ports::{Call, CallState, Excerpt, LogEntry, Summary, Target};
 use serde_json::Value;
 
@@ -91,12 +92,11 @@ pub(crate) fn parse(text: &str) -> Parsed {
                         calls.insert(id.to_string(), out.log.len());
                     }
                     out.log.push(LogEntry::Called(Call {
-                        id: field("id").unwrap_or_default().to_string(),
+                        id: ToolId::new(field("id").unwrap_or_default()),
                         tool: tool_name(tool),
                         target: target_of(tool, input),
                         state: CallState::Running,
                         started: at,
-                        took: None,
                         input: input_text(tool, input),
                         output: String::new(),
                     }));
@@ -111,12 +111,12 @@ pub(crate) fn parse(text: &str) -> Parsed {
                     let text = part.get("content").map(crate::text_of).unwrap_or_default();
                     let is_error = part.get("is_error").and_then(Value::as_bool) == Some(true);
                     let result = record.get("toolUseResult");
-                    call.state = outcome(&call.tool, &text, is_error, result);
-                    call.output = text.chars().take(OUTPUT).collect();
-                    call.took = call
+                    let took = call
                         .started
                         .zip(at)
                         .and_then(|(from, to)| to.duration_since(from).ok());
+                    call.state = outcome(&call.tool, &text, is_error, result, took);
+                    call.output = text.chars().take(OUTPUT).collect();
                 }
                 _ => {}
             }
@@ -327,7 +327,13 @@ fn counts_failures(line: &str) -> bool {
     })
 }
 
-fn outcome(tool: &str, text: &str, is_error: bool, result: Option<&Value>) -> CallState {
+fn outcome(
+    tool: &str,
+    text: &str,
+    is_error: bool,
+    result: Option<&Value>,
+    took: Option<Duration>,
+) -> CallState {
     let cleaned = text
         .replace("<tool_use_error>", "")
         .replace("</tool_use_error>", "");
@@ -345,6 +351,7 @@ fn outcome(tool: &str, text: &str, is_error: bool, result: Option<&Value>) -> Ca
         return CallState::Failed {
             code,
             excerpt: excerpt(&stderr.unwrap_or(body)),
+            took,
         };
     }
     let summary = summarize(tool, text, result);
@@ -357,10 +364,11 @@ fn outcome(tool: &str, text: &str, is_error: bool, result: Option<&Value>) -> Ca
             return CallState::Flagged {
                 summary,
                 excerpt: excerpt(&failing),
+                took,
             };
         }
     }
-    CallState::Done(summary)
+    CallState::Done { summary, took }
 }
 
 fn summarize(tool: &str, text: &str, result: Option<&Value>) -> Summary {
@@ -531,10 +539,15 @@ mod tests {
         let parsed = parse(&text);
         let calls = calls(&parsed);
         assert_eq!(calls[0].target, Target::Command("cargo test".into()));
-        assert_eq!(calls[0].state, CallState::Done(Summary::Text("ok".into())));
-        assert_eq!(calls[0].took, Some(Duration::from_millis(51_500)));
+        assert_eq!(
+            calls[0].state,
+            CallState::Done {
+                summary: Summary::Text("ok".into()),
+                took: Some(Duration::from_millis(51_500))
+            }
+        );
         assert_eq!(calls[1].state, CallState::Running);
-        assert_eq!(calls[1].took, None);
+        assert_eq!(calls[1].state.took(), None);
         assert_eq!(parsed.last_heard, parse_time("2026-11-08T10:00:51.500Z"));
     }
 
@@ -566,7 +579,8 @@ mod tests {
                         "last".into()
                     ],
                     more: 2
-                }
+                },
+                took: Some(Duration::from_secs(14))
             }
         );
         assert_eq!(
@@ -576,7 +590,8 @@ mod tests {
                 excerpt: Excerpt {
                     lines: vec!["String to replace not found in file.".into()],
                     more: 0
-                }
+                },
+                took: Some(Duration::from_millis(100))
             }
         );
     }
@@ -604,7 +619,13 @@ mod tests {
         .join("\n");
         let parsed = parse(&text);
         let calls = calls(&parsed);
-        assert_eq!(calls[0].state, CallState::Done(Summary::Text(pass.into())));
+        assert_eq!(
+            calls[0].state,
+            CallState::Done {
+                summary: Summary::Text(pass.into()),
+                took: Some(Duration::from_secs(1))
+            }
+        );
         assert_eq!(
             calls[1].state,
             CallState::Flagged {
@@ -615,7 +636,8 @@ mod tests {
                         "test result: FAILED. 409 passed; 3 failed".into()
                     ],
                     more: 0
-                }
+                },
+                took: Some(Duration::from_secs(1))
             }
         );
     }
@@ -641,6 +663,10 @@ mod tests {
         .join("\n");
         let parsed = parse(&text);
         let calls = calls(&parsed);
+        let done = |summary| CallState::Done {
+            summary,
+            took: Some(Duration::from_secs(1)),
+        };
         assert_eq!(
             calls[0].target,
             Target::Path {
@@ -648,20 +674,17 @@ mod tests {
                 range: Some((120, Some(200)))
             }
         );
-        assert_eq!(calls[0].state, CallState::Done(Summary::Lines(730)));
+        assert_eq!(calls[0].state, done(Summary::Lines(730)));
         assert_eq!(
             calls[1].state,
-            CallState::Done(Summary::Diff {
+            done(Summary::Diff {
                 added: 2,
                 removed: 1
             })
         );
-        assert_eq!(
-            calls[2].state,
-            CallState::Done(Summary::NewFile { lines: 3 })
-        );
-        assert_eq!(calls[3].state, CallState::Done(Summary::Matches(11)));
-        assert_eq!(calls[4].state, CallState::Done(Summary::Files(6)));
+        assert_eq!(calls[2].state, done(Summary::NewFile { lines: 3 }));
+        assert_eq!(calls[3].state, done(Summary::Matches(11)));
+        assert_eq!(calls[4].state, done(Summary::Files(6)));
         assert_eq!(calls[5].tool, "linear.get_issue");
         assert_eq!(
             calls[6].target,
@@ -671,7 +694,7 @@ mod tests {
                 current: Some("b".into())
             }
         );
-        assert_eq!(calls[7].state, CallState::Done(Summary::NoOutput));
+        assert_eq!(calls[7].state, done(Summary::NoOutput));
     }
 
     #[test]
