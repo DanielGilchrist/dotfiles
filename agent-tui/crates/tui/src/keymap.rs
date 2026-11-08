@@ -1,7 +1,7 @@
 //! The one table of NAV and peek bindings. The footer and the help both
 //! read it, so what they say can't drift apart. The key handlers in
-//! `update` still do the dispatching; a test checks every key they match
-//! on is in this table.
+//! `update` still do the dispatching; a test there presses every key in
+//! every context and checks the ones that do something are in this table.
 
 use crate::model::{Model, Panel, Reach, View, Visibility};
 use crate::tree::{ChangesScope, ChangesView, Node};
@@ -451,8 +451,8 @@ pub const BINDINGS: &[Binding] = &[
     ),
     Binding::new(
         &["."],
-        AGENTS,
-        RankBy(|s| s.toggle_worth_showing.then_some(1)),
+        PANELS,
+        RankBy(|s| (s.ctx == Ctx::Agents && s.toggle_worth_showing).then_some(1)),
         By(|s| s.toggle),
         "Show every checkout, or only those with a session. The pinned tab always lists every pin.",
     ),
@@ -699,6 +699,16 @@ pub struct Row {
     pub long: &'static str,
 }
 
+/// Every key the table binds in `ctx`, for the test that presses them.
+#[cfg(test)]
+pub fn keys_in(ctx: Ctx) -> Vec<&'static str> {
+    BINDINGS
+        .iter()
+        .filter(|b| b.contexts.has(ctx))
+        .flat_map(Binding::all_keys)
+        .collect()
+}
+
 pub struct FooterHint {
     pub keys: String,
     pub label: &'static str,
@@ -820,51 +830,6 @@ mod tests {
     }
 
     const CTXS: [Ctx; 5] = [Ctx::Agents, Ctx::Turn, Ctx::Changes, Ctx::Main, Ctx::Peek];
-
-    #[test]
-    fn every_key_the_handlers_match_is_in_the_table() {
-        let source = include_str!("update.rs");
-        let start = source.find("fn on_peek_key").expect("peek handler");
-        let end = source.find("fn run_action").expect("end of the handlers");
-        let handlers = &source[start..end];
-        let table: Vec<&str> = BINDINGS.iter().flat_map(Binding::all_keys).collect();
-        let mut missing = Vec::new();
-        for part in handlers.split("KeyCode::Char(").skip(1) {
-            let mut chars = part.chars();
-            if chars.next() != Some('\'') {
-                continue;
-            }
-            let key = match chars.next() {
-                Some(' ') => "Space".to_string(),
-                Some(c) => c.to_string(),
-                None => continue,
-            };
-            let ctrl_only = chars.as_str().starts_with("') if ctrl");
-            if key != "t" && !ctrl_only && !table.contains(&key.as_str()) {
-                missing.push(key);
-            }
-        }
-        for (code, shown) in [
-            ("KeyCode::Enter", "⏎"),
-            ("KeyCode::Esc", "Esc"),
-            ("KeyCode::Tab", "Tab"),
-            ("KeyCode::BackTab", "⇧Tab"),
-            ("KeyCode::PageDown", "PgDn"),
-            ("KeyCode::PageUp", "PgUp"),
-            ("KeyCode::Home", "Home"),
-            ("KeyCode::End", "End"),
-            ("KeyCode::Up", "↑"),
-            ("KeyCode::Down", "↓"),
-        ] {
-            if handlers.contains(code) && !table.contains(&shown) {
-                missing.push(shown.to_string());
-            }
-        }
-        assert!(
-            missing.is_empty(),
-            "handled but not in the table: {missing:?}"
-        );
-    }
 
     #[test]
     fn the_footer_never_repeats_a_hint_in_any_context() {

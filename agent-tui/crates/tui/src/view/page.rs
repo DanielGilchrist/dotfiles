@@ -23,7 +23,7 @@ use super::{
     truncate_start, warning, wrap,
 };
 use crate::document::{
-    BranchKey, CommitKey, DiffKey, Doc, FolderDocs, FolderKey, Hover, Key, Laid, Resolved,
+    BranchKey, CommitKey, DiffKey, Doc, FolderDocs, FolderKey, Hover, Key, Laid, Placed, Resolved,
 };
 use crate::model::{AgentStatus, MainLayout, Model, SubagentKey};
 use crate::review::{self, DiffView, LineInfo};
@@ -82,6 +82,16 @@ impl Body {
     }
 }
 
+/// Which of a document's rows the page shows: `height` of its `total`
+/// from row `top`, below `from` rows that stay on top.
+#[derive(Clone, Copy)]
+struct Window {
+    from: usize,
+    top: usize,
+    height: usize,
+    total: usize,
+}
+
 /// What [0] reads instead of the terminal, in `area`, scrolled as the model
 /// says, or `None` while the cursor is on nothing it reads. `border` is the
 /// corner's style and `width` the whole panel's. Nothing is kept: what the
@@ -134,18 +144,7 @@ pub(super) fn page(m: &Model, area: Rect, width: usize, border: Style) -> Option
     let top = placed.top;
     let mut lines: Vec<Line<'static>> = Vec::new();
     if let Some(question) = question {
-        let ask = "i answer";
-        let room = columns.saturating_sub(ask.len() + 3);
-        let text = question.lines().next().unwrap_or_default().trim();
-        lines.push(justify(
-            vec![
-                Span::styled("◆ ", warning().add_modifier(Modifier::BOLD)),
-                Span::styled(truncate_end(text, room), warning()),
-            ],
-            vec![Span::raw(ask)],
-            columns,
-        ));
-        lines.push(Line::raw(""));
+        lines.extend(question_lines(&question, columns));
     }
     lines.extend(body.pinned.iter().take(pinned).cloned());
     let from = lines.len();
@@ -154,54 +153,20 @@ pub(super) fn page(m: &Model, area: Rect, width: usize, border: Style) -> Option
         Rows::Doc(Some(laid)) => lines.extend(laid.rows.iter().skip(top).take(height).cloned()),
         Rows::Doc(None) => lines.extend(m.docs.cached().iter().skip(top).take(height).cloned()),
     }
+    let window = Window {
+        from,
+        top,
+        height,
+        total,
+    };
     if let Some(cursor) = &cursor {
-        mark_lines(m, &mut lines, doc_lines, cursor, (from, top, height));
+        mark_lines(m, &mut lines, doc_lines, cursor, window);
     }
-    if let Some(key) = &body.nav
-        && m.main_focused()
-        && let Some(&(start, len)) = m
-            .watched(key)
-            .and_then(|w| w.nav.cursor)
-            .and_then(|at| body.entries.get(at))
-    {
-        for row in start.max(top)..(start + len).min(top + height) {
-            if let Some(line) = lines.get_mut(from + row - top)
-                && let Some(first) = line.spans.first_mut()
-            {
-                *first = Span::styled("▌", accent());
-            }
-        }
-    }
+    mark_entry(m, &body, &mut lines, window);
 
-    let mut title = body.title;
-    if !m.sidebar_shown
-        && let Some((at, of)) = m.position()
-    {
-        title.insert(1, Span::styled(format!("{at} of {of} · "), dim()));
-    }
-    let title = fit(title, width.saturating_sub(6 + status_least).max(8));
-    let status = m
-        .selected_entry()
-        .map(|entry| status_line(m, entry, width.saturating_sub(line_width(&title) + 7)))
-        .unwrap_or_default();
-    let right = if fits_beside(&title, line_width(&status), width) {
-        status
-    } else {
-        Vec::new()
-    };
+    let (title, right) = title_and_status(m, body.title, width, status_least);
 
-    let shown = format!("{}-{} of {total}", top + 1, (top + height).min(total));
-    let corner = if body.loading || m.docs.loading(m.clock.mono) {
-        vec![Span::styled("loading", dim())]
-    } else if placed.following() {
-        vec![Span::styled("following", border)]
-    } else if placed.paused() {
-        vec![Span::styled(format!("paused {shown}"), border)]
-    } else if total > height {
-        vec![Span::styled(shown, border)]
-    } else {
-        Vec::new()
-    };
+    let corner = corner(m, body.loading, placed, window, border);
     Some(Page {
         title,
         right,
@@ -222,6 +187,100 @@ pub(super) fn page(m: &Model, area: Rect, width: usize, border: Style) -> Option
     })
 }
 
+/// The question an agent asks, which takes the top row since it needs an
+/// answer and the document doesn't.
+fn question_lines(question: &str, columns: usize) -> Vec<Line<'static>> {
+    let ask = "i answer";
+    let room = columns.saturating_sub(ask.len() + 3);
+    let text = question.lines().next().unwrap_or_default().trim();
+    vec![
+        justify(
+            vec![
+                Span::styled("◆ ", warning().add_modifier(Modifier::BOLD)),
+                Span::styled(truncate_end(text, room), warning()),
+            ],
+            vec![Span::raw(ask)],
+            columns,
+        ),
+        Line::raw(""),
+    ]
+}
+
+/// `▌` in the gutter of the log entry the cursor is on while [0] has the
+/// keys.
+fn mark_entry(m: &Model, body: &Body, lines: &mut [Line<'static>], window: Window) {
+    let Window {
+        from, top, height, ..
+    } = window;
+    if let Some(key) = &body.nav
+        && m.main_focused()
+        && let Some(&(start, len)) = m
+            .watched(key)
+            .and_then(|w| w.nav.cursor)
+            .and_then(|at| body.entries.get(at))
+    {
+        for row in start.max(top)..(start + len).min(top + height) {
+            if let Some(line) = lines.get_mut(from + row - top)
+                && let Some(first) = line.spans.first_mut()
+            {
+                *first = Span::styled("▌", accent());
+            }
+        }
+    }
+}
+
+/// The title cut to leave room for the agent's state, and that state if it
+/// fits beside the title.
+fn title_and_status(
+    m: &Model,
+    mut title: Vec<Span<'static>>,
+    width: usize,
+    status_least: usize,
+) -> (Vec<Span<'static>>, Vec<Span<'static>>) {
+    if !m.sidebar_shown
+        && let Some((at, of)) = m.position()
+    {
+        title.insert(1, Span::styled(format!("{at} of {of} · "), dim()));
+    }
+    let title = fit(title, width.saturating_sub(6 + status_least).max(8));
+    let status = m
+        .selected_entry()
+        .map(|entry| status_line(m, entry, width.saturating_sub(line_width(&title) + 7)))
+        .unwrap_or_default();
+    let right = if fits_beside(&title, line_width(&status), width) {
+        status
+    } else {
+        Vec::new()
+    };
+    (title, right)
+}
+
+/// [0]'s bottom-right corner: what it is waiting for, or where the rows
+/// shown sit among the document's.
+fn corner(
+    m: &Model,
+    loading: bool,
+    placed: Placed,
+    window: Window,
+    border: Style,
+) -> Vec<Span<'static>> {
+    let Window {
+        top, height, total, ..
+    } = window;
+    let shown = format!("{}-{} of {total}", top + 1, (top + height).min(total));
+    if loading || m.docs.loading(m.clock.mono) {
+        vec![Span::styled("loading", dim())]
+    } else if placed.following() {
+        vec![Span::styled("following", border)]
+    } else if placed.paused() {
+        vec![Span::styled(format!("paused {shown}"), border)]
+    } else if total > height {
+        vec![Span::styled(shown, border)]
+    } else {
+        Vec::new()
+    }
+}
+
 /// `▌` in the gutter of the cursor's lines while [0] has the keys, and `✎`
 /// on lines the agent's draft comments on.
 fn mark_lines(
@@ -229,8 +288,11 @@ fn mark_lines(
     out: &mut [Line<'static>],
     infos: &[LineInfo],
     cursor: &DiffView,
-    (from, top, height): (usize, usize, usize),
+    window: Window,
 ) {
+    let Window {
+        from, top, height, ..
+    } = window;
     let drafts = m.selected_entry().map_or(&[][..], |e| m.draft(e.name()));
     let rev = crate::update::commit_rev(m);
     let (lo, hi) = cursor.span();

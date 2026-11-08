@@ -520,6 +520,15 @@ fn names_fit(names: &[String], room: usize) -> String {
     out
 }
 
+/// What the status row quotes about a subagent, before it picks a state.
+struct Figures {
+    calls: Span<'static>,
+    errors: Option<Span<'static>>,
+    model: Option<Span<'static>>,
+    working: Option<String>,
+    took: Option<String>,
+}
+
 fn status_row(
     detail: &SubagentDetail,
     subagent: Option<&Subagent>,
@@ -528,7 +537,24 @@ fn status_row(
     stale: bool,
     narrow: bool,
 ) -> Vec<Span<'static>> {
-    let sep = || Span::styled(" · ", dim());
+    let figures = figures(detail, subagent, ctx, narrow);
+    match &detail.outcome {
+        Outcome::Finished { report: Some(_) } if !live => finished_row(figures),
+        Outcome::Stopped { reason } => stopped_row(reason),
+        _ if !live => ended_row(figures),
+        _ => match failing(detail) {
+            Some(reason) => failing_row(&reason, figures, narrow),
+            None => working_row(detail, figures, ctx, stale),
+        },
+    }
+}
+
+fn figures(
+    detail: &SubagentDetail,
+    subagent: Option<&Subagent>,
+    ctx: &Context<'_>,
+    narrow: bool,
+) -> Figures {
     let calls = {
         let n = call_count(detail);
         let text = if detail.truncated {
@@ -539,102 +565,133 @@ fn status_row(
         Span::styled(text, dim())
     };
     let errors = error_count(detail);
-    let error_span = (errors > 0).then(|| Span::styled(plural(errors, "error", "errors"), error()));
-    let model = detail
-        .model
-        .clone()
-        .filter(|_| !narrow)
-        .map(|m| Span::styled(m, dim()));
     let began = subagent.map(|s| s.since).or(detail.started);
     let ended = match subagent.map(|s| &s.status) {
         Some(SubagentStatus::Finished { at }) => Some(*at),
         Some(SubagentStatus::Running { .. }) | None => detail.last_heard,
     };
-    let working = began
-        .and_then(|from| ctx.now.duration_since(from).ok())
-        .map(span);
-    let took = began
-        .zip(ended)
-        .and_then(|(from, to)| to.duration_since(from).ok())
-        .map(span);
-    let finished = !live;
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    let tail = |spans: &mut Vec<Span<'static>>, extras: Vec<Option<Span<'static>>>| {
-        for extra in extras.into_iter().flatten() {
-            spans.push(sep());
-            spans.push(extra);
-        }
-    };
-    if let (true, Outcome::Finished { report: Some(_) }) = (finished, &detail.outcome) {
-        spans.push(Span::styled("✓", success().add_modifier(Modifier::BOLD)));
-        spans.push(Span::raw(format!(
-            " finished{}",
-            took.map(|t| format!(" in {t}")).unwrap_or_default()
-        )));
-        tail(&mut spans, vec![Some(calls), error_span, model]);
-    } else if let Outcome::Stopped { reason: stopped } = &detail.outcome {
-        spans.push(Span::styled("!", error().add_modifier(Modifier::BOLD)));
-        spans.push(Span::raw(" stopped"));
-        tail(&mut spans, vec![Some(Span::raw(stopped.clone()))]);
-    } else if finished {
-        spans.push(Span::styled("●", dim()));
-        spans.push(Span::styled(
-            format!(
-                " ended{}",
-                took.map(|t| format!(" after {t}")).unwrap_or_default()
-            ),
-            dim(),
-        ));
-        tail(
-            &mut spans,
-            vec![
-                Some(Span::styled("no report", dim())),
-                Some(calls),
-                error_span,
-            ],
-        );
-    } else if let Some(reason) = failing(detail) {
-        spans.push(Span::styled("!", error().add_modifier(Modifier::BOLD)));
-        spans.push(Span::styled(" failing", bold()));
-        spans.push(sep());
-        spans.push(Span::raw(reason));
-        if !narrow {
-            tail(
-                &mut spans,
-                vec![
-                    working.map(|w| Span::styled(format!("working {w}"), dim())),
-                    Some(calls),
-                    model,
-                ],
-            );
-        }
-    } else {
-        let glyph = if stale {
-            Span::styled(SPINNER[0], dim())
-        } else {
-            Span::raw(ctx.spinner)
-        };
-        spans.push(glyph);
-        spans.push(Span::raw(format!(
-            " working{}",
-            working.map(|w| format!(" {w}")).unwrap_or_default()
-        )));
-        let quiet = stale
-            .then(|| {
-                detail
-                    .last_heard
-                    .and_then(|at| ctx.now.duration_since(at).ok())
-            })
-            .flatten()
-            .map(|d| Span::raw(format!("quiet {} ", ago(ctx.now - d, ctx.now))));
-        let quiet = quiet.map(|q| {
-            let mut text = q.content.to_string();
-            text.push('?');
-            Span::styled(text, dim())
-        });
-        tail(&mut spans, vec![quiet, Some(calls), error_span, model]);
+    Figures {
+        calls,
+        errors: (errors > 0).then(|| Span::styled(plural(errors, "error", "errors"), error())),
+        model: detail
+            .model
+            .clone()
+            .filter(|_| !narrow)
+            .map(|m| Span::styled(m, dim())),
+        working: began
+            .and_then(|from| ctx.now.duration_since(from).ok())
+            .map(span),
+        took: began
+            .zip(ended)
+            .and_then(|(from, to)| to.duration_since(from).ok())
+            .map(span),
+    }
+}
+
+/// `spans` followed by each extra that is there, after a separator.
+fn with_tail(
+    mut spans: Vec<Span<'static>>,
+    extras: Vec<Option<Span<'static>>>,
+) -> Vec<Span<'static>> {
+    for extra in extras.into_iter().flatten() {
+        spans.push(Span::styled(" · ", dim()));
+        spans.push(extra);
     }
     spans
+}
+
+/// ` in 3m` or ` after 3m`, nothing when it's unknown how long.
+fn elapsed(took: Option<String>, preposition: &str) -> String {
+    took.map(|t| format!(" {preposition} {t}"))
+        .unwrap_or_default()
+}
+
+fn finished_row(figures: Figures) -> Vec<Span<'static>> {
+    let spans = vec![
+        Span::styled("✓", success().add_modifier(Modifier::BOLD)),
+        Span::raw(format!(" finished{}", elapsed(figures.took, "in"))),
+    ];
+    with_tail(
+        spans,
+        vec![Some(figures.calls), figures.errors, figures.model],
+    )
+}
+
+fn stopped_row(reason: &str) -> Vec<Span<'static>> {
+    let spans = vec![
+        Span::styled("!", error().add_modifier(Modifier::BOLD)),
+        Span::raw(" stopped"),
+    ];
+    with_tail(spans, vec![Some(Span::raw(reason.to_string()))])
+}
+
+fn ended_row(figures: Figures) -> Vec<Span<'static>> {
+    let spans = vec![
+        Span::styled("●", dim()),
+        Span::styled(format!(" ended{}", elapsed(figures.took, "after")), dim()),
+    ];
+    with_tail(
+        spans,
+        vec![
+            Some(Span::styled("no report", dim())),
+            Some(figures.calls),
+            figures.errors,
+        ],
+    )
+}
+
+fn failing_row(reason: &str, figures: Figures, narrow: bool) -> Vec<Span<'static>> {
+    let spans = vec![
+        Span::styled("!", error().add_modifier(Modifier::BOLD)),
+        Span::styled(" failing", bold()),
+        Span::styled(" · ", dim()),
+        Span::raw(reason.to_string()),
+    ];
+    if narrow {
+        return spans;
+    }
+    with_tail(
+        spans,
+        vec![
+            figures
+                .working
+                .map(|w| Span::styled(format!("working {w}"), dim())),
+            Some(figures.calls),
+            figures.model,
+        ],
+    )
+}
+
+fn working_row(
+    detail: &SubagentDetail,
+    figures: Figures,
+    ctx: &Context<'_>,
+    stale: bool,
+) -> Vec<Span<'static>> {
+    let glyph = if stale {
+        Span::styled(SPINNER[0], dim())
+    } else {
+        Span::raw(ctx.spinner)
+    };
+    let spans = vec![
+        glyph,
+        Span::raw(format!(
+            " working{}",
+            figures.working.map(|w| format!(" {w}")).unwrap_or_default()
+        )),
+    ];
+    let quiet = stale
+        .then(|| {
+            detail
+                .last_heard
+                .and_then(|at| ctx.now.duration_since(at).ok())
+        })
+        .flatten()
+        .map(|d| Span::styled(format!("quiet {} ?", ago(ctx.now - d, ctx.now)), dim()));
+    with_tail(
+        spans,
+        vec![quiet, Some(figures.calls), figures.errors, figures.model],
+    )
 }
 
 pub(super) fn render(

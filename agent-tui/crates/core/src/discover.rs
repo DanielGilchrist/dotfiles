@@ -3,7 +3,7 @@ use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::model::{Checkout, Entry, EntryKind, Repo, RepoKey, Snapshot, Worktree};
+use crate::model::{Checkout, Entry, EntryKind, Presence, Repo, RepoKey, Snapshot, Worktree};
 use crate::names::{NameError, SessionName};
 use crate::paths::{Layout, RepoRoot};
 use crate::ports::{HostError, RepoWorktrees, SessionHost, SessionInfo, Vcs};
@@ -226,89 +226,21 @@ pub fn assemble(
     let sessions: HashMap<&SessionName, &SessionInfo> =
         obs.sessions.iter().map(|s| (&s.name, s)).collect();
     let session_of = |name: &SessionName| sessions.get(name).map(|s| s.status.presence());
-    let mut claimed: HashSet<SessionName> = HashSet::new();
-    let mut warnings = Vec::new();
-    let mut grouped: Vec<(RepoKey, Vec<Entry>)> = Vec::new();
+    let mut claims = Claims::default();
+    let mut grouped: Vec<(RepoKey, Vec<Entry>)> = obs
+        .repos
+        .iter()
+        .map(|(root, worktrees)| {
+            let entries = repo_entries(obs, layout, root, worktrees, &mut claims, &session_of);
+            (RepoKey::Root(root.clone()), entries)
+        })
+        .collect();
 
-    for (root, worktrees) in &obs.repos {
-        let mut entries = Vec::new();
-        let mut claim = |name: SessionName, path: &PathBuf, warnings: &mut Vec<Warning>| {
-            if claimed.insert(name.clone()) {
-                Some(name)
-            } else {
-                warnings.push(Warning::NameClash {
-                    name,
-                    hidden: path.clone(),
-                });
-                None
-            }
-        };
-
-        match root.name().parse::<SessionName>() {
-            Ok(name) => {
-                if let Some(name) = claim(name, &worktrees.main.path, &mut warnings) {
-                    let kind = EntryKind::Main {
-                        root: root.clone(),
-                        head: worktrees.main.head.clone(),
-                        session: session_of(&name),
-                    };
-                    entries.push(Entry::new(name.clone(), kind));
-                }
-            }
-            Err(error) => warnings.push(Warning::Unnamed {
-                root: root.clone(),
-                error,
-            }),
-        }
-
-        for wt in &worktrees.linked {
-            let Some(worktree) = layout.worktree_at(&wt.path) else {
-                continue;
-            };
-            let Some(name) = claim(worktree.name().session(), &wt.path, &mut warnings) else {
-                continue;
-            };
-            let kind = EntryKind::Agent {
-                session: session_of(&name),
-                head: wt.head.clone(),
-                worktree,
-            };
-            entries.push(Entry::new(name.clone(), kind));
-        }
-
-        let checkout_of = |wt: &Worktree| match layout.worktree_at(&wt.path) {
-            Some(agent) => Checkout::Agent(agent),
-            None => Checkout::External(wt.path.clone()),
-        };
-        let all: Vec<(&Worktree, Checkout)> =
-            std::iter::once((&worktrees.main, Checkout::Main(root.clone())))
-                .chain(worktrees.linked.iter().map(|w| (w, checkout_of(w))))
-                .collect();
-        for session in &obs.sessions {
-            if claimed.contains(&session.name) {
-                continue;
-            }
-            let Some(cwd) = session.cwd() else { continue };
-            let Some((wt, checkout)) = all
-                .iter()
-                .filter(|(wt, _)| cwd.starts_with(&wt.path))
-                .max_by_key(|(wt, _)| wt.path.as_os_str().len())
-            else {
-                continue;
-            };
-            claimed.insert(session.name.clone());
-            let kind = EntryKind::Adopted {
-                checkout: checkout.clone(),
-                head: wt.head.clone(),
-                presence: session.status.presence(),
-            };
-            entries.push(Entry::new(session.name.clone(), kind));
-        }
-
-        grouped.push((RepoKey::Root(root.clone()), entries));
-    }
-
-    for session in obs.sessions.iter().filter(|s| !claimed.contains(&s.name)) {
+    for session in obs
+        .sessions
+        .iter()
+        .filter(|s| !claims.names.contains(&s.name))
+    {
         let kind = EntryKind::Orphan {
             cwd: session.cwd().map(PathBuf::from),
             presence: session.status.presence(),
@@ -319,29 +251,125 @@ pub fn assemble(
         ));
     }
 
-    // Pins for agents that no longer exist are kept but don't take a slot.
-    let present: HashSet<&SessionName> = grouped
-        .iter()
-        .flat_map(|(_, es)| es.iter().map(Entry::name))
-        .collect();
-    let live_pins: Vec<SessionName> = pins
-        .iter()
-        .filter(|p| present.contains(p))
-        .cloned()
-        .collect();
-    for (_, entries) in &mut grouped {
-        for entry in entries {
-            if let Some(position) = live_pins.iter().position(|p| p == entry.name()) {
-                entry.pin_at(position);
-            }
-        }
-    }
-
+    pin_present(&mut grouped, pins);
     let repos = grouped
         .into_iter()
         .filter_map(|(key, entries)| Repo::new(key, entries))
         .collect();
-    (Snapshot::new(repos), warnings)
+    (Snapshot::new(repos), claims.warnings)
+}
+
+/// The session names taken so far, and the clashes that hid a checkout.
+#[derive(Default)]
+struct Claims {
+    names: HashSet<SessionName>,
+    warnings: Vec<Warning>,
+}
+
+impl Claims {
+    /// `name` if nothing has it yet, else a warning that `path` is hidden.
+    fn claim(&mut self, name: SessionName, path: &Path) -> Option<SessionName> {
+        if self.names.insert(name.clone()) {
+            Some(name)
+        } else {
+            self.warnings.push(Warning::NameClash {
+                name,
+                hidden: path.to_path_buf(),
+            });
+            None
+        }
+    }
+}
+
+/// One repo's entries: its main checkout, its agent worktrees, then the
+/// unclaimed sessions whose cwd is inside one of its checkouts.
+fn repo_entries(
+    obs: &Observation,
+    layout: &Layout,
+    root: &RepoRoot,
+    worktrees: &RepoWorktrees,
+    claims: &mut Claims,
+    session_of: &impl Fn(&SessionName) -> Option<Presence>,
+) -> Vec<Entry> {
+    let mut entries = Vec::new();
+
+    match root.name().parse::<SessionName>() {
+        Ok(name) => {
+            if let Some(name) = claims.claim(name, &worktrees.main.path) {
+                let kind = EntryKind::Main {
+                    root: root.clone(),
+                    head: worktrees.main.head.clone(),
+                    session: session_of(&name),
+                };
+                entries.push(Entry::new(name, kind));
+            }
+        }
+        Err(error) => claims.warnings.push(Warning::Unnamed {
+            root: root.clone(),
+            error,
+        }),
+    }
+
+    for wt in &worktrees.linked {
+        let Some(worktree) = layout.worktree_at(&wt.path) else {
+            continue;
+        };
+        let Some(name) = claims.claim(worktree.name().session(), &wt.path) else {
+            continue;
+        };
+        let kind = EntryKind::Agent {
+            session: session_of(&name),
+            head: wt.head.clone(),
+            worktree,
+        };
+        entries.push(Entry::new(name, kind));
+    }
+
+    let checkout_of = |wt: &Worktree| match layout.worktree_at(&wt.path) {
+        Some(agent) => Checkout::Agent(agent),
+        None => Checkout::External(wt.path.clone()),
+    };
+    let all: Vec<(&Worktree, Checkout)> =
+        std::iter::once((&worktrees.main, Checkout::Main(root.clone())))
+            .chain(worktrees.linked.iter().map(|w| (w, checkout_of(w))))
+            .collect();
+    for session in &obs.sessions {
+        if claims.names.contains(&session.name) {
+            continue;
+        }
+        let Some(cwd) = session.cwd() else { continue };
+        let Some((wt, checkout)) = all
+            .iter()
+            .filter(|(wt, _)| cwd.starts_with(&wt.path))
+            .max_by_key(|(wt, _)| wt.path.as_os_str().len())
+        else {
+            continue;
+        };
+        claims.names.insert(session.name.clone());
+        let kind = EntryKind::Adopted {
+            checkout: checkout.clone(),
+            head: wt.head.clone(),
+            presence: session.status.presence(),
+        };
+        entries.push(Entry::new(session.name.clone(), kind));
+    }
+    entries
+}
+
+/// Pins for agents that no longer exist are kept but don't take a slot.
+fn pin_present(grouped: &mut [(RepoKey, Vec<Entry>)], pins: &[SessionName]) {
+    let present: HashSet<SessionName> = grouped
+        .iter()
+        .flat_map(|(_, es)| es.iter().map(|e| e.name().clone()))
+        .collect();
+    let live_pins: Vec<&SessionName> = pins.iter().filter(|p| present.contains(*p)).collect();
+    for (_, entries) in grouped {
+        for entry in entries {
+            if let Some(position) = live_pins.iter().position(|p| *p == entry.name()) {
+                entry.pin_at(position);
+            }
+        }
+    }
 }
 
 #[cfg(test)]

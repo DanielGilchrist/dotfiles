@@ -872,6 +872,15 @@ pub struct HelpState {
     pub offset: usize,
 }
 
+/// A comment being typed on lines of a diff.
+pub struct CommentDraft {
+    pub to: SessionName,
+    pub lines: Vec<crate::review::LineInfo>,
+    pub text: String,
+    /// The commit the lines are from, when they aren't the checkout's.
+    pub rev: Option<String>,
+}
+
 pub enum Overlay {
     None,
     New(Box<NewAgent>),
@@ -887,13 +896,7 @@ pub enum Overlay {
         text: String,
     },
     /// A comment being typed on lines of a diff, for an agent's draft review.
-    Comment {
-        to: SessionName,
-        lines: Vec<crate::review::LineInfo>,
-        text: String,
-        /// The commit the lines are from, when they aren't the checkout's.
-        rev: Option<String>,
-    },
+    Comment(CommentDraft),
     /// Working out what removing `name` would lose; the confirmation
     /// replaces this when the answer arrives.
     Planning {
@@ -1469,6 +1472,7 @@ impl Model {
         }
         tracked.facts = Some(facts);
         if let Some(anchor) = anchor {
+            self.refresh_tree();
             self.restore_changes_anchor(&anchor);
         }
     }
@@ -1631,6 +1635,7 @@ impl Model {
         } else {
             closed.insert(folder.path);
         }
+        self.refresh_tree();
     }
 
     /// Closes every folder of the selected agent, or opens them all, and
@@ -1646,6 +1651,7 @@ impl Model {
             HashSet::new()
         };
         self.track(&name).collapsed = all;
+        self.refresh_tree();
         if let Some(path) = was {
             self.point_changes_at(&path);
         }

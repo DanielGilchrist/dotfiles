@@ -296,6 +296,10 @@ impl<K: Clone + Eq + std::hash::Hash, V> Queue<K, V> {
         }
     }
 
+    /// A request still waiting for `key` is replaced and never answered.
+    /// `Documents` relies on it: its answer to the newer request drops the
+    /// older ones for the same slot from `requested`, which would
+    /// otherwise wait forever.
     fn request(&self, key: K, value: V) {
         let mut queue = self.queue.lock().expect("queue lock");
         match queue.waiting.iter_mut().find(|(k, _)| *k == key) {
@@ -640,57 +644,16 @@ fn run(backend: &Arc<Backend>, job: Job, msgs: &Sender<Msg>) -> Option<Msg> {
             launch,
             harness,
             ticket,
-        } => {
-            let result = (|| match launch {
-                Launchable::Create { name, repo, task } => {
-                    let repo = match repo {
-                        RepoChoice::Known(root) => root,
-                        RepoChoice::Path(path) => {
-                            ops::repo_for(svc, &path)?.ok_or(ops::Error::NotARepo(path))?
-                        }
-                    };
-                    ops::create(svc, &name, &repo, task.as_ref(), svc.harness(&harness)?)
-                }
-                Launchable::Attach { name, task } => ops::join(svc, &name.session(), task.as_ref()),
-                Launchable::Checkout { name, repo, target } => {
-                    let repo = match repo {
-                        RepoChoice::Known(root) => root,
-                        RepoChoice::Path(path) => {
-                            ops::repo_for(svc, &path)?.ok_or(ops::Error::NotARepo(path))?
-                        }
-                    };
-                    ops::checkout_launch(svc, &repo, &target, Some(name), svc.harness(&harness)?)
-                }
-                Launchable::Resurrect(name) => ops::join(svc, &name.session(), None),
-                Launchable::Start { at, task } => {
-                    ops::start(svc, &at, svc.harness(&harness)?, task)
-                }
-            })();
-            Msg::Launched {
-                ticket,
-                result: result.map_err(err),
-            }
-        }
-        Job::Acknowledge(name) => match svc.store.acknowledge(&name) {
-            Ok(()) => return None,
-            Err(e) => Msg::Done(Err(describe(&e))),
+        } => Msg::Launched {
+            ticket,
+            result: launch_session(svc, launch, &harness).map_err(err),
         },
         Job::Reply {
             to,
             prompt,
             not_before,
         } => {
-            let result = match svc.store.activities() {
-                Ok(all)
-                    if all
-                        .get(&to)
-                        .is_some_and(|a| a.ready_for_text(not_before, SystemTime::now())) =>
-                {
-                    ops::inject(svc, &to, &prompt).map_err(|e| SendError::Failed(err(e)))
-                }
-                Ok(_) => Err(SendError::Busy),
-                Err(e) => Err(SendError::Unreadable(describe(&e))),
-            };
+            let result = reply(svc, &to, &prompt, not_before);
             Msg::Sent { to, result }
         }
         Job::Kill(running) => Msg::Done(
@@ -706,26 +669,23 @@ fn run(backend: &Arc<Backend>, job: Job, msgs: &Sender<Msg>) -> Option<Msg> {
             ticket,
             result: ops::plan_removal(svc, target, own.as_ref()).map_err(err),
         },
-        Job::Remove { approved, own } => {
-            Msg::Done(match ops::remove(svc, approved, own.as_ref()) {
-                Ok(Removed::Session(name)) => Ok(Outcome::Removed {
-                    name,
-                    warnings: Vec::new(),
-                }),
-                Ok(Removed::Agent {
-                    worktree,
-                    mut warnings,
-                    ..
-                }) => {
-                    let name = worktree.name().session();
-                    if let Err(e) = ops::spawn_sweep(svc, &[worktree]) {
-                        warnings.push(describe(&e));
-                    }
-                    Ok(Outcome::Removed { name, warnings })
-                }
-                Err(e) => Err(err(e)),
-            })
+        Job::Remove { approved, own } => Msg::Done(remove(svc, approved, own.as_ref())),
+        Job::CheckShared { name, own } => {
+            let others = svc
+                .host
+                .clients()
+                .map_or(Ok(0), |c| c.other_clients(&name, own).map(|v| v.len()));
+            Msg::Shared {
+                name,
+                others: others.unwrap_or(0),
+            }
         }
+        Job::TakeOver { name, own } => Msg::TookOver {
+            detached: take_over(svc, &name, own).map_err(|e| describe(&e)),
+            name,
+        },
+        Job::Acknowledge(name) => return report_failure(svc.store.acknowledge(&name)),
+        Job::Select(name) => return report_failure(svc.store.set_last_selected(&name)),
         Job::Pin(name) => Msg::Done(
             svc.store
                 .pin(&name)
@@ -741,32 +701,98 @@ fn run(backend: &Arc<Backend>, job: Job, msgs: &Sender<Msg>) -> Option<Msg> {
         Job::ListRepo(dir) => {
             Msg::Done(ops::list_repo(svc, &dir).map(Outcome::Listed).map_err(err))
         }
-        Job::Select(name) => match svc.store.set_last_selected(&name) {
-            Ok(()) => return None,
-            Err(e) => Msg::Done(Err(describe(&e))),
-        },
-        Job::CheckShared { name, own } => {
-            let others = svc
-                .host
-                .clients()
-                .map_or(Ok(0), |c| c.other_clients(&name, own).map(|v| v.len()));
-            Msg::Shared {
-                name,
-                others: others.unwrap_or(0),
-            }
-        }
-        Job::TakeOver { name, own } => {
-            let detached = svc.host.clients().map_or(Ok(0), |c| {
-                let others = c.other_clients(&name, own)?;
-                c.detach(&others)?;
-                Ok(others.len())
-            });
-            Msg::TookOver {
-                name,
-                detached: detached.map_err(|e: HostError| describe(&e)),
-            }
-        }
     })
+}
+
+/// What a job with nothing to report unless it failed replies.
+fn report_failure<E: std::error::Error + 'static>(result: Result<(), E>) -> Option<Msg> {
+    result.err().map(|e| Msg::Done(Err(describe(&e))))
+}
+
+fn launch_session(
+    svc: ops::Services<'_>,
+    launch: Launchable,
+    harness: &HarnessId,
+) -> Result<ops::Launch, ops::Error> {
+    let repo_of = |choice: RepoChoice| match choice {
+        RepoChoice::Known(root) => Ok(root),
+        RepoChoice::Path(path) => ops::repo_for(svc, &path)?.ok_or(ops::Error::NotARepo(path)),
+    };
+    match launch {
+        Launchable::Create { name, repo, task } => ops::create(
+            svc,
+            &name,
+            &repo_of(repo)?,
+            task.as_ref(),
+            svc.harness(harness)?,
+        ),
+        Launchable::Attach { name, task } => ops::join(svc, &name.session(), task.as_ref()),
+        Launchable::Checkout { name, repo, target } => ops::checkout_launch(
+            svc,
+            &repo_of(repo)?,
+            &target,
+            Some(name),
+            svc.harness(harness)?,
+        ),
+        Launchable::Resurrect(name) => ops::join(svc, &name.session(), None),
+        Launchable::Start { at, task } => ops::start(svc, &at, svc.harness(harness)?, task),
+    }
+}
+
+fn reply(
+    svc: ops::Services<'_>,
+    to: &SessionName,
+    prompt: &Prompt,
+    not_before: Option<SystemTime>,
+) -> Result<(), SendError> {
+    match svc.store.activities() {
+        Ok(all)
+            if all
+                .get(to)
+                .is_some_and(|a| a.ready_for_text(not_before, SystemTime::now())) =>
+        {
+            ops::inject(svc, to, prompt).map_err(|e| SendError::Failed(describe(&e)))
+        }
+        Ok(_) => Err(SendError::Busy),
+        Err(e) => Err(SendError::Unreadable(describe(&e))),
+    }
+}
+
+fn remove(
+    svc: ops::Services<'_>,
+    approved: Approved,
+    own: Option<&SessionName>,
+) -> Result<Outcome, String> {
+    match ops::remove(svc, approved, own).map_err(|e| describe(&e))? {
+        Removed::Session(name) => Ok(Outcome::Removed {
+            name,
+            warnings: Vec::new(),
+        }),
+        Removed::Agent {
+            worktree,
+            mut warnings,
+            ..
+        } => {
+            let name = worktree.name().session();
+            if let Err(e) = ops::spawn_sweep(svc, &[worktree]) {
+                warnings.push(describe(&e));
+            }
+            Ok(Outcome::Removed { name, warnings })
+        }
+    }
+}
+
+fn take_over(
+    svc: ops::Services<'_>,
+    name: &SessionName,
+    own: Option<ClientId>,
+) -> Result<usize, HostError> {
+    let Some(clients) = svc.host.clients() else {
+        return Ok(0);
+    };
+    let others = clients.other_clients(name, own)?;
+    clients.detach(&others)?;
+    Ok(others.len())
 }
 
 #[cfg(test)]

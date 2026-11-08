@@ -7,7 +7,7 @@ use std::time::Duration;
 use agent_core::actions::{Action, CommandLine, Context, EventName, Invocation};
 use agent_core::activity::{Activity, AgentId, State as ActivityState};
 use agent_core::config::ControlKey;
-use agent_core::model::{EntryState, RepoKey};
+use agent_core::model::{Entry, EntryState, RepoKey, Snapshot};
 use agent_core::names::{CarriageReturn, InvalidPrompt, Prompt, SessionName, clean};
 use agent_core::ops::{Approved, Launch};
 use agent_core::paths::{RepoRoot, Typed, typed_path};
@@ -19,11 +19,11 @@ use ratatui::layout::Position;
 use crate::document::{Documents, Key};
 use crate::keymap::Situation;
 use crate::model::{
-    Answer, Areas, Chord, Confirm, Cursor, DirCheck, Direction, Drawn, Edge, Enter, Field, Focus,
-    Follow, FormKind, HelpState, INFO_TTL, Inspection, Intent, Listed, Mode, Model, Moment,
-    NamingState, NewAgent, Outbox, Overlay, Pane, Panel, Phase, Query, Reach, RepoInput, Screen,
-    StatusKind, SubagentKey, SubagentRead, Submission, TerminalFocus, Ticket, TurnRow, Unreachable,
-    View, WorkRoom, fuzzy_match, match_rank, repo_matches, unlisted,
+    Answer, Areas, Chord, CommentDraft, Confirm, Cursor, DirCheck, Direction, Drawn, Edge, Enter,
+    Field, Focus, Follow, FormKind, HelpState, INFO_TTL, Inspection, Intent, Listed, Mode, Model,
+    Moment, NamingState, NewAgent, Outbox, Overlay, Pane, Panel, Phase, Query, Reach, RepoInput,
+    Screen, StatusKind, SubagentKey, SubagentRead, Submission, TerminalFocus, Ticket, TurnRow,
+    Unreachable, View, WorkRoom, fuzzy_match, match_rank, repo_matches, unlisted,
 };
 use crate::track::{LiveSince, Release, Seen};
 use crate::tree::ChangesView;
@@ -125,6 +125,11 @@ pub enum Effect {
     /// Suspend the TUI and edit the new-agent task in `$EDITOR`.
     EditTask(String),
     Quit,
+    /// Type bytes into `to`'s terminal, if it is still the connected one.
+    Pty {
+        to: SessionName,
+        bytes: Vec<u8>,
+    },
     /// Ring the terminal's bell.
     Bell,
     /// Put text on the clipboard through the terminal (OSC 52).
@@ -149,6 +154,11 @@ pub fn pressed(key: &KeyEvent, control: ControlKey) -> bool {
 
 fn ctrl(key: &KeyEvent, c: char) -> bool {
     key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char(c)
+}
+
+/// The selected agent's checkout.
+fn selected_root(m: &Model) -> Option<PathBuf> {
+    m.selected_entry()?.path().map(Path::to_path_buf)
 }
 
 fn own_client(m: &Model) -> Option<ClientId> {
@@ -178,49 +188,10 @@ fn step(m: &mut Model, msg: Msg) -> Vec<Effect> {
             on_key(m, key)
         }
         Msg::Mouse(mouse) => on_mouse(m, mouse),
-        Msg::Paste(text) if matches!(m.overlay, Overlay::New(_)) => {
-            edit_form(m, |form| {
-                for c in sanitize_paste(&text).chars() {
-                    type_into(form, c);
-                }
-            });
-            Vec::new()
-        }
-        Msg::Paste(text) if matches!(m.overlay, Overlay::Talk { .. } | Overlay::Comment { .. }) => {
-            if let Overlay::Talk { text: typed, .. } | Overlay::Comment { text: typed, .. } =
-                &mut m.overlay
-            {
-                typed.push_str(&clean(&text, CarriageReturn::Newline, None));
-            }
-            Vec::new()
-        }
-        Msg::Paste(text) => {
-            if let Some(c) = m.pane.connection().filter(|c| c.mode == Mode::Agent) {
-                let text = sanitize_paste(&text);
-                let bytes = if c.term.modes().bracketed_paste {
-                    format!("\x1b[200~{text}\x1b[201~")
-                } else {
-                    text
-                };
-                c.term.send(bytes.into_bytes());
-            }
-            Vec::new()
-        }
+        Msg::Paste(text) => on_paste(m, &text),
         Msg::Resize => Vec::new(),
         Msg::Snapshot(Ok((snapshot, warnings))) => {
-            m.load(snapshot);
-            m.hold_turn_row();
-            track_live(m);
-            forget_gone(m);
-            if !warnings.is_empty() && warnings != m.last_warnings {
-                let more = if warnings.len() > 1 {
-                    format!(" (+{} more in `agent ls`)", warnings.len() - 1)
-                } else {
-                    String::new()
-                };
-                m.error(format!("discovery: {}{more}", warnings[0]));
-            }
-            m.last_warnings = warnings;
+            on_snapshot(m, snapshot, warnings);
             Vec::new()
         }
         Msg::Snapshot(Err(e)) | Msg::Done(Err(e)) => {
@@ -243,6 +214,16 @@ fn step(m: &mut Model, msg: Msg) -> Vec<Effect> {
             report(m, outcome);
             Vec::new()
         }
+        Msg::Sent { to, result } => on_sent(m, &to, result),
+        Msg::Activities(activities) => on_activities(m, activities),
+        Msg::Catalogue { repos, warnings } => {
+            on_catalogue(m, repos, warnings);
+            Vec::new()
+        }
+        Msg::TookOver { name, detached } => {
+            on_took_over(m, &name, detached);
+            Vec::new()
+        }
         Msg::DirChecked { path, found } => {
             if let Overlay::New(form) = &mut m.overlay
                 && form.dir.awaits(&path)
@@ -261,21 +242,6 @@ fn step(m: &mut Model, msg: Msg) -> Vec<Effect> {
             if let Some(c) = m.pane.connection_mut().filter(|c| c.name == name) {
                 c.others = NonZeroUsize::new(others);
             }
-            Vec::new()
-        }
-        Msg::Sent { to, result } => on_sent(m, &to, result),
-        Msg::Activities(activities) => on_activities(m, activities),
-        Msg::Catalogue { repos, warnings } => {
-            m.catalogue = repos;
-            if !warnings.is_empty() && warnings != m.catalogue_warnings {
-                let more = if warnings.len() > 1 {
-                    format!(" (+{} more)", warnings.len() - 1)
-                } else {
-                    String::new()
-                };
-                m.error(format!("{}{more}", warnings[0]));
-            }
-            m.catalogue_warnings = warnings;
             Vec::new()
         }
         Msg::Focus(focus) => {
@@ -302,20 +268,79 @@ fn step(m: &mut Model, msg: Msg) -> Vec<Effect> {
             }
             Vec::new()
         }
-        Msg::TookOver { name, detached } => {
-            match detached {
-                Ok(n) => {
-                    if let Some(c) = m.pane.connection_mut().filter(|c| c.name == name) {
-                        c.others = None;
-                    }
-                    if n > 0 {
-                        m.info(format!("took over {name} from {n} other client(s)"));
-                    }
+    }
+}
+
+fn on_paste(m: &mut Model, text: &str) -> Vec<Effect> {
+    match &mut m.overlay {
+        Overlay::New(_) => {
+            edit_form(m, |form| {
+                for c in sanitize_paste(text).chars() {
+                    type_into(form, c);
                 }
-                Err(e) => m.error(e),
-            }
-            Vec::new()
+            });
         }
+        Overlay::Talk { text: typed, .. } | Overlay::Comment(CommentDraft { text: typed, .. }) => {
+            typed.push_str(&clean(text, CarriageReturn::Newline, None));
+        }
+        _ => {
+            if let Some(c) = m.pane.connection().filter(|c| c.mode == Mode::Agent) {
+                let text = sanitize_paste(text);
+                let bytes = if c.term.modes().bracketed_paste {
+                    format!("\x1b[200~{text}\x1b[201~")
+                } else {
+                    text
+                };
+                return vec![Effect::Pty {
+                    to: c.name.clone(),
+                    bytes: bytes.into_bytes(),
+                }];
+            }
+        }
+    }
+    Vec::new()
+}
+
+/// "first (+n more{hint})": a warning list as one status line.
+fn first_warning(warnings: &[String], hint: &str) -> String {
+    match warnings {
+        [] => String::new(),
+        [only] => only.clone(),
+        [first, rest @ ..] => format!("{first} (+{} more{hint})", rest.len()),
+    }
+}
+
+fn on_snapshot(m: &mut Model, snapshot: Snapshot, warnings: Vec<String>) {
+    m.load(snapshot);
+    m.hold_turn_row();
+    track_live(m);
+    forget_gone(m);
+    if !warnings.is_empty() && warnings != m.last_warnings {
+        let line = first_warning(&warnings, " in `agent ls`");
+        m.error(format!("discovery: {line}"));
+    }
+    m.last_warnings = warnings;
+}
+
+fn on_catalogue(m: &mut Model, repos: Vec<RepoRoot>, warnings: Vec<String>) {
+    m.catalogue = repos;
+    if !warnings.is_empty() && warnings != m.catalogue_warnings {
+        m.error(first_warning(&warnings, ""));
+    }
+    m.catalogue_warnings = warnings;
+}
+
+fn on_took_over(m: &mut Model, name: &SessionName, detached: Result<usize, String>) {
+    match detached {
+        Ok(n) => {
+            if let Some(c) = m.pane.connection_mut().filter(|c| c.name == *name) {
+                c.others = None;
+            }
+            if n > 0 {
+                m.info(format!("took over {name} from {n} other client(s)"));
+            }
+        }
+        Err(e) => m.error(e),
     }
 }
 
@@ -370,6 +395,7 @@ pub fn tick(m: &mut Model) -> Vec<Effect> {
 /// message and tick, so a draw only reads.
 fn settle(m: &mut Model) {
     let geometry = crate::view::geometry(m.size, m.screen);
+    m.areas.terminal = geometry.terminal;
     m.fit_sidebar(geometry.sidebar, geometry.sidebar_shown);
     m.settle();
 }
@@ -442,11 +468,10 @@ fn clamp_panel(m: &mut Model) {
 pub fn tick_at(m: &mut Model, now: Moment) -> Vec<Effect> {
     m.clock = now;
     // What the cursor is on must be judged at this moment before deciding
-    // what to read.
+    // what to read. What the tick then asks for changes nothing settling
+    // reads, so once is enough.
     settle(m);
-    let effects = tick_effects(m);
-    settle(m);
-    effects
+    tick_effects(m)
 }
 
 fn tick_effects(m: &mut Model) -> Vec<Effect> {
@@ -640,7 +665,7 @@ fn read_document(m: &mut Model) -> Option<Effect> {
 /// [`SUBAGENT_SLOW_REFRESH`] regardless.
 fn read_subagent(m: &mut Model) -> Option<Effect> {
     let (name, id) = m.subagent_selected()?;
-    let workdir = m.selected_entry()?.path().map(Path::to_path_buf)?;
+    let workdir = selected_root(m)?;
     let events = m.activity(&name)?.events;
     let now = m.clock.mono;
     let key = (name.clone(), id.clone());
@@ -890,37 +915,42 @@ fn on_key(m: &mut Model, key: KeyEvent) -> Vec<Effect> {
                 m.preview_at = None;
             }
         } else {
-            c.term.send(encode_key(key, c.term.modes()));
+            return vec![Effect::Pty {
+                to: c.name.clone(),
+                bytes: encode_key(key, c.term.modes()),
+            }];
         }
         return Vec::new();
     }
-    if m.peek.is_some() {
-        return on_peek_key(m, key.code);
+    if m.peek.is_none() {
+        let armed = std::mem::replace(&mut m.chord, Chord::Idle) == Chord::Armed;
+        if pressed(&key, m.keys.nav()) {
+            return leave_pane(m, armed);
+        }
     }
-    on_nav_key(m, key)
+    nav_or_peek_command(m, &key).unwrap_or_default()
 }
 
 const SEND_MOVED: &str = "send is s now";
 
 /// The peek float reads the terminal and passes nothing to it.
-fn on_peek_key(m: &mut Model, code: KeyCode) -> Vec<Effect> {
-    let Some(name) = m.peek.clone() else {
-        return Vec::new();
-    };
+/// What `code` does in the peek, or `None` when nothing is bound to it.
+fn peek_command(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
+    let name = m.peek.clone()?;
     match code {
         KeyCode::Esc | KeyCode::Char('v') => m.peek = None,
         KeyCode::Char('s') => open_talk(m, &name),
         KeyCode::Char('t') => m.info(SEND_MOVED),
-        KeyCode::Char('i') | KeyCode::Enter => return activate(m, &name),
-        _ => {}
+        KeyCode::Char('i') | KeyCode::Enter => return Some(activate(m, &name)),
+        _ => return None,
     }
-    Vec::new()
+    Some(Vec::new())
 }
 
 /// `e` on a subagent row: its whole transcript, in the agent's checkout.
 fn edit_transcript(m: &mut Model) -> Option<Vec<Effect>> {
     let key = m.subagent_selected()?;
-    let root = m.selected_entry()?.path()?.to_path_buf();
+    let root = selected_root(m)?;
     match m.watched(&key).and_then(|w| w.log.as_ref()) {
         Some(Ok(Some(detail))) if !detail.transcript.as_os_str().is_empty() => {
             Some(vec![Effect::Edit(Open::File {
@@ -977,24 +1007,24 @@ fn add_comment(
         m.info(format!(
             "the comment has a control character ({c:?}) · Esc closes"
         ));
-        m.overlay = Overlay::Comment {
+        m.overlay = Overlay::Comment(CommentDraft {
             to: to.clone(),
             lines: lines.to_vec(),
             text: text.to_string(),
             rev,
-        };
+        });
         return;
     }
     let at = m.draft(to).iter().position(|c| c.same_place(&comment));
     match (at, text.trim().is_empty()) {
         (None, true) => {
             m.info("type a comment first · Esc closes");
-            m.overlay = Overlay::Comment {
+            m.overlay = Overlay::Comment(CommentDraft {
                 to: to.clone(),
                 lines: lines.to_vec(),
                 text: String::new(),
                 rev,
-            };
+            });
             return;
         }
         (Some(i), true) => {
@@ -1035,12 +1065,12 @@ fn open_comment(m: &mut Model) {
         .draft(&name)
         .iter()
         .find(|c| c.covers(first, rev.as_deref()));
-    m.overlay = Overlay::Comment {
+    m.overlay = Overlay::Comment(CommentDraft {
         to: name,
         text: existing.map(|c| c.text.clone()).unwrap_or_default(),
         lines,
         rev,
-    };
+    });
 }
 
 /// Keys for [0] while it reads the branch: a cursor over its commits and
@@ -1094,7 +1124,7 @@ fn branch_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
             if !matches!(line.kind, crate::review::LineKind::Entry(_)) {
                 return None;
             }
-            let root = m.selected_entry()?.path()?.to_path_buf();
+            let root = selected_root(m)?;
             effects.push(Effect::Edit(Open::File {
                 root,
                 file: line.path.clone(),
@@ -1127,7 +1157,7 @@ fn edit_line(m: &mut Model) -> Option<Vec<Effect>> {
         m.info("e opens the checkout, not a commit");
         return Some(Vec::new());
     }
-    let root = m.selected_entry()?.path()?.to_path_buf();
+    let root = selected_root(m)?;
     let line = m.docs.lines().get(m.diff_view.cursor)?;
     Some(vec![Effect::Edit(Open::At {
         root,
@@ -1246,7 +1276,7 @@ fn log_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
     let key = m.subagent_selected()?;
     let editing = (code == KeyCode::Char('e'))
         .then(|| {
-            let root = m.selected_entry()?.path()?.to_path_buf();
+            let root = selected_root(m)?;
             let title = m
                 .subagent_rows()
                 .into_iter()
@@ -1340,8 +1370,23 @@ fn sanitize_paste(text: &str) -> String {
 /// Keys that choose the panel `j`/`k` act on, and those a panel gives its
 /// own meaning. `None` leaves the key to NAV.
 fn on_panel_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
-    if m.main_focused()
-        && code == KeyCode::Char('y')
+    if m.main_focused() {
+        return on_document_key(m, code);
+    }
+    if let Some(effects) = focus_key(m, code) {
+        return Some(effects);
+    }
+    match m.panel.list() {
+        Listed::Agents => agents_key(m, code),
+        Listed::Agent { .. } => turn_key(m, code),
+        Listed::Changes { .. } => changes_key(m, code),
+    }
+}
+
+/// [0]'s keys. The panel numbers hand the keys to a list panel, so they
+/// leave [0] first.
+fn on_document_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
+    if code == KeyCode::Char('y')
         && let Some(crate::document::Hover::Turn(name)) = m.hover()
     {
         let message = m
@@ -1353,8 +1398,7 @@ fn on_panel_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
         };
         return Some(copy(m, text));
     }
-    if m.main_focused()
-        && code == KeyCode::Esc
+    if code == KeyCode::Esc
         && m.diff_view.anchor.is_some()
         && matches!(
             m.hover(),
@@ -1368,84 +1412,95 @@ fn on_panel_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
         m.diff_view.anchor = None;
         return Some(Vec::new());
     }
-    if m.main_focused() && code == KeyCode::Esc && m.opened.take().is_some() {
+    if code == KeyCode::Esc && m.opened.take().is_some() {
         m.diff_view.owner = None;
         return Some(Vec::new());
     }
-    if m.main_focused()
-        && let Some(effects) = log_key(m, code)
-            .or_else(|| diff_key(m, code))
-            .or_else(|| branch_key(m, code))
+    if let Some(effects) = log_key(m, code)
+        .or_else(|| diff_key(m, code))
+        .or_else(|| branch_key(m, code))
     {
         return Some(effects);
     }
-    if m.main_focused() {
-        match code {
-            KeyCode::Esc | KeyCode::Char('1' | '2' | '3') => m.panel.leave_document(),
-            KeyCode::Char('j') | KeyCode::Down => m.docs.scroll_by(1),
-            KeyCode::Char('k') | KeyCode::Up => m.docs.scroll_by(-1),
-            KeyCode::Char('g') | KeyCode::Home => m.docs.scroll_to_start(),
-            KeyCode::Char('G') | KeyCode::End => m.docs.scroll_to_end(),
-            KeyCode::PageDown => m.docs.scroll_by(m.doc_half_page() * 2),
-            KeyCode::PageUp => m.docs.scroll_by(-m.doc_half_page() * 2),
-            KeyCode::Enter | KeyCode::Char('0') => {}
-            _ => return None,
+    match code {
+        KeyCode::Esc => m.panel.leave_document(),
+        KeyCode::Char('1' | '2' | '3') => {
+            m.panel.leave_document();
+            return focus_key(m, code);
         }
-        if !matches!(code, KeyCode::Char('1' | '2' | '3')) {
-            return Some(Vec::new());
-        }
+        KeyCode::Char('j') | KeyCode::Down => m.docs.scroll_by(1),
+        KeyCode::Char('k') | KeyCode::Up => m.docs.scroll_by(-1),
+        KeyCode::Char('g') | KeyCode::Home => m.docs.scroll_to_start(),
+        KeyCode::Char('G') | KeyCode::End => m.docs.scroll_to_end(),
+        KeyCode::PageDown => m.docs.scroll_by(m.doc_half_page() * 2),
+        KeyCode::PageUp => m.docs.scroll_by(-m.doc_half_page() * 2),
+        KeyCode::Enter => {}
+        _ => return None,
     }
+    Some(Vec::new())
+}
+
+/// The keys that move the keys between the panels.
+fn focus_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
     match (code, m.panel.list()) {
         (KeyCode::Esc | KeyCode::Char('1'), Listed::Agent { .. } | Listed::Changes { .. }) => {
             m.panel = Panel::Agents;
-            Some(Vec::new())
         }
+        (KeyCode::Char('1'), Listed::Agents) => {}
         (KeyCode::Char('2'), _) if m.selected_entry().is_none() => {
             m.info("select an agent to see it");
-            Some(Vec::new())
         }
         (KeyCode::Char('2'), _)
             if m.selected_entry()
                 .is_some_and(|e| m.activity(e.name()).is_none()) =>
         {
             m.info("no turn recorded · d then ⏎ restarts it through agent");
-            Some(Vec::new())
         }
-        (KeyCode::Char('2'), _) => {
-            m.panel = Panel::turn();
-            Some(Vec::new())
-        }
-        (KeyCode::Char('3'), _) if m.change_rows() == 0 => {
-            m.info("no files to move to");
-            Some(Vec::new())
-        }
+        (KeyCode::Char('2'), _) => m.panel = Panel::turn(),
+        (KeyCode::Char('3'), _) if m.change_rows() == 0 => m.info("no files to move to"),
         (KeyCode::Char('3'), _) if m.work_room == WorkRoom::TooShort => {
             m.info("no room for [3] at this height");
-            Some(Vec::new())
         }
-        (KeyCode::Char('3'), _) => {
-            m.panel = Panel::Changes { file: 0 };
-            Some(Vec::new())
-        }
-        (KeyCode::Enter, Listed::Changes { .. }) if m.folder_under_cursor().is_some() => {
-            m.toggle_folder();
-            Some(Vec::new())
-        }
-        (KeyCode::Char('`'), Listed::Changes { .. }) => {
-            m.toggle_changes_view();
-            Some(Vec::new())
-        }
-        (KeyCode::Char('-' | '='), Listed::Changes { .. })
-            if m.changes_view == ChangesView::Flat =>
-        {
+        (KeyCode::Char('3'), _) => m.panel = Panel::Changes { file: 0 },
+        _ => return None,
+    }
+    Some(Vec::new())
+}
+
+/// Opens the document under the list panel's cursor.
+fn open_document(m: &mut Model) -> Vec<Effect> {
+    m.panel.focus_document();
+    m.opened = None;
+    Vec::new()
+}
+
+fn agents_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
+    match code {
+        KeyCode::Char('0') => m
+            .selected_entry()
+            .map(|e| e.name().clone())
+            .map(|name| activate(m, &name)),
+        _ => None,
+    }
+}
+
+fn turn_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
+    match code {
+        KeyCode::Enter | KeyCode::Char('0') if m.hover().is_some() => Some(open_document(m)),
+        KeyCode::Char('e') => edit_transcript(m),
+        _ => None,
+    }
+}
+
+fn changes_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
+    match code {
+        KeyCode::Enter if m.folder_under_cursor().is_some() => m.toggle_folder(),
+        KeyCode::Char('`') => m.toggle_changes_view(),
+        KeyCode::Char('-' | '=') if m.changes_view == ChangesView::Flat => {
             m.info("the flat list has no folders · ` shows the tree");
-            Some(Vec::new())
         }
-        (KeyCode::Char(c @ ('-' | '=')), Listed::Changes { .. }) => {
-            m.fold_all(c == '-');
-            Some(Vec::new())
-        }
-        (KeyCode::Char('e'), Listed::Changes { .. }) if m.folder_under_cursor().is_some() => {
+        KeyCode::Char(c @ ('-' | '=')) => m.fold_all(c == '-'),
+        KeyCode::Char('e') if m.folder_under_cursor().is_some() => {
             let root = m
                 .selected_entry()
                 .and_then(|e| e.path())
@@ -1455,25 +1510,23 @@ fn on_panel_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
                 m.info("that folder is gone from the checkout");
                 return Some(Vec::new());
             };
-            Some(vec![Effect::Edit(Open::Checkout(dir))])
+            return Some(vec![Effect::Edit(Open::Checkout(dir))]);
         }
-        (KeyCode::Enter | KeyCode::Char('0'), Listed::Changes { .. } | Listed::Agent { .. })
-            if m.hover().is_some() =>
-        {
-            m.panel.focus_document();
-            m.opened = None;
-            Some(Vec::new())
+        KeyCode::Enter | KeyCode::Char('0') if m.hover().is_some() => {
+            return Some(open_document(m));
         }
-        (KeyCode::Char('0'), Listed::Agents) => m
-            .selected_entry()
-            .map(|e| e.name().clone())
-            .map(|name| activate(m, &name)),
-        (KeyCode::Char('e'), Listed::Changes { .. }) => m
-            .file_under_cursor()
-            .map(|(root, file)| vec![Effect::Edit(Open::File { root, file })]),
-        (KeyCode::Char('e'), Listed::Agent { .. }) => edit_transcript(m),
-        _ => None,
+        KeyCode::Char('e') => {
+            return m
+                .file_under_cursor()
+                .map(|(root, file)| vec![Effect::Edit(Open::File { root, file })]);
+        }
+        _ => return None,
     }
+    Some(Vec::new())
+}
+
+fn has_tabs(m: &Model) -> bool {
+    matches!(m.panel, Panel::Agents | Panel::Changes { .. })
 }
 
 fn cycle_tab(m: &mut Model, direction: Direction) {
@@ -1481,8 +1534,6 @@ fn cycle_tab(m: &mut Model, direction: Direction) {
         m.cycle_view(direction);
     } else if matches!(m.panel, Panel::Changes { .. }) {
         m.toggle_changes_scope();
-    } else {
-        m.info("this panel has no tabs");
     }
 }
 
@@ -1518,67 +1569,47 @@ fn cycle_panel(m: &mut Model, direction: Direction) -> Vec<Effect> {
     on_panel_key(m, KeyCode::Char(digit)).unwrap_or_default()
 }
 
-fn on_nav_key(m: &mut Model, key: KeyEvent) -> Vec<Effect> {
-    let armed = std::mem::replace(&mut m.chord, Chord::Idle) == Chord::Armed;
-    if pressed(&key, m.keys.nav()) {
-        if armed {
-            let current = m.pane.session().cloned();
-            let previous = m
-                .mru()
-                .iter()
-                .find(|n| Some(*n) != current.as_ref())
-                .cloned();
-            if let Some(name) = previous {
-                return activate(m, &name);
-            }
-        }
-        return enter_agent(m);
+/// What `key` does in the peek while one is open, else in NAV, or `None`
+/// when nothing is bound to it there.
+pub(crate) fn nav_or_peek_command(m: &mut Model, key: &KeyEvent) -> Option<Vec<Effect>> {
+    if m.peek.is_some() {
+        peek_command(m, key.code)
+    } else {
+        nav_command(m, key)
     }
+}
+
+/// What `key` does in NAV, or `None` when nothing is bound to it here.
+fn nav_command(m: &mut Model, key: &KeyEvent) -> Option<Vec<Effect>> {
     let selected = m.selected_entry().cloned();
-    if let Some(effects) = on_panel_key(m, key.code) {
-        return effects;
+    on_panel_key(m, key.code)
+        .or_else(|| scroll_key(m, key))
+        .or_else(|| view_key(m, key))
+        .or_else(|| overlay_key(m, key, selected.as_ref()))
+        .or_else(|| action_key(m, key, selected))
+}
+
+/// The nav key in NAV: the agent the keys last left, if it follows a nav
+/// key from AGENT, else the one under the cursor.
+fn leave_pane(m: &mut Model, armed: bool) -> Vec<Effect> {
+    if armed {
+        let current = m.pane.session().cloned();
+        let previous = m
+            .mru()
+            .iter()
+            .find(|n| Some(*n) != current.as_ref())
+            .cloned();
+        if let Some(name) = previous {
+            return activate(m, &name);
+        }
     }
+    enter_agent(m)
+}
+
+fn scroll_key(m: &mut Model, key: &KeyEvent) -> Option<Vec<Effect>> {
     match key.code {
-        KeyCode::Char('q') => {
-            let queued = m.queued() + m.drafted();
-            if queued == 0 {
-                return vec![Effect::Quit];
-            }
-            m.overlay = Overlay::Confirm(Confirm::Quit(queued));
-            return Vec::new();
-        }
-        KeyCode::Esc => return enter_agent(m),
-        KeyCode::Char('i') => {
-            if let Some(entry) = selected {
-                return activate(m, entry.name());
-            }
-        }
-        KeyCode::Enter => match (m.cursor().cloned(), selected) {
-            (Some(Cursor::Repo(key)), _) => {
-                m.view = View::Focus;
-                m.select_repo(&key);
-            }
-            (_, Some(entry)) => return activate(m, entry.name()),
-            _ => {}
-        },
-        KeyCode::Char('d') if ctrl(&key, 'd') => match m.panel {
-            Panel::Changes { .. } | Panel::Agent { .. } | Panel::Main(_) => {
-                m.docs.scroll_by(m.doc_half_page());
-                if m.main_focused() {
-                    m.follow_page();
-                }
-            }
-            Panel::Agents => m.page_in_panel(m.half_page()),
-        },
-        KeyCode::Char('u') if ctrl(&key, 'u') => match m.panel {
-            Panel::Changes { .. } | Panel::Agent { .. } | Panel::Main(_) => {
-                m.docs.scroll_by(-m.doc_half_page());
-                if m.main_focused() {
-                    m.follow_page();
-                }
-            }
-            Panel::Agents => m.page_in_panel(-m.half_page()),
-        },
+        KeyCode::Char('d') if ctrl(key, 'd') => half_page(m, Direction::Forward),
+        KeyCode::Char('u') if ctrl(key, 'u') => half_page(m, Direction::Back),
         KeyCode::Char('J') if m.hover().is_some() => m.docs.scroll_by(SCROLL),
         KeyCode::Char('K') if m.hover().is_some() => m.docs.scroll_by(-SCROLL),
         KeyCode::PageDown => m.page_in_panel(m.half_page() * 2),
@@ -1587,30 +1618,53 @@ fn on_nav_key(m: &mut Model, key: KeyEvent) -> Vec<Effect> {
         KeyCode::Char('k') | KeyCode::Up => m.move_in_panel(-1),
         KeyCode::Char('g') | KeyCode::Home => m.panel_to_edge(Edge::First),
         KeyCode::Char('G') | KeyCode::End => m.panel_to_edge(Edge::Last),
+        _ => return None,
+    }
+    Some(Vec::new())
+}
+
+fn half_page(m: &mut Model, direction: Direction) {
+    let sign = match direction {
+        Direction::Forward => 1,
+        Direction::Back => -1,
+    };
+    match m.panel {
+        Panel::Changes { .. } | Panel::Agent { .. } | Panel::Main(_) => {
+            m.docs.scroll_by(sign * m.doc_half_page());
+            if m.main_focused() {
+                m.follow_page();
+            }
+        }
+        Panel::Agents => m.page_in_panel(sign * m.half_page()),
+    }
+}
+
+/// Keys that change what the lists show or which panel has the keys.
+fn view_key(m: &mut Model, key: &KeyEvent) -> Option<Vec<Effect>> {
+    match key.code {
         KeyCode::Char('}') => m.jump_repo(1),
         KeyCode::Char('{') => m.jump_repo(-1),
-        KeyCode::Char(']') => cycle_tab(m, Direction::Forward),
-        KeyCode::Char('[') => cycle_tab(m, Direction::Back),
-        KeyCode::Tab | KeyCode::Char('l') => return cycle_panel(m, Direction::Forward),
-        KeyCode::BackTab | KeyCode::Char('h') => return cycle_panel(m, Direction::Back),
+        KeyCode::Char(']') if has_tabs(m) => cycle_tab(m, Direction::Forward),
+        KeyCode::Char('[') if has_tabs(m) => cycle_tab(m, Direction::Back),
+        KeyCode::Tab | KeyCode::Char('l') => return Some(cycle_panel(m, Direction::Forward)),
+        KeyCode::BackTab | KeyCode::Char('h') => return Some(cycle_panel(m, Direction::Back)),
         KeyCode::Char('+') => m.screen = Screen::Full,
         KeyCode::Char('_') => m.screen = Screen::Split,
         KeyCode::Char('.') if m.view == View::Pinned => {
             m.info("pinned lists every pin · . filters the repo and agents tabs");
         }
         KeyCode::Char('.') => m.visibility = m.visibility.toggled(),
+        _ => return None,
+    }
+    Some(Vec::new())
+}
+
+/// Keys that open an overlay or a form.
+fn overlay_key(m: &mut Model, key: &KeyEvent, selected: Option<&Entry>) -> Option<Vec<Effect>> {
+    match key.code {
         KeyCode::Char('p') => m.overlay = Overlay::Picker(Query::default()),
         KeyCode::Char(' ' | '/') => m.overlay = Overlay::Switcher(Query::default()),
         KeyCode::Char('?') => m.overlay = Overlay::Help(HelpState::default()),
-        KeyCode::Char('m') => {
-            if let Some(entry) = selected {
-                let name = entry.name().clone();
-                return vec![Effect::Job(match entry.pin() {
-                    Some(_) => Job::Unpin(name),
-                    None => Job::Pin(name),
-                })];
-            }
-        }
         KeyCode::Char('n') => open_form(m, FormKind::New),
         KeyCode::Char('c') if !m.main_focused() => open_form(m, FormKind::Checkout),
         KeyCode::Char('s') => {
@@ -1620,50 +1674,6 @@ fn on_nav_key(m: &mut Model, key: KeyEvent) -> Vec<Effect> {
         }
         KeyCode::Char('t') => m.info(SEND_MOVED),
         KeyCode::Char('v') => open_peek(m),
-        KeyCode::Char('e') => {
-            let path = m.selected().and_then(|(repo, e)| {
-                e.and_then(|e| e.path())
-                    .or_else(|| repo.key().root().map(agent_core::paths::RepoRoot::path))
-                    .map(PathBuf::from)
-            });
-            if let Some(path) = path {
-                return vec![Effect::Edit(Open::Checkout(path))];
-            }
-        }
-        KeyCode::Char('d') => match selected.map(|e| (m.reach(&e), e)) {
-            Some((
-                Reach::Other {
-                    kill: Some(running),
-                    ..
-                },
-                _,
-            )) => m.overlay = Overlay::Confirm(Confirm::Kill(running)),
-            Some((Reach::Own, entry)) => {
-                m.error(format!("can't kill {}: this TUI runs in it", entry.name()));
-            }
-            Some((
-                Reach::Other {
-                    enter: Enter::Resurrect | Enter::Restart(_),
-                    ..
-                },
-                entry,
-            )) => {
-                m.info(format!("{} isn't running. D removes it", entry.name()));
-            }
-            Some((Reach::Other { .. }, _)) | None => m.info("no session to kill"),
-        },
-        KeyCode::Char('D') => return request_removal(m),
-        KeyCode::Char('a') => {
-            let here = m.visible_session().cloned();
-            let next = m
-                .needs_you()
-                .into_iter()
-                .find(|name| Some(name) != here.as_ref());
-            match next {
-                Some(name) => return activate(m, &name),
-                None => m.info("Nothing needs you"),
-            }
-        }
         KeyCode::Char('x') => match selected {
             _ if m.actions.is_empty() => m.info(format!(
                 "no actions · add [[action]] to {}",
@@ -1672,9 +1682,93 @@ fn on_nav_key(m: &mut Model, key: KeyEvent) -> Vec<Effect> {
             Some(entry) => m.overlay = Overlay::Actions(entry.name().clone()),
             None => m.info("select an agent to run an action on"),
         },
-        _ => {}
+        _ => return None,
     }
-    Vec::new()
+    Some(Vec::new())
+}
+
+/// Keys that act on the selected agent's session, or quit.
+fn action_key(m: &mut Model, key: &KeyEvent, selected: Option<Entry>) -> Option<Vec<Effect>> {
+    match key.code {
+        KeyCode::Char('q') => {
+            let queued = m.queued() + m.drafted();
+            if queued == 0 {
+                return Some(vec![Effect::Quit]);
+            }
+            m.overlay = Overlay::Confirm(Confirm::Quit(queued));
+        }
+        KeyCode::Esc => return Some(enter_agent(m)),
+        KeyCode::Char('i') => {
+            if let Some(entry) = selected {
+                return Some(activate(m, entry.name()));
+            }
+        }
+        KeyCode::Enter => match (m.cursor().cloned(), selected) {
+            (Some(Cursor::Repo(key)), _) => {
+                m.view = View::Focus;
+                m.select_repo(&key);
+            }
+            (_, Some(entry)) => return Some(activate(m, entry.name())),
+            _ => {}
+        },
+        KeyCode::Char('m') => {
+            if let Some(entry) = selected {
+                let name = entry.name().clone();
+                return Some(vec![Effect::Job(match entry.pin() {
+                    Some(_) => Job::Unpin(name),
+                    None => Job::Pin(name),
+                })]);
+            }
+        }
+        KeyCode::Char('e') => {
+            let path = m.selected().and_then(|(repo, e)| {
+                e.and_then(|e| e.path())
+                    .or_else(|| repo.key().root().map(agent_core::paths::RepoRoot::path))
+                    .map(PathBuf::from)
+            });
+            if let Some(path) = path {
+                return Some(vec![Effect::Edit(Open::Checkout(path))]);
+            }
+        }
+        KeyCode::Char('d') => kill_selected(m, selected),
+        KeyCode::Char('D') => return Some(request_removal(m)),
+        KeyCode::Char('a') => {
+            let here = m.visible_session().cloned();
+            let next = m
+                .needs_you()
+                .into_iter()
+                .find(|name| Some(name) != here.as_ref());
+            match next {
+                Some(name) => return Some(activate(m, &name)),
+                None => m.info("Nothing needs you"),
+            }
+        }
+        _ => return None,
+    }
+    Some(Vec::new())
+}
+
+fn kill_selected(m: &mut Model, selected: Option<Entry>) {
+    match selected.map(|e| (m.reach(&e), e)) {
+        Some((
+            Reach::Other {
+                kill: Some(running),
+                ..
+            },
+            _,
+        )) => m.overlay = Overlay::Confirm(Confirm::Kill(running)),
+        Some((Reach::Own, entry)) => {
+            m.error(format!("can't kill {}: this TUI runs in it", entry.name()));
+        }
+        Some((
+            Reach::Other {
+                enter: Enter::Resurrect | Enter::Restart(_),
+                ..
+            },
+            entry,
+        )) => m.info(format!("{} isn't running. D removes it", entry.name())),
+        Some((Reach::Other { .. }, _)) | None => m.info("no session to kill"),
+    }
 }
 
 /// Runs the action bound to `key` on `target`, refusing if a placeholder
@@ -2183,105 +2277,10 @@ fn on_overlay_key(m: &mut Model, key: KeyEvent) -> Vec<Effect> {
             m.overlay = Overlay::New(form);
             on_new_key(m, &key)
         }
-        Overlay::Talk { to, mut text } => match key.code {
-            KeyCode::Esc => Vec::new(),
-            KeyCode::Enter => talk(m, to, text),
-            _ if ctrl(&key, 'x') => {
-                clear_queue(m, &to);
-                m.overlay = Overlay::Talk { to, text };
-                Vec::new()
-            }
-            _ => {
-                match key.code {
-                    KeyCode::Backspace => {
-                        text.pop();
-                    }
-                    _ if ctrl(&key, 'u') => text.clear(),
-                    KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        text.push(c);
-                    }
-                    _ => {}
-                }
-                m.overlay = Overlay::Talk { to, text };
-                Vec::new()
-            }
-        },
-        Overlay::Comment {
-            to,
-            lines,
-            mut text,
-            rev,
-        } => match key.code {
-            KeyCode::Esc => Vec::new(),
-            KeyCode::Enter => {
-                add_comment(m, &to, &lines, &text, rev);
-                Vec::new()
-            }
-            _ => {
-                match key.code {
-                    KeyCode::Backspace => {
-                        text.pop();
-                    }
-                    _ if ctrl(&key, 'u') => text.clear(),
-                    KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        text.push(c);
-                    }
-                    _ => {}
-                }
-                m.overlay = Overlay::Comment {
-                    to,
-                    lines,
-                    text,
-                    rev,
-                };
-                Vec::new()
-            }
-        },
-        Overlay::Switcher(mut query) => {
-            let matches = switcher_matches(m, &query.text);
-            match key.code {
-                KeyCode::Esc | KeyCode::Tab => Vec::new(),
-                KeyCode::Enter => {
-                    if let Some(name) = query.pick(&matches).cloned() {
-                        activate(m, &name)
-                    } else {
-                        m.overlay = Overlay::Switcher(query);
-                        Vec::new()
-                    }
-                }
-                _ => {
-                    edit_query(&mut query, &key, matches.len(), m.keys.nav());
-                    m.overlay = Overlay::Switcher(query);
-                    Vec::new()
-                }
-            }
-        }
-        Overlay::Picker(mut query) => {
-            let matches = picker_matches(m, &query.text);
-            let rows = matches.rows();
-            match key.code {
-                KeyCode::Esc | KeyCode::Tab => Vec::new(),
-                KeyCode::Enter => match query.pick(rows).cloned() {
-                    Some(Pick::Listed(key)) => {
-                        m.select_repo(&key);
-                        Vec::new()
-                    }
-                    Some(Pick::Found(root)) => {
-                        vec![Effect::Job(Job::ListRepo(root.path().to_path_buf()))]
-                    }
-                    Some(Pick::Path(path)) => vec![Effect::Job(Job::ListRepo(path))],
-                    None => {
-                        m.overlay = Overlay::Picker(query);
-                        Vec::new()
-                    }
-                },
-                _ => {
-                    edit_query(&mut query, &key, rows.len(), m.keys.nav());
-                    m.overlay = Overlay::Picker(query);
-                    Vec::new()
-                }
-            }
-        }
+        Overlay::Talk { to, text } => on_talk_key(m, to, text, &key),
+        Overlay::Comment(draft) => on_comment_key(m, draft, &key),
+        Overlay::Switcher(query) => on_switcher_key(m, query, &key),
+        Overlay::Picker(query) => on_picker_key(m, query, &key),
         Overlay::Confirm(confirm) => on_confirm_key(m, confirm, &key),
         Overlay::Planning { ticket, name } => {
             if !matches!(key.code, KeyCode::Esc | KeyCode::Char('n' | 'q')) {
@@ -2289,21 +2288,96 @@ fn on_overlay_key(m: &mut Model, key: KeyEvent) -> Vec<Effect> {
             }
             Vec::new()
         }
-        Overlay::Actions(target) => {
-            let action = match key.code {
-                KeyCode::Char(c) if (key.modifiers - KeyModifiers::SHIFT).is_empty() => {
-                    m.actions.get(c).cloned()
-                }
-                _ => None,
-            };
-            match (key.code, action) {
-                (KeyCode::Esc, _) => Vec::new(),
-                (_, Some(action)) => run_action(m, &target, &action),
-                (_, None) => {
-                    m.overlay = Overlay::Actions(target);
-                    Vec::new()
-                }
+        Overlay::Actions(target) => on_actions_key(m, target, &key),
+    }
+}
+
+/// Edits the text of a one-line overlay.
+fn type_text(text: &mut String, key: &KeyEvent) {
+    match key.code {
+        KeyCode::Backspace => {
+            text.pop();
+        }
+        _ if ctrl(key, 'u') => text.clear(),
+        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => text.push(c),
+        _ => {}
+    }
+}
+
+fn on_talk_key(m: &mut Model, to: SessionName, mut text: String, key: &KeyEvent) -> Vec<Effect> {
+    match key.code {
+        KeyCode::Esc => return Vec::new(),
+        KeyCode::Enter => return talk(m, to, text),
+        _ if ctrl(key, 'x') => clear_queue(m, &to),
+        _ => type_text(&mut text, key),
+    }
+    m.overlay = Overlay::Talk { to, text };
+    Vec::new()
+}
+
+fn on_comment_key(m: &mut Model, mut draft: CommentDraft, key: &KeyEvent) -> Vec<Effect> {
+    match key.code {
+        KeyCode::Esc => return Vec::new(),
+        KeyCode::Enter => {
+            add_comment(m, &draft.to, &draft.lines, &draft.text, draft.rev);
+            return Vec::new();
+        }
+        _ => type_text(&mut draft.text, key),
+    }
+    m.overlay = Overlay::Comment(draft);
+    Vec::new()
+}
+
+fn on_switcher_key(m: &mut Model, mut query: Query, key: &KeyEvent) -> Vec<Effect> {
+    let matches = switcher_matches(m, &query.text);
+    match key.code {
+        KeyCode::Esc | KeyCode::Tab => return Vec::new(),
+        KeyCode::Enter => {
+            if let Some(name) = query.pick(&matches).cloned() {
+                return activate(m, &name);
             }
+        }
+        _ => edit_query(&mut query, key, matches.len(), m.keys.nav()),
+    }
+    m.overlay = Overlay::Switcher(query);
+    Vec::new()
+}
+
+fn on_picker_key(m: &mut Model, mut query: Query, key: &KeyEvent) -> Vec<Effect> {
+    let matches = picker_matches(m, &query.text);
+    let rows = matches.rows();
+    match key.code {
+        KeyCode::Esc | KeyCode::Tab => return Vec::new(),
+        KeyCode::Enter => match query.pick(rows).cloned() {
+            Some(Pick::Listed(key)) => {
+                m.select_repo(&key);
+                return Vec::new();
+            }
+            Some(Pick::Found(root)) => {
+                return vec![Effect::Job(Job::ListRepo(root.path().to_path_buf()))];
+            }
+            Some(Pick::Path(path)) => return vec![Effect::Job(Job::ListRepo(path))],
+            None => {}
+        },
+        _ => edit_query(&mut query, key, rows.len(), m.keys.nav()),
+    }
+    m.overlay = Overlay::Picker(query);
+    Vec::new()
+}
+
+fn on_actions_key(m: &mut Model, target: SessionName, key: &KeyEvent) -> Vec<Effect> {
+    let action = match key.code {
+        KeyCode::Char(c) if (key.modifiers - KeyModifiers::SHIFT).is_empty() => {
+            m.actions.get(c).cloned()
+        }
+        _ => None,
+    };
+    match (key.code, action) {
+        (KeyCode::Esc, _) => Vec::new(),
+        (_, Some(action)) => run_action(m, &target, &action),
+        (_, None) => {
+            m.overlay = Overlay::Actions(target);
+            Vec::new()
         }
     }
 }
@@ -2597,12 +2671,16 @@ fn on_mouse(m: &mut Model, mouse: MouseEvent) -> Vec<Effect> {
             Focus::Nav(Some(c)) if scrolling => Some(c),
             Focus::Nav(_) | Focus::Overlay(_) => None,
         };
-        if let Some(c) = forward
-            && let Some(bytes) = encode_mouse(mouse.kind, cell, c.term.modes())
-        {
-            c.term.send(bytes);
-        }
-        return Vec::new();
+        return forward
+            .and_then(|c| {
+                let bytes = encode_mouse(mouse.kind, cell, c.term.modes())?;
+                Some(Effect::Pty {
+                    to: c.name.clone(),
+                    bytes,
+                })
+            })
+            .into_iter()
+            .collect();
     }
     let scrolling = matches!(
         mouse.kind,
@@ -3477,6 +3555,38 @@ mod tests {
         let before = m.change_list();
         with_paths(&mut m, &PATHS);
         assert!(!std::sync::Arc::ptr_eq(&before, &m.change_list()), "facts");
+    }
+
+    #[test]
+    fn changing_the_folds_or_facts_builds_the_tree_once_before_anything_reads_it() {
+        let mut m = model(&[]);
+        m.changes_view = ChangesView::Tree;
+        with_paths(&mut m, &PATHS);
+        m.panel = Panel::Changes { file: 0 };
+        let first = m.change_list();
+        m.toggle_folder();
+        let folded = m.change_list();
+        assert!(!std::sync::Arc::ptr_eq(&first, &folded));
+        assert!(std::sync::Arc::ptr_eq(&folded, &m.change_list()));
+        m.fold_all(false);
+        let opened = m.change_list();
+        assert!(std::sync::Arc::ptr_eq(&opened, &m.change_list()));
+        with_paths(&mut m, &PATHS);
+        let reread = m.change_list();
+        assert!(std::sync::Arc::ptr_eq(&reread, &m.change_list()));
+        m.settle();
+        assert!(std::sync::Arc::ptr_eq(&reread, &m.change_list()));
+    }
+
+    #[test]
+    fn resizing_gives_the_terminal_pane_its_new_room_before_the_next_draw() {
+        let mut m = model(&[]);
+        let size = ratatui::layout::Rect::new(0, 0, 150, 40);
+        resized(&mut m, size);
+        assert_eq!(
+            m.areas.terminal,
+            crate::view::geometry(size, m.screen).terminal
+        );
     }
 
     #[test]
@@ -6022,7 +6132,7 @@ mod tests {
         add_comment(&mut m, &agent, &[line], "a\x1bb", Some("abc1234".into()));
         assert_eq!(m.drafted(), 0);
         assert!(
-            matches!(&m.overlay, Overlay::Comment { text, rev, .. }
+            matches!(&m.overlay, Overlay::Comment(CommentDraft { text, rev, .. })
                 if text == "a\x1bb" && rev.as_deref() == Some("abc1234")),
             "the box stays with its commit"
         );

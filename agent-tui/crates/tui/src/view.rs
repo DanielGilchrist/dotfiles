@@ -259,7 +259,7 @@ pub struct Geometry {
     left: Rect,
     right: Rect,
     /// Inside the main view's border and padding.
-    terminal: Rect,
+    pub terminal: Rect,
     /// The list's room inside the sidebar's border. As if the sidebar were
     /// there while it's hidden, so moving in the list still works.
     pub sidebar: Rect,
@@ -377,12 +377,15 @@ pub fn draw(frame: &mut Frame<'_>, m: &Model) -> Drawn {
         Overlay::Help(help) => drawn.overlay_offset = Some(draw_help(frame, m, help)),
         Overlay::Actions(target) => draw_actions(frame, m, target),
         Overlay::Talk { to, text } => draw_talk(frame, m, to, text),
-        Overlay::Comment {
-            to,
-            lines,
-            text,
-            rev,
-        } => draw_comment(frame, to, lines, text, rev.as_deref()),
+        Overlay::Comment(draft) => {
+            draw_comment(
+                frame,
+                &draft.to,
+                &draft.lines,
+                &draft.text,
+                draft.rev.as_deref(),
+            );
+        }
         Overlay::Planning { name, .. } => draw_planning(frame, m.clock.wall, name),
     }
     drawn
@@ -633,42 +636,30 @@ fn ranked<'a>(key: &'a str, desc: &'a str, rank: u8) -> Hint<'a> {
     }
 }
 
-/// The mode badge, then context hints, then the status message on the
-/// right. Hints that don't fit are dropped least important first (`? keys`
-/// always stays); the status never pushes hints out, which made the row
-/// jitter as messages came and went, it's cut to fit instead.
-fn draw_status_bar(frame: &mut Frame<'_>, m: &Model, area: Rect) {
-    let focus = m.focus();
-    let nav = m.keys.nav().to_string();
-    let twice = format!("{nav} {nav}");
-    let table = if matches!(focus, Focus::Agent(_) | Focus::Overlay(Overlay::New(_))) {
-        Vec::new()
-    } else {
-        keymap::footer(&Situation::of(m), &nav)
-    };
-    let mut hints: Vec<Hint<'_>> = Vec::new();
-    if let Focus::Agent(_) = focus {
-        hints.extend([ranked(&nav, "nav", 9), ranked(&twice, "previous", 8)]);
-    } else if let Focus::Overlay(Overlay::New(_)) = focus {
-        hints.extend([
-            ranked("⌃U", "clear field", 4),
-            ranked("⌃W", "delete word", 3),
-            ranked("⇧Tab", "previous field", 2),
-            ranked("⌃R", "use suggestion", 1),
-        ]);
-    } else if let Focus::Overlay(
-        Overlay::Switcher(_) | Overlay::Picker(_) | Overlay::Talk { .. } | Overlay::Comment { .. },
-    ) = focus
-    {
-        // The overlay's border carries its keys, so the footer doesn't
-        // compete with it.
-        hints.push(ranked("?", "keys", 9));
-    } else {
-        hints.extend(table.iter().map(|h| ranked(&h.keys, h.label, h.rank)));
-    }
+fn hints_width(hints: &[Hint<'_>]) -> usize {
+    hints
+        .iter()
+        .map(|h| line_width(&h.spans))
+        .sum::<usize>()
+        .saturating_sub(2)
+}
 
-    // What needs you, led by the key that goes there. It shows and hides
-    // as a block at the right edge, so the hints never shift.
+/// Drops the lowest ranked hints until the rest fit in `room`, keeping one.
+fn drop_to_fit(hints: &mut Vec<Hint<'_>>, room: usize) {
+    while hints.len() > 1 && hints_width(hints) > room {
+        let lowest = hints
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, h)| h.rank)
+            .map_or(0, |(i, _)| i);
+        hints.remove(lowest);
+    }
+}
+
+/// What needs you, led by the key that goes there, then the drafted and
+/// queued counts. It shows and hides as a block at the right edge, so the
+/// hints never shift.
+fn status_counts(m: &Model, focus: &Focus<'_>, nav: &str) -> Vec<Span<'static>> {
     let mut counts: Vec<Span<'static>> = Vec::new();
     for (kind, n) in m.attention().parts() {
         let colour = match kind {
@@ -717,6 +708,44 @@ fn draw_status_bar(frame: &mut Frame<'_>, m: &Model, area: Rect) {
             counts.pop();
         }
     }
+    counts
+}
+
+/// The mode badge, then context hints, then the status message on the
+/// right. Hints that don't fit are dropped least important first (`? keys`
+/// always stays); the status never pushes hints out, which made the row
+/// jitter as messages came and went, it's cut to fit instead.
+fn draw_status_bar(frame: &mut Frame<'_>, m: &Model, area: Rect) {
+    let focus = m.focus();
+    let nav = m.keys.nav().to_string();
+    let twice = format!("{nav} {nav}");
+    let table = if matches!(focus, Focus::Agent(_) | Focus::Overlay(Overlay::New(_))) {
+        Vec::new()
+    } else {
+        keymap::footer(&Situation::of(m), &nav)
+    };
+    let mut hints: Vec<Hint<'_>> = Vec::new();
+    if let Focus::Agent(_) = focus {
+        hints.extend([ranked(&nav, "nav", 9), ranked(&twice, "previous", 8)]);
+    } else if let Focus::Overlay(Overlay::New(_)) = focus {
+        hints.extend([
+            ranked("⌃U", "clear field", 4),
+            ranked("⌃W", "delete word", 3),
+            ranked("⇧Tab", "previous field", 2),
+            ranked("⌃R", "use suggestion", 1),
+        ]);
+    } else if let Focus::Overlay(
+        Overlay::Switcher(_) | Overlay::Picker(_) | Overlay::Talk { .. } | Overlay::Comment(_),
+    ) = focus
+    {
+        // The overlay's border carries its keys, so the footer doesn't
+        // compete with it.
+        hints.push(ranked("?", "keys", 9));
+    } else {
+        hints.extend(table.iter().map(|h| ranked(&h.keys, h.label, h.rank)));
+    }
+
+    let counts = status_counts(m, &focus, &nav);
     // The counts sit between a space, the right edge's space and the
     // column `justify` keeps between the sides.
     let badge_width = 9 + match line_width(&counts) {
@@ -724,22 +753,8 @@ fn draw_status_bar(frame: &mut Frame<'_>, m: &Model, area: Rect) {
         counts => counts + 3,
     };
     let width = usize::from(area.width);
-    let used = |hints: &[Hint<'_>]| {
-        hints
-            .iter()
-            .map(|h| line_width(&h.spans))
-            .sum::<usize>()
-            .saturating_sub(2)
-    };
-    while hints.len() > 1 && used(&hints) > width.saturating_sub(badge_width) {
-        let lowest = hints
-            .iter()
-            .enumerate()
-            .min_by_key(|(_, h)| h.rank)
-            .map_or(0, |(i, _)| i);
-        hints.remove(lowest);
-    }
-    let room_for_status = width.saturating_sub(badge_width + used(&hints) + 3);
+    drop_to_fit(&mut hints, width.saturating_sub(badge_width));
+    let room_for_status = width.saturating_sub(badge_width + hints_width(&hints) + 3);
     let mut status = match &m.status {
         Some(status) if room_for_status > 0 => {
             let style = if status.kind == StatusKind::Error {
@@ -1026,18 +1041,11 @@ fn spinner(now: SystemTime) -> &'static str {
 }
 
 fn draw_new(frame: &mut Frame<'_>, m: &Model, form: &NewAgent) {
-    let red = error();
-    let yellow = warning();
-    let max = agent_core::names::MAX_SESSION_LEN;
     let width = 64.min(frame.area().width.saturating_sub(4));
     let inner = usize::from(width).saturating_sub(4);
     let field_width = inner.saturating_sub(9);
     let fields = Fields::of(form);
-    let label = |field: Field, text: &'static str| fields.label(field, text);
-    let cursor = |field: Field| fields.cursor(field);
-    let indent = || Span::raw(" ".repeat(8));
     let derived = m.derive(form);
-    let check = &derived.check;
     let mut lines = Vec::new();
 
     let task_rows = TASK_ROWS.min(usize::from(frame.area().height.saturating_sub(14)).max(1));
@@ -1048,35 +1056,56 @@ fn draw_new(frame: &mut Frame<'_>, m: &Model, form: &NewAgent) {
         field_width,
         task_rows,
     ));
-    // What's wrong with the branch sits under it, live for a pasted link
-    // and after ⏎ for anything else, since a branch is invalid mid-word.
-    let target_problem = match (form.kind, &derived.submission) {
+    let problem = target_problem(form, &derived);
+    match &problem {
+        Some(why) => lines.extend(
+            wrap(why, inner.saturating_sub(8))
+                .into_iter()
+                .map(|row| Line::from(vec![form_indent(), Span::styled(row, error())])),
+        ),
+        None => lines.push(Line::raw("")),
+    }
+    let failure = form.error.as_ref().filter(|e| problem.as_ref() != Some(e));
+
+    lines.push(name_line(m, form, &derived, &fields, inner));
+    let message = name_message(form, &derived, failure);
+    lines.extend(name_note(message.as_ref(), derived.name.len(), inner));
+    lines.push(Line::raw(""));
+
+    lines.push(repo_line(m, form, &derived, &fields, inner));
+    finish_form(frame, form, &derived, m.clock.wall, lines, width);
+}
+
+fn form_indent() -> Span<'static> {
+    Span::raw(" ".repeat(8))
+}
+
+/// What's wrong with the branch sits under it, live for a pasted link and
+/// after ⏎ for anything else, since a branch is invalid mid-word.
+fn target_problem(form: &NewAgent, derived: &Derived) -> Option<String> {
+    match (form.kind, &derived.submission) {
         (FormKind::Checkout, Submission::Blocked(Blocked::Target(why)))
             if derived.link_pasted || form.error.is_some() =>
         {
             Some(why.clone())
         }
         _ => None,
-    };
-    match &target_problem {
-        Some(why) => lines.extend(
-            wrap(why, inner.saturating_sub(8))
-                .into_iter()
-                .map(|row| Line::from(vec![indent(), Span::styled(row, red)])),
-        ),
-        None => lines.push(Line::raw("")),
     }
-    let error = form
-        .error
-        .as_ref()
-        .filter(|e| target_problem.as_ref() != Some(e));
+}
 
-    // Name: the suggestion DIM with where it came from until one is typed;
-    // typed characters that don't fit or aren't allowed are Red.
-    let mut name = vec![label(Field::Name, "name")];
+/// The name row: the suggestion dim with where it came from until one is
+/// typed; typed characters that don't fit or aren't allowed are red.
+fn name_line(
+    m: &Model,
+    form: &NewAgent,
+    derived: &Derived,
+    fields: &Fields,
+    inner: usize,
+) -> Line<'static> {
+    let mut name = vec![fields.label(Field::Name, "name")];
     let mut source = Vec::new();
     if form.name.is_empty() {
-        name.push(cursor(Field::Name));
+        name.push(fields.cursor(Field::Name));
         match &derived.suggestion {
             Some(suggestion) => {
                 name.push(Span::styled(suggestion.name.clone(), dim()));
@@ -1113,17 +1142,28 @@ fn draw_new(frame: &mut Frame<'_>, m: &Model, form: &NewAgent) {
             .into_iter()
             .map(|(i, _)| i)
             .collect();
+        let max = agent_core::names::MAX_SESSION_LEN;
         name.extend(form.name.char_indices().map(|(i, c)| {
             let wrong = i + c.len_utf8() > max || bad.contains(&i);
-            Span::styled(c.to_string(), if wrong { red } else { Style::new() })
+            Span::styled(c.to_string(), if wrong { error() } else { Style::new() })
         }));
-        name.push(cursor(Field::Name));
+        name.push(fields.cursor(Field::Name));
     }
-    lines.push(justify(name, source, inner));
+    justify(name, source, inner)
+}
 
-    let message = match (&form.phase, error, check) {
+/// What to say under the name: the form's own error, else what the name
+/// check found.
+fn name_message(
+    form: &NewAgent,
+    derived: &Derived,
+    failure: Option<&String>,
+) -> Option<(String, Style)> {
+    let max = agent_core::names::MAX_SESSION_LEN;
+    let (red, yellow) = (error(), warning());
+    match (&form.phase, failure, &derived.check) {
         (Phase::Submitting { .. }, ..) | (_, None, NameCheck::Empty | NameCheck::Free(_)) => None,
-        (_, Some(error), _) => Some((error.clone(), red)),
+        (_, Some(failure), _) => Some((failure.clone(), red)),
         (_, None, NameCheck::TooLong { bytes }) => {
             Some((format!("{} over zellij's limit", bytes - max), red))
         }
@@ -1143,72 +1183,69 @@ fn draw_new(frame: &mut Frame<'_>, m: &Model, form: &NewAgent) {
                 Submission::Ready(Launchable::Checkout {
                     target: Checkout::Branch(_),
                     ..
-                }) => ("already on that branch · ⏎ attaches", yellow),
+                }) => ("already on that branch · ⏎ attaches".to_string(), yellow),
                 Submission::Ready(Launchable::Checkout {
                     target: Checkout::PullRequest(_),
                     ..
                 }) => (
-                    "already an agent · ⏎ attaches if its branch is the PR's",
+                    "already an agent · ⏎ attaches if its branch is the PR's".to_string(),
                     yellow,
                 ),
-                Submission::Blocked(
-                    refused @ (Blocked::OnAnotherBranch(_) | Blocked::InAnotherRepo(_)),
-                ) => {
-                    let text = match refused {
-                        Blocked::InAnotherRepo(repo) => format!("already an agent in {repo}"),
-                        Blocked::OnAnotherBranch(Some(on)) => format!("already an agent on {on}"),
-                        _ => "already an agent on a detached HEAD".to_string(),
-                    };
-                    lines.push(justify(
-                        vec![indent(), Span::styled(text, red)],
-                        vec![Span::styled(format!("{}/{max}", derived.name.len()), dim())],
-                        inner,
-                    ));
-                    lines.push(Line::raw(""));
-                    lines.push(repo_line(m, form, &derived, &fields, inner));
-                    return finish_form(frame, form, &derived, m.clock.wall, lines, width);
+                Submission::Blocked(Blocked::InAnotherRepo(repo)) => {
+                    (format!("already an agent in {repo}"), red)
                 }
-                Submission::Ready(Launchable::Attach { task: Some(_), .. }) => {
-                    ("already running: the prompt will be typed into it", yellow)
+                Submission::Blocked(Blocked::OnAnotherBranch(Some(on))) => {
+                    (format!("already an agent on {on}"), red)
                 }
+                Submission::Blocked(Blocked::OnAnotherBranch(None)) => {
+                    ("already an agent on a detached HEAD".to_string(), red)
+                }
+                Submission::Ready(Launchable::Attach { task: Some(_), .. }) => (
+                    "already running: the prompt will be typed into it".to_string(),
+                    yellow,
+                ),
                 Submission::Ready(Launchable::Attach { task: None, .. }) => {
-                    ("already running · ⏎ attaches", yellow)
+                    ("already running · ⏎ attaches".to_string(), yellow)
                 }
-                Submission::Ready(Launchable::Resurrect(_)) => ("exited · ⏎ resurrects it", yellow),
-                Submission::Blocked(Blocked::ExitedWithPrompt) => {
-                    ("exited, so clear the prompt to resurrect it", yellow)
+                Submission::Ready(Launchable::Resurrect(_)) => {
+                    ("exited · ⏎ resurrects it".to_string(), yellow)
                 }
+                Submission::Blocked(Blocked::ExitedWithPrompt) => (
+                    "exited, so clear the prompt to resurrect it".to_string(),
+                    yellow,
+                ),
                 Submission::Ready(Launchable::Start { .. }) => {
-                    ("an idle worktree · ⏎ starts it", yellow)
+                    ("an idle worktree · ⏎ starts it".to_string(), yellow)
                 }
                 Submission::Ready(Launchable::Create { .. }) | Submission::Blocked(_) => {
-                    ("", yellow)
+                    (String::new(), yellow)
                 }
             };
-            Some((text.to_string(), style))
+            Some((text, style))
         }
-    };
-    let length = derived.name.len();
-    let counter_style = if length > max { red } else { dim() };
+    }
+}
+
+/// The message under the name with the name's length beside its first row.
+/// Worker errors can be long, so they wrap rather than being cut.
+fn name_note(message: Option<&(String, Style)>, length: usize, inner: usize) -> Vec<Line<'static>> {
+    let max = agent_core::names::MAX_SESSION_LEN;
+    let counter_style = if length > max { error() } else { dim() };
     let counter = vec![Span::styled(format!("{length}/{max}"), counter_style)];
-    // Worker errors can be long, so they wrap under the name rather than
-    // being cut, with the counter beside the first row.
     let rows: Vec<String> = match &message {
         Some((text, _)) => wrap(text, inner.saturating_sub(8 + counter[0].width() + 1)),
         None => Vec::new(),
     };
-    if !rows.is_empty() || length > 0 {
-        let style = message.as_ref().map_or(dim(), |(_, style)| *style);
-        let mut rows = rows.into_iter();
-        let mut first = vec![indent()];
-        first.extend(rows.next().map(|row| Span::styled(row, style)));
-        lines.push(justify(first, counter, inner));
-        lines.extend(rows.map(|row| Line::from(vec![indent(), Span::styled(row, style)])));
+    if rows.is_empty() && length == 0 {
+        return Vec::new();
     }
-    lines.push(Line::raw(""));
-
-    lines.push(repo_line(m, form, &derived, &fields, inner));
-    finish_form(frame, form, &derived, m.clock.wall, lines, width);
+    let style = message.as_ref().map_or(dim(), |(_, style)| *style);
+    let mut rows = rows.into_iter();
+    let mut first = vec![form_indent()];
+    first.extend(rows.next().map(|row| Span::styled(row, style)));
+    let mut lines = vec![justify(first, counter, inner)];
+    lines.extend(rows.map(|row| Line::from(vec![form_indent(), Span::styled(row, style)])));
+    lines
 }
 
 /// Draws the assembled form, sized to its lines.
@@ -1461,7 +1498,16 @@ fn form_keys<'a>(
     hints.into_iter().flat_map(|h| h.spans).collect()
 }
 
-fn draw_confirm(frame: &mut Frame<'_>, confirm: &Confirm) {
+/// What a confirmation says: its title, the lines under it, the keys on
+/// its border and the colour of that border.
+struct ConfirmCard {
+    title: String,
+    body: Vec<Line<'static>>,
+    keys: Vec<Span<'static>>,
+    border: Style,
+}
+
+fn confirm_card(confirm: &Confirm) -> ConfirmCard {
     let warn = warning();
     let danger = error();
     let destructive = |key: &'static str, desc: &'static str| {
@@ -1540,6 +1586,21 @@ fn draw_confirm(frame: &mut Frame<'_>, confirm: &Confirm) {
             (format!("Remove {}", plan.name()), body, keys, border)
         }
     };
+    ConfirmCard {
+        title,
+        body,
+        keys,
+        border,
+    }
+}
+
+fn draw_confirm(frame: &mut Frame<'_>, confirm: &Confirm) {
+    let ConfirmCard {
+        title,
+        body,
+        keys,
+        border,
+    } = confirm_card(confirm);
     let content = body
         .iter()
         .map(Line::width)
@@ -1867,6 +1928,32 @@ fn draw_help(frame: &mut Frame<'_>, m: &Model, state: &HelpState) -> usize {
         Layout::vertical([Constraint::Min(3), Constraint::Length(describe)]).areas(area);
 
     let selected = state.selected.min(help.len().saturating_sub(1));
+    let block = help_block(state, help.len(), selected);
+    let inner = block.inner(list_area);
+    frame.render_widget(block, list_area);
+
+    let (lines, selected_line) = help_lines(&help, situation.ctx.name(), selected, inner.width);
+    let visible = usize::from(inner.height);
+    let offset = scroll(state.offset, selected_line, visible, lines.len());
+    frame.render_widget(
+        Paragraph::new(
+            lines
+                .into_iter()
+                .skip(offset)
+                .take(visible)
+                .collect::<Vec<_>>(),
+        ),
+        inner,
+    );
+
+    if describe > 0 {
+        let text = help.get(selected).map_or("", |row| row.long);
+        draw_description(frame, describe_area, state, text);
+    }
+    offset
+}
+
+fn help_block(state: &HelpState, rows: usize, selected: usize) -> Block<'static> {
     let mut block = Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(dim())
@@ -1874,11 +1961,7 @@ fn draw_help(frame: &mut Frame<'_>, m: &Model, state: &HelpState) -> usize {
         .title_top(Line::styled(" (type to filter) ", dim()).right_aligned())
         .title_bottom(
             Line::styled(
-                format!(
-                    " {} of {} ",
-                    usize::from(help.len() > 0) + selected,
-                    help.len()
-                ),
+                format!(" {} of {rows} ", usize::from(rows > 0) + selected),
                 dim(),
             )
             .right_aligned(),
@@ -1892,10 +1975,17 @@ fn draw_help(frame: &mut Frame<'_>, m: &Model, state: &HelpState) -> usize {
             .left_aligned(),
         );
     }
-    let inner = block.inner(list_area);
-    frame.render_widget(block, list_area);
+    block
+}
 
-    let width = usize::from(inner.width);
+/// The help's rows under their headers, and the line `selected` is on.
+fn help_lines(
+    help: &keymap::Help,
+    context: &str,
+    selected: usize,
+    width: u16,
+) -> (Vec<Line<'static>>, usize) {
+    let width = usize::from(width);
     let key_width = help
         .local
         .iter()
@@ -1913,7 +2003,7 @@ fn draw_help(frame: &mut Frame<'_>, m: &Model, state: &HelpState) -> usize {
         }
         let mut header = vec![Span::styled(format!(" {title}"), bold())];
         if title == "Local" {
-            header.push(Span::styled(format!("  {}", situation.ctx.name()), dim()));
+            header.push(Span::styled(format!("  {context}"), dim()));
         }
         lines.push(Line::from(header));
         for row in rows {
@@ -1939,39 +2029,26 @@ fn draw_help(frame: &mut Frame<'_>, m: &Model, state: &HelpState) -> usize {
     if lines.is_empty() {
         lines.push(Line::styled("  no key matches", dim()));
     }
-    let visible = usize::from(inner.height);
-    let offset = scroll(state.offset, selected_line, visible, lines.len());
+    (lines, selected_line)
+}
+
+fn draw_description(frame: &mut Frame<'_>, area: Rect, state: &HelpState, text: &str) {
+    let keys: &[(&str, &str)] = if state.typing {
+        &[("⏎", "keep filter"), ("Esc", "clear filter")]
+    } else {
+        &[("/", "filter"), ("? q Esc", "close")]
+    };
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(dim())
+        .title_top(Line::styled(" Description ", bold()).left_aligned())
+        .title_bottom(Line::from(hints(keys)).right_aligned());
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
     frame.render_widget(
-        Paragraph::new(
-            lines
-                .into_iter()
-                .skip(offset)
-                .take(visible)
-                .collect::<Vec<_>>(),
-        ),
+        Paragraph::new(format!(" {text}")).wrap(Wrap { trim: true }),
         inner,
     );
-
-    if describe > 0 {
-        let keys: &[(&str, &str)] = if state.typing {
-            &[("⏎", "keep filter"), ("Esc", "clear filter")]
-        } else {
-            &[("/", "filter"), ("? q Esc", "close")]
-        };
-        let block = Block::bordered()
-            .border_type(BorderType::Rounded)
-            .border_style(dim())
-            .title_top(Line::styled(" Description ", bold()).left_aligned())
-            .title_bottom(Line::from(hints(keys)).right_aligned());
-        let inner = block.inner(describe_area);
-        frame.render_widget(block, describe_area);
-        let text = help.get(selected).map_or("", |row| row.long);
-        frame.render_widget(
-            Paragraph::new(format!(" {text}")).wrap(Wrap { trim: true }),
-            inner,
-        );
-    }
-    offset
 }
 
 #[cfg(test)]

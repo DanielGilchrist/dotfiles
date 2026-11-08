@@ -1175,29 +1175,24 @@ struct Lower {
     room: WorkRoom,
 }
 
-/// [2] and [3] in `area`: [2] sized to its rows up to [`AGENT_ROWS`], [3]
-/// in what's left when it has the rows to say something and the room, and
-/// [2] in all of it when [3] has nothing.
-fn lower_panels(deck: &Deck<'_>, repo: &Repo, entry: &Entry, area: Rect) -> Lower {
-    let m = deck.m;
-    let rest = usize::from(area.height);
-    let (turn, turn_cursor) = deck.turn_rows(entry);
-    let work = work_of(m, entry);
-    let work_rows = work.as_ref().map_or(0, Work::rows);
-    let want_turn = if turn.is_empty() {
+/// How many of `rest` rows [2] and [3] get, for a turn with `turn_rows`
+/// rows and `work_rows` rows of work. [2] is sized to its rows up to
+/// [`AGENT_ROWS`], and [3] has what's left. [3] keeps its readiness row and
+/// three files, or what it has of them, and [2] a row, so when both can't
+/// fit [2] takes everything.
+fn budget(rest: usize, turn_rows: usize, work_rows: usize) -> (usize, usize) {
+    let want_turn = if turn_rows == 0 {
         0
     } else {
-        2 + turn.len().min(AGENT_ROWS)
+        2 + turn_rows.min(AGENT_ROWS)
     };
-    // [3] keeps its readiness row and three files, or what it has of them,
-    // and [2] a row, so when both can't fit [2] takes everything.
-    let turn_floor = if turn.is_empty() { 0 } else { 3 };
+    let turn_floor = if turn_rows == 0 { 0 } else { 3 };
     let work_least = if work_rows == 0 {
         0
     } else {
         (2 + work_rows).min(2 + READINESS_ROW + CHANGES_MIN)
     };
-    let (turn_height, work_height) = if work_rows > 0 && rest >= turn_floor + work_least {
+    if work_rows > 0 && rest >= turn_floor + work_least {
         let turn_height = if turn_floor == 0 {
             0
         } else {
@@ -1208,7 +1203,19 @@ fn lower_panels(deck: &Deck<'_>, repo: &Repo, entry: &Entry, area: Rect) -> Lowe
         (rest, 0)
     } else {
         (0, 0)
-    };
+    }
+}
+
+/// [2] and [3] in `area`: [2] sized to its rows up to [`AGENT_ROWS`], [3]
+/// in what's left when it has the rows to say something and the room, and
+/// [2] in all of it when [3] has nothing.
+fn lower_panels(deck: &Deck<'_>, repo: &Repo, entry: &Entry, area: Rect) -> Lower {
+    let m = deck.m;
+    let rest = usize::from(area.height);
+    let (turn, turn_cursor) = deck.turn_rows(entry);
+    let work = work_of(m, entry);
+    let work_rows = work.as_ref().map_or(0, Work::rows);
+    let (turn_height, work_height) = budget(rest, turn.len(), work_rows);
     let at = |y: usize, height: usize| {
         Rect::new(
             area.x,
@@ -1571,7 +1578,47 @@ pub(super) fn pad_title(mut spans: Vec<Span<'static>>) -> Vec<Span<'static>> {
 
 #[cfg(test)]
 mod tests {
+    use crate::keymap::Ctx;
     use agent_core::ports::Lines;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    #[test]
+    fn the_turn_is_sized_to_its_rows_and_the_work_gets_the_rest() {
+        assert_eq!(budget(30, 3, 20), (5, 25));
+        assert_eq!(budget(30, 40, 20), (8, 22));
+        assert_eq!(budget(30, 0, 20), (0, 30));
+    }
+
+    #[test]
+    fn the_work_keeps_its_least_before_the_turn_takes_more_than_its_floor() {
+        assert_eq!(budget(9, 10, 20), (3, 6));
+        assert_eq!(budget(10, 10, 20), (4, 6));
+    }
+
+    #[test]
+    fn the_turn_takes_everything_when_both_cannot_fit() {
+        assert_eq!(budget(8, 10, 20), (8, 0));
+        assert_eq!(budget(3, 1, 20), (3, 0));
+    }
+
+    #[test]
+    fn a_short_work_list_asks_for_no_more_than_its_rows() {
+        assert_eq!(budget(30, 2, 2), (4, 26));
+        assert_eq!(budget(5, 0, 2), (0, 5));
+    }
+
+    #[test]
+    fn nothing_is_shown_when_neither_has_the_room_or_the_rows() {
+        assert_eq!(budget(5, 0, 20), (0, 0));
+        assert_eq!(budget(2, 4, 0), (0, 0));
+        assert_eq!(budget(0, 0, 0), (0, 0));
+        assert_eq!(budget(10, 0, 0), (0, 0));
+    }
+
+    #[test]
+    fn the_turn_alone_fills_the_room_when_there_is_no_work() {
+        assert_eq!(budget(10, 2, 0), (10, 0));
+    }
 
     fn flat(facts: &WorktreeFacts) -> Vec<TreeRow> {
         crate::tree::build(
@@ -1583,7 +1630,7 @@ mod tests {
 
     use std::collections::{HashMap, HashSet};
 
-    use agent_core::activity::{AgentId, State};
+    use agent_core::activity::{Activity, AgentId, Common, Reported, State, ToolId};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Cell;
@@ -3107,16 +3154,18 @@ mod tests {
         m.panel = Focused::turn();
         m.point_at_subagent("s1");
         let mut all = m.activities.take().expect("reported");
-        let sub = all
-            .get_mut(&name("obs-layout-4"))
-            .and_then(|a| a.subagents.get_mut(&AgentId::new("s1")))
-            .expect("a subagent");
-        sub.start(agent_core::activity::Tool {
-            id: agent_core::activity::ToolId::new("t"),
-            name: "Bash".into(),
-            target: Some("cargo test".into()),
-            since: SystemTime::now() - std::time::Duration::from_secs(12),
-        });
+        let agent = name("obs-layout-4");
+        let started = Reported::subagent(
+            AgentId::new("s1"),
+            Common::ToolStarted {
+                id: ToolId::new("t"),
+                tool: "Bash".into(),
+                target: Some("cargo test".into()),
+            },
+        );
+        let at = SystemTime::now() - std::time::Duration::from_secs(12);
+        let activity = Activity::next(all.remove(&agent), started, at);
+        all.insert(agent, activity);
         m.activities = Some(all);
         m.set_log(
             (name("obs-layout-4"), AgentId::new("s1")),
@@ -3443,6 +3492,135 @@ mod tests {
         );
     }
 
+    /// Keys a handler answers only to say they moved.
+    const RETIRED_KEYS: [&str; 1] = ["t"];
+
+    fn shown_as(key: &KeyEvent) -> String {
+        let name = match key.code {
+            KeyCode::Char(' ') => "Space".into(),
+            KeyCode::Char(c) => c.to_string(),
+            KeyCode::Enter => "⏎".into(),
+            KeyCode::Esc => "Esc".into(),
+            KeyCode::Tab => "Tab".into(),
+            KeyCode::BackTab => "⇧Tab".into(),
+            KeyCode::PageDown => "PgDn".into(),
+            KeyCode::PageUp => "PgUp".into(),
+            KeyCode::Home => "Home".into(),
+            KeyCode::End => "End".into(),
+            KeyCode::Up => "↑".into(),
+            KeyCode::Down => "↓".into(),
+            KeyCode::Left => "←".into(),
+            KeyCode::Right => "→".into(),
+            other => unreachable!("not probed: {other:?}"),
+        };
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            format!("⌃{}", name.to_uppercase())
+        } else {
+            name
+        }
+    }
+
+    fn probed_keys() -> Vec<KeyEvent> {
+        let plain = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let named = [
+            KeyCode::Enter,
+            KeyCode::Esc,
+            KeyCode::Tab,
+            KeyCode::BackTab,
+            KeyCode::PageDown,
+            KeyCode::PageUp,
+            KeyCode::Home,
+            KeyCode::End,
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::Left,
+            KeyCode::Right,
+        ];
+        let controls = ['d', 'u'].map(|c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL));
+        (' '..='~')
+            .map(KeyCode::Char)
+            .chain(named)
+            .map(plain)
+            .chain(controls)
+            .collect()
+    }
+
+    fn reading_a_log() -> Model {
+        let mut m = fleet(10);
+        m.set_cursor(Cursor::Entry(name("obs-layout-4")));
+        m.panel = Focused::turn();
+        m.point_at_subagent("s1");
+        m.set_log(
+            (name("obs-layout-4"), AgentId::new("s1")),
+            Ok(Some(log_of(2, false))),
+        );
+        render(&mut m, (140, 40));
+        m.panel.focus_document();
+        m.settle();
+        m
+    }
+
+    fn in_panel(panel: Focused) -> Model {
+        let mut m = tree_fleet();
+        m.panel = panel;
+        m.settle();
+        m
+    }
+
+    #[test]
+    fn nav_keys_do_something_exactly_where_the_keymap_table_says() {
+        use crate::model::{Origin, TurnRow};
+        let contexts: [(Ctx, fn() -> Model); 7] = [
+            (Ctx::Agents, tree_fleet),
+            (Ctx::Turn, || in_panel(Focused::turn())),
+            (Ctx::Changes, || in_panel(Focused::Changes { file: 0 })),
+            (Ctx::Main, || {
+                in_panel(Focused::Main(Origin::Turn {
+                    offset: 0,
+                    row: TurnRow::Turn,
+                }))
+            }),
+            (Ctx::Main, on_a_loaded_diff),
+            (Ctx::Main, reading_a_log),
+            (Ctx::Peek, || {
+                let mut m = tree_fleet();
+                m.peek = Some(name("obs-layout-4"));
+                m
+            }),
+        ];
+        let keys = probed_keys();
+        let mut wrong = Vec::new();
+        for ctx in [Ctx::Agents, Ctx::Turn, Ctx::Changes, Ctx::Main, Ctx::Peek] {
+            let mut handled = std::collections::BTreeSet::new();
+            for (_, build) in contexts.iter().filter(|(c, _)| *c == ctx) {
+                for key in &keys {
+                    if crate::update::nav_or_peek_command(&mut build(), key).is_some() {
+                        handled.insert(shown_as(key));
+                    }
+                }
+            }
+            let table = crate::keymap::keys_in(ctx);
+            for key in &handled {
+                let said = table.contains(&key.as_str()) || RETIRED_KEYS.contains(&key.as_str());
+                if !said {
+                    wrong.push(format!(
+                        "{key} does something in {ctx:?}, the table is silent"
+                    ));
+                }
+            }
+            for key in &table {
+                // The nav chord is taken by on_key before nav_or_peek_command sees it.
+                let does = handled.contains(*key) || key.contains("{nav}");
+                if !does {
+                    wrong.push(format!(
+                        "{key} is in the table for {ctx:?} but does nothing"
+                    ));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
     fn press(m: &mut Model, code: crossterm::event::KeyCode) -> Vec<crate::update::Effect> {
         crate::update::update(
             m,
@@ -3531,7 +3709,7 @@ mod tests {
         }
         press(&mut m, KeyCode::Char('j'));
         press(&mut m, KeyCode::Char('c'));
-        assert!(matches!(m.overlay, crate::model::Overlay::Comment { .. }));
+        assert!(matches!(m.overlay, crate::model::Overlay::Comment(_)));
         let text = screen(&render(&mut m, (140, 40))).join("\n");
         assert!(
             text.contains("Comment · crates/tui/src/view/sidebar.rs:"),

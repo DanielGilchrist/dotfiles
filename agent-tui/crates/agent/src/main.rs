@@ -615,6 +615,46 @@ fn sweep(svc: Services<'_>, paths: &[PathBuf]) -> Result<()> {
     Ok(ops::sweep(svc.layout, &worktrees)?)
 }
 
+fn chosen_harness<'a>(svc: Services<'a>, requested: Option<&HarnessId>) -> Result<&'a dyn Harness> {
+    let Some(id) = requested else {
+        return Ok(svc.harnesses.default_harness());
+    };
+    svc.harnesses.get(id).with_context(|| {
+        let known: Vec<String> = svc
+            .harnesses
+            .all()
+            .iter()
+            .map(|h| h.id().to_string())
+            .collect();
+        format!("unknown harness {id} (known: {})", known.join(", "))
+    })
+}
+
+fn merged(svc: Services<'_>, verbose: bool) -> Result<()> {
+    for (wt, branch) in ops::merged(svc)? {
+        match (verbose, branch) {
+            (true, Some(branch)) => println!("{}  ({branch})", wt.name()),
+            (true, None) => println!("{}  (detached)", wt.name()),
+            (false, _) => println!("{}", wt.name()),
+        }
+    }
+    Ok(())
+}
+
+fn prompt(
+    svc: Services<'_>,
+    name: &SessionName,
+    text: Option<Prompt>,
+    file: Option<PathBuf>,
+) -> Result<()> {
+    let prompt = match (text, file) {
+        (Some(prompt), _) => prompt,
+        (None, Some(file)) => read_prompt(&file)?,
+        (None, None) => unreachable!("clap requires text or --file"),
+    };
+    Ok(ops::inject(svc, name, &prompt)?)
+}
+
 fn main() -> Result<()> {
     let mut args = std::env::args_os().skip(1);
     if args.next().is_some_and(|first| first == "event") {
@@ -623,18 +663,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let backend = backend()?;
     let svc = backend.services();
-    let harness: &dyn Harness = match &cli.harness {
-        Some(id) => svc.harnesses.get(id).with_context(|| {
-            let known: Vec<String> = svc
-                .harnesses
-                .all()
-                .iter()
-                .map(|h| h.id().to_string())
-                .collect();
-            format!("unknown harness {id} (known: {})", known.join(", "))
-        })?,
-        None => svc.harnesses.default_harness(),
-    };
+    let harness = chosen_harness(svc, cli.harness.as_ref())?;
     match cli.command.unwrap_or(Cmd::Tui) {
         Cmd::Tui => agent_tui::run(agent_tui::Options {
             config: config()?,
@@ -705,28 +734,12 @@ fn main() -> Result<()> {
         Cmd::Ls => ls(svc),
         Cmd::Add { path } => add(svc, path),
         Cmd::Forget { path } => forget(svc, path),
-        Cmd::Merged { verbose } => {
-            for (wt, branch) in ops::merged(svc)? {
-                match (verbose, branch) {
-                    (true, Some(branch)) => println!("{}  ({branch})", wt.name()),
-                    (true, None) => println!("{}  (detached)", wt.name()),
-                    (false, _) => println!("{}", wt.name()),
-                }
-            }
-            Ok(())
-        }
+        Cmd::Merged { verbose } => merged(svc, verbose),
         Cmd::Dump { name } => {
             print!("{}", svc.host.screen(&name)?);
             Ok(())
         }
-        Cmd::Prompt { name, text, file } => {
-            let prompt = match (text, file) {
-                (Some(prompt), _) => prompt,
-                (None, Some(file)) => read_prompt(&file)?,
-                (None, None) => unreachable!("clap requires text or --file"),
-            };
-            Ok(ops::inject(svc, &name, &prompt)?)
-        }
+        Cmd::Prompt { name, text, file } => prompt(svc, &name, text, file),
         Cmd::Pin { name } => Ok(svc.store.pin(&infer_name(svc, name)?)?),
         Cmd::Unpin { name } => Ok(svc.store.unpin(&infer_name(svc, name)?)?),
         Cmd::Exec { name } => exec(svc, &name),

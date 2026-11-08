@@ -387,63 +387,18 @@ impl Runtime {
                     let result = self.connect(m, launch.session, launch.spec, intent, ticket);
                     Self::connect_failed(m, ticket, result);
                 }
-                Effect::Edit(open) => {
-                    Self::fill_screen(m, terminal);
-                    let mut line = None;
-                    let mut transcript = None;
-                    let (cwd, file) = match &open {
-                        Open::Checkout(dir) => (dir, None),
-                        Open::File { root, file } => (root, Some(file.as_path())),
-                        Open::At {
-                            root,
-                            file,
-                            line: at,
-                        } => {
-                            line = Some(*at);
-                            (root, Some(file.as_path()))
-                        }
-                        Open::Transcript {
-                            root,
-                            name,
-                            text,
-                            line: at,
-                        } => match write_transcript(name, text) {
-                            Ok(path) => {
-                                line = Some(*at);
-                                (root, transcript.insert(path).as_path().into())
-                            }
-                            Err(e) => {
-                                m.error(format!("{e:#}"));
-                                continue;
-                            }
-                        },
-                    };
-                    let edited = self.edit(terminal, cwd, file, line).map(drop);
-                    m.clock = Moment::now();
-                    if let Err(e) = edited {
-                        m.error(format!("{e:#}"));
-                    }
-                    m.schedule_preview();
-                }
+                Effect::Edit(open) => self.open(m, terminal, &open),
                 Effect::Interactive { label, launch } => {
-                    Self::fill_screen(m, terminal);
-                    let mut command = std::process::Command::new(&launch.program);
-                    command.args(&launch.args);
-                    if let Some(cwd) = &launch.cwd {
-                        command.current_dir(cwd);
-                    }
-                    let ran = self.suspended(terminal, &mut command);
-                    m.clock = Moment::now();
-                    match ran {
-                        Ok(status) if status.success() => {}
-                        Ok(status) => m.error(format!("{label} exited with {status}")),
-                        Err(e) => m.error(format!("{label}: {e:#}")),
-                    }
-                    m.schedule_preview();
+                    self.run_interactive(m, terminal, &label, &launch);
                 }
                 Effect::Copy(text) => {
                     if let Err(e) = copy_to_clipboard(terminal, &text) {
                         m.error(format!("copying: {e}"));
+                    }
+                }
+                Effect::Pty { to, bytes } => {
+                    if let Some(c) = m.pane.connection().filter(|c| c.name == to) {
+                        c.term.send(bytes);
                     }
                 }
                 Effect::Bell => {
@@ -458,25 +413,89 @@ impl Runtime {
                         m.error(format!("sending {}: {e}", name.as_str()));
                     }
                 }
-                Effect::EditTask(task) => {
-                    Self::fill_screen(m, terminal);
-                    let edited = self.edit_task(terminal, &task);
-                    m.clock = Moment::now();
-                    match edited {
-                        Ok(Some(task)) => {
-                            let now = m.clock.mono;
-                            if let model::Overlay::New(form) = &mut m.overlay {
-                                form.task = task;
-                                form.prompt_changed(now);
-                            }
-                        }
-                        Ok(None) => {}
-                        Err(e) => m.error(format!("{e:#}")),
-                    }
-                }
+                Effect::EditTask(task) => self.edit_form_task(m, terminal, &task),
             }
         }
         Ok(Flow::Continue)
+    }
+
+    fn open(&self, m: &mut Model, terminal: &mut DefaultTerminal, open: &Open) {
+        Self::fill_screen(m, terminal);
+        let mut line = None;
+        let mut transcript = None;
+        let (cwd, file) = match open {
+            Open::Checkout(dir) => (dir, None),
+            Open::File { root, file } => (root, Some(file.as_path())),
+            Open::At {
+                root,
+                file,
+                line: at,
+            } => {
+                line = Some(*at);
+                (root, Some(file.as_path()))
+            }
+            Open::Transcript {
+                root,
+                name,
+                text,
+                line: at,
+            } => match write_transcript(name, text) {
+                Ok(path) => {
+                    line = Some(*at);
+                    (root, transcript.insert(path).as_path().into())
+                }
+                Err(e) => {
+                    m.error(format!("{e:#}"));
+                    return;
+                }
+            },
+        };
+        let edited = self.edit(terminal, cwd, file, line).map(drop);
+        m.clock = Moment::now();
+        if let Err(e) = edited {
+            m.error(format!("{e:#}"));
+        }
+        m.schedule_preview();
+    }
+
+    fn run_interactive(
+        &self,
+        m: &mut Model,
+        terminal: &mut DefaultTerminal,
+        label: &str,
+        launch: &agent_core::actions::CommandLine,
+    ) {
+        Self::fill_screen(m, terminal);
+        let mut command = std::process::Command::new(&launch.program);
+        command.args(&launch.args);
+        if let Some(cwd) = &launch.cwd {
+            command.current_dir(cwd);
+        }
+        let ran = self.suspended(terminal, &mut command);
+        m.clock = Moment::now();
+        match ran {
+            Ok(status) if status.success() => {}
+            Ok(status) => m.error(format!("{label} exited with {status}")),
+            Err(e) => m.error(format!("{label}: {e:#}")),
+        }
+        m.schedule_preview();
+    }
+
+    fn edit_form_task(&self, m: &mut Model, terminal: &mut DefaultTerminal, task: &str) {
+        Self::fill_screen(m, terminal);
+        let edited = self.edit_task(terminal, task);
+        m.clock = Moment::now();
+        match edited {
+            Ok(Some(task)) => {
+                let now = m.clock.mono;
+                if let model::Overlay::New(form) = &mut m.overlay {
+                    form.task = task;
+                    form.prompt_changed(now);
+                }
+            }
+            Ok(None) => {}
+            Err(e) => m.error(format!("{e:#}")),
+        }
     }
 
     /// Edits `task` in `$EDITOR` through a temp file. `None` if the editor
@@ -577,14 +596,14 @@ fn event_loop(
             m.pane = Pane::Empty;
             m.info(format!("detached from {name}"));
         }
+        let size = Rect::from(terminal.size()?);
+        if size != m.size {
+            update::resized(&mut m, size);
+        }
         if let (Pane::Connected(c), Some(size)) = (&mut m.pane, TermSize::of(m.areas.terminal))
             && let Err(e) = c.term.resize(size)
         {
             m.error(format!("resizing the pane: {e}"));
-        }
-        let size = Rect::from(terminal.size()?);
-        if size != m.size {
-            update::resized(&mut m, size);
         }
         view::paint(terminal, &mut m)?;
         let title = m.attention().title();

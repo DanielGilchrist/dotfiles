@@ -376,7 +376,7 @@ impl Subagent {
         }
     }
 
-    pub fn start(&mut self, tool: Tool) {
+    fn start(&mut self, tool: Tool) {
         if let SubagentStatus::Running { tools } = &mut self.status {
             tools.push(tool);
         }
