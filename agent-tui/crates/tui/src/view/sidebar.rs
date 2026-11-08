@@ -21,7 +21,7 @@ use unicode_width::UnicodeWidthStr;
 use super::{
     NAME_MIN, accent, ago, bold, dim, error, fit, glyph, justify, line_width, name_style, palette,
     panel, scroll, sidebar_count, sidebar_focused, sidebar_title, spinner, success, truncate_end,
-    truncate_start, warning, wrap,
+    truncate_start, warning,
 };
 use crate::model::{
     AgentStatus, Cursor, Doing, Extent, Failure, Fold, ListScroll, Model, Panel as Focused, Place,
@@ -39,8 +39,6 @@ const CHANGES_MIN: usize = 3;
 const READINESS_ROW: usize = 1;
 /// Inner widths below this use the short forms.
 const SHORT_BELOW: usize = 36;
-const LEAD_LINES: usize = 3;
-const PROMPT_LINES: usize = 2;
 /// Trailing path components a changed file keeps when they fit.
 const PATH_TAIL: usize = 3;
 
@@ -189,26 +187,11 @@ impl<'a> Gist<'a> {
         (fitted, shown)
     }
 
-    /// The state in a word, for a state line whose text sits in the lead
-    /// below it.
-    fn word(&self) -> &str {
-        match self {
-            Self::Asking(_) => "asking",
-            Self::Failed(_) => "failed",
-            Self::Tool { name, .. } => name,
-            Self::Thinking => "thinking",
-            Self::Delegating { .. } => "delegating",
-            Self::HandingBack => "handing back",
-            Self::Done(_) => "done",
-        }
-    }
-
-    /// All of what the second line says, for a block to lead with when the
-    /// card cut or hid it. Delegating has none, since the subagent tree
-    /// says more.
-    fn lead(&self) -> Option<String> {
-        let text = match self {
-            Self::Asking(question) => (*question).to_string(),
+    /// All of what the agent says about this, for [0]'s turn document.
+    /// Delegating has none, since the subagents say more.
+    fn message(&self) -> Option<String> {
+        Some(match self {
+            Self::Asking(question) => question.trim().to_string(),
             Self::Failed(failure) => failure_text(failure).to_string(),
             Self::Tool {
                 name,
@@ -216,10 +199,11 @@ impl<'a> Gist<'a> {
             } => format!("{name}  {}", target_text(target)),
             Self::Tool { name, target: None } => (*name).to_string(),
             Self::Thinking => "thinking".to_string(),
-            Self::Done(summary) => summary.map_or_else(|| "done".to_string(), plain),
-            Self::Delegating { .. } | Self::HandingBack => return None,
-        };
-        Some(text.split_whitespace().collect::<Vec<_>>().join(" "))
+            Self::HandingBack => "handing back".to_string(),
+            Self::Done(Some(summary)) => plain(summary),
+            Self::Done(None) => "done".to_string(),
+            Self::Delegating { .. } => return None,
+        })
     }
 }
 
@@ -486,10 +470,6 @@ impl<'m> Deck<'m> {
         justify(vec![Span::styled(arrow, dim()), name], right, self.content)
     }
 
-    fn in_pane(&self, entry: &Entry) -> bool {
-        self.m.visible_session() == Some(entry.name())
-    }
-
     /// Files this agent changed that others in its repo changed too, with
     /// the others that changed each.
     fn overlaps(&self, repo: &Repo, entry: &Entry) -> HashMap<PathBuf, Vec<&'m Entry>> {
@@ -511,110 +491,62 @@ impl<'m> Deck<'m> {
             .collect()
     }
 
-    /// [2], the turn: what the agent is doing unless its `card` says it
-    /// whole, then the exchange the pane has scrolled past: the prompt,
-    /// the agent's message or question in full, and its subagents. Items
-    /// are in priority order, each placed where it reads in sequence.
-    fn detail(&self, repo: &Repo, entry: &Entry, card: Shown) -> Detail {
+    /// [2]: the turn row and a row per subagent, the one the cursor is on
+    /// marked while [2] has the keys. What they say is [0]'s to show.
+    fn detail(&self, repo: &Repo, entry: &Entry) -> Detail {
         let m = self.m;
-        let status = m.status(entry);
-        let activity = m.activity(entry.name());
         let width = self.content;
-        let in_pane = self.in_pane(entry);
-        let heard = activity.map_or(m.now, |a| a.heard);
-        let gist = Gist::of(&status, heard, m.now);
-        // The card above already says when the turn ended, and the quiet
-        // time is in the text.
-        let time = match gist {
-            Some(Gist::Delegating { .. }) => Vec::new(),
-            _ => time_in_state(&status, m.now),
-        };
-        let room = width.saturating_sub(2 + line_width(&time) + 1);
-        let (text, shown) = match (&gist, &status) {
-            (Some(gist), _) => gist.line(self.form, room),
-            (None, AgentStatus::Idle) => ("idle".to_string(), Shown::Whole),
-            (None, AgentStatus::Exited) => ("exited".to_string(), Shown::Whole),
-            (None, _) => ("no session".to_string(), Shown::Whole),
-        };
-        let states = card != Shown::Whole;
-        let lead = gist
-            .as_ref()
-            .filter(|_| states && !in_pane && shown == Shown::Cut)
-            .and_then(|gist| {
-                let style = gist.style();
-                gist.lead().map(|text| Item {
-                    cap: LEAD_LINES,
-                    order: Order::Lead,
-                    content: Content::Text {
-                        rows: wrap(&text, width),
-                        style,
-                        width,
-                        hang: "",
-                    },
-                })
-            });
-        // With the lead carrying the text, the state line says the state
-        // rather than opening with a cut copy of the row below it.
-        let text = match (&gist, &lead) {
-            (Some(gist), Some(_)) => gist.word().to_string(),
-            _ => text,
-        };
-        let style = gist.as_ref().map_or_else(dim, Gist::style);
-        let state = justify(
-            vec![glyph(&status), Span::raw(" "), Span::styled(text, style)],
-            time,
-            width,
-        );
-        let state = states.then(|| Item::fixed(Order::State, vec![state]));
-        let cursor = matches!(m.panel, Focused::Agent { .. }).then(|| m.subagent_at());
-        let tree = activity.filter(|_| m.subagents(entry).is_some()).map(|a| {
-            Item::fixed(
-                Order::Tree,
-                tree(
-                    a.subagents.values().collect(),
-                    self.form,
-                    width,
-                    m.now,
-                    cursor,
-                ),
-            )
-        });
-        let prompt = activity.and_then(|a| a.prompt.as_deref()).map(|prompt| {
-            let room = width.saturating_sub(2);
-            Item {
-                cap: PROMPT_LINES,
+        let focused = matches!(m.panel, Focused::Agent { .. });
+        let cursor = focused.then(|| m.row_at());
+        let mut items = Vec::new();
+        if let Some(activity) = m.activity(entry.name()) {
+            items.push(Item {
+                cap: 1,
                 order: Order::Prompt,
                 content: Content::Text {
-                    rows: wrap(&format!("› {prompt}"), room),
-                    style: dim(),
-                    width: room,
-                    hang: "  ",
+                    rows: vec![turn_row(
+                        activity.prompt.as_deref(),
+                        width,
+                        cursor == Some(0),
+                    )],
+                    style: Style::new(),
+                    width,
+                    hang: "",
                 },
-            }
-        });
-        let right = if in_pane {
-            vec![Span::styled("in pane", dim())]
-        } else if repo.name() != entry.label() && self.form == Form::Long {
-            vec![Span::styled(repo.name().into_owned(), dim())]
-        } else {
-            Vec::new()
-        };
-        let items: Vec<Item> = [state, lead, tree, prompt].into_iter().flatten().collect();
-        let cursor = cursor.filter(|_| items.iter().any(|i| i.order == Order::Tree));
-        let above: usize = items
-            .iter()
-            .filter(|i| i.order < Order::Tree)
-            .map(Item::len)
-            .sum();
+            });
+            let rows = tree(
+                activity.subagents.values().collect(),
+                self.form,
+                width,
+                m.now,
+                cursor.and_then(|row| row.checked_sub(1)),
+            );
+            items.extend(
+                rows.into_iter()
+                    .map(|row| Item::fixed(Order::Tree, vec![row])),
+            );
+        }
+        let _ = repo;
         Detail {
-            title: vec![
-                Span::raw("[2] "),
-                Span::styled(entry.label().to_string(), bold()),
-            ],
-            right,
-            cursor: cursor.map(|row| above + row),
+            title: vec![Span::raw("[2] "), Span::styled("Turn", bold())],
+            right: Vec::new(),
+            cursor,
             items,
         }
+    }
+}
+
+/// The turn row: `› ` and the prompt's first line, cut to `width`. The mark
+/// for the cursor takes the place of the panel's padding.
+fn turn_row(prompt: Option<&str>, width: usize, selected: bool) -> String {
+    let first = prompt
+        .and_then(|p| p.lines().map(str::trim).find(|l| !l.is_empty()))
+        .unwrap_or("no prompt yet");
+    let row = truncate_end(&format!("› {first}"), width);
+    if selected {
+        format!("{GUTTER}{row}")
+    } else {
+        row
     }
 }
 
@@ -928,9 +860,7 @@ struct Item {
 /// in the order it happened, then the subagents the agent is waiting on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Order {
-    State,
     Prompt,
-    Lead,
     Tree,
     /// Why git couldn't be read, only while [3] has no room to say so.
     Work,
@@ -1183,12 +1113,7 @@ fn lay_out(m: &Model, area: Rect) -> Option<Laid> {
     // decided here, once, and carried in the type.
     let lower = selection.and_then(|(repo, entry)| {
         let room = LowerRoom::of(rest)?;
-        Some((
-            repo,
-            entry,
-            room,
-            needs(&deck, repo, entry, list.card, room),
-        ))
+        Some((repo, entry, room, needs(&deck, repo, entry, room)))
     });
     let (list_rows, geometry) = match &lower {
         None => (visible, None),
@@ -1612,15 +1537,9 @@ enum Took {
 /// What the selected agent's panels have to say, given the room under the
 /// list. Too short for [3], the one thing worth knowing about the work
 /// goes in [2] instead.
-fn needs<'m>(
-    deck: &Deck<'m>,
-    repo: &Repo,
-    entry: &Entry,
-    card: Shown,
-    room: LowerRoom,
-) -> Needs<'m> {
+fn needs<'m>(deck: &Deck<'m>, repo: &Repo, entry: &Entry, room: LowerRoom) -> Needs<'m> {
     let m = deck.m;
-    let mut detail = deck.detail(repo, entry, card);
+    let mut detail = deck.detail(repo, entry);
     let status = m.status(entry);
     let work = match m.facts.get(entry.name()) {
         Some(Ok(facts)) => {
@@ -1808,13 +1727,37 @@ fn pad(area: Rect, lines: Vec<Line<'static>>) -> Panel {
     let lines = lines
         .into_iter()
         .map(|mut line| {
-            if line.spans.first().is_none_or(|s| s.content != GUTTER) {
+            if line
+                .spans
+                .first()
+                .is_none_or(|s| !s.content.starts_with(GUTTER))
+            {
                 line.spans.insert(0, Span::raw(" "));
             }
             line
         })
         .collect();
     Panel { area, lines }
+}
+
+/// What the selected agent says about what it's doing, in full.
+pub(super) fn turn_message(m: &Model, entry: &Entry) -> Option<String> {
+    let status = m.status(entry);
+    let heard = m.activity(entry.name()).map_or(m.now, |a| a.heard);
+    Gist::of(&status, heard, m.now)?.message()
+}
+
+/// The agent's subagents as tree rows, for [0]'s turn document.
+pub(super) fn subagent_rows(m: &Model, entry: &Entry, width: usize) -> Vec<Line<'static>> {
+    m.activity(entry.name()).map_or_else(Vec::new, |a| {
+        tree(
+            a.subagents.values().collect(),
+            Form::Long,
+            width,
+            m.now,
+            None,
+        )
+    })
 }
 
 /// The selected agent's state as one line: its glyph, name, what it's doing
@@ -1991,7 +1934,7 @@ mod tests {
 
     use super::*;
     use crate::fixtures::{fleet, name, reported};
-    use crate::model::{Group, Overlay, Pane, View, Visibility};
+    use crate::model::{Group, Overlay, View, Visibility};
 
     const SIZES: [(u16, u16); 3] = [(200, 50), (100, 30), (80, 24)];
     const FLEETS: [usize; 5] = [0, 1, 2, 8, 20];
@@ -2107,16 +2050,17 @@ mod tests {
             quiet: "22s".into(),
         };
         assert_eq!(delegating.line(Form::Long, 40).0, "↳1 subagent · quiet 22s");
-        assert_eq!(delegating.lead(), None, "the tree says more");
+        assert_eq!(delegating.message(), None, "the tree says more");
     }
 
     #[test]
-    fn a_finished_turn_reads_its_first_line_and_leads_with_all_of_it() {
+    fn a_finished_turn_reads_its_first_line_and_says_all_of_it() {
         let done = Gist::Done(Some("## **Done**\n\nAdded `retry`.\nTests pass."));
         assert_eq!(done.line(Form::Long, 40), ("Done".to_string(), Shown::Cut));
         assert_eq!(
-            done.lead().as_deref(),
-            Some("Done Added retry. Tests pass.")
+            done.message().as_deref(),
+            Some("Done\n\nAdded retry.\nTests pass."),
+            "[0] shows all of it"
         );
         assert_eq!(
             Gist::Failed(&Failure::RateLimit).line(Form::Short, 24),
@@ -2227,7 +2171,7 @@ mod tests {
     fn item(cap: usize, full: usize) -> Item {
         Item {
             cap,
-            order: Order::Lead,
+            order: Order::Prompt,
             content: Content::Text {
                 rows: (0..full).map(|i| format!("row {i}")).collect(),
                 style: Style::new(),
@@ -2496,21 +2440,6 @@ mod tests {
     }
 
     #[test]
-    fn the_agent_in_the_pane_says_so() {
-        let mut m = fleet(8);
-        let agent = name("obs-layout-4");
-        let ticket = m.ticket();
-        m.pane = Pane::Connecting {
-            name: agent.clone(),
-            ticket,
-        };
-        m.set_cursor(Cursor::Entry(agent));
-        let laid = laid(&mut m, (200, 50));
-        let (_, detail) = laid.agent.expect("succeeds");
-        assert_eq!(texts(&[Line::from(detail.right)]), ["in pane"]);
-    }
-
-    #[test]
     fn shared_files_are_marked_in_changes_and_named_under_the_cursor() {
         let mut m = fleet(8);
         m.set_cursor(Cursor::Entry(name("rate-limit-1")));
@@ -2584,132 +2513,45 @@ mod tests {
     }
 
     #[test]
-    fn the_turn_reads_prompt_then_message_then_subagents_and_says_whats_hidden() {
+    fn the_turn_panel_is_a_row_for_the_turn_then_one_per_subagent() {
         let mut m = fleet(8);
         m.toggle_view();
-        m.set_cursor(Cursor::Entry(name("auth-refresh-2")));
+        m.set_cursor(Cursor::Entry(name("obs-layout-4")));
         let first = laid(&mut m, (200, 50));
         let lines = agent_lines(&first);
-        let prompt = lines
-            .iter()
-            .position(|l| l.starts_with(" › go"))
-            .expect("the prompt");
-        let message = lines
-            .iter()
-            .position(|l| l.starts_with(" Added token refresh"))
-            .expect("the message");
-        assert!(prompt < message, "{}", lines.join("\n"));
         assert_eq!(first.turn, Turn::Whole);
-
         assert!(
-            lines[0].trim_start().starts_with("✓ done"),
-            "with the message below, the state line says the state\n{}",
+            lines[0].trim_start().starts_with("› go"),
+            "{}",
             lines.join("\n")
         );
-
-        let short = laid(&mut m, (80, 24));
-        let lines = agent_lines(&short);
-        let Turn::Hidden(hidden) = short.turn else {
-            panic!("{:?}", short.turn)
-        };
-        assert_eq!(
-            lines.last().expect("rows").trim(),
-            format!("+{hidden} more")
-        );
-        let all = {
-            let area = m.areas.sidebar;
-            let deck = Deck::new(
-                &m,
-                m.snapshot().expect("loaded"),
-                usize::from(area.width),
-                usize::from(area.height),
-            );
-            let (repo, entry) = m.selected().expect("an agent is selected");
-            fill_all(
-                &deck
-                    .detail(repo, entry.expect("an agent, not a repo"), Shown::Cut)
-                    .items,
-            )
-            .len()
-        };
-        assert_eq!(
-            lines.len() - 1 + hidden.get(),
-            all,
-            "the count is exact\n{}",
-            lines.join("\n")
-        );
-
-        m.panel = Focused::Agents;
-        let unfocused = laid(&mut m, (80, 24));
-        let list_height = usize::from(unfocused.list.area.height);
-        let turn_height = usize::from(unfocused.agent.as_ref().expect("[2] shows").0.area.height);
-        let work_height = unfocused.changes.as_ref().expect("[3] shows").0.area.height;
-        m.panel = Focused::Agent { offset: 1 };
-        let expanded = laid(&mut m, (80, 24));
-        assert_eq!(expanded.turn, Turn::Whole, "focused, [2] shows all of it");
-        assert_eq!(agent_lines(&expanded).len(), all);
-        assert_eq!(
-            usize::from(expanded.list.area.height),
-            list_height - (all - (turn_height - 2)),
-            "the list gives only the deficit, [3] having nothing above its content"
-        );
-        let (changes, _) = expanded.changes.as_ref().expect("[3] shows");
-        assert_eq!(changes.area.height, work_height, "[3] keeps what it has");
-
-        m.panel = Focused::Agent { offset: 1 };
-        let scrolled = laid(&mut m, (80, 16));
-        let Turn::Scrolled { top, bottom, total } = scrolled.turn else {
-            panic!("{:?}", scrolled.turn)
-        };
-        assert_eq!(
-            (top, bottom, total),
-            (2, 1 + agent_lines(&scrolled).len(), all)
-        );
-        assert!(
-            !agent_lines(&scrolled).iter().any(|l| l.contains("more")),
-            "focused, nothing is hidden"
-        );
-
-        m.panel = Focused::Changes { file: 0 };
-        let files = laid(&mut m, (80, 24));
-        assert_eq!(
-            usize::from(files.agent.as_ref().expect("[2] shows").0.area.height),
-            turn_height,
-            "two files already fit, so focusing [3] moves nothing"
-        );
-        let (changes, _) = files.changes.as_ref().expect("[3] shows");
-        assert_eq!(changes.area.height, work_height);
-    }
-
-    #[test]
-    fn a_hidden_count_never_costs_a_fixed_item_its_row() {
-        let mut m = fleet(20);
-        m.toggle_view();
-        m.set_cursor(Cursor::Entry(name("obs-layout-4")));
-        let laid = laid(&mut m, (80, 24));
-        let (panel, _) = &laid.agent.as_ref().expect("[2] shows");
-        let lines = texts(&panel.lines);
-        assert_eq!(
-            panel.lines.len() + 2,
-            usize::from(panel.area.height),
-            "[2] is sized to what it shows\n{}",
-            lines.join("\n")
-        );
-        let Turn::Hidden(hidden) = laid.turn else {
-            panic!("{:?}\n{}", laid.turn, lines.join("\n"))
-        };
-        assert_eq!(
-            hidden.get(),
-            1,
-            "only the prompt is hidden: the tree that fit stays\n{}",
-            lines.join("\n")
-        );
-        assert_eq!(lines.len(), 4, "{}", lines.join("\n"));
-        assert!(lines[0].contains("↳3"));
+        assert!(lines[1].trim_start().starts_with('├'));
         assert!(lines[3].trim_start().starts_with('└'));
+        assert_eq!(lines.len(), 4, "{}", lines.join("\n"));
         assert!(
-            !lines.iter().any(|l| l.contains("more")),
-            "a count row that costs the tree isn't worth it"
+            !lines.iter().any(|l| l.contains('▌')),
+            "no cursor mark while [1] has the keys"
+        );
+
+        m.panel = Focused::Agent { offset: 0 };
+        let lines = agent_lines(&laid(&mut m, (200, 50)));
+        assert!(
+            lines[0].starts_with('▌'),
+            "the cursor starts on the turn\n{}",
+            lines.join("\n")
+        );
+        m.subagent = Some(AgentId::new("s1"));
+        let lines = agent_lines(&laid(&mut m, (200, 50)));
+        assert!(lines[2].starts_with('▌'), "{}", lines.join("\n"));
+        assert_eq!(lines.iter().filter(|l| l.starts_with('▌')).count(), 1);
+
+        let short = laid(&mut m, (80, 16));
+        let Turn::Scrolled { top, bottom, total } = short.turn else {
+            return;
+        };
+        assert!(
+            top <= 3 && bottom >= 3 && total == 4,
+            "the cursor's row stays in view"
         );
     }
 
@@ -2823,7 +2665,7 @@ mod tests {
             let (turn, _) = laid.agent.as_ref().expect("[2] shows");
             let list_clamped = list_room(height - 1) <= LIST_MIN;
             assert!(
-                list_clamped || usize::from(turn.area.height) >= DETAIL_MIN + 2,
+                list_clamped || usize::from(turn.area.height) >= 3,
                 "{height} rows: [2] is {} tall",
                 turn.area.height
             );
@@ -3053,21 +2895,18 @@ mod tests {
             )
         };
         let items = [
-            fixed(Order::State, 1),
-            fixed(Order::Lead, 2),
             fixed(Order::Tree, 2),
+            fixed(Order::Work, 1),
             fixed(Order::Prompt, 1),
         ];
         assert_eq!(
-            texts(&fill(&items, 6)),
-            [
-                "State 0", "Prompt 0", "Lead 0", "Lead 1", "Tree 0", "Tree 1"
-            ]
+            texts(&fill(&items, 4)),
+            ["Prompt 0", "Tree 0", "Tree 1", "Work 0"]
         );
         assert_eq!(
-            texts(&fill(&items, 5)),
-            ["State 0", "Lead 0", "Lead 1", "Tree 0", "Tree 1"],
-            "the prompt is the first to go"
+            texts(&fill(&items, 3)),
+            ["Tree 0", "Tree 1", "Work 0"],
+            "the last in priority is the first to go"
         );
     }
 
@@ -3141,42 +2980,6 @@ mod tests {
         );
         m.facts.remove(&name("rate-limit-1"));
         assert_eq!(laid(&mut m, (200, 50)).focus, Focused::Agents);
-    }
-
-    #[test]
-    fn the_agent_panel_repeats_the_card_only_when_the_card_cuts_it() {
-        let mut m = fleet(8);
-        m.toggle_view();
-        m.set_cursor(Cursor::Entry(name("payroll-fix-3")));
-        let lines = agent_lines(&laid(&mut m, (200, 50)));
-        assert!(
-            !lines[0].contains("Edit"),
-            "the card shows it whole\n{}",
-            lines.join("\n")
-        );
-        let lines = agent_lines(&laid(&mut m, (80, 24)));
-        let state = lines[0].trim();
-        let after_glyph = state
-            .split_once(' ')
-            .map(|(_, rest)| rest)
-            .unwrap_or_default();
-        assert!(
-            after_glyph.starts_with("Edit ") && after_glyph.trim_end().ends_with("38s"),
-            "the short card cuts it, so [2] names the tool with the time\n{}",
-            lines.join("\n")
-        );
-        assert!(
-            !state.contains('…') && !state.contains("calc.ts"),
-            "not a cut copy of the lead\n{state}"
-        );
-        assert!(
-            lines
-                .concat()
-                .replace(' ', "")
-                .contains("src/payroll/rules/overtime/calc.ts"),
-            "and the lead says it whole\n{}",
-            lines.join("\n")
-        );
     }
 
     #[test]
@@ -3360,5 +3163,136 @@ mod tests {
         m.focus_main = true;
         let terminal = render(&mut m, (100, 30));
         assert_eq!(border(&terminal), Color::Cyan, "[0] has them now");
+    }
+
+    fn log_of(entries: usize, finished: bool) -> agent_core::ports::SubagentDetail {
+        use agent_core::ports::LogEntry;
+        let mut log = Vec::new();
+        for i in 0..entries {
+            log.push(LogEntry::Called {
+                tool: "Read".into(),
+                target: Some(format!("src/file{i}.rs")),
+                result: Some(format!("{i} lines")),
+            });
+            if i % 4 == 3 {
+                log.push(LogEntry::Said(format!("Checked file {i}.")));
+            }
+        }
+        log.push(LogEntry::Called {
+            tool: "Bash".into(),
+            target: Some("cargo test".into()),
+            result: None,
+        });
+        if finished {
+            log.push(LogEntry::Said("All done, three call sites.".into()));
+        }
+        agent_core::ports::SubagentDetail {
+            prompt: "Find every call site of roundCurrency.".into(),
+            finished,
+            log,
+        }
+    }
+
+    #[test]
+    fn the_turn_document_shows_the_whole_prompt_message_and_subagents() {
+        let mut m = fleet(10);
+        m.set_cursor(Cursor::Entry(name("auth-refresh-2")));
+        m.panel = Focused::Agent { offset: 0 };
+        let text = screen(&render(&mut m, (100, 30))).join("\n");
+        assert!(text.contains("[0] Turn"), "{text}");
+        assert!(text.contains("› go"), "{text}");
+        assert!(
+            text.contains("Added token refresh with retry and a 401 interceptor."),
+            "{text}"
+        );
+        assert!(
+            text.contains("14 tests pass."),
+            "the message in full, not its first line\n{text}"
+        );
+
+        m.set_cursor(Cursor::Entry(name("obs-layout-4")));
+        m.panel = Focused::Agent { offset: 0 };
+        let text = screen(&render(&mut m, (100, 30))).join("\n");
+        assert!(text.contains("Subagents"), "{text}");
+        assert!(text.contains("Reverting memo edit"), "{text}");
+    }
+
+    #[test]
+    fn a_subagents_log_follows_its_tail_and_pauses_when_scrolled_up() {
+        let mut m = fleet(10);
+        m.set_cursor(Cursor::Entry(name("obs-layout-4")));
+        m.panel = Focused::Agent { offset: 0 };
+        m.subagent = Some(AgentId::new("s1"));
+        let loading = screen(&render(&mut m, (100, 30))).join("\n");
+        assert!(
+            loading.contains("[0] general-purpose · Reverting memo edit"),
+            "{loading}"
+        );
+
+        m.subagent_logs.insert(
+            (name("obs-layout-4"), AgentId::new("s1")),
+            Ok(Some(log_of(40, false))),
+        );
+        let rows = screen(&render(&mut m, (100, 30)));
+        let text = rows.join("\n");
+        assert!(text.contains("following"), "{text}");
+        assert!(text.contains("cargo test"), "the tail is on screen\n{text}");
+        assert!(
+            text.contains("running"),
+            "the call without a result is running\n{text}"
+        );
+        assert!(
+            !text.contains("Find every call site"),
+            "the prompt scrolled off\n{text}"
+        );
+        let call = rows
+            .iter()
+            .find(|r| r.contains("src/file38.rs"))
+            .expect("a call row");
+        assert!(
+            call.contains("38 lines"),
+            "its result sits beside it\n{call}"
+        );
+
+        m.docs.scroll_by(-5);
+        let text = screen(&render(&mut m, (100, 30))).join("\n");
+        assert!(text.contains("paused "), "{text}");
+        assert!(!text.contains("following"));
+
+        m.docs.scroll_to_end();
+        let text = screen(&render(&mut m, (100, 30))).join("\n");
+        assert!(text.contains("following"), "G resumes\n{text}");
+
+        m.subagent_logs.insert(
+            (name("obs-layout-4"), AgentId::new("s1")),
+            Ok(Some(log_of(2, true))),
+        );
+        m.docs.scroll_to_start();
+        let text = screen(&render(&mut m, (100, 30))).join("\n");
+        assert!(
+            text.contains("Find every call site of roundCurrency."),
+            "{text}"
+        );
+        let rule = text
+            .lines()
+            .position(|l| l.contains("────────"))
+            .expect("a rule");
+        let result = text
+            .lines()
+            .position(|l| l.contains("All done, three call sites."))
+            .expect("the result");
+        assert!(rule < result, "the final result follows a rule\n{text}");
+    }
+
+    #[test]
+    fn a_subagent_without_a_transcript_says_so() {
+        let mut m = fleet(10);
+        m.set_cursor(Cursor::Entry(name("obs-layout-4")));
+        m.panel = Focused::Agent { offset: 0 };
+        m.subagent = Some(AgentId::new("s1"));
+        m.subagent_logs
+            .insert((name("obs-layout-4"), AgentId::new("s1")), Ok(None));
+        let text = screen(&render(&mut m, (100, 30))).join("\n");
+        assert!(text.contains("no transcript for this subagent"), "{text}");
     }
 }

@@ -339,7 +339,7 @@ pub fn draw(frame: &mut Frame<'_>, m: &mut Model) {
     let padding = Padding::horizontal(1);
     let terminal = Block::bordered().padding(padding).inner(right);
     m.areas.terminal = terminal;
-    if let Some(page) = page::diff(m, terminal, usize::from(right.width), pane_style) {
+    if let Some(page) = page::page(m, terminal, usize::from(right.width), pane_style) {
         let block = panel(page.title, page.corner, pane_style, pane_focused)
             .padding(padding)
             .title_top(Line::from(sidebar::pad_title(page.right)).right_aligned());
@@ -641,7 +641,11 @@ fn draw_status_bar(frame: &mut Frame<'_>, m: &Model, area: Rect) {
         match m.panel {
             _ if m.main_focused() => hints.extend([
                 ranked("j/k", "scroll", 8),
-                ranked("G", "end", 6),
+                if m.docs.paused() {
+                    ranked("G", "follow", 9)
+                } else {
+                    ranked("G", "end", 6)
+                },
                 ranked("i", "type", 8),
                 ranked("Esc", "back", 9),
             ]),
@@ -652,11 +656,17 @@ fn draw_status_bar(frame: &mut Frame<'_>, m: &Model, area: Rect) {
                 ranked("i", "type", 8),
                 ranked("Esc", "back", 9),
             ]),
-            Panel::Agent { .. } => hints.extend([ranked("i", "type", 8), ranked("Esc", "back", 9)]),
+            Panel::Agent { .. } => hints.extend([
+                ranked("⏎", "open", 9),
+                ranked("J/K", "scroll", 8),
+                ranked("i", "type", 8),
+                ranked("Esc", "back", 9),
+            ]),
             Panel::Agents => {}
         }
         match (selected, entry.map(|e| m.reach(e))) {
-            _ if matches!(m.panel, Panel::Changes { .. }) || m.main_focused() => {}
+            _ if matches!(m.panel, Panel::Changes { .. } | Panel::Agent { .. })
+                || m.main_focused() => {}
             (Some((_, None)), _) => hints.push(ranked("⏎", "focus", 7)),
             (
                 _,

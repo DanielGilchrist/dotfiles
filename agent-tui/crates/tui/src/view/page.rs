@@ -3,16 +3,20 @@
 
 use std::time::Instant;
 
-use agent_core::ports::{FileDiff, Lines};
+use agent_core::activity::AgentId;
+use agent_core::names::SessionName;
+use agent_core::ports::{FileDiff, Lines, LogEntry};
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthChar;
 
-use super::sidebar::{fits_beside, status_line};
+use super::sidebar::{fits_beside, status_line, subagent_rows, turn_message};
 use super::{
-    bold, dim, error, justify, line_width, success, truncate_end, truncate_start, warning,
+    ago, bold, dim, error, justify, line_width, spinner, success, truncate_end, truncate_start,
+    warning, wrap,
 };
+use crate::document::{DiffKey, Hover};
 use crate::model::{AgentStatus, Model};
 
 /// [0]'s title, what its top border says on the right, its bottom-right
@@ -24,11 +28,25 @@ pub(super) struct Page {
     pub lines: Vec<Line<'static>>,
 }
 
-/// The hovered file's diff in `area`, scrolled as the model says, while the
-/// cursor is on a file in [3]. `border` is the corner's style and `width`
-/// the whole panel's.
-pub(super) fn diff(m: &mut Model, area: Rect, width: usize, border: Style) -> Option<Page> {
-    let (hover, _) = m.hovered_diff()?;
+/// What a document says before it's scrolled and framed.
+struct Body {
+    title: Vec<Span<'static>>,
+    rows: Vec<Line<'static>>,
+    /// A log, which follows its end.
+    tails: bool,
+    /// Still being read.
+    loading: bool,
+}
+
+/// A result sits within this many columns of its call, so it stays near it
+/// on a wide screen.
+const RESULT_COLUMNS: usize = 100;
+
+/// What [0] reads instead of the terminal, in `area`, scrolled as the model
+/// says, or `None` while the cursor is on nothing it reads. `border` is the
+/// corner's style and `width` the whole panel's.
+pub(super) fn page(m: &mut Model, area: Rect, width: usize, border: Style) -> Option<Page> {
+    let hover = m.hover()?;
     let columns = usize::from(area.width);
     // An agent that asks takes the top row, since it needs an answer and
     // the document doesn't. It never switches [0] to the terminal itself.
@@ -38,14 +56,12 @@ pub(super) fn diff(m: &mut Model, area: Rect, width: usize, border: Style) -> Op
     });
     let reserved = if question.is_some() { 2 } else { 0 };
     let height = usize::from(area.height).saturating_sub(reserved);
-    let rows = m
-        .docs
-        .shown()
-        .map(|(_, loaded)| diff_rows(loaded, columns))
-        .unwrap_or_default();
-    let top = m.docs.scroll.min(rows.len().saturating_sub(height));
-    m.docs.scroll = top;
-    m.docs.page = height;
+    let body = match &hover {
+        Hover::Diff(key) => diff_body(m, key, columns, width),
+        Hover::Turn(name) => turn_body(m, name, columns)?,
+        Hover::Subagent(name, id) => log_body(m, name, id, columns),
+    };
+    let top = m.docs.place(body.rows.len(), height, body.tails);
     let mut lines: Vec<Line<'static>> = Vec::new();
     if let Some(question) = question {
         let ask = "i answer";
@@ -61,8 +77,52 @@ pub(super) fn diff(m: &mut Model, area: Rect, width: usize, border: Style) -> Op
         ));
         lines.push(Line::raw(""));
     }
-    lines.extend(rows.iter().skip(top).take(height).cloned());
+    lines.extend(body.rows.iter().skip(top).take(height).cloned());
 
+    let title = body.title;
+    let status = m
+        .selected_entry()
+        .map(|entry| status_line(m, entry, width.saturating_sub(line_width(&title) + 9)))
+        .unwrap_or_default();
+    let right = if fits_beside(&title, line_width(&status), width) {
+        status
+    } else {
+        Vec::new()
+    };
+
+    let shown = format!(
+        "{}-{} of {}",
+        top + 1,
+        (top + height).min(body.rows.len()),
+        body.rows.len()
+    );
+    let corner = if body.loading || m.docs.loading(Instant::now()) {
+        vec![Span::styled("loading", dim())]
+    } else if m.docs.following() {
+        vec![Span::styled("following", border)]
+    } else if m.docs.paused() {
+        vec![Span::styled(format!("paused {shown}"), border)]
+    } else if body.rows.len() > height {
+        vec![Span::styled(shown, border)]
+    } else {
+        Vec::new()
+    };
+    Some(Page {
+        title,
+        right,
+        corner,
+        lines,
+    })
+}
+
+/// The hovered file's diff: what's loaded, or the last one shown while the
+/// new one loads, under the hovered file's name and counts.
+fn diff_body(m: &Model, hover: &DiffKey, columns: usize, width: usize) -> Body {
+    let rows = m
+        .docs
+        .shown()
+        .map(|(_, loaded)| diff_rows(loaded, columns))
+        .unwrap_or_default();
     let mut title = vec![
         Span::raw("[0] "),
         Span::styled(
@@ -88,37 +148,148 @@ pub(super) fn diff(m: &mut Model, area: Rect, width: usize, border: Style) -> Op
         Lines::Binary => title.push(Span::styled(" bin", dim())),
         Lines::Untracked => title.push(Span::styled(" new", dim())),
     }
-
-    let status = m
-        .selected_entry()
-        .map(|entry| status_line(m, entry, width.saturating_sub(line_width(&title) + 9)))
-        .unwrap_or_default();
-    let right = if fits_beside(&title, line_width(&status), width) {
-        status
-    } else {
-        Vec::new()
-    };
-
-    let mut corner = Vec::new();
-    if m.docs.loading(Instant::now()) {
-        corner.push(Span::styled("loading", dim()));
-    } else if rows.len() > height {
-        corner.push(Span::styled(
-            format!(
-                "{}-{} of {}",
-                top + 1,
-                (top + height).min(rows.len()),
-                rows.len()
-            ),
-            border,
-        ));
-    }
-    Some(Page {
+    Body {
         title,
-        right,
-        corner,
-        lines,
+        rows,
+        tails: false,
+        loading: false,
+    }
+}
+
+/// The turn: the whole prompt, the whole message or question, and the
+/// subagents.
+fn turn_body(m: &Model, name: &SessionName, columns: usize) -> Option<Body> {
+    let (_, entry) = m.snapshot()?.entry(name)?;
+    let activity = m.activity(name)?;
+    let mut rows: Vec<Line<'static>> = Vec::new();
+    if let Some(prompt) = &activity.prompt {
+        for (i, row) in wrap(prompt, columns.saturating_sub(2))
+            .into_iter()
+            .enumerate()
+        {
+            let lead = if i == 0 { "› " } else { "  " };
+            rows.push(Line::styled(format!("{lead}{row}"), dim()));
+        }
+        rows.push(Line::raw(""));
+    }
+    if let Some(message) = turn_message(m, entry) {
+        rows.extend(wrap(&message, columns).into_iter().map(Line::raw));
+        rows.push(Line::raw(""));
+    }
+    let subagents = subagent_rows(m, entry, columns);
+    if !subagents.is_empty() {
+        rows.push(Line::styled("Subagents", dim()));
+        rows.extend(subagents);
+    }
+    if rows
+        .last()
+        .is_some_and(|row| row.spans.is_empty() || line_width(&row.spans) == 0)
+    {
+        rows.pop();
+    }
+    Some(Body {
+        title: vec![Span::raw("[0] "), Span::styled("Turn", bold())],
+        rows,
+        tails: false,
+        loading: false,
     })
+}
+
+/// A subagent's transcript: what it was told, then a line per tool call
+/// with the start of its result, and what it said.
+fn log_body(m: &Model, name: &SessionName, id: &AgentId, columns: usize) -> Body {
+    let subagent = m.activity(name).and_then(|a| a.subagents.get(id));
+    let mut title = vec![Span::raw("[0] ")];
+    match subagent {
+        Some(s) => {
+            title.push(Span::styled(s.kind.clone(), bold()));
+            if let Some(description) = s.description.as_deref().filter(|d| !d.is_empty()) {
+                title.push(Span::styled(format!(" · {description}"), dim()));
+            }
+        }
+        None => title.push(Span::styled("subagent", bold())),
+    }
+    let note = |text: String, style: Style| Body {
+        title: title.clone(),
+        rows: vec![Line::styled(text, style)],
+        tails: true,
+        loading: false,
+    };
+    let key = (name.clone(), id.clone());
+    let detail = match m.subagent_logs.get(&key) {
+        None => {
+            return Body {
+                loading: true,
+                ..note(String::new(), dim())
+            };
+        }
+        Some(Err(e)) => return note(e.lines().next().unwrap_or_default().to_string(), error()),
+        Some(Ok(None)) => return note("no transcript for this subagent".into(), dim()),
+        Some(Ok(Some(detail))) => detail,
+    };
+    let running = subagent
+        .and_then(|s| s.tools.last())
+        .map(|tool| ago(tool.since, m.now));
+    let mut rows: Vec<Line<'static>> = Vec::new();
+    for (i, row) in wrap(&detail.prompt, columns.saturating_sub(2))
+        .into_iter()
+        .enumerate()
+    {
+        rows.push(Line::raw(format!(
+            "{}{row}",
+            if i == 0 { "› " } else { "  " }
+        )));
+    }
+    rows.push(Line::raw(""));
+    let cap = columns.min(RESULT_COLUMNS);
+    let last = detail.log.len().saturating_sub(1);
+    let ended = detail.finished && matches!(detail.log.last(), Some(LogEntry::Said(_)));
+    let body = if ended { last } else { detail.log.len() };
+    for (at, entry) in detail.log.iter().take(body).enumerate() {
+        match entry {
+            LogEntry::Said(text) => {
+                rows.extend(wrap(text, columns).into_iter().map(Line::raw));
+            }
+            LogEntry::Called {
+                tool,
+                target,
+                result,
+            } => {
+                let live = result.is_none() && at == last && !detail.finished;
+                let lead = if live {
+                    Span::raw(format!("{} ", spinner()))
+                } else {
+                    Span::raw("  ")
+                };
+                let right = match (result, live) {
+                    (Some(result), _) => result.clone(),
+                    (None, true) => running
+                        .as_ref()
+                        .map_or_else(|| "running".to_string(), |since| format!("running {since}")),
+                    (None, false) => String::new(),
+                };
+                rows.push(justify(
+                    vec![
+                        lead,
+                        Span::styled(format!("{tool}  "), dim()),
+                        Span::raw(target.clone().unwrap_or_default()),
+                    ],
+                    vec![Span::styled(right, dim())],
+                    cap,
+                ));
+            }
+        }
+    }
+    if let (true, Some(LogEntry::Said(text))) = (ended, detail.log.last()) {
+        rows.push(Line::styled("─".repeat(columns.min(RESULT_COLUMNS)), dim()));
+        rows.extend(wrap(text, columns).into_iter().map(Line::raw));
+    }
+    Body {
+        title,
+        rows,
+        tails: true,
+        loading: false,
+    }
 }
 
 fn diff_rows(loaded: &Result<FileDiff, String>, width: usize) -> Vec<Line<'static>> {

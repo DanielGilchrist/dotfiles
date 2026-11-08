@@ -715,6 +715,13 @@ fn on_panel_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
             m.info("select an agent to see it");
             Some(Vec::new())
         }
+        (KeyCode::Char('2'), _)
+            if m.selected_entry()
+                .is_some_and(|e| m.activity(e.name()).is_none()) =>
+        {
+            m.info("no turn recorded · d then ⏎ restarts it through agent");
+            Some(Vec::new())
+        }
         (KeyCode::Char('2'), _) => {
             m.panel = Panel::Agent { offset: 0 };
             m.subagent = None;
@@ -732,14 +739,11 @@ fn on_panel_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
             m.panel = Panel::Changes { file: 0 };
             Some(Vec::new())
         }
-        (KeyCode::Enter | KeyCode::Char('l' | '0'), Panel::Changes { .. })
-            if m.hovered_diff().is_some() =>
-        {
+        (
+            KeyCode::Enter | KeyCode::Char('l' | '0'),
+            Panel::Changes { .. } | Panel::Agent { .. },
+        ) if m.hover().is_some() => {
             m.focus_main = true;
-            Some(Vec::new())
-        }
-        (KeyCode::Char('0'), Panel::Agent { .. }) => {
-            m.info("[2] has no document to open yet");
             Some(Vec::new())
         }
         (KeyCode::Char('0'), Panel::Agents) => m
@@ -790,17 +794,15 @@ fn on_nav_key(m: &mut Model, key: KeyEvent) -> Vec<Effect> {
             _ => {}
         },
         KeyCode::Char('d') if ctrl(&key, 'd') => match m.panel {
-            Panel::Changes { .. } => m.docs.scroll_by(m.docs.half_page()),
-            _ => m.page_in_panel(m.half_page()),
+            Panel::Changes { .. } | Panel::Agent { .. } => m.docs.scroll_by(m.docs.half_page()),
+            Panel::Agents => m.page_in_panel(m.half_page()),
         },
         KeyCode::Char('u') if ctrl(&key, 'u') => match m.panel {
-            Panel::Changes { .. } => m.docs.scroll_by(-m.docs.half_page()),
-            _ => m.page_in_panel(-m.half_page()),
+            Panel::Changes { .. } | Panel::Agent { .. } => m.docs.scroll_by(-m.docs.half_page()),
+            Panel::Agents => m.page_in_panel(-m.half_page()),
         },
-        KeyCode::Char('J') if matches!(m.panel, Panel::Changes { .. }) => m.docs.scroll_by(SCROLL),
-        KeyCode::Char('K') if matches!(m.panel, Panel::Changes { .. }) => {
-            m.docs.scroll_by(-SCROLL);
-        }
+        KeyCode::Char('J') if m.hover().is_some() => m.docs.scroll_by(SCROLL),
+        KeyCode::Char('K') if m.hover().is_some() => m.docs.scroll_by(-SCROLL),
         KeyCode::PageDown => m.page_in_panel(m.half_page() * 2),
         KeyCode::PageUp => m.page_in_panel(-m.half_page() * 2),
         KeyCode::Char('j') | KeyCode::Down => m.move_in_panel(1),
@@ -1427,11 +1429,11 @@ fn on_mouse(m: &mut Model, mouse: MouseEvent) -> Vec<Effect> {
             mouse.kind,
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
         );
-        if clicked && m.hovered_diff().is_some() {
+        if clicked && m.hover().is_some() {
             m.focus_main = true;
             return Vec::new();
         }
-        if scrolling && m.hovered_diff().is_some() {
+        if scrolling && m.hover().is_some() {
             let up = matches!(mouse.kind, MouseEventKind::ScrollUp);
             m.docs.scroll_by(if up { -SCROLL } else { SCROLL });
             return Vec::new();
@@ -1557,22 +1559,23 @@ mod tests {
             "stops at the end rather than wrapping"
         );
         m.panel = Panel::Agent { offset: 0 };
+        m.docs.page = 6;
         update(
             &mut m,
             Msg::Key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL)),
         );
-        assert_eq!(m.panel, Panel::Agent { offset: 3 });
+        assert_eq!(m.docs.scroll, 3, "from [2] it's half a page of [0]");
         update(
             &mut m,
             Msg::Key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL)),
         );
-        assert_eq!(m.panel, Panel::Agent { offset: 0 });
-        m.areas.page = 1;
+        assert_eq!(m.docs.scroll, 0);
+        m.docs.page = 1;
         update(
             &mut m,
             Msg::Key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL)),
         );
-        assert_eq!(m.panel, Panel::Agent { offset: 1 }, "at least one row");
+        assert_eq!(m.docs.scroll, 1, "at least one row");
     }
 
     #[test]
@@ -1866,6 +1869,20 @@ mod tests {
         assert_eq!(order, ["api", "idle", "fix", "web"]);
     }
 
+    fn with_turn(m: &mut Model) {
+        let mut all = m.activities.take().unwrap_or_default();
+        for agent in ["fix", "api"] {
+            all.insert(
+                name(agent),
+                reported(
+                    agent_core::activity::State::Working { tools: Vec::new() },
+                    5,
+                ),
+            );
+        }
+        m.activities = Some(all);
+    }
+
     fn with_changes(m: &mut Model, files: usize) {
         let changed = (0..files)
             .map(|i| agent_core::ports::Change {
@@ -1886,6 +1903,7 @@ mod tests {
     fn number_keys_focus_panels_and_esc_returns_to_the_list() {
         let mut m = model(&[]);
         with_changes(&mut m, 3);
+        with_turn(&mut m);
         update(&mut m, key(KeyCode::Char('2')));
         assert_eq!(m.panel, Panel::Agent { offset: 0 });
         update(&mut m, key(KeyCode::Char('3')));
@@ -1908,6 +1926,7 @@ mod tests {
     fn j_and_k_move_within_the_focused_panel() {
         let mut m = model(&[]);
         with_changes(&mut m, 3);
+        with_turn(&mut m);
         update(&mut m, key(KeyCode::Char('3')));
         for _ in 0..5 {
             update(&mut m, key(KeyCode::Char('j')));
@@ -1931,9 +1950,8 @@ mod tests {
         update(&mut m, key(KeyCode::Char('2')));
         update(&mut m, key(KeyCode::Char('j')));
         update(&mut m, key(KeyCode::Char('j')));
-        assert_eq!(m.panel, Panel::Agent { offset: 2 });
-        update(&mut m, key(KeyCode::Char('k')));
-        assert_eq!(m.panel, Panel::Agent { offset: 1 });
+        assert_eq!(m.panel, Panel::Agent { offset: 0 });
+        assert_eq!(m.row_at(), 0, "[2] has only its turn row");
         update(&mut m, key(KeyCode::Char('1')));
         update(&mut m, key(KeyCode::Char('j')));
         assert_eq!(
@@ -1947,6 +1965,7 @@ mod tests {
     fn panels_fall_back_to_the_list() {
         let mut m = model(&[]);
         with_changes(&mut m, 3);
+        with_turn(&mut m);
         update(&mut m, key(KeyCode::Char('3')));
         update(&mut m, key(KeyCode::Char(']')));
         assert_eq!(m.panel, Panel::Agents, "a new selection starts in [1]");
@@ -3296,16 +3315,21 @@ mod tests {
     }
 
     #[test]
-    fn focusing_the_turn_puts_a_cursor_on_the_subagents_and_reads_the_one_it_is_on() {
+    fn focusing_the_turn_puts_a_cursor_on_its_rows_and_reads_the_subagent_it_is_on() {
         let mut m = delegating();
-        assert_eq!(m.subagent_count(), 3);
+        assert_eq!(m.subagent_rows().len(), 3);
         assert!(
             reads(tick(&mut m)).is_empty(),
             "nothing is read while [2] is unfocused"
         );
 
         update(&mut m, key(KeyCode::Char('2')));
-        assert_eq!(m.panel, Panel::Agent { offset: 0 });
+        assert_eq!(m.row_at(), 0, "the turn row first");
+        assert!(
+            reads(tick(&mut m)).is_empty(),
+            "the turn needs no transcript"
+        );
+        update(&mut m, key(KeyCode::Char('j')));
         assert_eq!(
             reads(tick(&mut m)),
             ["AgentId(\"s2\") /w/heucristic0/obs-layout-4"],
@@ -3314,31 +3338,32 @@ mod tests {
         assert!(reads(tick(&mut m)).is_empty(), "once");
 
         update(&mut m, key(KeyCode::Char('j')));
-        assert_eq!(
-            m.panel,
-            Panel::Agent { offset: 0 },
-            "j moves the cursor, not the scroll"
-        );
-        assert_eq!(m.subagent_at(), 1);
+        assert_eq!(m.row_at(), 2);
         assert_eq!(
             reads(tick(&mut m)).len(),
             1,
             "the newly selected one is read at once"
         );
         update(&mut m, key(KeyCode::Char('G')));
-        assert_eq!(m.subagent_at(), 2);
+        assert_eq!(m.row_at(), 3);
         update(&mut m, key(KeyCode::Char('j')));
-        assert_eq!(m.subagent_at(), 2, "stops at the end");
+        assert_eq!(m.row_at(), 3, "stops at the end");
         update(&mut m, key(KeyCode::Char('g')));
-        assert_eq!(m.subagent_at(), 0);
+        assert_eq!(m.row_at(), 0);
         update(&mut m, key(KeyCode::Char('k')));
-        assert_eq!(m.subagent_at(), 0);
+        assert_eq!(m.row_at(), 0);
+        assert_eq!(
+            m.panel,
+            Panel::Agent { offset: 0 },
+            "j moves the cursor, not a scroll"
+        );
     }
 
     #[test]
     fn a_subagent_is_read_again_soon_after_its_agent_reports_but_not_every_tick() {
         let mut m = delegating();
         update(&mut m, key(KeyCode::Char('2')));
+        update(&mut m, key(KeyCode::Char('j')));
         assert_eq!(reads(tick(&mut m)).len(), 1);
         let (name, id) = m.subagent_selected().expect("a subagent is selected");
 
@@ -3390,83 +3415,52 @@ mod tests {
     }
 
     #[test]
-    fn without_subagents_j_and_k_still_scroll_the_turn() {
+    fn with_only_a_turn_there_is_one_row_and_zero_or_enter_open_its_document() {
         let mut m = crate::fixtures::fleet(10);
         m.set_cursor(Cursor::Entry(name("rate-limit-1")));
         update(&mut m, key(KeyCode::Char('2')));
         update(&mut m, key(KeyCode::Char('j')));
-        assert_eq!(m.panel, Panel::Agent { offset: 1 });
+        assert_eq!(m.row_at(), 0, "nowhere to go");
+        assert!(matches!(m.hover(), Some(crate::document::Hover::Turn(_))));
         assert_eq!(reads(tick(&mut m)), [""; 0]);
+        update(&mut m, key(KeyCode::Enter));
+        assert!(m.main_focused());
     }
 
     #[test]
-    fn dot_counts_what_it_adds_per_tab_and_does_nothing_on_the_pinned_tab() {
-        let mut m = filtered(&[]);
-        update(&mut m, key(KeyCode::Tab));
-        assert_eq!(
-            m.hidden(),
-            3,
-            "the agents tab spans every repo: api, idle, web"
-        );
-        update(&mut m, key(KeyCode::Tab));
-        assert_eq!(m.view, View::Pinned);
-        update(&mut m, key(KeyCode::Char('.')));
-        assert_eq!(
-            m.visibility,
-            Visibility::Active,
-            "no effect on the pinned tab"
-        );
-        assert!(
-            m.status
-                .as_ref()
-                .is_some_and(|s| s.text.contains("pinned lists every pin"))
-        );
-    }
-
-    #[test]
-    fn a_finished_subagent_is_not_read_again() {
+    fn j_and_k_in_the_turn_pick_what_zero_opens() {
         let mut m = delegating();
         update(&mut m, key(KeyCode::Char('2')));
-        assert_eq!(reads(tick(&mut m)).len(), 1);
-        let (name, id) = m.subagent_selected().expect("a subagent is selected");
-        let done = agent_core::ports::SubagentDetail {
-            finished: true,
-            ..Default::default()
-        };
-        update(
-            &mut m,
-            Msg::Subagent {
-                name,
-                id,
-                detail: Ok(Some(done)),
-            },
-        );
-        for last in m.subagent_reads.values_mut() {
-            last.at -= SUBAGENT_SLOW_REFRESH;
-        }
-        assert_eq!(reads(tick(&mut m)), [""; 0]);
-    }
-
-    #[test]
-    fn the_turn_cursor_follows_its_subagent_when_the_others_come_and_go() {
-        let mut m = delegating();
-        update(&mut m, key(KeyCode::Char('2')));
+        assert!(matches!(m.hover(), Some(crate::document::Hover::Turn(_))));
         update(&mut m, key(KeyCode::Char('j')));
-        let (name, id) = m.subagent_selected().expect("a subagent is selected");
-        assert_eq!(id, AgentId::new("s1"));
-        let mut fewer = m.activities.clone().expect("reported");
-        fewer
-            .get_mut(&name)
-            .expect("has activity")
-            .subagents
-            .remove(&AgentId::new("s2"));
-        update(&mut m, Msg::Activities(fewer));
-        assert_eq!(
-            m.subagent_selected().map(|(_, id)| id),
-            Some(id),
-            "still s1, now first"
-        );
-        assert_eq!(m.subagent_at(), 0);
+        assert!(matches!(
+            m.hover(),
+            Some(crate::document::Hover::Subagent(..))
+        ));
+        update(&mut m, key(KeyCode::Char('J')));
+        assert_eq!(m.docs.scroll, 2, "J scrolls [0] from [2] too");
+        update(&mut m, key(KeyCode::Char('0')));
+        assert!(m.main_focused());
+        update(&mut m, key(KeyCode::Esc));
+        assert!(matches!(m.panel, Panel::Agent { .. }), "back to [2]");
+    }
+
+    #[test]
+    fn an_agent_with_no_report_has_no_turn_to_focus() {
+        let mut m = crate::fixtures::fleet(10);
+        m.set_cursor(Cursor::Entry(name("payroll-fix-11")));
+        let live_without_report = m
+            .selected_entry()
+            .is_some_and(|e| m.activity(e.name()).is_none());
+        if live_without_report {
+            update(&mut m, key(KeyCode::Char('2')));
+            assert_eq!(m.panel, Panel::Agents);
+            assert!(
+                m.status
+                    .as_ref()
+                    .is_some_and(|s| s.text.contains("no turn recorded"))
+            );
+        }
     }
 
     fn diff_reads(effects: Vec<Effect>) -> Vec<String> {

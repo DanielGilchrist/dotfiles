@@ -16,7 +16,7 @@ use agent_core::ports::{Change, HarnessId, SubagentDetail, WorktreeFacts};
 use agent_term::{Emulator, Terminal};
 use ratatui::layout::Rect;
 
-use crate::document::{DiffKey, Documents};
+use crate::document::{DiffKey, Documents, Hover};
 use crate::palette::Palette;
 
 pub const PREVIEW_DEBOUNCE: Duration = Duration::from_millis(150);
@@ -911,7 +911,7 @@ pub struct Model {
     pub terminal: TerminalFocus,
     /// Which checkouts [1] lists.
     pub visibility: Visibility,
-    /// The subagent [2]'s cursor is on while it's focused. The first one
+    /// The subagent row [2]'s cursor is on while it's focused. The turn row
     /// while it's unset or gone.
     pub subagent: Option<AgentId>,
     /// What each subagent being watched was told and has done, as last read.
@@ -1044,13 +1044,10 @@ impl Model {
                 self.move_cursor_by(delta, wrap);
                 Panel::Agents
             }
-            Panel::Agent { .. } if self.subagent_count() > 0 => {
-                self.point_at_subagent(|at, last| at.saturating_add_signed(delta).min(last));
+            Panel::Agent { .. } => {
+                self.point_at_row(|at, last| at.saturating_add_signed(delta).min(last));
                 self.panel
             }
-            Panel::Agent { offset } => Panel::Agent {
-                offset: offset.saturating_add_signed(delta),
-            },
             Panel::Changes { file } => Panel::Changes {
                 file: file
                     .saturating_add_signed(delta)
@@ -1072,15 +1069,13 @@ impl Model {
                 self.move_to_edge(edge);
                 Panel::Agents
             }
-            (Panel::Agent { .. }, edge) if self.subagent_count() > 0 => {
-                self.point_at_subagent(|_, last| match edge {
+            (Panel::Agent { .. }, edge) => {
+                self.point_at_row(|_, last| match edge {
                     Edge::First => 0,
                     Edge::Last => last,
                 });
                 self.panel
             }
-            (Panel::Agent { .. }, Edge::First) => Panel::Agent { offset: 0 },
-            (Panel::Agent { .. }, Edge::Last) => Panel::Agent { offset: usize::MAX },
             (Panel::Changes { .. }, Edge::First) => Panel::Changes { file: 0 },
             (Panel::Changes { .. }, Edge::Last) => Panel::Changes {
                 file: self.changes().len().saturating_sub(1),
@@ -1088,8 +1083,8 @@ impl Model {
         };
     }
 
-    /// The diff the main view reads: the file under [3]'s cursor, unless the
-    /// keys are going to the agent.
+    /// The file under [3]'s cursor and its checkout, unless the keys are
+    /// going to the agent.
     pub fn hovered_diff(&self) -> Option<(DiffKey, PathBuf)> {
         let Panel::Changes { file } = self.panel else {
             return None;
@@ -1110,12 +1105,12 @@ impl Model {
 
     /// Whether the keys go to the document in [0].
     pub fn main_focused(&self) -> bool {
-        self.focus_main && self.hovered_diff().is_some()
+        self.focus_main && self.hover().is_some()
     }
 
     /// Whether [0] shows the terminal rather than a document.
     pub fn terminal_visible(&self) -> bool {
-        self.hovered_diff().is_none()
+        self.hover().is_none()
     }
 
     /// The agent whose terminal [0] shows, if it shows one.
@@ -1128,8 +1123,8 @@ impl Model {
         if !matches!(self.panel, Panel::Agent { .. } | Panel::Changes { .. }) {
             self.focus_main = false;
         }
-        let hover = self.hovered_diff().map(|(key, _)| key);
-        self.docs.settle(hover, Instant::now());
+        let hover = self.hover();
+        self.docs.settle(hover.as_ref(), Instant::now());
     }
 
     /// The selected agent's checkout and the file under [3]'s cursor in it.
@@ -1228,28 +1223,21 @@ impl Model {
         rows
     }
 
-    pub fn subagent_count(&self) -> usize {
-        self.subagent_rows().len()
-    }
-
-    /// Where [2]'s cursor is among the subagents: its own, or the first
-    /// while it points at none that exist.
-    pub fn subagent_at(&self) -> usize {
+    /// Where [2]'s cursor is among its rows: 0 is the turn, then the
+    /// subagents. The turn while it points at a subagent that's gone.
+    pub fn row_at(&self) -> usize {
         self.subagent
             .as_ref()
             .and_then(|id| self.subagent_rows().iter().position(|(row, _)| *row == id))
-            .unwrap_or(0)
+            .map_or(0, |at| at + 1)
     }
 
-    /// Moves [2]'s cursor to the subagent `to` picks from where it is and
-    /// the last one's index.
-    fn point_at_subagent(&mut self, to: impl FnOnce(usize, usize) -> usize) {
+    /// Moves [2]'s cursor to the row `to` picks from where it is and the
+    /// last row's index.
+    fn point_at_row(&mut self, to: impl FnOnce(usize, usize) -> usize) {
         let rows = self.subagent_rows();
-        let Some(last) = rows.len().checked_sub(1) else {
-            return;
-        };
-        let id = rows[to(self.subagent_at(), last).min(last)].0.clone();
-        self.subagent = Some(id);
+        let row = to(self.row_at(), rows.len()).min(rows.len());
+        self.subagent = row.checked_sub(1).map(|at| rows[at].0.clone());
     }
 
     /// The subagent [2]'s cursor is on, while [2] is focused.
@@ -1259,8 +1247,29 @@ impl Model {
         };
         let name = self.selected_entry()?.name().clone();
         let rows = self.subagent_rows();
-        let (id, _) = rows.get(self.subagent_at())?;
+        let (id, _) = rows.get(self.row_at().checked_sub(1)?)?;
         Some((name, (*id).clone()))
+    }
+
+    /// What the main view reads: the file under [3]'s cursor or the row
+    /// under [2]'s, unless the keys are going to the agent.
+    pub fn hover(&self) -> Option<Hover> {
+        if matches!(self.focus(), Focus::Agent(_)) {
+            return None;
+        }
+        match self.panel {
+            Panel::Agents => None,
+            Panel::Changes { .. } => self.hovered_diff().map(|(key, _)| Hover::Diff(key)),
+            Panel::Agent { .. } => {
+                let entry = self.selected_entry()?;
+                self.activity(entry.name())?;
+                let name = entry.name().clone();
+                Some(match self.subagent_selected() {
+                    Some((_, id)) => Hover::Subagent(name, id),
+                    None => Hover::Turn(name),
+                })
+            }
+        }
     }
 
     /// How many subagents a live agent has running, if any.

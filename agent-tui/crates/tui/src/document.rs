@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use agent_core::activity::AgentId;
 use agent_core::names::SessionName;
 use agent_core::ports::{FileDiff, Lines};
 
@@ -26,6 +27,35 @@ pub struct DiffKey {
     pub lines: Lines,
 }
 
+/// What the cursor is on that [0] reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Hover {
+    /// A changed file in [3].
+    Diff(DiffKey),
+    /// [2]'s turn row.
+    Turn(SessionName),
+    /// A subagent row in [2].
+    Subagent(SessionName, AgentId),
+}
+
+/// What a scroll position belongs to, so another item starts afresh.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Item {
+    File(SessionName, PathBuf),
+    Turn(SessionName),
+    Subagent(SessionName, AgentId),
+}
+
+impl Hover {
+    fn item(&self) -> Item {
+        match self {
+            Self::Diff(key) => Item::File(key.name.clone(), key.path.clone()),
+            Self::Turn(name) => Item::Turn(name.clone()),
+            Self::Subagent(name, id) => Item::Subagent(name.clone(), id.clone()),
+        }
+    }
+}
+
 pub type Loaded = Arc<Result<FileDiff, String>>;
 
 #[derive(Default)]
@@ -34,8 +64,12 @@ pub struct Documents {
     pub scroll: usize,
     /// Rows of [0] as last drawn, for paging.
     pub page: usize,
-    /// What the scroll belongs to: moving to another file starts at the top.
-    item: Option<(SessionName, PathBuf)>,
+    /// Whether the document on screen is a log that follows its end, and
+    /// whether it is: scrolling up pauses it and reaching the end resumes.
+    tails: bool,
+    following: bool,
+    /// What the scroll belongs to: moving to another item starts afresh.
+    item: Option<Item>,
     /// The diff the cursor is on and since when.
     hover: Option<(DiffKey, Instant)>,
     requested: Vec<DiffKey>,
@@ -48,24 +82,31 @@ pub struct Documents {
 }
 
 impl Documents {
-    /// Follows the cursor: `hover` is the diff it's on, if any.
-    pub fn settle(&mut self, hover: Option<DiffKey>, now: Instant) {
-        let Some(key) = hover else {
+    /// Follows the cursor: `hover` is what it's on, if [0] reads it.
+    pub fn settle(&mut self, hover: Option<&Hover>, now: Instant) {
+        let Some(hover) = hover else {
             self.hover = None;
             self.item = None;
             self.shown = None;
             self.waiting = None;
             return;
         };
-        if self.hover.as_ref().map(|(k, _)| k) != Some(&key) {
-            self.hover = Some((key.clone(), now));
-        }
-        let item = (key.name.clone(), key.path.clone());
+        let item = hover.item();
         if self.item.as_ref() != Some(&item) {
             self.item = Some(item);
             self.scroll = 0;
+            self.following = true;
         }
-        match self.cache.iter().position(|(k, _)| *k == key) {
+        let Hover::Diff(key) = hover else {
+            self.hover = None;
+            self.shown = None;
+            self.waiting = None;
+            return;
+        };
+        if self.hover.as_ref().map(|(k, _)| k) != Some(key) {
+            self.hover = Some((key.clone(), now));
+        }
+        match self.cache.iter().position(|(k, _)| k == key) {
             Some(at) => {
                 let hit = self.cache.remove(at);
                 self.shown = Some(hit.clone());
@@ -116,15 +157,49 @@ impl Documents {
 
     pub fn scroll_by(&mut self, delta: isize) {
         self.scroll = self.scroll.saturating_add_signed(delta);
+        if delta < 0 {
+            self.following = false;
+        }
     }
 
     pub fn scroll_to_start(&mut self) {
         self.scroll = 0;
+        self.following = false;
     }
 
-    /// Past the last row, which drawing clamps to it.
+    /// Past the last row, which drawing clamps to it, and following again.
     pub fn scroll_to_end(&mut self) {
         self.scroll = usize::MAX;
+        self.following = true;
+    }
+
+    /// The first row shown of `total` rows in `height`, and the scroll kept
+    /// at it. A log that follows its end stays on it as rows are added until
+    /// scrolled up, and following resumes on reaching the end again.
+    pub fn place(&mut self, total: usize, height: usize, tails: bool) -> usize {
+        let last = total.saturating_sub(height);
+        self.tails = tails;
+        self.page = height;
+        let top = if tails && self.following {
+            last
+        } else {
+            self.scroll.min(last)
+        };
+        if tails && top >= last {
+            self.following = true;
+        }
+        self.scroll = top;
+        top
+    }
+
+    /// Whether the log on screen follows its end.
+    pub fn following(&self) -> bool {
+        self.tails && self.following
+    }
+
+    /// Whether the log on screen was scrolled away from its end.
+    pub fn paused(&self) -> bool {
+        self.tails && !self.following
     }
 
     /// Half the rows of [0], at least one.
@@ -162,16 +237,16 @@ mod tests {
     fn a_read_starts_after_the_cursor_rests_and_the_old_document_stays_until_it_lands() {
         let mut docs = Documents::default();
         let t0 = Instant::now();
-        docs.settle(Some(key("a", 1)), t0);
+        docs.settle(Some(&Hover::Diff(key("a", 1))), t0);
         assert_eq!(docs.due(t0), None, "not at once");
         let a = docs.due(t0 + REST).expect("after the rest");
         assert_eq!(docs.due(t0 + REST), None, "once");
         docs.loaded(&a, Ok(diff("a")));
-        docs.settle(Some(key("a", 1)), t0 + REST);
+        docs.settle(Some(&Hover::Diff(key("a", 1))), t0 + REST);
         assert_eq!(docs.shown().map(|(k, _)| k.path.clone()), Some("a".into()));
 
         let t1 = t0 + REST * 2;
-        docs.settle(Some(key("b", 2)), t1);
+        docs.settle(Some(&Hover::Diff(key("b", 2))), t1);
         assert_eq!(
             docs.shown().map(|(k, _)| k.path.clone()),
             Some("a".into()),
@@ -181,11 +256,11 @@ mod tests {
         assert!(docs.loading(t1 + LOADING_AFTER));
         let b = docs.due(t1 + REST).expect("b is read");
         docs.loaded(&b, Ok(diff("b")));
-        docs.settle(Some(key("b", 2)), t1 + REST);
+        docs.settle(Some(&Hover::Diff(key("b", 2))), t1 + REST);
         assert_eq!(docs.shown().map(|(k, _)| k.path.clone()), Some("b".into()));
         assert!(!docs.loading(t1 + Duration::from_secs(9)));
 
-        docs.settle(Some(key("a", 1)), t1 + REST * 2);
+        docs.settle(Some(&Hover::Diff(key("a", 1))), t1 + REST * 2);
         assert_eq!(
             docs.shown().map(|(k, _)| k.path.clone()),
             Some("a".into()),
@@ -202,11 +277,11 @@ mod tests {
     fn scroll_resets_for_another_file_but_not_when_the_same_file_changes() {
         let mut docs = Documents::default();
         let t0 = Instant::now();
-        docs.settle(Some(key("a", 1)), t0);
+        docs.settle(Some(&Hover::Diff(key("a", 1))), t0);
         docs.scroll_by(7);
-        docs.settle(Some(key("a", 5)), t0);
+        docs.settle(Some(&Hover::Diff(key("a", 5))), t0);
         assert_eq!(docs.scroll, 7, "same file, new numstat line");
-        docs.settle(Some(key("b", 1)), t0);
+        docs.settle(Some(&Hover::Diff(key("b", 1))), t0);
         assert_eq!(docs.scroll, 0);
         docs.scroll_by(-3);
         assert_eq!(docs.scroll, 0);
@@ -217,11 +292,11 @@ mod tests {
         let mut docs = Documents::default();
         let t0 = Instant::now();
         docs.loaded(&key("x", 1), Ok(diff("x")));
-        docs.settle(Some(key("x", 1)), t0);
+        docs.settle(Some(&Hover::Diff(key("x", 1))), t0);
         assert!(docs.shown().is_none(), "never requested");
         for i in 0..CACHE + 5 {
             let k = key(&format!("f{i}"), i);
-            docs.settle(Some(k.clone()), t0);
+            docs.settle(Some(&Hover::Diff(k.clone())), t0);
             docs.hover = Some((k.clone(), t0));
             let due = docs.due(t0 + REST).expect("due");
             docs.loaded(&due, Ok(diff("d")));
@@ -231,6 +306,56 @@ mod tests {
             docs.cache
                 .iter()
                 .all(|(k, _)| k.path.as_path() != std::path::Path::new("f0"))
+        );
+    }
+
+    fn log() -> Hover {
+        Hover::Subagent("fix".parse().expect("parses"), AgentId::new("s1"))
+    }
+
+    #[test]
+    fn a_log_follows_its_end_pauses_when_scrolled_up_and_resumes_at_the_end() {
+        let mut docs = Documents::default();
+        let t0 = Instant::now();
+        docs.settle(Some(&log()), t0);
+        assert_eq!(docs.place(30, 10, true), 20, "opens at the tail");
+        assert!(docs.following());
+        assert_eq!(docs.place(35, 10, true), 25, "and follows as rows arrive");
+
+        docs.scroll_by(-3);
+        assert_eq!(docs.place(35, 10, true), 22);
+        assert!(docs.paused());
+        assert_eq!(
+            docs.place(40, 10, true),
+            22,
+            "rows arriving don't move a paused log"
+        );
+
+        docs.scroll_by(2);
+        assert_eq!(docs.place(40, 10, true), 24);
+        assert!(docs.paused());
+        docs.scroll_by(99);
+        assert_eq!(docs.place(40, 10, true), 30);
+        assert!(docs.following(), "scrolling back to the end resumes");
+
+        docs.scroll_by(-1);
+        docs.scroll_to_end();
+        assert_eq!(docs.place(44, 10, true), 34, "G resumes at once");
+        docs.scroll_to_start();
+        assert_eq!(docs.place(44, 10, true), 0);
+        assert!(docs.paused());
+
+        docs.settle(Some(&Hover::Turn("fix".parse().expect("parses"))), t0);
+        assert_eq!(docs.place(44, 10, false), 0, "a document opens at the top");
+        assert!(
+            !docs.following() && !docs.paused(),
+            "and has nothing to follow"
+        );
+        docs.settle(Some(&log()), t0);
+        assert_eq!(
+            docs.place(44, 10, true),
+            34,
+            "returning to a log starts at its tail"
         );
     }
 }

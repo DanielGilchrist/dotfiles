@@ -33,13 +33,16 @@ const HOOKS: &[(&str, Option<&str>)] = &[
 ];
 /// How much of a tool's target or a message the TUI keeps.
 const SNIPPET: usize = 160;
+/// How much of a prompt or an agent's last message the TUI keeps, whole
+/// lines and all, for [0] to show it in full.
+const LONG: usize = 8000;
 /// How much of what a subagent said a log entry keeps.
 const SAID: usize = 600;
 /// Log entries kept per subagent, the newest.
-const LOG_ENTRIES: usize = 60;
+const LOG_ENTRIES: usize = 400;
 /// How much of the end of a subagent's transcript is read for its log, and
 /// the most it widens to when that holds no whole record.
-const TAIL_BYTES: u64 = 512 * 1024;
+const TAIL_BYTES: u64 = 1024 * 1024;
 const TAIL_BYTES_MAX: u64 = 8 * 1024 * 1024;
 /// How much of its start is read for the prompt.
 const HEAD_BYTES: u64 = 256 * 1024;
@@ -580,6 +583,11 @@ fn snippet(text: &str) -> String {
         .collect()
 }
 
+/// `text` trimmed and cut to [`LONG`] characters, keeping its lines.
+fn long(text: &str) -> String {
+    text.trim().chars().take(LONG).collect()
+}
+
 /// What a tool is acting on: a command, a file, a search or a URL.
 fn target(input: &serde_json::Value) -> Option<String> {
     ["command", "file_path", "pattern", "url", "description"]
@@ -619,7 +627,7 @@ fn claude_event(payload: &serde_json::Value) -> Option<Reported> {
                 {
                     Input::Notification
                 } else {
-                    Input::User(snippet(prompt))
+                    Input::User(long(prompt))
                 },
             )
         }
@@ -677,7 +685,7 @@ fn claude_event(payload: &serde_json::Value) -> Option<Reported> {
         },
         "SubagentStop" => Event::SubagentStopped,
         "Stop" => Event::Finished {
-            summary: text("last_assistant_message").map(snippet),
+            summary: text("last_assistant_message").map(long),
             running: background_subagents(payload),
         },
         "StopFailure" => Event::Failed(text("error").unwrap_or("error").replace('_', " ")),
