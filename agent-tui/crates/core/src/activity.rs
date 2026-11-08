@@ -311,9 +311,13 @@ impl Activity {
                 ..
             }
         );
-        if let Event::Launched { pid } = &reported.event {
-            activity.launcher = *pid;
-            activity.launched = Some(now);
+        match (&reported.origin, &reported.event) {
+            (_, Event::Launched { pid }) => {
+                activity.launcher = *pid;
+                activity.launched = Some(now);
+            }
+            (Origin::Main, Event::Started | Event::Ended) => activity.launched = None,
+            _ => {}
         }
         let before = activity.state.clone();
         let answered = activity.answer(&reported);
@@ -1364,6 +1368,22 @@ mod tests {
             ])
             .at_rest(),
             "asking"
+        );
+    }
+
+    #[test]
+    fn a_launch_vouches_only_for_its_own_boot() {
+        let launched = run(vec![(0, main(Event::Launched { pid: None }))]);
+        assert_eq!(launched.launched, Some(at(0)));
+        let started = Activity::next(Some(launched.clone()), main(Event::Started), at(1));
+        assert_eq!(
+            started.launched, None,
+            "its session has reported, so heard takes over"
+        );
+        let ended = Activity::next(Some(launched), main(Event::Ended), at(2));
+        assert_eq!(
+            ended.launched, None,
+            "a gone session can't vouch for the next"
         );
     }
 }
