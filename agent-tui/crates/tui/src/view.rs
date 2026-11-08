@@ -23,6 +23,7 @@ use crate::model::{
 use crate::palette::Palette;
 use crate::update::{Pick, Picks, Unusable, picker_matches, switcher_matches};
 
+mod log;
 mod page;
 mod sidebar;
 
@@ -136,8 +137,14 @@ fn fit(mut spans: Vec<Span<'_>>, room: usize) -> Vec<Span<'_>> {
     spans
 }
 
-/// Left spans, then right spans flush to `width`; the left side yields first.
+/// Left spans, then right spans flush to `width`. The left side yields first,
+/// and a right side wider than the line is cut too, so nothing overflows.
 fn justify<'a>(left: Vec<Span<'a>>, right: Vec<Span<'a>>, width: usize) -> Line<'a> {
+    let right = if line_width(&right) > width {
+        fit(right, width)
+    } else {
+        right
+    };
     let right_width = line_width(&right);
     let mut left = fit(
         left,
@@ -1795,6 +1802,19 @@ fn draw_help(frame: &mut Frame<'_>, m: &Model, state: &HelpState) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn justify_cuts_a_right_side_wider_than_the_line_instead_of_overflowing() {
+        use super::*;
+        let line = justify(
+            vec![Span::raw("Bash  cd")],
+            vec![Span::raw("x".repeat(60))],
+            20,
+        );
+        assert_eq!(line_width(&line.spans), 20);
+        let roomy = justify(vec![Span::raw("ab")], vec![Span::raw("cd")], 10);
+        assert_eq!(line_width(&roomy.spans), 10);
+    }
+
     use super::*;
 
     #[test]

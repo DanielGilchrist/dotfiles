@@ -322,16 +322,30 @@ pub const BINDINGS: &[Binding] = &[
     ),
     Binding::new(
         &["e"],
-        Ctxs::of(&[Ctx::Turn]),
+        Ctxs::of(&[Ctx::Turn, Ctx::Main]),
         RankBy(|s| s.subagent_row.then_some(7)),
         By(|s| s.subagent_row.then_some("edit transcript")),
-        "Open the subagent's whole transcript in $EDITOR, in the agent's checkout.",
+        "Open the subagent's transcript as Markdown in $EDITOR. From [0] it opens at the entry under the cursor.",
+    ),
+    Binding::new(
+        &["⏎"],
+        Ctxs::of(&[Ctx::Main]),
+        RankBy(|s| s.subagent_row.then_some(8)),
+        By(|s| s.subagent_row.then_some("fold")),
+        "Expand or collapse the log entry under the cursor: the whole prompt or text, a call's input and result, or a run of calls.",
+    ),
+    Binding::new(
+        &["=", "-"],
+        Ctxs::of(&[Ctx::Main]),
+        Hidden,
+        By(|s| s.subagent_row.then_some("expand all / collapse all")),
+        "Expand every entry of a subagent's log, or collapse them all.",
     ),
     Binding::new(
         &["e"],
         Ctxs::of(&[Ctx::Agents, Ctx::Main]),
         RankBy(|s| (s.ctx == Ctx::Agents).then_some(0)),
-        By(|s| s.can_edit_checkout.then_some("edit checkout")),
+        By(|s| (s.can_edit_checkout && !(s.ctx == Ctx::Main && s.subagent_row)).then_some("edit checkout")),
         "Open the agent's checkout (or the repo's) in $EDITOR.",
     ),
     Binding::new(

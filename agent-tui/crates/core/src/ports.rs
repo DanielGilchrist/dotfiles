@@ -673,18 +673,106 @@ pub struct SubagentDetail {
     pub log: Vec<LogEntry>,
     /// The file the harness keeps the whole transcript in.
     pub transcript: PathBuf,
+    /// What it handed back, or its last message once finished.
+    pub report: Option<String>,
+    /// The model it runs, as the harness names it.
+    pub model: Option<String>,
+    /// The first record's time.
+    pub started: Option<SystemTime>,
+    /// The last record's time.
+    pub last_heard: Option<SystemTime>,
+    /// Whether the log starts after the transcript's start, so counts of
+    /// calls are lower bounds.
+    pub truncated: bool,
+    /// Why the transcript ends, when the API gave up on it.
+    pub stopped: Option<String>,
 }
 
 /// One step of a subagent's work.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LogEntry {
-    Said(String),
-    Called {
-        tool: String,
-        target: Option<String>,
-        /// The first line of what the tool returned, once it has.
-        result: Option<String>,
+    Said {
+        text: String,
+        at: Option<SystemTime>,
     },
+    Called(Call),
+}
+
+/// A tool call, from the request to what came back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Call {
+    pub id: String,
+    pub tool: String,
+    pub target: Target,
+    pub state: CallState,
+    pub started: Option<SystemTime>,
+    /// How long it took, once it has returned and both times are known.
+    pub took: Option<std::time::Duration>,
+    /// The whole input and result, cut, for expanding.
+    pub input: String,
+    pub output: String,
+}
+
+/// What a tool is acting on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Target {
+    None,
+    Command(String),
+    Path {
+        path: String,
+        range: Option<(u64, Option<u64>)>,
+    },
+    Search {
+        pattern: String,
+        path: Option<String>,
+    },
+    Pattern(String),
+    Url(String),
+    Query(String),
+    Task(String),
+    Todos {
+        done: usize,
+        total: usize,
+        current: Option<String>,
+    },
+    Other(String),
+}
+
+/// Where a call stands. A running call has no outcome, and only a finished
+/// one can have failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CallState {
+    Running,
+    Done(Summary),
+    Failed {
+        code: Option<i32>,
+        excerpt: Excerpt,
+    },
+    /// Succeeded, but its output carries a failure line.
+    Flagged {
+        summary: Summary,
+        excerpt: Excerpt,
+    },
+}
+
+/// What a finished call came to, in a few words.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Summary {
+    Lines(usize),
+    Diff { added: usize, removed: usize },
+    NewFile { lines: usize },
+    Matches(usize),
+    Files(usize),
+    Text(String),
+    NoOutput,
+    Image,
+}
+
+/// The lines worth showing under a call, and how many more there were.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Excerpt {
+    pub lines: Vec<String>,
+    pub more: usize,
 }
 
 pub trait Harnesses: Send + Sync {

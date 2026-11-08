@@ -2698,30 +2698,36 @@ mod tests {
     }
 
     fn log_of(entries: usize, finished: bool) -> agent_core::ports::SubagentDetail {
-        use agent_core::ports::LogEntry;
+        use crate::log::fixtures::{bash, said};
+        use agent_core::ports::{Call, CallState, LogEntry, Summary, Target};
         let mut log = Vec::new();
         for i in 0..entries {
-            log.push(LogEntry::Called {
-                tool: "Read".into(),
-                target: Some(format!("src/file{i}.rs")),
-                result: Some(format!("{i} lines")),
-            });
+            log.push(LogEntry::Called(Call {
+                id: format!("c{i}"),
+                tool: "Edit".into(),
+                target: Target::Path {
+                    path: format!("src/file{i}.rs"),
+                    range: None,
+                },
+                state: CallState::Done(Summary::Diff {
+                    added: i,
+                    removed: 0,
+                }),
+                started: None,
+                took: None,
+                input: String::new(),
+                output: String::new(),
+            }));
             if i % 4 == 3 {
-                log.push(LogEntry::Said(format!("Checked file {i}.")));
+                log.push(said(&format!("Checked file {i}.")));
             }
         }
-        log.push(LogEntry::Called {
-            tool: "Bash".into(),
-            target: Some("cargo test".into()),
-            result: None,
-        });
-        if finished {
-            log.push(LogEntry::Said("All done, three call sites.".into()));
-        }
+        log.push(bash("cargo test", CallState::Running));
         agent_core::ports::SubagentDetail {
             prompt: "Find every call site of roundCurrency.".into(),
             finished,
             log,
+            report: finished.then(|| "All done, three call sites.".to_string()),
             ..Default::default()
         }
     }
@@ -2758,7 +2764,7 @@ mod tests {
         m.subagent = Some(AgentId::new("s1"));
         let loading = screen(&render(&mut m, (100, 30))).join("\n");
         assert!(
-            loading.contains("[0] general-purpose · Reverting memo edit"),
+            loading.contains("[0] Reverting memo edit · general-purpose"),
             "{loading}"
         );
 
@@ -2782,10 +2788,7 @@ mod tests {
             .iter()
             .find(|r| r.contains("src/file38.rs"))
             .expect("a call row");
-        assert!(
-            call.contains("38 lines"),
-            "its result sits beside it\n{call}"
-        );
+        assert!(call.contains("+38 −0"), "its result sits beside it\n{call}");
 
         m.docs.scroll_by(-5);
         let text = screen(&render(&mut m, (100, 30))).join("\n");
@@ -2808,13 +2811,17 @@ mod tests {
         );
         let rule = text
             .lines()
-            .position(|l| l.contains("────────"))
-            .expect("a rule");
-        let result = text
+            .position(|l| l.contains("Activity ·"))
+            .expect("an activity rule");
+        let report = text
             .lines()
             .position(|l| l.contains("All done, three call sites."))
-            .expect("the result");
-        assert!(rule < result, "the final result follows a rule\n{text}");
+            .expect("the report");
+        assert!(
+            report < rule,
+            "the report comes before the activity\n{text}"
+        );
+        assert!(text.contains("✓ finished"), "{text}");
     }
 
     #[test]
@@ -3057,7 +3064,8 @@ mod tests {
         );
         let text = screen(&render(&mut m, (100, 30))).join("\n");
         assert!(
-            text.contains("running 1"),
+            text.lines()
+                .any(|l| l.contains("cargo test") && (l.contains("11s") || l.contains("12s"))),
             "about 12s, from the hooks\n{text}"
         );
     }

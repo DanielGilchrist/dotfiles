@@ -7,19 +7,20 @@ use std::time::Instant;
 use agent_core::activity::AgentId;
 use agent_core::model::{Head, RepoKey};
 use agent_core::names::SessionName;
-use agent_core::ports::{BranchLog, Change, Compared, FileDiff, Lines, LogEntry};
+use agent_core::ports::{BranchLog, Change, Compared, FileDiff, Lines};
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use super::log;
 use super::sidebar::{fits_beside, others_on, status_line, subagent_rows, turn_message};
 use super::{
-    ago, bold, dim, error, fit, justify, line_width, spinner, success, truncate_end,
+    accent, bold, dim, error, fit, justify, line_width, spinner, success, truncate_end,
     truncate_start, warning, wrap,
 };
 use crate::document::{BranchKey, DiffKey, Doc, FolderKey, Hover, Resolved};
-use crate::model::{AgentStatus, Model};
+use crate::model::{AgentStatus, Model, SubagentKey};
 
 /// [0]'s title, what its top border says on the right, its bottom-right
 /// corner and its rows.
@@ -45,6 +46,12 @@ struct Body {
     tails: bool,
     /// Still being read.
     loading: bool,
+    /// Rows that stay on top while the rest scrolls.
+    pinned: Vec<Line<'static>>,
+    /// A log's entries: each one's first row and row count.
+    entries: Vec<(usize, usize)>,
+    /// The log's entry the cursor is on, and which subagent it belongs to.
+    nav: Option<SubagentKey>,
 }
 
 impl Body {
@@ -54,13 +61,12 @@ impl Body {
             rows: Rows::Built(rows),
             tails: false,
             loading: false,
+            pinned: Vec::new(),
+            entries: Vec::new(),
+            nav: None,
         }
     }
 }
-
-/// A result sits within this many columns of its call, so it stays near it
-/// on a wide screen.
-const RESULT_COLUMNS: usize = 100;
 
 /// What [0] reads instead of the terminal, in `area`, scrolled as the model
 /// says, or `None` while the cursor is on nothing it reads. `border` is the
@@ -87,14 +93,22 @@ pub(super) fn page(m: &mut Model, area: Rect, width: usize, border: Style) -> Op
         Hover::Branch(key) => branch_body(m, key, columns),
         Hover::Folder(key) => folder_body(m, key, columns, budget),
         Hover::Turn(name) => turn_body(m, name, columns)?,
-        Hover::Subagent(name, id) => log_body(m, name, id, columns),
+        Hover::Subagent(name, id) => log_body(m, name, id, columns, budget),
         Hover::Repo(key) => repo_body(m, key, columns)?,
     };
+    let pinned = body.pinned.len().min(height);
+    let height = height - pinned;
     let total = match &body.rows {
         Rows::Built(rows) => rows.len(),
         Rows::Cached => m.docs.cached().len(),
     };
+    if let Some(key) = &body.nav {
+        reveal(m, key, &body.entries, height);
+    }
     let top = m.docs.place(total, height, body.tails);
+    if let Some(key) = &body.nav {
+        follow_page(m, key, &body.entries, top);
+    }
     let mut lines: Vec<Line<'static>> = Vec::new();
     if let Some(question) = question {
         let ask = "i answer";
@@ -110,9 +124,28 @@ pub(super) fn page(m: &mut Model, area: Rect, width: usize, border: Style) -> Op
         ));
         lines.push(Line::raw(""));
     }
+    lines.extend(body.pinned.iter().take(pinned).cloned());
+    let from = lines.len();
     match &body.rows {
         Rows::Built(rows) => lines.extend(rows.iter().skip(top).take(height).cloned()),
         Rows::Cached => lines.extend(m.docs.cached().iter().skip(top).take(height).cloned()),
+    }
+    if let Some(key) = &body.nav
+        && m.main_focused()
+        && let Some(&(start, len)) = m
+            .log_view
+            .navs
+            .get(key)
+            .and_then(|nav| nav.cursor)
+            .and_then(|at| body.entries.get(at))
+    {
+        for row in start.max(top)..(start + len).min(top + height) {
+            if let Some(line) = lines.get_mut(from + row - top)
+                && let Some(first) = line.spans.first_mut()
+            {
+                *first = Span::styled("▌", accent());
+            }
+        }
     }
 
     let mut title = body.title;
@@ -150,6 +183,40 @@ pub(super) fn page(m: &mut Model, area: Rect, width: usize, border: Style) -> Op
         corner,
         lines,
     })
+}
+
+/// Scrolls so the cursor's entry shows, once, after a key moved it.
+fn reveal(m: &mut Model, key: &SubagentKey, entries: &[(usize, usize)], height: usize) {
+    if !std::mem::take(&mut m.log_view.reveal) {
+        return;
+    }
+    let Some(&(start, len)) = m
+        .log_view
+        .navs
+        .get(key)
+        .and_then(|nav| nav.cursor)
+        .and_then(|at| entries.get(at))
+    else {
+        return;
+    };
+    let top = m.docs.scroll;
+    if start < top {
+        m.docs.scroll = start;
+    } else if start + len > top + height {
+        m.docs.scroll = (start + len).saturating_sub(height).min(start);
+    }
+}
+
+/// Moves the cursor onto the first entry on screen after a page scroll.
+fn follow_page(m: &mut Model, key: &SubagentKey, entries: &[(usize, usize)], top: usize) {
+    if !std::mem::take(&mut m.log_view.follow_page) {
+        return;
+    }
+    let at = entries
+        .iter()
+        .position(|&(start, len)| start + len > top)
+        .unwrap_or(entries.len().saturating_sub(1));
+    m.log_view.navs.entry(key.clone()).or_default().cursor = Some(at);
 }
 
 /// `names` as far as `room` columns allow, the rest counted: `a, b +2`.
@@ -229,6 +296,9 @@ fn diff_body(m: &mut Model, hover: &DiffKey, columns: usize, budget: usize) -> B
         rows,
         tails: false,
         loading: false,
+        pinned: Vec::new(),
+        entries: Vec::new(),
+        nav: None,
     }
 }
 
@@ -345,6 +415,9 @@ fn branch_body(m: &mut Model, key: &BranchKey, columns: usize) -> Body {
         rows,
         tails: false,
         loading: false,
+        pinned: Vec::new(),
+        entries: Vec::new(),
+        nav: None,
     }
 }
 
@@ -500,18 +573,26 @@ fn turn_body(m: &Model, name: &SessionName, columns: usize) -> Option<Body> {
     ))
 }
 
-/// A subagent's transcript: what it was told, then a line per tool call
-/// with the start of its result, and what it said.
-fn log_body(m: &Model, name: &SessionName, id: &AgentId, columns: usize) -> Body {
-    let subagent = m.activity(name).and_then(|a| a.subagents.get(id));
+/// A subagent's log: its status, what it was told, a row per call and what
+/// it handed back.
+fn log_body(m: &Model, name: &SessionName, id: &AgentId, columns: usize, budget: usize) -> Body {
+    let subagent = m
+        .subagent_rows()
+        .into_iter()
+        .find(|(held, _)| *held == id)
+        .map(|(_, s)| s);
     let mut title = vec![Span::raw("[0] ")];
     match subagent {
-        Some(s) => {
-            title.push(Span::styled(s.kind.clone(), bold()));
-            if let Some(description) = s.description.as_deref().filter(|d| !d.is_empty()) {
-                title.push(Span::styled(format!(" · {description}"), dim()));
+        Some(s) => match s.description.as_deref().filter(|d| !d.is_empty()) {
+            Some(description) => {
+                title.push(Span::styled(description.to_string(), bold()));
+                let kind = format!(" · {}", s.kind);
+                if line_width(&title) + kind.chars().count() <= budget {
+                    title.push(Span::styled(kind, dim()));
+                }
             }
-        }
+            None => title.push(Span::styled(s.kind.clone(), bold())),
+        },
         None => title.push(Span::styled("subagent", bold())),
     }
     let note = |text: String, style: Style| Body {
@@ -530,66 +611,30 @@ fn log_body(m: &Model, name: &SessionName, id: &AgentId, columns: usize) -> Body
         Some(Ok(None)) => return note("no transcript for this subagent".into(), dim()),
         Some(Ok(Some(detail))) => detail,
     };
-    let running = subagent
-        .and_then(|s| s.tools.last())
-        .map(|tool| ago(tool.since, m.now));
-    let mut rows: Vec<Line<'static>> = Vec::new();
-    for (i, row) in wrap(&detail.prompt, columns.saturating_sub(2))
-        .into_iter()
-        .enumerate()
-    {
-        rows.push(Line::raw(format!(
-            "{}{row}",
-            if i == 0 { "› " } else { "  " }
-        )));
-    }
-    rows.push(Line::raw(""));
-    let cap = columns.min(RESULT_COLUMNS);
-    let last = detail.log.len().saturating_sub(1);
-    let ended = detail.finished && matches!(detail.log.last(), Some(LogEntry::Said(_)));
-    let body = if ended { last } else { detail.log.len() };
-    for (at, entry) in detail.log.iter().take(body).enumerate() {
-        match entry {
-            LogEntry::Said(text) => {
-                rows.extend(wrap(text, columns).into_iter().map(Line::raw));
-            }
-            LogEntry::Called {
-                tool,
-                target,
-                result,
-            } => {
-                let live = result.is_none() && at == last && !detail.finished;
-                let lead = if live {
-                    Span::raw(format!("{} ", spinner()))
-                } else {
-                    Span::raw("  ")
-                };
-                let right = match (result, live) {
-                    (Some(result), _) => result.clone(),
-                    (None, true) => running
-                        .as_ref()
-                        .map_or_else(|| "running".to_string(), |since| format!("running {since}")),
-                    (None, false) => String::new(),
-                };
-                rows.push(justify(
-                    vec![
-                        lead,
-                        Span::styled(format!("{tool}  "), dim()),
-                        Span::raw(target.clone().unwrap_or_default()),
-                    ],
-                    vec![Span::styled(right, dim())],
-                    cap,
-                ));
-            }
-        }
-    }
-    if let (true, Some(LogEntry::Said(text))) = (ended, detail.log.last()) {
-        rows.push(Line::styled("─".repeat(columns.min(RESULT_COLUMNS)), dim()));
-        rows.extend(wrap(text, columns).into_iter().map(Line::raw));
-    }
+    let checkout = m
+        .selected_entry()
+        .and_then(|e| e.path())
+        .map(|p| p.to_string_lossy().into_owned());
+    let home = std::env::var("HOME").ok();
+    let nav = m.log_view.navs.get(&key).cloned().unwrap_or_default();
+    let rendered = log::render(
+        detail,
+        subagent,
+        &nav,
+        &log::Context {
+            columns,
+            now: m.now,
+            spinner: spinner(),
+            checkout: checkout.as_deref(),
+            home: home.as_deref(),
+        },
+    );
     Body {
-        tails: true,
-        ..Body::built(title, rows)
+        tails: !rendered.finished,
+        pinned: rendered.pinned,
+        entries: rendered.layout,
+        nav: Some(key),
+        ..Body::built(title, rendered.rows)
     }
 }
 

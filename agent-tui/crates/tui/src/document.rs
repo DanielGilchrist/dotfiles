@@ -355,6 +355,11 @@ impl Documents {
         }
     }
 
+    /// Stops following the end of a log without moving.
+    pub fn pause(&mut self) {
+        self.following = false;
+    }
+
     pub fn scroll_to_start(&mut self) {
         self.scroll = 0;
         self.following = false;
@@ -371,6 +376,9 @@ impl Documents {
     /// scrolled up, and following resumes on reaching the end again.
     pub fn place(&mut self, total: usize, height: usize, tails: bool) -> usize {
         let last = total.saturating_sub(height);
+        if self.tails && self.following && !tails {
+            self.scroll = 0;
+        }
         self.tails = tails;
         self.page = height;
         let top = if tails && self.following {

@@ -1,5 +1,6 @@
 mod document;
 mod keymap;
+mod log;
 mod model;
 mod palette;
 mod tree;
@@ -264,6 +265,7 @@ impl Runtime {
         terminal: &mut DefaultTerminal,
         cwd: &Path,
         arg: Option<&Path>,
+        line: Option<usize>,
     ) -> Result<Edited> {
         let editor = std::env::var("EDITOR").unwrap_or_else(|_| "nvim".into());
         let argv =
@@ -271,7 +273,11 @@ impl Runtime {
         let (program, args) = argv.split_first().context("$EDITOR is empty")?;
 
         let mut command = std::process::Command::new(program);
-        command.args(args).args(arg).current_dir(cwd);
+        command
+            .args(args)
+            .args(line.map(|l| format!("+{l}")))
+            .args(arg)
+            .current_dir(cwd);
         let status = self
             .suspended(terminal, &mut command)
             .with_context(|| format!("running {program}"))?;
@@ -350,11 +356,29 @@ impl Runtime {
                 }
                 Effect::Edit(open) => {
                     Self::fill_screen(m, terminal);
+                    let mut line = None;
+                    let written;
                     let (cwd, file) = match &open {
                         Open::Checkout(dir) => (dir, None),
                         Open::File { root, file } => (root, Some(file.as_path())),
+                        Open::Transcript {
+                            root,
+                            name,
+                            text,
+                            line: at,
+                        } => match write_transcript(name, text) {
+                            Ok(path) => {
+                                written = path;
+                                line = Some(*at);
+                                (root, Some(written.as_path()))
+                            }
+                            Err(e) => {
+                                m.error(format!("{e:#}"));
+                                continue;
+                            }
+                        },
                     };
-                    if let Err(e) = self.edit(terminal, cwd, file).map(drop) {
+                    if let Err(e) = self.edit(terminal, cwd, file, line).map(drop) {
                         m.error(format!("{e:#}"));
                     }
                     m.schedule_preview();
@@ -417,7 +441,7 @@ impl Runtime {
             .path()
             .parent()
             .map_or_else(std::env::temp_dir, Path::to_path_buf);
-        if let Edited::Cancelled = self.edit(terminal, &dir, Some(file.path()))? {
+        if let Edited::Cancelled = self.edit(terminal, &dir, Some(file.path()), None)? {
             return Ok(None);
         }
         let edited = std::fs::read_to_string(file.path())
@@ -553,6 +577,25 @@ fn event_loop(
         }
     }
     Ok(())
+}
+
+/// Writes a transcript's Markdown under the temp dir and returns its path.
+fn write_transcript(name: &str, text: &str) -> Result<std::path::PathBuf> {
+    let dir = std::env::temp_dir().join("agent-transcripts");
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let safe: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let path = dir.join(format!("{safe}.md"));
+    std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
+    Ok(path)
 }
 
 #[cfg(test)]

@@ -6,10 +6,11 @@ use std::time::SystemTime;
 use agent_core::activity::{About, AgentId, Background, Event, Input, Origin, Reported, ToolId};
 use agent_core::names::Prompt;
 use agent_core::ports::{
-    Harness, HarnessError, HarnessId, Harnesses, LaunchCtx, LogEntry, PendingPrompt, Seen,
-    SubagentDetail,
+    Harness, HarnessError, HarnessId, Harnesses, LaunchCtx, PendingPrompt, Seen, SubagentDetail,
 };
 use agent_core::process::LaunchSpec;
+
+mod transcript;
 
 const ASK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
@@ -36,10 +37,6 @@ const SNIPPET: usize = 160;
 /// How much of a prompt or an agent's last message the TUI keeps, whole
 /// lines and all, for [0] to show it in full.
 const LONG: usize = 8000;
-/// How much of what a subagent said a log entry keeps.
-const SAID: usize = 600;
-/// Log entries kept per subagent, the newest.
-const LOG_ENTRIES: usize = 400;
 /// How much of the end of a subagent's transcript is read for its log, and
 /// the most it widens to when that holds no whole record.
 const TAIL_BYTES: u64 = 1024 * 1024;
@@ -417,30 +414,75 @@ fn has_user_turn(path: &Path) -> io::Result<bool> {
 }
 
 /// A subagent's prompt, log and whether it finished, from its transcript
-/// and the `meta.json` beside it. A transcript still being written is read
-/// as far as it goes.
+/// and the `meta.json` beside it. A transcript still being read as far as it
+/// goes.
 fn read_subagent(transcript: &Path) -> io::Result<SubagentDetail> {
     use std::io::{BufRead, Read};
     let mut file = std::fs::File::open(transcript)?;
     let len = file.metadata()?.len();
     let mut head = Vec::new();
     std::io::BufReader::new((&file).take(HEAD_BYTES)).read_until(b'\n', &mut head)?;
-    let tail = read_tail(&mut file, len, TAIL_BYTES, TAIL_BYTES_MAX)?;
-    let finished = std::fs::read_to_string(transcript.with_extension("meta.json"))
-        .is_ok_and(|meta| parse_finished(&meta));
+    let (tail, from_start) = read_tail(&mut file, len, TAIL_BYTES, TAIL_BYTES_MAX)?;
+    let meta: Option<serde_json::Value> =
+        std::fs::read_to_string(transcript.with_extension("meta.json"))
+            .ok()
+            .and_then(|meta| serde_json::from_str(&meta).ok());
+    let finished = meta
+        .as_ref()
+        .and_then(|meta| meta.get("finished").and_then(serde_json::Value::as_bool))
+        .unwrap_or(false);
+    let model = meta
+        .as_ref()
+        .and_then(|meta| meta.get("model").and_then(serde_json::Value::as_str))
+        .map(str::to_string);
+    let head = String::from_utf8_lossy(&head);
+    let started = serde_json::from_str::<serde_json::Value>(head.trim())
+        .ok()
+        .and_then(|r| {
+            r.get("timestamp")
+                .and_then(serde_json::Value::as_str)
+                .and_then(transcript::parse_time)
+        });
+    let mut parsed = transcript::parse(&tail);
+    let report = match parsed.handed_back.take() {
+        Some(report) => Some(report),
+        None if finished => {
+            let said = parsed.last_said.take();
+            if let (Some(said), Some(agent_core::ports::LogEntry::Said { text, .. })) =
+                (&said, parsed.log.last())
+                && said.starts_with(text.as_str())
+            {
+                parsed.log.pop();
+            }
+            said
+        }
+        None => None,
+    };
     Ok(SubagentDetail {
-        prompt: parse_prompt(&String::from_utf8_lossy(&head)).unwrap_or_default(),
+        prompt: parse_prompt(&head).unwrap_or_default(),
         finished,
-        log: parse_log(&tail),
+        log: parsed.log,
         transcript: transcript.to_path_buf(),
+        report,
+        model,
+        started,
+        last_heard: parsed.last_heard,
+        truncated: parsed.dropped || !from_start,
+        stopped: parsed.stopped,
     })
 }
 
-/// The whole records in the last `window` bytes of a `len` byte file, widening
+/// The whole records in the last `window` bytes of a `len` byte file and
+/// whether they reach its start, widening
 /// the window fourfold up to `max` while it holds none (one huge record).
 /// The window reaches one byte back so a record starting exactly at its edge
 /// is kept, and the partial one before it is dropped.
-fn read_tail(file: &mut std::fs::File, len: u64, mut window: u64, max: u64) -> io::Result<String> {
+fn read_tail(
+    file: &mut std::fs::File,
+    len: u64,
+    mut window: u64,
+    max: u64,
+) -> io::Result<(String, bool)> {
     use std::io::{Read, Seek, SeekFrom};
     loop {
         let start = len.saturating_sub(window);
@@ -456,9 +498,9 @@ fn read_tail(file: &mut std::fs::File, len: u64, mut window: u64, max: u64) -> i
         };
         match whole {
             Some(whole) if whole.contains('\n') || start == 0 || window >= max => {
-                return Ok(whole.to_string());
+                return Ok((whole.to_string(), start == 0));
             }
-            None if window >= max => return Ok(String::new()),
+            None if window >= max => return Ok((String::new(), false)),
             _ => window = (window * 4).min(max),
         }
     }
@@ -484,75 +526,6 @@ fn text_of(content: &serde_json::Value) -> String {
             .to_string(),
         _ => String::new(),
     }
-}
-
-/// Whether a `meta.json` says the subagent is done.
-fn parse_finished(meta: &str) -> bool {
-    serde_json::from_str::<serde_json::Value>(meta)
-        .ok()
-        .and_then(|meta| meta.get("finished").and_then(serde_json::Value::as_bool))
-        .unwrap_or(false)
-}
-
-/// The steps in transcript lines, oldest first and at most
-/// [`LOG_ENTRIES`] of them: what the subagent said and the tools it
-/// called, each with the first line of its result once that's recorded.
-/// Lines that aren't whole records are skipped.
-fn parse_log(text: &str) -> Vec<LogEntry> {
-    let mut log: Vec<LogEntry> = Vec::new();
-    let mut calls: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    for record in text
-        .lines()
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-    {
-        let Some(parts) = record
-            .pointer("/message/content")
-            .and_then(serde_json::Value::as_array)
-        else {
-            continue;
-        };
-        for part in parts {
-            let field = |key: &str| part.get(key).and_then(serde_json::Value::as_str);
-            match (
-                record.get("type").and_then(serde_json::Value::as_str),
-                field("type"),
-            ) {
-                (Some("assistant"), Some("text")) => {
-                    let said: String = field("text")
-                        .unwrap_or_default()
-                        .trim()
-                        .chars()
-                        .take(SAID)
-                        .collect();
-                    if !said.is_empty() {
-                        log.push(LogEntry::Said(said));
-                    }
-                }
-                (Some("assistant"), Some("tool_use")) => {
-                    if let Some(id) = field("id") {
-                        calls.insert(id.to_string(), log.len());
-                    }
-                    log.push(LogEntry::Called {
-                        tool: field("name").unwrap_or("a tool").to_string(),
-                        target: part.get("input").and_then(target),
-                        result: None,
-                    });
-                }
-                (Some("user"), Some("tool_result")) => {
-                    let first = part.get("content").map(text_of).map(|t| snippet(&t));
-                    let at = field("tool_use_id").and_then(|id| calls.get(id));
-                    if let (Some(first), Some(&at)) = (first, at)
-                        && let Some(LogEntry::Called { result, .. }) = log.get_mut(at)
-                    {
-                        *result = Some(first).filter(|r| !r.is_empty());
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-    log.drain(..log.len().saturating_sub(LOG_ENTRIES));
-    log
 }
 
 /// `--settings` JSON adding hooks that report each event to the TUI with
@@ -731,6 +704,7 @@ fn background_subagents(payload: &serde_json::Value) -> Vec<Background> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_core::ports::{CallState, LogEntry};
 
     #[test]
     fn project_dir_matches_claude_codes_slugs() {
@@ -957,48 +931,68 @@ mod tests {
     const LATER_LINE: &str = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"tu2","name":"Bash","input":{"command":"cargo test"}}]}}"#;
 
     #[test]
-    fn a_subagent_transcript_reads_as_a_log_with_results_paired_to_calls() {
+    fn a_subagent_transcript_reads_as_a_prompt_and_a_log() {
         assert_eq!(
             parse_prompt(PROMPT_LINE).as_deref(),
             Some("Review the diff.\nBe harsh.")
         );
+        assert_eq!(parse_prompt("{\"type\":"), None);
         let text =
             format!("{PROMPT_LINE}\n{CALL_LINE}\n{RESULT_LINE}\n{LATER_LINE}\n{{\"type\":\"assi");
-        assert_eq!(
-            parse_log(&text),
-            [
-                LogEntry::Said("Looking.".into()),
-                LogEntry::Called {
-                    tool: "Read".into(),
-                    target: Some("/a/b.rs".into()),
-                    result: Some("fn main() {}".into()),
-                },
-                LogEntry::Called {
-                    tool: "Bash".into(),
-                    target: Some("cargo test".into()),
-                    result: None,
-                },
-            ],
-            "a record cut off mid-write is skipped"
+        let log = transcript::parse(&text).log;
+        assert_eq!(log.len(), 3, "a record cut off mid-write is skipped");
+        assert!(matches!(&log[0], LogEntry::Said { text, .. } if text == "Looking."));
+        assert!(
+            matches!(&log[2], LogEntry::Called(c) if c.state == CallState::Running && c.tool == "Bash")
         );
-        assert!(parse_finished(r#"{"agentType":"Explore","finished":true}"#));
-        assert!(!parse_finished(r#"{"agentType":"Explore"}"#));
-        assert!(!parse_finished("not json"));
-        assert_eq!(parse_prompt("{\"type\":"), None);
     }
 
     #[test]
     fn the_log_keeps_only_the_newest_entries() {
-        let text: String = (0..LOG_ENTRIES + 5)
+        let text: String = (0..transcript::LOG_ENTRIES + 5)
             .map(|i| {
                 format!(
                     r#"{{"type":"assistant","message":{{"content":[{{"type":"text","text":"t{i}"}}]}}}}"#
                 ) + "\n"
             })
             .collect();
-        let log = parse_log(&text);
-        assert_eq!(log.len(), LOG_ENTRIES);
-        assert_eq!(log[0], LogEntry::Said("t5".into()));
+        let parsed = transcript::parse(&text);
+        assert_eq!(parsed.log.len(), transcript::LOG_ENTRIES);
+        assert!(parsed.dropped);
+        assert!(matches!(&parsed.log[0], LogEntry::Said { text, .. } if text == "t5"));
+    }
+
+    #[test]
+    fn a_finished_subagent_reports_its_last_message_and_its_model_and_times() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("agent-a1.jsonl");
+        let first = r#"{"type":"user","timestamp":"2026-11-08T10:00:00.000Z","message":{"content":"Do it."}}"#;
+        let last = r#"{"type":"assistant","timestamp":"2026-11-08T10:06:02.000Z","message":{"content":[{"type":"text","text":"Done: all green."}]}}"#;
+        std::fs::write(&path, format!("{first}\n{last}\n")).expect("writes");
+        std::fs::write(
+            dir.path().join("agent-a1.meta.json"),
+            r#"{"finished":true,"model":"sonnet"}"#,
+        )
+        .expect("writes");
+        let detail = read_subagent(&path).expect("reads");
+        assert_eq!(detail.report.as_deref(), Some("Done: all green."));
+        assert_eq!(detail.log, [], "the report isn't also an entry");
+        assert_eq!(detail.model.as_deref(), Some("sonnet"));
+        assert!(!detail.truncated);
+        let took = detail
+            .last_heard
+            .zip(detail.started)
+            .map(|(end, start)| end.duration_since(start).expect("after").as_secs());
+        assert_eq!(took, Some(362));
+
+        std::fs::remove_file(dir.path().join("agent-a1.meta.json")).expect("removes");
+        let running = read_subagent(&path).expect("reads");
+        assert_eq!(running.report, None);
+        assert_eq!(
+            running.log.len(),
+            1,
+            "unfinished: its last words stay in the log"
+        );
     }
 
     #[test]
@@ -1048,7 +1042,9 @@ mod tests {
             let path = dir.path().join("t.jsonl");
             std::fs::write(&path, body).expect("writes");
             let mut file = std::fs::File::open(&path).expect("opens");
-            read_tail(&mut file, body.len() as u64, window, max).expect("reads")
+            read_tail(&mut file, body.len() as u64, window, max)
+                .expect("reads")
+                .0
         };
         let body = "aaaa\nbbbb\ncccc\n";
         assert_eq!(tail(body, 100, 100), body, "the whole file");

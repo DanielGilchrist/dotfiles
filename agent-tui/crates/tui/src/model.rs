@@ -1088,6 +1088,8 @@ pub struct Model {
     pub subagent_logs: HashMap<SubagentKey, Result<Option<SubagentDetail>, String>>,
     /// When each subagent's transcript was last asked for.
     pub subagent_reads: HashMap<SubagentKey, SubagentRead>,
+    /// [0]'s subagent log: cursor, expansion and layout.
+    pub log_view: crate::log::LogView,
     /// The agent whose terminal the peek float shows.
     pub peek: Option<SessionName>,
     /// Messages waiting for their agents to be at rest.
@@ -1158,6 +1160,7 @@ impl Model {
             held_subagent: None,
             subagent_logs: HashMap::new(),
             subagent_reads: HashMap::new(),
+            log_view: crate::log::LogView::default(),
             peek: None,
             outboxes: HashMap::new(),
             live_since: HashMap::new(),

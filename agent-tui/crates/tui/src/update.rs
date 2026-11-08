@@ -57,6 +57,13 @@ pub enum Open {
     Checkout(PathBuf),
     /// A file, relative to the checkout the editor runs in.
     File { root: PathBuf, file: PathBuf },
+    /// A subagent's transcript as Markdown, at `line`.
+    Transcript {
+        root: PathBuf,
+        name: String,
+        text: String,
+        line: usize,
+    },
 }
 
 pub enum Effect {
@@ -457,6 +464,7 @@ fn forget_subagents(m: &mut Model) {
     };
     m.subagent_reads.retain(|key, _| listed(key));
     m.subagent_logs.retain(|key, _| listed(key));
+    m.log_view.navs.retain(|key, _| listed(key));
 }
 
 /// Asks for what [3]'s cursor is on once it has rested there.
@@ -746,6 +754,84 @@ fn edit_transcript(m: &mut Model) -> Option<Vec<Effect>> {
     }
 }
 
+/// Keys for [0] while it reads a subagent's log: the entry cursor, folds and
+/// the transcript in the editor. `None` leaves the key to the plain
+/// document keys.
+fn log_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
+    let key = m.subagent_selected()?;
+    let Some(Ok(Some(detail))) = m.subagent_logs.get(&key) else {
+        return None;
+    };
+    let entries = crate::log::entries(detail);
+    let last = entries.len().checked_sub(1)?;
+    let running = !detail.finished;
+    let nav = m.log_view.navs.entry(key.clone()).or_default();
+    let at = nav
+        .cursor
+        .unwrap_or(if running { last } else { 0 })
+        .min(last);
+    let mut effects = Vec::new();
+    match code {
+        KeyCode::Char('j') | KeyCode::Down => {
+            nav.cursor = Some((at + 1).min(last));
+            m.log_view.reveal = true;
+            if running && at + 1 >= last {
+                m.docs.scroll_to_end();
+            }
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            nav.cursor = Some(at.saturating_sub(1));
+            m.log_view.reveal = true;
+            m.docs.pause();
+        }
+        KeyCode::Char('g') | KeyCode::Home => {
+            nav.cursor = Some(0);
+            m.docs.scroll_to_start();
+        }
+        KeyCode::Char('G') | KeyCode::End => {
+            nav.cursor = Some(last);
+            m.docs.scroll_to_end();
+        }
+        KeyCode::PageDown | KeyCode::PageUp => {
+            let half = m.docs.half_page() * 2;
+            m.docs.scroll_by(if code == KeyCode::PageDown {
+                half
+            } else {
+                -half
+            });
+            m.log_view.follow_page = true;
+        }
+        KeyCode::Enter => {
+            nav.cursor = Some(at);
+            nav.toggle(at);
+        }
+        KeyCode::Char('=') => nav.all = true,
+        KeyCode::Char('-') => {
+            nav.all = false;
+            nav.open.clear();
+        }
+        KeyCode::Char('e') => {
+            let root = m.selected_entry()?.path()?.to_path_buf();
+            let title = m
+                .subagent_rows()
+                .into_iter()
+                .find(|(id, _)| **id == key.1)
+                .and_then(|(_, s)| s.description.clone())
+                .unwrap_or_else(|| "subagent".into());
+            let (text, starts) = crate::log::markdown(detail, &title);
+            let line = starts.get(at).copied().unwrap_or(1);
+            effects.push(Effect::Edit(Open::Transcript {
+                root,
+                name: format!("{}-{}", key.0.as_str(), key.1.as_str()),
+                text,
+                line,
+            }));
+        }
+        _ => return None,
+    }
+    Some(effects)
+}
+
 /// Control characters other than newlines and tabs could end a bracketed
 /// paste early and run the rest as keystrokes.
 fn sanitize_paste(text: &str) -> String {
@@ -757,6 +843,11 @@ fn sanitize_paste(text: &str) -> String {
 /// Keys that choose the panel `j`/`k` act on, and those a panel gives its
 /// own meaning. `None` leaves the key to NAV.
 fn on_panel_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
+    if m.main_focused()
+        && let Some(effects) = log_key(m, code)
+    {
+        return Some(effects);
+    }
     if m.main_focused() {
         match code {
             KeyCode::Esc | KeyCode::Char('1' | '2' | '3') => m.panel = m.panel.listed(),
@@ -944,12 +1035,14 @@ fn on_nav_key(m: &mut Model, key: KeyEvent) -> Vec<Effect> {
         KeyCode::Char('d') if ctrl(&key, 'd') => match m.panel {
             Panel::Changes { .. } | Panel::Agent { .. } | Panel::Main(_) => {
                 m.docs.scroll_by(m.docs.half_page());
+                m.log_view.follow_page = m.main_focused();
             }
             Panel::Agents => m.page_in_panel(m.half_page()),
         },
         KeyCode::Char('u') if ctrl(&key, 'u') => match m.panel {
             Panel::Changes { .. } | Panel::Agent { .. } | Panel::Main(_) => {
                 m.docs.scroll_by(-m.docs.half_page());
+                m.log_view.follow_page = m.main_focused();
             }
             Panel::Agents => m.page_in_panel(-m.half_page()),
         },
@@ -5277,6 +5370,83 @@ mod tests {
             matches!(effects.as_slice(), [Effect::Edit(Open::File { root, file })]
                 if root.ends_with("obs-layout-4")
                     && file == std::path::Path::new("/p/s/subagents/agent-a1.jsonl")),
+        );
+    }
+
+    fn with_log(m: &mut Model, finished: bool) -> (SessionName, AgentId) {
+        use crate::log::fixtures::{bash, detail, said};
+        use agent_core::ports::{CallState, Summary};
+        let (name, id) = m.subagent_selected().expect("a subagent is selected");
+        let ok = || CallState::Done(Summary::NoOutput);
+        let mut d = detail(vec![
+            said("one"),
+            bash("ls", ok()),
+            said("two"),
+            bash("pwd", ok()),
+        ]);
+        d.finished = finished;
+        m.subagent_logs
+            .insert((name.clone(), id.clone()), Ok(Some(d)));
+        (name, id)
+    }
+
+    #[test]
+    fn the_log_cursor_moves_by_entry_folds_and_opens_the_transcript_at_it() {
+        let mut m = delegating();
+        update(&mut m, key(KeyCode::Char('2')));
+        update(&mut m, key(KeyCode::Char('j')));
+        let key_ = with_log(&mut m, true);
+        update(&mut m, key(KeyCode::Char('0')));
+        let nav = |m: &Model| m.log_view.navs.get(&key_).cloned().unwrap_or_default();
+
+        update(&mut m, key(KeyCode::Char('j')));
+        assert_eq!(
+            nav(&m).cursor,
+            Some(1),
+            "a finished log starts at the prompt"
+        );
+        update(&mut m, key(KeyCode::Char('j')));
+        update(&mut m, key(KeyCode::Enter));
+        assert!(nav(&m).is_open(2));
+        update(&mut m, key(KeyCode::Enter));
+        assert!(!nav(&m).is_open(2));
+        update(&mut m, key(KeyCode::Char('=')));
+        assert!(nav(&m).is_open(4));
+        update(&mut m, key(KeyCode::Char('-')));
+        assert!(!nav(&m).is_open(4));
+        update(&mut m, key(KeyCode::Char('G')));
+        assert_eq!(nav(&m).cursor, Some(4));
+        update(&mut m, key(KeyCode::Char('j')));
+        assert_eq!(nav(&m).cursor, Some(4), "stops at the last entry");
+        update(&mut m, key(KeyCode::Char('g')));
+        assert_eq!(nav(&m).cursor, Some(0));
+
+        update(&mut m, key(KeyCode::Char('j')));
+        update(&mut m, key(KeyCode::Char('j')));
+        let effects = update(&mut m, key(KeyCode::Char('e')));
+        assert!(
+            matches!(effects.as_slice(), [Effect::Edit(Open::Transcript { text, line, .. })]
+                if text.lines().nth(line - 1) == Some("### Bash ls")),
+            "e opens the rendered transcript at the cursor's entry"
+        );
+        update(&mut m, key(KeyCode::Esc));
+        assert!(matches!(m.panel, Panel::Agent { .. }));
+    }
+
+    #[test]
+    fn a_running_log_follows_on_its_last_entry_and_pauses_when_the_cursor_moves_up() {
+        let mut m = delegating();
+        update(&mut m, key(KeyCode::Char('2')));
+        update(&mut m, key(KeyCode::Char('j')));
+        with_log(&mut m, false);
+        update(&mut m, key(KeyCode::Char('0')));
+        update(&mut m, key(KeyCode::Char('k')));
+        assert!(m.docs.paused() || !m.docs.following());
+        update(&mut m, key(KeyCode::Char('G')));
+        update(&mut m, key(KeyCode::Char('j')));
+        assert_eq!(
+            m.log_view.navs.values().next().and_then(|n| n.cursor),
+            Some(4)
         );
     }
 }

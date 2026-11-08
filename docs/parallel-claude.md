@@ -81,7 +81,7 @@ types into the embedded session. `?` shows every key.
 | `p` | Repo picker: `⏎` focuses a listed repo, or adds one from the catalogue or by a typed path (`~/code/foo`) |
 | `` ` `` | In [3], switch between the directory tree (default) and the flat file list |
 | `-` `=` | In [3]'s tree, close / open every folder |
-| `e` | Edit: the agent's checkout in $EDITOR, in [3] the file (or folder) under the cursor, in [2] a subagent's transcript |
+| `e` | Edit: the agent's checkout in $EDITOR, in [3] the file (or folder) under the cursor, in [2] a subagent's transcript, and in [0] on a subagent's log the transcript as Markdown at the entry under the cursor |
 | `d` / `D` | Kill the session / remove session, worktree and branch (confirms, lists anything that would be lost) |
 | `x` | Run a configured action on the selected agent (see below) |
 | `a` | Attach the agent that needs you most (asking, failed, then finished) |
@@ -110,8 +110,7 @@ message), when there's room. Under the list, panel [2] lists the turn and
 its subagents and panel [3] lists the work in two tabs, `[` `]` to switch: `Uncommitted` (the default) lists only files with uncommitted state counted against the last commit, and `Branch` what this branch changes compared with where it left origin/main, like a PR plus your uncommitted work (on the trunk the tab is `Unpushed`: commits not yet on origin plus uncommitted work, which a push empties). The second tab's first row is a short branch summary (`↑27 · 4 uncommitted`, `↓n` when behind), and hovering it shows the branch in [0]: titled `Unpushed · main vs origin/main` or `Branch · fix-thing vs origin/main`, then its commits and uncommitted files. `Uncommitted` lists only its files and the panel's corner counts them. Files carry lazygit's status code (staged letter green, unstaged red, `??` untracked, nothing for committed-only files, a `●` on folders holding uncommitted files), a `∩` on any file another agent
 in the repo changed too, and `∩ n` in the title counting them. The right pane
 [0] shows what the cursor in the focused panel is on: the agent's terminal
-for [1], the turn document or a subagent's transcript for [2] (it follows
-the tail until you scroll up, and `G` resumes), and the branch or a file's
+for [1], the turn document or a subagent's log for [2] (a status row, the prompt, what it said and a row per call with failures spelled out, its report first once finished; it follows the tail until you scroll up and `G` resumes; with [0] focused `j` `k` move over entries, `⏎` expands one and `=` `-` expand or collapse all), and the branch or a file's
 diff from the fork point for [3], with who else changed the file in its title. Clicking a row of [2] or [3] puts the cursor there, and the wheel scrolls.
 When the selected agent asks while you read, a banner at the top of [0] says
 so and `i` answers it. An agent whose terminal isn't showing still counts for
