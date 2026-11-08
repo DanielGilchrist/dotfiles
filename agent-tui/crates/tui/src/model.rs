@@ -2105,6 +2105,7 @@ impl Model {
             cursor.clone_from(&wanted);
         }
         self.reconcile(repo.as_ref());
+        self.schedule_preview();
         if self.cursor().and_then(Cursor::entry_name)
             != wanted.as_ref().and_then(Cursor::entry_name)
         {

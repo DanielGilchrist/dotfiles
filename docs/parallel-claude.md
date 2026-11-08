@@ -64,14 +64,15 @@ types into the embedded session. `?` shows every key.
 | `Esc` | Back one level: a focused document to its panel, [2] or [3] to [1], then to the agent you left |
 | `⌃\` | Back to NAV from an agent. Twice goes to the previous agent |
 | `1` `2` `3` | Focus the list [1] (and the terminal in [0], without typing), the turn [2] and the changes [3]. Each is a plain list whose cursor decides what [0] shows |
-| `j k g G`, `[ ]` | Move in the focused panel, previous / next repo. With [0] focused they scroll it and jump to its top and bottom |
+| `j k g G`, `{ }` | Move in the focused panel, previous / next repo. With [0] focused they scroll it and jump to its top and bottom |
 | `J K` | From [2] or [3], scroll [0] two rows without focusing it |
 | `⌃D ⌃U` | Half a page in the list, or in [0] from [2] or [3] |
 | `+` `_` | [0] full width / back. Keys keep going to the focused panel, so `j` flips to the next file |
 | `t` | From [2], [3] or a focused document, preview the agent's live terminal read-only (double border, `[0] preview · …`) and back to the same place. In the preview `r` replies, `i` or `⏎` types, `Esc` returns |
 | `.` | Show every checkout, or only those with a live session (the default). `+7 hidden` in [1]'s corner says how many are left out |
 | `Space` / `/` | Switcher (fuzzy), `⌃N ⌃P` to move |
-| `Tab` / `⇧Tab` | Cycle [1]'s tabs: the repo, all agents, pinned. The title names them where the width allows, the active one bold, and the footer's `Tab` hint names the next |
+| `Tab` / `⇧Tab` | Focus the next / previous left panel: [1], [2], [3], wrapping and skipping one with nothing to focus. In AGENT mode they go to the agent |
+| `[` / `]` | Cycle the focused panel's tabs. Only [1] has them: the repo, all agents, pinned. The title names them where the width allows, the active one bold, and the footer's `]` hint names the next |
 | `m` | Pin / unpin (pinned agents get their own tab) |
 | `n` | New agent form: prompt (`⌃E` edits it in $EDITOR), name (suggested from the prompt or a Linear/GitHub link), repo (listed, from the catalogue, or a path) |
 | `c` | Check out for review: a branch name or a GitHub PR link, name (suggested from it), repo (a PR link picks the repo it names). Fetches the branch if git doesn't know it, asks `gh` for a PR's branch (a fork's PR lands on a `pr/N` branch), and attaches instead if an agent already has the branch checked out |

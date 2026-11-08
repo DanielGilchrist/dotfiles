@@ -779,6 +779,46 @@ fn on_panel_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
     }
 }
 
+fn cycle_tab(m: &mut Model, direction: Direction) {
+    if m.panel == Panel::Agents {
+        m.cycle_view(direction);
+    } else {
+        m.info("this panel has no tabs");
+    }
+}
+
+fn panel_focusable(m: &Model, number: usize) -> bool {
+    match number {
+        1 => true,
+        2 => m
+            .selected_entry()
+            .is_some_and(|e| m.activity(e.name()).is_some()),
+        _ => m.change_rows() > 0 && m.work_room != WorkRoom::TooShort,
+    }
+}
+
+fn cycle_panel(m: &mut Model, direction: Direction) -> Vec<Effect> {
+    let current = match m.panel.listed() {
+        Panel::Agent { .. } => 2,
+        Panel::Changes { .. } => 3,
+        _ => 1,
+    };
+    let step = match direction {
+        Direction::Forward => 1,
+        Direction::Back => 2,
+    };
+    let target = (1..=3)
+        .map(|k| (current - 1 + k * step) % 3 + 1)
+        .find(|n| panel_focusable(m, *n))
+        .unwrap_or(1);
+    let digit = match target {
+        2 => '2',
+        3 => '3',
+        _ => '1',
+    };
+    on_panel_key(m, KeyCode::Char(digit)).unwrap_or_default()
+}
+
 fn on_nav_key(m: &mut Model, key: KeyEvent) -> Vec<Effect> {
     let armed = std::mem::replace(&mut m.chord, Chord::Idle) == Chord::Armed;
     if pressed(&key, m.keys.nav()) {
@@ -841,10 +881,12 @@ fn on_nav_key(m: &mut Model, key: KeyEvent) -> Vec<Effect> {
         KeyCode::Char('k') | KeyCode::Up => m.move_in_panel(-1),
         KeyCode::Char('g') | KeyCode::Home => m.panel_to_edge(Edge::First),
         KeyCode::Char('G') | KeyCode::End => m.panel_to_edge(Edge::Last),
-        KeyCode::Char(']') => m.jump_repo(1),
-        KeyCode::Char('[') => m.jump_repo(-1),
-        KeyCode::Tab => m.cycle_view(Direction::Forward),
-        KeyCode::BackTab => m.cycle_view(Direction::Back),
+        KeyCode::Char('}') => m.jump_repo(1),
+        KeyCode::Char('{') => m.jump_repo(-1),
+        KeyCode::Char(']') => cycle_tab(m, Direction::Forward),
+        KeyCode::Char('[') => cycle_tab(m, Direction::Back),
+        KeyCode::Tab => return cycle_panel(m, Direction::Forward),
+        KeyCode::BackTab => return cycle_panel(m, Direction::Back),
         KeyCode::Char('+') => m.screen = Screen::Full,
         KeyCode::Char('_') => m.screen = Screen::Split,
         KeyCode::Char('.') if m.view == View::Pinned => {
@@ -1926,7 +1968,7 @@ mod tests {
     #[test]
     fn overview_expands_only_the_selected_repo_and_collapses_single_entry_repos() {
         let mut m = model(&[]);
-        update(&mut m, key(KeyCode::Tab));
+        update(&mut m, key(KeyCode::Char(']')));
         let rows = m.rows();
         assert_eq!(rows.len(), 5, "{rows:?}");
         assert!(
@@ -1937,7 +1979,7 @@ mod tests {
     #[test]
     fn enter_on_a_repo_row_focuses_it() {
         let mut m = model(&[]);
-        update(&mut m, key(KeyCode::Tab));
+        update(&mut m, key(KeyCode::Char(']')));
         update(&mut m, key(KeyCode::Char('g')));
         assert!(matches!(m.cursor(), Some(Cursor::Repo(_))));
         update(&mut m, key(KeyCode::Enter));
@@ -2074,9 +2116,9 @@ mod tests {
         with_changes(&mut m, 3);
         with_turn(&mut m);
         update(&mut m, key(KeyCode::Char('3')));
-        update(&mut m, key(KeyCode::Char(']')));
+        update(&mut m, key(KeyCode::Char('}')));
         assert_eq!(m.panel, Panel::Agents, "a new selection starts in [1]");
-        update(&mut m, key(KeyCode::Char('[')));
+        update(&mut m, key(KeyCode::Char('{')));
         update(&mut m, key(KeyCode::Char('2')));
         m.revalidate();
         assert_eq!(
@@ -2085,11 +2127,89 @@ mod tests {
             "the same agent keeps [2]"
         );
         update(&mut m, key(KeyCode::Esc));
-        update(&mut m, key(KeyCode::Tab));
+        update(&mut m, key(KeyCode::Char(']')));
         update(&mut m, key(KeyCode::Char('g')));
         assert!(matches!(m.cursor(), Some(Cursor::Repo(_))));
         update(&mut m, key(KeyCode::Char('2')));
         assert_eq!(m.panel, Panel::Agents, "a repo row has no [2]");
+    }
+
+    #[test]
+    fn tab_cycles_the_panels_and_wraps() {
+        let mut m = model(&[]);
+        with_changes(&mut m, 3);
+        with_turn(&mut m);
+        update(&mut m, key(KeyCode::Tab));
+        assert_eq!(m.panel, Panel::Agent { offset: 0 });
+        update(&mut m, key(KeyCode::Tab));
+        assert_eq!(m.panel, Panel::Changes { file: 0 });
+        update(&mut m, key(KeyCode::Tab));
+        assert_eq!(m.panel, Panel::Agents);
+        update(&mut m, key(KeyCode::BackTab));
+        assert_eq!(m.panel, Panel::Changes { file: 0 });
+        update(&mut m, key(KeyCode::BackTab));
+        assert_eq!(m.panel, Panel::Agent { offset: 0 });
+    }
+
+    #[test]
+    fn tab_skips_panels_that_have_nothing_to_focus() {
+        let mut m = model(&[]);
+        with_changes(&mut m, 3);
+        update(&mut m, key(KeyCode::Tab));
+        assert_eq!(m.panel, Panel::Changes { file: 0 }, "no turn recorded");
+        update(&mut m, key(KeyCode::Tab));
+        assert_eq!(m.panel, Panel::Agents);
+        with_changes(&mut m, 0);
+        with_turn(&mut m);
+        update(&mut m, key(KeyCode::BackTab));
+        assert_eq!(m.panel, Panel::Agent { offset: 0 }, "no files");
+        m.work_room = WorkRoom::TooShort;
+        with_changes(&mut m, 3);
+        update(&mut m, key(KeyCode::Tab));
+        assert_eq!(m.panel, Panel::Agents, "no room for [3]");
+    }
+
+    #[test]
+    fn tab_from_a_document_goes_to_the_panel_after_its_origin() {
+        let mut m = model(&[]);
+        with_changes(&mut m, 3);
+        with_turn(&mut m);
+        m.panel = Panel::Main(crate::model::Origin::Turn { offset: 0 });
+        update(&mut m, key(KeyCode::Tab));
+        assert_eq!(m.panel, Panel::Changes { file: 0 });
+        m.panel = Panel::Preview {
+            from: crate::model::Origin::Changes { file: 0 },
+            in_main: false,
+        };
+        update(&mut m, key(KeyCode::Tab));
+        assert_eq!(m.panel, Panel::Agents);
+    }
+
+    #[test]
+    fn a_tab_switch_reschedules_the_preview_so_the_pane_never_sticks() {
+        let mut m = model(&["fix"]);
+        m.pane = Pane::Empty;
+        m.preview_at = None;
+        update(&mut m, key(KeyCode::Char(']')));
+        assert!(
+            m.preview_at.is_some(),
+            "the selection may have changed under the tab"
+        );
+    }
+
+    #[test]
+    fn brackets_cycle_the_tabs_of_the_list_only() {
+        let mut m = model(&["fix"]);
+        with_changes(&mut m, 3);
+        with_turn(&mut m);
+        update(&mut m, key(KeyCode::Char(']')));
+        assert_eq!(m.view, View::Overview);
+        update(&mut m, key(KeyCode::Char('[')));
+        assert_eq!(m.view, View::Focus);
+        update(&mut m, key(KeyCode::Char('2')));
+        update(&mut m, key(KeyCode::Char(']')));
+        assert_eq!(m.view, View::Focus, "[2] has no tabs");
+        assert_eq!(m.panel, Panel::Agent { offset: 0 });
     }
 
     #[test]
@@ -2934,7 +3054,7 @@ mod tests {
             "asking beats an older done"
         );
         assert_eq!(m.attention().title(), "◆1 ✓1 · agent");
-        update(&mut m, key(KeyCode::Tab));
+        update(&mut m, key(KeyCode::Char(']')));
         let rows = m.rows();
         assert_eq!(rows[0], Row::Header(crate::model::Group::NeedsYou));
         assert_eq!(
@@ -3009,7 +3129,7 @@ mod tests {
     fn the_selection_follows_an_agent_into_and_out_of_needs_you() {
         use agent_core::activity::State;
         let mut m = two_live();
-        update(&mut m, key(KeyCode::Tab));
+        update(&mut m, key(KeyCode::Char(']')));
         m.set_cursor(Cursor::Entry(name("fix")));
         update(
             &mut m,
@@ -3030,29 +3150,29 @@ mod tests {
     fn tab_cycles_repo_agents_pinned_and_back() {
         let mut m = model(&["fix"]);
         assert_eq!(m.view, View::Focus);
-        update(&mut m, key(KeyCode::Tab));
+        update(&mut m, key(KeyCode::Char(']')));
         assert_eq!(m.view, View::Overview);
-        update(&mut m, key(KeyCode::Tab));
+        update(&mut m, key(KeyCode::Char(']')));
         assert_eq!(m.view, View::Pinned);
         assert_eq!(
             m.cursor(),
             Some(&Cursor::Entry(name("fix"))),
             "the selected agent is pinned, so it stays selected"
         );
-        update(&mut m, key(KeyCode::Tab));
+        update(&mut m, key(KeyCode::Char(']')));
         assert_eq!(m.view, View::Focus);
         assert_eq!(m.cursor(), Some(&Cursor::Entry(name("fix"))));
-        update(&mut m, key(KeyCode::BackTab));
+        update(&mut m, key(KeyCode::Char('[')));
         assert_eq!(m.view, View::Pinned);
-        update(&mut m, key(KeyCode::BackTab));
+        update(&mut m, key(KeyCode::Char('[')));
         assert_eq!(m.view, View::Overview);
     }
 
     #[test]
     fn the_pinned_tab_lists_pins_then_the_other_agents_that_need_you() {
         let mut m = model(&["api"]);
-        update(&mut m, key(KeyCode::Tab));
-        update(&mut m, key(KeyCode::Tab));
+        update(&mut m, key(KeyCode::Char(']')));
+        update(&mut m, key(KeyCode::Char(']')));
         let pin = Row::Entry {
             name: name("api"),
             place: crate::model::Place::Pinned,
@@ -3085,8 +3205,8 @@ mod tests {
     #[test]
     fn a_waiting_pin_stays_in_its_place_on_the_pinned_tab() {
         let mut m = model(&["fix"]);
-        update(&mut m, key(KeyCode::Tab));
-        update(&mut m, key(KeyCode::Tab));
+        update(&mut m, key(KeyCode::Char(']')));
+        update(&mut m, key(KeyCode::Char(']')));
         update(
             &mut m,
             Msg::Activities(HashMap::from([(name("fix"), asking("rm?", 5))])),
@@ -3104,8 +3224,8 @@ mod tests {
     #[test]
     fn an_empty_pinned_tab_selects_nothing_and_a_repo_pick_leaves_it() {
         let mut m = model(&[]);
-        update(&mut m, key(KeyCode::Tab));
-        update(&mut m, key(KeyCode::Tab));
+        update(&mut m, key(KeyCode::Char(']')));
+        update(&mut m, key(KeyCode::Char(']')));
         assert_eq!(m.rows(), Vec::new());
         assert_eq!(m.cursor(), None, "nothing to select");
         update(&mut m, key(KeyCode::Char('p')));
@@ -3126,8 +3246,8 @@ mod tests {
             Msg::Activities(HashMap::from([(name("fix"), asking("rm?", 5))])),
         );
         m.set_cursor(Cursor::Entry(name("api")));
-        update(&mut m, key(KeyCode::Tab));
-        update(&mut m, key(KeyCode::Tab));
+        update(&mut m, key(KeyCode::Char(']')));
+        update(&mut m, key(KeyCode::Char(']')));
         assert_eq!(m.view, View::Pinned);
         assert_eq!(
             m.cursor(),
@@ -3139,8 +3259,8 @@ mod tests {
     #[test]
     fn selecting_an_agent_the_pinned_tab_lacks_moves_to_the_agents_tab() {
         let mut m = model(&["api"]);
-        update(&mut m, key(KeyCode::Tab));
-        update(&mut m, key(KeyCode::Tab));
+        update(&mut m, key(KeyCode::Char(']')));
+        update(&mut m, key(KeyCode::Char(']')));
         m.set_cursor(Cursor::Entry(name("fix")));
         assert_eq!(m.view, View::Overview);
         assert_eq!(m.cursor(), Some(&Cursor::Entry(name("fix"))));
@@ -3158,17 +3278,17 @@ mod tests {
     fn a_full_tab_cycle_comes_back_to_the_agent_the_pinned_tab_lacked() {
         let mut m = model(&["api"]);
         assert_eq!(m.cursor(), Some(&Cursor::Entry(name("fix"))));
-        update(&mut m, key(KeyCode::Tab));
-        update(&mut m, key(KeyCode::Tab));
+        update(&mut m, key(KeyCode::Char(']')));
+        update(&mut m, key(KeyCode::Char(']')));
         assert_eq!(m.cursor(), Some(&Cursor::Entry(name("api"))));
-        update(&mut m, key(KeyCode::Tab));
+        update(&mut m, key(KeyCode::Char(']')));
         assert_eq!(m.view, View::Focus);
         assert_eq!(m.cursor(), Some(&Cursor::Entry(name("fix"))));
 
-        update(&mut m, key(KeyCode::Tab));
-        update(&mut m, key(KeyCode::Tab));
+        update(&mut m, key(KeyCode::Char(']')));
+        update(&mut m, key(KeyCode::Char(']')));
         m.set_cursor(Cursor::Entry(name("api")));
-        update(&mut m, key(KeyCode::Tab));
+        update(&mut m, key(KeyCode::Char(']')));
         assert_eq!(
             m.cursor(),
             Some(&Cursor::Entry(name("api"))),
@@ -3184,8 +3304,8 @@ mod tests {
             Msg::Activities(HashMap::from([(name("fix"), asking("rm?", 5))])),
         );
         m.set_cursor(Cursor::Entry(name("idle")));
-        update(&mut m, key(KeyCode::Tab));
-        update(&mut m, key(KeyCode::Tab));
+        update(&mut m, key(KeyCode::Char(']')));
+        update(&mut m, key(KeyCode::Char(']')));
         assert_eq!(m.view, View::Pinned);
         assert_eq!(m.cursor(), Some(&Cursor::Entry(name("web"))));
     }
@@ -3248,8 +3368,8 @@ mod tests {
             Msg::Activities(HashMap::from([(name("fix"), asking("rm?", 5))])),
         );
         m.set_cursor(Cursor::Entry(name("tools")));
-        update(&mut m, key(KeyCode::Tab));
-        update(&mut m, key(KeyCode::Tab));
+        update(&mut m, key(KeyCode::Char(']')));
+        update(&mut m, key(KeyCode::Char(']')));
         let pin = Cursor::Entry(name("api"));
         assert_eq!(
             m.cursor(),
@@ -3261,7 +3381,7 @@ mod tests {
             Msg::Snapshot(Ok((snapshot_with_tools(false), Vec::new()))),
         );
         assert_eq!(m.cursor(), Some(&pin));
-        update(&mut m, key(KeyCode::Tab));
+        update(&mut m, key(KeyCode::Char(']')));
         assert_eq!(m.view, View::Focus);
         assert_eq!(m.cursor(), Some(&pin), "the gone agent is forgotten");
     }
@@ -3373,10 +3493,10 @@ mod tests {
     #[test]
     fn overview_drops_repos_with_nothing_listed_and_the_pinned_tab_keeps_every_pin() {
         let mut m = filtered(&["web"]);
-        update(&mut m, key(KeyCode::Tab));
+        update(&mut m, key(KeyCode::Char(']')));
         assert_eq!(m.view, View::Overview);
         assert_eq!(listed(&m), ["repo /src/api", "fix"], "web has no session");
-        update(&mut m, key(KeyCode::Tab));
+        update(&mut m, key(KeyCode::Char(']')));
         assert_eq!(m.view, View::Pinned);
         assert_eq!(listed(&m), ["web"], "pins show whatever their state");
         assert_eq!(m.hidden(), 0, "the filter doesn't apply here");
@@ -3385,10 +3505,10 @@ mod tests {
     #[test]
     fn repo_jumps_skip_repos_with_nothing_running() {
         let mut m = filtered(&[]);
-        update(&mut m, key(KeyCode::Char(']')));
+        update(&mut m, key(KeyCode::Char('}')));
         assert_eq!(selected(&m).as_deref(), Some("fix"));
         update(&mut m, key(KeyCode::Char('.')));
-        update(&mut m, key(KeyCode::Char(']')));
+        update(&mut m, key(KeyCode::Char('}')));
         assert_eq!(selected(&m).as_deref(), Some("web"));
     }
 

@@ -52,7 +52,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
             ("⌃D ⌃U", "half a page, of [0] from [3]"),
             ("J K", "scroll [0] from [3]"),
             ("g G", "first / last"),
-            ("[ ]", "previous / next repo"),
+            ("{ }", "previous / next repo"),
             ("+ _", "[0] full width / back"),
             (".", "show every checkout, or only those running"),
             ("Space /", "switch agent"),
@@ -60,7 +60,8 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
                 "p",
                 "repos: focus one, or add one from the catalogue or a path",
             ),
-            ("Tab ⇧Tab", "next / previous tab: repo, agents, pinned"),
+            ("Tab ⇧Tab", "next / previous panel"),
+            ("[ ]", "previous / next tab in [1]: repo, agents, pinned"),
             ("m", "pin / unpin"),
             ("n c", "new agent, or check out a branch / PR for review"),
             ("e", "open in $EDITOR, the file in [3]"),
@@ -750,7 +751,9 @@ fn draw_status_bar(frame: &mut Frame<'_>, m: &Model, area: Rect) {
                 1,
             ));
         }
-        hints.push(ranked("Tab", m.view.next().hint(), 6));
+        if m.panel == Panel::Agents {
+            hints.push(ranked("]", m.view.next().hint(), 6));
+        }
         if entry.is_some() && !m.actions.is_empty() {
             hints.push(ranked("x", "actions", 0));
         }
