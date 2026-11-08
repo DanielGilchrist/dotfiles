@@ -488,7 +488,7 @@ fn read_document(m: &mut Model) -> Option<Effect> {
             m.docs
                 .cached_diffs(&folder.name, folder.base, folder.generation, &folder.files)
         }
-        Key::Diff(_) | Key::Branch(_) => Vec::new(),
+        Key::Diff(_) | Key::Branch(_) | Key::Commit(_) => Vec::new(),
     };
     Some(Effect::ReadDocument {
         key: due,
@@ -852,12 +852,83 @@ fn open_comment(m: &mut Model) {
     };
 }
 
+/// Keys for [0] while it reads the branch: a cursor over its commits and
+/// uncommitted files, `⏎` into one's diff and `e` on a file.
+fn branch_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
+    if !matches!(m.hover(), Some(crate::document::Hover::Branch(_))) {
+        return None;
+    }
+    let lines = m.docs.lines();
+    if lines.is_empty() {
+        return None;
+    }
+    let at = m.diff_view.cursor;
+    let mut effects = Vec::new();
+    let to = match code {
+        KeyCode::Char('j') | KeyCode::Down => crate::review::step(lines, at, 1),
+        KeyCode::Char('k') | KeyCode::Up => crate::review::step(lines, at, -1),
+        KeyCode::Char('g') | KeyCode::Home => crate::review::first(lines),
+        KeyCode::Char('G') | KeyCode::End => crate::review::last(lines),
+        KeyCode::Enter => {
+            let line = lines.get(at)?;
+            m.opened = Some(match line.kind {
+                crate::review::LineKind::Commit => {
+                    let (sha, subject) = line.text.split_once(' ').unwrap_or((&line.text, ""));
+                    crate::model::Opened::Commit {
+                        sha: sha.to_string(),
+                        subject: subject.to_string(),
+                    }
+                }
+                crate::review::LineKind::Entry => crate::model::Opened::File {
+                    path: line.path.clone(),
+                    code: line.text.clone(),
+                },
+                _ => return Some(effects),
+            });
+            m.diff_view.owner = None;
+            return Some(effects);
+        }
+        KeyCode::Char('e') => {
+            let line = lines.get(at)?;
+            if line.kind != crate::review::LineKind::Entry {
+                return None;
+            }
+            let root = m.selected_entry()?.path()?.to_path_buf();
+            effects.push(Effect::Edit(Open::File {
+                root,
+                file: line.path.clone(),
+            }));
+            return Some(effects);
+        }
+        KeyCode::PageDown | KeyCode::PageUp => {
+            let half = m.docs.half_page() * 2;
+            m.docs.scroll_by(if code == KeyCode::PageDown {
+                half
+            } else {
+                -half
+            });
+            m.diff_view.follow_page = true;
+            return Some(effects);
+        }
+        _ => return None,
+    };
+    if let Some(to) = to {
+        m.diff_view.cursor = to;
+        m.diff_view.reveal = true;
+    }
+    Some(effects)
+}
+
 /// Keys for [0] while it reads a diff: the line cursor, hunk jumps and
 /// editing at the line. `None` leaves the key to the plain document keys.
 fn diff_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
     if !matches!(
         m.hover(),
-        Some(crate::document::Hover::Diff(_) | crate::document::Hover::Folder(_))
+        Some(
+            crate::document::Hover::Diff(_)
+                | crate::document::Hover::Folder(_)
+                | crate::document::Hover::Commit(_)
+        )
     ) {
         return None;
     }
@@ -996,8 +1067,14 @@ fn sanitize_paste(text: &str) -> String {
 /// Keys that choose the panel `j`/`k` act on, and those a panel gives its
 /// own meaning. `None` leaves the key to NAV.
 fn on_panel_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
+    if m.main_focused() && code == KeyCode::Esc && m.opened.take().is_some() {
+        m.diff_view.owner = None;
+        return Some(Vec::new());
+    }
     if m.main_focused()
-        && let Some(effects) = log_key(m, code).or_else(|| diff_key(m, code))
+        && let Some(effects) = log_key(m, code)
+            .or_else(|| diff_key(m, code))
+            .or_else(|| branch_key(m, code))
     {
         return Some(effects);
     }
@@ -1086,6 +1163,7 @@ fn on_panel_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
             if m.hover().is_some() =>
         {
             m.panel = m.panel.into_main();
+            m.opened = None;
             Some(Vec::new())
         }
         (KeyCode::Char('0'), Panel::Agents) => m

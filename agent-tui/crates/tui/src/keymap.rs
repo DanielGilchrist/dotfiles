@@ -87,6 +87,8 @@ pub struct Situation {
     pub subagent_row: bool,
     /// [0] reads a diff: a file's, a folder's or a commit's.
     pub diff: bool,
+    /// [0] reads the branch.
+    pub branch: bool,
     /// The selected agent has comments drafted on its diffs.
     pub draft: bool,
     pub left_agent: bool,
@@ -148,8 +150,13 @@ impl Situation {
             subagent_row: m.subagent_selected().is_some(),
             diff: matches!(
                 m.hover(),
-                Some(crate::document::Hover::Diff(_) | crate::document::Hover::Folder(_))
+                Some(
+                    crate::document::Hover::Diff(_)
+                        | crate::document::Hover::Folder(_)
+                        | crate::document::Hover::Commit(_)
+                )
             ),
+            branch: matches!(m.hover(), Some(crate::document::Hover::Branch(_))),
             draft: entry.is_some_and(|e| m.drafts.contains_key(e.name())),
             left_agent,
             can_edit_checkout: selected.is_some(),
@@ -330,6 +337,13 @@ pub const BINDINGS: &[Binding] = &[
         "Collapse every folder in [3], or expand them all.",
     ),
     Binding::new(
+        &["⏎"],
+        Ctxs::of(&[Ctx::Main]),
+        RankBy(|s| s.branch.then_some(9)),
+        By(|s| s.branch.then_some("open")),
+        "Open the commit under the cursor: the files it changed with each diff against its parent. On an uncommitted file it opens that file's diff. Esc goes back to the branch.",
+    ),
+    Binding::new(
         &["e"],
         Ctxs::of(&[Ctx::Main]),
         RankBy(|s| s.diff.then_some(7)),
@@ -460,7 +474,8 @@ pub const BINDINGS: &[Binding] = &[
         PANELS,
         RankBy(|s| (s.ctx == Ctx::Main).then_some(8)),
         By(|s| {
-            Some(match (s.ctx, s.diff) {
+            Some(match (s.ctx, s.diff || s.branch) {
+                (Ctx::Main, true) if s.branch => "move",
                 (Ctx::Main, true) => "line",
                 (Ctx::Main, false) => "scroll",
                 _ => "move",
@@ -726,6 +741,7 @@ mod tests {
             tree: true,
             subagent_row: true,
             diff: false,
+            branch: false,
             draft: false,
             left_agent: true,
             can_edit_checkout: true,

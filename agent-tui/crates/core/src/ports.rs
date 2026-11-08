@@ -387,6 +387,16 @@ pub trait Vcs: Send + Sync {
     /// The worktree's commits since it forked, and its uncommitted files.
     /// Slow on a big repo: call it off the UI thread.
     fn branch_log(&self, worktree: &Path) -> Result<BranchLog, CommandError>;
+    /// The files commit `sha` changed, each with its diff against its
+    /// parent. Slow on big commits: call it off the UI thread.
+    fn commit_diff(
+        &self,
+        worktree: &Path,
+        sha: &str,
+    ) -> Result<Vec<(Change, FileDiff)>, CommandError> {
+        let _ = (worktree, sha);
+        Ok(Vec::new())
+    }
     /// `path`'s change against `base`: the last commit, or the fork point
     /// from the default branch (committed and uncommitted together). `lines`
     /// says what kind of change facts found, so a new untracked file is

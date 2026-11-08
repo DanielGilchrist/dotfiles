@@ -121,9 +121,19 @@ pub struct BranchKey {
     pub generation: u64,
 }
 
+/// A commit's diff: the files it changed, read when it is opened from the
+/// branch view.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitKey {
+    pub name: SessionName,
+    pub sha: String,
+    pub subject: String,
+}
+
 /// A document read off the UI thread.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Key {
+    Commit(CommitKey),
     Diff(DiffKey),
     Branch(BranchKey),
     Folder(FolderKey),
@@ -139,6 +149,10 @@ impl Key {
             Self::Diff(key) => (key.name.clone(), Some(key.path.clone())),
             Self::Branch(key) => (key.name.clone(), None),
             Self::Folder(key) => (key.name.clone(), Some(key.path.clone())),
+            Self::Commit(key) => (
+                key.name.clone(),
+                Some(PathBuf::from(format!("commit:{}", key.sha))),
+            ),
         }
     }
 
@@ -147,6 +161,7 @@ impl Key {
             Self::Diff(key) => &key.name,
             Self::Branch(key) => &key.name,
             Self::Folder(key) => &key.name,
+            Self::Commit(key) => &key.name,
         }
     }
 }
@@ -190,6 +205,8 @@ pub enum Hover {
     Branch(BranchKey),
     /// A folder in [3].
     Folder(FolderKey),
+    /// A commit opened from the branch view.
+    Commit(CommitKey),
     /// [2]'s turn row.
     Turn(SessionName),
     /// A subagent row in [2].
@@ -204,6 +221,7 @@ enum Item {
     File(SessionName, PathBuf),
     Branch(SessionName),
     Folder(SessionName, PathBuf),
+    Commit(SessionName, String),
     Turn(SessionName),
     Subagent(SessionName, AgentId),
     Repo(RepoKey),
@@ -215,6 +233,7 @@ impl Hover {
             Self::Diff(key) => Item::File(key.name.clone(), key.path.clone()),
             Self::Branch(key) => Item::Branch(key.name.clone()),
             Self::Folder(key) => Item::Folder(key.name.clone(), key.path.clone()),
+            Self::Commit(key) => Item::Commit(key.name.clone(), key.sha.clone()),
             Self::Turn(name) => Item::Turn(name.clone()),
             Self::Subagent(name, id) => Item::Subagent(name.clone(), id.clone()),
             Self::Repo(key) => Item::Repo(key.clone()),
@@ -227,6 +246,7 @@ impl Hover {
             Self::Diff(key) => Some(Key::Diff(key.clone())),
             Self::Branch(key) => Some(Key::Branch(key.clone())),
             Self::Folder(key) => Some(Key::Folder(key.clone())),
+            Self::Commit(key) => Some(Key::Commit(key.clone())),
             Self::Turn(_) | Self::Subagent(..) | Self::Repo(_) => None,
         }
     }

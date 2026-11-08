@@ -3504,6 +3504,89 @@ mod tests {
     }
 
     #[test]
+    fn enter_on_a_commit_in_the_branch_opens_its_files_and_escape_goes_back() {
+        use crate::document::{Doc, FolderDocs, FolderFile, Hover, Key};
+        use agent_core::ports::{BranchLog, Change, FileDiff, FileState, Lines};
+        use crossterm::event::KeyCode;
+        let mut m = fleet(10);
+        m.set_cursor(Cursor::Entry(name("obs-layout-4")));
+        m.toggle_changes_scope();
+        m.panel = Focused::Changes { file: 0 };
+        m.settle_main();
+        std::thread::sleep(crate::document::REST + std::time::Duration::from_millis(20));
+        let key = m.docs.due(std::time::Instant::now()).expect("due");
+        m.docs.loaded(
+            &key,
+            Ok(Doc::Branch(BranchLog {
+                commits: vec![
+                    "abc1234 Fix the rounding".into(),
+                    "def5678 Add tests".into(),
+                ],
+                uncommitted: vec![(" M".into(), "src/a.rs".into())],
+            })),
+        );
+        render(&mut m, (140, 40));
+        m.panel = m.panel.into_main();
+        let text = screen(&render(&mut m, (140, 40))).join("\n");
+        assert!(
+            text.contains("▌abc1234"),
+            "the cursor starts on the first commit\n{text}"
+        );
+        press(&mut m, KeyCode::Char('j'));
+        press(&mut m, KeyCode::Char('k'));
+        let effects = press(&mut m, KeyCode::Enter);
+        let _ = effects;
+        let Some(Hover::Commit(commit)) = m.hover() else {
+            panic!("a commit opens");
+        };
+        assert_eq!(commit.sha, "abc1234");
+        m.settle_main();
+        std::thread::sleep(crate::document::REST + std::time::Duration::from_millis(20));
+        let key = m
+            .docs
+            .due(std::time::Instant::now())
+            .expect("the commit is read");
+        assert!(matches!(key, Key::Commit(_)));
+        let change = Change {
+            path: "src/a.rs".into(),
+            lines: Lines::Counted {
+                added: 1,
+                removed: 0,
+            },
+            state: FileState::Committed,
+        };
+        m.docs.loaded(
+            &key,
+            Ok(Doc::Folder(FolderDocs {
+                files: vec![FolderFile {
+                    change,
+                    diff: Ok(FileDiff::Text {
+                        lines: vec!["@@ -1 +1,2 @@".into(), " a".into(), "+b".into()],
+                        more: 0,
+                    }),
+                }],
+                more_files: 0,
+            })),
+        );
+        m.settle_main();
+        let text = screen(&render(&mut m, (140, 40))).join("\n");
+        assert!(
+            text.contains("[0] commit abc1234 Fix the rounding"),
+            "{text}"
+        );
+        assert!(text.contains("+b"), "{text}");
+        press(&mut m, KeyCode::Char('j'));
+        press(&mut m, KeyCode::Esc);
+        assert!(
+            matches!(m.hover(), Some(Hover::Branch(_))),
+            "Esc goes back one level"
+        );
+        assert!(m.main_focused(), "and [0] keeps the keys");
+        press(&mut m, KeyCode::Esc);
+        assert!(!m.main_focused());
+    }
+
+    #[test]
     fn clicks_and_the_wheel_work_on_tree_rows() {
         let mut m = tree_fleet();
         render(&mut m, (100, 50));

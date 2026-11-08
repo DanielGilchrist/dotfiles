@@ -7,6 +7,10 @@ use std::path::{Path, PathBuf};
 pub enum LineKind {
     /// A hunk header or a `\ No newline` note: shown, never selected.
     Header,
+    /// A commit in the branch view; its `text` is the log line.
+    Commit,
+    /// An uncommitted file in the branch view; its `text` is its status.
+    Entry,
     Added,
     Removed,
     Context,
@@ -336,7 +340,7 @@ mod tests {
         let comment = Comment::on(&[&lines[1]], "Use the limit.".into()).expect("a line");
         assert!(comment.covers(&lines[1]));
         assert_eq!(
-            review_message("", &[comment.clone()]),
+            review_message("", std::slice::from_ref(&comment)),
             "Review comments. Work through each one.\n\na.rs:1\n> +let x = 3;\nUse the limit."
         );
         let with = review_message("Mostly fine.", &[comment]);

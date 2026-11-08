@@ -8,7 +8,7 @@ use std::time::Instant;
 use agent_core::activity::AgentId;
 use agent_core::model::{Head, RepoKey};
 use agent_core::names::SessionName;
-use agent_core::ports::{BranchLog, Compared, FileDiff, Lines};
+use agent_core::ports::{BranchLog, Change, Compared, FileDiff, Lines};
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -20,7 +20,9 @@ use super::{
     accent, bold, dim, error, fit, justify, line_width, spinner, success, truncate_end,
     truncate_start, warning, wrap,
 };
-use crate::document::{BranchKey, DiffKey, Doc, FolderDocs, FolderKey, Hover, Key, Resolved};
+use crate::document::{
+    BranchKey, CommitKey, DiffKey, Doc, FolderDocs, FolderKey, Hover, Key, Resolved,
+};
 use crate::model::{AgentStatus, Model, SubagentKey};
 use crate::review::{self, LineInfo};
 
@@ -97,6 +99,7 @@ pub(super) fn page(m: &mut Model, area: Rect, width: usize, border: Style) -> Op
         Hover::Diff(key) => diff_body(m, key, columns, budget),
         Hover::Branch(key) => branch_body(m, key, columns),
         Hover::Folder(key) => folder_body(m, key, columns, budget),
+        Hover::Commit(key) => commit_body(m, key, columns),
         Hover::Turn(name) => turn_body(m, name, columns)?,
         Hover::Subagent(name, id) => log_body(m, name, id, columns, budget),
         Hover::Repo(key) => repo_body(m, key, columns)?,
@@ -451,6 +454,7 @@ fn folder_body(m: &mut Model, hover: &FolderKey, columns: usize, budget: usize) 
     }
     Body {
         rows,
+        diff: true,
         ..Body::built(title, Vec::new())
     }
 }
@@ -481,12 +485,23 @@ fn folder_rows(
     docs: Option<Result<&FolderDocs, &String>>,
     columns: usize,
 ) -> (Vec<Line<'static>>, Vec<LineInfo>) {
+    section_rows(&folder.files, &folder.path, docs, columns)
+}
+
+/// `files` listed, then a section per file of `docs`. Paths in the list are
+/// shown relative to `base`.
+fn section_rows(
+    files: &[Change],
+    base: &Path,
+    docs: Option<Result<&FolderDocs, &String>>,
+    columns: usize,
+) -> (Vec<Line<'static>>, Vec<LineInfo>) {
     let mut rows: Vec<Line<'static>> = Vec::new();
     let mut infos: Vec<LineInfo> = Vec::new();
-    for change in &folder.files {
+    for change in files {
         let rel = change
             .path
-            .strip_prefix(&folder.path)
+            .strip_prefix(base)
             .unwrap_or(&change.path)
             .to_string_lossy()
             .into_owned();
@@ -536,6 +551,39 @@ fn folder_rows(
     (rows, infos)
 }
 
+/// A commit opened from the branch view: the files it changed, then each
+/// file's diff against its parent.
+fn commit_body(m: &mut Model, hover: &CommitKey, columns: usize) -> Body {
+    let rows = match m.docs.resolve() {
+        Resolved::Current(key, loaded) | Resolved::Stale(key, loaded) => {
+            let (key, loaded) = (key.clone(), loaded.clone());
+            m.docs
+                .rows_with_lines(&key, columns, || match loaded.as_ref() {
+                    Ok(Doc::Folder(docs)) => {
+                        let files: Vec<Change> =
+                            docs.files.iter().map(|f| f.change.clone()).collect();
+                        section_rows(&files, Path::new(""), Some(Ok(docs)), columns)
+                    }
+                    Err(e) => section_rows(&[], Path::new(""), Some(Err(e)), columns),
+                    Ok(_) => (Vec::new(), Vec::new()),
+                });
+            Rows::Cached
+        }
+        Resolved::Missing => Rows::Built(Vec::new()),
+    };
+    let short: String = hover.sha.chars().take(8).collect();
+    let title = vec![
+        Span::raw("[0] "),
+        Span::styled(format!("commit {short}"), bold()),
+        Span::styled(format!(" {}", hover.subject), dim()),
+    ];
+    Body {
+        rows,
+        diff: true,
+        ..Body::built(title, Vec::new())
+    }
+}
+
 /// The branch: how far it is from shipping, its commits and the files not
 /// yet committed.
 fn branch_body(m: &mut Model, key: &BranchKey, columns: usize) -> Body {
@@ -549,14 +597,18 @@ fn branch_body(m: &mut Model, key: &BranchKey, columns: usize) -> Body {
     let rows = match m.docs.resolve() {
         Resolved::Current(key, loaded) | Resolved::Stale(key, loaded) => {
             let (key, loaded) = (key.clone(), loaded.clone());
-            m.docs.rows(&key, columns, || match loaded.as_ref() {
-                Ok(Doc::Branch(log)) => branch_rows(log, &compared, behind, columns),
-                Ok(Doc::Diff(_) | Doc::Folder(_)) => Vec::new(),
-                Err(e) => vec![Line::styled(
-                    e.lines().next().unwrap_or_default().to_string(),
-                    error(),
-                )],
-            });
+            m.docs
+                .rows_with_lines(&key, columns, || match loaded.as_ref() {
+                    Ok(Doc::Branch(log)) => branch_rows(log, &compared, behind, columns),
+                    Ok(Doc::Diff(_) | Doc::Folder(_)) => (Vec::new(), Vec::new()),
+                    Err(e) => (
+                        vec![Line::styled(
+                            e.lines().next().unwrap_or_default().to_string(),
+                            error(),
+                        )],
+                        Vec::new(),
+                    ),
+                });
             Rows::Cached
         }
         Resolved::Missing => Rows::Built(Vec::new()),
@@ -573,32 +625,58 @@ fn branch_body(m: &mut Model, key: &BranchKey, columns: usize) -> Body {
     }
 }
 
-/// A branch log as rows: its commits, then the files not committed.
+/// A branch log as rows: its commits, then the files not committed, each
+/// after a gutter for the cursor, and a line for each commit and file.
 fn branch_rows(
     log: &BranchLog,
     compared: &Compared,
     behind: usize,
     columns: usize,
-) -> Vec<Line<'static>> {
+) -> (Vec<Line<'static>>, Vec<LineInfo>) {
+    let gutter = || Span::raw(" ");
     let mut rows: Vec<Line<'static>> = Vec::new();
+    let mut items: Vec<LineInfo> = Vec::new();
+    let item =
+        |row: usize, height: usize, path: &Path, kind: review::LineKind, text: &str| LineInfo {
+            row,
+            height,
+            path: path.to_path_buf(),
+            kind,
+            old: None,
+            new: None,
+            text: text.to_string(),
+            edit: 1,
+        };
     if log.commits.is_empty() && log.uncommitted.is_empty() {
-        rows.push(Line::styled("nothing ahead of the default branch", dim()));
+        rows.push(Line::from(vec![
+            gutter(),
+            Span::styled("nothing ahead of the default branch", dim()),
+        ]));
     }
     if !log.commits.is_empty() {
-        rows.push(Line::styled(
-            format!("Commits ({})", log.commits.len()),
-            dim(),
-        ));
+        rows.push(Line::from(vec![
+            gutter(),
+            Span::styled(format!("Commits ({})", log.commits.len()), dim()),
+        ]));
         for commit in &log.commits {
             let (hash, subject) = commit.split_once(' ').unwrap_or((commit, ""));
-            let room = columns.saturating_sub(hash.len() + 1);
-            for (i, row) in hard_wrap(subject, room).into_iter().enumerate() {
+            let room = columns.saturating_sub(hash.len() + 2);
+            let cut = hard_wrap(subject, room);
+            items.push(item(
+                rows.len(),
+                cut.len(),
+                Path::new(""),
+                review::LineKind::Commit,
+                commit,
+            ));
+            for (i, row) in cut.into_iter().enumerate() {
                 let lead = if i == 0 {
                     hash.to_string()
                 } else {
                     " ".repeat(hash.len())
                 };
                 rows.push(Line::from(vec![
+                    gutter(),
                     Span::styled(lead, dim()),
                     Span::raw(format!(" {row}")),
                 ]));
@@ -607,25 +685,30 @@ fn branch_rows(
         rows.push(Line::raw(""));
     }
     if !log.uncommitted.is_empty() {
-        rows.push(Line::styled(
-            format!("Uncommitted ({})", log.uncommitted.len()),
-            dim(),
-        ));
+        rows.push(Line::from(vec![
+            gutter(),
+            Span::styled(format!("Uncommitted ({})", log.uncommitted.len()), dim()),
+        ]));
         for (code, path) in &log.uncommitted {
+            items.push(item(rows.len(), 1, path, review::LineKind::Entry, code));
             rows.push(Line::from(vec![
+                gutter(),
                 Span::styled(format!("{code} "), dim()),
                 Span::raw(truncate_start(
                     &path.to_string_lossy(),
-                    columns.saturating_sub(code.len() + 1),
+                    columns.saturating_sub(code.len() + 2),
                 )),
             ]));
         }
     }
     if let (true, Some(base)) = (behind > 0, compared.base()) {
         rows.push(Line::raw(""));
-        rows.push(Line::styled(format!("behind {base} by {behind}"), dim()));
+        rows.push(Line::from(vec![
+            gutter(),
+            Span::styled(format!("behind {base} by {behind}"), dim()),
+        ]));
     }
-    rows
+    (rows, items)
 }
 
 fn compared_title(compared: &Compared) -> String {

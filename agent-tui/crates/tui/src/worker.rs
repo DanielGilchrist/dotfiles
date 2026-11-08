@@ -363,6 +363,17 @@ fn spawn_document_readers(backend: &Arc<Backend>, msgs: &Sender<Msg>) -> Arc<Doc
                         .file_diff(&worktree, &diff.path, diff.lines, diff.base)
                         .map(Doc::Diff),
                     Key::Branch(_) => backend.vcs.branch_log(&worktree).map(Doc::Branch),
+                    Key::Commit(commit) => {
+                        backend
+                            .vcs
+                            .commit_diff(&worktree, &commit.sha)
+                            .map(|files| {
+                                let changes: Vec<_> =
+                                    files.iter().map(|(c, _)| c.clone()).collect();
+                                let diffs = files.into_iter().map(|(c, d)| (c.path, d)).collect();
+                                Doc::Folder(assemble(&changes, diffs, |_| Err("not read".into())))
+                            })
+                    }
                     Key::Folder(folder) => Ok(Doc::Folder(assemble(&folder.files, reuse, |c| {
                         backend
                             .vcs

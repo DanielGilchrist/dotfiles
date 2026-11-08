@@ -12,11 +12,11 @@ use agent_core::model::{
 use agent_core::names::{AgentName, BranchName, Checkout, Prompt, SessionName};
 use agent_core::ops::{Approved, Hazardous, RemovalPlan};
 use agent_core::paths::{RepoRoot, Typed, typed_path};
-use agent_core::ports::{Change, HarnessId, Readiness, SubagentDetail, WorktreeFacts};
+use agent_core::ports::{Change, HarnessId, Lines, Readiness, SubagentDetail, WorktreeFacts};
 use agent_term::{Emulator, Terminal};
 use ratatui::layout::Rect;
 
-use crate::document::{BranchKey, DiffKey, Documents, FolderKey, Hover, Key};
+use crate::document::{BranchKey, CommitKey, DiffKey, Documents, FolderKey, Hover, Key};
 use crate::palette::Palette;
 use crate::tree::{self, ChangesScope, ChangesView, Node, TreeRow};
 
@@ -1004,6 +1004,14 @@ pub struct SubagentRead {
     pub at: Instant,
 }
 
+/// What [0] opened from the branch view: a commit's diff, or the diff of an
+/// uncommitted file with its status code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Opened {
+    Commit { sha: String, subject: String },
+    File { path: PathBuf, code: String },
+}
+
 /// A subagent by its agent and its id.
 pub type SubagentKey = (SessionName, AgentId);
 
@@ -1100,6 +1108,8 @@ pub struct Model {
     pub log_view: crate::log::LogView,
     /// [0]'s diff: the cursor over its lines.
     pub diff_view: crate::review::DiffView,
+    /// What the branch view opened in [0], until `Esc` goes back to it.
+    pub opened: Option<Opened>,
     /// Comments drafted on diffs for each agent, until sent.
     pub drafts: HashMap<SessionName, Vec<crate::review::Comment>>,
     /// The agent whose terminal the peek float shows.
@@ -1174,6 +1184,7 @@ impl Model {
             subagent_reads: HashMap::new(),
             log_view: crate::log::LogView::default(),
             diff_view: crate::review::DiffView::default(),
+            opened: None,
             drafts: HashMap::new(),
             peek: None,
             outboxes: HashMap::new(),
@@ -1546,6 +1557,32 @@ impl Model {
         let root = entry.path()?.to_path_buf();
         let name = entry.name().clone();
         let generation = self.facts_generation.get(&name).copied().unwrap_or(0);
+        if self.panel.in_main()
+            && let Some(opened) = &self.opened
+        {
+            let hover = match opened {
+                Opened::Commit { sha, subject } => Hover::Commit(CommitKey {
+                    name,
+                    sha: sha.clone(),
+                    subject: subject.clone(),
+                }),
+                Opened::File { path, code } => Hover::Diff(DiffKey {
+                    name,
+                    path: path.clone(),
+                    lines: if code.trim() == "??" {
+                        Lines::Untracked
+                    } else {
+                        Lines::Counted {
+                            added: 0,
+                            removed: 0,
+                        }
+                    },
+                    base: agent_core::ports::DiffBase::Head,
+                    generation,
+                }),
+            };
+            return Some((hover, root));
+        }
         let folder = self.folder_under_cursor().map(|r| r.path);
         let hover = match (row, self.change_at(row), self.facts.get(&name)) {
             (_, None, _) if folder.is_none() && !self.branch_row() => return None,
@@ -1587,6 +1624,7 @@ impl Model {
             Hover::Diff(key) => Key::Diff(key),
             Hover::Branch(key) => Key::Branch(key),
             Hover::Folder(key) => Key::Folder(key),
+            Hover::Commit(key) => Key::Commit(key),
             Hover::Turn(_) | Hover::Subagent(..) | Hover::Repo(_) => return None,
         };
         Some((key, root))

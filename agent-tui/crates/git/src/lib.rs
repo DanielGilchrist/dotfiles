@@ -586,6 +586,28 @@ impl Vcs for Git {
         })
     }
 
+    fn commit_diff(
+        &self,
+        worktree: &Path,
+        sha: &str,
+    ) -> Result<Vec<(Change, FileDiff)>, CommandError> {
+        let mut cmd = git(worktree);
+        cmd.args([
+            "show",
+            "--no-color",
+            "--no-ext-diff",
+            "--format=",
+            "-m",
+            "--first-parent",
+        ])
+        .arg(sha);
+        let (out, cut) = process::output_capped(&mut cmd, DIFF_TIMEOUT, DIFF_BYTES * 4)?;
+        if !cut && !out.status.success() {
+            return Err(process::failed(&cmd, &out));
+        }
+        Ok(split_commit(&String::from_utf8_lossy(&out.stdout)))
+    }
+
     fn file_diff(
         &self,
         worktree: &Path,
@@ -633,6 +655,52 @@ impl Vcs for Git {
     fn delete_branch(&self, repo: &RepoRoot, branch: LocalBranch) -> Result<(), CommandError> {
         process::run(git(repo.path()).args(["branch", "-D", branch.name().as_str()])).map(drop)
     }
+}
+
+/// The per-file diffs in `git show` output, in git's order, with their
+/// counts.
+fn split_commit(out: &str) -> Vec<(Change, FileDiff)> {
+    let mut chunks: Vec<Vec<&str>> = Vec::new();
+    for line in out.lines() {
+        if line.starts_with("diff --git ") {
+            chunks.push(Vec::new());
+        }
+        if let Some(chunk) = chunks.last_mut() {
+            chunk.push(line);
+        }
+    }
+    chunks
+        .into_iter()
+        .filter_map(|chunk| {
+            let path = chunk
+                .iter()
+                .find_map(|l| l.strip_prefix("+++ b/"))
+                .or_else(|| chunk.iter().find_map(|l| l.strip_prefix("--- a/")))
+                .or_else(|| {
+                    chunk[0]
+                        .strip_prefix("diff --git a/")
+                        .and_then(|rest| rest.split(" b/").next())
+                })?;
+            let text = chunk.join("\n");
+            let diff =
+                parse_diff(&text, DIFF_LINES, false).unwrap_or(FileDiff::Binary { bytes: None });
+            let lines = match &diff {
+                FileDiff::Binary { .. } => Lines::Binary,
+                FileDiff::Text { lines, .. } => Lines::Counted {
+                    added: lines.iter().filter(|l| l.starts_with('+')).count(),
+                    removed: lines.iter().filter(|l| l.starts_with('-')).count(),
+                },
+            };
+            Some((
+                Change {
+                    path: PathBuf::from(path),
+                    lines,
+                    state: FileState::Committed,
+                },
+                diff,
+            ))
+        })
+        .collect()
 }
 
 /// The hunks of `git diff` output, from the first `@@`, at most `keep` lines
@@ -1241,5 +1309,22 @@ mod tests {
         assert_eq!(Git.unreachable_commits(&dir).expect("succeeds"), 0);
         sh(&format!("git checkout -q --detach && {commit} detached"));
         assert_eq!(Git.unreachable_commits(&dir).expect("succeeds"), 1);
+    }
+
+    #[test]
+    fn a_commit_splits_into_files_with_counts() {
+        let out = "diff --git a/src/a.rs b/src/a.rs\nindex 1..2 100644\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1,2 +1,2 @@\n-old\n+new\n keep\ndiff --git a/img.png b/img.png\nBinary files a/img.png and b/img.png differ\n";
+        let files = split_commit(out);
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].0.path, PathBuf::from("src/a.rs"));
+        assert_eq!(
+            files[0].0.lines,
+            Lines::Counted {
+                added: 1,
+                removed: 1
+            }
+        );
+        assert_eq!(files[1].0.path, PathBuf::from("img.png"));
+        assert_eq!(files[1].0.lines, Lines::Binary);
     }
 }

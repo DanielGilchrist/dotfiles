@@ -62,6 +62,7 @@ types into the embedded session. `?` shows every key.
 | `i` | Attach the selected agent from any panel |
 | `0` | Same as `⏎` in [1], [2] and [3] |
 | `s` | Send a message without attaching: now if the agent is at rest, otherwise queued. `⌃X` clears the queue (`t` says `send is s now`). With review comments drafted for the agent it reads `send review`: the comments go as one message after your typed overview |
+| `⏎` | With [0] on the branch: open the commit (its files and diffs) or uncommitted file under the cursor, `Esc` goes back |
 | `j` `k` `[` `]` `e` `c` | With [0] on a diff: move a line cursor, jump hunks, open the file at the line in $EDITOR, and comment on the line (`c`). Comments collect in a per-agent draft, marked `✎`, until `s` sends them |
 | `v` | Peek: a read-only float of the agent's terminal. `⏎` or `i` attaches, `s` sends, `Esc` or `v` closes |
 | `⌃\` | Back to NAV from an agent. Twice goes to the previous agent |
