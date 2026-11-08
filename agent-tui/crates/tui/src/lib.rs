@@ -365,6 +365,9 @@ impl Runtime {
                 Effect::ReadSubagent { name, id, workdir } => {
                     self.workers.read_subagent(name, id, workdir);
                 }
+                Effect::ReadTurn { name, workdir, at } => {
+                    self.workers.read_turn(name, workdir, at);
+                }
                 Effect::SuggestName {
                     prompt,
                     harness,

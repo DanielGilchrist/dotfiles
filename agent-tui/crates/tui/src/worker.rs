@@ -7,14 +7,14 @@ use std::thread::{self, JoinHandle};
 use agent_core::actions::CommandLine;
 use std::time::SystemTime;
 
-use agent_core::activity::{Activity, AgentId};
+use agent_core::activity::{Activity, AgentId, TranscriptRef};
 use agent_core::config::Sources;
 use agent_core::discover;
 use agent_core::model::{Removable, Running, Snapshot, Startable};
 use agent_core::names::{AgentName, Prompt, SessionName};
 use agent_core::ops::{self, Approved, Backend, Launch, RemovalPlan, Removed};
 use agent_core::paths::RepoRoot;
-use agent_core::ports::{ClientId, FileDiff, HarnessId, HostError, SubagentDetail, WorktreeFacts};
+use agent_core::ports::{ClientId, FileDiff, HarnessId, HostError, Log, TurnDetail, WorktreeFacts};
 use crossterm::event::{KeyEvent, MouseEvent};
 
 use crate::document::{Doc, Key, assemble};
@@ -98,7 +98,13 @@ pub enum Msg {
     Subagent {
         name: SessionName,
         id: AgentId,
-        detail: Result<Option<SubagentDetail>, String>,
+        detail: Result<Option<Log>, String>,
+    },
+    /// An agent's current turn, or `None` when its harness has no record of
+    /// one.
+    Turn {
+        name: SessionName,
+        turn: Result<Option<TurnDetail>, String>,
     },
 }
 
@@ -228,6 +234,7 @@ pub struct Workers {
     pub jobs: Sender<Job>,
     inspector: Arc<Inspector>,
     subagents: Arc<SubagentReader>,
+    turns: Arc<TurnReader>,
     documents: Arc<DocumentReader>,
     namer: Arc<Namer>,
     pub refresh: Sender<()>,
@@ -251,6 +258,12 @@ impl Workers {
     /// Asks for what subagent `id` of an agent working in `workdir` has done.
     pub fn read_subagent(&self, name: SessionName, id: AgentId, workdir: PathBuf) {
         self.subagents.request((name, id), workdir);
+    }
+
+    /// Asks for what the agent working in `workdir` has done this turn, from
+    /// the transcript its hooks named.
+    pub fn read_turn(&self, name: SessionName, workdir: PathBuf, at: Option<TranscriptRef>) {
+        self.turns.request(name, (workdir, at));
     }
 
     /// Asks the harness's model to name `prompt`. A request still waiting
@@ -404,34 +417,82 @@ fn spawn_document_readers(backend: &Arc<Backend>, msgs: &Sender<Msg>) -> Arc<Doc
     reader
 }
 
-/// Reads subagent transcripts on [`SUBAGENT_READERS`] threads.
+/// The harness `name` runs, or the default one for an agent with no record.
+fn harness_of<'a>(backend: &'a Backend, name: &SessionName) -> &'a dyn agent_core::ports::Harness {
+    backend
+        .store
+        .record(name)
+        .ok()
+        .flatten()
+        .and_then(|record| backend.harnesses.get(&record.harness))
+        .unwrap_or_else(|| backend.harnesses.default_harness())
+}
+
+/// Reads subagent transcripts.
 type SubagentReader = Queue<(SessionName, AgentId), PathBuf>;
 
-fn spawn_subagent_readers(backend: &Arc<Backend>, msgs: &Sender<Msg>) -> Arc<SubagentReader> {
-    let reader = Arc::new(SubagentReader::new());
+/// Reads agents' current turns.
+type TurnReader = Queue<SessionName, (PathBuf, Option<TranscriptRef>)>;
+
+/// Serves a queue of transcript reads on [`SUBAGENT_READERS`] threads.
+/// `read` asks the harness of the session `session` names and says what came
+/// back. The answer goes out before the key is free again, so a newer read of
+/// the same key can't be answered first and then overwritten by this one.
+fn spawn_log_readers<K, V>(
+    backend: &Arc<Backend>,
+    msgs: &Sender<Msg>,
+    session: fn(&K) -> &SessionName,
+    read: fn(&dyn agent_core::ports::Harness, &K, V) -> Msg,
+) -> Arc<Queue<K, V>>
+where
+    K: Clone + Eq + std::hash::Hash + Send + 'static,
+    V: Send + 'static,
+{
+    let reader = Arc::new(Queue::<K, V>::new());
     for _ in 0..SUBAGENT_READERS {
         let reader = Arc::clone(&reader);
         let backend = Arc::clone(backend);
         let msgs = msgs.clone();
         thread::spawn(move || {
             loop {
-                let ((name, id), workdir) = reader.next();
-                let harness = backend
-                    .store
-                    .record(&name)
-                    .ok()
-                    .flatten()
-                    .and_then(|record| backend.harnesses.get(&record.harness))
-                    .unwrap_or_else(|| backend.harnesses.default_harness());
-                let detail = harness.subagent(&workdir, &id).map_err(|e| describe(&e));
-                reader.done(&(name.clone(), id.clone()));
-                if msgs.send(Msg::Subagent { name, id, detail }).is_err() {
+                let (key, value) = reader.next();
+                let msg = read(harness_of(&backend, session(&key)), &key, value);
+                let sent = msgs.send(msg);
+                reader.done(&key);
+                if sent.is_err() {
                     return;
                 }
             }
         });
     }
     reader
+}
+
+fn spawn_subagent_readers(backend: &Arc<Backend>, msgs: &Sender<Msg>) -> Arc<SubagentReader> {
+    spawn_log_readers(
+        backend,
+        msgs,
+        |(name, _)| name,
+        |harness, (name, id), workdir| Msg::Subagent {
+            name: name.clone(),
+            id: id.clone(),
+            detail: harness.subagent(&workdir, id).map_err(|e| describe(&e)),
+        },
+    )
+}
+
+fn spawn_turn_readers(backend: &Arc<Backend>, msgs: &Sender<Msg>) -> Arc<TurnReader> {
+    spawn_log_readers(
+        backend,
+        msgs,
+        |name| name,
+        |harness, name, (workdir, at)| Msg::Turn {
+            name: name.clone(),
+            turn: harness
+                .turn(&workdir, at.as_ref())
+                .map_err(|e| describe(&e)),
+        },
+    )
 }
 
 /// Asks the model to name prompts on one thread, one at a time. A model
@@ -506,6 +567,7 @@ pub fn spawn(backend: Arc<Backend>, sources: Sources, msgs: Sender<Msg>) -> Work
 
     let inspector = spawn_inspectors(&backend, &msgs);
     let subagents = spawn_subagent_readers(&backend, &msgs);
+    let turns = spawn_turn_readers(&backend, &msgs);
     let documents = spawn_document_readers(&backend, &msgs);
     let namer = {
         let backend = Arc::clone(&backend);
@@ -541,6 +603,7 @@ pub fn spawn(backend: Arc<Backend>, sources: Sources, msgs: Sender<Msg>) -> Work
         jobs,
         inspector,
         subagents,
+        turns,
         documents,
         namer,
         refresh,

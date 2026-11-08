@@ -5,25 +5,26 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use agent_core::actions::{Action, CommandLine, Context, EventName, Invocation};
-use agent_core::activity::{Activity, AgentId, State as ActivityState};
+use agent_core::activity::{Activity, AgentId, State as ActivityState, TranscriptRef};
 use agent_core::config::ControlKey;
 use agent_core::model::{Entry, EntryState, RepoKey, Snapshot};
 use agent_core::names::{CarriageReturn, InvalidPrompt, Prompt, SessionName, clean};
 use agent_core::ops::{Approved, Launch};
 use agent_core::paths::{RepoRoot, Typed, typed_path};
-use agent_core::ports::{ClientId, Listing};
+use agent_core::ports::{ClientId, Listing, Log, TurnDetail};
 use agent_term::{CellPos, encode_key, encode_mouse};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind};
 use ratatui::layout::Position;
 
 use crate::document::{Documents, Key};
 use crate::keymap::Situation;
+use crate::log::Nav;
 use crate::model::{
     Answer, Areas, Chord, CommentDraft, Confirm, Cursor, DirCheck, Direction, Drawn, Edge, Enter,
-    Field, Focus, Follow, FormKind, HelpState, INFO_TTL, Inspection, Intent, Listed, Mode, Model,
-    Moment, NamingState, NewAgent, Outbox, Overlay, Pane, Panel, Phase, Query, Reach, RepoInput,
-    Screen, StatusKind, SubagentKey, SubagentRead, Submission, TerminalFocus, Ticket, TurnRow,
-    Unreachable, View, WorkRoom, fuzzy_match, match_rank, repo_matches, unlisted,
+    Field, Focus, Follow, FormKind, HelpState, INFO_TTL, Inspection, Intent, Listed, LogKey, Mode,
+    Model, Moment, NamingState, NewAgent, Outbox, Overlay, Pane, Panel, Phase, Query, Reach,
+    RepoInput, Screen, StatusKind, Submission, TerminalFocus, Ticket, TurnRow, Unreachable, View,
+    WorkRoom, fuzzy_match, match_rank, repo_matches, unlisted,
 };
 use crate::track::{LiveSince, Release, Seen};
 use crate::tree::ChangesView;
@@ -41,13 +42,6 @@ const LONG_TURN: Duration = Duration::from_secs(30);
 const REINSPECT_AFTER: Duration = Duration::from_secs(3);
 /// And this often whatever it does.
 const SLOW_REFRESH: Duration = Duration::from_secs(30);
-/// The subagent under [2]'s cursor is read again on its agent's activity, at
-/// most this often.
-const SUBAGENT_REFRESH: Duration = Duration::from_secs(2);
-/// And this often whatever it does, since a transcript can be written
-/// without a hook firing.
-const SUBAGENT_SLOW_REFRESH: Duration = Duration::from_secs(10);
-
 /// Rows `J` and `K` scroll the main view by.
 const SCROLL: isize = 2;
 
@@ -102,6 +96,13 @@ pub enum Effect {
         name: SessionName,
         id: AgentId,
         workdir: PathBuf,
+    },
+    /// Read the current turn of an agent working in `workdir`.
+    ReadTurn {
+        name: SessionName,
+        workdir: PathBuf,
+        /// Where its hooks last said the transcript is.
+        at: Option<TranscriptRef>,
     },
     /// Attach to an existing session (resurrecting it if it exited).
     Attach {
@@ -258,17 +259,35 @@ fn step(m: &mut Model, msg: Msg) -> Vec<Effect> {
             m.docs.loaded(&key, result, m.clock.mono);
             Vec::new()
         }
+        Msg::Turn { name, turn } => {
+            on_turn(m, &name, turn);
+            Vec::new()
+        }
         Msg::Subagent { name, id, detail } => {
             if let Some(watched) = m
                 .agents
                 .get_mut(&name)
                 .and_then(|t| t.subagents.get_mut(&id))
             {
-                watched.log = Some(detail);
+                watched.watch.log = Some(detail);
             }
             Vec::new()
         }
     }
+}
+
+/// An agent's turn was read. A new prompt starts the cursor over.
+fn on_turn(m: &mut Model, name: &SessionName, turn: Result<Option<TurnDetail>, String>) {
+    let Some(tracked) = m.agents.get_mut(name) else {
+        return;
+    };
+    let watch = &mut tracked.turn;
+    if let (Some(Ok(Some(old))), Ok(Some(new))) = (&watch.watch.log, &turn)
+        && old.mark != new.mark
+    {
+        watch.watch.nav = Nav::default();
+    }
+    watch.watch.log = Some(turn);
 }
 
 fn on_paste(m: &mut Model, text: &str) -> Vec<Effect> {
@@ -483,10 +502,11 @@ fn tick_effects(m: &mut Model) -> Vec<Effect> {
     let mut effects: Vec<Effect> = ask_for_name(m).into_iter().collect();
     effects.extend(bell(m));
     effects.extend(flush(m));
-    effects.extend(acknowledge(m, SEEN_AFTER).map(Effect::Job));
+    effects.extend(look(m, SEEN_AFTER).map(Effect::Job));
     effects.extend(preview(m));
     effects.extend(inspect(m));
     effects.extend(read_subagent(m));
+    effects.extend(read_turn(m));
     effects.extend(read_document(m));
     effects.extend(check_dir(m));
     effects
@@ -661,52 +681,100 @@ fn read_document(m: &mut Model) -> Option<Effect> {
 }
 
 /// Asks for what the subagent under [2]'s cursor has done: when it's first
-/// shown, soon after its agent reports something, and every
-/// [`SUBAGENT_SLOW_REFRESH`] regardless.
+/// shown, soon after its agent reports something, and every few seconds
+/// while it runs.
 fn read_subagent(m: &mut Model) -> Option<Effect> {
     let (name, id) = m.subagent_selected()?;
     let workdir = selected_root(m)?;
     let events = m.activity(&name)?.events;
     let now = m.clock.mono;
-    let key = (name.clone(), id.clone());
-    let watched = m.watched(&key);
-    if matches!(watched.and_then(|w| w.log.as_ref()), Some(Ok(Some(detail))) if matches!(detail.outcome, agent_core::ports::Outcome::Finished { .. }))
+    let watched = m.watched(&(name.clone(), id.clone()));
+    if matches!(watched.and_then(|w| w.watch.log.as_ref()), Some(Ok(Some(detail))) if matches!(detail.outcome, agent_core::ports::Outcome::Finished { .. }))
     {
         return None;
     }
-    let due = watched.and_then(|w| w.read).is_none_or(|last| {
-        now >= last.at + SUBAGENT_SLOW_REFRESH
-            || (last.events != events && now >= last.at + SUBAGENT_REFRESH)
-    });
-    if !due {
+    if !watched.is_none_or(|w| w.watch.due(events, true, now)) {
         return None;
     }
-    m.track(&name).subagents.entry(id.clone()).or_default().read =
-        Some(SubagentRead { events, at: now });
+    m.track(&name)
+        .subagents
+        .entry(id.clone())
+        .or_default()
+        .watch
+        .asked(events, now);
     Some(Effect::ReadSubagent { name, id, workdir })
 }
 
-/// The agent in the pane has finished a turn and been in view for `after`
-/// with the terminal focused: mark it seen.
-fn acknowledge(m: &mut Model, after: Duration) -> Option<Job> {
-    let c = m
-        .pane
-        .connection()
-        .filter(|c| m.clock.mono.saturating_duration_since(c.opened) >= after)
-        .filter(|_| m.terminal_visible())?;
-    if m.terminal == TerminalFocus::Unfocused {
+/// Asks for the current turn of the agent whose turn [0] shows: when it is
+/// first shown, soon after the agent reports something, and every few
+/// seconds while it works.
+fn read_turn(m: &mut Model) -> Option<Effect> {
+    let Some(crate::document::Hover::Turn(name)) = m.hover() else {
+        return None;
+    };
+    let workdir = selected_root(m)?;
+    let activity = m.activity(&name)?;
+    let (events, at) = (activity.events, activity.transcript.clone());
+    let now = m.clock.mono;
+    let growing = m.turn_running(&name);
+    if !m
+        .tracked(&name)
+        .is_none_or(|t| t.turn.watch.due(events, growing, now))
+    {
         return None;
     }
-    let activity = m.activity(&c.name)?;
+    m.track(&name).turn.watch.asked(events, now);
+    Some(Effect::ReadTurn { name, workdir, at })
+}
+
+/// Notes the agent in front of the user as seen once it has been there for
+/// `after`, with the terminal focused: its turn in [0], or its terminal in
+/// the pane. Only the peek float shows a terminal over a turn, and what it
+/// covers isn't in front of them, so the pane wins. What the agent did since
+/// is new to them, and a finished turn they haven't looked at is
+/// acknowledged, so the `✓` and the `since you looked` marker clear together.
+fn look(m: &mut Model, after: Duration) -> Option<Job> {
+    let now = m.clock.mono;
+    let focused = m.terminal != TerminalFocus::Unfocused;
+    let viewing = match m.hover() {
+        Some(crate::document::Hover::Turn(name)) if focused => Some(name),
+        _ => None,
+    };
+    for (name, tracked) in &mut m.agents {
+        let looked = &mut tracked.turn.looked;
+        if viewing.as_ref() == Some(name) {
+            looked.since.get_or_insert(now);
+        } else {
+            looked.since = None;
+        }
+    }
+    let steady = viewing.filter(|name| {
+        m.tracked(name)
+            .and_then(|t| t.turn.looked.since)
+            .is_some_and(|since| now.saturating_duration_since(since) >= after)
+    });
+    let watching = m
+        .pane
+        .connection()
+        .filter(|c| now.saturating_duration_since(c.opened) >= after)
+        .filter(|_| m.terminal_visible())
+        .map(|c| c.name.clone());
+    let front = watching.or(steady).filter(|_| focused);
+    if let Some(name) = &front {
+        let wall = m.clock.wall;
+        m.track(name).turn.looked.seen = Some(wall);
+    }
+    let name = front?;
+    let activity = m.activity(&name)?;
     let ActivityState::Done { .. } = activity.state else {
         return None;
     };
-    let mark = (c.name.clone(), activity.events);
+    let mark = (name.clone(), activity.events);
     if m.acknowledged.as_ref() == Some(&mark) {
         return None;
     }
     m.acknowledged = Some(mark);
-    Some(Job::Acknowledge(c.name.clone()))
+    Some(Job::Acknowledge(name))
 }
 
 /// Drops what's known about entries that are no longer in the snapshot.
@@ -835,7 +903,7 @@ pub fn enter_agent(m: &mut Model) -> Vec<Effect> {
     m.touch_mru(&name);
     m.preview_at = None;
     let mut effects = vec![Effect::Job(Job::TakeOver { name, own })];
-    effects.extend(acknowledge(m, Duration::ZERO).map(Effect::Job));
+    effects.extend(look(m, Duration::ZERO).map(Effect::Job));
     effects
 }
 
@@ -951,11 +1019,11 @@ fn peek_command(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
 fn edit_transcript(m: &mut Model) -> Option<Vec<Effect>> {
     let key = m.subagent_selected()?;
     let root = selected_root(m)?;
-    match m.watched(&key).and_then(|w| w.log.as_ref()) {
-        Some(Ok(Some(detail))) if !detail.transcript.as_os_str().is_empty() => {
+    match m.watched(&key).and_then(|w| w.watch.log.as_ref()) {
+        Some(Ok(Some(detail))) if !detail.transcript.as_str().is_empty() => {
             Some(vec![Effect::Edit(Open::File {
                 root,
-                file: detail.transcript.clone(),
+                file: detail.transcript.path().to_path_buf(),
             })])
         }
         _ => {
@@ -1263,37 +1331,86 @@ fn diff_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
 
 /// Scrolls [0] so the log entry `at` of subagent `key` shows, as the last
 /// draw laid it out.
-fn reveal_entry(areas: &Areas, docs: &mut Documents, key: &SubagentKey, at: usize) {
+fn reveal_entry(areas: &Areas, docs: &mut Documents, key: &LogKey, at: usize) {
     if let Some(main) = areas.main.as_ref().filter(|a| a.nav.as_ref() == Some(key)) {
         main.reveal_entry(docs, at);
     }
 }
 
-/// Keys for [0] while it reads a subagent's log: the entry cursor, folds and
-/// the transcript in the editor. `None` leaves the key to the plain
-/// document keys.
+/// The log [0] reads, with what moves over it.
+struct OpenLog<'a> {
+    detail: &'a Log,
+    nav: &'a mut Nav,
+    entries: Vec<crate::log::Entry<'a>>,
+    /// Whether it is still growing, so its cursor starts at the end and
+    /// moving there follows it.
+    running: bool,
+}
+
+/// The log `key` names, if it was read.
+fn open_log<'a>(m: &'a mut Model, key: &LogKey) -> Option<OpenLog<'a>> {
+    match key {
+        LogKey::Subagent((name, id)) => {
+            let watch = &mut m.agents.get_mut(name)?.subagents.get_mut(id)?.watch;
+            let Some(Ok(Some(detail))) = &watch.log else {
+                return None;
+            };
+            Some(OpenLog {
+                detail,
+                entries: crate::log::entries(detail),
+                running: !matches!(detail.outcome, agent_core::ports::Outcome::Finished { .. }),
+                nav: &mut watch.nav,
+            })
+        }
+        LogKey::Turn(name) => {
+            let (closing, running) = (m.closing(name), m.turn_running(name));
+            let watch = &mut m.agents.get_mut(name)?.turn.watch;
+            let Some(Ok(Some(turn))) = &watch.log else {
+                return None;
+            };
+            Some(OpenLog {
+                detail: &turn.log,
+                entries: crate::log::turn_entries(&turn.log, closing.as_deref())
+                    .into_iter()
+                    .map(|(entry, _)| entry)
+                    .collect(),
+                running,
+                nav: &mut watch.nav,
+            })
+        }
+    }
+}
+
+/// Keys for [0] while it reads a log, a subagent's or the current turn: the
+/// entry cursor, folds and, for a subagent, the transcript in the editor.
+/// `None` leaves the key to the plain document keys.
 fn log_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
-    let key = m.subagent_selected()?;
-    let editing = (code == KeyCode::Char('e'))
-        .then(|| {
+    let key = match m.hover()? {
+        crate::document::Hover::Subagent(name, id) => LogKey::Subagent((name, id)),
+        crate::document::Hover::Turn(name) => LogKey::Turn(name),
+        _ => return None,
+    };
+    let editing = match &key {
+        LogKey::Subagent((name, id)) if code == KeyCode::Char('e') => {
             let root = selected_root(m)?;
             let title = m
                 .subagent_rows()
                 .into_iter()
-                .find(|(id, _)| **id == key.1)
+                .find(|(held, _)| *held == id)
                 .and_then(|(_, s)| s.description.clone())
                 .unwrap_or_else(|| "subagent".into());
-            Some((root, title))
-        })
-        .flatten();
-    let watched = m.agents.get_mut(&key.0)?.subagents.get_mut(&key.1)?;
-    let Some(Ok(Some(detail))) = &watched.log else {
-        return None;
+            Some((root, title, format!("{}-{}", name.as_str(), id.as_str())))
+        }
+        LogKey::Turn(_) if code == KeyCode::Char('e') => return None,
+        _ => None,
     };
-    let entries = crate::log::entries(detail);
+    let OpenLog {
+        detail,
+        nav,
+        entries,
+        running,
+    } = open_log(m, &key)?;
     let last = entries.len().checked_sub(1)?;
-    let running = !matches!(detail.outcome, agent_core::ports::Outcome::Finished { .. });
-    let nav = &mut watched.nav;
     let at = nav
         .cursor
         .unwrap_or(if running { last } else { 0 })
@@ -1346,12 +1463,12 @@ fn log_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
             return Some(copy(m, text));
         }
         KeyCode::Char('e') => {
-            let (root, title) = editing?;
+            let (root, title, name) = editing?;
             let (text, starts) = crate::log::markdown(detail, &title);
             let line = starts.get(at).copied().unwrap_or(NonZeroUsize::MIN);
             effects.push(Effect::Edit(Open::Transcript {
                 root,
-                name: format!("{}-{}", key.0.as_str(), key.1.as_str()),
+                name,
                 text,
                 line,
             }));
@@ -1388,6 +1505,7 @@ fn on_panel_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
 fn on_document_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
     if code == KeyCode::Char('y')
         && let Some(crate::document::Hover::Turn(name)) = m.hover()
+        && !m.turn_has_log(&name)
     {
         let message = m
             .selected_entry()
@@ -2711,6 +2829,7 @@ fn on_mouse(m: &mut Model, mouse: MouseEvent) -> Vec<Effect> {
 
 #[cfg(test)]
 mod tests {
+    use crate::track::{LOG_REFRESH, LOG_SLOW_REFRESH};
     use std::time::{Instant, SystemTime};
 
     use crate::model::Found;
@@ -5459,14 +5578,14 @@ mod tests {
             .agents
             .values_mut()
             .flat_map(|t| t.subagents.values_mut())
-            .filter_map(|w| w.read.as_mut())
+            .filter_map(|w| w.watch.read.as_mut())
         {
-            read.at -= SUBAGENT_REFRESH;
+            read.at -= LOG_REFRESH;
         }
         assert_eq!(reads(tick(&mut m)).len(), 1, "after it");
 
-        let detail = agent_core::ports::SubagentDetail {
-            prompt: "do it".into(),
+        let detail = agent_core::ports::Log {
+            prompt: Some("do it".into()),
             ..crate::log::fixtures::detail(Vec::new())
         };
         update(
@@ -5479,7 +5598,7 @@ mod tests {
         );
         assert_eq!(
             m.watched(&(name.clone(), id.clone()))
-                .and_then(|w| w.log.as_ref()),
+                .and_then(|w| w.watch.log.as_ref()),
             Some(&Ok(Some(detail.clone())))
         );
 
@@ -6570,8 +6689,8 @@ mod tests {
 
         m.set_log(
             key_of,
-            Ok(Some(agent_core::ports::SubagentDetail {
-                transcript: "/p/s/subagents/agent-a1.jsonl".into(),
+            Ok(Some(agent_core::ports::Log {
+                transcript: TranscriptRef::new("/p/s/subagents/agent-a1.jsonl"),
                 ..crate::log::fixtures::detail(Vec::new())
             })),
         );
@@ -6611,7 +6730,11 @@ mod tests {
         update(&mut m, key(KeyCode::Char('j')));
         let key_ = with_log(&mut m, true);
         update(&mut m, key(KeyCode::Char('0')));
-        let nav = |m: &Model| m.watched(&key_).map(|w| w.nav.clone()).unwrap_or_default();
+        let nav = |m: &Model| {
+            m.watched(&key_)
+                .map(|w| w.watch.nav.clone())
+                .unwrap_or_default()
+        };
 
         update(&mut m, key(KeyCode::Char('j')));
         assert_eq!(
@@ -6663,7 +6786,7 @@ mod tests {
                 .values()
                 .flat_map(|t| t.subagents.values())
                 .next()
-                .and_then(|w| w.nav.cursor),
+                .and_then(|w| w.watch.nav.cursor),
             Some(4)
         );
     }
@@ -6736,6 +6859,361 @@ mod tests {
         assert!(
             matches!(effects.as_slice(), [Effect::Copy(text)] if text.contains("token refresh")),
             "the message is copied"
+        );
+    }
+
+    fn at_work() -> Model {
+        let mut m = crate::fixtures::fleet(10);
+        m.set_cursor(Cursor::Entry(name("payroll-fix-3")));
+        m
+    }
+
+    fn turn_reads(effects: Vec<Effect>) -> Vec<(String, Option<String>)> {
+        effects
+            .into_iter()
+            .filter_map(|e| match e {
+                Effect::ReadTurn { name, at, workdir } => Some((
+                    format!("{name} {}", workdir.display()),
+                    at.map(|a| a.as_str().to_string()),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_turn_is_asked_for_through_an_effect_only_while_it_is_shown_and_when_it_may_have_moved() {
+        let mut m = at_work();
+        m.activities
+            .as_mut()
+            .and_then(|a| a.get_mut(&name("payroll-fix-3")))
+            .expect("reports")
+            .transcript = Some(TranscriptRef::new("/p/s.jsonl"));
+        assert!(
+            turn_reads(tick(&mut m)).is_empty(),
+            "[0] shows the terminal, which needs no transcript"
+        );
+
+        update(&mut m, key(KeyCode::Char('2')));
+        assert_eq!(
+            turn_reads(tick(&mut m)),
+            [(
+                "payroll-fix-3 /w/heucristic0/payroll-fix-3".to_string(),
+                Some("/p/s.jsonl".to_string())
+            )],
+            "the checkout and the transcript the hooks named, for the worker"
+        );
+        assert!(turn_reads(tick(&mut m)).is_empty(), "once");
+
+        let again = |m: &mut Model, back: Duration| {
+            m.track(&name("payroll-fix-3"))
+                .turn
+                .watch
+                .read
+                .as_mut()
+                .expect("read")
+                .at -= back;
+            turn_reads(tick(m)).len()
+        };
+        assert_eq!(again(&mut m, LOG_REFRESH), 0, "nothing was reported");
+        assert_eq!(
+            again(&mut m, LOG_SLOW_REFRESH),
+            1,
+            "a working agent's transcript is read again whatever its hooks say"
+        );
+
+        m.activities
+            .as_mut()
+            .and_then(|a| a.get_mut(&name("payroll-fix-3")))
+            .expect("reports")
+            .events += 1;
+        assert_eq!(again(&mut m, LOG_REFRESH), 1, "soon after it reports");
+        assert_eq!(
+            turn_reads(tick(&mut m)).len() + again(&mut m, Duration::ZERO),
+            0,
+            "not before the interval"
+        );
+    }
+
+    #[test]
+    fn a_finished_turn_is_read_again_only_when_its_agent_reports_something() {
+        let mut m = crate::fixtures::fleet(10);
+        m.set_cursor(Cursor::Entry(name("auth-refresh-2")));
+        update(&mut m, key(KeyCode::Char('2')));
+        assert_eq!(turn_reads(tick(&mut m)).len(), 1);
+        let who = name("auth-refresh-2");
+        m.track(&who).turn.watch.read.as_mut().expect("read").at -= LOG_SLOW_REFRESH * 3;
+        assert!(
+            turn_reads(tick(&mut m)).is_empty(),
+            "its transcript can still grow, but only a report says so"
+        );
+    }
+
+    #[test]
+    fn an_answer_replaces_the_turn_and_a_new_turn_starts_the_cursor_over() {
+        let mut m = at_work();
+        let who = name("payroll-fix-3");
+        let turn = |mark: &str| {
+            let mut turn = crate::log::fixtures::turn(vec![crate::log::fixtures::said("one")]);
+            turn.mark = Some(agent_core::ports::TurnMark::new(mark));
+            turn
+        };
+        update(
+            &mut m,
+            Msg::Turn {
+                name: who.clone(),
+                turn: Ok(Some(turn("p1"))),
+            },
+        );
+        m.track(&who).turn.watch.nav.cursor = Some(1);
+        update(
+            &mut m,
+            Msg::Turn {
+                name: who.clone(),
+                turn: Ok(Some(turn("p1"))),
+            },
+        );
+        assert_eq!(
+            m.track(&who).turn.watch.nav.cursor,
+            Some(1),
+            "the same turn, grown"
+        );
+        update(
+            &mut m,
+            Msg::Turn {
+                name: who.clone(),
+                turn: Ok(Some(turn("p2"))),
+            },
+        );
+        assert_eq!(m.track(&who).turn.watch.nav.cursor, None, "a new prompt");
+        update(
+            &mut m,
+            Msg::Turn {
+                name: who.clone(),
+                turn: Err("denied".into()),
+            },
+        );
+        assert!(m.turn(&who).is_none());
+        update(
+            &mut m,
+            Msg::Turn {
+                name: name("nobody"),
+                turn: Ok(None),
+            },
+        );
+        assert!(
+            m.tracked(&name("nobody")).is_none(),
+            "an unknown agent is dropped"
+        );
+    }
+
+    fn story() -> Vec<agent_core::ports::LogEntry> {
+        use crate::log::fixtures::{bash, said};
+        use agent_core::ports::{CallState, Summary};
+        let ok = || CallState::Done {
+            summary: Summary::NoOutput,
+            took: None,
+        };
+        vec![
+            said("one"),
+            bash("ls", ok()),
+            said("two"),
+            bash("pwd", ok()),
+            said("three"),
+            bash("cargo test", CallState::Running),
+        ]
+    }
+
+    #[test]
+    fn the_turn_log_has_the_entry_cursor_folds_follow_and_copy_a_subagent_log_has() {
+        let mut m = at_work();
+        let who = name("payroll-fix-3");
+        m.set_turn(&who, Ok(Some(crate::log::fixtures::turn(story()))));
+        update(&mut m, key(KeyCode::Char('2')));
+        update(&mut m, key(KeyCode::Char('0')));
+        let nav = |m: &Model| {
+            m.nav(&LogKey::Turn(who.clone()))
+                .cloned()
+                .unwrap_or_default()
+        };
+
+        update(&mut m, key(KeyCode::Char('k')));
+        assert_eq!(
+            nav(&m).cursor,
+            Some(3),
+            "a working turn starts on its last entry: prompt, two folded phases, then three said and one call"
+        );
+        let paused = !m.docs.following();
+        assert!(paused, "up pauses the follow");
+        update(&mut m, key(KeyCode::Char('g')));
+        assert_eq!(nav(&m).cursor, Some(0));
+        update(&mut m, key(KeyCode::Char('j')));
+        update(&mut m, key(KeyCode::Enter));
+        assert!(nav(&m).is_open(1), "⏎ opens the folded phase");
+        update(&mut m, key(KeyCode::Enter));
+        assert!(!nav(&m).is_open(1));
+        update(&mut m, key(KeyCode::Char('=')));
+        assert!(nav(&m).is_open(2));
+        update(&mut m, key(KeyCode::Char('-')));
+        assert!(!nav(&m).is_open(2));
+        update(&mut m, key(KeyCode::Char('G')));
+        update(&mut m, key(KeyCode::Char('j')));
+        assert_eq!(nav(&m).cursor, Some(4), "stops at the last entry");
+
+        update(&mut m, key(KeyCode::Char('g')));
+        update(&mut m, key(KeyCode::Char('j')));
+        let effects = update(&mut m, key(KeyCode::Char('y')));
+        assert!(
+            matches!(effects.as_slice(), [Effect::Copy(text)] if text.contains("input")),
+            "y copies the phase's entry"
+        );
+    }
+
+    #[test]
+    fn y_on_a_turn_with_no_log_still_copies_the_agents_message() {
+        let mut m = crate::fixtures::fleet(10);
+        m.set_cursor(Cursor::Entry(name("auth-refresh-2")));
+        update(&mut m, key(KeyCode::Char('2')));
+        m.set_turn(&name("auth-refresh-2"), Ok(None));
+        update(&mut m, key(KeyCode::Char('0')));
+        let effects = update(&mut m, key(KeyCode::Char('y')));
+        assert!(
+            matches!(effects.as_slice(), [Effect::Copy(text)] if text.contains("token refresh"))
+        );
+    }
+
+    #[test]
+    fn the_turn_counts_as_seen_after_a_few_steady_seconds_in_front_of_the_user() {
+        let mut m = at_work();
+        let who = name("payroll-fix-3");
+        let base = m.clock;
+        let moved = |secs| Moment {
+            wall: base.wall + Duration::from_secs(secs),
+            mono: base.mono + Duration::from_secs(secs),
+        };
+        let now = moved(0);
+        tick_at(&mut m, now);
+        assert_eq!(m.track(&who).turn.looked.seen, None, "not on screen");
+
+        update(&mut m, key(KeyCode::Char('2')));
+        let start = moved(1);
+        tick_at(&mut m, start);
+        let almost = moved(3);
+        tick_at(&mut m, almost);
+        assert_eq!(m.track(&who).turn.looked.seen, None, "only 2s");
+        let steady = moved(5);
+        tick_at(&mut m, steady);
+        assert_eq!(m.track(&who).turn.looked.seen, Some(steady.wall));
+
+        update(&mut m, key(KeyCode::Esc));
+        let later = moved(60);
+        tick_at(&mut m, later);
+        assert_eq!(
+            m.track(&who).turn.looked.seen,
+            Some(steady.wall),
+            "frozen when it left the screen"
+        );
+        assert_eq!(m.track(&who).turn.looked.since, None);
+    }
+
+    #[test]
+    fn reading_a_finished_turn_acknowledges_it_as_the_marker_clears() {
+        let mut m = crate::fixtures::fleet(10);
+        let who = name("auth-refresh-2");
+        m.set_cursor(Cursor::Entry(who.clone()));
+        update(&mut m, key(KeyCode::Char('2')));
+        let base = m.clock;
+        let acknowledged = |effects: Vec<Effect>| {
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::Job(Job::Acknowledge(n)) if *n == who))
+        };
+        let at = |secs| Moment {
+            wall: base.wall + Duration::from_secs(secs),
+            mono: base.mono + Duration::from_secs(secs),
+        };
+        assert!(!acknowledged(tick_at(&mut m, at(0))));
+        assert!(!acknowledged(tick_at(&mut m, at(2))), "not yet 3s");
+        let effects = tick_at(&mut m, at(4));
+        assert!(acknowledged(effects), "the same dwell time as the marker");
+        assert_eq!(m.track(&who).turn.looked.seen, Some(at(4).wall));
+        assert!(!acknowledged(tick_at(&mut m, at(6))), "once per report");
+    }
+
+    fn connect(m: &mut Model, agent: &str) {
+        let size =
+            agent_term::TermSize::of(ratatui::layout::Rect::new(0, 0, 80, 24)).expect("size");
+        let term = agent_term::Terminal::spawn(
+            &agent_core::process::LaunchSpec::new("cat"),
+            size,
+            Box::new(agent_term::Vt100::new(size)) as Box<dyn agent_term::Emulator>,
+        )
+        .expect("a pty");
+        m.pane = Pane::Connected(crate::model::Connection {
+            name: name(agent),
+            term,
+            others: None,
+            mode: Mode::Nav,
+            opened: Instant::now(),
+        });
+    }
+
+    #[test]
+    fn a_peeked_terminal_is_what_is_seen_over_the_turn_behind_it_whatever_the_agents_order() {
+        for _ in 0..8 {
+            let mut m = crate::fixtures::fleet(10);
+            m.set_cursor(Cursor::Entry(name("auth-refresh-2")));
+            update(&mut m, key(KeyCode::Char('2')));
+            connect(&mut m, "obs-layout-4");
+            m.peek = Some(name("obs-layout-4"));
+            let base = m.clock;
+            let at = |secs| Moment {
+                wall: base.wall + Duration::from_secs(secs),
+                mono: base.mono + Duration::from_secs(secs),
+            };
+            tick_at(&mut m, at(0));
+            tick_at(&mut m, at(5));
+            let seen = |m: &mut Model, who: &str| m.track(&name(who)).turn.looked.seen;
+            assert_eq!(seen(&mut m, "obs-layout-4"), Some(at(5).wall), "the pane");
+            assert_eq!(seen(&mut m, "auth-refresh-2"), None, "covered by the peek");
+        }
+    }
+
+    #[test]
+    fn nothing_is_seen_or_acknowledged_while_the_terminal_window_is_unfocused() {
+        let mut m = crate::fixtures::fleet(10);
+        let who = name("auth-refresh-2");
+        m.set_cursor(Cursor::Entry(who.clone()));
+        update(&mut m, key(KeyCode::Char('2')));
+        m.terminal = TerminalFocus::Unfocused;
+        let base = m.clock;
+        let at = |secs| Moment {
+            wall: base.wall + Duration::from_secs(secs),
+            mono: base.mono + Duration::from_secs(secs),
+        };
+        tick_at(&mut m, at(0));
+        let effects = tick_at(&mut m, at(10));
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::Job(Job::Acknowledge(_)))),
+            "a turn on an unattended screen isn't read"
+        );
+        assert_eq!(m.track(&who).turn.looked.seen, None);
+        m.terminal = TerminalFocus::Focused;
+        let effects = tick_at(&mut m, at(11));
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::Job(Job::Acknowledge(_)))),
+            "time away doesn't count toward the dwell"
+        );
+        let effects = tick_at(&mut m, at(30));
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::Job(Job::Acknowledge(_)))),
+            "it counts once the window has been back for the dwell"
         );
     }
 }

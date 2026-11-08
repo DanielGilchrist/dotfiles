@@ -3,8 +3,11 @@
 
 use std::time::{Duration, SystemTime};
 
+use agent_core::activity::ToolId;
 use agent_core::activity::{Subagent, SubagentStatus};
-use agent_core::ports::{Call, CallState, Excerpt, Outcome, SubagentDetail, Summary, Target};
+use agent_core::ports::{
+    Call, CallState, Excerpt, Log, LogEntry, Outcome, Progress, Summary, Target, TurnDetail,
+};
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 
@@ -12,7 +15,11 @@ use super::{
     SPINNER, accent, ago, bold, dim, error, fit, justify, line_width, success, truncate_end,
     truncate_start, warning, wrap,
 };
-use crate::log::{Entry, Nav, call_count, entries, error_count, failing, target_text};
+use crate::log::{
+    Entry, Nav, Phase, agent_count, call_count, delegates, entries, error_count, failing,
+    files_touched, target_text, time_of, turn_entries, unrecovered_count,
+};
+use crate::model::Asking;
 
 /// A call or a line of text sits within this many columns, so it stays near
 /// its result on a wide screen.
@@ -54,6 +61,29 @@ pub(super) fn span(d: Duration) -> String {
     }
 }
 
+/// `12 calls`, or `12+ calls` when the log starts after the transcript does.
+fn calls_label(detail: &Log) -> String {
+    let n = call_count(detail);
+    if detail.truncated {
+        format!("{n}+ calls")
+    } else {
+        plural(n, "call", "calls")
+    }
+}
+
+/// `+9 −14`, leaving out the side that has nothing.
+fn diff_spans(added: usize, removed: usize) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    if added > 0 || removed == 0 {
+        spans.push(Span::styled(format!("+{added}"), success()));
+    }
+    if removed > 0 {
+        let gap = if spans.is_empty() { "" } else { " " };
+        spans.push(Span::styled(format!("{gap}−{removed}"), error()));
+    }
+    spans
+}
+
 fn plural(n: usize, one: &str, many: &str) -> String {
     format!("{n} {}", if n == 1 { one } else { many })
 }
@@ -69,12 +99,7 @@ fn lines_text(n: usize) -> String {
 fn summary_spans(summary: &Summary) -> Vec<Span<'static>> {
     let text = match summary {
         Summary::Lines(n) => lines_text(*n),
-        Summary::Diff { added, removed } => {
-            return vec![
-                Span::styled(format!("+{added}"), success()),
-                Span::styled(format!(" −{removed}"), error()),
-            ];
-        }
+        Summary::Diff { added, removed } => return diff_spans(*added, *removed),
         Summary::NewFile { lines } => format!("new · {}", lines_text(*lines)),
         Summary::Matches(n) => plural(*n, "match", "matches"),
         Summary::Files(n) => plural(*n, "file", "files"),
@@ -135,6 +160,11 @@ struct Rows<'a, 'b> {
     live: bool,
     /// Whether it has gone quiet, so spinners stand still.
     stale: bool,
+    /// Whether every running call is live, not just the last one: an agent
+    /// can run several at once.
+    parallel: bool,
+    /// The call the user's answer is awaited for.
+    waiting: Option<ToolId>,
     /// When the hooks say its running tool started, for a call whose
     /// request carried no time.
     running_since: Option<SystemTime>,
@@ -173,18 +203,12 @@ impl Rows<'_, '_> {
         }
     }
 
-    fn report(&mut self, report: &str, detail: &SubagentDetail) {
+    fn report(&mut self, report: &str, detail: &Log) {
         self.blank();
         self.push(Line::from(vec![gutter(), Span::styled("Report", bold())]));
         self.text_rows(report, 2);
         self.blank();
-        let calls = call_count(detail);
-        let count = if detail.truncated {
-            format!("{calls}+ calls")
-        } else {
-            plural(calls, "call", "calls")
-        };
-        self.rule(&format!("Activity · {count}"));
+        self.rule(&format!("Activity · {}", calls_label(detail)));
     }
 
     fn prompt(&mut self, prompt: &str, open: bool) {
@@ -215,7 +239,10 @@ impl Rows<'_, '_> {
         if more > 0 {
             self.push(indented(
                 2,
-                vec![Span::styled(format!("+{more} lines"), dim())],
+                vec![Span::styled(
+                    format!("+{}", plural(more, "line", "lines")),
+                    dim(),
+                )],
             ));
         }
     }
@@ -235,7 +262,7 @@ impl Rows<'_, '_> {
             self.push(indented(
                 2,
                 vec![Span::styled(
-                    format!("+{} lines", rows.len() - shown),
+                    format!("+{}", plural(rows.len() - shown, "line", "lines")),
                     dim(),
                 )],
             ));
@@ -243,11 +270,18 @@ impl Rows<'_, '_> {
     }
 
     fn is_live(&self, call: &Call, last: bool) -> bool {
-        self.live && last && matches!(call.state, CallState::Running)
+        self.live && (last || self.parallel) && matches!(call.state, CallState::Running)
+    }
+
+    fn asks(&self, call: &Call) -> bool {
+        self.waiting.as_ref() == Some(&call.id)
     }
 
     fn glyph(&self, call: &Call, last: bool) -> Span<'static> {
         match &call.state {
+            CallState::Running if self.asks(call) => {
+                Span::styled("◆", warning().add_modifier(Modifier::BOLD))
+            }
             CallState::Running if self.is_live(call, last) && self.stale => {
                 Span::styled(SPINNER[0], dim())
             }
@@ -261,7 +295,7 @@ impl Rows<'_, '_> {
     fn target_spans(&self, target: &Target, room: usize) -> Vec<Span<'static>> {
         match target {
             Target::Path { path, range } => {
-                let shown = unwind(path, self.ctx);
+                let shown = tame(&unwind(path, self.ctx));
                 let suffix = target_text(&Target::Path {
                     path: String::new(),
                     range: *range,
@@ -276,7 +310,7 @@ impl Rows<'_, '_> {
                 let mut spans = vec![Span::raw(format!("\"{pattern}\""))];
                 if let Some(path) = path {
                     spans.push(Span::styled(
-                        format!(" in {}", unwind(path, self.ctx)),
+                        format!(" in {}", tame(&unwind(path, self.ctx))),
                         dim(),
                     ));
                 }
@@ -299,6 +333,9 @@ impl Rows<'_, '_> {
             .filter(|d| d.as_secs() >= DURATION_FROM)
             .map(span);
         let mut spans = match &call.state {
+            CallState::Running if self.asks(call) => {
+                return vec![Span::styled("waiting", warning())];
+            }
             CallState::Running => {
                 let ran = call
                     .started
@@ -411,7 +448,7 @@ impl Rows<'_, '_> {
             self.push(indented(
                 6,
                 vec![Span::styled(
-                    format!("+{} lines", result.len() - RESULT_LINES),
+                    format!("+{}", plural(result.len() - RESULT_LINES, "line", "lines")),
                     dim(),
                 )],
             ));
@@ -432,10 +469,10 @@ impl Rows<'_, '_> {
     }
 
     fn group(&mut self, tool: &str, calls: &[&Call]) {
-        let noun = match tool {
-            "Read" => "files",
-            "Grep" => "searches",
-            "Glob" => "globs",
+        let noun = match calls.first().map(|c| &c.target) {
+            Some(Target::Path { .. }) => "files",
+            Some(Target::Search { .. }) => "searches",
+            Some(Target::Pattern(_)) => "globs",
             _ => "calls",
         };
         let names: Vec<String> = calls
@@ -530,7 +567,7 @@ struct Figures {
 }
 
 fn status_row(
-    detail: &SubagentDetail,
+    detail: &Log,
     subagent: Option<&Subagent>,
     ctx: &Context<'_>,
     live: bool,
@@ -549,21 +586,8 @@ fn status_row(
     }
 }
 
-fn figures(
-    detail: &SubagentDetail,
-    subagent: Option<&Subagent>,
-    ctx: &Context<'_>,
-    narrow: bool,
-) -> Figures {
-    let calls = {
-        let n = call_count(detail);
-        let text = if detail.truncated {
-            format!("{n}+ calls")
-        } else {
-            plural(n, "call", "calls")
-        };
-        Span::styled(text, dim())
-    };
+fn figures(detail: &Log, subagent: Option<&Subagent>, ctx: &Context<'_>, narrow: bool) -> Figures {
+    let calls = Span::styled(calls_label(detail), dim());
     let errors = error_count(detail);
     let began = subagent.map(|s| s.since).or(detail.started);
     let ended = match subagent.map(|s| &s.status) {
@@ -663,7 +687,7 @@ fn failing_row(reason: &str, figures: Figures, narrow: bool) -> Vec<Span<'static
 }
 
 fn working_row(
-    detail: &SubagentDetail,
+    detail: &Log,
     figures: Figures,
     ctx: &Context<'_>,
     stale: bool,
@@ -694,8 +718,207 @@ fn working_row(
     )
 }
 
+/// What kind of turn [0] is showing, with what the status row needs of the
+/// agent's own state.
+pub(super) enum TurnState<'a> {
+    Working {
+        since: SystemTime,
+        /// Quiet long enough that the spinner should stand still.
+        stale: bool,
+        /// Subagents running.
+        running: usize,
+    },
+    Asking {
+        since: SystemTime,
+        /// What the harness says it was asked.
+        question: &'a str,
+        /// What the question is about, when it could be placed.
+        asking: Option<&'a Asking>,
+        /// Who is asking, when it isn't the agent itself.
+        by: Option<String>,
+    },
+    Delegating {
+        running: usize,
+        quiet: Duration,
+        stale: bool,
+    },
+    Done {
+        /// Whether the user has already looked at it.
+        seen: bool,
+    },
+    Failed {
+        reason: &'a str,
+        since: SystemTime,
+    },
+}
+
+impl TurnState<'_> {
+    fn finished(&self) -> bool {
+        matches!(self, Self::Done { .. } | Self::Failed { .. })
+    }
+}
+
+pub(super) struct TurnView<'a> {
+    pub state: TurnState<'a>,
+    /// What the agent ended the turn with, shown on top of its activity.
+    pub closing: Option<&'a str>,
+    /// The last moment the user had the turn in front of them.
+    pub looked: Option<SystemTime>,
+    /// The panel's height, which the question may take half of.
+    pub height: usize,
+}
+
+impl Rows<'_, '_> {
+    /// Rows for one entry, and where they are. `last` says it is the log's
+    /// last, which a running call there is live in.
+    fn entry(&mut self, entry: &Entry<'_>, last: bool, open: bool) -> (usize, usize) {
+        let started = self.out.len();
+        match entry {
+            Entry::Prompt(prompt) => self.prompt(prompt, open),
+            Entry::Said(text) => {
+                self.blank();
+                let started = self.out.len();
+                self.said(text, open);
+                return (started, self.out.len() - started);
+            }
+            Entry::Queued(text) => {
+                self.blank();
+                let started = self.out.len();
+                self.queued(text);
+                return (started, self.out.len() - started);
+            }
+            Entry::Compacted => {
+                self.blank();
+                let started = self.out.len();
+                self.push(Line::from(vec![gutter(), Span::styled("compacted", dim())]));
+                return (started, 1);
+            }
+            Entry::Call(call) => self.call(call, last, None, open),
+            Entry::Group { tool, calls } => {
+                if open {
+                    for call in calls {
+                        self.call_row(call, false, None, None);
+                    }
+                } else {
+                    self.group(tool, calls);
+                }
+            }
+            Entry::Repeat(calls) => {
+                if open {
+                    for call in calls {
+                        self.call(call, false, None, false);
+                    }
+                } else if let Some(call) = calls.last() {
+                    let times = Span::styled(format!("  ×{}", calls.len()), dim());
+                    self.call(call, last, Some(times), false);
+                }
+            }
+            Entry::Phase(phase) if open => {
+                for inner in &phase.entries {
+                    self.entry(inner, false, matches!(inner, Entry::Said(_)));
+                }
+            }
+            Entry::Phase(phase) => self.phase(phase),
+        }
+        (started, self.out.len() - started)
+    }
+
+    fn queued(&mut self, text: &str) {
+        let width = self.cap.saturating_sub(3).max(1);
+        for (i, row) in wrap(&tame(text), width).into_iter().enumerate() {
+            let lead = if i == 0 {
+                Span::styled("›", accent())
+            } else {
+                Span::raw(" ")
+            };
+            let first = if i == 0 { "queued: " } else { "        " };
+            self.push(Line::from(vec![
+                gutter(),
+                lead,
+                Span::raw(" "),
+                Span::styled(format!("{first}{row}"), dim()),
+            ]));
+        }
+    }
+
+    /// A finished phase on one row: what it started with, how many calls it
+    /// took and the one thing about it worth knowing.
+    fn phase(&mut self, phase: &Phase<'_>) {
+        let calls: Vec<&Call> = phase.entries.iter().flat_map(Entry::calls).collect();
+        let heading = phase
+            .entries
+            .iter()
+            .find_map(|e| match e {
+                Entry::Said(text) => {
+                    Some(tame(text).lines().next().unwrap_or_default().to_string())
+                }
+                _ => None,
+            })
+            .or_else(|| {
+                calls
+                    .first()
+                    .map(|c| format!("{} {}", c.tool, target_text(&c.target)))
+            })
+            .unwrap_or_default();
+        let mut right = vec![Span::styled(plural(calls.len(), "call", "calls"), dim())];
+        if let Some(note) = phase_note(&calls, phase.took) {
+            right.push(Span::raw("  "));
+            right.extend(note);
+        }
+        let room = self.cap.saturating_sub(line_width(&right) + 5);
+        self.push(justify(
+            vec![
+                gutter(),
+                Span::styled("▸", dim()),
+                Span::raw(" "),
+                Span::raw(truncate_end(heading.trim(), room)),
+            ],
+            right,
+            self.cap,
+        ));
+    }
+}
+
+/// What stands out about a folded phase, most urgent first.
+fn phase_note(calls: &[&Call], took: Option<Duration>) -> Option<Vec<Span<'static>>> {
+    let errors = calls
+        .iter()
+        .filter(|c| matches!(c.state, CallState::Failed { .. }))
+        .count();
+    if errors > 0 {
+        return Some(vec![Span::styled(
+            plural(errors, "error", "errors"),
+            error(),
+        )]);
+    }
+    let (mut added, mut removed) = (0, 0);
+    for call in calls {
+        if let CallState::Done {
+            summary:
+                Summary::Diff {
+                    added: a,
+                    removed: r,
+                },
+            ..
+        } = &call.state
+        {
+            added += a;
+            removed += r;
+        }
+    }
+    if added + removed > 0 {
+        return Some(diff_spans(added, removed));
+    }
+    let agents = delegates(calls);
+    if agents > 0 {
+        return Some(vec![Span::styled(format!("↳{agents}"), dim())]);
+    }
+    took.filter(|d| d.as_secs() >= 60)
+        .map(|d| vec![Span::styled(span(d), dim())])
+}
+
 pub(super) fn render(
-    detail: &SubagentDetail,
+    detail: &Log,
     subagent: Option<&Subagent>,
     nav: &Nav,
     ctx: &Context<'_>,
@@ -717,15 +940,7 @@ pub(super) fn render(
     let narrow = ctx.columns < WIDE;
     let cap = ctx.columns.min(CAP);
     let status = status_row(detail, subagent, ctx, live, stale, narrow);
-    let mut pinned = vec![Line::from(
-        std::iter::once(gutter())
-            .chain(fit(status, cap.saturating_sub(1)))
-            .collect::<Vec<_>>(),
-    )];
-    pinned.push(Line::from(vec![
-        gutter(),
-        Span::styled("─".repeat(cap.saturating_sub(1)), dim()),
-    ]));
+    let pinned = status_rows(status, cap);
 
     let mut rows = Rows {
         ctx,
@@ -733,6 +948,8 @@ pub(super) fn render(
         narrow,
         live,
         stale,
+        parallel: false,
+        waiting: None,
         running_since: subagent.and_then(|s| s.tools().last()).map(|t| t.since),
         out: Vec::new(),
         after_rule: false,
@@ -749,39 +966,7 @@ pub(super) fn render(
         rows.report(report, detail);
     }
     for (at, entry) in all.iter().enumerate() {
-        let open = nav.is_open(at);
-        let started = rows.out.len();
-        match entry {
-            Entry::Prompt(prompt) => rows.prompt(prompt, open),
-            Entry::Said(text) => {
-                rows.blank();
-                let started = rows.out.len();
-                rows.said(text, open);
-                layout.push((started, rows.out.len() - started));
-                continue;
-            }
-            Entry::Call(call) => rows.call(call, at == last_call, None, open),
-            Entry::Group { tool, calls } => {
-                if open {
-                    for call in calls {
-                        rows.call_row(call, false, None, None);
-                    }
-                } else {
-                    rows.group(tool, calls);
-                }
-            }
-            Entry::Repeat(calls) => {
-                if open {
-                    for call in calls {
-                        rows.call(call, false, None, false);
-                    }
-                } else if let Some(call) = calls.last() {
-                    let times = Span::styled(format!("  ×{}", calls.len()), dim());
-                    rows.call(call, at == last_call, Some(times), false);
-                }
-            }
-        }
-        layout.push((started, rows.out.len() - started));
+        layout.push(rows.entry(entry, at == last_call, nav.is_open(at)));
         if let (0, true, Some(report)) = (at, has_prompt, report) {
             rows.report(report, detail);
         }
@@ -793,3 +978,647 @@ pub(super) fn render(
         finished,
     }
 }
+
+/// `text` without the `**` and `__` Markdown emphasises with, which a
+/// terminal would show as they are.
+fn strip_emphasis(text: &str) -> String {
+    text.replace("**", "").replace("__", "")
+}
+
+/// The status row and the rule under it, which stay on top.
+fn status_rows(status: Vec<Span<'static>>, cap: usize) -> Vec<Line<'static>> {
+    vec![
+        Line::from(
+            std::iter::once(gutter())
+                .chain(fit(status, cap.saturating_sub(1)))
+                .collect::<Vec<_>>(),
+        ),
+        rule_row(cap),
+    ]
+}
+
+fn rule_row(cap: usize) -> Line<'static> {
+    Line::from(vec![
+        gutter(),
+        Span::styled("─".repeat(cap.saturating_sub(1)), dim()),
+    ])
+}
+
+/// The main agent's current turn: a status row (and the question while it
+/// asks) on top, then the prompt, the agent's closing message once it's
+/// done, and the log with its older phases folded.
+pub(super) fn render_turn(
+    turn: &TurnDetail,
+    view: &TurnView<'_>,
+    nav: &Nav,
+    ctx: &Context<'_>,
+) -> Rendered {
+    let narrow = ctx.columns < WIDE;
+    let cap = ctx.columns.min(CAP);
+    let finished = view.state.finished();
+    let status = turn_status(turn, view, ctx, narrow);
+    let mut pinned = status_rows(status, cap);
+    let mut rows = Rows {
+        ctx,
+        cap,
+        narrow,
+        live: !finished,
+        stale: matches!(
+            view.state,
+            TurnState::Working { stale: true, .. } | TurnState::Delegating { stale: true, .. }
+        ),
+        parallel: true,
+        waiting: match &view.state {
+            TurnState::Asking {
+                asking: Some(Asking::Choice { call, .. } | Asking::Permission { call }),
+                ..
+            } => Some(call.clone()),
+            _ => None,
+        },
+        running_since: None,
+        out: Vec::new(),
+        after_rule: false,
+    };
+    if let TurnState::Asking {
+        question,
+        asking,
+        by,
+        ..
+    } = &view.state
+    {
+        let block = question_rows(
+            turn,
+            &Pinned {
+                question,
+                asking: *asking,
+                by: by.as_deref(),
+            },
+            (view.height * 3 / 4).saturating_sub(3),
+            &rows,
+        );
+        pinned.splice(1..1, std::iter::once(Line::raw("")).chain(block));
+    }
+
+    let all = turn_entries(&turn.log, view.closing);
+    let last = all.len().saturating_sub(1);
+    let mut layout = Vec::new();
+    let has_prompt = matches!(all.first(), Some((Entry::Prompt(_), _)));
+    let calls = calls_label(&turn.log);
+    let closing = |rows: &mut Rows<'_, '_>| {
+        if let Some(text) = view.closing {
+            rows.blank();
+            rows.text_rows(&strip_emphasis(text), 0);
+            rows.blank();
+            rows.rule(&format!("Activity · {calls}"));
+        }
+    };
+    if !has_prompt {
+        closing(&mut rows);
+    }
+    let mut marked = false;
+    for (index, (entry, from)) in all.iter().enumerate() {
+        if let Some(looked) = view.looked
+            && !marked
+            && turn
+                .log
+                .log
+                .get(*from)
+                .and_then(time_of)
+                .is_some_and(|at| at > looked)
+            && all[..index]
+                .iter()
+                .any(|(e, _)| !matches!(e, Entry::Prompt(_)))
+        {
+            marked = true;
+            let ago = ctx.now.duration_since(looked).map(span).unwrap_or_default();
+            rows.blank();
+            rows.rule(&format!("since you looked · {ago}"));
+        }
+        layout.push(rows.entry(entry, index == last, nav.is_open(index)));
+        if index == 0 && has_prompt {
+            closing(&mut rows);
+        }
+    }
+    Rendered {
+        pinned,
+        rows: rows.out,
+        layout,
+        finished,
+    }
+}
+
+/// What the status row quotes about a turn, before it picks a state.
+struct TurnFigures<'a> {
+    log: &'a Log,
+    calls: Span<'static>,
+    errors: usize,
+    files: usize,
+    agents: usize,
+    /// Since the prompt, or since the agent began when that's unknown.
+    working: Option<String>,
+    ctx: &'a Context<'a>,
+    narrow: bool,
+}
+
+impl TurnFigures<'_> {
+    /// `1 error`, which says whether it was recovered from once the turn
+    /// is done.
+    fn errors(&self, recovered: Option<bool>) -> Option<Span<'static>> {
+        let n = self.errors;
+        (n > 0).then(|| {
+            let mut text = plural(n, "error", "errors");
+            let recovered = recovered == Some(true);
+            if recovered {
+                text.push_str(if n == 1 {
+                    ", recovered"
+                } else {
+                    ", all recovered"
+                });
+            }
+            Span::styled(text, if recovered { dim() } else { error() })
+        })
+    }
+
+    fn files(&self) -> Option<Span<'static>> {
+        (self.files > 0 && !self.narrow)
+            .then(|| Span::styled(plural(self.files, "file", "files"), dim()))
+    }
+
+    fn subagents(&self) -> Option<Span<'static>> {
+        (self.agents > 0).then(|| Span::styled(plural(self.agents, "subagent", "subagents"), dim()))
+    }
+
+    fn quiet(&self, stale: bool) -> Option<Span<'static>> {
+        let heard = stale.then_some(self.log.last_heard).flatten()?;
+        let quiet = self.ctx.now.duration_since(heard).ok()?;
+        Some(Span::styled(
+            format!("quiet {} ?", ago(self.ctx.now - quiet, self.ctx.now)),
+            dim(),
+        ))
+    }
+}
+
+fn spinner_span(stale: bool, ctx: &Context<'_>) -> Span<'static> {
+    if stale {
+        Span::styled(SPINNER[0], dim())
+    } else {
+        Span::raw(ctx.spinner)
+    }
+}
+
+/// How the turn reads on the status row.
+fn turn_status(
+    turn: &TurnDetail,
+    view: &TurnView<'_>,
+    ctx: &Context<'_>,
+    narrow: bool,
+) -> Vec<Span<'static>> {
+    let log = &turn.log;
+    let since = match view.state {
+        TurnState::Working { since, .. } => Some(since),
+        _ => None,
+    };
+    let figures = TurnFigures {
+        log,
+        calls: Span::styled(calls_label(log), dim()),
+        errors: error_count(log),
+        files: files_touched(log),
+        agents: agent_count(log),
+        working: since
+            .and_then(|from| ctx.now.duration_since(from).ok())
+            .map(span),
+        ctx,
+        narrow,
+    };
+    match &view.state {
+        TurnState::Working { stale, running, .. } => working_turn_row(&figures, *stale, *running),
+        TurnState::Asking {
+            since,
+            question,
+            asking,
+            by,
+        } => asking_turn_row(&figures, *since, question, *asking, by.as_deref()),
+        TurnState::Delegating {
+            running,
+            quiet,
+            stale,
+        } => delegating_turn_row(&figures, *running, *quiet, *stale),
+        TurnState::Done { seen } => done_turn_row(turn, &figures, *seen),
+        TurnState::Failed { reason, since } => failed_turn_row(&figures, reason, *since),
+    }
+}
+
+fn working_turn_row(figures: &TurnFigures<'_>, stale: bool, running: usize) -> Vec<Span<'static>> {
+    let narrow = figures.narrow;
+    if let Some(reason) = failing(figures.log) {
+        let spans = vec![
+            Span::styled("!", error().add_modifier(Modifier::BOLD)),
+            Span::styled(" failing", bold()),
+            Span::styled(" · ", dim()),
+            Span::raw(reason),
+        ];
+        if narrow {
+            return spans;
+        }
+        let working = figures
+            .working
+            .as_ref()
+            .map(|w| Span::styled(format!("working {w}"), dim()));
+        return with_tail(spans, vec![working, Some(figures.calls.clone())]);
+    }
+    let spans = vec![
+        spinner_span(stale, figures.ctx),
+        Span::raw(format!(
+            " working{}",
+            figures
+                .working
+                .as_ref()
+                .map(|w| format!(" {w}"))
+                .unwrap_or_default()
+        )),
+    ];
+    with_tail(
+        spans,
+        vec![
+            figures.quiet(stale),
+            Some(figures.calls.clone()),
+            figures.errors(None),
+            figures.files(),
+            (running > 0 && !narrow).then(|| Span::styled(format!("↳{running}"), dim())),
+        ],
+    )
+}
+
+fn asking_turn_row(
+    figures: &TurnFigures<'_>,
+    since: SystemTime,
+    question: &str,
+    asking: Option<&Asking>,
+    by: Option<&str>,
+) -> Vec<Span<'static>> {
+    let ctx = figures.ctx;
+    let mut spans = vec![
+        Span::styled("◆", warning().add_modifier(Modifier::BOLD)),
+        Span::raw(format!(" asking {}", ago(since, ctx.now))),
+        Span::styled(" · ", dim()),
+    ];
+    let first = |text: &str| tame(text.lines().next().unwrap_or_default().trim());
+    let about = match (asking, by) {
+        (Some(Asking::Choice { questions, .. }), _) => questions
+            .first()
+            .map(|q| first(&q.header))
+            .filter(|header| !header.is_empty())
+            .unwrap_or_else(|| "question".to_string()),
+        (_, Some(by)) => format!("↳ {by}"),
+        _ => first(question),
+    };
+    let width = ctx.columns.min(CAP);
+    let room = width.saturating_sub(line_width(&spans) + 1);
+    if !figures.narrow && room > about.chars().count() + ANSWER_HINT.len() + 3 {
+        let used = line_width(&spans) + about.chars().count();
+        let gap = " ".repeat(width.saturating_sub(used + ANSWER_HINT.len() + 1));
+        spans.extend([
+            Span::raw(about),
+            Span::raw(gap),
+            Span::styled(ANSWER_HINT, dim()),
+        ]);
+    } else {
+        spans.push(Span::raw(truncate_end(&about, room)));
+    }
+    spans
+}
+
+const ANSWER_HINT: &str = "i answer in the terminal";
+
+fn delegating_turn_row(
+    figures: &TurnFigures<'_>,
+    running: usize,
+    quiet: Duration,
+    stale: bool,
+) -> Vec<Span<'static>> {
+    let quiet = (quiet >= QUIET_FROM).then(|| {
+        Span::styled(
+            format!("quiet {}{}", span(quiet), if stale { " ?" } else { "" }),
+            dim(),
+        )
+    });
+    with_tail(
+        vec![spinner_span(stale, figures.ctx), Span::raw(" delegating")],
+        vec![Some(Span::styled(format!("↳{running}"), dim())), quiet],
+    )
+}
+
+fn done_turn_row(turn: &TurnDetail, figures: &TurnFigures<'_>, seen: bool) -> Vec<Span<'static>> {
+    let log = figures.log;
+    let took = match turn.progress {
+        Progress::Finished { took } => took.map(span),
+        Progress::Running { .. } | Progress::Stopped => None,
+    };
+    let glyph = if seen {
+        Span::styled("●", dim())
+    } else {
+        Span::styled("✓", success().add_modifier(Modifier::BOLD))
+    };
+    let (preposition, narrow) = (if figures.narrow { "" } else { " in" }, figures.narrow);
+    let spans = vec![
+        glyph,
+        Span::raw(format!(
+            " finished{}",
+            took.map(|t| format!("{preposition} {t}"))
+                .unwrap_or_default()
+        )),
+    ];
+    if narrow {
+        return with_tail(spans, vec![Some(figures.calls.clone())]);
+    }
+    with_tail(
+        spans,
+        vec![
+            Some(figures.calls.clone()),
+            figures.errors(Some(unrecovered_count(log) == 0)),
+            figures.files(),
+            figures.subagents(),
+        ],
+    )
+}
+
+fn failed_turn_row(
+    figures: &TurnFigures<'_>,
+    reason: &str,
+    since: SystemTime,
+) -> Vec<Span<'static>> {
+    let spans = vec![
+        Span::styled("!", error().add_modifier(Modifier::BOLD)),
+        Span::raw(" failed"),
+        Span::styled(" · ", dim()),
+        Span::raw(tame(reason)),
+    ];
+    let mut extras = vec![Some(Span::styled(ago(since, figures.ctx.now), dim()))];
+    if !figures.narrow {
+        extras.extend([Some(figures.calls.clone()), figures.errors(None)]);
+    }
+    with_tail(spans, extras)
+}
+
+/// A quiet delegating turn says so from this long.
+const QUIET_FROM: Duration = Duration::from_secs(30);
+
+/// What the pinned question block draws.
+struct Pinned<'a> {
+    question: &'a str,
+    asking: Option<&'a Asking>,
+    by: Option<&'a str>,
+}
+
+/// The question the agent is waiting on, pinned under the status row: a
+/// choice's questions with their options, a permission prompt's call with
+/// what the agent said before it, or a subagent's question. At most
+/// `budget` rows.
+fn question_rows(
+    turn: &TurnDetail,
+    pinned: &Pinned<'_>,
+    budget: usize,
+    rows: &Rows<'_, '_>,
+) -> Vec<Line<'static>> {
+    let budget = budget.max(6);
+    let width = rows.cap.saturating_sub(1).max(1);
+    let mut out: Vec<Line<'static>> = Vec::new();
+    match pinned.asking {
+        Some(Asking::Choice { questions, .. }) => {
+            for (at, question) in questions.iter().enumerate() {
+                if at > 0 {
+                    out.push(Line::raw(""));
+                }
+                choice_rows(question, rows, &mut out);
+            }
+        }
+        Some(Asking::Permission { call }) => permission_rows(turn, call, rows, &mut out),
+        Some(Asking::Subagent(_)) | None => {
+            if let Some(by) = pinned.by {
+                out.push(Line::from(vec![
+                    gutter(),
+                    Span::styled(format!("↳ {by} asks"), dim()),
+                ]));
+            }
+            out.extend(
+                wrap(&tame(pinned.question), width)
+                    .into_iter()
+                    .take(PERMISSION_ROWS)
+                    .map(plain_row),
+            );
+        }
+    }
+    if out.len() > budget {
+        let hidden = out.len() - (budget - 1);
+        out.truncate(budget - 1);
+        out.push(Line::from(vec![
+            gutter(),
+            Span::styled(
+                format!("+{hidden} more rows · i answer in the terminal"),
+                dim(),
+            ),
+        ]));
+    }
+    out
+}
+
+fn plain_row(text: String) -> Line<'static> {
+    Line::from(vec![gutter(), Span::raw(text)])
+}
+
+/// Where the numbers, labels and descriptions of a question's options sit.
+struct Columns {
+    /// Columns before a label: the gutter, the number and its gap.
+    lead: usize,
+    label: usize,
+    /// Room for a description beside its label, or `None` when it goes
+    /// under it.
+    beside: Option<usize>,
+    cap: usize,
+}
+
+impl Columns {
+    fn of(question: &agent_core::ports::Question, rows: &Rows<'_, '_>) -> Self {
+        let lead = 4;
+        let label = question
+            .options
+            .iter()
+            .map(|o| o.label.chars().count())
+            .max()
+            .unwrap_or(0)
+            .min(OPTION_LABEL);
+        let room = rows.cap.saturating_sub(lead + label + 3);
+        Self {
+            lead,
+            label,
+            beside: (!rows.narrow && room >= OPTION_BESIDE).then_some(room),
+            cap: rows.cap,
+        }
+    }
+}
+
+/// The question's text, then its options as numbered rows, then the
+/// `Other` the harness always adds.
+fn choice_rows(
+    question: &agent_core::ports::Question,
+    rows: &Rows<'_, '_>,
+    out: &mut Vec<Line<'static>>,
+) {
+    let width = rows.cap.saturating_sub(1).max(1);
+    out.extend(
+        wrap(&tame(&question.text), width)
+            .into_iter()
+            .map(plain_row),
+    );
+    if question.multi {
+        out.push(Line::from(vec![
+            gutter(),
+            Span::styled("pick any number", dim()),
+        ]));
+    }
+    out.push(Line::raw(""));
+    let columns = Columns::of(question, rows);
+    for (at, option) in question.options.iter().enumerate() {
+        option_rows(at + 1, &option.label, &option.description, &columns, out);
+    }
+    option_rows(
+        question.options.len() + 1,
+        "Other",
+        "type an answer",
+        &columns,
+        out,
+    );
+}
+
+/// One option: `1  label   description`, the description wrapped beside the
+/// label or, in a narrow panel, under it and cut to two rows.
+fn option_rows(
+    number: usize,
+    label: &str,
+    description: &str,
+    columns: &Columns,
+    out: &mut Vec<Line<'static>>,
+) {
+    let Columns {
+        lead,
+        label: label_width,
+        beside,
+        cap,
+    } = *columns;
+    let number = Span::styled(number.to_string(), bold());
+    let label = truncate_end(&tame(label), label_width.max(OTHER.len()).min(cap));
+    let Some(room) = beside else {
+        out.push(Line::from(vec![
+            gutter(),
+            number,
+            Span::raw("  "),
+            Span::raw(truncate_end(&label, cap.saturating_sub(lead))),
+        ]));
+        let rows = wrap(&tame(description), cap.saturating_sub(lead).max(1));
+        for (at, row) in rows.iter().take(NARROW_DESCRIPTION).enumerate() {
+            let cut = at + 1 == NARROW_DESCRIPTION && rows.len() > NARROW_DESCRIPTION;
+            let row = if cut {
+                let kept: String = row.chars().take(cap.saturating_sub(lead + 1)).collect();
+                format!("{kept}…")
+            } else {
+                row.clone()
+            };
+            out.push(Line::from(vec![
+                Span::raw(" ".repeat(lead)),
+                Span::styled(row, dim()),
+            ]));
+        }
+        return;
+    };
+    let rows = wrap(&tame(description), room.max(1));
+    let indent = " ".repeat(lead + label_width + 3);
+    for (at, row) in rows.iter().take(BESIDE_DESCRIPTION).enumerate() {
+        let mut spans = if at == 0 {
+            vec![
+                gutter(),
+                number.clone(),
+                Span::raw("  "),
+                Span::raw(format!("{label:<label_width$}   ")),
+            ]
+        } else {
+            vec![Span::raw(indent.clone())]
+        };
+        spans.push(Span::styled(row.clone(), dim()));
+        out.push(Line::from(spans));
+    }
+    if rows.len() > BESIDE_DESCRIPTION {
+        out.push(Line::from(vec![
+            Span::raw(indent),
+            Span::styled(format!("+{} lines", rows.len() - BESIDE_DESCRIPTION), dim()),
+        ]));
+    }
+}
+
+const OTHER: &str = "Other";
+/// The widest an option's label column gets, and the least room a
+/// description needs to sit beside it.
+const OPTION_LABEL: usize = 28;
+const OPTION_BESIDE: usize = 24;
+/// Rows of an option's description kept beside it, and under it when
+/// narrow.
+const BESIDE_DESCRIPTION: usize = 4;
+const NARROW_DESCRIPTION: usize = 2;
+
+fn permission_rows(
+    turn: &TurnDetail,
+    waiting: &ToolId,
+    rows: &Rows<'_, '_>,
+    out: &mut Vec<Line<'static>>,
+) {
+    let width = rows.cap.saturating_sub(1).max(1);
+    let Some((at, call)) = turn.log.log.iter().enumerate().find_map(|(at, e)| match e {
+        LogEntry::Called(call) if call.id == *waiting => Some((at, call)),
+        _ => None,
+    }) else {
+        return;
+    };
+    let said = turn.log.log[..at].iter().rev().find_map(|e| match e {
+        LogEntry::Said { text, .. } => Some(text),
+        _ => None,
+    });
+    if let Some(said) = said {
+        let wrapped = wrap(&tame(said), width);
+        let mut shown: Vec<String> = wrapped.iter().take(SAID_BEFORE).cloned().collect();
+        if wrapped.len() > SAID_BEFORE
+            && let Some(last) = shown.last_mut()
+        {
+            let kept: String = last.chars().take(width.saturating_sub(1)).collect();
+            *last = format!("{kept}…");
+        }
+        out.extend(shown.into_iter().map(plain_row));
+        out.push(Line::raw(""));
+    }
+    let name = format!("{:<6} ", call.tool);
+    let room = width.saturating_sub(name.chars().count()).max(1);
+    let input: Vec<String> = call
+        .input
+        .lines()
+        .flat_map(|line| wrap(&tame(line), room))
+        .collect();
+    for (i, row) in input.iter().take(PERMISSION_ROWS).enumerate() {
+        let lead = if i == 0 {
+            Span::styled(name.clone(), bold())
+        } else {
+            Span::raw(" ".repeat(name.chars().count()))
+        };
+        out.push(Line::from(vec![gutter(), lead, Span::raw(row.clone())]));
+    }
+    if input.len() > PERMISSION_ROWS {
+        out.push(Line::from(vec![
+            gutter(),
+            Span::raw(" ".repeat(name.chars().count())),
+            Span::styled(format!("+{} lines", input.len() - PERMISSION_ROWS), dim()),
+        ]));
+    }
+}
+
+/// The most rows of what the agent said before a permission prompt that stay
+/// pinned with it.
+const SAID_BEFORE: usize = 2;
+/// The most rows of a permission prompt's call that stay pinned.
+const PERMISSION_ROWS: usize = 6;

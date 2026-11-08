@@ -25,7 +25,7 @@ use super::{
 use crate::document::{
     BranchKey, CommitKey, DiffKey, Doc, FolderDocs, FolderKey, Hover, Key, Laid, Placed, Resolved,
 };
-use crate::model::{AgentStatus, MainLayout, Model, SubagentKey};
+use crate::model::{AgentStatus, Asking, LogKey, MainLayout, Model};
 use crate::review::{self, DiffView, LineInfo};
 
 /// [0]'s title, what its top border says on the right, its bottom-right
@@ -61,8 +61,8 @@ struct Body {
     pinned: Vec<Line<'static>>,
     /// A log's entries: each one's first row and row count.
     entries: Vec<(usize, usize)>,
-    /// The log's entry the cursor is on, and which subagent it belongs to.
-    nav: Option<SubagentKey>,
+    /// The log's entry the cursor is on, and which log it belongs to.
+    nav: Option<LogKey>,
     /// A diff, whose lines the cursor moves over.
     diff: bool,
 }
@@ -101,10 +101,15 @@ pub(super) fn page(m: &Model, area: Rect, width: usize, border: Style) -> Option
     let columns = usize::from(area.width);
     // An agent that asks takes the top row, since it needs an answer and
     // the document doesn't. It never switches [0] to the terminal itself.
-    let question = m.selected_entry().and_then(|e| match m.status(e) {
-        AgentStatus::Asking { question, .. } => Some(question),
-        _ => None,
-    });
+    // The turn pins its own, which says more.
+    let pins_own = matches!(&hover, Hover::Turn(name) if m.turn(name).is_some());
+    let question = m
+        .selected_entry()
+        .and_then(|e| match m.status(e) {
+            AgentStatus::Asking { question, .. } => Some(question),
+            _ => None,
+        })
+        .filter(|_| !pins_own);
     let reserved = if question.is_some() { 2 } else { 0 };
     let height = usize::from(area.height).saturating_sub(reserved);
     // The agent's state keeps its glyph, name and time, so the title yields
@@ -118,7 +123,7 @@ pub(super) fn page(m: &Model, area: Rect, width: usize, border: Style) -> Option
         Hover::Branch(key) => branch_body(m, key, columns),
         Hover::Folder(key) => folder_body(m, key, columns, budget),
         Hover::Commit(key) => commit_body(m, key, columns),
-        Hover::Turn(name) => turn_body(m, name, columns)?,
+        Hover::Turn(name) => turn_body(m, name, columns, height)?,
         Hover::Subagent(name, id) => log_body(m, name, id, columns, budget),
         Hover::Repo(key) => repo_body(m, key, columns)?,
     };
@@ -215,8 +220,8 @@ fn mark_entry(m: &Model, body: &Body, lines: &mut [Line<'static>], window: Windo
     if let Some(key) = &body.nav
         && m.main_focused()
         && let Some(&(start, len)) = m
-            .watched(key)
-            .and_then(|w| w.nav.cursor)
+            .nav(key)
+            .and_then(|nav| nav.cursor)
             .and_then(|at| body.entries.get(at))
     {
         for row in start.max(top)..(start + len).min(top + height) {
@@ -788,13 +793,150 @@ fn repo_body(m: &Model, key: &RepoKey, columns: usize) -> Option<Body> {
     Some(Body::built(title, rows))
 }
 
-/// The turn: the whole prompt, the whole message or question, and the
-/// subagents.
-fn turn_body(m: &Model, name: &SessionName, columns: usize) -> Option<Body> {
+/// The turn: its log when the harness has one, and otherwise the whole
+/// prompt, the whole message or question, and the subagents.
+fn turn_body(m: &Model, name: &SessionName, columns: usize, height: usize) -> Option<Body> {
     let (_, entry) = m.snapshot()?.entry(name)?;
     let activity = m.activity(name)?;
+    let title = vec![Span::raw("[0] "), Span::styled("Turn", bold())];
+    let watch = m.tracked(name).map(|t| &t.turn);
+    let Some(turn) = m.turn(name) else {
+        let failed = match watch.and_then(|w| w.watch.log.as_ref()) {
+            Some(Err(e)) => e.lines().next().map(str::to_string),
+            _ => None,
+        };
+        return Some(plain_turn_body(m, entry, title, failed, columns, height));
+    };
+    let closing = m.closing(name);
+    let asking = m.asking(name);
+    let view = log::TurnView {
+        state: turn_state(m, activity, asking.as_ref()),
+        closing: closing.as_deref(),
+        looked: watch.and_then(|w| w.looked.seen),
+        height,
+    };
+    let checkout = entry.path().map(|p| p.to_string_lossy().into_owned());
+    let home = std::env::var("HOME").ok();
+    let nav = watch.map(|w| w.watch.nav.clone()).unwrap_or_default();
+    let rendered = log::render_turn(
+        turn,
+        &view,
+        &nav,
+        &log::Context {
+            columns,
+            now: m.clock.wall,
+            spinner: spinner(m.clock.wall),
+            checkout: checkout.as_deref(),
+            home: home.as_deref(),
+        },
+    );
+    let mut rows = rendered.rows;
+    let queue = queue_rows(m, name, columns);
+    if !queue.is_empty() {
+        rows.push(Line::raw(""));
+        rows.extend(queue);
+    }
+    Some(Body {
+        tails: !rendered.finished,
+        pinned: rendered.pinned,
+        entries: rendered.layout,
+        nav: Some(LogKey::Turn(name.clone())),
+        ..Body::built(title, rows)
+    })
+}
+
+/// What the status row says of the agent's state.
+fn turn_state<'a>(
+    m: &Model,
+    activity: &'a agent_core::activity::Activity,
+    asking: Option<&'a Asking>,
+) -> log::TurnState<'a> {
+    use agent_core::activity::State;
+    let stale = activity.stale(m.clock.wall);
+    if let Some(ask) = activity.waiting() {
+        let by = match asking {
+            Some(Asking::Subagent(id)) => activity.subagents.get(id).map(|s| {
+                s.description
+                    .clone()
+                    .filter(|d| !d.is_empty())
+                    .unwrap_or_else(|| s.kind.clone())
+            }),
+            _ => None,
+        };
+        return log::TurnState::Asking {
+            since: ask.since,
+            question: &ask.question,
+            asking,
+            by,
+        };
+    }
+    match &activity.state {
+        State::Working { .. } => log::TurnState::Working {
+            since: activity.since,
+            stale,
+            running: activity.running(),
+        },
+        State::Delegating => log::TurnState::Delegating {
+            running: activity.running(),
+            quiet: m
+                .clock
+                .wall
+                .duration_since(activity.heard)
+                .unwrap_or_default(),
+            stale,
+        },
+        State::Failed { reason } => log::TurnState::Failed {
+            reason,
+            since: activity.since,
+        },
+        State::Done { .. } => log::TurnState::Done { seen: false },
+        State::Idle | State::Exited => log::TurnState::Done { seen: true },
+    }
+}
+
+/// `queued: …` rows for messages waiting to be typed into the agent.
+fn queue_rows(m: &Model, name: &SessionName, columns: usize) -> Vec<Line<'static>> {
+    let Some(queue) = m.tracked(name).and_then(|t| t.outbox.as_ref()) else {
+        return Vec::new();
+    };
+    let mut rows: Vec<Line<'static>> = queue
+        .iter()
+        .map(|q| {
+            Line::styled(
+                truncate_end(
+                    &format!("queued: {}", crate::update::first_words(q.as_ref())),
+                    columns,
+                ),
+                dim(),
+            )
+        })
+        .collect();
+    if queue.stalled(m.activity(name).map(|a| a.events), m.clock.mono) {
+        rows.push(Line::styled(
+            truncate_end(&format!("queued · waiting for {name} to report"), columns),
+            dim(),
+        ));
+    }
+    rows
+}
+
+/// The turn as the hooks tell it, for a harness with no transcript to read:
+/// the whole prompt, the whole message or question, and the subagents.
+fn plain_turn_body(
+    m: &Model,
+    entry: &agent_core::model::Entry,
+    title: Vec<Span<'static>>,
+    failed: Option<String>,
+    columns: usize,
+    height: usize,
+) -> Body {
+    let name = entry.name();
     let mut rows: Vec<Line<'static>> = Vec::new();
-    if let Some(prompt) = &activity.prompt {
+    if let Some(failed) = failed {
+        rows.push(Line::styled(truncate_end(&failed, columns), error()));
+        rows.push(Line::raw(""));
+    }
+    if let Some(prompt) = m.activity(name).and_then(|a| a.prompt.as_ref()) {
         for (i, row) in wrap(prompt, columns.saturating_sub(2))
             .into_iter()
             .enumerate()
@@ -808,22 +950,9 @@ fn turn_body(m: &Model, name: &SessionName, columns: usize) -> Option<Body> {
         rows.extend(wrap(&message, columns).into_iter().map(Line::raw));
         rows.push(Line::raw(""));
     }
-    if let Some(queue) = m.tracked(name).and_then(|t| t.outbox.as_ref()) {
-        rows.extend(queue.iter().map(|q| {
-            Line::styled(
-                truncate_end(
-                    &format!("queued: {}", crate::update::first_words(q.as_ref())),
-                    columns,
-                ),
-                dim(),
-            )
-        }));
-        if queue.stalled(m.activity(name).map(|a| a.events), m.clock.mono) {
-            rows.push(Line::styled(
-                truncate_end(&format!("queued · waiting for {name} to report"), columns),
-                dim(),
-            ));
-        }
+    let queue = queue_rows(m, name, columns);
+    if !queue.is_empty() {
+        rows.extend(queue);
         rows.push(Line::raw(""));
     }
     let subagents = subagent_rows(m, entry, columns);
@@ -837,10 +966,19 @@ fn turn_body(m: &Model, name: &SessionName, columns: usize) -> Option<Body> {
     {
         rows.pop();
     }
-    Some(Body::built(
-        vec![Span::raw("[0] "), Span::styled("Turn", bold())],
-        rows,
-    ))
+    if rows.is_empty() {
+        rows = empty_turn(columns, height);
+    }
+    Body::built(title, rows)
+}
+
+/// The one DIM line a turn that hasn't started shows, in the middle.
+fn empty_turn(columns: usize, height: usize) -> Vec<Line<'static>> {
+    let text = "no turn yet · s send";
+    let pad = columns.saturating_sub(text.chars().count()) / 2;
+    let mut rows = vec![Line::raw(""); height.saturating_sub(1) / 2];
+    rows.push(Line::styled(format!("{}{text}", " ".repeat(pad)), dim()));
+    rows
 }
 
 /// A subagent's log: its status, what it was told, a row per call and what
@@ -870,7 +1008,7 @@ fn log_body(m: &Model, name: &SessionName, id: &AgentId, columns: usize, budget:
         ..Body::built(title.clone(), vec![Line::styled(text, style)])
     };
     let key = (name.clone(), id.clone());
-    let detail = match m.watched(&key).and_then(|w| w.log.as_ref()) {
+    let detail = match m.watched(&key).and_then(|w| w.watch.log.as_ref()) {
         None => {
             return Body {
                 loading: true,
@@ -886,7 +1024,11 @@ fn log_body(m: &Model, name: &SessionName, id: &AgentId, columns: usize, budget:
         .and_then(|e| e.path())
         .map(|p| p.to_string_lossy().into_owned());
     let home = std::env::var("HOME").ok();
-    let nav = m.watched(&key).map(|w| w.nav.clone()).unwrap_or_default();
+    let nav = m
+        .watched(&key)
+        .map(|w| w.watch.nav.clone())
+        .unwrap_or_default();
+    let log_key = LogKey::Subagent(key);
     let rendered = log::render(
         detail,
         subagent,
@@ -903,7 +1045,7 @@ fn log_body(m: &Model, name: &SessionName, id: &AgentId, columns: usize, budget:
         tails: !rendered.finished,
         pinned: rendered.pinned,
         entries: rendered.layout,
-        nav: Some(key),
+        nav: Some(log_key),
         ..Body::built(title, rendered.rows)
     }
 }

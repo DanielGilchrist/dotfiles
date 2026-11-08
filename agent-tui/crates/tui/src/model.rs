@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
 use agent_core::actions::Actions;
-use agent_core::activity::{Activity, AgentId, State as ActivityState, Subagent};
+use agent_core::activity::{
+    Activity, AgentId, Answer as AskedBy, Origin as Asker, State as ActivityState, Subagent, ToolId,
+};
 use agent_core::config::Keys;
 use agent_core::model::{
     Entry, EntryKind, EntryState, Removable, Repo, RepoKey, Revival, Running, Snapshot, Startable,
@@ -12,11 +14,15 @@ use agent_core::model::{
 use agent_core::names::{AgentName, BranchName, Checkout, Prompt, SessionName};
 use agent_core::ops::{Approved, Hazardous, RemovalPlan};
 use agent_core::paths::{RepoRoot, Typed, typed_path};
-use agent_core::ports::{Change, FileState, HarnessId, Readiness, Uncommitted, WorktreeFacts};
+use agent_core::ports::{
+    CallKind, Change, FileState, HarnessId, Progress, Readiness, TurnDetail, Uncommitted,
+    WorktreeFacts,
+};
 use agent_term::{Emulator, Terminal};
 use ratatui::layout::Rect;
 
 use crate::document::{BranchKey, CommitKey, DiffKey, Documents, FolderKey, Hover, Key};
+use crate::log::Nav;
 use crate::palette::Palette;
 use crate::track::{CachedTree, LiveSince};
 pub use crate::track::{Outbox, Tracked, Watched};
@@ -982,10 +988,10 @@ pub struct MainLayout {
     pub height: usize,
     /// A log, which follows its end.
     pub tails: bool,
-    /// A log's entries: each one's first row and row count, and the
-    /// subagent it belongs to.
+    /// A log's entries: each one's first row and row count, and the log
+    /// they belong to.
     pub entries: Vec<(usize, usize)>,
-    pub nav: Option<SubagentKey>,
+    pub nav: Option<LogKey>,
     /// The document, if it is a diff whose lines the cursor moves over.
     pub diff: Option<crate::document::Slot>,
 }
@@ -1084,14 +1090,6 @@ fn lead(visibility: Visibility, repo: &Repo) -> &Entry {
         .unwrap_or_else(|| repo.first())
 }
 
-/// When a subagent's transcript was last asked for, and how many events its
-/// agent had reported then.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SubagentRead {
-    pub events: u64,
-    pub at: Instant,
-}
-
 /// What [0] opened from the branch view: a commit's diff, or the diff of an
 /// uncommitted file.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1102,6 +1100,29 @@ pub enum Opened {
 
 /// A subagent by its agent and its id.
 pub type SubagentKey = (SessionName, AgentId);
+
+/// What an agent that waits on the user is asking about, as far as its
+/// turn can place the question.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Asking {
+    /// A call that puts questions to the user.
+    Choice {
+        call: ToolId,
+        questions: Vec<agent_core::ports::Question>,
+    },
+    /// Leave to run `call`.
+    Permission { call: ToolId },
+    /// One of its subagents asks.
+    Subagent(AgentId),
+}
+
+/// A log [0] reads and the cursor moves over: a subagent's, or the current
+/// turn of an agent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LogKey {
+    Subagent(SubagentKey),
+    Turn(SessionName),
+}
 
 pub enum Load {
     Pending,
@@ -1426,6 +1447,100 @@ impl Model {
     /// What is known about `name`'s subagent `id`, if it is being watched.
     pub fn watched(&self, (name, id): &SubagentKey) -> Option<&Watched> {
         self.agents.get(name)?.subagents.get(id)
+    }
+
+    /// The cursor and folds of the log `key` names.
+    pub fn nav(&self, key: &LogKey) -> Option<&Nav> {
+        match key {
+            LogKey::Subagent(key) => self.watched(key).map(|w| &w.watch.nav),
+            LogKey::Turn(name) => self.agents.get(name).map(|t| &t.turn.watch.nav),
+        }
+    }
+
+    pub fn nav_mut(&mut self, key: &LogKey) -> Option<&mut Nav> {
+        match key {
+            LogKey::Subagent((name, id)) => self
+                .agents
+                .get_mut(name)?
+                .subagents
+                .get_mut(id)
+                .map(|w| &mut w.watch.nav),
+            LogKey::Turn(name) => self.agents.get_mut(name).map(|t| &mut t.turn.watch.nav),
+        }
+    }
+
+    /// Whether `name` is at work on its turn, so its log grows: working,
+    /// delegating or waiting on an answer.
+    pub fn turn_running(&self, name: &SessionName) -> bool {
+        self.activity(name).is_some_and(|a| {
+            a.waiting().is_some()
+                || matches!(
+                    a.state,
+                    ActivityState::Working { .. } | ActivityState::Delegating
+                )
+        })
+    }
+
+    /// What `name` is asking about, matched by tool id to its turn. `None`
+    /// when it asks nothing or the turn hasn't caught up with the ask.
+    pub fn asking(&self, name: &SessionName) -> Option<Asking> {
+        let ask = self.activity(name)?.waiting()?;
+        if let Asker::Subagent(id) = &ask.asker {
+            return Some(Asking::Subagent(id.clone()));
+        }
+        let AskedBy::ToolEnding(call) = &ask.answered_by else {
+            return None;
+        };
+        let turn = self.turn(name)?;
+        if let Progress::Running { asked: Some(asked) } = &turn.progress
+            && asked.call == *call
+        {
+            return Some(Asking::Choice {
+                call: call.clone(),
+                questions: asked.questions.clone(),
+            });
+        }
+        turn.log
+            .log
+            .iter()
+            .find_map(|e| match e {
+                agent_core::ports::LogEntry::Called(c) if c.id == *call => Some(c),
+                _ => None,
+            })
+            .filter(|c| c.kind != CallKind::Ask)
+            .map(|c| Asking::Permission { call: c.id.clone() })
+    }
+
+    /// What `name` ended its turn with, once it has: the message its hook
+    /// reported, or else the transcript's last line. It is shown apart from
+    /// the turn's log.
+    pub fn closing(&self, name: &SessionName) -> Option<String> {
+        let reported = || match &self.turn(name)?.log.outcome {
+            agent_core::ports::Outcome::Finished { report } => report.clone(),
+            _ => None,
+        };
+        match &self.activity(name)?.state {
+            ActivityState::Done { summary } => summary.clone().or_else(reported),
+            ActivityState::Idle | ActivityState::Exited => reported(),
+            ActivityState::Working { .. }
+            | ActivityState::Delegating
+            | ActivityState::Failed { .. } => None,
+        }
+    }
+
+    /// Whether [0] has a log of `name`'s turn to move over, as opposed to the
+    /// hooks' account of it.
+    pub fn turn_has_log(&self, name: &SessionName) -> bool {
+        self.turn(name)
+            .is_some_and(|t| t.log.prompt.is_some() || !t.log.log.is_empty())
+    }
+
+    /// `name`'s current turn as last read, if it was read and found.
+    pub fn turn(&self, name: &SessionName) -> Option<&TurnDetail> {
+        match self.agents.get(name)?.turn.watch.log.as_ref()? {
+            Ok(Some(turn)) => Some(turn),
+            Ok(None) | Err(_) => None,
+        }
     }
 
     /// `name`'s git facts, or why they couldn't be read, as last read.
@@ -1801,6 +1916,8 @@ impl Model {
             return;
         };
         let top = main.top(&self.docs);
+        let entry = main.entry_at(top);
+        let key = main.nav.clone();
         if main.diff.is_some() {
             let lines = self.docs.lines();
             let at = lines
@@ -1812,13 +1929,10 @@ impl Model {
                 self.diff_view.anchor = None;
             }
         }
-        if let Some(key) = &main.nav
-            && let Some(watched) = self
-                .agents
-                .get_mut(&key.0)
-                .and_then(|t| t.subagents.get_mut(&key.1))
+        if let Some(key) = key
+            && let Some(nav) = self.nav_mut(&key)
         {
-            watched.nav.cursor = Some(main.entry_at(top));
+            nav.cursor = Some(entry);
         }
     }
 
@@ -3579,9 +3693,19 @@ impl Model {
     pub fn set_log(
         &mut self,
         key: SubagentKey,
-        log: Result<Option<agent_core::ports::SubagentDetail>, String>,
+        log: Result<Option<agent_core::ports::Log>, String>,
     ) {
-        self.track(&key.0).subagents.entry(key.1).or_default().log = Some(log);
+        self.track(&key.0)
+            .subagents
+            .entry(key.1)
+            .or_default()
+            .watch
+            .log = Some(log);
+    }
+
+    /// `name`'s current turn as if it had been read.
+    pub fn set_turn(&mut self, name: &SessionName, turn: Result<Option<TurnDetail>, String>) {
+        self.track(name).turn.watch.log = Some(turn);
     }
 
     /// How many subagents are being watched across every agent.

@@ -6,7 +6,9 @@ use std::fmt::Write;
 use std::time::{Duration, SystemTime};
 
 use agent_core::activity::ToolId;
-use agent_core::ports::{Call, CallState, Excerpt, LogEntry, Summary, Target};
+use agent_core::ports::{
+    Call, CallKind, CallState, Choice, Excerpt, LogEntry, Question, Summary, Target,
+};
 use serde_json::Value;
 
 /// How much of what a subagent said a log entry keeps.
@@ -21,6 +23,11 @@ const REPORT: usize = 8000;
 /// Lines shown under a call that failed or was flagged.
 const EXCERPT: usize = 3;
 const SUMMARY: usize = 160;
+/// How much of a question or an option's description is kept, and how many
+/// questions and options a call is read for.
+const ASKED: usize = 1000;
+const QUESTIONS: usize = 4;
+const OPTIONS: usize = 8;
 const TARGET: usize = 240;
 
 #[derive(Debug, Default)]
@@ -34,6 +41,12 @@ pub(crate) struct Parsed {
     /// Entries older than [`LOG_ENTRIES`] were dropped.
     pub dropped: bool,
     pub stopped: Option<String>,
+    /// How long the turn took, while nothing has followed the record that
+    /// says it ended.
+    pub took: Option<Duration>,
+    /// The call that asks the user questions and has no answer yet, with its
+    /// questions.
+    pub asking: Option<(ToolId, Vec<Question>)>,
 }
 
 /// The records in `text`, one JSON per line. Lines that aren't whole records
@@ -51,7 +64,9 @@ pub(crate) fn parse(text: &str) -> Parsed {
             .and_then(parse_time);
         out.last_heard = out.last_heard.max(at);
         let kind = record.get("type").and_then(Value::as_str);
+        note_turn_record(&mut out, &record, at);
         if kind == Some("assistant") {
+            out.took = None;
             if record.get("isApiErrorMessage").and_then(Value::as_bool) == Some(true) {
                 let text = record
                     .pointer("/message/content")
@@ -90,18 +105,25 @@ pub(crate) fn parse(text: &str) -> Parsed {
                     let tool = field("name").unwrap_or("a tool");
                     if let Some(id) = field("id") {
                         calls.insert(id.to_string(), out.log.len());
+                        if tool == "AskUserQuestion" {
+                            out.asking = Some((ToolId::new(id), questions(input)));
+                        }
                     }
-                    out.log.push(LogEntry::Called(Call {
+                    out.log.push(LogEntry::Called(Box::new(Call {
                         id: ToolId::new(field("id").unwrap_or_default()),
-                        tool: tool_name(tool),
+                        tool: plain(&tool_name(tool)),
+                        kind: kind_of(tool),
                         target: target_of(tool, input),
                         state: CallState::Running,
                         started: at,
                         input: input_text(tool, input),
                         output: String::new(),
-                    }));
+                    })));
                 }
                 (Some("user"), Some("tool_result")) => {
+                    if out.asking.as_ref().map(|(id, _)| id.as_str()) == field("tool_use_id") {
+                        out.asking = None;
+                    }
                     let Some(&index) = field("tool_use_id").and_then(|id| calls.get(id)) else {
                         continue;
                     };
@@ -126,6 +148,90 @@ pub(crate) fn parse(text: &str) -> Parsed {
     out.dropped = over > 0;
     out.log.drain(..over);
     out
+}
+
+/// The records that say how the turn went rather than what the agent did:
+/// how long it took, a compaction, a message the user queued.
+fn note_turn_record(out: &mut Parsed, record: &Value, at: Option<SystemTime>) {
+    let kind = record.get("type").and_then(Value::as_str);
+    match (kind, record.get("subtype").and_then(Value::as_str)) {
+        (Some("system"), Some("turn_duration")) => {
+            out.took = record
+                .get("durationMs")
+                .and_then(Value::as_u64)
+                .map(Duration::from_millis);
+        }
+        (Some("system"), Some("compact_boundary")) => out.log.push(LogEntry::Compacted),
+        (Some("attachment"), _) => {
+            if let Some(text) = queued_message(record) {
+                out.log.push(LogEntry::Queued { text, at });
+            }
+        }
+        _ => {}
+    }
+}
+
+/// What the user sent while the agent was working, from a `queued_command`
+/// attachment. Messages the harness wrote itself are left out.
+fn queued_message(record: &Value) -> Option<String> {
+    let attachment = record.get("attachment")?;
+    if attachment.get("type")?.as_str()? != "queued_command" {
+        return None;
+    }
+    let text = crate::text_of(attachment.get("prompt")?);
+    let text = text.trim();
+    let own = crate::NOTIFICATION_PREFIXES
+        .iter()
+        .any(|prefix| text.starts_with(prefix));
+    (!text.is_empty() && !own).then(|| text.chars().take(SAID).collect())
+}
+
+/// The questions of an `AskUserQuestion` call's input.
+fn questions(input: &Value) -> Vec<Question> {
+    let text = |value: &Value, key: &str, max: usize| {
+        value
+            .get(key)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .chars()
+            .take(max)
+            .collect::<String>()
+    };
+    input
+        .get("questions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .take(QUESTIONS)
+        .map(|question| Question {
+            header: first_line(&text(question, "header", SUMMARY), SUMMARY),
+            text: text(question, "question", ASKED),
+            multi: question.get("multiSelect").and_then(Value::as_bool) == Some(true),
+            options: question
+                .get("options")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .take(OPTIONS)
+                .map(|option| Choice {
+                    label: first_line(&text(option, "label", SUMMARY), SUMMARY),
+                    description: text(option, "description", ASKED),
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+/// What a tool does, by the names Claude Code gives them.
+fn kind_of(tool: &str) -> CallKind {
+    match tool {
+        "Read" | "Grep" | "Glob" | "LS" => CallKind::Explore,
+        "Edit" | "MultiEdit" | "Write" | "NotebookEdit" => CallKind::Edit,
+        "Agent" | "Task" => CallKind::Delegate,
+        "AskUserQuestion" => CallKind::Ask,
+        _ => CallKind::Other,
+    }
 }
 
 /// `mcp__server__tool` reads `server.tool`.
@@ -464,41 +570,15 @@ pub(crate) fn parse_time(stamp: &str) -> Option<SystemTime> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn record(kind: &str, at: &str, content: &str, extra: &str) -> String {
-        format!(
-            r#"{{"type":"{kind}","timestamp":"{at}"{extra},"message":{{"content":{content}}}}}"#
-        )
-    }
-
-    fn use_of(id: &str, name: &str, input: &str, at: &str) -> String {
-        record(
-            "assistant",
-            at,
-            &format!(r#"[{{"type":"tool_use","id":"{id}","name":"{name}","input":{input}}}]"#),
-            "",
-        )
-    }
-
-    fn result_of(id: &str, text: &str, error: bool, at: &str, extra: &str) -> String {
-        record(
-            "user",
-            at,
-            &format!(
-                r#"[{{"type":"tool_result","tool_use_id":"{id}","is_error":{error},"content":{}}}]"#,
-                serde_json::to_string(text).expect("json")
-            ),
-            extra,
-        )
-    }
+    use crate::fixtures::{record, result_of, use_of};
 
     fn calls(parsed: &Parsed) -> Vec<&Call> {
         parsed
             .log
             .iter()
             .filter_map(|e| match e {
-                LogEntry::Called(c) => Some(c),
-                LogEntry::Said { .. } => None,
+                LogEntry::Called(c) => Some(c.as_ref()),
+                LogEntry::Said { .. } | LogEntry::Queued { .. } | LogEntry::Compacted => None,
             })
             .collect()
     }
@@ -752,5 +832,55 @@ mod tests {
             "python3 - <<'E'"
         );
         assert_eq!(command_target("cd /only"), "cd /only");
+    }
+
+    #[test]
+    fn calls_are_classified_by_what_they_do_and_their_names_cleaned() {
+        let text = [
+            use_of(
+                "a",
+                "Edit",
+                r#"{"file_path":"/a"}"#,
+                "2026-11-08T10:00:00.000Z",
+            ),
+            use_of(
+                "b",
+                "Agent",
+                r#"{"description":"qa"}"#,
+                "2026-11-08T10:00:01.000Z",
+            ),
+            use_of(
+                "c",
+                "AskUserQuestion",
+                r#"{"questions":[]}"#,
+                "2026-11-08T10:00:02.000Z",
+            ),
+            use_of(
+                "d",
+                "Grep",
+                r#"{"pattern":"x"}"#,
+                "2026-11-08T10:00:03.000Z",
+            ),
+            use_of(
+                "e",
+                r"Bash\u001b[2J",
+                r#"{"command":"ls"}"#,
+                "2026-11-08T10:00:04.000Z",
+            ),
+        ]
+        .join("\n");
+        let parsed = parse(&text);
+        let kinds: Vec<_> = calls(&parsed).iter().map(|c| c.kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                CallKind::Edit,
+                CallKind::Delegate,
+                CallKind::Ask,
+                CallKind::Explore,
+                CallKind::Other
+            ]
+        );
+        assert!(!calls(&parsed)[4].tool.contains('\u{1b}'));
     }
 }

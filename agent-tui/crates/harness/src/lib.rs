@@ -5,16 +5,20 @@ use std::time::SystemTime;
 
 use agent_core::activity::{
     About, AgentId, Background, Common, Input, MainEvent, Reported, SubagentEvent, ToolId,
+    TranscriptRef,
 };
 use agent_core::names::Prompt;
 use agent_core::ports::{
-    Harness, HarnessError, HarnessId, Harnesses, LaunchCtx, LogEntry, Outcome, PendingPrompt, Seen,
-    SubagentDetail,
+    Harness, HarnessError, HarnessId, Harnesses, LaunchCtx, Log, Outcome, PendingPrompt, Seen,
+    TurnDetail, ends_with_report,
 };
 use agent_core::process::{LaunchSpec, quiet};
 use serde::Deserialize;
 
+#[cfg(test)]
+mod fixtures;
 mod transcript;
+mod turn;
 
 const ASK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
@@ -212,6 +216,25 @@ impl Claude {
         Ok(newest.map(|(_, path)| path))
     }
 
+    /// The transcript of the agent's current conversation: the one the hooks
+    /// named, if it is a transcript file under the projects directory, and
+    /// otherwise the one
+    /// `launch` would resume.
+    fn turn_file(&self, workdir: &Path, at: Option<&TranscriptRef>) -> io::Result<Option<PathBuf>> {
+        let projects = self.projects.canonicalize().ok();
+        let named = at
+            .and_then(|at| at.path().canonicalize().ok())
+            .filter(|path| path.extension().is_some_and(|e| e == "jsonl") && path.is_file())
+            .filter(|path| projects.as_ref().is_some_and(|dir| path.starts_with(dir)));
+        if named.is_some() {
+            return Ok(named);
+        }
+        let workdir = workdir.canonicalize()?;
+        Ok(self
+            .resumable(&workdir)?
+            .map(|id| self.project_dir(&workdir).join(format!("{id}.jsonl"))))
+    }
+
     /// The conversation to resume: the newest transcript written since the
     /// worktree was created that the user has spoken in. Older ones belong
     /// to a previous agent that used the same name. `/clear` starts a new
@@ -345,11 +368,7 @@ impl Harness for Claude {
     /// Claude Code writes each subagent's transcript beside the session's,
     /// in `<session>/subagents/agent-<id>.jsonl`. The hooks name the
     /// subagent but not the session, so the project's sessions are searched.
-    fn subagent(
-        &self,
-        workdir: &Path,
-        id: &AgentId,
-    ) -> Result<Option<SubagentDetail>, HarnessError> {
+    fn subagent(&self, workdir: &Path, id: &AgentId) -> Result<Option<Log>, HarnessError> {
         let workdir = workdir
             .canonicalize()
             .unwrap_or_else(|_| workdir.to_path_buf());
@@ -369,6 +388,23 @@ impl Harness for Claude {
                 context: context(),
                 source,
             })
+    }
+
+    /// The turn in the transcript the hooks last named, or failing that the
+    /// worktree's newest conversation.
+    fn turn(
+        &self,
+        workdir: &Path,
+        at: Option<&TranscriptRef>,
+    ) -> Result<Option<TurnDetail>, HarnessError> {
+        let context = |source| HarnessError {
+            context: "reading the transcript of the current turn".into(),
+            source,
+        };
+        let Some(file) = self.turn_file(workdir, at).map_err(context)? else {
+            return Ok(None);
+        };
+        turn::read(&file).map_err(context)
     }
 
     /// Bracketed paste keeps a multi-line prompt as one message; Enter submits it.
@@ -475,7 +511,7 @@ fn has_user_turn(path: &Path) -> io::Result<bool> {
 /// A subagent's prompt, log and outcome, from its transcript and the
 /// `meta.json` beside it. A transcript still being written is read as far
 /// as it goes.
-fn read_subagent(transcript: &Path) -> io::Result<SubagentDetail> {
+fn read_subagent(transcript: &Path) -> io::Result<Log> {
     let mut file = std::fs::File::open(transcript)?;
     let len = file.metadata()?.len();
     let head = read_head(&file)?;
@@ -483,10 +519,10 @@ fn read_subagent(transcript: &Path) -> io::Result<SubagentDetail> {
     let meta = read_meta(transcript);
     let mut parsed = transcript::parse(tail.text());
     let outcome = outcome_of(&mut parsed, meta.finished.get().copied().unwrap_or(false));
-    Ok(SubagentDetail {
+    Ok(Log {
         prompt: head.prompt,
         log: parsed.log,
-        transcript: transcript.to_path_buf(),
+        transcript: TranscriptRef::new(transcript.to_string_lossy()),
         outcome,
         model: meta.model.0,
         started: head.started,
@@ -512,7 +548,7 @@ fn read_meta(transcript: &Path) -> Meta {
 }
 
 struct Head {
-    prompt: String,
+    prompt: Option<String>,
     started: Option<SystemTime>,
 }
 
@@ -526,7 +562,7 @@ fn read_head(file: &std::fs::File) -> io::Result<Head> {
         .as_ref()
         .and_then(|r| r.get("timestamp")?.as_str())
         .and_then(transcript::parse_time);
-    let prompt = record.as_ref().and_then(prompt_of).unwrap_or_default();
+    let prompt = record.as_ref().and_then(prompt_of);
     Ok(Head { prompt, started })
 }
 
@@ -539,8 +575,9 @@ fn outcome_of(parsed: &mut transcript::Parsed, finished: bool) -> Outcome {
         },
         (None, true) => {
             let said = parsed.last_said.take();
-            if let (Some(said), Some(LogEntry::Said { text, .. })) = (&said, parsed.log.last())
-                && said.starts_with(text.as_str())
+            if said
+                .as_deref()
+                .is_some_and(|said| ends_with_report(&parsed.log, said))
             {
                 parsed.log.pop();
             }
@@ -716,6 +753,9 @@ struct Payload {
     /// Set when a subagent fired the hook.
     #[serde(default)]
     agent_id: Option<NonEmpty>,
+    /// The agent's transcript file.
+    #[serde(default)]
+    transcript_path: Lenient<String>,
     #[serde(flatten)]
     hook: Hook,
 }
@@ -876,8 +916,16 @@ enum Routed {
 /// name a subagent, and the other way round. So are payloads that aren't
 /// one of the hooks above or lack an id or tool name they need.
 fn claude_event(payload: &str) -> Option<Reported> {
-    let Payload { agent_id, hook } = serde_json::from_str(payload).ok()?;
+    let Payload {
+        agent_id,
+        transcript_path,
+        hook,
+    } = serde_json::from_str(payload).ok()?;
     let agent = agent_id.map(|id| AgentId::new(id.0));
+    let transcript = transcript_path
+        .text()
+        .filter(|path| !path.is_empty())
+        .map(TranscriptRef::new);
     let routed = match hook {
         Hook::SessionStart { source } if source.as_deref() == Some("compact") => {
             Routed::Main(MainEvent::Compacted)
@@ -944,8 +992,8 @@ fn claude_event(payload: &str) -> Option<Reported> {
             Some(Reported::subagent(id, event))
         }
         (Routed::Common(event), Some(id)) => Some(Reported::subagent(id, event)),
-        (Routed::Main(event), None) => Some(Reported::main(event)),
-        (Routed::Common(event), None) => Some(Reported::main(event)),
+        (Routed::Main(event), None) => Some(Reported::main(event).at_transcript(transcript)),
+        (Routed::Common(event), None) => Some(Reported::main(event).at_transcript(transcript)),
         (Routed::Main(_), Some(_)) | (Routed::Subagent(_), None) => None,
     }
 }
@@ -1503,7 +1551,10 @@ mod tests {
             .subagent(&work_path, &id)
             .expect("reads")
             .expect("found");
-        assert_eq!(detail.prompt, "Review the diff.\nBe harsh.");
+        assert_eq!(
+            detail.prompt.as_deref(),
+            Some("Review the diff.\nBe harsh.")
+        );
         assert!(matches!(detail.outcome, Outcome::Finished { .. }));
         assert_eq!(detail.log.len(), 2);
 
@@ -1512,7 +1563,7 @@ mod tests {
             .subagent(&work_path, &id)
             .expect("reads")
             .expect("found");
-        assert_eq!(empty.prompt, "");
+        assert_eq!(empty.prompt, None);
         assert_eq!(empty.log, []);
 
         let hostile = AgentId::new("../x");
@@ -1582,5 +1633,84 @@ mod tests {
             .expect("reads")
             .expect("found");
         assert!(found.to_string_lossy().contains("aaa-new"));
+    }
+
+    #[test]
+    fn the_transcript_path_of_the_agent_is_kept_and_a_subagents_is_not() {
+        let payload = |extra: &str| {
+            format!(
+                r#"{{"hook_event_name":"UserPromptSubmit","prompt":"hi","transcript_path":"/p/s.jsonl"{extra}}}"#
+            )
+        };
+        let main = claude_event(&payload("")).expect("an event");
+        assert_eq!(main.transcript, Some(TranscriptRef::new("/p/s.jsonl")));
+        assert_eq!(
+            claude_event(r#"{"hook_event_name":"SessionEnd","transcript_path":""}"#)
+                .expect("an event")
+                .transcript,
+            None,
+            "an empty path names nothing"
+        );
+        let tool = |extra: &str| {
+            format!(
+                r#"{{"hook_event_name":"PreToolUse","tool_use_id":"t","tool_name":"Bash","transcript_path":"/p/s.jsonl"{extra}}}"#
+            )
+        };
+        assert_eq!(
+            claude_event(&tool(r#","agent_id":"a1""#))
+                .expect("an event")
+                .transcript,
+            None,
+            "whichever file a subagent's hooks name, it isn't the agent's turn"
+        );
+        assert_eq!(
+            claude_event(&tool("")).expect("an event").transcript,
+            Some(TranscriptRef::new("/p/s.jsonl"))
+        );
+    }
+
+    #[test]
+    fn the_turn_is_read_from_the_named_transcript_or_else_the_newest_conversation() {
+        let home = tempfile::tempdir().expect("a temp dir");
+        let work = tempfile::tempdir().expect("a temp dir");
+        let claude = Claude::with_program(home.path(), "/usr/bin/true".into());
+        let dir = claude.project_dir(&work.path().canonicalize().expect("exists"));
+        std::fs::create_dir_all(&dir).expect("creates");
+        let prompt = |text: &str| {
+            format!(
+                r#"{{"type":"user","promptId":"p","timestamp":"2026-11-08T10:00:00.000Z","message":{{"role":"user","content":"{text}"}}}}"#
+            )
+        };
+        let other = claude.projects.join("other-project");
+        std::fs::create_dir_all(&other).expect("creates");
+        let named = other.join("named.jsonl");
+        std::fs::write(&named, prompt("from the hooks")).expect("writes");
+        let outside = home.path().join("elsewhere.jsonl");
+        std::fs::write(&outside, prompt("from outside")).expect("writes");
+        let sneaky = format!("{}/../../elsewhere.jsonl", claude.projects.display());
+        std::fs::write(dir.join("found.jsonl"), prompt("from the newest")).expect("writes");
+
+        let turn = |at: Option<&TranscriptRef>| {
+            claude
+                .turn(work.path(), at)
+                .expect("reads")
+                .and_then(|t| t.log.prompt)
+        };
+        let at = TranscriptRef::new(named.to_string_lossy());
+        assert_eq!(turn(Some(&at)).as_deref(), Some("from the hooks"));
+        assert_eq!(turn(None).as_deref(), Some("from the newest"));
+        for refused in [
+            "relative.jsonl",
+            "/etc/passwd",
+            "/nowhere/else.jsonl",
+            &outside.to_string_lossy(),
+            sneaky.as_str(),
+        ] {
+            assert_eq!(
+                turn(Some(&TranscriptRef::new(refused))).as_deref(),
+                Some("from the newest"),
+                "{refused} isn't a transcript to read"
+            );
+        }
     }
 }

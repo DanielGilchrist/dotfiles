@@ -2780,36 +2780,32 @@ mod tests {
         assert_eq!(border(&terminal), Color::Cyan, "[0] has them now");
     }
 
-    fn log_of(entries: usize, finished: bool) -> agent_core::ports::SubagentDetail {
+    fn log_of(entries: usize, finished: bool) -> agent_core::ports::Log {
         use crate::log::fixtures::{bash, said};
-        use agent_core::ports::{Call, CallState, LogEntry, Summary, Target};
+        use agent_core::ports::{CallState, LogEntry, Summary, Target};
         let mut log = Vec::new();
         for i in 0..entries {
-            log.push(LogEntry::Called(Call {
-                id: agent_core::activity::ToolId::new(format!("c{i}")),
-                tool: "Edit".into(),
-                target: Target::Path {
+            log.push(LogEntry::Called(Box::new(crate::log::fixtures::call(
+                "Edit",
+                Target::Path {
                     path: format!("src/file{i}.rs"),
                     range: None,
                 },
-                state: CallState::Done {
+                CallState::Done {
                     summary: Summary::Diff {
                         added: i,
                         removed: 0,
                     },
                     took: None,
                 },
-                started: None,
-                input: String::new(),
-                output: String::new(),
-            }));
+            ))));
             if i % 4 == 3 {
                 log.push(said(&format!("Checked file {i}.")));
             }
         }
         log.push(bash("cargo test", CallState::Running));
-        agent_core::ports::SubagentDetail {
-            prompt: "Find every call site of roundCurrency.".into(),
+        agent_core::ports::Log {
+            prompt: Some("Find every call site of roundCurrency.".into()),
             outcome: if finished {
                 agent_core::ports::Outcome::Finished {
                     report: Some("All done, three call sites.".to_string()),
@@ -2895,7 +2891,10 @@ mod tests {
             .iter()
             .find(|r| r.contains("src/file38.rs"))
             .expect("a call row");
-        assert!(call.contains("+38 −0"), "its result sits beside it\n{call}");
+        assert!(
+            call.contains("+38") && !call.contains("−0"),
+            "its result sits beside it\n{call}"
+        );
 
         m.docs.scroll_by(-5);
         let text = screen(&render(&mut m, (100, 30))).join("\n");
@@ -3943,5 +3942,589 @@ mod tests {
         assert!(text.contains("▶ crates/tui/src"), "{text}");
         assert!(!text.contains("lib.rs"), "{text}");
         assert!(text.contains("▼ docs"), "{text}");
+    }
+
+    mod turn {
+        use std::time::Duration;
+
+        use agent_core::activity::{Answer, Ask, Origin, State, Tool, ToolId};
+        use agent_core::ports::{
+            Asked, CallState, Choice, LogEntry, Outcome, Progress, Question, Summary, Target,
+            TurnDetail,
+        };
+
+        use super::*;
+        use crate::log::fixtures::{before, call_at, done, said_at, story, turn_at};
+
+        fn at(m: &mut Model, agent: &str, size: (u16, u16)) -> SessionName {
+            let who = name(agent);
+            m.set_cursor(Cursor::Entry(who.clone()));
+            m.panel = Focused::turn();
+            let _ = size;
+            who
+        }
+
+        /// The agent's [0] as rows, after the sidebar, with its bottom border.
+        fn page(m: &mut Model, size: (u16, u16)) -> Vec<String> {
+            let terminal = render(m, size);
+            let area = m.areas.terminal;
+            screen(&terminal)
+                .into_iter()
+                .skip(usize::from(area.y))
+                .take(usize::from(area.height) + 1)
+                .map(|row| {
+                    row.chars()
+                        .skip(usize::from(area.x))
+                        .take(usize::from(area.width))
+                        .collect()
+                })
+                .collect()
+        }
+
+        fn working(m: &mut Model, agent: &str) -> SessionName {
+            let who = at(m, agent, (140, 40));
+            let activity = m
+                .activities
+                .as_mut()
+                .and_then(|a| a.get_mut(&who))
+                .expect("reports");
+            activity.state = State::Working {
+                tools: vec![Tool {
+                    id: ToolId::new("b2"),
+                    name: "Bash".into(),
+                    target: Some("nvim --headless".into()),
+                    since: m.clock.wall - Duration::from_secs(12),
+                }],
+            };
+            activity.since = m.clock.wall - Duration::from_secs(372);
+            let turn = turn_at(
+                m.clock.wall,
+                story(m.clock.wall),
+                Some(call_at(
+                    m.clock.wall,
+                    "b2",
+                    "Bash",
+                    Target::Command(
+                        "nvim --headless -c 'lua require(\"heucristic.status\")' -c q".into(),
+                    ),
+                    CallState::Running,
+                    12,
+                )),
+            );
+            m.set_turn(&who, Ok(Some(turn)));
+            who
+        }
+
+        #[test]
+        fn a_working_turn_shows_progress_older_phases_folded_and_the_current_one_whole() {
+            let mut m = fleet(10);
+            working(&mut m, "payroll-fix-3");
+            for size in [(140, 40), (70, 26)] {
+                let rows = page(&mut m, size);
+                let text = rows.join("\n");
+                assert!(text.contains("working 6m12s"), "{size:?}\n{text}");
+                assert!(text.contains("calls"), "{size:?}\n{text}");
+                assert!(text.contains("1 err"), "{size:?}\n{text}");
+                assert!(
+                    size.0 < 100 || text.contains("› Are you able to run manual QA"),
+                    "the prompt is on top until a narrow log follows its tail off it\n{text}"
+                );
+                for folded in ["I'll read how th", "The provider need"] {
+                    let row = rows
+                        .iter()
+                        .find(|r| r.contains(folded))
+                        .unwrap_or_else(|| panic!("{folded}\n{text}"));
+                    assert!(row.contains('▸') && row.contains("call"), "{row}");
+                }
+                assert!(
+                    !text.contains("while I write the module."),
+                    "an older phase is a heading, not its whole text\n{text}"
+                );
+                assert!(
+                    text.contains("guarding it and running it again."),
+                    "the current phase in full\n{text}"
+                );
+                assert!(text.contains("E5113"), "the failure's first line\n{text}");
+                assert!(text.contains("running"), "the live call\n{text}");
+                assert!(text.contains("following"), "{text}");
+            }
+        }
+
+        #[test]
+        fn a_phase_with_two_subagents_says_so_and_a_diff_phase_its_counts() {
+            let mut m = fleet(10);
+            working(&mut m, "payroll-fix-3");
+            let text = page(&mut m, (140, 40)).join("\n");
+            assert!(text.contains("+4 −2"), "{text}");
+            assert!(text.contains("↳2"), "{text}");
+        }
+
+        #[test]
+        fn opening_a_folded_phase_shows_what_it_said_and_did() {
+            let mut m = fleet(10);
+            let who = working(&mut m, "payroll-fix-3");
+            m.panel.focus_document();
+            render(&mut m, (140, 40));
+            m.track(&who).turn.watch.nav.open.insert(2);
+            let text = page(&mut m, (140, 40)).join("\n");
+            assert!(text.contains("wiring it into lsp.lua."), "{text}");
+            assert!(text.contains("lsp.lua") && text.contains("Edit"), "{text}");
+        }
+
+        fn asking(
+            m: &mut Model,
+            agent: &str,
+            questions: Vec<Question>,
+            running: LogEntry,
+        ) -> SessionName {
+            let who = at(m, agent, (140, 40));
+            let activity = m
+                .activities
+                .as_mut()
+                .and_then(|a| a.get_mut(&who))
+                .expect("reports");
+            let call = match &running {
+                LogEntry::Called(call) => call.id.clone(),
+                other => panic!("{other:?}"),
+            };
+            activity.asks.push(Ask {
+                asker: Origin::Main,
+                question: "Meta-session: drop the grid?".into(),
+                answered_by: Answer::ToolEnding(call.clone()),
+                since: m.clock.wall - Duration::from_secs(120),
+            });
+            let log = vec![
+                said_at(
+                    m.clock.wall,
+                    "Listing what still references the meta-session.",
+                    100,
+                ),
+                call_at(
+                    m.clock.wall,
+                    "g",
+                    "Grep",
+                    Target::Search {
+                        pattern: "meta_session".into(),
+                        path: None,
+                    },
+                    done(Summary::Matches(14)),
+                    95,
+                ),
+                said_at(
+                    m.clock.wall,
+                    "Three callers still use it. Before deleting them I want to confirm you don't still use the grid anywhere.",
+                    90,
+                ),
+            ];
+            let mut turn = turn_at(m.clock.wall, log, Some(running));
+            if !questions.is_empty() {
+                turn.progress = Progress::Running {
+                    asked: Some(Asked { call, questions }),
+                };
+            }
+            m.set_turn(&who, Ok(Some(turn)));
+            who
+        }
+
+        fn grid() -> Vec<Question> {
+            vec![Question {
+                header: "Meta-session".into(),
+                text: "The TUI replaces the agents meta-session/grid. Should the binary drop everything built around it (agent restore, agent reset, hide's meta-pane handling)?".into(),
+                options: vec![
+                    Choice {
+                        label: "Drop it (Recommended)".into(),
+                        description: "No grid anymore. `hide` becomes a TUI-side filter stored in a state file.".into(),
+                    },
+                    Choice {
+                        label: "Keep for now".into(),
+                        description: "Port restore/reset/hide meta behaviour too, so the old grid keeps working.".into(),
+                    },
+                ],
+                multi: false,
+            }]
+        }
+
+        #[test]
+        fn an_asking_turn_pins_the_whole_question_with_its_options_and_replaces_the_banner() {
+            let mut m = fleet(10);
+            let ask = call_at(
+                m.clock.wall,
+                "q",
+                "AskUserQuestion",
+                Target::None,
+                CallState::Running,
+                120,
+            );
+            asking(&mut m, "payroll-fix-3", grid(), ask);
+            for size in [(140, 40), (70, 26)] {
+                let rows = page(&mut m, size);
+                let text = rows.join("\n");
+                assert!(rows[0].contains("asking 2m · Me"), "{size:?}\n{text}");
+                assert!(
+                    text.contains("The TUI replaces the agents"),
+                    "{size:?}\n{text}"
+                );
+                assert!(text.contains("Drop it (Recommended)"), "{size:?}\n{text}");
+                assert!(text.contains("Keep for now"), "{size:?}\n{text}");
+                assert!(text.contains("Other"), "{size:?}\n{text}");
+                assert_eq!(
+                    rows.iter().filter(|r| r.contains("◆")).count(),
+                    2,
+                    "the status row and the call that waits, with no banner above them\n{text}"
+                );
+                let waiting = rows
+                    .iter()
+                    .find(|r| r.contains("waiting"))
+                    .unwrap_or_else(|| panic!("{text}"));
+                assert!(waiting.contains("AskUserQuestion"), "{waiting}");
+            }
+        }
+
+        #[test]
+        fn a_permission_prompt_pins_what_was_said_and_the_whole_call() {
+            let mut m = fleet(10);
+            let command = "cargo build --release --workspace --all-features && cp target/release/agent ~/.local/bin/agent && echo installed";
+            let run = call_at(
+                m.clock.wall,
+                "p",
+                "Bash",
+                Target::Command(command.into()),
+                CallState::Running,
+                120,
+            );
+            asking(&mut m, "payroll-fix-3", Vec::new(), run);
+            let rows = page(&mut m, (70, 26));
+            let text = rows.join("\n");
+            assert!(text.contains("asking 2m"), "{text}");
+            let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(
+                flat.contains("Before deleting them I want to confirm"),
+                "what it said before\n{text}"
+            );
+            assert!(
+                flat.contains("cargo build --release --workspace --all-features && cp target/release/agent ~/.local/bin/agent && echo installed"),
+                "the whole command, wrapped\n{text}"
+            );
+        }
+
+        /// A running Bash call and the main agent's permission ask for it,
+        /// beside another call that runs without asking.
+        fn parallel(m: &mut Model) -> SessionName {
+            let wall = m.clock.wall;
+            let run = |id: &str, command: &str| {
+                call_at(
+                    wall,
+                    id,
+                    "Bash",
+                    Target::Command(command.into()),
+                    CallState::Running,
+                    30,
+                )
+            };
+            let who = asking(m, "payroll-fix-3", Vec::new(), run("p1", "rm -rf target"));
+            let turn = m.track(&who).turn.watch.log.take();
+            let Some(Ok(Some(mut turn))) = turn else {
+                panic!("a turn");
+            };
+            turn.log.log.insert(0, run("p0", "sleep 600"));
+            m.set_turn(&who, Ok(Some(turn)));
+            who
+        }
+
+        #[test]
+        fn with_calls_in_parallel_the_ask_belongs_to_the_one_it_names_by_id() {
+            let mut m = fleet(10);
+            parallel(&mut m);
+            let rows = page(&mut m, (140, 40));
+            let text = rows.join("\n");
+            assert!(text.contains("rm -rf target"), "pinned\n{text}");
+            let waiting: Vec<_> = rows.iter().filter(|r| r.contains("waiting")).collect();
+            assert_eq!(waiting.len(), 1, "{text}");
+            assert!(waiting[0].contains("rm -rf target"), "{text}");
+            let other = rows
+                .iter()
+                .find(|r| r.contains("sleep 600"))
+                .expect("shown");
+            assert!(!other.contains('◆'), "{other}");
+        }
+
+        #[test]
+        fn a_subagents_question_is_drawn_as_theirs_and_leaves_the_agents_calls_alone() {
+            let mut m = fleet(10);
+            let who = parallel(&mut m);
+            let wall = m.clock.wall;
+            let activity = m
+                .activities
+                .as_mut()
+                .and_then(|a| a.get_mut(&who))
+                .expect("reports");
+            activity.asks.clear();
+            activity.subagents.insert(
+                AgentId::new("s9"),
+                agent_core::activity::Subagent {
+                    kind: "general-purpose".into(),
+                    description: Some("QA pass".into()),
+                    launch: agent_core::activity::Launch::Foreground,
+                    since: wall,
+                    status: agent_core::activity::SubagentStatus::Running { tools: Vec::new() },
+                },
+            );
+            activity.asks.push(Ask {
+                asker: Origin::Subagent(AgentId::new("s9")),
+                question: "Delete the cache directory?".into(),
+                answered_by: Answer::AnyTool,
+                since: wall - Duration::from_secs(60),
+            });
+            let rows = page(&mut m, (140, 40));
+            let text = rows.join("\n");
+            assert!(
+                rows[0].contains("asking 1m") && rows[0].contains("QA pass"),
+                "{text}"
+            );
+            assert!(text.contains("↳ QA pass asks"), "{text}");
+            assert!(text.contains("Delete the cache directory?"), "{text}");
+            assert_eq!(
+                rows.iter().filter(|r| r.contains('◆')).count(),
+                1,
+                "only the status row, no call is waiting\n{text}"
+            );
+        }
+
+        #[test]
+        fn a_question_call_the_transcript_hasnt_parsed_yet_shows_the_asked_text_not_its_input() {
+            let mut m = fleet(10);
+            let ask = call_at(
+                m.clock.wall,
+                "q",
+                "AskUserQuestion",
+                Target::None,
+                CallState::Running,
+                20,
+            );
+            let who = asking(&mut m, "payroll-fix-3", Vec::new(), ask);
+            let Some(Ok(Some(turn))) = m.track(&who).turn.watch.log.as_mut() else {
+                panic!("a turn");
+            };
+            let LogEntry::Called(call) = turn.log.log.last_mut().expect("a call") else {
+                panic!("a call");
+            };
+            call.input = r#"{"questions":[{"question":"raw"}]}"#.into();
+            let text = page(&mut m, (140, 40)).join("\n");
+            assert!(!text.contains("{\"questions\""), "{text}");
+            assert!(text.contains("Meta-session: drop the grid?"), "{text}");
+        }
+
+        #[test]
+        fn a_working_turns_elapsed_time_is_the_agents_not_the_old_prompts() {
+            let mut m = fleet(10);
+            let who = working(&mut m, "payroll-fix-3");
+            let activity = m
+                .activities
+                .as_mut()
+                .and_then(|a| a.get_mut(&who))
+                .expect("reports");
+            activity.since = m.clock.wall - Duration::from_secs(25);
+            let rows = page(&mut m, (140, 40));
+            assert!(
+                rows[0].contains("working 25s"),
+                "after a hand-back the prompt is 7m old\n{}",
+                rows[0]
+            );
+        }
+
+        #[test]
+        fn transcript_text_is_cleaned_and_markdown_emphasis_dropped_from_the_closing_message() {
+            let mut m = fleet(10);
+            let who = at(&mut m, "auth-refresh-2", (140, 40));
+            let wall = m.clock.wall;
+            let mut turn = turn_at(
+                wall,
+                vec![said_at(wall, "reading \u{1b}[31mred\u{1b}[0m text", 30)],
+                None,
+            );
+            turn.log.prompt = Some("do it \u{7}now".into());
+            m.set_turn(&who, Ok(Some(turn)));
+            let text = page(&mut m, (140, 40)).join("\n");
+            assert!(
+                !text.contains('\u{1b}') && !text.contains('\u{7}'),
+                "{text:?}"
+            );
+            assert!(
+                text.contains("a 401 interceptor"),
+                "emphasis is stripped\n{text}"
+            );
+            assert!(!text.contains("**"), "{text}");
+        }
+
+        #[test]
+        fn a_finished_turn_leads_with_its_closing_message_and_folds_all_its_phases() {
+            let mut m = fleet(10);
+            let who = at(&mut m, "auth-refresh-2", (140, 40));
+            let turn = TurnDetail {
+                progress: Progress::Finished {
+                    took: Some(Duration::from_secs(520)),
+                },
+                ..turn_at(m.clock.wall, story(m.clock.wall), None)
+            };
+            m.set_turn(&who, Ok(Some(turn)));
+            for size in [(140, 40), (70, 26)] {
+                let rows = page(&mut m, size);
+                let text = rows.join("\n");
+                assert!(rows[0].contains("✓ finished"), "{size:?}\n{text}");
+                assert!(rows[0].contains("8m40s"), "{size:?}\n{text}");
+                assert!(
+                    text.contains("14 tests pass."),
+                    "the message in full\n{text}"
+                );
+                let message = rows
+                    .iter()
+                    .position(|r| r.contains("14 tests pass."))
+                    .expect("shown");
+                let activity = rows
+                    .iter()
+                    .position(|r| r.contains("Activity ·"))
+                    .unwrap_or_else(|| panic!("{text}"));
+                assert!(message < activity, "{text}");
+                assert!(
+                    !text.contains("guarding it and running it again."),
+                    "every phase is a row\n{text}"
+                );
+                assert!(text.contains("▸ The headless"), "{size:?}\n{text}");
+                assert!(!text.contains("following"), "{text}");
+            }
+        }
+
+        #[test]
+        fn an_idle_agent_shows_its_last_turn_as_finished_without_the_check() {
+            let mut m = fleet(10);
+            let who = at(&mut m, "payroll-fix-3", (140, 40));
+            let activity = m
+                .activities
+                .as_mut()
+                .and_then(|a| a.get_mut(&who))
+                .expect("reports");
+            activity.state = State::Idle;
+            let mut turn = turn_at(
+                m.clock.wall,
+                story(m.clock.wall),
+                Some(said_at(m.clock.wall, "All fixed.", 10)),
+            );
+            turn.log.outcome = Outcome::Finished {
+                report: Some("All fixed.".into()),
+            };
+            m.set_turn(&who, Ok(Some(turn)));
+            let rows = page(&mut m, (140, 40));
+            assert!(
+                rows[0].contains("● finished") && !rows[0].contains('✓'),
+                "{}",
+                rows.join("\n")
+            );
+            assert!(rows.iter().any(|r| r.contains("All fixed.")));
+        }
+
+        #[test]
+        fn a_failed_turn_says_why_and_keeps_its_last_calls_open() {
+            let mut m = fleet(10);
+            let who = at(&mut m, "rate-limit-1", (140, 40));
+            m.set_turn(
+                &who,
+                Ok(Some(turn_at(m.clock.wall, story(m.clock.wall), None))),
+            );
+            let rows = page(&mut m, (140, 40));
+            assert!(
+                rows[0].contains("! failed") && rows[0].contains("rate limit"),
+                "{}",
+                rows.join("\n")
+            );
+            assert!(
+                rows.iter().any(|r| r.contains("E5113")),
+                "the call it died on stays open"
+            );
+        }
+
+        #[test]
+        fn a_turn_not_yet_started_says_so_in_the_middle_and_a_failed_read_says_why() {
+            let mut m = fleet(10);
+            let who = at(&mut m, "payroll-fix-3", (140, 40));
+            let activity = m
+                .activities
+                .as_mut()
+                .and_then(|a| a.get_mut(&who))
+                .expect("reports");
+            activity.prompt = None;
+            activity.state = State::Idle;
+            m.set_turn(&who, Ok(None));
+            let rows = page(&mut m, (100, 30));
+            let at = rows
+                .iter()
+                .position(|r| r.contains("no turn yet · s send"))
+                .unwrap_or_else(|| panic!("{}", rows.join("\n")));
+            assert!(at > 5 && at < rows.len() - 5, "in the middle, row {at}");
+            assert!(rows[at].starts_with(' '), "centred across");
+
+            m.set_turn(&who, Err("reading the transcript: denied".into()));
+            let rows = page(&mut m, (100, 30));
+            assert!(
+                rows.iter()
+                    .any(|r| r.contains("reading the transcript: denied"))
+            );
+        }
+
+        #[test]
+        fn what_happened_since_the_user_looked_is_marked_once() {
+            let mut m = fleet(10);
+            let who = working(&mut m, "payroll-fix-3");
+            m.track(&who).turn.looked.seen = Some(before(m.clock.wall, 200));
+            let rows = page(&mut m, (140, 40));
+            let text = rows.join("\n");
+            let marker = rows
+                .iter()
+                .position(|r| r.contains("since you looked"))
+                .unwrap_or_else(|| panic!("{text}"));
+            assert!(rows[marker].contains("3m"), "{}", rows[marker]);
+            let handing = rows
+                .iter()
+                .position(|r| r.contains("Handing QA"))
+                .expect("shown");
+            let after = rows
+                .iter()
+                .position(|r| r.contains("guarding it and running it again."))
+                .expect("shown");
+            assert!(
+                handing < marker && marker < after,
+                "between what it had done and what it did since\n{text}"
+            );
+            assert_eq!(text.matches("since you looked").count(), 1);
+
+            m.track(&who).turn.looked.seen = Some(before(m.clock.wall, 1));
+            let text = page(&mut m, (140, 40)).join("\n");
+            assert!(!text.contains("since you looked"), "nothing is new\n{text}");
+            m.track(&who).turn.looked.seen = None;
+            let text = page(&mut m, (140, 40)).join("\n");
+            assert!(
+                !text.contains("since you looked"),
+                "never looked: nothing to mark\n{text}"
+            );
+        }
+
+        #[test]
+        fn queued_messages_stay_under_the_turn() {
+            let mut m = fleet(10);
+            let who = working(&mut m, "payroll-fix-3");
+            m.track(&who).outbox = Some(crate::track::Outbox::new(
+                "also check lsp.lua".parse().expect("parses"),
+                Vec::new(),
+            ));
+            let rows = page(&mut m, (140, 40));
+            let queued = rows
+                .iter()
+                .rposition(|r| r.contains("queued: also check lsp.lua"))
+                .unwrap_or_else(|| panic!("{}", rows.join("\n")));
+            let live = rows
+                .iter()
+                .rposition(|r| r.contains("running"))
+                .expect("shown");
+            assert!(queued > live);
+        }
     }
 }

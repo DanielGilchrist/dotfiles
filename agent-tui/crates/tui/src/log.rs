@@ -1,15 +1,18 @@
-//! A subagent's log as [0] reads it: entries (the prompt, what it said,
-//! calls, runs of calls folded together), how it is going, the cursor and
+//! A log as [0] reads it, a subagent's or the main agent's current turn:
+//! entries (the prompt, what it said, calls, runs of calls folded together,
+//! a turn's older phases folded to a row), how it is going, the cursor and
 //! what is expanded, and the transcript written out for `$EDITOR`.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Write;
 use std::num::NonZeroUsize;
+use std::time::{Duration, SystemTime};
 
-use agent_core::ports::{Call, CallState, LogEntry, Outcome, SubagentDetail, Target};
+use agent_core::ports::{
+    Call, CallKind, CallState, Log, LogEntry, Outcome, Target, ends_with_report,
+};
 
-/// Consecutive successful calls of these tools fold into one row.
-const EXPLORE: [&str; 4] = ["Read", "Grep", "Glob", "LS"];
+/// Consecutive successful explore calls of one tool fold into one row.
 const GROUP_AT: usize = 3;
 /// Failures of one call in a row, or of the last [`WINDOW`] calls, that
 /// make a subagent read as failing.
@@ -23,6 +26,9 @@ const RECENT: usize = 6;
 pub enum Entry<'a> {
     Prompt(&'a str),
     Said(&'a str),
+    /// A message the user sent while the agent worked.
+    Queued(&'a str),
+    Compacted,
     Call(&'a Call),
     /// Three or more successful explore calls of one tool.
     Group {
@@ -32,32 +38,73 @@ pub enum Entry<'a> {
     /// The same tool and target more than once in a row. The last call's
     /// outcome stands for all.
     Repeat(Vec<&'a Call>),
+    /// A finished stretch of a turn folded to one row: what the agent said
+    /// and the calls under it, which open with the cursor.
+    Phase(Phase<'a>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Phase<'a> {
+    pub entries: Vec<Entry<'a>>,
+    /// From its first step to the next phase's.
+    pub took: Option<Duration>,
+}
+
+impl<'a> Entry<'a> {
+    /// The calls the entry stands for.
+    pub fn calls(&self) -> Vec<&'a Call> {
+        match self {
+            Self::Call(call) => vec![call],
+            Self::Group { calls, .. } | Self::Repeat(calls) => calls.clone(),
+            Self::Phase(phase) => phase.entries.iter().flat_map(Self::calls).collect(),
+            Self::Prompt(_) | Self::Said(_) | Self::Queued(_) | Self::Compacted => Vec::new(),
+        }
+    }
 }
 
 fn explored(call: &Call) -> bool {
-    EXPLORE.contains(&call.tool.as_str()) && matches!(call.state, CallState::Done { .. })
+    call.kind == CallKind::Explore && matches!(call.state, CallState::Done { .. })
 }
 
-pub fn entries(detail: &SubagentDetail) -> Vec<Entry<'_>> {
+pub fn entries(detail: &Log) -> Vec<Entry<'_>> {
+    indexed(detail.prompt.as_deref(), &detail.log)
+        .into_iter()
+        .map(|(entry, _)| entry)
+        .collect()
+}
+
+/// The entries of `log` after `prompt`, each with the index of the first log
+/// entry it stands for. The prompt stands for index 0.
+fn indexed<'a>(prompt: Option<&'a str>, log: &'a [LogEntry]) -> Vec<(Entry<'a>, usize)> {
     let mut out = Vec::new();
-    if !detail.prompt.is_empty() {
-        out.push(Entry::Prompt(&detail.prompt));
+    if let Some(prompt) = prompt.filter(|p| !p.is_empty()) {
+        out.push((Entry::Prompt(prompt), 0));
     }
     let mut at = 0;
-    while at < detail.log.len() {
-        let call = match &detail.log[at] {
+    while at < log.len() {
+        let call = match &log[at] {
             LogEntry::Said { text, .. } => {
-                out.push(Entry::Said(text));
+                out.push((Entry::Said(text), at));
                 at += 1;
                 continue;
             }
-            LogEntry::Called(call) => call,
+            LogEntry::Queued { text, .. } => {
+                out.push((Entry::Queued(text), at));
+                at += 1;
+                continue;
+            }
+            LogEntry::Compacted => {
+                out.push((Entry::Compacted, at));
+                at += 1;
+                continue;
+            }
+            LogEntry::Called(call) => call.as_ref(),
         };
         let following = |keep: &dyn Fn(&Call) -> bool| {
-            detail.log[at..]
+            log[at..]
                 .iter()
                 .map_while(|e| match e {
-                    LogEntry::Called(c) if keep(c) => Some(c),
+                    LogEntry::Called(c) if keep(c) => Some(c.as_ref()),
                     _ => None,
                 })
                 .collect::<Vec<_>>()
@@ -68,41 +115,191 @@ pub fn entries(detail: &SubagentDetail) -> Vec<Entry<'_>> {
             Vec::new()
         };
         if run.len() >= GROUP_AT {
+            let from = at;
             at += run.len();
-            out.push(Entry::Group {
-                tool: &call.tool,
-                calls: run,
-            });
+            out.push((
+                Entry::Group {
+                    tool: &call.tool,
+                    calls: run,
+                },
+                from,
+            ));
             continue;
         }
         let same = following(&|c| c.tool == call.tool && c.target == call.target);
+        let from = at;
         at += same.len();
-        out.push(if same.len() > 1 {
-            Entry::Repeat(same)
-        } else {
-            Entry::Call(call)
-        });
+        out.push((
+            if same.len() > 1 {
+                Entry::Repeat(same)
+            } else {
+                Entry::Call(call)
+            },
+            from,
+        ));
     }
     out
 }
 
-fn calls(detail: &SubagentDetail) -> impl Iterator<Item = &Call> {
+/// What a turn's log is made of: loose entries, and stretches that each
+/// begin with something the agent said.
+enum Piece<'a> {
+    Loose(Entry<'a>, usize),
+    Stretch {
+        entries: Vec<(Entry<'a>, usize)>,
+        from: usize,
+        to: usize,
+    },
+}
+
+pub fn time_of(entry: &LogEntry) -> Option<SystemTime> {
+    match entry {
+        LogEntry::Said { at, .. } | LogEntry::Queued { at, .. } => *at,
+        LogEntry::Called(call) => call.started,
+        LogEntry::Compacted => None,
+    }
+}
+
+/// The indexes of calls that failed since the last one that succeeded.
+fn unrecovered(log: &[LogEntry]) -> HashSet<usize> {
+    let succeeded = |e: &LogEntry| matches!(e, LogEntry::Called(c) if matches!(c.state, CallState::Done { .. } | CallState::Flagged { .. }));
+    let after = log.iter().rposition(succeeded).map_or(0, |at| at + 1);
+    log.iter()
+        .enumerate()
+        .skip(after)
+        .filter(|(_, e)| {
+            matches!(e, LogEntry::Called(c) if matches!(c.state, CallState::Failed { .. }))
+        })
+        .map(|(at, _)| at)
+        .collect()
+}
+
+/// A turn's entries: its prompt, then the log with every phase but the
+/// latest folded to one entry. A phase stays open while it holds a running
+/// call or a failure nothing has succeeded after. The index beside each
+/// entry is the first log entry it stands for. `closing` is the message the
+/// turn ended with, which the view shows apart from the log.
+pub fn turn_entries<'a>(detail: &'a Log, closing: Option<&str>) -> Vec<(Entry<'a>, usize)> {
+    let log = match closing {
+        Some(closing) if ends_with_report(&detail.log, closing) => {
+            &detail.log[..detail.log.len() - 1]
+        }
+        _ => &detail.log[..],
+    };
+    let mut pieces: Vec<Piece<'a>> = Vec::new();
+    let mut out = Vec::new();
+    for (entry, at) in indexed(detail.prompt.as_deref(), log) {
+        match entry {
+            Entry::Prompt(_) => out.push((entry, at)),
+            Entry::Queued(_) | Entry::Compacted => pieces.push(Piece::Loose(entry, at)),
+            Entry::Said(_) => pieces.push(Piece::Stretch {
+                entries: vec![(entry, at)],
+                from: at,
+                to: at + 1,
+            }),
+            Entry::Call(_) | Entry::Group { .. } | Entry::Repeat(_) | Entry::Phase(_) => {
+                match pieces.last_mut() {
+                    Some(Piece::Stretch { entries, to, .. }) => {
+                        *to = at + entry.calls().len();
+                        entries.push((entry, at));
+                    }
+                    _ => pieces.push(Piece::Stretch {
+                        to: at + entry.calls().len(),
+                        from: at,
+                        entries: vec![(entry, at)],
+                    }),
+                }
+            }
+        }
+    }
+    let latest = pieces
+        .iter()
+        .rposition(|p| matches!(p, Piece::Stretch { .. }));
+    let failed = unrecovered(log);
+    let starts: Vec<usize> = pieces
+        .iter()
+        .map(|p| match p {
+            Piece::Loose(_, at) => *at,
+            Piece::Stretch { from, .. } => *from,
+        })
+        .collect();
+    for (index, piece) in pieces.into_iter().enumerate() {
+        match piece {
+            Piece::Loose(entry, at) => out.push((entry, at)),
+            Piece::Stretch { entries, from, .. } => {
+                let end = starts.get(index + 1).copied().unwrap_or(log.len());
+                let held = (Some(index) == latest && closing.is_none())
+                    || log[from..end.min(log.len())].iter().enumerate().any(|(i, e)| {
+                        matches!(e, LogEntry::Called(c) if matches!(c.state, CallState::Running))
+                            || failed.contains(&(from + i))
+                    });
+                if held {
+                    out.extend(entries);
+                } else {
+                    let began = log.get(from).and_then(time_of);
+                    let ended = log.get(end).and_then(time_of);
+                    let took = began.zip(ended).and_then(|(a, b)| b.duration_since(a).ok());
+                    out.push((
+                        Entry::Phase(Phase {
+                            entries: entries.into_iter().map(|(e, _)| e).collect(),
+                            took,
+                        }),
+                        from,
+                    ));
+                }
+            }
+        }
+    }
+    out
+}
+
+fn calls(detail: &Log) -> impl Iterator<Item = &Call> {
     detail.log.iter().filter_map(|e| match e {
-        LogEntry::Called(c) => Some(c),
-        LogEntry::Said { .. } => None,
+        LogEntry::Called(c) => Some(c.as_ref()),
+        LogEntry::Said { .. } | LogEntry::Queued { .. } | LogEntry::Compacted => None,
     })
 }
 
 /// How many calls the log holds.
-pub fn call_count(detail: &SubagentDetail) -> usize {
+pub fn call_count(detail: &Log) -> usize {
     calls(detail).count()
 }
 
 /// How many of them failed.
-pub fn error_count(detail: &SubagentDetail) -> usize {
+pub fn error_count(detail: &Log) -> usize {
     calls(detail)
         .filter(|c| matches!(c.state, CallState::Failed { .. }))
         .count()
+}
+
+/// How many failed calls nothing has succeeded after.
+pub fn unrecovered_count(detail: &Log) -> usize {
+    unrecovered(&detail.log).len()
+}
+
+/// How many subagents the log's agent started.
+pub fn agent_count(detail: &Log) -> usize {
+    delegates(&calls(detail).collect::<Vec<_>>())
+}
+
+/// How many of `calls` hand work to a subagent.
+pub fn delegates(calls: &[&Call]) -> usize {
+    calls
+        .iter()
+        .filter(|c| c.kind == CallKind::Delegate)
+        .count()
+}
+
+/// How many distinct files its edits and writes aimed at.
+pub fn files_touched(detail: &Log) -> usize {
+    calls(detail)
+        .filter(|c| c.kind == CallKind::Edit)
+        .filter_map(|c| match &c.target {
+            Target::Path { path, .. } => Some(path.as_str()),
+            _ => None,
+        })
+        .collect::<HashSet<_>>()
+        .len()
 }
 
 /// A short name for a call, to say what keeps failing.
@@ -122,7 +319,7 @@ fn label(call: &Call) -> String {
 
 /// Why it reads as failing: one call that failed three times since it last
 /// succeeded, or three of the last five calls failing.
-pub fn failing(detail: &SubagentDetail) -> Option<String> {
+pub fn failing(detail: &Log) -> Option<String> {
     let all: Vec<&Call> = calls(detail).collect();
     let mut streaks: HashMap<(&str, String), (usize, usize)> = HashMap::new();
     for (at, call) in all.iter().enumerate() {
@@ -201,12 +398,12 @@ fn fenced(text: &str) -> String {
 
 /// The transcript as Markdown for `$EDITOR`, and the line each entry starts
 /// on, in the order [`entries`] lists them.
-pub fn markdown(detail: &SubagentDetail, title: &str) -> (String, Vec<NonZeroUsize>) {
+pub fn markdown(detail: &Log, title: &str) -> (String, Vec<NonZeroUsize>) {
     let mut out = String::new();
     let mut starts = Vec::new();
     let _ = write!(out, "# {title}\n\n");
-    if !detail.transcript.as_os_str().is_empty() {
-        let _ = write!(out, "Raw transcript: `{}`\n\n", detail.transcript.display());
+    if !detail.transcript.as_str().is_empty() {
+        let _ = write!(out, "Raw transcript: `{}`\n\n", detail.transcript.as_str());
     }
     if let Outcome::Finished {
         report: Some(report),
@@ -233,9 +430,18 @@ pub fn markdown(detail: &SubagentDetail, title: &str) -> (String, Vec<NonZeroUsi
             Entry::Said(said) => {
                 let _ = write!(text, "{said}\n\n");
             }
+            Entry::Queued(said) => {
+                let _ = write!(text, "### Queued message\n\n{said}\n\n");
+            }
+            Entry::Compacted => text.push_str("Conversation compacted.\n\n"),
             Entry::Call(call) => single(&mut text, call),
             Entry::Group { calls, .. } | Entry::Repeat(calls) => {
                 for call in calls {
+                    single(&mut text, call);
+                }
+            }
+            Entry::Phase(phase) => {
+                for call in phase.entries.iter().flat_map(Entry::calls) {
                     single(&mut text, call);
                 }
             }
@@ -257,11 +463,18 @@ pub fn entry_text(entry: &Entry<'_>) -> String {
         }
     };
     match entry {
-        Entry::Prompt(text) | Entry::Said(text) => (*text).to_string(),
+        Entry::Prompt(text) | Entry::Said(text) | Entry::Queued(text) => (*text).to_string(),
+        Entry::Compacted => "compacted".to_string(),
         Entry::Call(c) => call(c),
         Entry::Group { calls, .. } | Entry::Repeat(calls) => calls
             .iter()
             .map(|c| call(c))
+            .collect::<Vec<_>>()
+            .join("\n\n"),
+        Entry::Phase(phase) => phase
+            .entries
+            .iter()
+            .map(entry_text)
             .collect::<Vec<_>>()
             .join("\n\n"),
     }
@@ -298,13 +511,19 @@ pub fn target_text(target: &Target) -> String {
 pub(crate) mod fixtures {
     use super::*;
     use agent_core::activity::ToolId;
-    use agent_core::ports::{Excerpt, Outcome, Summary};
-    use std::path::PathBuf;
+    use agent_core::ports::{Excerpt, Outcome, Summary, TurnDetail};
 
     pub fn call(tool: &str, target: Target, state: CallState) -> Call {
         Call {
             id: ToolId::new(""),
             tool: tool.into(),
+            kind: match tool {
+                "Read" | "Grep" | "Glob" | "LS" => CallKind::Explore,
+                "Edit" | "MultiEdit" | "Write" | "NotebookEdit" => CallKind::Edit,
+                "Agent" | "Task" => CallKind::Delegate,
+                "AskUserQuestion" => CallKind::Ask,
+                _ => CallKind::Other,
+            },
             target,
             state,
             started: None,
@@ -314,7 +533,7 @@ pub(crate) mod fixtures {
     }
 
     pub fn read(path: &str) -> LogEntry {
-        LogEntry::Called(call(
+        LogEntry::Called(Box::new(call(
             "Read",
             Target::Path {
                 path: path.into(),
@@ -324,11 +543,15 @@ pub(crate) mod fixtures {
                 summary: Summary::Lines(10),
                 took: None,
             },
-        ))
+        )))
     }
 
     pub fn bash(command: &str, state: CallState) -> LogEntry {
-        LogEntry::Called(call("Bash", Target::Command(command.into()), state))
+        LogEntry::Called(Box::new(call(
+            "Bash",
+            Target::Command(command.into()),
+            state,
+        )))
     }
 
     pub fn failed() -> CallState {
@@ -346,11 +569,173 @@ pub(crate) mod fixtures {
         }
     }
 
-    pub fn detail(log: Vec<LogEntry>) -> SubagentDetail {
-        SubagentDetail {
-            prompt: "Do it.".into(),
+    pub fn turn(log: Vec<LogEntry>) -> agent_core::ports::TurnDetail {
+        agent_core::ports::TurnDetail {
+            log: Log {
+                prompt: Some("Fix the statusline.".into()),
+                ..detail(log)
+            },
+            mark: Some(agent_core::ports::TurnMark::new("p1")),
+            progress: agent_core::ports::Progress::Running { asked: None },
+        }
+    }
+
+    pub fn before(now: SystemTime, secs: u64) -> SystemTime {
+        now - Duration::from_secs(secs)
+    }
+
+    pub fn call_at(
+        now: SystemTime,
+        id: &str,
+        tool: &str,
+        target: Target,
+        state: CallState,
+        secs: u64,
+    ) -> LogEntry {
+        let input = match &target {
+            Target::Command(c) => c.clone(),
+            other => crate::log::target_text(other),
+        };
+        LogEntry::Called(Box::new(Call {
+            id: ToolId::new(id),
+            started: Some(before(now, secs)),
+            input,
+            output: String::new(),
+            ..call(tool, target, state)
+        }))
+    }
+
+    pub fn said_at(now: SystemTime, text: &str, secs: u64) -> LogEntry {
+        LogEntry::Said {
+            text: text.into(),
+            at: Some(before(now, secs)),
+        }
+    }
+
+    pub fn path(p: &str) -> Target {
+        Target::Path {
+            path: p.into(),
+            range: None,
+        }
+    }
+
+    pub fn done(summary: Summary) -> CallState {
+        CallState::Done {
+            summary,
+            took: None,
+        }
+    }
+
+    pub fn diff(added: usize, removed: usize) -> CallState {
+        done(Summary::Diff { added, removed })
+    }
+
+    /// A turn of four phases: reading, a first edit, a hand-off to two
+    /// subagents, and a failing headless run that is being fixed.
+    pub fn story(now: SystemTime) -> Vec<LogEntry> {
+        let mut log = vec![said_at(
+            now,
+            "I'll read how the statusline loads its providers first.",
+            400,
+        )];
+        for (i, file) in ["a.lua", "b.lua", "c.lua"].iter().enumerate() {
+            log.push(call_at(
+                now,
+                &format!("r{i}"),
+                "Read",
+                path(file),
+                done(Summary::Lines(40)),
+                390,
+            ));
+        }
+        log.push(said_at(
+            now,
+            "The provider needs an LSP client, so wiring it into lsp.lua.",
+            330,
+        ));
+        log.push(call_at(
+            now,
+            "e1",
+            "Edit",
+            path("nvim/plugin/lsp.lua"),
+            diff(4, 2),
+            320,
+        ));
+        log.push(said_at(now, "Handing QA to a subagent and reviewing the lsp change in parallel while I write the module.", 300));
+        log.push(call_at(
+            now,
+            "g1",
+            "Agent",
+            Target::Task("QA pass on statusline".into()),
+            done(Summary::Text("2 findings".into())),
+            290,
+        ));
+        log.push(call_at(
+            now,
+            "g2",
+            "Agent",
+            Target::Task("Review lsp changes".into()),
+            done(Summary::Text("fine".into())),
+            290,
+        ));
+        log.push(said_at(now, "The headless run failed on a nil client. status.lua assumed the client exists before attach, so I'm guarding it and running it again.", 60));
+        log.push(call_at(
+            now,
+            "e2",
+            "Edit",
+            path("nvim/lua/heucristic/status.lua"),
+            diff(9, 14),
+            55,
+        ));
+        log.push(call_at(
+            now,
+            "b1",
+            "Bash",
+            Target::Command("nvim --headless -c q".into()),
+            CallState::Failed {
+                code: Some(1),
+                excerpt: Excerpt {
+                    lines: vec![
+                        "E5113: Error while calling lua chunk: attempt to index a nil value".into(),
+                    ],
+                    more: 0,
+                },
+                took: None,
+            },
+            50,
+        ));
+        log.push(call_at(
+            now,
+            "e3",
+            "Edit",
+            path("nvim/lua/heucristic/status.lua"),
+            diff(3, 0),
+            40,
+        ));
+        log
+    }
+
+    pub fn turn_at(now: SystemTime, mut log: Vec<LogEntry>, tail: Option<LogEntry>) -> TurnDetail {
+        log.extend(tail);
+        TurnDetail {
+            log: agent_core::ports::Log {
+                prompt: Some(
+                    "Are you able to run manual QA/UX/quality tests?\nOr have the adversarial agent do so."
+                        .into(),
+                ),
+                started: Some(before(now, 450)),
+                last_heard: Some(before(now, 5)),
+                ..detail(log)
+            },
+            ..crate::log::fixtures::turn(Vec::new())
+        }
+    }
+
+    pub fn detail(log: Vec<LogEntry>) -> Log {
+        Log {
+            prompt: Some("Do it.".into()),
             log,
-            transcript: PathBuf::new(),
+            transcript: agent_core::activity::TranscriptRef::new(""),
             outcome: Outcome::Running,
             model: None,
             started: None,
@@ -378,14 +763,14 @@ mod tests {
 
     #[test]
     fn a_failed_read_breaks_a_group() {
-        let broken = LogEntry::Called(call(
+        let broken = LogEntry::Called(Box::new(call(
             "Read",
             Target::Path {
                 path: "/x".into(),
                 range: None,
             },
             failed(),
-        ));
+        )));
         let d = detail(vec![read("/a"), read("/b"), broken, read("/c"), read("/d")]);
         assert!(
             entries(&d)
@@ -513,7 +898,7 @@ mod tests {
         );
         c.input = "echo '```'".into();
         c.output = "````\nout".into();
-        let mut d = detail(vec![LogEntry::Called(c)]);
+        let mut d = detail(vec![LogEntry::Called(Box::new(c))]);
         d.outcome = Outcome::Finished {
             report: Some("done".into()),
         };
@@ -526,5 +911,185 @@ mod tests {
             "### Bash x",
             "starts stay right after a report and a long fence"
         );
+    }
+
+    fn running() -> LogEntry {
+        bash("cargo test", CallState::Running)
+    }
+
+    fn ok() -> CallState {
+        CallState::Done {
+            summary: Summary::NoOutput,
+            took: None,
+        }
+    }
+
+    fn shapes(found: &[(Entry<'_>, usize)]) -> Vec<String> {
+        found
+            .iter()
+            .map(|(entry, from)| {
+                let kind = match entry {
+                    Entry::Prompt(_) => "prompt",
+                    Entry::Said(_) => "said",
+                    Entry::Queued(_) => "queued",
+                    Entry::Compacted => "compacted",
+                    Entry::Call(_) => "call",
+                    Entry::Group { .. } => "group",
+                    Entry::Repeat(_) => "repeat",
+                    Entry::Phase(_) => "phase",
+                };
+                format!("{kind}@{from}")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_phase_but_the_latest_folds_to_one_entry_that_remembers_where_it_starts() {
+        let turn = turn(vec![
+            said("one"),
+            bash("a", ok()),
+            bash("b", ok()),
+            said("two"),
+            bash("c", ok()),
+            said("three"),
+            bash("d", ok()),
+        ]);
+        let found = turn_entries(&turn.log, None);
+        assert_eq!(
+            shapes(&found),
+            ["prompt@0", "phase@0", "phase@3", "said@5", "call@6"]
+        );
+        let (Entry::Phase(first), _) = &found[1] else {
+            panic!("{:?}", found[1]);
+        };
+        assert_eq!(first.entries.len(), 3, "its words and both calls");
+    }
+
+    #[test]
+    fn a_phase_stays_open_for_a_running_call_or_a_failure_nothing_has_followed() {
+        let running_early = turn(vec![
+            said("one"),
+            running(),
+            said("two"),
+            bash("c", ok()),
+            said("three"),
+            bash("d", ok()),
+        ]);
+        assert_eq!(
+            shapes(&turn_entries(&running_early.log, None)),
+            [
+                "prompt@0", "said@0", "call@1", "phase@2", "said@4", "call@5"
+            ],
+            "parallel work in an older phase isn't hidden"
+        );
+
+        let failure_stands = turn(vec![
+            said("one"),
+            bash("a", failed()),
+            said("two"),
+            bash("b", failed()),
+        ]);
+        assert_eq!(
+            shapes(&turn_entries(&failure_stands.log, None)),
+            ["prompt@0", "said@0", "call@1", "said@2", "call@3"]
+        );
+
+        let recovered = turn(vec![
+            said("one"),
+            bash("a", failed()),
+            said("two"),
+            bash("b", ok()),
+        ]);
+        assert_eq!(
+            shapes(&turn_entries(&recovered.log, None)),
+            ["prompt@0", "phase@0", "said@2", "call@3"],
+            "a failure a later success followed is history"
+        );
+    }
+
+    #[test]
+    fn a_turn_with_a_closing_message_folds_every_phase_and_leaves_the_message_out() {
+        let turn = turn(vec![
+            said("one"),
+            bash("a", ok()),
+            said("two"),
+            bash("b", ok()),
+            said("All done. Three files changed."),
+        ]);
+        let found = turn_entries(&turn.log, Some("All done. Three files changed. And more."));
+        assert_eq!(shapes(&found), ["prompt@0", "phase@0", "phase@2"]);
+        let unmatched = turn_entries(&turn.log, Some("something else"));
+        assert_eq!(
+            shapes(&unmatched),
+            ["prompt@0", "phase@0", "phase@2", "phase@4"],
+            "a closing message that isn't the agent's last line leaves the log whole, folded"
+        );
+    }
+
+    #[test]
+    fn queued_messages_and_compactions_end_a_phase_and_never_fold() {
+        let turn = turn(vec![
+            said("one"),
+            bash("a", ok()),
+            LogEntry::Queued {
+                text: "also lsp.lua".into(),
+                at: None,
+            },
+            LogEntry::Compacted,
+            bash("b", ok()),
+        ]);
+        assert_eq!(
+            shapes(&turn_entries(&turn.log, None)),
+            ["prompt@0", "phase@0", "queued@2", "compacted@3", "call@4"]
+        );
+    }
+
+    #[test]
+    fn a_phase_knows_how_long_it_took_from_its_first_step_to_the_next_phases() {
+        use std::time::{Duration, SystemTime};
+        let at = |secs| Some(SystemTime::UNIX_EPOCH + Duration::from_secs(secs));
+        let turn = turn(vec![
+            LogEntry::Said {
+                text: "one".into(),
+                at: at(100),
+            },
+            bash("a", ok()),
+            LogEntry::Said {
+                text: "two".into(),
+                at: at(190),
+            },
+        ]);
+        let found = turn_entries(&turn.log, None);
+        let (Entry::Phase(first), _) = &found[1] else {
+            panic!("{:?}", found[1]);
+        };
+        assert_eq!(first.took, Some(Duration::from_secs(90)));
+    }
+
+    #[test]
+    fn counts_of_files_agents_and_unrecovered_failures() {
+        let edit = |path: &str| {
+            LogEntry::Called(Box::new(call(
+                "Edit",
+                Target::Path {
+                    path: path.into(),
+                    range: None,
+                },
+                ok(),
+            )))
+        };
+        let agent = LogEntry::Called(Box::new(call("Agent", Target::Task("qa".into()), ok())));
+        let detail = detail(vec![
+            edit("/a.rs"),
+            edit("/a.rs"),
+            edit("/b.rs"),
+            agent,
+            bash("x", failed()),
+            bash("y", ok()),
+            bash("z", failed()),
+        ]);
+        assert_eq!(files_touched(&detail), 2);
+        assert_eq!(agent_count(&detail), 1);
+        assert_eq!((error_count(&detail), unrecovered_count(&detail)), (2, 1));
     }
 }

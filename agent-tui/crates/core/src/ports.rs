@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
-use crate::activity::{Activity, AgentId, Reported, ToolId};
+use crate::activity::{Activity, AgentId, Reported, ToolId, TranscriptRef};
 use crate::model::{Head, Presence, Running, Worktree};
 use crate::names::{BranchName, NameError, Prompt, PullRequest, SessionName};
 use crate::paths::{AgentWorktree, RepoRoot};
@@ -796,25 +796,93 @@ pub trait Harness: Send + Sync {
     /// What subagent `id` of the agent working in `workdir` was told and has
     /// done, or `None` when the harness keeps no record of it (yet). Reads
     /// files: call it off the UI thread.
-    fn subagent(
+    fn subagent(&self, workdir: &Path, id: &AgentId) -> Result<Option<Log>, HarnessError> {
+        let _ = (workdir, id);
+        Ok(None)
+    }
+    /// The agent's current turn, cut at its last prompt, or `None` when the
+    /// harness keeps no record of one. `at` is where the hooks last said the
+    /// transcript is. Reads files: call it off the UI thread.
+    fn turn(
         &self,
         workdir: &Path,
-        id: &AgentId,
-    ) -> Result<Option<SubagentDetail>, HarnessError> {
-        let _ = (workdir, id);
+        at: Option<&TranscriptRef>,
+    ) -> Result<Option<TurnDetail>, HarnessError> {
+        let _ = (workdir, at);
         Ok(None)
     }
 }
 
-/// What one subagent was told and what it has done since, for a log.
+/// Whether a log ends with the report `said` is the whole of: the agent's
+/// last step was saying it, not an older line followed by calls.
+pub fn ends_with_report(log: &[LogEntry], said: &str) -> bool {
+    matches!(log.last(), Some(LogEntry::Said { text, .. }) if said.starts_with(text.as_str()))
+}
+
+/// Which turn a [`TurnDetail`] is, as the harness tells turns apart. A new
+/// prompt makes a new mark.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SubagentDetail {
-    /// What the agent told it to do.
-    pub prompt: String,
+pub struct TurnMark(String);
+
+impl TurnMark {
+    pub fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+}
+
+/// An agent's current turn: its log, and what only the agent itself has.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnDetail {
+    pub log: Log,
+    /// Which turn it is, when the harness could tell.
+    pub mark: Option<TurnMark>,
+    pub progress: Progress,
+}
+
+/// How far a turn got, with what only that stage has.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Progress {
+    /// Still going, and waiting on the user's answer if it asked.
+    Running { asked: Option<Asked> },
+    /// The harness says it ended, and how long it took.
+    Finished { took: Option<Duration> },
+    /// The transcript ends because the API gave up on it.
+    Stopped,
+}
+
+/// An unanswered question call and what it asked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Asked {
+    pub call: ToolId,
+    pub questions: Vec<Question>,
+}
+
+/// One question an agent put to the user, with the answers it offered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Question {
+    pub header: String,
+    pub text: String,
+    pub options: Vec<Choice>,
+    /// Whether several options can be picked.
+    pub multi: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Choice {
+    pub label: String,
+    pub description: String,
+}
+
+/// What an agent (a subagent, or the main agent's current turn) was told and
+/// what it has done since, for a log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Log {
+    /// What it was told to do, when the record of it is in reach.
+    pub prompt: Option<String>,
     /// The most recent entries, oldest first.
     pub log: Vec<LogEntry>,
-    /// The file the harness keeps the whole transcript in.
-    pub transcript: PathBuf,
+    /// Where the harness keeps the whole transcript.
+    pub transcript: TranscriptRef,
     pub outcome: Outcome,
     /// The model it runs, as the harness names it.
     pub model: Option<String>,
@@ -841,14 +909,35 @@ pub enum Outcome {
     },
 }
 
-/// One step of a subagent's work.
+/// One step of an agent's work.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LogEntry {
     Said {
         text: String,
         at: Option<SystemTime>,
     },
-    Called(Call),
+    Called(Box<Call>),
+    /// A message the user sent while the agent was working.
+    Queued {
+        text: String,
+        at: Option<SystemTime>,
+    },
+    /// The harness compacted the conversation here.
+    Compacted,
+}
+
+/// What a tool call does, as far as a view treats calls differently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallKind {
+    /// Reads or searches, which repeats a lot and folds.
+    Explore,
+    /// Changes a file.
+    Edit,
+    /// Hands work to a subagent.
+    Delegate,
+    /// Puts a question to the user.
+    Ask,
+    Other,
 }
 
 /// A tool call, from the request to what came back.
@@ -856,6 +945,7 @@ pub enum LogEntry {
 pub struct Call {
     pub id: ToolId,
     pub tool: String,
+    pub kind: CallKind,
     pub target: Target,
     pub state: CallState,
     pub started: Option<SystemTime>,

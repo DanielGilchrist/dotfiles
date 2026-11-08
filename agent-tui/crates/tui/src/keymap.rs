@@ -91,6 +91,8 @@ pub struct Situation {
     pub branch: bool,
     /// [0] reads the turn document.
     pub turn: bool,
+    /// The turn document is a log with entries to move over.
+    pub turn_log: bool,
     /// A range of diff lines is selected.
     pub selecting: bool,
     /// The branch cursor is on a commit.
@@ -164,6 +166,7 @@ impl Situation {
             ),
             branch: matches!(m.hover(), Some(crate::document::Hover::Branch(_))),
             turn: matches!(m.hover(), Some(crate::document::Hover::Turn(_))),
+            turn_log: matches!(m.hover(), Some(crate::document::Hover::Turn(name)) if m.turn_has_log(&name)),
             selecting: m.diff_view.anchor.is_some(),
             commit_row: m
                 .docs
@@ -371,13 +374,15 @@ pub const BINDINGS: &[Binding] = &[
                 Some(if s.commit_row { "copy sha" } else { "copy path" })
             } else if s.diff {
                 Some(if s.selecting { "copy lines" } else { "copy path:line" })
+            } else if s.turn_log {
+                Some("copy entry")
             } else if s.turn {
                 Some("copy message")
             } else {
                 s.subagent_row.then_some("copy entry")
             }
         }),
-        "Copy to the clipboard through the terminal (OSC 52): path:line or the selected lines of a diff, a commit's sha or an uncommitted file's path, the agent's message, or a subagent's log entry.",
+        "Copy to the clipboard through the terminal (OSC 52): path:line or the selected lines of a diff, a commit's sha or an uncommitted file's path, the agent's message, or the log entry under the cursor.",
     ),
     Binding::new(
         &["V"],
@@ -410,16 +415,16 @@ pub const BINDINGS: &[Binding] = &[
     Binding::new(
         &["⏎"],
         Ctxs::of(&[Ctx::Main]),
-        RankBy(|s| s.subagent_row.then_some(8)),
-        By(|s| s.subagent_row.then_some("fold")),
+        RankBy(|s| (s.subagent_row || s.turn_log).then_some(8)),
+        By(|s| (s.subagent_row || s.turn_log).then_some("fold")),
         "Expand or collapse the log entry under the cursor: the whole prompt or text, a call's input and result, or a run of calls.",
     ),
     Binding::new(
         &["=", "-"],
         Ctxs::of(&[Ctx::Main]),
         Hidden,
-        By(|s| s.subagent_row.then_some("expand all / collapse all")),
-        "Expand every entry of a subagent's log, or collapse them all.",
+        By(|s| (s.subagent_row || s.turn_log).then_some("expand all / collapse all")),
+        "Expand every entry of a log, or collapse them all. Folded phases of a turn open too.",
     ),
     Binding::new(
         &["e"],
@@ -803,6 +808,7 @@ mod tests {
             diff: false,
             branch: false,
             turn: false,
+            turn_log: false,
             selecting: false,
             commit_row: false,
             draft: false,

@@ -8,10 +8,10 @@ use std::time::{Duration, Instant, SystemTime};
 
 use agent_core::activity::{AgentId, Subagent};
 use agent_core::names::Prompt;
-use agent_core::ports::{SubagentDetail, WorktreeFacts};
+use agent_core::ports::{Log, TurnDetail, WorktreeFacts};
 
 use crate::log::Nav;
-use crate::model::{Inspection, SubagentRead};
+use crate::model::Inspection;
 use crate::tree::{ChangesScope, ChangesView, TreeRow};
 
 /// The tree built for an agent, rebuilt only when its facts, the view or
@@ -57,6 +57,75 @@ pub struct Tracked {
     pub seen: Seen,
     /// The subagents being watched, dropped with the agent.
     pub subagents: HashMap<AgentId, Watched>,
+    /// Its current turn, as [0] last read it.
+    pub turn: TurnWatch,
+}
+
+/// What is known about an agent's current turn, and how far the user had
+/// got when they last looked.
+#[derive(Default)]
+pub struct TurnWatch {
+    pub watch: Watch<TurnDetail>,
+    pub looked: Looked,
+}
+
+/// When a log's transcript was last asked for, and how many events its
+/// agent had reported then.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadAt {
+    pub events: u64,
+    pub at: Instant,
+}
+
+/// A log [0] reads: when it was last asked for, what came back, and the
+/// cursor over it.
+pub struct Watch<T> {
+    pub read: Option<ReadAt>,
+    pub log: Option<Result<Option<T>, String>>,
+    pub nav: Nav,
+}
+
+impl<T> Default for Watch<T> {
+    fn default() -> Self {
+        Self {
+            read: None,
+            log: None,
+            nav: Nav::default(),
+        }
+    }
+}
+
+/// A log is read again on its agent's activity, at most this often.
+pub const LOG_REFRESH: Duration = Duration::from_secs(2);
+/// And this often while it is growing whatever its agent reports, since a
+/// transcript can be written without a hook firing.
+pub const LOG_SLOW_REFRESH: Duration = Duration::from_secs(10);
+
+impl<T> Watch<T> {
+    /// Whether to ask for the log at `now`, when its agent has reported
+    /// `events` and `growing` says its transcript may be getting longer.
+    pub fn due(&self, events: u64, growing: bool, now: Instant) -> bool {
+        self.read.is_none_or(|last| {
+            (last.events != events && now >= last.at + LOG_REFRESH)
+                || (growing && now >= last.at + LOG_SLOW_REFRESH)
+        })
+    }
+
+    /// It was asked for at `now`, with `events` reported.
+    pub fn asked(&mut self, events: u64, now: Instant) {
+        self.read = Some(ReadAt { events, at: now });
+    }
+}
+
+/// Whether the turn is in front of the user, and when they last saw it.
+#[derive(Debug, Default)]
+pub struct Looked {
+    /// When [0] began showing the turn, while it does.
+    pub since: Option<Instant>,
+    /// The last moment the turn view or the terminal had been in front of
+    /// them for a few seconds. What the agent did after is
+    /// new to them.
+    pub seen: Option<SystemTime>,
 }
 
 /// How long a launch is kept for a session no snapshot lists: its worktree
@@ -113,13 +182,10 @@ impl Tracked {
     }
 }
 
-/// What is known about one subagent being watched: when its transcript was
-/// asked for, what it said, and the cursor over it.
+/// What is known about one subagent being watched.
 #[derive(Default)]
 pub struct Watched {
-    pub read: Option<SubagentRead>,
-    pub log: Option<Result<Option<SubagentDetail>, String>>,
-    pub nav: Nav,
+    pub watch: Watch<Log>,
     /// The subagent as its agent last listed it, kept so a new prompt
     /// clearing finished subagents doesn't take its row from under the
     /// cursor. Marked finished once the activity drops it, since nothing

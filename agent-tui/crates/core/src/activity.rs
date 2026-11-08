@@ -42,6 +42,28 @@ impl ToolId {
     }
 }
 
+/// Where a harness keeps its record of the conversation, as it names it. Only
+/// the harness that produced it knows how to read it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct TranscriptRef(String);
+
+impl TranscriptRef {
+    pub fn new(locator: impl Into<String>) -> Self {
+        Self(locator.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// The locator as a file, for the harnesses that keep transcripts in
+    /// files, which is all of them so far.
+    pub fn path(&self) -> &std::path::Path {
+        std::path::Path::new(&self.0)
+    }
+}
+
 /// A process id. Zero is never a process, so it can't be one here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -97,6 +119,9 @@ pub enum Lineage {
 pub struct Reported {
     pub event: Event,
     pub lineage: Lineage,
+    /// Where the harness said the agent's transcript is, when the event
+    /// carried it.
+    pub transcript: Option<TranscriptRef>,
 }
 
 impl Reported {
@@ -104,6 +129,7 @@ impl Reported {
         Self {
             event: Event::Main(event.into()),
             lineage: Lineage::Untraced,
+            transcript: None,
         }
     }
 
@@ -111,7 +137,14 @@ impl Reported {
         Self {
             event: Event::Subagent(id, event.into()),
             lineage: Lineage::Untraced,
+            transcript: None,
         }
+    }
+
+    #[must_use]
+    pub fn at_transcript(mut self, transcript: Option<TranscriptRef>) -> Self {
+        self.transcript = transcript;
+        self
     }
 
     #[must_use]
@@ -486,6 +519,8 @@ pub struct Activity {
     pub asks: Vec<Ask>,
     pub subagents: BTreeMap<AgentId, Subagent>,
     pub session: Session,
+    /// The latest transcript the harness reported.
+    pub transcript: Option<TranscriptRef>,
 }
 
 /// How much earlier than a bound a launch may be recorded and still count
@@ -511,6 +546,7 @@ impl Activity {
             session: Session::Live {
                 join: Join::Untraced,
             },
+            transcript: None,
         }
     }
 
@@ -524,6 +560,9 @@ impl Activity {
         let mut activity = previous.unwrap_or_else(|| Self::fresh(now));
         activity.session = activity.session.after(&reported.event, now);
         let before = activity.state.clone();
+        if reported.transcript.is_some() {
+            activity.transcript = reported.transcript;
+        }
         let answered = activity.answer(&reported.event);
         activity.apply(reported.event, answered, now);
         if !same_kind(&before, &activity.state) {
@@ -857,6 +896,8 @@ struct Stored {
     #[serde(default)]
     session: Option<Session>,
     #[serde(default)]
+    transcript: Option<TranscriptRef>,
+    #[serde(default)]
     booting: bool,
     #[serde(default)]
     launcher: Option<u32>,
@@ -877,6 +918,7 @@ struct Written {
     asks: Vec<Ask>,
     subagents: BTreeMap<AgentId, Subagent>,
     session: Session,
+    transcript: Option<TranscriptRef>,
     booting: bool,
     launcher: Option<u32>,
     launched: Option<SystemTime>,
@@ -897,6 +939,7 @@ impl From<Activity> for Written {
             asks: activity.asks,
             subagents: activity.subagents,
             session: activity.session,
+            transcript: activity.transcript,
             booting: activity.session.is_booting(),
             launcher,
             launched: activity.session.launched_at(),
@@ -1005,6 +1048,7 @@ impl From<Stored> for Activity {
             mut asks,
             subagents,
             session,
+            transcript,
             booting,
             launcher,
             launched,
@@ -1030,6 +1074,7 @@ impl From<Stored> for Activity {
             asks,
             subagents,
             session: session.unwrap_or_else(|| legacy_session(booting, launcher, launched)),
+            transcript,
         }
     }
 }
@@ -1868,5 +1913,36 @@ mod tests {
             }
         );
         assert!(a.bound_met(Some(at(25))) && !a.session.is_booting());
+    }
+
+    #[test]
+    fn the_latest_transcript_reported_is_kept_through_reports_without_one_and_a_save() {
+        let first = TranscriptRef::new("/p/one.jsonl");
+        let second = TranscriptRef::new("/p/two.jsonl");
+        let a = run(vec![
+            (1, main(user("go")).at_transcript(Some(first.clone()))),
+            (2, main(MainEvent::Common(start("t", "Bash")))),
+        ]);
+        assert_eq!(a.transcript, Some(first));
+        let b = Activity::next(
+            Some(a),
+            main(user("again")).at_transcript(Some(second.clone())),
+            at(3),
+        );
+        assert_eq!(
+            b.transcript,
+            Some(second.clone()),
+            "a new session names its own"
+        );
+        let saved = serde_json::to_string(&b).expect("serialises");
+        let loaded: Activity = serde_json::from_str(&saved).expect("reads");
+        assert_eq!(loaded.transcript, Some(second));
+        let old = saved.replace(r#""transcript":"/p/two.jsonl","#, "");
+        assert_eq!(
+            serde_json::from_str::<Activity>(&old)
+                .expect("a file from before it")
+                .transcript,
+            None
+        );
     }
 }
