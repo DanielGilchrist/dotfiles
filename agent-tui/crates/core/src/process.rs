@@ -240,6 +240,7 @@ pub struct LaunchSpec {
     cwd: Option<PathBuf>,
     env: Vec<(OsString, OsString)>,
     env_remove: Vec<OsString>,
+    reattaches: bool,
 }
 
 impl LaunchSpec {
@@ -250,7 +251,20 @@ impl LaunchSpec {
             cwd: None,
             env: Vec::new(),
             env_remove: Vec::new(),
+            reattaches: false,
         }
+    }
+
+    /// Joins a session that is already running, so its hooks come from a
+    /// process other than the one this spec starts.
+    #[must_use]
+    pub fn reattaching(mut self) -> Self {
+        self.reattaches = true;
+        self
+    }
+
+    pub fn reattaches(&self) -> bool {
+        self.reattaches
     }
 
     #[must_use]

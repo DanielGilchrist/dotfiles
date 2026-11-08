@@ -18,6 +18,8 @@ use agent_zellij::Zellij;
 use anyhow::{Context, Result, bail};
 use clap::{ArgGroup, CommandFactory, Parser, Subcommand};
 
+mod lineage;
+
 #[derive(Parser)]
 #[command(
     name = "agent",
@@ -588,7 +590,8 @@ fn event(svc: Services<'_>, name: &SessionName) {
     }
     .unwrap_or_else(|| svc.harnesses.default_harness());
     if let Some(event) = harness.event(&payload) {
-        let _ = svc.store.report(name, event);
+        let lineage = lineage::of(std::process::id(), lineage::parent_of);
+        let _ = svc.store.report(name, event.from_lineage(lineage));
     }
 }
 

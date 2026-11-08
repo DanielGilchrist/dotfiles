@@ -265,7 +265,8 @@ impl Harness for Claude {
                     return Ok(LaunchSpec::new(&self.program)
                         .cwd(&workdir)
                         .env_remove(INHERITED_SESSION_ENV.iter().copied())
-                        .args(["attach".to_string(), id.clone()]));
+                        .args(["attach".to_string(), id.clone()])
+                        .reattaching());
                 }
                 Some(_) => self.stop(id)?,
             }
@@ -693,7 +694,11 @@ fn claude_event(payload: &serde_json::Value) -> Option<Reported> {
         "SessionEnd" => Event::Ended,
         _ => return None,
     };
-    Some(Reported { origin, event })
+    Some(Reported {
+        origin,
+        event,
+        lineage: None,
+    })
 }
 
 /// The subagents a finished turn left running. Other background work

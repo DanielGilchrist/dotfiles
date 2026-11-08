@@ -18,6 +18,7 @@ dependencies = [
  "clap_complete",
  "portable-pty",
  "shell-words",
+ "sysinfo",
  "tempfile",
  "vt100",
 ]

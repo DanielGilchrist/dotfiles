@@ -54,6 +54,8 @@ pub enum Origin {
 pub struct Reported {
     pub origin: Origin,
     pub event: Event,
+    /// The reporting process and its ancestors, when they could be read.
+    pub lineage: Option<Vec<u32>>,
 }
 
 impl Reported {
@@ -61,6 +63,7 @@ impl Reported {
         Self {
             origin: Origin::Main,
             event,
+            lineage: None,
         }
     }
 
@@ -68,7 +71,14 @@ impl Reported {
         Self {
             origin: Origin::Subagent(id),
             event,
+            lineage: None,
         }
+    }
+
+    #[must_use]
+    pub fn from_lineage(mut self, lineage: Option<Vec<u32>>) -> Self {
+        self.lineage = lineage;
+        self
     }
 }
 
@@ -77,7 +87,12 @@ impl Reported {
 pub enum Event {
     /// `agent exec` is about to start the harness: a new session, not yet
     /// reporting.
-    Launched,
+    /// The harness was just started by process `pid`, which every hook of
+    /// the new session descends from. None when it joined a session that
+    /// was already running.
+    Launched {
+        pid: Option<u32>,
+    },
     /// A session began (fresh, resumed or cleared).
     Started,
     /// The context was compacted.
@@ -248,6 +263,10 @@ pub struct Activity {
     /// The last thing reported was a session launching or starting, which a
     /// dialog may still be covering.
     pub booting: bool,
+    /// The process the current session was launched as. Reports from
+    /// processes that don't descend from it are from a session it replaced.
+    #[serde(default)]
+    pub launcher: Option<u32>,
 }
 
 /// How long a session that just reported starting must stay quiet before
@@ -259,6 +278,9 @@ impl Activity {
     /// only restarts when the state itself changes, not when a working agent
     /// moves to its next tool or answers a question.
     pub fn next(previous: Option<Self>, reported: Reported, now: SystemTime) -> Self {
+        if let Some(previous) = previous.as_ref().filter(|p| p.is_stale_report(&reported)) {
+            return previous.clone();
+        }
         let mut activity = previous.unwrap_or(Self {
             state: State::Working { tools: Vec::new() },
             since: now,
@@ -268,14 +290,19 @@ impl Activity {
             asks: Vec::new(),
             subagents: BTreeMap::new(),
             booting: false,
+            launcher: None,
         });
         let booting = matches!(
             reported,
             Reported {
                 origin: Origin::Main,
-                event: Event::Started | Event::Launched
+                event: Event::Started | Event::Launched { .. },
+                ..
             }
         );
+        if let Event::Launched { pid } = &reported.event {
+            activity.launcher = *pid;
+        }
         let before = activity.state.clone();
         let answered = activity.answer(&reported);
         activity.apply(reported, answered, now);
@@ -286,6 +313,16 @@ impl Activity {
         activity.events += 1;
         activity.booting = booting;
         activity
+    }
+
+    /// `reported` came from a process that isn't part of the session
+    /// launched last, such as a background session it replaced. Reports
+    /// whose process couldn't be traced are given the benefit of the doubt.
+    fn is_stale_report(&self, reported: &Reported) -> bool {
+        match (self.launcher, &reported.lineage, &reported.event) {
+            (_, _, Event::Launched { .. }) | (None, _, _) | (_, None, _) => false,
+            (Some(pid), Some(lineage), _) => !lineage.contains(&pid),
+        }
     }
 
     /// Takes out the question `reported` shows was answered.
@@ -310,7 +347,7 @@ impl Activity {
 
     fn apply(
         &mut self,
-        Reported { origin, event }: Reported,
+        Reported { origin, event, .. }: Reported,
         answered: Option<Ask>,
         now: SystemTime,
     ) {
@@ -323,7 +360,7 @@ impl Activity {
         };
         let state = std::mem::replace(&mut self.state, State::Idle);
         self.state = match (origin, event) {
-            (Origin::Main, Event::Launched) => {
+            (Origin::Main, Event::Launched { .. }) => {
                 self.forget_subagents();
                 State::Working { tools: Vec::new() }
             }
@@ -600,6 +637,8 @@ struct Stored {
     subagents: BTreeMap<AgentId, Subagent>,
     #[serde(default)]
     booting: bool,
+    #[serde(default)]
+    launcher: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -626,6 +665,7 @@ impl From<Stored> for Activity {
             mut asks,
             subagents,
             booting,
+            launcher,
         } = stored;
         let state = match state {
             StoredState::Current(state) => state,
@@ -648,6 +688,7 @@ impl From<Stored> for Activity {
             asks,
             subagents,
             booting,
+            launcher,
         }
     }
 }
@@ -1206,19 +1247,61 @@ mod tests {
 
     #[test]
     fn a_launched_agent_is_busy_until_its_session_has_been_quiet() {
-        let a = run(vec![(10, main(finished(&[]))), (20, main(Event::Launched))]);
+        let a = run(vec![
+            (10, main(finished(&[]))),
+            (20, main(Event::Launched { pid: Some(7) })),
+        ]);
         assert!(!a.at_rest() && a.booting);
         assert!(!a.ready_for_text(Some(at(15)), at(100)));
         let a = run(vec![
             (10, main(finished(&[]))),
-            (20, main(Event::Launched)),
+            (20, main(Event::Launched { pid: Some(7) })),
             (21, main(Event::Started)),
         ]);
         assert!(a.at_rest() && a.booting);
         assert!(!a.ready_for_text(Some(at(15)), at(22)));
         assert!(a.ready_for_text(Some(at(15)), at(21 + BOOT_QUIET.as_secs())));
-        let a = run(vec![(10, main(finished(&[]))), (20, main(Event::Launched))]);
+        let a = run(vec![
+            (10, main(finished(&[]))),
+            (20, main(Event::Launched { pid: Some(7) })),
+        ]);
         assert!(a.asks.is_empty() && a.subagents.is_empty());
+    }
+
+    #[test]
+    fn reports_from_a_replaced_process_are_ignored_after_a_launch() {
+        let from = |pids: &[u32], event| main(event).from_lineage(Some(pids.to_vec()));
+        let a = run(vec![
+            (10, main(finished(&[]))),
+            (20, main(Event::Launched { pid: Some(7) })),
+            (21, from(&[99, 98], finished(&[]))),
+        ]);
+        assert!(!a.at_rest() && a.booting);
+        assert_eq!(a.heard, at(20));
+        let a = run(vec![
+            (20, main(Event::Launched { pid: Some(7) })),
+            (21, from(&[50, 7, 3], Event::Started)),
+        ]);
+        assert!(a.at_rest());
+    }
+
+    #[test]
+    fn untraceable_or_unrecorded_reports_are_accepted() {
+        let a = run(vec![
+            (20, main(Event::Launched { pid: Some(7) })),
+            (21, main(Event::Started)),
+        ]);
+        assert!(a.at_rest(), "no lineage");
+        let a = run(vec![
+            (20, main(Event::Launched { pid: None })),
+            (21, main(Event::Started).from_lineage(Some(vec![99]))),
+        ]);
+        assert!(a.at_rest(), "reattached session");
+        let a = run(vec![(
+            21,
+            main(Event::Started).from_lineage(Some(vec![99])),
+        )]);
+        assert!(a.at_rest(), "old record");
     }
 
     #[test]

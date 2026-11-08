@@ -653,17 +653,20 @@ pub fn exec_spec(svc: Services<'_>, name: &SessionName, workdir: &Path) -> Resul
         svc.store.put_record(name, &record)?;
     }
     let bootstrap = record.pending.as_ref().map(|p| &p.prompt);
-    // A failed write must not stop the launch.
-    let _ = svc.store.report(
-        name,
-        crate::activity::Reported::main(crate::activity::Event::Launched),
-    );
-    Ok(harness.launch(&LaunchCtx {
+    let spec = harness.launch(&LaunchCtx {
         session: name,
         workdir,
         bootstrap,
         report: svc.exe,
-    })?)
+    })?;
+    // The harness replaces this process, keeping its pid. A failed write
+    // must not stop the launch.
+    let pid = (!spec.reattaches()).then(std::process::id);
+    let _ = svc.store.report(
+        name,
+        crate::activity::Reported::main(crate::activity::Event::Launched { pid }),
+    );
+    Ok(spec)
 }
 
 /// Ensure an agent worktree exists for `branch`; returns its name.
