@@ -684,51 +684,32 @@ fn branch_summary(facts: &WorktreeFacts, scope: ChangesScope) -> Line<'static> {
     Line::from(spans)
 }
 
-/// The branch row on the second tab: what is compared with what, then the
-/// commits and uncommitted files, `fix-thing vs origin/main · 3 commits ·
-/// 2 uncommitted`. On the trunk the commits are `↑26 commits`, the ones not
-/// on origin yet.
+/// The branch row on the second tab, short enough for the narrow sidebar:
+/// `↑27 · 4 uncommitted`, `↓n` when behind. [0] says what is compared.
 fn compared_summary(facts: &WorktreeFacts) -> Line<'static> {
-    let head = facts.compared.head().to_string();
-    let Some(base) = facts.compared.base() else {
-        return Line::from(vec![
-            Span::raw(head),
-            Span::styled(" · ", dim()),
-            Span::raw("no base to compare with"),
-        ]);
-    };
-    let trunk = matches!(facts.compared, Compared::Trunk { .. });
-    let mut parts: Vec<Vec<Span<'static>>> = Vec::new();
+    let mut parts: Vec<String> = Vec::new();
     if facts.ahead > 0 {
-        let noun = if facts.ahead == 1 {
-            "commit"
-        } else {
-            "commits"
-        };
-        let mut part = Vec::new();
-        if trunk {
-            part.push(Span::styled("↑", dim()));
-        }
-        part.push(Span::raw(format!("{} {noun}", facts.ahead)));
-        parts.push(part);
-    }
-    if facts.dirty > 0 {
-        parts.push(vec![Span::raw(format!("{} uncommitted", facts.dirty))]);
+        parts.push(format!("↑{}", facts.ahead));
     }
     if facts.behind > 0 {
-        parts.push(vec![Span::raw(format!("behind {}", facts.behind))]);
+        parts.push(format!("↓{}", facts.behind));
+    }
+    if facts.dirty > 0 {
+        parts.push(format!("{} uncommitted", facts.dirty));
     }
     if parts.is_empty() {
-        parts.push(vec![Span::raw(if trunk {
-            "nothing to commit or push"
-        } else {
-            "no changes"
-        })]);
+        let empty = match facts.compared {
+            Compared::Trunk { .. } => "nothing to push",
+            _ => "no changes",
+        };
+        return Line::from(Span::raw(empty));
     }
-    let mut spans = vec![Span::raw(format!("{head} vs {base}"))];
-    for part in parts {
-        spans.push(Span::styled(" · ", dim()));
-        spans.extend(part);
+    let mut spans = Vec::new();
+    for (i, part) in parts.into_iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(" · ", dim()));
+        }
+        spans.push(Span::raw(part));
     }
     Line::from(spans)
 }
@@ -1770,7 +1751,7 @@ mod tests {
     }
 
     #[test]
-    fn the_second_tab_row_names_what_is_compared_with_what() {
+    fn the_second_tab_row_is_short() {
         let branch = || Compared::Branch {
             branch: "fix-thing".into(),
             base: "origin/main".into(),
@@ -1791,45 +1772,15 @@ mod tests {
                 ChangesScope::Since,
             ))
         };
-        assert_eq!(
-            read(branch(), 3, 2, 0),
-            "fix-thing vs origin/main · 3 commits · 2 uncommitted"
-        );
-        assert_eq!(
-            read(branch(), 1, 0, 2),
-            "fix-thing vs origin/main · 1 commit · behind 2"
-        );
-        assert_eq!(
-            read(branch(), 0, 0, 0),
-            "fix-thing vs origin/main · no changes"
-        );
-        assert_eq!(
-            read(trunk(), 26, 4, 0),
-            "main vs origin/main · ↑26 commits · 4 uncommitted"
-        );
-        assert_eq!(
-            read(trunk(), 0, 4, 0),
-            "main vs origin/main · 4 uncommitted"
-        );
-        assert_eq!(
-            read(trunk(), 0, 0, 0),
-            "main vs origin/main · nothing to commit or push"
-        );
-        assert_eq!(
-            read(
-                Compared::Detached {
-                    sha: "abc1234".into(),
-                    base: "origin/main".into()
-                },
-                2,
-                0,
-                0
-            ),
-            "abc1234 vs origin/main · 2 commits"
-        );
+        assert_eq!(read(branch(), 3, 2, 0), "↑3 · 2 uncommitted");
+        assert_eq!(read(branch(), 1, 0, 2), "↑1 · ↓2");
+        assert_eq!(read(branch(), 0, 0, 0), "no changes");
+        assert_eq!(read(trunk(), 27, 4, 0), "↑27 · 4 uncommitted");
+        assert_eq!(read(trunk(), 0, 4, 0), "4 uncommitted");
+        assert_eq!(read(trunk(), 0, 0, 0), "nothing to push");
         assert_eq!(
             read(Compared::NoBase { head: "wip".into() }, 0, 1, 0),
-            "wip · no base to compare with"
+            "1 uncommitted"
         );
     }
 
@@ -1918,7 +1869,7 @@ mod tests {
         }
         assert_eq!(shown[0].0, " ↑24 unpushed · 4 uncommitted");
         assert_eq!(
-            shown[1].0, " fix vs origin/main · 24 commits · 4 uncommitt…",
+            shown[1].0, " ↑24 · 4 uncommitted",
             "the branch row leads both tabs"
         );
         assert_eq!(shown[0].1, 1);
@@ -2940,7 +2891,14 @@ mod tests {
             })),
         );
         let text = screen(&render(&mut m, (100, 30))).join("\n");
-        assert!(text.contains("[0] Branch ↑1"), "{text}");
+        assert!(
+            text.contains("[0] Branch · feature vs origin/main"),
+            "{text}"
+        );
+        assert!(
+            text.contains("What feature changes since it left origin/main"),
+            "{text}"
+        );
         assert!(
             text.contains("Commits (1)") && text.contains("abc1234 Fix the rounding"),
             "{text}"

@@ -7,7 +7,7 @@ use std::time::Instant;
 use agent_core::activity::AgentId;
 use agent_core::model::{Head, RepoKey};
 use agent_core::names::SessionName;
-use agent_core::ports::{BranchLog, Change, FileDiff, Lines, LogEntry};
+use agent_core::ports::{BranchLog, Change, Compared, FileDiff, Lines, LogEntry};
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -318,26 +318,18 @@ fn folder_body(m: &Model, key: &FolderKey, columns: usize, budget: usize) -> Bod
 /// The branch: how far it is from shipping, its commits and the files not
 /// yet committed.
 fn branch_body(m: &mut Model, key: &BranchKey, columns: usize) -> Body {
-    let mut facts = Vec::new();
-    if key.ahead > 0 {
-        facts.push(format!("↑{}", key.ahead));
-    }
-    if key.behind > 0 {
-        facts.push(format!("behind {}", key.behind));
-    }
-    if key.dirty > 0 {
-        facts.push(format!("{} uncommitted", key.dirty));
-    }
-    let mut title = vec![Span::raw("[0] "), Span::styled("Branch", bold())];
-    if !facts.is_empty() {
-        title.push(Span::styled(format!(" {}", facts.join(" · ")), dim()));
-    }
+    let title = vec![
+        Span::raw("[0] "),
+        Span::styled(key.compared.tab(), bold()),
+        Span::styled(format!(" · {}", compared_title(&key.compared)), dim()),
+    ];
+    let compared = key.compared.clone();
     let behind = key.behind;
     let rows = match m.docs.resolve() {
         Resolved::Current(key, loaded) | Resolved::Stale(key, loaded) => {
             let (key, loaded) = (key.clone(), loaded.clone());
             m.docs.rows(&key, columns, || match loaded.as_ref() {
-                Ok(Doc::Branch(log)) => branch_rows(log, behind, columns),
+                Ok(Doc::Branch(log)) => branch_rows(log, &compared, behind, columns),
                 Ok(Doc::Diff(_)) => Vec::new(),
                 Err(e) => vec![Line::styled(
                     e.lines().next().unwrap_or_default().to_string(),
@@ -357,8 +349,17 @@ fn branch_body(m: &mut Model, key: &BranchKey, columns: usize) -> Body {
 }
 
 /// A branch log as rows: its commits, then the files not committed.
-fn branch_rows(log: &BranchLog, behind: usize, columns: usize) -> Vec<Line<'static>> {
-    let mut rows: Vec<Line<'static>> = Vec::new();
+fn branch_rows(
+    log: &BranchLog,
+    compared: &Compared,
+    behind: usize,
+    columns: usize,
+) -> Vec<Line<'static>> {
+    let mut rows: Vec<Line<'static>> = wrap(&compared_explanation(compared), columns)
+        .into_iter()
+        .map(|row| Line::styled(row, dim()))
+        .collect();
+    rows.push(Line::raw(""));
     if log.commits.is_empty() && log.uncommitted.is_empty() {
         rows.push(Line::styled("nothing ahead of the default branch", dim()));
     }
@@ -399,14 +400,37 @@ fn branch_rows(log: &BranchLog, behind: usize, columns: usize) -> Vec<Line<'stat
             ]));
         }
     }
-    if behind > 0 {
+    if let (true, Some(base)) = (behind > 0, compared.base()) {
         rows.push(Line::raw(""));
-        rows.push(Line::styled(
-            format!("The default branch has {behind} newer commits."),
-            dim(),
-        ));
+        rows.push(Line::styled(format!("behind {base} by {behind}"), dim()));
     }
     rows
+}
+
+fn compared_title(compared: &Compared) -> String {
+    match compared.base() {
+        Some(base) => format!("{} vs {base}", compared.head()),
+        None => format!("{} · no base", compared.head()),
+    }
+}
+
+fn compared_explanation(compared: &Compared) -> String {
+    let head = compared.head();
+    match compared {
+        Compared::Trunk { base, .. } => format!(
+            "Commits on {head} that aren't on {base} yet, then uncommitted work. Pushing empties the commits."
+        ),
+        Compared::Branch { base, .. } => format!(
+            "What {head} changes since it left {base}, like a pull request, then uncommitted work."
+        ),
+        Compared::Detached { base, .. } => {
+            format!("What {head} changes since it left {base}, then uncommitted work.")
+        }
+        Compared::NoBase { .. } => {
+            "There is no default branch to compare with, so only uncommitted work is listed."
+                .to_string()
+        }
+    }
 }
 
 /// A repo row's summary: its checkouts as the cards say them.

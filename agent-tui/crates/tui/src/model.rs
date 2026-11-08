@@ -1529,6 +1529,7 @@ impl Model {
                 ahead: facts.ahead,
                 behind: facts.behind,
                 dirty: facts.dirty,
+                compared: facts.compared.clone(),
                 generation,
             }),
             (_, None, _) => return None,

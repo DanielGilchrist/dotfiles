@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use agent_core::activity::AgentId;
 use agent_core::model::RepoKey;
 use agent_core::names::SessionName;
-use agent_core::ports::{BranchLog, DiffBase, FileDiff, Lines};
+use agent_core::ports::{BranchLog, Compared, DiffBase, FileDiff, Lines};
 use ratatui::text::Line;
 
 /// The cursor must rest on a file this long before its diff is asked for, so
@@ -56,6 +56,7 @@ pub struct BranchKey {
     pub ahead: usize,
     pub behind: usize,
     pub dirty: usize,
+    pub compared: Compared,
     /// As in [`DiffKey`], so a swapped commit shows.
     pub generation: u64,
 }
@@ -529,6 +530,7 @@ mod tests {
                 ahead: 1,
                 behind: 0,
                 dirty: 0,
+                compared: Compared::default(),
                 generation: 0,
             })),
             t0 + REST * 3,
