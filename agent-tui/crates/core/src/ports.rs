@@ -31,6 +31,10 @@ pub struct WorktreeFacts {
     pub behind: usize,
     /// Committed, uncommitted and untracked changes since the fork point.
     pub changed: Vec<Change>,
+    /// The files with uncommitted state, counted against the last commit.
+    pub pending: Vec<Change>,
+    /// The default branch the fork point is on, as `main`.
+    pub base: Option<String>,
     /// Modified, staged and untracked files.
     pub dirty: usize,
 }
@@ -115,18 +119,14 @@ pub enum Lines {
 }
 
 impl WorktreeFacts {
+    /// Totals since the fork point.
     pub fn diff(&self) -> DiffStat {
-        let counted = || {
-            self.changed.iter().filter_map(|c| match c.lines {
-                Lines::Counted { added, removed } => Some((added, removed)),
-                Lines::Binary | Lines::Untracked => None,
-            })
-        };
-        DiffStat {
-            files: self.changed.len(),
-            added: counted().map(|(added, _)| added).sum(),
-            removed: counted().map(|(_, removed)| removed).sum(),
-        }
+        DiffStat::of(&self.changed)
+    }
+
+    /// Totals of the uncommitted files, against the last commit.
+    pub fn pending_diff(&self) -> DiffStat {
+        DiffStat::of(&self.pending)
     }
 
     /// How close the work is to shipping. Uncommitted files come first,
@@ -170,6 +170,31 @@ pub struct DiffStat {
     pub files: usize,
     pub added: usize,
     pub removed: usize,
+}
+
+impl DiffStat {
+    pub fn of(changes: &[Change]) -> Self {
+        let counted = || {
+            changes.iter().filter_map(|c| match c.lines {
+                Lines::Counted { added, removed } => Some((added, removed)),
+                Lines::Binary | Lines::Untracked => None,
+            })
+        };
+        Self {
+            files: changes.len(),
+            added: counted().map(|(added, _)| added).sum(),
+            removed: counted().map(|(_, removed)| removed).sum(),
+        }
+    }
+}
+
+/// What a file's diff is read against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiffBase {
+    /// The last commit: what is uncommitted.
+    Head,
+    /// The fork point: committed and uncommitted together.
+    Fork,
 }
 
 /// A branch a [`Vcs`] found in the repo's local refs. Only `Vcs`
@@ -276,15 +301,16 @@ pub trait Vcs: Send + Sync {
     /// The worktree's commits since it forked, and its uncommitted files.
     /// Slow on a big repo: call it off the UI thread.
     fn branch_log(&self, worktree: &Path) -> Result<BranchLog, CommandError>;
-    /// `path`'s change since the worktree forked from the default branch,
-    /// committed and uncommitted together. `lines` says what kind of change
-    /// facts found, so a new untracked file is shown whole. Slow on big
-    /// diffs: call it off the UI thread.
+    /// `path`'s change against `base`: the last commit, or the fork point
+    /// from the default branch (committed and uncommitted together). `lines`
+    /// says what kind of change facts found, so a new untracked file is
+    /// shown whole. Slow on big diffs: call it off the UI thread.
     fn file_diff(
         &self,
         worktree: &Path,
         path: &Path,
         lines: Lines,
+        base: DiffBase,
     ) -> Result<FileDiff, CommandError>;
 }
 
@@ -684,8 +710,8 @@ mod tests {
         WorktreeFacts {
             ahead,
             behind,
-            changed: Vec::new(),
             dirty,
+            ..WorktreeFacts::default()
         }
     }
 

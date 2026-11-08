@@ -859,6 +859,8 @@ fn on_panel_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
 fn cycle_tab(m: &mut Model, direction: Direction) {
     if m.panel == Panel::Agents {
         m.cycle_view(direction);
+    } else if matches!(m.panel, Panel::Changes { .. }) {
+        m.toggle_changes_scope();
     } else {
         m.info("this panel has no tabs");
     }
@@ -2341,7 +2343,7 @@ mod tests {
     }
 
     fn with_changes(m: &mut Model, files: usize) {
-        let changed = (0..files)
+        let changed: Vec<agent_core::ports::Change> = (0..files)
             .map(|i| agent_core::ports::Change {
                 path: format!("src/f{i}.rs").into(),
                 lines: agent_core::ports::Lines::Untracked,
@@ -2351,6 +2353,7 @@ mod tests {
         m.set_facts(
             &name("fix"),
             Ok(agent_core::ports::WorktreeFacts {
+                pending: changed.clone(),
                 changed,
                 ..Default::default()
             }),
@@ -2358,7 +2361,7 @@ mod tests {
     }
 
     fn with_paths(m: &mut Model, paths: &[&str]) {
-        let changed = paths
+        let changed: Vec<agent_core::ports::Change> = paths
             .iter()
             .map(|p| agent_core::ports::Change {
                 path: (*p).into(),
@@ -2372,6 +2375,7 @@ mod tests {
         m.set_facts(
             &name("fix"),
             Ok(agent_core::ports::WorktreeFacts {
+                pending: changed.clone(),
                 changed,
                 ..Default::default()
             }),
@@ -2419,6 +2423,92 @@ mod tests {
         update(&mut m, key(KeyCode::Char('`')));
         assert_eq!(m.changes_view, ChangesView::Tree);
         assert_eq!(m.panel, Panel::Changes { file: 8 });
+    }
+
+    fn with_scopes(m: &mut Model) {
+        use agent_core::ports::{Change, Edit, FileState, Lines};
+        let change = |path: &str, added, state| Change {
+            path: path.into(),
+            lines: Lines::Counted { added, removed: 0 },
+            state,
+        };
+        let edited = FileState::Unstaged(Edit::Modified);
+        m.set_facts(
+            &name("fix"),
+            Ok(agent_core::ports::WorktreeFacts {
+                ahead: 3,
+                dirty: 1,
+                base: Some("main".into()),
+                changed: vec![
+                    change("a/old.rs", 40, FileState::Committed),
+                    change("a/hot.rs", 9, edited),
+                ],
+                pending: vec![change("a/hot.rs", 2, edited)],
+                ..Default::default()
+            }),
+        );
+    }
+
+    #[test]
+    fn changes_start_on_the_uncommitted_tab_and_brackets_switch_tabs_for_the_session() {
+        let mut m = model(&[]);
+        m.changes_view = ChangesView::Flat;
+        with_scopes(&mut m);
+        assert_eq!(m.changes_scope, crate::tree::ChangesScope::Uncommitted);
+        assert_eq!(tree_labels(&m), ["a/hot.rs"], "only uncommitted files");
+        assert_eq!(m.changes().len(), 1);
+        m.panel = Panel::Changes { file: 1 };
+        update(&mut m, key(KeyCode::Char(']')));
+        assert_eq!(m.changes_scope, crate::tree::ChangesScope::Since);
+        assert_eq!(tree_labels(&m), ["a/old.rs", "a/hot.rs"]);
+        assert_eq!(
+            m.change_at(1).map(|c| c.state),
+            Some(agent_core::ports::FileState::Committed),
+            "committed files carry no uncommitted state"
+        );
+        assert_eq!(
+            m.panel,
+            Panel::Changes { file: 2 },
+            "the cursor follows hot.rs"
+        );
+        update(&mut m, key(KeyCode::Char('[')));
+        assert_eq!(m.changes_scope, crate::tree::ChangesScope::Uncommitted);
+        assert_eq!(m.panel, Panel::Changes { file: 1 });
+        update(&mut m, key(KeyCode::Char(']')));
+        update(&mut m, key(KeyCode::Char('1')));
+        update(&mut m, key(KeyCode::Char('3')));
+        assert_eq!(
+            m.changes_scope,
+            crate::tree::ChangesScope::Since,
+            "refocusing keeps the tab"
+        );
+    }
+
+    #[test]
+    fn a_row_missing_from_the_other_tab_sends_the_cursor_to_the_branch_row() {
+        let mut m = model(&[]);
+        m.changes_view = ChangesView::Flat;
+        with_scopes(&mut m);
+        update(&mut m, key(KeyCode::Char(']')));
+        m.panel = Panel::Changes { file: 1 };
+        update(&mut m, key(KeyCode::Char('[')));
+        assert_eq!(m.panel, Panel::Changes { file: 0 });
+    }
+
+    #[test]
+    fn the_diff_under_the_cursor_is_read_against_the_tab_it_is_in() {
+        use agent_core::ports::DiffBase;
+        let mut m = model(&[]);
+        m.changes_view = ChangesView::Flat;
+        with_scopes(&mut m);
+        let base = |m: &Model| match m.hovered_document() {
+            Some((Key::Diff(key), _)) => key.base,
+            other => panic!("a diff, got {other:?}"),
+        };
+        m.panel = Panel::Changes { file: 1 };
+        assert_eq!(base(&m), DiffBase::Head);
+        update(&mut m, key(KeyCode::Char(']')));
+        assert_eq!(base(&m), DiffBase::Fork);
     }
 
     #[test]
@@ -2580,7 +2670,7 @@ mod tests {
         let on = |m: &Model| m.file_under_cursor().map(|(_, f)| f);
         assert_eq!(on(&m), Some("c.rs".into()));
         let refreshed = |m: &mut Model, paths: &[&str]| {
-            let changed = paths
+            let changed: Vec<agent_core::ports::Change> = paths
                 .iter()
                 .map(|p| agent_core::ports::Change {
                     path: (*p).into(),
@@ -2593,6 +2683,7 @@ mod tests {
                 Msg::Inspected {
                     name: name("fix"),
                     facts: Ok(agent_core::ports::WorktreeFacts {
+                        pending: changed.clone(),
                         changed,
                         ..Default::default()
                     }),

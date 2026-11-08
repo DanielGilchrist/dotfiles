@@ -4,7 +4,7 @@
 //! on is in this table.
 
 use crate::model::{Model, Panel, Reach, View, Visibility};
-use crate::tree::{ChangesView, Node};
+use crate::tree::{ChangesScope, ChangesView, Node};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ctx {
@@ -90,6 +90,8 @@ pub struct Situation {
     pub toggle: Option<&'static str>,
     pub toggle_worth_showing: bool,
     pub next_tab: &'static str,
+    /// What `]` names while [3] has the keys.
+    pub next_changes_tab: &'static str,
 }
 
 impl Situation {
@@ -147,6 +149,10 @@ impl Situation {
                 Visibility::Active => "show all",
             }),
             toggle_worth_showing: m.visibility == Visibility::All || m.hidden() > 0,
+            next_changes_tab: match m.changes_scope.toggled() {
+                ChangesScope::Uncommitted => "tab: uncommitted",
+                ChangesScope::Since => "tab: since base",
+            },
             next_tab: match m.view.next() {
                 View::Focus => "tab: repo",
                 View::Overview => "tab: agents",
@@ -323,6 +329,13 @@ pub const BINDINGS: &[Binding] = &[
         RankBy(|_| Some(6)),
         By(|s| Some(s.next_tab)),
         "Cycle [1]'s tabs: the repo, all agents, pinned. The footer names the next one.",
+    ),
+    Binding::new(
+        &["[", "]"],
+        Ctxs::of(&[Ctx::Changes]),
+        RankBy(|_| Some(4)),
+        By(|s| Some(s.next_changes_tab)),
+        "Cycle [3]'s tabs: the uncommitted files, counted against the last commit, and everything since the fork from the default branch. The choice lasts for the session.",
     ),
     Binding::new(
         &["."],
@@ -654,7 +667,21 @@ mod tests {
             toggle: Some("show all"),
             toggle_worth_showing: true,
             next_tab: "tab: agents",
+            next_changes_tab: "tab: since base",
         }
+    }
+
+    #[test]
+    fn brackets_name_the_next_tab_of_whichever_panel_has_the_keys() {
+        let label = |ctx| {
+            BINDINGS
+                .iter()
+                .find(|b| b.keys == ["[", "]"] && b.contexts.has(ctx))
+                .and_then(|b| b.label_in(&situation(ctx)))
+        };
+        assert_eq!(label(Ctx::Agents), Some("tab: agents"));
+        assert_eq!(label(Ctx::Changes), Some("tab: since base"));
+        assert_eq!(label(Ctx::Turn), None);
     }
 
     const CTXS: [Ctx; 5] = [Ctx::Agents, Ctx::Turn, Ctx::Changes, Ctx::Main, Ctx::Peek];

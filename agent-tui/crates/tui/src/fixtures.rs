@@ -176,18 +176,21 @@ fn facts(k: usize) -> WorktreeFacts {
             },
         ),
     ];
+    let changed: Vec<Change> = files
+        .iter()
+        .take(k % 7)
+        .map(|(path, lines)| Change {
+            path: (*path).into(),
+            lines: *lines,
+            state: agent_core::ports::FileState::Committed,
+        })
+        .collect();
     WorktreeFacts {
         ahead: k % 3,
         behind: k % 2,
-        changed: files
-            .iter()
-            .take(k % 7)
-            .map(|(path, lines)| Change {
-                path: (*path).into(),
-                lines: *lines,
-                state: agent_core::ports::FileState::Committed,
-            })
-            .collect(),
+        pending: changed.clone(),
+        changed,
+        base: Some("main".into()),
         dirty: k % 4,
     }
 }

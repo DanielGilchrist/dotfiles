@@ -22,6 +22,40 @@ impl ChangesView {
     }
 }
 
+/// Which files [3] lists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ChangesScope {
+    /// Only what isn't committed, counted against the last commit.
+    #[default]
+    Uncommitted,
+    /// Everything since the fork from the default branch.
+    Since,
+}
+
+impl ChangesScope {
+    pub fn toggled(self) -> Self {
+        match self {
+            Self::Uncommitted => Self::Since,
+            Self::Since => Self::Uncommitted,
+        }
+    }
+
+    pub fn diff_base(self) -> agent_core::ports::DiffBase {
+        match self {
+            Self::Uncommitted => agent_core::ports::DiffBase::Head,
+            Self::Since => agent_core::ports::DiffBase::Fork,
+        }
+    }
+
+    /// The files of `facts` in this scope.
+    pub fn of(self, facts: &agent_core::ports::WorktreeFacts) -> &[Change] {
+        match self {
+            Self::Uncommitted => &facts.pending,
+            Self::Since => &facts.changed,
+        }
+    }
+}
+
 /// Lines changed under a row: the counted files' sums, and how many files
 /// are new or binary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

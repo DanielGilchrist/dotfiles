@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use agent_core::activity::AgentId;
 use agent_core::model::RepoKey;
 use agent_core::names::SessionName;
-use agent_core::ports::{BranchLog, FileDiff, Lines};
+use agent_core::ports::{BranchLog, DiffBase, FileDiff, Lines};
 use ratatui::text::Line;
 
 /// The cursor must rest on a file this long before its diff is asked for, so
@@ -31,6 +31,9 @@ pub struct DiffKey {
     pub name: SessionName,
     pub path: PathBuf,
     pub lines: Lines,
+    /// What the diff is read against, so the same file in the other view
+    /// of [3] is another document.
+    pub base: DiffBase,
     /// Counts the agent's git facts read, so a file edited without its
     /// counts changing is a different document.
     pub generation: u64,
@@ -412,6 +415,7 @@ mod tests {
             name: "fix".parse().expect("parses"),
             path: path.into(),
             lines: Lines::Counted { added, removed: 0 },
+            base: DiffBase::Fork,
             generation: 0,
         }
     }

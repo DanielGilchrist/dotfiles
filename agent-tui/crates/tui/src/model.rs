@@ -18,7 +18,7 @@ use ratatui::layout::Rect;
 
 use crate::document::{BranchKey, DiffKey, Documents, FolderKey, Hover, Key};
 use crate::palette::Palette;
-use crate::tree::{self, ChangesView, Node, TreeRow};
+use crate::tree::{self, ChangesScope, ChangesView, Node, TreeRow};
 
 pub const PREVIEW_DEBOUNCE: Duration = Duration::from_millis(150);
 pub const INFO_TTL: Duration = Duration::from_secs(4);
@@ -175,6 +175,7 @@ impl View {
 struct CachedTree {
     generation: u64,
     view: ChangesView,
+    scope: ChangesScope,
     collapsed: HashSet<PathBuf>,
     rows: std::sync::Arc<Vec<TreeRow>>,
 }
@@ -1057,6 +1058,7 @@ pub struct Model {
     pub facts_generation: HashMap<SessionName, u64>,
     /// How [3] lists the changed files, for the whole session.
     pub changes_view: ChangesView,
+    pub changes_scope: ChangesScope,
     /// The folders each agent's [3] has closed. A folder that isn't named
     /// is open, so one that appears starts open.
     pub collapsed: HashMap<SessionName, HashSet<PathBuf>>,
@@ -1143,6 +1145,7 @@ impl Model {
             facts: HashMap::new(),
             facts_generation: HashMap::new(),
             changes_view: ChangesView::default(),
+            changes_scope: ChangesScope::default(),
             collapsed: HashMap::new(),
             tree_cache: std::cell::RefCell::new(HashMap::new()),
             inspections: HashMap::new(),
@@ -1204,10 +1207,10 @@ impl Model {
         self.selected().and_then(|(_, e)| e)
     }
 
-    /// The selected agent's changed files, as last read.
+    /// The selected agent's files in the scope [3] shows, as last read.
     pub fn changes(&self) -> &[Change] {
         match self.selected_entry().and_then(|e| self.facts.get(e.name())) {
-            Some(Ok(facts)) => &facts.changed,
+            Some(Ok(facts)) => self.changes_scope.of(facts),
             Some(Err(_)) | None => &[],
         }
     }
@@ -1299,7 +1302,10 @@ impl Model {
         let generation = self.facts_generation.get(&name).copied().unwrap_or(0);
         let mut cache = self.tree_cache.borrow_mut();
         if let Some(hit) = cache.get(&name).filter(|c| {
-            c.generation == generation && c.view == self.changes_view && c.collapsed == *collapsed
+            c.generation == generation
+                && c.view == self.changes_view
+                && c.scope == self.changes_scope
+                && c.collapsed == *collapsed
         }) {
             return hit.rows.clone();
         }
@@ -1309,6 +1315,7 @@ impl Model {
             CachedTree {
                 generation,
                 view: self.changes_view,
+                scope: self.changes_scope,
                 collapsed: collapsed.clone(),
                 rows: rows.clone(),
             },
@@ -1325,7 +1332,8 @@ impl Model {
         *self.facts_generation.entry(name.clone()).or_default() += 1;
         self.facts.insert(name.clone(), facts);
         if let Some(Ok(facts)) = self.facts.get(name) {
-            let existing = tree::folders(&facts.changed);
+            let mut existing = tree::folders(&facts.changed);
+            existing.extend(tree::folders(&facts.pending));
             if let Some(closed) = self.collapsed.get_mut(name) {
                 closed.retain(|p| existing.contains(p));
             }
@@ -1440,6 +1448,17 @@ impl Model {
         }
     }
 
+    /// Switches [3] between the uncommitted files and everything since the
+    /// fork. The cursor stays on the same row when the other view has it,
+    /// else on the branch row.
+    pub fn toggle_changes_scope(&mut self) {
+        let was = self.changes_cursor_path();
+        self.changes_scope = self.changes_scope.toggled();
+        if !was.is_some_and(|path| self.point_changes_at(&path)) {
+            self.set_changes_file(0);
+        }
+    }
+
     /// Opens or closes the folder under [3]'s cursor. A chain row closes
     /// at its deepest folder and opens every folder it stands for.
     pub fn toggle_folder(&mut self) {
@@ -1502,6 +1521,7 @@ impl Model {
                 name,
                 path: change.path.clone(),
                 lines: change.lines,
+                base: self.changes_scope.diff_base(),
                 generation,
             }),
             (_, None, Some(Ok(facts))) => Hover::Branch(BranchKey {

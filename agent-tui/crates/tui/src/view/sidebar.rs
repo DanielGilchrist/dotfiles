@@ -10,10 +10,10 @@ use std::time::SystemTime;
 use agent_core::activity::Subagent;
 use agent_core::model::{Entry, Head, Repo, RepoKey, Snapshot};
 use agent_core::names::SessionName;
-use agent_core::ports::{DiffStat, Edit, FileState, Readiness, WorktreeFacts};
+use agent_core::ports::{DiffStat, Edit, FileState, WorktreeFacts};
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use unicode_width::UnicodeWidthStr;
@@ -27,7 +27,7 @@ use crate::model::{
     AgentStatus, Cursor, Doing, Extent, Failure, Fold, ListScroll, Model, Panel as Focused, Place,
     Pulse, Row, Target, WorkRoom,
 };
-use crate::tree::{Counts, Node, TreeRow};
+use crate::tree::{ChangesScope, Counts, Node, TreeRow};
 
 /// Rows [2] keeps inside its border however long the list is.
 const DETAIL_MIN: usize = 4;
@@ -651,33 +651,32 @@ fn tree(
         .collect()
 }
 
-fn readiness(readiness: Readiness) -> Line<'static> {
-    let ahead = |n: usize| {
-        [
-            Span::styled(" · ", dim()),
+/// The branch row: `↑24 unpushed · 4 uncommitted`, each part left out when
+/// it's zero, then `behind n` when the default branch moved on.
+fn branch_summary(facts: &WorktreeFacts) -> Line<'static> {
+    let mut parts: Vec<Vec<Span<'static>>> = Vec::new();
+    if facts.ahead > 0 {
+        parts.push(vec![
             Span::styled("↑", dim()),
-            Span::raw(n.to_string()),
-        ]
-    };
-    let spans: Vec<Span<'static>> = match readiness {
-        Readiness::Dirty { dirty, ahead: 0 } => vec![Span::raw(format!("{dirty} uncommitted"))],
-        Readiness::Dirty { dirty, ahead: n } => {
-            std::iter::once(Span::raw(format!("{dirty} uncommitted")))
-                .chain(ahead(n))
-                .collect()
+            Span::raw(format!("{} unpushed", facts.ahead)),
+        ]);
+    }
+    if facts.dirty > 0 {
+        parts.push(vec![Span::raw(format!("{} uncommitted", facts.dirty))]);
+    }
+    if facts.behind > 0 {
+        parts.push(vec![Span::raw(format!("behind {}", facts.behind))]);
+    }
+    if parts.is_empty() {
+        return Line::raw("nothing to commit or push");
+    }
+    let mut spans = Vec::new();
+    for (i, part) in parts.into_iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(" · ", dim()));
         }
-        Readiness::Behind { behind, ahead: n } => {
-            std::iter::once(Span::raw(format!("behind {behind}")))
-                .chain(ahead(n.get()))
-                .collect()
-        }
-        Readiness::Ready { ahead: n } => vec![
-            Span::raw("ready "),
-            Span::styled("↑", dim()),
-            Span::raw(n.to_string()),
-        ],
-        Readiness::NothingAhead => vec![Span::raw("nothing ahead")],
-    };
+        spans.extend(part);
+    }
     Line::from(spans)
 }
 
@@ -739,7 +738,7 @@ fn edit_letter(edit: Edit) -> &'static str {
 
 /// Lazygit's `XY` code before a file's name: the staged letter in the
 /// success colour, the unstaged one in the error colour, `??` for a file
-/// git isn't tracking, and a DIM `·` for one already committed. A folder
+/// git isn't tracking, and nothing for one already committed. A folder
 /// shows a `●` in each column that has something pending under it.
 fn marker(row: &TreeRow) -> Vec<Span<'static>> {
     let cell = |text: Option<&'static str>, colour| match text {
@@ -753,7 +752,7 @@ fn marker(row: &TreeRow) -> Vec<Span<'static>> {
             cell((row.counts.unstaged > 0).then_some("●"), palette_err),
         ],
         Node::File(_) => match row.state {
-            FileState::Committed => vec![Span::styled("·", dim()), Span::raw(" ")],
+            FileState::Committed => vec![Span::raw("  ")],
             FileState::Untracked => vec![Span::styled("??", Style::new().fg(palette_err))],
             state => vec![
                 cell(state.staged().map(edit_letter), palette_ok),
@@ -882,6 +881,9 @@ fn window(total: usize, rows: usize, cursor: Option<usize>) -> (usize, usize) {
 struct Changes {
     diff: DiffStat,
     shared: usize,
+    scope: ChangesScope,
+    /// What the second tab is called.
+    since: String,
 }
 
 /// The list's lines with the row each belongs to, the selected card's
@@ -1132,7 +1134,7 @@ impl Work<'_> {
 fn work_of<'m>(m: &'m Model, entry: &Entry) -> Option<Work<'m>> {
     match m.facts.get(entry.name()) {
         Some(Ok(facts)) => {
-            let head = m.branch_row().then(|| readiness(facts.readiness()));
+            let head = m.branch_row().then(|| branch_summary(facts));
             let list = m.change_list();
             (!list.is_empty() || head.is_some()).then_some(Work::Facts { facts, head, list })
         }
@@ -1235,7 +1237,10 @@ fn lower_panels(deck: &Deck<'_>, repo: &Repo, entry: &Entry, area: Rect) -> Lowe
             Work::Facts { facts, head, list } => {
                 let shared = deck.overlaps(repo, entry);
                 let lines = changes(&list, &shared, head, deck.content, inside, cursor);
-                (Panel { area, lines }, summary(facts, &shared))
+                (
+                    Panel { area, lines },
+                    summary(facts, &shared, m.changes_scope),
+                )
             }
             Work::Unreadable(text) => (
                 Panel {
@@ -1245,6 +1250,8 @@ fn lower_panels(deck: &Deck<'_>, repo: &Repo, entry: &Entry, area: Rect) -> Lowe
                 Changes {
                     diff: DiffStat::default(),
                     shared: 0,
+                    scope: m.changes_scope,
+                    since: since_label(None),
                 },
             ),
         }
@@ -1264,11 +1271,56 @@ fn lower_panels(deck: &Deck<'_>, repo: &Repo, entry: &Entry, area: Rect) -> Lowe
 }
 
 /// What [3]'s title says about `facts`.
-fn summary(facts: &WorktreeFacts, shared: &HashMap<PathBuf, Vec<&Entry>>) -> Changes {
+fn summary(
+    facts: &WorktreeFacts,
+    shared: &HashMap<PathBuf, Vec<&Entry>>,
+    scope: ChangesScope,
+) -> Changes {
     Changes {
-        diff: facts.diff(),
+        diff: match scope {
+            ChangesScope::Uncommitted => facts.pending_diff(),
+            ChangesScope::Since => facts.diff(),
+        },
         shared: shared.len(),
+        scope,
+        since: since_label(facts.base.as_deref()),
     }
+}
+
+/// The second tab of [3]: `Since main`.
+fn since_label(base: Option<&str>) -> String {
+    format!("Since {}", base.unwrap_or("fork"))
+}
+
+/// `[3]` then its tabs as [1]'s title has them: the active one BOLD, a DIM
+/// `·` between. They all show while they fit `width`, else only the active
+/// one, so moving the cursor never changes the form.
+fn changes_tabs(scope: ChangesScope, since: &str, width: usize) -> Vec<Span<'static>> {
+    let tabs = [
+        (ChangesScope::Uncommitted, "Uncommitted".to_string()),
+        (ChangesScope::Since, since.to_string()),
+    ];
+    let all = 4 + tabs.iter().map(|(_, n)| n.width()).sum::<usize>() + 3 * (tabs.len() - 1);
+    if width < all {
+        let active = tabs
+            .into_iter()
+            .find(|(s, _)| *s == scope)
+            .map_or_else(String::new, |(_, n)| n);
+        return vec![Span::raw("[3] "), Span::styled(active, bold())];
+    }
+    let mut title = vec![Span::raw("[3] ")];
+    for (i, (tab, name)) in tabs.into_iter().enumerate() {
+        if i > 0 {
+            title.push(Span::styled(" · ", dim()));
+        }
+        let style = if tab == scope {
+            bold()
+        } else {
+            Style::new().fg(Color::Reset)
+        };
+        title.push(Span::styled(name, style));
+    }
+    title
 }
 
 /// A panel holding `lines`, each a column off the left border.
@@ -1446,7 +1498,11 @@ pub(super) fn draw(frame: &mut Frame<'_>, m: &mut Model, area: Rect, border: Sty
     }
     if let Some((Panel { area, lines }, changes)) = laid.changes {
         let (added, removed) = counts_text(changes.diff.added, changes.diff.removed);
-        let mut title = vec![Span::raw("[3] "), Span::styled("Changes", bold())];
+        let mut title = changes_tabs(
+            changes.scope,
+            &changes.since,
+            usize::from(area.width).saturating_sub(4),
+        );
         for (count, colour) in [(added, palette().success), (removed, palette().error)] {
             if !count.is_empty() {
                 title.push(Span::raw(" "));
@@ -1644,31 +1700,80 @@ mod tests {
     }
 
     #[test]
-    fn readiness_reads_as_counts() {
-        let read = |r| text(&readiness(r));
-        assert_eq!(
-            read(Readiness::Dirty {
-                dirty: n(2),
-                ahead: 0
-            }),
-            "2 uncommitted"
-        );
-        assert_eq!(
-            read(Readiness::Dirty {
-                dirty: n(2),
-                ahead: 2
-            }),
-            "2 uncommitted · ↑2"
-        );
-        assert_eq!(
-            read(Readiness::Behind {
-                behind: n(2),
-                ahead: n(3)
-            }),
-            "behind 2 · ↑3"
-        );
-        assert_eq!(read(Readiness::Ready { ahead: n(1) }), "ready ↑1");
-        assert_eq!(read(Readiness::NothingAhead), "nothing ahead");
+    fn the_branch_row_reads_unpushed_and_uncommitted_and_leaves_out_zeros() {
+        let read = |ahead, dirty, behind| {
+            text(&branch_summary(&WorktreeFacts {
+                ahead,
+                dirty,
+                behind,
+                ..WorktreeFacts::default()
+            }))
+        };
+        assert_eq!(read(24, 4, 0), "↑24 unpushed · 4 uncommitted");
+        assert_eq!(read(0, 2, 0), "2 uncommitted");
+        assert_eq!(read(3, 0, 0), "↑3 unpushed");
+        assert_eq!(read(3, 0, 2), "↑3 unpushed · behind 2");
+        assert_eq!(read(0, 0, 0), "nothing to commit or push");
+    }
+
+    #[test]
+    fn changes_title_shows_both_tabs_while_they_fit_and_only_the_active_one_below_that() {
+        use crate::tree::ChangesScope::{Since, Uncommitted};
+        let title = |scope, width| text(&Line::from(changes_tabs(scope, "Since main", width)));
+        assert_eq!(title(Uncommitted, 40), "[3] Uncommitted · Since main");
+        assert_eq!(title(Since, 28), "[3] Uncommitted · Since main");
+        assert_eq!(title(Uncommitted, 27), "[3] Uncommitted");
+        assert_eq!(title(Since, 27), "[3] Since main");
+        let bold_of = |scope| {
+            changes_tabs(scope, "Since main", 40)
+                .into_iter()
+                .filter(|s| s.style.add_modifier.contains(Modifier::BOLD))
+                .map(|s| s.content.to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(bold_of(Uncommitted), ["Uncommitted"]);
+        assert_eq!(bold_of(Since), ["Since main"]);
+    }
+
+    #[test]
+    fn each_tab_totals_its_own_files_and_both_keep_the_branch_row_first() {
+        use agent_core::ports::{Change, Lines};
+        let change = |path: &str, added, removed| Change {
+            path: path.into(),
+            lines: Lines::Counted { added, removed },
+            state: FileState::Committed,
+        };
+        let mut m = fleet(10);
+        m.set_cursor(Cursor::Entry(name("obs-layout-4")));
+        m.changes_view = crate::tree::ChangesView::Flat;
+        let Some(Ok(facts)) = m.facts.get_mut(&name("obs-layout-4")) else {
+            panic!("facts")
+        };
+        facts.ahead = 24;
+        facts.dirty = 4;
+        facts.base = Some("main".into());
+        facts.changed = vec![change("a.rs", 50, 5), change("b.rs", 7, 1)];
+        facts.pending = vec![change("b.rs", 2, 0)];
+        let mut shown = Vec::new();
+        for _ in 0..2 {
+            let laid = laid(&mut m, (200, 50));
+            let (panel, changes) = laid.changes.as_ref().expect("[3] shows");
+            shown.push((
+                texts(&panel.lines)[0].clone(),
+                changes.diff.files,
+                changes.diff.added,
+                changes.diff.removed,
+                panel.lines.len(),
+            ));
+            m.toggle_changes_scope();
+        }
+        assert_eq!(shown[0].0, " ↑24 unpushed · 4 uncommitted");
+        assert_eq!(shown[1].0, shown[0].0, "the branch row leads both tabs");
+        assert_eq!(shown[0].1, 1);
+        assert_eq!((shown[0].2, shown[0].3), (2, 0));
+        assert_eq!(shown[0].4, 2, "the branch row and one file");
+        assert_eq!((shown[1].1, shown[1].2, shown[1].3), (2, 57, 6));
+        assert_eq!(shown[1].4, 3);
     }
 
     #[test]
@@ -1739,7 +1844,7 @@ mod tests {
             [
                 " MM src/payroll/calc.ts     +98 −52",
                 " A  payroll/calc.test.ts    +24    ",
-                " ·  logo.png                bin    ",
+                "    logo.png                bin    ",
                 " ?? notes.md                new    ",
             ]
         );
@@ -1749,7 +1854,7 @@ mod tests {
         assert_eq!(
             texts(&cursor),
             [
-                " ·  logo.png                bin    ",
+                "    logo.png                bin    ",
                 "▌?? notes.md                new    ",
             ],
             "the rows scroll to keep the cursor in view"
@@ -2118,7 +2223,7 @@ mod tests {
         let first = laid(&mut m, (200, 50));
         let (panel, changes) = first.changes.as_ref().expect("[3] shows");
         assert_eq!(changes.diff.files, 0);
-        assert_eq!(texts(&panel.lines), [" nothing ahead"]);
+        assert_eq!(texts(&panel.lines), [" nothing to commit or push"]);
         assert!(
             panel.lines[0].spans[1]
                 .style
@@ -3101,6 +3206,7 @@ mod tests {
             state: agent_core::ports::FileState::Committed,
         })
         .collect();
+        facts.pending = facts.changed.clone();
         m
     }
 

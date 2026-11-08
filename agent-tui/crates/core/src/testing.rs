@@ -11,7 +11,7 @@ use crate::model::{Head, Running, Worktree};
 use crate::names::{BranchName, Prompt, PullRequest, SessionName};
 use crate::paths::{AgentWorktree, RepoRoot};
 use crate::ports::{
-    AgentRecord, BranchLog, BranchState, ClientControl, Fetch, FileDiff, Forge, Harness,
+    AgentRecord, BranchLog, BranchState, ClientControl, DiffBase, Fetch, FileDiff, Forge, Harness,
     HarnessError, HarnessId, Harnesses, HostError, LaunchCtx, Lines, Listing, LocalBranch,
     PaneCommand, PendingPrompt, PullRequestHead, RemoteBranch, RepoWorktrees, Seen, SessionHost,
     SessionInfo, SessionStatus, Store, StoreError, Unlisting, Vcs, WorktreeFacts, WorktreeStart,
@@ -228,7 +228,13 @@ impl Vcs for FakeVcs {
         Ok(BranchLog::default())
     }
 
-    fn file_diff(&self, _: &Path, _: &Path, _: Lines) -> Result<FileDiff, CommandError> {
+    fn file_diff(
+        &self,
+        _: &Path,
+        _: &Path,
+        _: Lines,
+        _: DiffBase,
+    ) -> Result<FileDiff, CommandError> {
         Ok(FileDiff::Text {
             lines: Vec::new(),
             more: 0,

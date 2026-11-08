@@ -361,7 +361,7 @@ fn spawn_document_readers(backend: &Arc<Backend>, msgs: &Sender<Msg>) -> Arc<Doc
                 let result = match &key {
                     Key::Diff(diff) => backend
                         .vcs
-                        .file_diff(&worktree, &diff.path, diff.lines)
+                        .file_diff(&worktree, &diff.path, diff.lines, diff.base)
                         .map(Doc::Diff),
                     Key::Branch(_) => backend.vcs.branch_log(&worktree).map(Doc::Branch),
                 }

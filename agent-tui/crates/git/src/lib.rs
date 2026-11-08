@@ -8,8 +8,8 @@ use agent_core::model::{Head, Worktree};
 use agent_core::names::{BranchName, NameError, PullRequest};
 use agent_core::paths::{AgentWorktree, RepoRoot};
 use agent_core::ports::{
-    BranchLog, BranchState, Change, Edit, Fetch, FileDiff, FileState, Forge, Lines, LocalBranch,
-    PullRequestHead, RemoteBranch, RepoWorktrees, Vcs, WorktreeFacts, WorktreeStart,
+    BranchLog, BranchState, Change, DiffBase, Edit, Fetch, FileDiff, FileState, Forge, Lines,
+    LocalBranch, PullRequestHead, RemoteBranch, RepoWorktrees, Vcs, WorktreeFacts, WorktreeStart,
 };
 use agent_core::process::{self, CommandError};
 
@@ -484,14 +484,15 @@ impl Vcs for Git {
 
     fn facts(&self, worktree: &Path) -> Result<WorktreeFacts, CommandError> {
         let status = Self::status(worktree)?;
-        let untracked = status
+        let untracked: Vec<Change> = status
             .iter()
             .filter(|(code, _)| code == "??")
             .map(|(_, path)| Change {
                 path: path.clone(),
                 lines: Lines::Untracked,
                 state: FileState::Untracked,
-            });
+            })
+            .collect();
         let states: std::collections::HashMap<&Path, FileState> = status
             .iter()
             .map(|(code, path)| (path.as_path(), parse_state(code)))
@@ -505,11 +506,12 @@ impl Vcs for Git {
             changed
         };
         let dirty = status.len();
+        let mut pending = with_state(Self::numstat(worktree, "HEAD")?);
+        pending.extend(untracked.iter().cloned());
         let Some(base) = Self::default_base(worktree)? else {
-            let mut changed = with_state(Self::numstat(worktree, "HEAD")?);
-            changed.extend(untracked);
             return Ok(WorktreeFacts {
-                changed,
+                changed: pending.clone(),
+                pending,
                 dirty,
                 ..WorktreeFacts::default()
             });
@@ -537,6 +539,8 @@ impl Vcs for Git {
             ahead,
             behind,
             changed,
+            pending,
+            base: Some(base.strip_prefix("origin/").unwrap_or(&base).to_string()),
             dirty,
         })
     }
@@ -567,6 +571,7 @@ impl Vcs for Git {
         worktree: &Path,
         path: &Path,
         lines: Lines,
+        base: DiffBase,
     ) -> Result<FileDiff, CommandError> {
         let binary = || FileDiff::Binary {
             bytes: std::fs::metadata(worktree.join(path)).ok().map(|m| m.len()),
@@ -581,15 +586,15 @@ impl Vcs for Git {
                 cmd.args(["--no-index", "--", "/dev/null"]).arg(path);
             }
             Lines::Counted { .. } | Lines::Binary => {
-                let base = match Self::default_base(worktree)? {
-                    Some(base) => {
+                let since = match (base, Self::default_base(worktree)?) {
+                    (DiffBase::Fork, Some(default)) => {
                         let mut merge = git(worktree);
-                        merge.args(["merge-base", "HEAD", &base]);
+                        merge.args(["merge-base", "HEAD", &default]);
                         process::run(&mut merge)?.trim().to_string()
                     }
-                    None => "HEAD".to_string(),
+                    (DiffBase::Fork, None) | (DiffBase::Head, _) => "HEAD".to_string(),
                 };
-                cmd.arg(base).arg("--").arg(path);
+                cmd.arg(since).arg("--").arg(path);
             }
         }
         let (out, cut) = process::output_capped(&mut cmd, DIFF_TIMEOUT, DIFF_BYTES)?;
@@ -793,6 +798,8 @@ mod tests {
         );
         std::fs::write(work.join("a.txt"), "one\ntwo\n").expect("writes");
         git(&work, &["add", "a.txt"]);
+        std::fs::write(work.join("b.txt"), "b\n").expect("writes");
+        git(&work, &["add", "b.txt"]);
         git(&work, &["commit", "-q", "-m", "a"]);
         std::fs::write(work.join("a.txt"), "one\n").expect("writes");
         git(
@@ -802,6 +809,7 @@ mod tests {
         git(&work, &["fetch", "-q"]);
         let facts = Git.facts(&work).expect("succeeds");
         assert_eq!((facts.ahead, facts.behind, facts.dirty), (1, 1, 1));
+        assert_eq!(facts.base.as_deref(), Some("main"));
         std::fs::write(work.join("new.txt"), "x\n").expect("writes");
         let facts = Git.facts(&work).expect("succeeds");
         assert_eq!(
@@ -816,12 +824,39 @@ mod tests {
                     state: FileState::Unstaged(Edit::Modified)
                 },
                 Change {
+                    path: "b.txt".into(),
+                    lines: Lines::Counted {
+                        added: 1,
+                        removed: 0
+                    },
+                    state: FileState::Committed
+                },
+                Change {
                     path: "new.txt".into(),
                     lines: Lines::Untracked,
                     state: FileState::Untracked
                 },
             ],
             "uncommitted and untracked work counts too"
+        );
+        assert_eq!(
+            facts.pending,
+            [
+                Change {
+                    path: "a.txt".into(),
+                    lines: Lines::Counted {
+                        added: 0,
+                        removed: 1
+                    },
+                    state: FileState::Unstaged(Edit::Modified)
+                },
+                Change {
+                    path: "new.txt".into(),
+                    lines: Lines::Untracked,
+                    state: FileState::Untracked
+                },
+            ],
+            "uncommitted files count against the last commit, committed ones are left out"
         );
     }
 
@@ -922,7 +957,7 @@ mod tests {
             removed: 0,
         };
         let FileDiff::Text { lines, more } = Git
-            .file_diff(&work, Path::new("a.txt"), counted)
+            .file_diff(&work, Path::new("a.txt"), counted, DiffBase::Fork)
             .expect("succeeds")
         else {
             panic!("a text diff");
@@ -934,7 +969,23 @@ mod tests {
             "committed and uncommitted together"
         );
         let FileDiff::Text { lines, .. } = Git
-            .file_diff(&work, Path::new("new.txt"), Lines::Untracked)
+            .file_diff(&work, Path::new("a.txt"), counted, DiffBase::Head)
+            .expect("succeeds")
+        else {
+            panic!("a text diff");
+        };
+        assert_eq!(
+            lines[1..],
+            [" one", " two", "+three"],
+            "only what's uncommitted"
+        );
+        let FileDiff::Text { lines, .. } = Git
+            .file_diff(
+                &work,
+                Path::new("new.txt"),
+                Lines::Untracked,
+                DiffBase::Fork,
+            )
             .expect("succeeds")
         else {
             panic!("a text diff");
@@ -946,7 +997,7 @@ mod tests {
         let files: Vec<&Path> = log.uncommitted.iter().map(|(_, p)| p.as_path()).collect();
         assert_eq!(files, [Path::new("a.txt"), Path::new("new.txt")]);
         assert_eq!(
-            Git.file_diff(&work, Path::new("new.txt"), Lines::Binary)
+            Git.file_diff(&work, Path::new("new.txt"), Lines::Binary, DiffBase::Fork)
                 .expect("succeeds"),
             FileDiff::Binary { bytes: Some(4) }
         );
