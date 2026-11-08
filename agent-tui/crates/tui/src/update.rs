@@ -20,10 +20,10 @@ use crate::document::Key;
 use crate::model::{
     Answer, Chord, Confirm, Cursor, Direction, Edge, Enter, Field, Focus, Follow, FormKind,
     INFO_TTL, Inspection, Intent, Mode, Model, NamingState, NewAgent, Overlay, Pane, Panel, Phase,
-    Query, Reach, Screen, StatusKind, SubagentRead, Submission, TerminalFocus, Ticket, View,
-    WorkRoom, fuzzy_match, match_rank, repo_matches, unlisted,
+    Query, Reach, Screen, StatusKind, SubagentRead, Submission, TerminalFocus, Ticket, Unreachable,
+    View, WorkRoom, fuzzy_match, match_rank, repo_matches, unlisted,
 };
-use crate::worker::{Job, Msg, Outcome};
+use crate::worker::{Job, Msg, Outcome, SendError};
 
 /// How long the pane shows a finished agent, terminal focused, before it
 /// counts as seen.
@@ -208,6 +208,7 @@ fn step(m: &mut Model, msg: Msg) -> Vec<Effect> {
             }
             Vec::new()
         }
+        Msg::Sent { to, result } => on_sent(m, &to, result),
         Msg::Activities(activities) => on_activities(m, activities),
         Msg::Catalogue { repos, warnings } => {
             m.catalogue = repos;
@@ -294,6 +295,7 @@ pub fn tick(m: &mut Model) -> Vec<Effect> {
     m.now = SystemTime::now();
     let mut effects: Vec<Effect> = ask_for_name(m).into_iter().collect();
     effects.extend(bell(m));
+    effects.extend(flush(m));
     effects.extend(acknowledge(m, SEEN_AFTER).map(Effect::Job));
     effects.extend(preview(m));
     effects.extend(inspect(m));
@@ -410,7 +412,6 @@ fn report(m: &mut Model, outcome: Outcome) {
                 });
             }
         }
-        Outcome::Replied(name) => m.info(format!("sent to {name}")),
         Outcome::Unpinned(name) => m.info(format!("unpinned {name}")),
         Outcome::Started(label) => m.info(format!("started {label}")),
         Outcome::Finished(label) => m.info(format!("{label} finished")),
@@ -427,7 +428,7 @@ fn on_activities(m: &mut Model, activities: HashMap<SessionName, Activity>) -> V
     m.activities = Some(activities);
     forget_subagents(m);
     m.revalidate();
-    Vec::new()
+    flush(m)
 }
 
 /// Drops what's known about subagents their agents no longer list.
@@ -512,6 +513,10 @@ fn forget_gone(m: &mut Model) {
     m.subagent_reads.retain(|(name, _), _| known.contains(name));
     m.subagent_logs.retain(|(name, _), _| known.contains(name));
     m.facts.retain(|name, _| known.contains(name));
+    m.outboxes.retain(|name, _| known.contains(name));
+    if m.peek.as_ref().is_some_and(|name| !known.contains(name)) {
+        m.peek = None;
+    }
     m.docs.forget(|name| known.contains(name));
 }
 
@@ -599,6 +604,7 @@ pub fn enter_agent(m: &mut Model) -> Vec<Effect> {
     };
     c.mode = Mode::Agent;
     let name = c.name.clone();
+    m.peek = None;
     m.touch_mru(&name);
     m.preview_at = None;
     let mut effects = vec![Effect::Job(Job::TakeOver { name, own })];
@@ -615,6 +621,7 @@ fn activate(m: &mut Model, name: &SessionName) -> Vec<Effect> {
         return Vec::new();
     };
     m.overlay = Overlay::None;
+    m.peek = None;
     if !matches!(m.cursor(), Some(Cursor::Grouped(_, n)) if n == name) {
         m.set_cursor(Cursor::Entry(name.clone()));
     }
@@ -681,7 +688,42 @@ fn on_key(m: &mut Model, key: KeyEvent) -> Vec<Effect> {
         }
         return Vec::new();
     }
+    if m.peek.is_some() {
+        return on_peek_key(m, key.code);
+    }
     on_nav_key(m, key)
+}
+
+/// The peek float reads the terminal and passes nothing to it.
+fn on_peek_key(m: &mut Model, code: KeyCode) -> Vec<Effect> {
+    let Some(name) = m.peek.clone() else {
+        return Vec::new();
+    };
+    match code {
+        KeyCode::Esc | KeyCode::Char('v') => m.peek = None,
+        KeyCode::Char('t') => open_talk(m, &name),
+        KeyCode::Char('i') | KeyCode::Enter => return activate(m, &name),
+        _ => {}
+    }
+    Vec::new()
+}
+
+/// `e` on a subagent row: its whole transcript, in the agent's checkout.
+fn edit_transcript(m: &mut Model) -> Option<Vec<Effect>> {
+    let key = m.subagent_selected()?;
+    let root = m.selected_entry()?.path()?.to_path_buf();
+    match m.subagent_logs.get(&key) {
+        Some(Ok(Some(detail))) if !detail.transcript.as_os_str().is_empty() => {
+            Some(vec![Effect::Edit(Open::File {
+                root,
+                file: detail.transcript.clone(),
+            })])
+        }
+        _ => {
+            m.info("no transcript for this subagent yet");
+            Some(Vec::new())
+        }
+    }
 }
 
 /// Control characters other than newlines and tabs could end a bracketed
@@ -695,23 +737,6 @@ fn sanitize_paste(text: &str) -> String {
 /// Keys that choose the panel `j`/`k` act on, and those a panel gives its
 /// own meaning. `None` leaves the key to NAV.
 fn on_panel_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
-    if m.panel.listed() != Panel::Agents && matches!(code, KeyCode::Char('t')) {
-        m.panel = m.panel.toggled_preview();
-        return Some(Vec::new());
-    }
-    if let Panel::Preview { .. } = m.panel {
-        match code {
-            KeyCode::Esc => {
-                m.panel = m.panel.toggled_preview();
-                return Some(Vec::new());
-            }
-            KeyCode::Enter | KeyCode::Char('l' | '0') => {
-                let name = m.selected_entry().map(|e| e.name().clone());
-                return Some(name.map_or_else(Vec::new, |name| activate(m, &name)));
-            }
-            _ => {}
-        }
-    }
     if m.main_focused() {
         match code {
             KeyCode::Esc | KeyCode::Char('1' | '2' | '3') => m.panel = m.panel.listed(),
@@ -775,6 +800,7 @@ fn on_panel_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
         (KeyCode::Char('e'), Panel::Changes { .. }) => m
             .file_under_cursor()
             .map(|(root, file)| vec![Effect::Edit(Open::File { root, file })]),
+        (KeyCode::Char('e'), Panel::Agent { .. }) => edit_transcript(m),
         _ => None,
     }
 }
@@ -856,19 +882,13 @@ fn on_nav_key(m: &mut Model, key: KeyEvent) -> Vec<Effect> {
             _ => {}
         },
         KeyCode::Char('d') if ctrl(&key, 'd') => match m.panel {
-            Panel::Changes { .. }
-            | Panel::Agent { .. }
-            | Panel::Main(_)
-            | Panel::Preview { .. } => {
+            Panel::Changes { .. } | Panel::Agent { .. } | Panel::Main(_) => {
                 m.docs.scroll_by(m.docs.half_page());
             }
             Panel::Agents => m.page_in_panel(m.half_page()),
         },
         KeyCode::Char('u') if ctrl(&key, 'u') => match m.panel {
-            Panel::Changes { .. }
-            | Panel::Agent { .. }
-            | Panel::Main(_)
-            | Panel::Preview { .. } => {
+            Panel::Changes { .. } | Panel::Agent { .. } | Panel::Main(_) => {
                 m.docs.scroll_by(-m.docs.half_page());
             }
             Panel::Agents => m.page_in_panel(-m.half_page()),
@@ -907,22 +927,12 @@ fn on_nav_key(m: &mut Model, key: KeyEvent) -> Vec<Effect> {
         }
         KeyCode::Char('n') => open_form(m, FormKind::New),
         KeyCode::Char('c') => open_form(m, FormKind::Checkout),
-        KeyCode::Char('r') => {
+        KeyCode::Char('t') => {
             if let Some(entry) = selected {
-                match m.replyable(&entry).cloned() {
-                    Some(to) => {
-                        m.overlay = Overlay::Reply {
-                            to,
-                            text: String::new(),
-                        }
-                    }
-                    None => m.info(format!(
-                        "{} can't take a reply from here · ⏎ attaches",
-                        entry.name()
-                    )),
-                }
+                open_talk(m, entry.name());
             }
         }
+        KeyCode::Char('v') => open_peek(m),
         KeyCode::Char('e') => {
             let path = m.selected().and_then(|(repo, e)| {
                 e.and_then(|e| e.path())
@@ -1057,26 +1067,143 @@ fn request_removal(m: &mut Model) -> Vec<Effect> {
     Vec::new()
 }
 
-/// Sends a reply, unless the agent started asking since: the text would
-/// then land in its prompt, so the reply stays open with an error.
-fn reply(m: &mut Model, to: SessionName, text: String) -> Vec<Effect> {
+/// Opens the message box for `name`, or says why it can't be messaged.
+fn open_talk(m: &mut Model, name: &SessionName) {
+    let Some(entry) = m.snapshot().and_then(|s| s.entry(name)).map(|(_, e)| e) else {
+        return;
+    };
+    match m.talkable(entry) {
+        Ok(to) => {
+            m.overlay = Overlay::Talk {
+                to: to.clone(),
+                text: String::new(),
+            }
+        }
+        Err(Unreachable::NotRunning) => m.info(format!("{name} isn't running · ⏎ starts it")),
+        Err(Unreachable::Own) => m.info(format!("{name} is where this TUI runs")),
+        Err(Unreachable::Unreported) => m.info(format!(
+            "{name} reports no activity, so its turn's end can't be known · ⏎ attaches"
+        )),
+    }
+}
+
+/// Opens the peek float on the selected live agent.
+fn open_peek(m: &mut Model) {
+    let Some(entry) = m.selected_entry() else {
+        m.info("select an agent to peek at");
+        return;
+    };
+    let name = entry.name().clone();
+    match m.reach(entry) {
+        Reach::Other {
+            enter: Enter::Attach,
+            ..
+        } => {
+            if m.pane.session() != Some(&name) {
+                m.schedule_preview();
+            }
+            m.peek = Some(name);
+        }
+        Reach::Own => m.info(format!("{name} is where this TUI runs")),
+        Reach::Other { .. } => m.info(format!("{name} isn't running · ⏎ starts it")),
+    }
+}
+
+/// Queues a message for its agent and sends the first one that can go.
+fn talk(m: &mut Model, to: SessionName, text: String) -> Vec<Effect> {
     let Ok(prompt) = text.parse::<Prompt>() else {
-        m.overlay = Overlay::Reply { to, text };
+        m.overlay = Overlay::Talk { to, text };
         return Vec::new();
     };
-    let open = m
-        .snapshot()
-        .and_then(|s| s.entry(&to))
-        .and_then(|(_, entry)| m.replyable(entry))
-        .is_some();
-    if !open {
-        m.error(format!(
-            "{to} isn't waiting for a prompt now, so the reply wasn't sent"
-        ));
-        m.overlay = Overlay::Reply { to, text };
-        return Vec::new();
+    m.outboxes
+        .entry(to.clone())
+        .or_default()
+        .queue
+        .push_back(prompt);
+    let effects = flush(m);
+    if m.outboxes.get(&to).is_some_and(|o| !o.in_flight) {
+        m.info(format!("queued for {to} · sent when it's at rest"));
     }
-    vec![Effect::Job(Job::Reply { to, prompt })]
+    effects
+}
+
+/// Starts typing the first queued message into every agent that is live,
+/// at rest, and has reported since the last one went in. The worker checks
+/// the store again just before typing.
+fn flush(m: &mut Model) -> Vec<Effect> {
+    let ready: Vec<SessionName> = m
+        .outboxes
+        .iter()
+        .filter(|(_, o)| !o.in_flight && !o.queue.is_empty())
+        .filter(|(name, o)| {
+            m.at_rest(name)
+                && o.sent_at
+                    .is_none_or(|at| m.activity(name).is_some_and(|a| a.events != at))
+                && m.snapshot()
+                    .and_then(|s| s.entry(name))
+                    .is_some_and(|(_, e)| m.talkable(e).is_ok())
+        })
+        .map(|(name, _)| name.clone())
+        .collect();
+    let mut effects = Vec::new();
+    for name in ready {
+        if let Some(outbox) = m.outboxes.get_mut(&name)
+            && let Some(prompt) = outbox.queue.front().cloned()
+        {
+            outbox.in_flight = true;
+            effects.push(Effect::Job(Job::Reply { to: name, prompt }));
+        }
+    }
+    effects
+}
+
+/// A typed message was delivered, or wasn't: the first of the queue is
+/// done if it was, kept for the next rest if the agent got busy, and
+/// dropped with the reason otherwise.
+fn on_sent(m: &mut Model, to: &SessionName, result: Result<(), SendError>) -> Vec<Effect> {
+    let events = m.activity(to).map(|a| a.events);
+    let Some(outbox) = m.outboxes.get_mut(to) else {
+        return Vec::new();
+    };
+    outbox.in_flight = false;
+    match result {
+        Ok(()) => {
+            outbox.queue.pop_front();
+            outbox.sent_at = events;
+            let left = outbox.queue.len();
+            if left == 0 {
+                m.outboxes.remove(to);
+                m.info(format!("sent to {to}"));
+            } else {
+                m.info(format!("sent to {to} · {left} queued"));
+            }
+        }
+        Err(SendError::Busy) => {}
+        Err(SendError::Failed(e)) => {
+            let dropped = outbox.queue.pop_front();
+            if outbox.queue.is_empty() {
+                m.outboxes.remove(to);
+            }
+            let words = dropped.map(|p| first_words(p.as_ref())).unwrap_or_default();
+            m.error(format!("couldn't send to {to}: {e} · dropped \"{words}\""));
+        }
+    }
+    flush(m)
+}
+
+/// Drops what's queued for `to`, unless its first message is already being
+/// typed.
+fn clear_queue(m: &mut Model, to: &SessionName) {
+    if m.outboxes.get(to).is_some_and(|o| o.in_flight) {
+        m.info(format!("the first message to {to} is being typed"));
+    } else if let Some(cleared) = m.outboxes.remove(to) {
+        m.info(format!("cleared {} queued for {to}", cleared.queue.len()));
+    }
+}
+
+/// The start of a message, for a line with little room.
+pub fn first_words(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Shared query editing for the switcher and picker. Other keys are ignored.
@@ -1207,9 +1334,14 @@ fn on_overlay_key(m: &mut Model, key: KeyEvent) -> Vec<Effect> {
             m.overlay = Overlay::New(form);
             on_new_key(m, &key)
         }
-        Overlay::Reply { to, mut text } => match key.code {
+        Overlay::Talk { to, mut text } => match key.code {
             KeyCode::Esc => Vec::new(),
-            KeyCode::Enter => reply(m, to, text),
+            KeyCode::Enter => talk(m, to, text),
+            _ if ctrl(&key, 'x') => {
+                clear_queue(m, &to);
+                m.overlay = Overlay::Talk { to, text };
+                Vec::new()
+            }
             _ => {
                 match key.code {
                     KeyCode::Backspace => {
@@ -1221,7 +1353,7 @@ fn on_overlay_key(m: &mut Model, key: KeyEvent) -> Vec<Effect> {
                     }
                     _ => {}
                 }
-                m.overlay = Overlay::Reply { to, text };
+                m.overlay = Overlay::Talk { to, text };
                 Vec::new()
             }
         },
@@ -1561,6 +1693,9 @@ fn on_mouse(m: &mut Model, mouse: MouseEvent) -> Vec<Effect> {
     if let Focus::Overlay(_) = m.focus() {
         return Vec::new();
     }
+    if m.peeking() {
+        return Vec::new();
+    }
     if let Some(cell) = CellPos::within(m.areas.terminal, at) {
         let scrolling = matches!(
             mouse.kind,
@@ -1574,9 +1709,6 @@ fn on_mouse(m: &mut Model, mouse: MouseEvent) -> Vec<Effect> {
             let up = matches!(mouse.kind, MouseEventKind::ScrollUp);
             m.docs.scroll_by(if up { -SCROLL } else { SCROLL });
             return Vec::new();
-        }
-        if m.previewing() {
-            return if clicked { enter_agent(m) } else { Vec::new() };
         }
         let forward = match m.focus() {
             Focus::Agent(c) => Some(c),
@@ -2177,10 +2309,7 @@ mod tests {
         m.panel = Panel::Main(crate::model::Origin::Turn { offset: 0 });
         update(&mut m, key(KeyCode::Tab));
         assert_eq!(m.panel, Panel::Changes { file: 0 });
-        m.panel = Panel::Preview {
-            from: crate::model::Origin::Changes { file: 0 },
-            in_main: false,
-        };
+        m.panel = Panel::Main(crate::model::Origin::Changes { file: 0 });
         update(&mut m, key(KeyCode::Tab));
         assert_eq!(m.panel, Panel::Agents);
     }
@@ -3074,58 +3203,6 @@ mod tests {
     }
 
     #[test]
-    fn a_reply_goes_to_the_selected_agent_while_it_shows_no_prompt() {
-        use agent_core::activity::State;
-        let mut m = two_live();
-        m.set_cursor(Cursor::Entry(name("fix")));
-        m.activities = Some(HashMap::from([(
-            name("fix"),
-            reported(State::Done { summary: None }, 5),
-        )]));
-        update(&mut m, key(KeyCode::Char('r')));
-        type_text(&mut m, "rebase");
-        let effects = update(&mut m, key(KeyCode::Enter));
-        assert!(
-            matches!(effects.as_slice(), [Effect::Job(Job::Reply { to, prompt })]
-                if to.as_str() == "fix" && prompt.as_str() == "rebase"),
-            "{}",
-            effects.len()
-        );
-        assert!(matches!(m.overlay, Overlay::None));
-    }
-
-    #[test]
-    fn no_reply_is_typed_into_a_prompt() {
-        use agent_core::activity::State;
-        let mut m = two_live();
-        m.set_cursor(Cursor::Entry(name("fix")));
-        m.activities = Some(HashMap::from([(name("fix"), asking("rm?", 5))]));
-        update(&mut m, key(KeyCode::Char('r')));
-        assert!(
-            matches!(m.overlay, Overlay::None),
-            "asking agents get no reply box"
-        );
-        m.activities = Some(HashMap::from([(
-            name("fix"),
-            reported(State::Working { tools: Vec::new() }, 5),
-        )]));
-        update(&mut m, key(KeyCode::Char('r')));
-        assert!(
-            matches!(m.overlay, Overlay::None),
-            "a working agent can open a prompt before it's reported"
-        );
-        m.activities = Some(HashMap::from([(name("fix"), reported(State::Idle, 5))]));
-        update(&mut m, key(KeyCode::Char('r')));
-        type_text(&mut m, "go");
-        m.activities = Some(HashMap::from([(name("fix"), asking("rm?", 0))]));
-        assert!(update(&mut m, key(KeyCode::Enter)).is_empty());
-        assert!(
-            matches!(&m.overlay, Overlay::Reply { text, .. } if text == "go"),
-            "the text is kept for when it's answered"
-        );
-    }
-
-    #[test]
     fn the_selection_follows_an_agent_into_and_out_of_needs_you() {
         use agent_core::activity::State;
         let mut m = two_live();
@@ -3961,81 +4038,313 @@ mod tests {
         assert_eq!(m.screen, Screen::Split);
     }
 
-    #[test]
-    fn t_previews_the_terminal_read_only_and_returns_to_the_same_document_and_place() {
-        let mut m = on_changes("obs-layout-4");
-        update(&mut m, key(KeyCode::Char('j')));
-        update(&mut m, key(KeyCode::Enter));
-        update(&mut m, key(KeyCode::Char('j')));
-        update(&mut m, key(KeyCode::Char('j')));
-        assert_eq!(m.docs.scroll, 2);
+    fn set_state(m: &mut Model, agent: &str, state: agent_core::activity::State, events: u64) {
+        let mut activity = reported(state, 5);
+        activity.events = events;
+        m.activities
+            .get_or_insert_default()
+            .insert(name(agent), activity);
+    }
 
-        update(&mut m, key(KeyCode::Char('t')));
-        assert!(m.previewing());
-        assert!(m.terminal_visible(), "it's being looked at");
-        assert!(matches!(m.focus(), Focus::Nav(_)), "keys stay in the TUI");
-        assert!(!m.main_focused());
-        assert_eq!(m.panel.listed(), Panel::Changes { file: 1 });
+    fn working() -> agent_core::activity::State {
+        agent_core::activity::State::Working { tools: Vec::new() }
+    }
 
-        update(&mut m, key(KeyCode::Char('t')));
-        assert!(m.main_focused(), "back in the document");
-        assert_eq!(m.docs.scroll, 2, "at the same place");
+    fn done() -> agent_core::activity::State {
+        agent_core::activity::State::Done { summary: None }
+    }
 
-        update(&mut m, key(KeyCode::Esc));
-        update(&mut m, key(KeyCode::Char('t')));
-        assert!(m.previewing());
-        update(&mut m, key(KeyCode::Esc));
-        assert_eq!(
-            m.panel,
-            Panel::Changes { file: 1 },
-            "Esc returns from a preview first"
-        );
-        update(&mut m, key(KeyCode::Esc));
-        assert_eq!(m.panel, Panel::Agents, "and the next goes up a level");
+    fn replies(effects: &[Effect]) -> Vec<String> {
+        effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::Job(Job::Reply { prompt, .. }) => Some(prompt.as_str().to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn talk_to(m: &mut Model, agent: &str, text: &str) -> Vec<Effect> {
+        m.set_cursor(Cursor::Entry(name(agent)));
+        update(m, key(KeyCode::Char('t')));
+        assert!(matches!(m.overlay, Overlay::Talk { .. }), "the box opens");
+        type_text(m, text);
+        update(m, key(KeyCode::Enter))
+    }
+
+    fn sent(m: &mut Model, agent: &str) -> Vec<Effect> {
+        update(
+            m,
+            Msg::Sent {
+                to: name(agent),
+                result: Ok(()),
+            },
+        )
     }
 
     #[test]
-    fn a_preview_replies_or_types_and_never_clears_its_origin() {
+    fn t_opens_the_message_box_from_every_panel_whatever_the_agent_is_doing() {
         let mut m = crate::fixtures::fleet(10);
         m.set_cursor(Cursor::Entry(name("auth-refresh-2")));
-        update(&mut m, key(KeyCode::Char('2')));
-        update(&mut m, key(KeyCode::Char('t')));
-        assert!(m.previewing());
-        update(&mut m, key(KeyCode::Char('r')));
-        assert!(
-            matches!(m.overlay, Overlay::Reply { .. }),
-            "r opens the reply box"
-        );
-        m.overlay = Overlay::None;
-
-        let effects = update(&mut m, key(KeyCode::Char('i')));
-        assert!(effects.iter().any(|e| matches!(
-            e,
-            Effect::Attach {
-                intent: Intent::Activate,
-                ..
+        set_state(&mut m, "auth-refresh-2", working(), 1);
+        for panel in [None, Some('2'), Some('3')] {
+            if let Some(panel) = panel {
+                update(&mut m, key(KeyCode::Char(panel)));
             }
-        )));
-        assert!(
-            matches!(m.panel, Panel::Preview { .. }),
-            "and ⌃\\ comes back to the preview"
-        );
+            update(&mut m, key(KeyCode::Char('t')));
+            assert!(
+                matches!(&m.overlay, Overlay::Talk { to, .. } if to.as_str() == "auth-refresh-2"),
+                "{:?}",
+                m.panel
+            );
+            update(&mut m, key(KeyCode::Esc));
+        }
+        update(&mut m, key(KeyCode::Char('r')));
+        assert!(matches!(m.overlay, Overlay::None), "r is free");
+    }
 
-        let effects = update(&mut m, key(KeyCode::Enter));
-        assert!(
-            effects.iter().any(|e| matches!(e, Effect::Attach { .. })),
-            "⏎ types too"
-        );
-
-        update(&mut m, key(KeyCode::Esc));
-        assert!(!m.previewing());
-        assert!(matches!(m.panel, Panel::Agent { .. }));
-        let mut m = crate::fixtures::fleet(10);
+    #[test]
+    fn t_refuses_agents_that_report_nothing_or_are_not_running() {
+        let mut m = two_live();
+        m.set_cursor(Cursor::Entry(name("fix")));
         update(&mut m, key(KeyCode::Char('t')));
+        assert!(matches!(m.overlay, Overlay::None));
+        assert!(
+            m.status
+                .as_ref()
+                .is_some_and(|s| s.text.contains("reports no activity")),
+            "says why"
+        );
+        let mut m = model(&[]);
+        m.set_cursor(Cursor::Entry(name("api")));
+        update(&mut m, key(KeyCode::Char('t')));
+        assert!(matches!(m.overlay, Overlay::None), "exited");
+    }
+
+    #[test]
+    fn a_message_to_an_agent_at_rest_is_sent_now() {
+        let mut m = crate::fixtures::fleet(10);
+        set_state(&mut m, "auth-refresh-2", done(), 1);
+        let effects = talk_to(&mut m, "auth-refresh-2", "rebase");
+        assert_eq!(replies(&effects), ["rebase"]);
+        assert!(matches!(m.overlay, Overlay::None));
+    }
+
+    #[test]
+    fn a_message_to_a_working_agent_is_queued_and_sent_only_once_it_is_at_rest() {
+        let mut m = crate::fixtures::fleet(10);
+        set_state(&mut m, "auth-refresh-2", working(), 1);
+        let effects = talk_to(&mut m, "auth-refresh-2", "rebase");
+        assert!(effects.is_empty(), "nothing is typed while it works");
+        assert_eq!(m.outboxes[&name("auth-refresh-2")].queue.len(), 1);
+        assert_eq!(replies(&tick(&mut m)).len(), 0);
+
+        let mut asking_now = crate::fixtures::asking("rm?", 1);
+        asking_now.events = 2;
+        let effects = update(
+            &mut m,
+            Msg::Activities(HashMap::from([(name("auth-refresh-2"), asking_now)])),
+        );
+        assert!(replies(&effects).is_empty(), "a prompt is open");
+
+        let mut finished = reported(done(), 0);
+        finished.events = 3;
+        let effects = update(
+            &mut m,
+            Msg::Activities(HashMap::from([(name("auth-refresh-2"), finished)])),
+        );
+        assert_eq!(replies(&effects), ["rebase"], "the first rest sends it");
+        assert!(
+            replies(&tick(&mut m)).is_empty(),
+            "not again while it is being typed"
+        );
+    }
+
+    #[test]
+    fn queued_messages_go_in_order_one_per_rest_and_busy_keeps_them() {
+        let mut m = crate::fixtures::fleet(10);
+        let agent = "auth-refresh-2";
+        set_state(&mut m, agent, working(), 1);
+        talk_to(&mut m, agent, "first");
+        talk_to(&mut m, agent, "second");
+        let queue = |m: &Model| -> Vec<String> {
+            m.outboxes[&name(agent)]
+                .queue
+                .iter()
+                .map(|p| p.as_str().to_string())
+                .collect()
+        };
+        assert_eq!(queue(&m), ["first", "second"]);
+
+        set_state(&mut m, agent, done(), 2);
+        let all = m.activities.clone().expect("reported");
+        assert_eq!(replies(&update(&mut m, Msg::Activities(all))), ["first"]);
+
+        let effects = update(
+            &mut m,
+            Msg::Sent {
+                to: name(agent),
+                result: Err(crate::worker::SendError::Busy),
+            },
+        );
+        assert_eq!(replies(&effects), ["first"], "still first, retried at rest");
+        assert_eq!(queue(&m), ["first", "second"]);
+
+        let effects = sent(&mut m, agent);
+        assert!(
+            replies(&effects).is_empty(),
+            "the next waits for the agent to report again"
+        );
+        assert_eq!(queue(&m), ["second"]);
+
+        set_state(&mut m, agent, working(), 3);
+        set_state(&mut m, agent, done(), 4);
+        let all = m.activities.clone().expect("reported");
+        assert_eq!(replies(&update(&mut m, Msg::Activities(all))), ["second"]);
+        sent(&mut m, agent);
+        assert!(m.outboxes.is_empty());
+    }
+
+    #[test]
+    fn a_failed_send_drops_that_message_and_says_which() {
+        let mut m = crate::fixtures::fleet(10);
+        let agent = "auth-refresh-2";
+        set_state(&mut m, agent, done(), 1);
+        talk_to(&mut m, agent, "rebase onto main");
+        update(
+            &mut m,
+            Msg::Sent {
+                to: name(agent),
+                result: Err(crate::worker::SendError::Failed("no pty".into())),
+            },
+        );
+        assert!(m.outboxes.is_empty());
+        assert!(
+            m.status
+                .as_ref()
+                .is_some_and(|s| s.text.contains("no pty") && s.text.contains("rebase onto main"))
+        );
+    }
+
+    #[test]
+    fn the_queue_survives_selection_changes_and_ctrl_x_in_the_box_clears_it() {
+        let mut m = crate::fixtures::fleet(10);
+        let agent = "auth-refresh-2";
+        set_state(&mut m, agent, working(), 1);
+        talk_to(&mut m, agent, "one");
+        talk_to(&mut m, agent, "two");
+        m.set_cursor(Cursor::Entry(name("obs-layout-4")));
+        assert_eq!(m.outboxes[&name(agent)].queue.len(), 2);
+
+        m.set_cursor(Cursor::Entry(name(agent)));
+        update(&mut m, key(KeyCode::Char('t')));
+        update(
+            &mut m,
+            Msg::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL)),
+        );
+        assert!(!m.outboxes.contains_key(&name(agent)));
+        assert!(matches!(m.overlay, Overlay::Talk { .. }), "the box stays");
+    }
+
+    #[test]
+    fn v_opens_and_closes_the_peek_and_it_counts_as_the_terminal_being_visible() {
+        let mut m = crate::fixtures::fleet(10);
+        m.set_cursor(Cursor::Entry(name("obs-layout-4")));
+        update(&mut m, key(KeyCode::Char('2')));
+        assert!(!m.terminal_visible(), "[2] shows a document");
+        update(&mut m, key(KeyCode::Char('v')));
+        assert!(m.peeking());
+        assert!(m.terminal_visible());
+        update(&mut m, key(KeyCode::Char('v')));
+        assert!(!m.peeking());
+        update(&mut m, key(KeyCode::Char('v')));
+        update(&mut m, key(KeyCode::Esc));
+        assert!(!m.peeking());
         assert_eq!(
             m.panel,
-            Panel::Agents,
-            "[1] has no preview, it is the terminal"
+            Panel::Agent { offset: 0 },
+            "Esc closed only the peek"
+        );
+    }
+
+    #[test]
+    fn keys_do_not_reach_the_terminal_while_peeking() {
+        let mut m = crate::fixtures::fleet(10);
+        m.set_cursor(Cursor::Entry(name("obs-layout-4")));
+        update(&mut m, key(KeyCode::Char('v')));
+        let before = selected(&m);
+        for c in ['j', 'k', 'x', 'q', 'd', 'n', 'G', 'p'] {
+            let effects = update(&mut m, key(KeyCode::Char(c)));
+            assert!(effects.is_empty(), "{c}");
+        }
+        assert!(m.peeking());
+        assert!(matches!(m.focus(), Focus::Nav(_)));
+        assert!(matches!(m.overlay, Overlay::None));
+        assert_eq!(selected(&m), before);
+    }
+
+    #[test]
+    fn t_in_the_peek_opens_the_box_and_the_peek_stays_behind_it() {
+        let mut m = crate::fixtures::fleet(10);
+        set_state(&mut m, "obs-layout-4", done(), 1);
+        m.set_cursor(Cursor::Entry(name("obs-layout-4")));
+        update(&mut m, key(KeyCode::Char('v')));
+        update(&mut m, key(KeyCode::Char('t')));
+        assert!(matches!(m.overlay, Overlay::Talk { .. }));
+        type_text(&mut m, "hi");
+        let effects = update(&mut m, key(KeyCode::Enter));
+        assert_eq!(replies(&effects), ["hi"]);
+        assert!(m.peeking(), "back to the peek");
+    }
+
+    #[test]
+    fn i_and_enter_in_the_peek_enter_the_agent() {
+        for code in [KeyCode::Char('i'), KeyCode::Enter] {
+            let mut m = crate::fixtures::fleet(10);
+            m.set_cursor(Cursor::Entry(name("obs-layout-4")));
+            update(&mut m, key(KeyCode::Char('v')));
+            let effects = update(&mut m, key(code));
+            assert!(
+                effects.iter().any(|e| matches!(
+                    e,
+                    Effect::Attach {
+                        intent: Intent::Activate,
+                        ..
+                    }
+                )),
+                "{code:?}"
+            );
+            assert!(!m.peeking());
+        }
+    }
+
+    #[test]
+    fn e_on_a_subagent_row_opens_its_transcript_and_on_the_turn_row_the_checkout() {
+        let mut m = delegating();
+        update(&mut m, key(KeyCode::Char('2')));
+        let effects = update(&mut m, key(KeyCode::Char('e')));
+        assert!(
+            matches!(effects.as_slice(), [Effect::Edit(Open::Checkout(_))]),
+            "the turn row"
+        );
+
+        update(&mut m, key(KeyCode::Char('j')));
+        let key_of = m.subagent_selected().expect("a subagent is selected");
+        let effects = update(&mut m, key(KeyCode::Char('e')));
+        assert!(edits(&effects) == 0, "not read yet");
+
+        m.subagent_logs.insert(
+            key_of,
+            Ok(Some(agent_core::ports::SubagentDetail {
+                transcript: "/p/s/subagents/agent-a1.jsonl".into(),
+                ..Default::default()
+            })),
+        );
+        let effects = update(&mut m, key(KeyCode::Char('e')));
+        assert!(
+            matches!(effects.as_slice(), [Effect::Edit(Open::File { root, file })]
+                if root.ends_with("obs-layout-4")
+                    && file == std::path::Path::new("/p/s/subagents/agent-a1.jsonl")),
         );
     }
 }

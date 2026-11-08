@@ -519,6 +519,8 @@ pub struct SubagentDetail {
     pub finished: bool,
     /// The most recent entries, oldest first.
     pub log: Vec<LogEntry>,
+    /// The file the harness keeps the whole transcript in.
+    pub transcript: PathBuf,
 }
 
 /// One step of a subagent's work.

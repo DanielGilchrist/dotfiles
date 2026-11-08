@@ -66,9 +66,6 @@ const RESULT_COLUMNS: usize = 100;
 /// says, or `None` while the cursor is on nothing it reads. `border` is the
 /// corner's style and `width` the whole panel's.
 pub(super) fn page(m: &mut Model, area: Rect, width: usize, border: Style) -> Option<Page> {
-    if m.previewing() {
-        return None;
-    }
     let hover = m.hover()?;
     let columns = usize::from(area.width);
     // An agent that asks takes the top row, since it needs an answer and
@@ -381,6 +378,18 @@ fn turn_body(m: &Model, name: &SessionName, columns: usize) -> Option<Body> {
     }
     if let Some(message) = turn_message(m, entry) {
         rows.extend(wrap(&message, columns).into_iter().map(Line::raw));
+        rows.push(Line::raw(""));
+    }
+    if let Some(queue) = m.outboxes.get(name) {
+        rows.extend(queue.queue.iter().map(|q| {
+            Line::styled(
+                truncate_end(
+                    &format!("queued: {}", crate::update::first_words(q.as_ref())),
+                    columns,
+                ),
+                dim(),
+            )
+        }));
         rows.push(Line::raw(""));
     }
     let subagents = subagent_rows(m, entry, columns);

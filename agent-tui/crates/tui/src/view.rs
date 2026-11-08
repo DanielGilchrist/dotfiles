@@ -39,62 +39,38 @@ const NARROW: u16 = 60;
 const NAME_MIN: usize = 8;
 /// The NAV and switcher sections of the help; the AGENT section names the
 /// configured keys.
-const HELP: &[(&str, &[(&str, &str)])] = &[
-    (
-        " NAV ",
-        &[
-            ("⏎ l", "attach, resurrect or start"),
-            ("Esc", "back one level, then to the agent"),
-            ("i", "type to the selected agent, from anywhere"),
-            ("0", "attach from [1], focus [0] from [2] [3]"),
-            ("1 2 3", "focus agents, turn, changes"),
-            ("j k", "move, or scroll [2] [3]"),
-            ("⌃D ⌃U", "half a page, of [0] from [3]"),
-            ("J K", "scroll [0] from [3]"),
-            ("g G", "first / last"),
-            ("{ }", "previous / next repo"),
-            ("+ _", "[0] full width / back"),
-            (".", "show every checkout, or only those running"),
-            ("Space /", "switch agent"),
-            (
-                "p",
-                "repos: focus one, or add one from the catalogue or a path",
-            ),
-            ("Tab ⇧Tab", "next / previous panel"),
-            ("[ ]", "previous / next tab in [1]: repo, agents, pinned"),
-            ("m", "pin / unpin"),
-            ("n c", "new agent, or check out a branch / PR for review"),
-            ("e", "open in $EDITOR, the file in [3]"),
-            ("r", "reply without attaching"),
-            ("d", "kill session"),
-            ("D", "remove with worktree and branch"),
-            ("x", "run a configured action"),
-            ("a", "next agent that needs you"),
-            ("q", "quit"),
-        ],
-    ),
-    (
-        " SWITCH / REPOS ",
-        &[
-            ("⌃N ⌃P", "move, and the nav key"),
-            ("⏎", "switch, focus or add"),
-            ("Esc", "close"),
-        ],
-    ),
-    (
-        " STATES ",
-        &[
-            ("◆", "asking you"),
-            ("!", "failed"),
-            ("✓", "done, unseen"),
-            ("⠹", "working"),
-            ("⠹?", "gone quiet"),
-            ("●", "idle"),
-            ("○", "exited"),
-            ("·", "no session"),
-        ],
-    ),
+const NAV_HELP: &[(&str, &str)] = &[
+    ("⏎ l", "attach or start"),
+    ("Esc", "back a level"),
+    ("i", "type to the agent"),
+    ("0", "attach / focus [0]"),
+    ("1 2 3", "focus panel"),
+    ("j k g G", "move, first, last"),
+    ("⌃D ⌃U", "half page"),
+    ("J K", "scroll [0] from [3]"),
+    ("{ }", "prev / next repo"),
+    ("Tab ⇧Tab", "next / prev panel"),
+    ("[ ]", "prev / next tab"),
+    ("+ _", "[0] wide / back"),
+    (".", "all / running only"),
+    ("Space /", "switch agent"),
 ];
+
+const ACT_HELP: &[(&str, &str)] = &[
+    ("p", "repos: focus or add"),
+    ("m", "pin / unpin"),
+    ("n c", "new / check out"),
+    ("e", "edit [3] file/[2] log"),
+    ("t", "message, queued"),
+    ("v", "peek at terminal"),
+    ("d", "kill session"),
+    ("D", "remove worktree"),
+    ("x", "run an action"),
+    ("a", "next needing you"),
+    ("q", "quit"),
+];
+
+const SWITCH_HELP: &[(&str, &str)] = &[("⌃N ⌃P", "move in the list"), ("⏎ Esc", "pick / close")];
 
 thread_local! {
     /// Set from the model at the start of each draw. Styles are chosen deep
@@ -354,42 +330,14 @@ pub fn draw(frame: &mut Frame<'_>, m: &mut Model) {
         frame.render_widget(Paragraph::new(page.lines).block(block), right);
     } else {
         let (title, path) = pane_title(m, usize::from(right.width));
-        let mut block = panel(title, path, pane_style, pane_focused).padding(padding);
-        if m.previewing() {
-            // Only reading: its own border and title say so, and the hints
-            // say where the keys go.
-            let name = m
-                .selected_entry()
-                .map(|entry| sidebar::status_line(m, entry, 0));
-            let mut title = vec![
-                Span::raw("[0] "),
-                Span::styled("preview", bold()),
-                Span::styled(" · ", dim()),
-            ];
-            title.extend(name.unwrap_or_default());
-            let mut hints = Vec::new();
-            for (key, what) in [("i", "type"), ("r", "reply"), ("t", "back")] {
-                if !hints.is_empty() {
-                    hints.push(Span::styled(" · ", dim()));
-                }
-                hints.push(Span::raw(key));
-                hints.push(Span::styled(format!(" {what}"), dim()));
-            }
-            let hints = if line_width(&title) + 7 + line_width(&hints) <= usize::from(right.width) {
-                hints
-            } else {
-                Vec::new()
-            };
-            block = panel(title, Vec::new(), Style::new(), false)
-                .border_type(BorderType::Double)
-                .padding(padding)
-                .title_top(Line::from(sidebar::pad_title(hints)).right_aligned());
-        }
+        let block = panel(title, path, pane_style, pane_focused).padding(padding);
         frame.render_widget(block, right);
         draw_terminal(frame, m, terminal);
     }
 
     draw_status_bar(frame, m, footer);
+
+    draw_peek(frame, m);
 
     match &m.overlay {
         Overlay::None => {}
@@ -399,7 +347,7 @@ pub fn draw(frame: &mut Frame<'_>, m: &mut Model) {
         Overlay::Confirm(confirm) => draw_confirm(frame, confirm),
         Overlay::Help => draw_help(frame, m.keys),
         Overlay::Actions(target) => draw_actions(frame, m, target),
-        Overlay::Reply { to, text } => draw_reply(frame, to, text),
+        Overlay::Talk { to, text } => draw_talk(frame, m, to, text),
         Overlay::Planning { name, .. } => draw_planning(frame, name),
     }
 }
@@ -667,7 +615,15 @@ fn draw_status_bar(frame: &mut Frame<'_>, m: &Model, area: Rect) {
             ranked("⇧Tab", "previous field", 2),
             ranked("⌃R", "use suggestion", 1),
         ]);
-    } else if let Focus::Overlay(Overlay::Switcher(_) | Overlay::Picker(_)) = focus {
+    } else if m.peeking() && !matches!(focus, Focus::Overlay(_)) {
+        hints.extend([
+            ranked("t", "talk", 9),
+            ranked("i", "type", 9),
+            ranked("Esc", "close", 9),
+        ]);
+    } else if let Focus::Overlay(Overlay::Switcher(_) | Overlay::Picker(_) | Overlay::Talk { .. }) =
+        focus
+    {
         // The overlay's border carries its keys, so the footer doesn't
         // compete with it.
         hints.push(ranked("?", "keys", 9));
@@ -675,13 +631,6 @@ fn draw_status_bar(frame: &mut Frame<'_>, m: &Model, area: Rect) {
         let selected = m.selected();
         let entry = selected.and_then(|(_, e)| e);
         match m.panel {
-            _ if m.previewing() => {
-                hints.extend([ranked("i", "type", 9), ranked("t", "back", 9)]);
-                if entry.is_some_and(|e| m.replyable(e).is_some()) {
-                    hints.push(ranked("r", "reply", 8));
-                }
-                hints.push(ranked("Esc", "back", 7));
-            }
             _ if m.main_focused() => hints.extend([
                 ranked("j/k", "scroll", 8),
                 if m.docs.paused() {
@@ -690,7 +639,7 @@ fn draw_status_bar(frame: &mut Frame<'_>, m: &Model, area: Rect) {
                     ranked("G", "end", 6)
                 },
                 ranked("i", "type", 8),
-                ranked("t", "preview", 6),
+                ranked("t", "talk", 6),
                 ranked("Esc", "back", 9),
             ]),
             Panel::Changes { .. } => hints.extend([
@@ -698,17 +647,18 @@ fn draw_status_bar(frame: &mut Frame<'_>, m: &Model, area: Rect) {
                 ranked("J/K", "scroll", 8),
                 ranked("e", "edit", 7),
                 ranked("i", "type", 8),
-                ranked("t", "preview", 6),
+                ranked("t", "talk", 6),
                 ranked("Esc", "back", 9),
             ]),
             Panel::Agent { .. } => hints.extend([
                 ranked("⏎", "open", 9),
                 ranked("J/K", "scroll", 8),
+                ranked("e", "edit", 7),
                 ranked("i", "type", 8),
-                ranked("t", "preview", 6),
+                ranked("t", "talk", 6),
                 ranked("Esc", "back", 9),
             ]),
-            Panel::Agents | Panel::Main(_) | Panel::Preview { .. } => {}
+            Panel::Agents | Panel::Main(_) => {}
         }
         match (selected, entry.map(|e| m.reach(e))) {
             _ if matches!(m.panel, Panel::Changes { .. } | Panel::Agent { .. })
@@ -735,8 +685,9 @@ fn draw_status_bar(frame: &mut Frame<'_>, m: &Model, area: Rect) {
                 None => "pin",
             };
             hints.push(ranked("m", pin, 3));
-            if m.replyable(entry).is_some() {
-                hints.push(ranked("r", "reply", 5));
+            if m.talkable(entry).is_ok() {
+                hints.push(ranked("t", "talk", 5));
+                hints.push(ranked("v", "peek", 4));
             }
         }
         hints.push(ranked("n", "new", 4));
@@ -784,6 +735,17 @@ fn draw_status_bar(frame: &mut Frame<'_>, m: &Model, area: Rect) {
             Focus::Nav(_) | Focus::Overlay(_) => "a".to_string(),
         };
         counts.splice(0..0, [Span::raw(key), Span::raw(" ")]);
+    }
+    let queued: usize = m.outboxes.values().map(|o| o.queue.len()).sum();
+    if queued > 0 {
+        let lead = [
+            Span::styled(format!("{queued} queued"), dim()),
+            Span::raw("  "),
+        ];
+        counts.splice(0..0, lead);
+        if counts.len() == 2 {
+            counts.pop();
+        }
     }
     // The counts sit between a space, the right edge's space and the
     // column `justify` keeps between the sides.
@@ -1660,23 +1622,114 @@ fn draw_actions(frame: &mut Frame<'_>, m: &Model, target: &SessionName) {
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
-fn draw_reply(frame: &mut Frame<'_>, to: &SessionName, text: &str) {
-    let area = centred(frame, 72, 3);
+fn draw_talk(frame: &mut Frame<'_>, m: &Model, to: &SessionName, text: &str) {
+    let queued: Vec<&str> = m
+        .outboxes
+        .get(to)
+        .map(|o| o.queue.iter().map(AsRef::as_ref).collect())
+        .unwrap_or_default();
+    let shown = queued.len().min(3);
+    let height = u16::try_from(3 + shown + usize::from(queued.len() > shown)).unwrap_or(3);
+    let area = centred(frame, 72, height);
     clear_around(frame, area);
-    let block = overlay_block(
-        &format!("Reply to {to}"),
-        hints(&[("⏎", "send"), ("Esc", "close")]),
-        dim(),
-    );
+    let hint_keys: &[(&str, &str)] = if queued.is_empty() {
+        &[("⏎", "send"), ("Esc", "close")]
+    } else {
+        &[("⏎", "queue"), ("⌃X", "clear queue"), ("Esc", "close")]
+    };
+    let title = if m.at_rest(to) {
+        format!("Message {to}")
+    } else {
+        format!("Message {to} · queued until it's at rest")
+    };
+    let block = overlay_block(&title, hints(hint_keys), dim());
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let room = usize::from(inner.width).saturating_sub(4);
-    let line = Line::from(vec![
+    let mut lines: Vec<Line<'static>> = queued
+        .iter()
+        .take(shown)
+        .map(|q| {
+            Line::styled(
+                format!(
+                    " queued: {}",
+                    truncate_end(&crate::update::first_words(q), room.saturating_sub(8))
+                ),
+                dim(),
+            )
+        })
+        .collect();
+    if queued.len() > shown {
+        lines.push(Line::styled(
+            format!(" +{} more queued", queued.len() - shown),
+            dim(),
+        ));
+    }
+    lines.push(Line::from(vec![
         Span::styled(" › ", accent()),
         Span::raw(truncate_start(text, room)),
         Span::styled("█", dim()),
-    ]);
-    frame.render_widget(Paragraph::new(line), inner);
+    ]));
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// The peek float: the agent's terminal at the pty's size, over everything
+/// else, which is dimmed. A pty bigger than the screen is cropped.
+fn draw_peek(frame: &mut Frame<'_>, m: &Model) {
+    let Some(name) = m.peek.as_ref().filter(|_| m.peeking()) else {
+        return;
+    };
+    let screen = frame.area();
+    for cell in &mut frame.buffer_mut().content {
+        cell.modifier.insert(Modifier::DIM);
+    }
+    let size = match &m.pane {
+        Pane::Connected(c) if &c.name == name => Some(c.term.size()),
+        _ => None,
+    };
+    let (cols, rows) = size.map_or((m.areas.terminal.width, m.areas.terminal.height), |s| {
+        (s.cols.get(), s.rows.get())
+    });
+    let width = cols.saturating_add(2).min(screen.width);
+    let height = rows.saturating_add(2).min(screen.height);
+    let area = Rect::new(
+        screen.x + (screen.width - width) / 2,
+        screen.y + (screen.height - height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, area);
+    let title = m.snapshot().and_then(|s| s.entry(name)).map_or_else(
+        || vec![Span::raw(name.to_string())],
+        |(_, entry)| sidebar::status_line(m, entry, 0),
+    );
+    let mut keys = Vec::new();
+    for (key, what) in [("t", "talk"), ("i", "type"), ("Esc", "close")] {
+        if !keys.is_empty() {
+            keys.push(Span::styled(" · ", dim()));
+        }
+        keys.push(Span::raw(key));
+        keys.push(Span::styled(format!(" {what}"), dim()));
+    }
+    let mut title_spans = vec![Span::raw(" ")];
+    title_spans.extend(title);
+    title_spans.push(Span::raw(" "));
+    let fits = line_width(&title_spans) + line_width(&keys) + 4 <= usize::from(area.width);
+    let block = Block::bordered()
+        .border_type(BorderType::Double)
+        .border_style(accent())
+        .title_top(Line::from(title_spans))
+        .title_top(Line::from(if fits { keys } else { Vec::new() }).right_aligned());
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    match &m.pane {
+        Pane::Connected(c) if &c.name == name => c.term.render(inner, frame.buffer_mut(), false),
+        _ => centered(
+            frame,
+            inner,
+            vec![Line::styled(format!("attaching to {name}…"), dim())],
+        ),
+    }
 }
 
 fn pad(text: &str, width: usize) -> String {
@@ -1697,50 +1750,45 @@ fn help_section<K: AsRef<str>>(
     lines
 }
 
-/// Sections stacked in one column, or side by side when the terminal is
-/// too short for that.
+/// Sections packed into as many columns as the height needs: each fills
+/// to the room there is before the next starts.
 fn draw_help(frame: &mut Frame<'_>, keys: Keys) {
     let nav = keys.nav();
     let agent = [
         (nav.to_string(), "back to NAV"),
         (format!("{nav} {nav}"), "previous agent"),
     ];
-    let sections: Vec<Vec<Line<'static>>> = std::iter::once(help_section(" AGENT ", &agent))
-        .chain(
-            HELP.iter()
-                .map(|(section, keys)| help_section(section, keys)),
-        )
-        .collect();
-    let available = usize::from(frame.area().height.saturating_sub(4));
-    let stacked = |sections: &[Vec<Line<'static>>], gap: bool| {
-        let mut lines = Vec::new();
-        for (i, section) in sections.iter().enumerate() {
-            if i > 0 && gap {
-                lines.push(Line::raw(""));
-            }
-            lines.extend(section.iter().cloned());
-        }
-        lines
-    };
-    let rows: usize = sections.iter().map(Vec::len).sum();
-    let columns = if rows + sections.len() - 1 <= available {
-        vec![stacked(&sections, true)]
-    } else if rows <= available {
-        vec![stacked(&sections, false)]
-    } else {
-        let (longest, _) = sections
-            .iter()
-            .enumerate()
-            .max_by_key(|(_, s)| s.len())
-            .unwrap_or((0, &Vec::new()));
-        let others: Vec<_> = sections
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| *i != longest)
-            .map(|(_, s)| s.clone())
+    let states: Vec<Line<'static>> =
+        std::iter::once(Line::from(vec![Span::raw(" "), badge(" STATES ")]))
+            .chain(
+                [
+                    "◆ asking  ! failed  ✓ done",
+                    "⠹ working  ⠹? quiet  ● idle",
+                    "○ exited  · no session",
+                ]
+                .map(|row| Line::raw(format!("   {row}"))),
+            )
             .collect();
-        vec![sections[longest].clone(), stacked(&others, true)]
-    };
+    let sections: Vec<Vec<Line<'static>>> = vec![
+        help_section(" NAV ", NAV_HELP),
+        states,
+        help_section(" ACT ", ACT_HELP),
+        help_section(" AGENT ", &agent),
+        help_section(" SWITCH / REPOS ", SWITCH_HELP),
+    ];
+    let available = usize::from(frame.area().height.saturating_sub(4));
+    let mut columns: Vec<Vec<Line<'static>>> = Vec::new();
+    let mut column: Vec<Line<'static>> = Vec::new();
+    for section in sections {
+        if !column.is_empty() && column.len() + 1 + section.len() > available {
+            columns.push(std::mem::take(&mut column));
+        }
+        if !column.is_empty() {
+            column.push(Line::raw(""));
+        }
+        column.extend(section);
+    }
+    columns.push(column);
     let widths: Vec<usize> = columns
         .iter()
         .map(|c| c.iter().map(Line::width).max().unwrap_or(0) + 2)

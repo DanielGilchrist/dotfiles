@@ -431,6 +431,7 @@ fn read_subagent(transcript: &Path) -> io::Result<SubagentDetail> {
         prompt: parse_prompt(&String::from_utf8_lossy(&head)).unwrap_or_default(),
         finished,
         log: parse_log(&tail),
+        transcript: transcript.to_path_buf(),
     })
 }
 

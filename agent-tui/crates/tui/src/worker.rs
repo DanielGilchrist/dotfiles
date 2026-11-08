@@ -48,6 +48,11 @@ pub enum Msg {
         result: Result<RemovalPlan, String>,
     },
     Done(Result<Outcome, String>),
+    /// A message was typed into `to`, or wasn't.
+    Sent {
+        to: SessionName,
+        result: Result<(), SendError>,
+    },
     Shared {
         name: SessionName,
         others: usize,
@@ -104,11 +109,19 @@ pub enum Outcome {
     Started(String),
     /// It exited successfully.
     Finished(String),
-    Replied(SessionName),
+}
+
+/// Why a message wasn't typed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SendError {
+    /// The store says the agent isn't at rest: try again when it is.
+    Busy,
+    Failed(String),
 }
 
 pub enum Job {
-    /// Type a reply into an agent and submit it.
+    /// Type a message into an agent and submit it, if the store still says
+    /// it's at rest.
     Reply {
         to: SessionName,
         prompt: Prompt,
@@ -598,15 +611,16 @@ fn run(backend: &Arc<Backend>, job: Job, msgs: &Sender<Msg>) -> Option<Msg> {
             Ok(()) => return None,
             Err(e) => Msg::Done(Err(describe(&e))),
         },
-        Job::Reply { to, prompt } => Msg::Done(match svc.store.activities() {
-            Ok(all) if all.get(&to).is_some_and(Activity::at_rest) => {
-                ops::inject(svc, &to, &prompt)
-                    .map(|()| Outcome::Replied(to))
-                    .map_err(err)
-            }
-            Ok(_) => Err(format!("{to} started working, so the reply wasn't sent")),
-            Err(e) => Err(describe(&e)),
-        }),
+        Job::Reply { to, prompt } => {
+            let result = match svc.store.activities() {
+                Ok(all) if all.get(&to).is_some_and(Activity::at_rest) => {
+                    ops::inject(svc, &to, &prompt).map_err(|e| SendError::Failed(err(e)))
+                }
+                Ok(_) => Err(SendError::Busy),
+                Err(e) => Err(SendError::Failed(describe(&e))),
+            };
+            Msg::Sent { to, result }
+        }
         Job::Kill(running) => Msg::Done(
             ops::kill(svc, &running)
                 .map(|()| Outcome::Killed(running.name().clone()))

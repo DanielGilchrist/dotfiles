@@ -355,7 +355,24 @@ impl<'m> Deck<'m> {
             _ => m.subagents(entry),
         };
         let indent = title.indent();
+        let elsewhere = matches!(title, Title::Elsewhere(_));
         let line1 = self.line1(entry, &status, title, subagents, selected);
+        let blocked = matches!(gist, Some(Gist::Asking(_) | Gist::Failed(_)));
+        if !blocked
+            && !elsewhere
+            && self.has_line2(entry.name())
+            && let Some(text) = queued_line(
+                m,
+                entry.name(),
+                self.content.saturating_sub(indent.width() + 2),
+            )
+        {
+            let line2 = Line::from(vec![
+                Span::raw(format!("{indent}  ")),
+                Span::styled(text, dim()),
+            ]);
+            return (vec![line1, line2], Shown::Whole);
+        }
         match gist {
             Some(gist) => {
                 let room = self.content.saturating_sub(indent.width() + 2);
@@ -1230,6 +1247,22 @@ pub(super) fn subagent_rows(m: &Model, entry: &Entry, width: usize) -> Vec<Line<
     })
 }
 
+/// `queued: <first words>` for an agent with messages waiting, cut to
+/// `width`.
+pub(super) fn queued_line(m: &Model, name: &SessionName, width: usize) -> Option<String> {
+    let queue = &m.outboxes.get(name)?.queue;
+    let first = crate::update::first_words(queue.front()?.as_ref());
+    let more = match queue.len() {
+        1 => String::new(),
+        n => format!(" +{}", n - 1),
+    };
+    let room = width.saturating_sub(more.width());
+    Some(format!(
+        "{}{more}",
+        truncate_end(&format!("queued: {first}"), room)
+    ))
+}
+
 /// The selected agent's state as one line: its glyph, name, what it's doing
 /// and for how long, cut to `width` by dropping what it's doing first.
 pub(super) fn status_line(m: &Model, entry: &Entry, width: usize) -> Vec<Span<'static>> {
@@ -1311,7 +1344,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, m: &mut Model, area: Rect, border: Sty
             .changes
             .as_ref()
             .map_or(0, |(p, _)| usize::from(p.area.height)),
-        Focused::Main(_) | Focused::Preview { .. } => 0,
+        Focused::Main(_) => 0,
     }
     .saturating_sub(2);
     let agent_area = laid.agent.as_ref().map_or(Rect::default(), |p| p.area);
@@ -1636,7 +1669,7 @@ mod tests {
                     let laid = laid(&mut m, size);
                     let column = column(&m, size);
                     let focused_lower = match laid.focus {
-                        Focused::Agents | Focused::Main(_) | Focused::Preview { .. } => None,
+                        Focused::Agents | Focused::Main(_) => None,
                         Focused::Agent { .. } => Some(1),
                         Focused::Changes { .. } => Some(2),
                     };
@@ -2356,6 +2389,7 @@ mod tests {
             prompt: "Find every call site of roundCurrency.".into(),
             finished,
             log,
+            ..Default::default()
         }
     }
 
@@ -2601,31 +2635,42 @@ mod tests {
     }
 
     #[test]
-    fn a_preview_says_it_only_previews_and_its_border_is_its_own() {
+    fn the_peek_floats_over_a_dimmed_screen_without_resizing_the_pty() {
         let mut m = fleet(10);
         m.set_cursor(Cursor::Entry(name("obs-layout-4")));
         m.panel = Focused::Changes { file: 1 };
-        let plain = render(&mut m, (100, 30));
-        let area = m.areas.terminal;
-        let corner = |t: &Terminal<TestBackend>| {
-            t.backend().buffer()[(area.x - 2, area.y - 1)]
-                .symbol()
-                .to_string()
+        let area = {
+            render(&mut m, (100, 30));
+            m.areas.terminal
         };
-        assert_eq!(corner(&plain), "╭");
-        m.panel = m.panel.toggled_preview();
+        m.peek = Some(name("obs-layout-4"));
         let terminal = render(&mut m, (100, 30));
         let rows = screen(&terminal);
-        assert!(rows[0].contains("[0] preview · "), "{}", rows[0]);
-        assert!(rows[0].contains("obs-layout-4"), "{}", rows[0]);
-        assert!(rows[0].contains("i type · r reply · t back"), "{}", rows[0]);
-        assert_eq!(corner(&terminal), "╔", "a border no other panel has");
+        let title = rows.iter().find(|r| r.contains("╔")).expect("a float");
+        assert!(title.contains("obs-layout-4"), "{title}");
+        assert!(title.contains("t talk · i type · Esc close"), "{title}");
         assert_eq!(m.areas.terminal, area, "the pty keeps its size");
+        let behind = terminal.backend().buffer()[(0, 5)].modifier;
+        assert!(behind.contains(Modifier::DIM), "what's behind is dimmed");
         let footer = rows.last().expect("a footer");
         assert!(
-            footer.contains("t back") && footer.contains("i type"),
+            footer.contains("t talk") && footer.contains("i type"),
             "{footer}"
         );
+    }
+
+    #[test]
+    fn a_card_says_what_is_queued_for_its_agent() {
+        let mut m = fleet(10);
+        m.set_cursor(Cursor::Entry(name("obs-layout-4")));
+        let outbox = m.outboxes.entry(name("obs-layout-4")).or_default();
+        for text in ["rebase on main", "then run the tests"] {
+            outbox.queue.push_back(text.parse().expect("a prompt"));
+        }
+        let text = screen(&render(&mut m, (100, 30))).join("\n");
+        assert!(text.contains("queued: rebase on ma"), "{text}");
+        assert!(text.contains("+1"), "{text}");
+        assert!(text.contains("2 queued"), "the status bar says so\n{text}");
     }
 
     #[test]
@@ -2675,5 +2720,22 @@ mod tests {
             text.contains("running 1"),
             "about 12s, from the hooks\n{text}"
         );
+    }
+
+    #[test]
+    fn the_help_shows_every_key_at_80_by_24() {
+        let mut m = fleet(10);
+        m.overlay = Overlay::Help;
+        let text = screen(&render(&mut m, (80, 24))).join("\n");
+        for expected in [
+            "attach or start",
+            "message, queued",
+            "peek at terminal",
+            "quit",
+            "no session",
+            "pick / close",
+        ] {
+            assert!(text.contains(expected), "{expected}\n{text}");
+        }
     }
 }

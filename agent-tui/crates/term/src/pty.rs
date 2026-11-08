@@ -127,6 +127,10 @@ impl<E: Emulator> Terminal<E> {
         Ok(())
     }
 
+    pub fn size(&self) -> TermSize {
+        self.size
+    }
+
     pub fn send(&self, bytes: Vec<u8>) {
         if !bytes.is_empty() {
             let _ = self.input.send(bytes);

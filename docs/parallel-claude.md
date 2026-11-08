@@ -68,7 +68,8 @@ types into the embedded session. `?` shows every key.
 | `J K` | From [2] or [3], scroll [0] two rows without focusing it |
 | `⌃D ⌃U` | Half a page in the list, or in [0] from [2] or [3] |
 | `+` `_` | [0] full width / back. Keys keep going to the focused panel, so `j` flips to the next file |
-| `t` | From [2], [3] or a focused document, preview the agent's live terminal read-only (double border, `[0] preview · …`) and back to the same place. In the preview `r` replies, `i` or `⏎` types, `Esc` returns |
+| `t` | Message the selected live agent, from any panel and from the peek. An agent at rest gets it on `⏎`. Otherwise it is queued and typed the first time the agent is at rest, in order, one per rest. Queued messages show as `queued: …` on the card and in the status bar, and `⌃X` in the box clears them. Agents without hook activity can't be messaged |
+| `v` | Peek: a floating window with the agent's live terminal at the pty's size. Keys never reach it. `t` talks, `i` or `⏎` enters AGENT, `Esc` or `v` closes |
 | `.` | Show every checkout, or only those with a live session (the default). `+7 hidden` in [1]'s corner says how many are left out |
 | `Space` / `/` | Switcher (fuzzy), `⌃N ⌃P` to move |
 | `Tab` / `⇧Tab` | Focus the next / previous left panel: [1], [2], [3], wrapping and skipping one with nothing to focus. In AGENT mode they go to the agent |
@@ -77,8 +78,7 @@ types into the embedded session. `?` shows every key.
 | `n` | New agent form: prompt (`⌃E` edits it in $EDITOR), name (suggested from the prompt or a Linear/GitHub link), repo (listed, from the catalogue, or a path) |
 | `c` | Check out for review: a branch name or a GitHub PR link, name (suggested from it), repo (a PR link picks the repo it names). Fetches the branch if git doesn't know it, asks `gh` for a PR's branch (a fork's PR lands on a `pr/N` branch), and attaches instead if an agent already has the branch checked out |
 | `p` | Repo picker: `⏎` focuses a listed repo, or adds one from the catalogue or by a typed path (`~/code/foo`) |
-| `e` | Open the agent's worktree in $EDITOR, or in Changes the file under the cursor (`⏎` there reads its diff instead) |
-| `r` | Reply without attaching, once its turn is over and nothing is asking |
+| `e` | Open the agent's worktree in $EDITOR, or in Changes the file under the cursor (`⏎` there reads its diff instead), or in the turn panel on a subagent row its whole transcript |
 | `d` / `D` | Kill the session / remove session, worktree and branch (confirms, lists anything that would be lost) |
 | `x` | Run a configured action on the selected agent (see below) |
 | `a` | Jump to the agent that needs you most (asking, failed, then finished), into AGENT |

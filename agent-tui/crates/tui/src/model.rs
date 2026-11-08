@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
@@ -39,10 +39,6 @@ pub enum Panel {
     /// The keys are in the document [0] shows for the list panel it came
     /// from, whose cursor still says which document.
     Main(Origin),
-    /// [0] shows the agent's live terminal for reading only, while the list
-    /// panel it came from keeps its cursor. `in_main` says whether the keys
-    /// were in the document, so `t` returns to where they were.
-    Preview { from: Origin, in_main: bool },
 }
 
 /// The list panel a focused document in [0] came from.
@@ -62,11 +58,10 @@ impl Origin {
 }
 
 impl Panel {
-    /// The list panel, with the focus on its document or its preview taken
-    /// away.
+    /// The list panel, with the focus on its document taken away.
     pub fn listed(self) -> Self {
         match self {
-            Self::Main(from) | Self::Preview { from, .. } => from.panel(),
+            Self::Main(from) => from.panel(),
             panel => panel,
         }
     }
@@ -75,33 +70,15 @@ impl Panel {
         match self.listed() {
             Self::Agent { offset } => Some(Origin::Turn { offset }),
             Self::Changes { file } => Some(Origin::Changes { file }),
-            Self::Agents | Self::Main(_) | Self::Preview { .. } => None,
-        }
-    }
-
-    /// `t`: the preview of the terminal, or back from it to where the keys
-    /// were. [1] has none.
-    pub fn toggled_preview(self) -> Self {
-        match self {
-            Self::Preview { from, in_main } if in_main => Self::Main(from),
-            Self::Preview { from, .. } => from.panel(),
-            Self::Main(from) => Self::Preview {
-                from,
-                in_main: true,
-            },
-            list => list.origin().map_or(list, |from| Self::Preview {
-                from,
-                in_main: false,
-            }),
+            Self::Agents | Self::Main(_) => None,
         }
     }
 
     /// This panel after a layout settled `list` as its list panel: the
-    /// focus on its document or preview survives when the list panel does.
+    /// focus on its document survives when the list panel does.
     pub fn with_list(self, list: Self) -> Self {
         match (self, list.origin()) {
             (Self::Main(_), Some(from)) => Self::Main(from),
-            (Self::Preview { in_main, .. }, Some(from)) => Self::Preview { from, in_main },
             _ => list,
         }
     }
@@ -111,7 +88,6 @@ impl Panel {
         match self {
             Self::Agent { offset } => Self::Main(Origin::Turn { offset }),
             Self::Changes { file } => Self::Main(Origin::Changes { file }),
-            Self::Preview { from, .. } => Self::Main(from),
             panel => panel,
         }
     }
@@ -813,6 +789,26 @@ impl Proposal {
     }
 }
 
+/// Why `t` can't message an agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unreachable {
+    NotRunning,
+    Own,
+    /// No hook activity: when it's at rest can't be known.
+    Unreported,
+}
+
+/// What's queued to type into one agent, oldest first.
+#[derive(Debug, Default)]
+pub struct Outbox {
+    pub queue: VecDeque<Prompt>,
+    /// The first message is with the worker.
+    pub in_flight: bool,
+    /// How many events the agent had reported when the last one was typed:
+    /// the next waits for it to report again, since hooks lag the typing.
+    pub sent_at: Option<u64>,
+}
+
 pub enum Overlay {
     None,
     New(Box<NewAgent>),
@@ -822,8 +818,8 @@ pub enum Overlay {
     Help,
     /// The configured actions, to run on this agent.
     Actions(SessionName),
-    /// A reply being typed for an agent.
-    Reply {
+    /// A message being typed for an agent.
+    Talk {
         to: SessionName,
         text: String,
     },
@@ -1029,6 +1025,10 @@ pub struct Model {
     pub subagent_logs: HashMap<SubagentKey, Result<Option<SubagentDetail>, String>>,
     /// When each subagent's transcript was last asked for.
     pub subagent_reads: HashMap<SubagentKey, SubagentRead>,
+    /// The agent whose terminal the peek float shows.
+    pub peek: Option<SessionName>,
+    /// Messages waiting for their agents to be at rest.
+    pub outboxes: HashMap<SessionName, Outbox>,
     /// What the main view [0] reads when it isn't the terminal.
     pub docs: Documents,
     pub screen: Screen,
@@ -1086,6 +1086,8 @@ impl Model {
             held_subagent: None,
             subagent_logs: HashMap::new(),
             subagent_reads: HashMap::new(),
+            peek: None,
+            outboxes: HashMap::new(),
             docs: Documents::default(),
             screen: Screen::Split,
             sidebar_shown: true,
@@ -1154,7 +1156,7 @@ impl Model {
 
     fn move_in_panel_by(&mut self, delta: isize, wrap: Wrap) {
         self.panel = match self.panel {
-            Panel::Main(_) | Panel::Preview { .. } => self.panel,
+            Panel::Main(_) => self.panel,
             Panel::Agents => {
                 self.move_cursor_by(delta, wrap);
                 Panel::Agents
@@ -1180,7 +1182,7 @@ impl Model {
 
     pub fn panel_to_edge(&mut self, edge: Edge) {
         self.panel = match (self.panel, edge) {
-            (Panel::Main(_) | Panel::Preview { .. }, _) => self.panel,
+            (Panel::Main(_), _) => self.panel,
             (Panel::Agents, _) => {
                 self.move_to_edge(edge);
                 Panel::Agents
@@ -1271,7 +1273,7 @@ impl Model {
     /// title while the sidebar is out of sight.
     pub fn position(&self) -> Option<(usize, usize)> {
         match self.panel.listed() {
-            Panel::Agents | Panel::Main(_) | Panel::Preview { .. } => None,
+            Panel::Agents | Panel::Main(_) => None,
             Panel::Changes { file } => {
                 let rows = self.change_rows();
                 Some((file.min(rows.checked_sub(1)?) + 1, rows))
@@ -1285,21 +1287,22 @@ impl Model {
         self.panel.in_main()
     }
 
-    /// Whether [0] reads the live terminal as a preview.
-    pub fn previewing(&self) -> bool {
-        matches!(self.panel, Panel::Preview { .. }) && !matches!(self.focus(), Focus::Agent(_))
+    /// Whether the peek float is showing an agent's terminal. The keys
+    /// never reach it.
+    pub fn peeking(&self) -> bool {
+        self.peek.is_some() && !matches!(self.focus(), Focus::Agent(_))
     }
 
     /// Whether [0] shows a document that scrolls, as opposed to the
-    /// terminal, a preview of it or a repo's summary.
+    /// terminal or a repo's summary.
     pub fn shows_document(&self) -> bool {
-        !self.previewing() && !matches!(self.hover(), None | Some(Hover::Repo(_)))
+        !matches!(self.hover(), None | Some(Hover::Repo(_)))
     }
 
-    /// Whether [0] shows the terminal, live or as a preview, rather than a
-    /// document. It's being looked at either way.
+    /// Whether the terminal is being looked at: [0] shows it, or the peek
+    /// float does.
     pub fn terminal_visible(&self) -> bool {
-        self.previewing() || self.hover().is_none()
+        self.peeking() || self.hover().is_none()
     }
 
     /// The agent whose terminal [0] shows, if it shows one.
@@ -1381,18 +1384,26 @@ impl Model {
         }
     }
 
-    /// The agent `r` can type a reply into: live and at rest. While it works,
-    /// a permission prompt can open before its report arrives, and typed
-    /// text would pick a menu option.
-    pub fn replyable<'a>(&self, entry: &'a Entry) -> Option<&'a SessionName> {
+    /// Whether `t` may message the agent: it's live, isn't the one this TUI
+    /// runs in, and reports through hooks, which is the only way to know
+    /// when typing is safe.
+    pub fn talkable<'a>(&self, entry: &'a Entry) -> Result<&'a SessionName, Unreachable> {
         let EntryState::Live = entry.state() else {
-            return None;
+            return Err(Unreachable::NotRunning);
         };
         if self.own_session.as_ref() == Some(entry.name()) {
-            return None;
+            return Err(Unreachable::Own);
         }
-        self.activity(entry.name()).filter(|a| a.at_rest())?;
-        Some(entry.name())
+        if self.activity(entry.name()).is_none() {
+            return Err(Unreachable::Unreported);
+        }
+        Ok(entry.name())
+    }
+
+    /// Whether the agent is live and between turns, so typed text can't
+    /// answer a permission prompt that opens before its report arrives.
+    pub fn at_rest(&self, name: &SessionName) -> bool {
+        self.activity(name).is_some_and(Activity::at_rest)
     }
 
     /// The selected agent's subagents, oldest first, as [2] lists them.
@@ -1486,7 +1497,7 @@ impl Model {
             return None;
         }
         match self.panel.listed() {
-            Panel::Agents | Panel::Main(_) | Panel::Preview { .. } => match self.cursor() {
+            Panel::Agents | Panel::Main(_) => match self.cursor() {
                 Some(Cursor::Repo(key)) if self.panel == Panel::Agents => {
                     Some(Hover::Repo(key.clone()))
                 }
