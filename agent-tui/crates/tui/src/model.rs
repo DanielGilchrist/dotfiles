@@ -530,6 +530,16 @@ impl Target {
     }
 }
 
+/// The subagent row under [2]'s cursor as it was last listed, and whose.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Held {
+    pub by: SessionName,
+    pub id: AgentId,
+    /// Marked finished once the activity drops it, since nothing will say
+    /// so afterwards.
+    pub subagent: Subagent,
+}
+
 /// What a working agent is busy with.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Doing {
@@ -1014,7 +1024,7 @@ pub struct Model {
     /// The row under [2]'s cursor as it last was listed, kept so a new
     /// prompt clearing finished subagents doesn't take it from under the
     /// cursor. Dropped once the cursor leaves it.
-    pub held_subagent: Option<(SessionName, AgentId, Subagent)>,
+    pub held_subagent: Option<Held>,
     /// What each subagent being watched was told and has done, as last read.
     pub subagent_logs: HashMap<SubagentKey, Result<Option<SubagentDetail>, String>>,
     /// When each subagent's transcript was last asked for.
@@ -1397,11 +1407,11 @@ impl Model {
             return Vec::new();
         };
         let mut rows: Vec<_> = activity.subagents.iter().collect();
-        if let Some((held_by, id, subagent)) = &self.held_subagent
-            && held_by == entry.name()
-            && !activity.subagents.contains_key(id)
+        if let Some(held) = &self.held_subagent
+            && held.by == *entry.name()
+            && !activity.subagents.contains_key(&held.id)
         {
-            rows.push((id, subagent));
+            rows.push((&held.id, &held.subagent));
         }
         rows.sort_by_key(|(_, s)| s.since);
         rows
@@ -1411,7 +1421,9 @@ impl Model {
     /// the memory only while the cursor stays on that row.
     pub fn hold_hovered_subagent(&mut self) {
         let hovered = match (self.panel.listed(), self.selected_entry(), &self.subagent) {
-            (Panel::Agent { .. }, Some(entry), Some(id)) => {
+            (Panel::Agent { .. }, Some(entry), Some(id))
+                if matches!(entry.state(), EntryState::Live) =>
+            {
                 Some((entry.name().clone(), id.clone()))
             }
             _ => None,
@@ -1424,10 +1436,16 @@ impl Model {
             .activity(&name)
             .and_then(|a| a.subagents.get(&id))
             .cloned();
+        let now = self.now;
         self.held_subagent = match (listed, self.held_subagent.take()) {
-            (Some(subagent), _) => Some((name, id, subagent)),
-            (None, Some((held_by, held, subagent))) if held_by == name && held == id => {
-                Some((held_by, held, subagent))
+            (Some(subagent), _) => Some(Held {
+                by: name,
+                id,
+                subagent,
+            }),
+            (None, Some(mut held)) if held.by == name && held.id == id => {
+                held.subagent.finished.get_or_insert(now);
+                Some(held)
             }
             (None, _) => None,
         };

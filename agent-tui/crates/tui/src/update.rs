@@ -435,7 +435,7 @@ fn forget_subagents(m: &mut Model) {
     let Some(activities) = &m.activities else {
         return;
     };
-    let held = m.held_subagent.as_ref().map(|(n, id, _)| (n, id));
+    let held = m.held_subagent.as_ref().map(|h| (&h.by, &h.id));
     let listed = |(name, id): &(SessionName, AgentId)| {
         held == Some((name, id))
             || activities
@@ -3491,7 +3491,7 @@ mod tests {
 
         update(&mut m, key(KeyCode::Char('j')));
         assert_eq!(m.subagent_rows().len(), 2, "gone once the cursor moved on");
-        assert!(m.held_subagent.is_some_and(|(_, held, _)| held != id));
+        assert!(m.held_subagent.is_some_and(|held| held.id != id));
         assert!(!m.subagent_reads.contains_key(&(agent, id)));
     }
 
