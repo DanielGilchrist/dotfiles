@@ -1,5 +1,5 @@
 use std::ffi::OsString;
-use std::io;
+use std::io::{self, BufRead, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -11,7 +11,8 @@ use agent_core::ports::{
     Harness, HarnessError, HarnessId, Harnesses, LaunchCtx, LogEntry, Outcome, PendingPrompt, Seen,
     SubagentDetail,
 };
-use agent_core::process::LaunchSpec;
+use agent_core::process::{LaunchSpec, quiet};
+use serde::Deserialize;
 
 mod transcript;
 
@@ -102,6 +103,16 @@ impl Claude {
         }
     }
 
+    /// A one-off `claude` invocation, outside any session this process is
+    /// itself running in.
+    fn command(&self) -> std::process::Command {
+        let mut cmd = quiet(&self.program);
+        for key in INHERITED_SESSION_ENV {
+            cmd.env_remove(key);
+        }
+        cmd
+    }
+
     /// Whether the conversation `id` is still running as a background
     /// session: Claude Code keeps a session alive when its terminal goes,
     /// and `--resume` refuses one that's alive. A registry entry whose
@@ -132,11 +143,8 @@ impl Claude {
     /// Stops the background session `id` so it can be resumed with a
     /// prompt, which `attach` can't carry.
     fn stop(&self, id: &str) -> Result<(), HarnessError> {
-        let mut cmd = std::process::Command::new(&self.program);
-        cmd.args(["stop", id]).stdin(std::process::Stdio::null());
-        for key in INHERITED_SESSION_ENV {
-            cmd.env_remove(key);
-        }
+        let mut cmd = self.command();
+        cmd.args(["stop", id]);
         agent_core::process::output_within(&mut cmd, STOP_TIMEOUT).map_err(|e| HarnessError {
             context: format!("stopping background session {id}"),
             source: io::Error::other(e),
@@ -293,7 +301,7 @@ impl Harness for Claude {
     }
 
     fn event(&self, payload: &str) -> Option<Reported> {
-        claude_event(&serde_json::from_str(payload).ok()?)
+        claude_event(payload)
     }
 
     fn acknowledged(
@@ -319,13 +327,9 @@ impl Harness for Claude {
 
     /// `claude -p` with the quick model: print one answer and exit.
     fn ask(&self, question: &Prompt) -> Result<Option<String>, HarnessError> {
-        let mut cmd = std::process::Command::new(&self.program);
-        cmd.env("LC_ALL", "C").stdin(std::process::Stdio::null());
+        let mut cmd = self.command();
         cmd.args(["-p", "--model", self.quick_model.as_str()])
             .arg(question.as_str());
-        for key in INHERITED_SESSION_ENV {
-            cmd.env_remove(key);
-        }
         let out = agent_core::process::output_within(&mut cmd, ASK_TIMEOUT).map_err(|e| {
             HarnessError {
                 context: "asking claude".into(),
@@ -403,51 +407,133 @@ fn process_alive(pid: i32) -> bool {
     nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
 }
 
+/// How much of each transcript line is looked at. A record can hold a
+/// whole file or tool result, and what is searched for comes first.
+const LINE_PREFIX_BYTES: u64 = 64 * 1024;
+
+/// The first `max` bytes of each line of `reader`, so a line of any length
+/// costs at most that much memory.
+struct LinePrefixes<R> {
+    reader: R,
+    max: u64,
+}
+
+impl<R: BufRead> LinePrefixes<R> {
+    fn new(reader: R, max: u64) -> Self {
+        Self { reader, max }
+    }
+
+    fn skip_rest_of_line(&mut self) -> io::Result<()> {
+        loop {
+            let buf = self.reader.fill_buf()?;
+            let end = buf.iter().position(|b| *b == b'\n').map(|at| at + 1);
+            let used = end.unwrap_or(buf.len());
+            self.reader.consume(used);
+            if end.is_some() || used == 0 {
+                return Ok(());
+            }
+        }
+    }
+}
+
+impl<R: BufRead> Iterator for LinePrefixes<R> {
+    type Item = io::Result<Vec<u8>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut line = Vec::new();
+        match (&mut self.reader)
+            .take(self.max)
+            .read_until(b'\n', &mut line)
+        {
+            Ok(0) => None,
+            Err(e) => Some(Err(e)),
+            Ok(_) => {
+                let cut = line.last() != Some(&b'\n') && line.len() as u64 == self.max;
+                Some(if cut {
+                    self.skip_rest_of_line().map(|()| line)
+                } else {
+                    Ok(line)
+                })
+            }
+        }
+    }
+}
+
 /// Whether the user has said anything in the transcript at `path`. The
 /// first user turn comes early, so this reads little of a long file.
 fn has_user_turn(path: &Path) -> io::Result<bool> {
-    use std::io::BufRead;
+    const MARKER: &[u8] = br#""type":"user""#;
     let file = std::fs::File::open(path)?;
-    for line in std::io::BufReader::new(file).lines() {
-        if line?.contains(r#""type":"user""#) {
+    for line in LinePrefixes::new(io::BufReader::new(file), LINE_PREFIX_BYTES) {
+        if line?.windows(MARKER.len()).any(|w| w == MARKER) {
             return Ok(true);
         }
     }
     Ok(false)
 }
 
-/// A subagent's prompt, log and whether it finished, from its transcript
-/// and the `meta.json` beside it. A transcript still being read as far as it
-/// goes.
+/// A subagent's prompt, log and outcome, from its transcript and the
+/// `meta.json` beside it. A transcript still being written is read as far
+/// as it goes.
 fn read_subagent(transcript: &Path) -> io::Result<SubagentDetail> {
-    use std::io::{BufRead, Read};
     let mut file = std::fs::File::open(transcript)?;
     let len = file.metadata()?.len();
-    let mut head = Vec::new();
-    std::io::BufReader::new((&file).take(HEAD_BYTES)).read_until(b'\n', &mut head)?;
-    let (tail, from_start) = read_tail(&mut file, len, TAIL_BYTES, TAIL_BYTES_MAX)?;
-    let meta: Option<serde_json::Value> =
-        std::fs::read_to_string(transcript.with_extension("meta.json"))
-            .ok()
-            .and_then(|meta| serde_json::from_str(&meta).ok());
-    let finished = meta
-        .as_ref()
-        .and_then(|meta| meta.get("finished").and_then(serde_json::Value::as_bool))
-        .unwrap_or(false);
-    let model = meta
-        .as_ref()
-        .and_then(|meta| meta.get("model").and_then(serde_json::Value::as_str))
-        .map(str::to_string);
-    let head = String::from_utf8_lossy(&head);
-    let started = serde_json::from_str::<serde_json::Value>(head.trim())
+    let head = read_head(&file)?;
+    let tail = read_tail(&mut file, len, TAIL_BYTES, TAIL_BYTES_MAX)?;
+    let meta = read_meta(transcript);
+    let mut parsed = transcript::parse(tail.text());
+    let outcome = outcome_of(&mut parsed, meta.finished.get().copied().unwrap_or(false));
+    Ok(SubagentDetail {
+        prompt: head.prompt,
+        log: parsed.log,
+        transcript: transcript.to_path_buf(),
+        outcome,
+        model: meta.model.0,
+        started: head.started,
+        last_heard: parsed.last_heard,
+        truncated: parsed.dropped || !tail.reaches_start(),
+    })
+}
+
+/// What Claude Code records beside a subagent's transcript.
+#[derive(Deserialize, Default)]
+struct Meta {
+    #[serde(default)]
+    finished: Lenient<bool>,
+    #[serde(default)]
+    model: Lenient<String>,
+}
+
+fn read_meta(transcript: &Path) -> Meta {
+    std::fs::read_to_string(transcript.with_extension("meta.json"))
         .ok()
-        .and_then(|r| {
-            r.get("timestamp")
-                .and_then(serde_json::Value::as_str)
-                .and_then(transcript::parse_time)
-        });
-    let mut parsed = transcript::parse(&tail);
-    let outcome = match (parsed.handed_back.take(), finished) {
+        .and_then(|meta| serde_json::from_str(&meta).ok())
+        .unwrap_or_default()
+}
+
+struct Head {
+    prompt: String,
+    started: Option<SystemTime>,
+}
+
+/// The first record of the transcript: the prompt and when it began.
+fn read_head(file: &std::fs::File) -> io::Result<Head> {
+    let mut first = Vec::new();
+    io::BufReader::new(file.take(HEAD_BYTES)).read_until(b'\n', &mut first)?;
+    let first = String::from_utf8_lossy(&first);
+    let record: Option<serde_json::Value> = serde_json::from_str(first.trim()).ok();
+    let started = record
+        .as_ref()
+        .and_then(|r| r.get("timestamp")?.as_str())
+        .and_then(transcript::parse_time);
+    let prompt = record.as_ref().and_then(prompt_of).unwrap_or_default();
+    Ok(Head { prompt, started })
+}
+
+/// How the subagent stands: what it handed back, what it last said once
+/// `finished` says it's done, or why it stopped, if it did.
+fn outcome_of(parsed: &mut transcript::Parsed, finished: bool) -> Outcome {
+    match (parsed.handed_back.take(), finished) {
         (Some(report), _) => Outcome::Finished {
             report: Some(report),
         },
@@ -464,31 +550,36 @@ fn read_subagent(transcript: &Path) -> io::Result<SubagentDetail> {
             Some(reason) => Outcome::Stopped { reason },
             None => Outcome::Running,
         },
-    };
-    Ok(SubagentDetail {
-        prompt: parse_prompt(&head).unwrap_or_default(),
-        log: parsed.log,
-        transcript: transcript.to_path_buf(),
-        outcome,
-        model,
-        started,
-        last_heard: parsed.last_heard,
-        truncated: parsed.dropped || !from_start,
-    })
+    }
 }
 
-/// The whole records in the last `window` bytes of a `len` byte file and
-/// whether they reach its start, widening
-/// the window fourfold up to `max` while it holds none (one huge record).
+/// The whole records read from the end of a transcript.
+#[derive(Debug, PartialEq, Eq)]
+enum Tail {
+    /// They reach the start of the file.
+    FromStart(String),
+    /// Older records were left unread.
+    Partial(String),
+}
+
+impl Tail {
+    fn text(&self) -> &str {
+        match self {
+            Self::FromStart(text) | Self::Partial(text) => text,
+        }
+    }
+
+    fn reaches_start(&self) -> bool {
+        matches!(self, Self::FromStart(_))
+    }
+}
+
+/// The whole records in the last `window` bytes of a `len` byte file,
+/// widening the window fourfold up to `max` while it holds none (one huge
+/// record).
 /// The window reaches one byte back so a record starting exactly at its edge
 /// is kept, and the partial one before it is dropped.
-fn read_tail(
-    file: &mut std::fs::File,
-    len: u64,
-    mut window: u64,
-    max: u64,
-) -> io::Result<(String, bool)> {
-    use std::io::{Read, Seek, SeekFrom};
+fn read_tail(file: &mut std::fs::File, len: u64, mut window: u64, max: u64) -> io::Result<Tail> {
     loop {
         let start = len.saturating_sub(window);
         let back = start.min(1);
@@ -503,17 +594,21 @@ fn read_tail(
         };
         match whole {
             Some(whole) if whole.contains('\n') || start == 0 || window >= max => {
-                return Ok((whole.to_string(), start == 0));
+                let whole = whole.to_string();
+                return Ok(if start == 0 {
+                    Tail::FromStart(whole)
+                } else {
+                    Tail::Partial(whole)
+                });
             }
-            None if window >= max => return Ok((String::new(), false)),
+            None if window >= max => return Ok(Tail::Partial(String::new())),
             _ => window = (window * 4).min(max),
         }
     }
 }
 
-/// The prompt in a subagent transcript's first line.
-fn parse_prompt(line: &str) -> Option<String> {
-    let record: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+/// The prompt in a subagent transcript's first record.
+fn prompt_of(record: &serde_json::Value) -> Option<String> {
     let text = text_of(record.pointer("/message/content")?);
     (!text.is_empty()).then_some(text)
 }
@@ -568,154 +663,367 @@ fn long(text: &str) -> String {
     text.trim().chars().take(LONG).collect()
 }
 
-/// What a tool is acting on: a command, a file, a search or a URL.
-fn target(input: &serde_json::Value) -> Option<String> {
-    ["command", "file_path", "pattern", "url", "description"]
-        .iter()
-        .find_map(|key| input.get(key).and_then(serde_json::Value::as_str))
-        .map(snippet)
-}
-
 /// Prompts Claude Code writes to tell the agent something, like a
 /// background subagent finishing.
 const NOTIFICATION_PREFIXES: &[&str] = &["<agent-message", "<task-notification"];
+
+/// An id or name Claude Code gave a tool call or a subagent. An empty one
+/// would match every other empty one, so a payload carrying one is refused.
+struct NonEmpty(String);
+
+impl<'de> Deserialize<'de> for NonEmpty {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        if text.is_empty() {
+            return Err(serde::de::Error::custom("empty id"));
+        }
+        Ok(Self(text))
+    }
+}
+
+/// A field of a shape that varies by tool or version: the value if it has
+/// the expected one, and nothing otherwise.
+struct Lenient<T>(Option<T>);
+
+impl<T> Default for Lenient<T> {
+    fn default() -> Self {
+        Self(None)
+    }
+}
+
+impl<'de, T: serde::de::DeserializeOwned> Deserialize<'de> for Lenient<T> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        Ok(Self(serde_json::from_value(value).ok()))
+    }
+}
+
+impl<T> Lenient<T> {
+    fn get(&self) -> Option<&T> {
+        self.0.as_ref()
+    }
+}
+
+impl Lenient<String> {
+    fn text(&self) -> Option<&str> {
+        self.0.as_deref()
+    }
+}
+
+/// A hook payload: who fired it, and which hook.
+#[derive(Deserialize)]
+struct Payload {
+    /// Set when a subagent fired the hook.
+    #[serde(default)]
+    agent_id: Option<NonEmpty>,
+    #[serde(flatten)]
+    hook: Hook,
+}
+
+/// The hooks that move an agent's state, with the fields read from each.
+/// Ones that can't be told apart without an id or a tool name carry it as
+/// a required field, so a payload without one fails to parse and is
+/// dropped.
+#[derive(Deserialize)]
+#[serde(tag = "hook_event_name")]
+enum Hook {
+    SessionStart {
+        #[serde(default)]
+        source: Option<String>,
+    },
+    UserPromptSubmit {
+        #[serde(default)]
+        prompt: Option<String>,
+    },
+    PreToolUse {
+        tool_use_id: NonEmpty,
+        tool_name: NonEmpty,
+        #[serde(default)]
+        tool_input: Lenient<ToolInput>,
+    },
+    PostToolUse {
+        tool_use_id: NonEmpty,
+        #[serde(default)]
+        tool_input: Lenient<ToolInput>,
+        #[serde(default)]
+        tool_response: Lenient<ToolResponse>,
+    },
+    PostToolUseFailure {
+        tool_use_id: NonEmpty,
+    },
+    PermissionRequest {
+        tool_name: NonEmpty,
+        #[serde(default)]
+        tool_input: Lenient<ToolInput>,
+    },
+    PermissionDenied {
+        #[serde(default)]
+        tool_use_id: Option<NonEmpty>,
+    },
+    Notification {
+        #[serde(default)]
+        message: Option<String>,
+    },
+    SubagentStart {
+        #[serde(default)]
+        agent_type: Option<String>,
+    },
+    SubagentStop {},
+    Stop {
+        #[serde(default)]
+        last_assistant_message: Option<String>,
+        #[serde(default)]
+        background_tasks: Lenient<Vec<Lenient<BackgroundTask>>>,
+    },
+    StopFailure {
+        #[serde(default)]
+        error: Option<String>,
+    },
+    SessionEnd {},
+}
+
+#[derive(Deserialize, Default)]
+struct ToolInput {
+    #[serde(default)]
+    command: Lenient<String>,
+    #[serde(default)]
+    file_path: Lenient<String>,
+    #[serde(default)]
+    pattern: Lenient<String>,
+    #[serde(default)]
+    url: Lenient<String>,
+    #[serde(default)]
+    description: Lenient<String>,
+    #[serde(default)]
+    subagent_type: Lenient<String>,
+    #[serde(default)]
+    questions: Lenient<Vec<Question>>,
+}
+
+impl ToolInput {
+    /// What a tool is acting on: a command, a file, a search or a URL.
+    fn target(&self) -> Option<String> {
+        [
+            &self.command,
+            &self.file_path,
+            &self.pattern,
+            &self.url,
+            &self.description,
+        ]
+        .into_iter()
+        .find_map(Lenient::text)
+        .map(snippet)
+    }
+
+    fn first_question(&self) -> Option<&str> {
+        self.questions.get()?.first()?.question.text()
+    }
+}
+
+#[derive(Deserialize)]
+struct Question {
+    #[serde(default)]
+    question: Lenient<String>,
+}
+
+/// What a tool handed back. Only a backgrounded subagent's is read.
+#[derive(Deserialize)]
+struct ToolResponse {
+    #[serde(default, rename = "agentId")]
+    agent_id: Lenient<NonEmpty>,
+    #[serde(default)]
+    status: Lenient<String>,
+    #[serde(default)]
+    description: Lenient<String>,
+}
+
+impl ToolResponse {
+    fn launched(&self) -> Option<&NonEmpty> {
+        self.agent_id
+            .get()
+            .filter(|_| self.status.text() == Some("async_launched"))
+    }
+}
+
+#[derive(Deserialize)]
+struct BackgroundTask {
+    #[serde(default)]
+    id: Option<NonEmpty>,
+    #[serde(default, rename = "type")]
+    kind: Option<String>,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    agent_type: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+}
+
+/// Who a hook speaks for: the agent, one of its subagents, or either.
+enum Routed {
+    Main(MainEvent),
+    Subagent(SubagentEvent),
+    /// The agent started the subagent named here, whoever reports it.
+    Launched(AgentId, SubagentEvent),
+    Common(Common),
+}
 
 /// A hook payload as a [`Reported`] event.
 ///
 /// Claude Code fires no hook while a trust or resume dialog is up or when
 /// the user interrupts with Esc, so the core leans on silence for both.
 /// Hooks only the agent itself fires, like `Stop`, are dropped when they
-/// name a subagent, and the other way round.
-fn claude_event(payload: &serde_json::Value) -> Option<Reported> {
-    let text = |key: &str| payload.get(key).and_then(serde_json::Value::as_str);
-    let at = |pointer: &str| payload.pointer(pointer).and_then(serde_json::Value::as_str);
-    let tool = || text("tool_name").unwrap_or("a tool").to_string();
-    let id = || ToolId::new(text("tool_use_id").unwrap_or_default());
-    let input = payload.get("tool_input").cloned().unwrap_or_default();
-    let kind = |value: Option<&str>| value.unwrap_or("subagent").to_string();
-    let name = text("hook_event_name")?;
-    let launched = at("/tool_response/agentId")
-        .filter(|_| at("/tool_response/status") == Some("async_launched"));
-    let agent = launched.or_else(|| text("agent_id")).map(AgentId::new);
-    let hook = match name {
-        "SessionStart" if text("source") == Some("compact") => Hook::Main(MainEvent::Compacted),
-        "SessionStart" => Hook::Main(MainEvent::Started),
-        "UserPromptSubmit" => {
-            let prompt = text("prompt").unwrap_or_default();
-            Hook::Main(MainEvent::Prompted(
-                if NOTIFICATION_PREFIXES
-                    .iter()
-                    .any(|p| prompt.trim_start().starts_with(p))
-                {
-                    Input::Notification
-                } else {
-                    Input::User(long(prompt))
-                },
-            ))
+/// name a subagent, and the other way round. So are payloads that aren't
+/// one of the hooks above or lack an id or tool name they need.
+fn claude_event(payload: &str) -> Option<Reported> {
+    let Payload { agent_id, hook } = serde_json::from_str(payload).ok()?;
+    let agent = agent_id.map(|id| AgentId::new(id.0));
+    let routed = match hook {
+        Hook::SessionStart { source } if source.as_deref() == Some("compact") => {
+            Routed::Main(MainEvent::Compacted)
         }
-        "PreToolUse" if text("tool_name") == Some("AskUserQuestion") => {
-            let question = input
-                .pointer("/questions/0/question")
-                .and_then(serde_json::Value::as_str);
-            Hook::Common(Common::Asked {
-                question: snippet(question.unwrap_or("has a question")),
-                about: About::Tool(id()),
-            })
+        Hook::SessionStart { .. } => Routed::Main(MainEvent::Started),
+        Hook::UserPromptSubmit { prompt } => {
+            let prompt = prompt.unwrap_or_default();
+            let notification = NOTIFICATION_PREFIXES
+                .iter()
+                .any(|p| prompt.trim_start().starts_with(p));
+            Routed::Main(MainEvent::Prompted(if notification {
+                Input::Notification
+            } else {
+                Input::User(long(&prompt))
+            }))
         }
-        "PreToolUse" => Hook::Common(Common::ToolStarted {
-            id: id(),
-            tool: tool(),
-            target: target(&input),
+        Hook::PreToolUse {
+            tool_use_id,
+            tool_name,
+            tool_input,
+        } => pre_tool_use(ToolId::new(tool_use_id.0), tool_name.0, &tool_input),
+        Hook::PostToolUse {
+            tool_use_id,
+            tool_input,
+            tool_response,
+        } => post_tool_use(ToolId::new(tool_use_id.0), &tool_input, tool_response.get()),
+        Hook::PostToolUseFailure { tool_use_id }
+        | Hook::PermissionDenied {
+            tool_use_id: Some(tool_use_id),
+        } => Routed::Common(Common::ToolFinished {
+            id: ToolId::new(tool_use_id.0),
         }),
-        "PostToolUse" if launched.is_some() => Hook::Subagent(SubagentEvent::Launched {
-            tool: id(),
-            kind: kind(
-                input
-                    .get("subagent_type")
-                    .and_then(serde_json::Value::as_str),
-            ),
-            description: snippet(
-                at("/tool_response/description")
-                    .or_else(|| input.get("description").and_then(serde_json::Value::as_str))
-                    .unwrap_or_default(),
-            ),
-        }),
-        "PostToolUse" | "PostToolUseFailure" => Hook::Common(Common::ToolFinished { id: id() }),
-        "PermissionDenied" if text("tool_use_id").is_some() => {
-            Hook::Common(Common::ToolFinished { id: id() })
-        }
-        "PermissionDenied" => Hook::Common(Common::Declined),
+        Hook::PermissionDenied { tool_use_id: None } => Routed::Common(Common::Declined),
         // Its question already arrived with its PreToolUse.
-        "PermissionRequest" if text("tool_name") == Some("AskUserQuestion") => return None,
-        "PermissionRequest" => {
-            let target = target(&input);
-            Hook::Common(Common::Asked {
-                question: match &target {
-                    Some(target) => format!("{}: {target}", tool()),
-                    None => tool(),
-                },
-                about: About::Call {
-                    tool: tool(),
-                    target,
-                },
-            })
+        Hook::PermissionRequest { tool_name, .. } if tool_name.0 == "AskUserQuestion" => {
+            return None;
         }
-        "Notification" => Hook::Common(Common::Asked {
-            question: snippet(text("message").unwrap_or("has a question")),
+        Hook::PermissionRequest {
+            tool_name,
+            tool_input,
+        } => permission_request(tool_name.0, &tool_input),
+        Hook::Notification { message } => Routed::Common(Common::Asked {
+            question: snippet(message.as_deref().unwrap_or("has a question")),
             about: About::Unknown,
         }),
-        "SubagentStart" => Hook::Subagent(SubagentEvent::Started {
-            kind: kind(text("agent_type")),
+        Hook::SubagentStart { agent_type } => Routed::Subagent(SubagentEvent::Started {
+            kind: agent_type.unwrap_or_else(|| DEFAULT_SUBAGENT_KIND.to_string()),
         }),
-        "SubagentStop" => Hook::Subagent(SubagentEvent::Stopped),
-        "Stop" => Hook::Main(MainEvent::Finished {
-            summary: text("last_assistant_message").map(long),
-            running: background_subagents(payload),
+        Hook::SubagentStop {} => Routed::Subagent(SubagentEvent::Stopped),
+        Hook::Stop {
+            last_assistant_message,
+            background_tasks,
+        } => Routed::Main(MainEvent::Finished {
+            summary: last_assistant_message.as_deref().map(long),
+            running: background_subagents(background_tasks.get().map_or(&[][..], Vec::as_slice)),
         }),
-        "StopFailure" => Hook::Main(MainEvent::Failed(
-            text("error").unwrap_or("error").replace('_', " "),
+        Hook::StopFailure { error } => Routed::Main(MainEvent::Failed(
+            error.as_deref().unwrap_or("error").replace('_', " "),
         )),
-        "SessionEnd" => Hook::Main(MainEvent::Ended),
-        _ => return None,
+        Hook::SessionEnd {} => Routed::Main(MainEvent::Ended),
     };
-    match (hook, agent) {
-        (Hook::Common(event), Some(id)) => Some(Reported::subagent(id, event)),
-        (Hook::Common(event), None) => Some(Reported::main(event)),
-        (Hook::Main(event), None) => Some(Reported::main(event)),
-        (Hook::Subagent(event), Some(id)) => Some(Reported::subagent(id, event)),
-        (Hook::Main(_), Some(_)) | (Hook::Subagent(_), None) => None,
+    match (routed, agent) {
+        (Routed::Launched(id, event), _) | (Routed::Subagent(event), Some(id)) => {
+            Some(Reported::subagent(id, event))
+        }
+        (Routed::Common(event), Some(id)) => Some(Reported::subagent(id, event)),
+        (Routed::Main(event), None) => Some(Reported::main(event)),
+        (Routed::Common(event), None) => Some(Reported::main(event)),
+        (Routed::Main(_), Some(_)) | (Routed::Subagent(_), None) => None,
     }
 }
 
-/// Who fires a hook: the agent, one of its subagents, or either.
-enum Hook {
-    Main(MainEvent),
-    Subagent(SubagentEvent),
-    Common(Common),
+fn pre_tool_use(id: ToolId, tool: String, input: &Lenient<ToolInput>) -> Routed {
+    let fallback = ToolInput::default();
+    let input = input.get().unwrap_or(&fallback);
+    if tool == "AskUserQuestion" {
+        return Routed::Common(Common::Asked {
+            question: snippet(input.first_question().unwrap_or("has a question")),
+            about: About::Tool(id),
+        });
+    }
+    Routed::Common(Common::ToolStarted {
+        id,
+        tool,
+        target: input.target(),
+    })
 }
 
+/// A finished tool call, or the launch of a background subagent, which
+/// names the subagent in its response.
+fn post_tool_use(
+    tool: ToolId,
+    input: &Lenient<ToolInput>,
+    response: Option<&ToolResponse>,
+) -> Routed {
+    let Some((response, launched)) = response.and_then(|r| Some((r, r.launched()?))) else {
+        return Routed::Common(Common::ToolFinished { id: tool });
+    };
+    let input = input.get();
+    let description = response
+        .description
+        .text()
+        .or(input.and_then(|i| i.description.text()));
+    let kind = input
+        .and_then(|i| i.subagent_type.text())
+        .unwrap_or(DEFAULT_SUBAGENT_KIND);
+    Routed::Launched(
+        AgentId::new(launched.0.clone()),
+        SubagentEvent::Launched {
+            tool,
+            kind: kind.to_string(),
+            description: snippet(description.unwrap_or_default()),
+        },
+    )
+}
+
+fn permission_request(tool: String, input: &Lenient<ToolInput>) -> Routed {
+    let target = input.get().and_then(ToolInput::target);
+    Routed::Common(Common::Asked {
+        question: match &target {
+            Some(target) => format!("{tool}: {target}"),
+            None => tool.clone(),
+        },
+        about: About::Call { tool, target },
+    })
+}
+
+const DEFAULT_SUBAGENT_KIND: &str = "subagent";
+
 /// The subagents a finished turn left running. Other background work
-/// (shells, monitors) doesn't hand anything back to the agent.
-fn background_subagents(payload: &serde_json::Value) -> Vec<Background> {
-    let tasks = payload
-        .get("background_tasks")
-        .and_then(serde_json::Value::as_array)
-        .map_or(&[][..], Vec::as_slice);
+/// (shells, monitors) doesn't hand anything back to the agent. A task that
+/// can't be read is skipped without hiding the others.
+fn background_subagents(tasks: &[Lenient<BackgroundTask>]) -> Vec<Background> {
     tasks
         .iter()
-        .filter(|task| task.get("type").and_then(serde_json::Value::as_str) == Some("subagent"))
-        .filter(|task| {
-            matches!(
-                task.get("status").and_then(serde_json::Value::as_str),
-                None | Some("running" | "pending")
-            )
-        })
+        .filter_map(Lenient::get)
+        .filter(|task| task.kind.as_deref() == Some("subagent"))
+        .filter(|task| matches!(task.status.as_deref(), None | Some("running" | "pending")))
         .filter_map(|task| {
-            let field = |key: &str| task.get(key).and_then(serde_json::Value::as_str);
             Some(Background {
-                id: AgentId::new(field("id")?),
-                kind: field("agent_type").unwrap_or("subagent").to_string(),
-                description: field("description").map(snippet),
+                id: AgentId::new(task.id.as_ref()?.0.clone()),
+                kind: task
+                    .agent_type
+                    .clone()
+                    .unwrap_or_else(|| DEFAULT_SUBAGENT_KIND.to_string()),
+                description: task.description.as_deref().map(snippet),
             })
         })
         .collect()
@@ -841,7 +1149,7 @@ mod tests {
 
     #[test]
     fn hook_payloads_become_events() {
-        let event = |json: &str| claude_event(&serde_json::from_str(json).expect("json"));
+        let event = claude_event;
         let main = |e: MainEvent| Some(Reported::main(e));
         let common = |c: Common| Some(Reported::main(c));
         assert_eq!(
@@ -897,7 +1205,7 @@ mod tests {
 
     #[test]
     fn subagent_payloads_say_which_subagent_they_came_from() {
-        let event = |json: &str| claude_event(&serde_json::from_str(json).expect("json"));
+        let event = claude_event;
         let a1 = |e: SubagentEvent| Some(Reported::subagent(AgentId::new("a1"), e));
         let a1_common = |c: Common| Some(Reported::subagent(AgentId::new("a1"), c));
         assert_eq!(
@@ -949,9 +1257,128 @@ mod tests {
 
     #[test]
     fn hooks_only_one_side_fires_are_dropped_from_the_other() {
-        let event = |json: &str| claude_event(&serde_json::from_str(json).expect("json"));
+        let event = claude_event;
         assert_eq!(event(r#"{"hook_event_name":"Stop","agent_id":"a1"}"#), None);
         assert_eq!(event(r#"{"hook_event_name":"SubagentStop"}"#), None);
+    }
+
+    #[test]
+    fn hooks_missing_an_id_they_need_are_dropped() {
+        for payload in [
+            r#"{"hook_event_name":"PreToolUse","tool_name":"Bash"}"#,
+            r#"{"hook_event_name":"PreToolUse","tool_use_id":"t1"}"#,
+            r#"{"hook_event_name":"PreToolUse","tool_use_id":"t1","tool_name":""}"#,
+            r#"{"hook_event_name":"PermissionRequest","tool_input":{"command":"ls"}}"#,
+            r#"{"hook_event_name":"PermissionDenied","tool_use_id":""}"#,
+            r#"{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_use_id":""}"#,
+            r#"{"hook_event_name":"PostToolUse","tool_input":{}}"#,
+            r#"{"hook_event_name":"PostToolUseFailure"}"#,
+            r#"{"hook_event_name":"SubagentStart","agent_id":""}"#,
+            r#"{"hook_event_name":"Unheard","tool_use_id":"t1"}"#,
+            r#"{"tool_use_id":"t1"}"#,
+            "not json",
+        ] {
+            assert_eq!(claude_event(payload), None, "{payload}");
+        }
+    }
+
+    #[test]
+    fn a_denial_without_a_call_is_a_decline() {
+        assert_eq!(
+            claude_event(r#"{"hook_event_name":"PermissionDenied"}"#),
+            Some(Reported::main(Common::Declined))
+        );
+    }
+
+    #[test]
+    fn one_unreadable_background_task_does_not_hide_the_others() {
+        assert_eq!(
+            claude_event(
+                r#"{"hook_event_name":"Stop","background_tasks":[7,{"id":"","type":"subagent"},{"id":"a1","type":"subagent"}]}"#
+            ),
+            Some(Reported::main(MainEvent::Finished {
+                summary: None,
+                running: vec![Background {
+                    id: AgentId::new("a1"),
+                    kind: "subagent".into(),
+                    description: None
+                }]
+            }))
+        );
+    }
+
+    #[test]
+    fn fields_of_an_unexpected_shape_are_left_out_not_fatal() {
+        assert_eq!(
+            claude_event(
+                r#"{"hook_event_name":"PostToolUse","tool_use_id":"t1","tool_input":"ls","tool_response":"done"}"#
+            ),
+            Some(Reported::main(Common::ToolFinished {
+                id: ToolId::new("t1")
+            }))
+        );
+        assert_eq!(
+            claude_event(
+                r#"{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_use_id":"t1","tool_input":{"command":7,"url":"http://x"}}"#
+            ),
+            Some(Reported::main(Common::ToolStarted {
+                id: ToolId::new("t1"),
+                tool: "Bash".into(),
+                target: Some("http://x".into())
+            }))
+        );
+    }
+
+    #[test]
+    fn line_prefixes_bound_a_long_line_and_keep_the_ones_after() {
+        let text = format!("{}\nshort\nlast", "x".repeat(50));
+        let lines: Vec<Vec<u8>> = LinePrefixes::new(text.as_bytes(), 10)
+            .collect::<io::Result<_>>()
+            .expect("reads");
+        assert_eq!(
+            lines,
+            [
+                b"xxxxxxxxxx".to_vec(),
+                b"short\n".to_vec(),
+                b"last".to_vec()
+            ]
+        );
+        let exact: Vec<Vec<u8>> = LinePrefixes::new(&b"abcd"[..], 4)
+            .collect::<io::Result<_>>()
+            .expect("reads");
+        assert_eq!(exact, [b"abcd".to_vec()]);
+    }
+
+    #[test]
+    fn a_user_turn_after_a_huge_record_is_still_found() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("t.jsonl");
+        let huge = "y".repeat(usize::try_from(LINE_PREFIX_BYTES).expect("fits") * 3);
+        std::fs::write(&path, format!("{{\"type\":\"queue\",\"x\":\"{huge}\"}}\n"))
+            .expect("writes");
+        assert!(!has_user_turn(&path).expect("reads"));
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("opens");
+        std::io::Write::write_all(&mut file, br#"{"type":"user","message":{}}"#).expect("writes");
+        assert!(has_user_turn(&path).expect("reads"));
+    }
+
+    #[test]
+    fn a_tail_says_whether_it_reaches_the_start() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("t.jsonl");
+        std::fs::write(&path, "aaaa\nbbbb\n").expect("writes");
+        let mut file = std::fs::File::open(&path).expect("opens");
+        assert_eq!(
+            read_tail(&mut file, 10, 100, 100).expect("reads"),
+            Tail::FromStart("aaaa\nbbbb\n".into())
+        );
+        assert_eq!(
+            read_tail(&mut file, 10, 5, 5).expect("reads"),
+            Tail::Partial("bbbb\n".into())
+        );
     }
 
     const PROMPT_LINE: &str = r#"{"type":"user","isSidechain":true,"message":{"role":"user","content":"Review the diff.\nBe harsh."}}"#;
@@ -962,10 +1389,12 @@ mod tests {
     #[test]
     fn a_subagent_transcript_reads_as_a_prompt_and_a_log() {
         assert_eq!(
-            parse_prompt(PROMPT_LINE).as_deref(),
+            serde_json::from_str(PROMPT_LINE)
+                .ok()
+                .and_then(|r| prompt_of(&r))
+                .as_deref(),
             Some("Review the diff.\nBe harsh.")
         );
-        assert_eq!(parse_prompt("{\"type\":"), None);
         let text =
             format!("{PROMPT_LINE}\n{CALL_LINE}\n{RESULT_LINE}\n{LATER_LINE}\n{{\"type\":\"assi");
         let log = transcript::parse(&text).log;
@@ -1100,9 +1529,8 @@ mod tests {
             let path = dir.path().join("t.jsonl");
             std::fs::write(&path, body).expect("writes");
             let mut file = std::fs::File::open(&path).expect("opens");
-            read_tail(&mut file, body.len() as u64, window, max)
-                .expect("reads")
-                .0
+            let tail = read_tail(&mut file, body.len() as u64, window, max).expect("reads");
+            tail.text().to_string()
         };
         let body = "aaaa\nbbbb\ncccc\n";
         assert_eq!(tail(body, 100, 100), body, "the whole file");

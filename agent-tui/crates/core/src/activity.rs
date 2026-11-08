@@ -82,31 +82,40 @@ pub enum Origin {
     Subagent(AgentId),
 }
 
+/// Where a reporting process came from, as far as it could be read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Lineage {
+    /// Its ancestry wasn't read, or couldn't be.
+    Untraced,
+    /// The process and its ancestors, nearest first. A process with no
+    /// ancestors to speak of has a chain of just itself.
+    Traced(Vec<Pid>),
+}
+
 /// An event and who it came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reported {
     pub event: Event,
-    /// The reporting process and its ancestors, when they could be read.
-    pub lineage: Option<Vec<Pid>>,
+    pub lineage: Lineage,
 }
 
 impl Reported {
     pub fn main(event: impl Into<MainEvent>) -> Self {
         Self {
             event: Event::Main(event.into()),
-            lineage: None,
+            lineage: Lineage::Untraced,
         }
     }
 
     pub fn subagent(id: AgentId, event: impl Into<SubagentEvent>) -> Self {
         Self {
             event: Event::Subagent(id, event.into()),
-            lineage: None,
+            lineage: Lineage::Untraced,
         }
     }
 
     #[must_use]
-    pub fn from_lineage(mut self, lineage: Option<Vec<Pid>>) -> Self {
+    pub fn from_lineage(mut self, lineage: Lineage) -> Self {
         self.lineage = lineage;
         self
     }
@@ -530,10 +539,10 @@ impl Activity {
     /// whose process couldn't be traced are given the benefit of the doubt.
     fn is_stale_report(&self, reported: &Reported) -> bool {
         match (self.session.join(), &reported.lineage, &reported.event) {
-            (_, _, Event::Main(MainEvent::Launched(_))) | (Join::Untraced, _, _) | (_, None, _) => {
-                false
-            }
-            (Join::Fresh(pid), Some(lineage), _) => !lineage.contains(&pid),
+            (_, _, Event::Main(MainEvent::Launched(_)))
+            | (Join::Untraced, _, _)
+            | (_, Lineage::Untraced, _) => false,
+            (Join::Fresh(pid), Lineage::Traced(lineage), _) => !lineage.contains(&pid),
         }
     }
 
@@ -1639,7 +1648,9 @@ mod tests {
     #[test]
     fn reports_from_a_replaced_process_are_ignored_after_a_launch() {
         let from = |pids: &[u32], event| {
-            main(event).from_lineage(Some(pids.iter().filter_map(|p| Pid::new(*p)).collect()))
+            main(event).from_lineage(Lineage::Traced(
+                pids.iter().filter_map(|p| Pid::new(*p)).collect(),
+            ))
         };
         let a = run(vec![
             (10, main(finished(&[]))),
@@ -1663,13 +1674,13 @@ mod tests {
             (20, main(untraced())),
             (
                 21,
-                main(MainEvent::Started).from_lineage(Some(vec![pid(99)])),
+                main(MainEvent::Started).from_lineage(Lineage::Traced(vec![pid(99)])),
             ),
         ]);
         assert!(a.at_rest(), "reattached session");
         let a = run(vec![(
             21,
-            main(MainEvent::Started).from_lineage(Some(vec![pid(99)])),
+            main(MainEvent::Started).from_lineage(Lineage::Traced(vec![pid(99)])),
         )]);
         assert!(a.at_rest(), "old record");
     }

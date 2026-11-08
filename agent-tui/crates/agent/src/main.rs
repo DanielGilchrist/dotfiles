@@ -5,7 +5,6 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
-use agent_core::activity::Pid;
 use agent_core::config::Config;
 use agent_core::model::Presence;
 use agent_core::names::{AgentName, BranchName, Prompt, SessionName};
@@ -579,20 +578,30 @@ fn hook_event(name: Option<&std::ffi::OsString>) -> ! {
     std::process::exit(0)
 }
 
+/// The most of a hook payload that is read. `PostToolUse` carries the whole
+/// tool response, which can be a large file, and the hook runs on every
+/// tool call. Past this a payload is cut short, fails to parse and is
+/// dropped like any other unreadable one.
+const HOOK_PAYLOAD_BYTES: u64 = 16 * 1024 * 1024;
+
+fn read_payload(input: impl Read, max: u64) -> std::io::Result<String> {
+    let mut payload = String::new();
+    input.take(max).read_to_string(&mut payload)?;
+    Ok(payload)
+}
+
 /// Records a hook's payload as the agent's activity.
 fn event(svc: Services<'_>, name: &SessionName) {
-    let mut payload = String::new();
-    if std::io::stdin().read_to_string(&mut payload).is_err() {
+    let Ok(payload) = read_payload(std::io::stdin().lock(), HOOK_PAYLOAD_BYTES) else {
         return;
-    }
+    };
     let harness = match svc.store.record(name) {
         Ok(Some(record)) => svc.harnesses.get(&record.harness),
         _ => None,
     }
     .unwrap_or_else(|| svc.harnesses.default_harness());
     if let Some(event) = harness.event(&payload) {
-        let lineage = lineage::of(std::process::id(), lineage::parent_of)
-            .map(|chain| chain.into_iter().filter_map(Pid::new).collect());
+        let lineage = lineage::of(std::process::id(), lineage::process_table());
         let _ = svc.store.report(name, event.from_lineage(lineage));
     }
 }
@@ -729,6 +738,16 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_hook_payload_is_read_up_to_the_cap() {
+        let big = "x".repeat(100);
+        assert_eq!(
+            read_payload(big.as_bytes(), 10).expect("reads"),
+            "x".repeat(10)
+        );
+        assert_eq!(read_payload(big.as_bytes(), 1000).expect("reads"), big);
+    }
 
     #[test]
     fn the_cli_is_well_formed() {

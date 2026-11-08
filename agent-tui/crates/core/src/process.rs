@@ -1,7 +1,7 @@
 use std::ffi::{OsStr, OsString};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Output, Stdio};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -42,28 +42,42 @@ pub fn describe(cmd: &Command) -> String {
 
 /// A command whose output is parsed: C locale so messages are stable, and
 /// no stdin, so nothing can prompt.
-pub fn quiet(program: &str) -> Command {
+pub fn quiet(program: impl AsRef<OsStr>) -> Command {
     let mut cmd = Command::new(program);
     cmd.env("LC_ALL", "C").stdin(Stdio::null());
     cmd
 }
 
-/// Reads a pipe to the end on its own thread. A grandchild that inherits the
-/// pipe can keep it open past the child's exit, so the result is collected
-/// with a deadline rather than joined.
-fn drain(mut pipe: impl Read + Send + 'static) -> mpsc::Receiver<Vec<u8>> {
+/// What a pipe held: at most the cap's worth of bytes, and whether the
+/// writer had more.
+struct Drained {
+    bytes: Vec<u8>,
+    more: bool,
+}
+
+/// Reads up to `cap` bytes of a pipe on its own thread. Anything past the
+/// cap is read and thrown away, so a chatty child never blocks on a full
+/// pipe. A grandchild that inherits the pipe can keep it open past the
+/// child's exit, so the result is collected with a deadline rather than
+/// joined.
+fn drain(mut pipe: impl Read + Send + 'static, cap: u64) -> mpsc::Receiver<Drained> {
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = pipe.read_to_end(&mut buf);
-        let _ = tx.send(buf);
+        let mut bytes = Vec::new();
+        let _ = pipe.by_ref().take(cap).read_to_end(&mut bytes);
+        let mut probe = [0u8; 1];
+        let more = pipe.read(&mut probe).is_ok_and(|n| n > 0);
+        let _ = tx.send(Drained { bytes, more });
+        if more {
+            let _ = io::copy(&mut pipe, &mut io::sink());
+        }
     });
     rx
 }
 
 /// The pipe's contents, or `None` if something still holds it open past the
-/// deadline; partial output must never pass for complete output.
-fn collect(pipe: &mpsc::Receiver<Vec<u8>>, deadline: Instant) -> Option<Vec<u8>> {
+/// deadline: partial output must never pass for complete output.
+fn collect(pipe: &mpsc::Receiver<Drained>, deadline: Instant) -> Option<Drained> {
     pipe.recv_timeout(
         deadline
             .saturating_duration_since(Instant::now())
@@ -72,10 +86,58 @@ fn collect(pipe: &mpsc::Receiver<Vec<u8>>, deadline: Instant) -> Option<Vec<u8>>
     .ok()
 }
 
-/// Runs `cmd` to completion within `timeout`, killing it if it overruns.
-/// Non-zero exits are returned, not errors.
-pub fn output_within(cmd: &mut Command, timeout: Duration) -> Result<Output, CommandError> {
+enum Waited {
+    Exited(ExitStatus),
+    Stopped,
+    Overran,
+}
+
+/// Waits for `child` until `deadline`, killing it if it overruns or if
+/// `stop` says to.
+fn wait(
+    child: &mut Child,
+    deadline: Instant,
+    mut stop: impl FnMut() -> bool,
+) -> io::Result<Waited> {
+    loop {
+        if stop() {
+            let _ = child.kill();
+            child.wait()?;
+            return Ok(Waited::Stopped);
+        }
+        match child.try_wait()? {
+            Some(status) => return Ok(Waited::Exited(status)),
+            None if Instant::now() < deadline => thread::sleep(Duration::from_millis(5)),
+            None => {
+                let _ = child.kill();
+                child.wait()?;
+                return Ok(Waited::Overran);
+            }
+        }
+    }
+}
+
+/// Stderr is only read for error messages.
+const STDERR_BYTES: u64 = 256 * 1024;
+
+/// What [`output_capped`] read.
+#[derive(Debug)]
+pub enum Capped {
+    Whole(Output),
+    /// The command had more than the cap and was killed, so there is no
+    /// exit status to report.
+    Cut {
+        stdout: Vec<u8>,
+    },
+}
+
+fn collect_output(
+    cmd: &mut Command,
+    timeout: Duration,
+    stdout_cap: u64,
+) -> Result<Capped, CommandError> {
     let command = describe(cmd);
+    let started = Instant::now();
     let mut child = cmd
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -84,34 +146,56 @@ pub fn output_within(cmd: &mut Command, timeout: Duration) -> Result<Output, Com
             command: command.clone(),
             source,
         })?;
-    let stdout = drain(child.stdout.take().expect("stdout is piped"));
-    let stderr = drain(child.stderr.take().expect("stderr is piped"));
-    let deadline = Instant::now() + timeout;
-    let status: ExitStatus = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(5)),
-            Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(CommandError::TimedOut {
-                    command,
-                    after: timeout,
-                });
-            }
-            Err(source) => return Err(CommandError::Spawn { command, source }),
+    let stdout = drain(child.stdout.take().expect("stdout is piped"), stdout_cap);
+    let stderr = drain(child.stderr.take().expect("stderr is piped"), STDERR_BYTES);
+    let deadline = started + timeout;
+    let timed_out = |after| CommandError::TimedOut {
+        command: command.clone(),
+        after,
+    };
+    let mut early: Option<Drained> = None;
+    let waited = wait(&mut child, deadline, || {
+        if early.is_none() {
+            early = stdout.try_recv().ok();
+        }
+        early.as_ref().is_some_and(|d| d.more)
+    })
+    .map_err(|source| CommandError::Spawn {
+        command: command.clone(),
+        source,
+    })?;
+    let status = match waited {
+        Waited::Exited(status) => status,
+        Waited::Overran => return Err(timed_out(timeout)),
+        Waited::Stopped => {
+            let stdout = early.expect("only a read stdout stops the wait").bytes;
+            return Ok(Capped::Cut { stdout });
         }
     };
-    match (collect(&stdout, deadline), collect(&stderr, deadline)) {
-        (Some(stdout), Some(stderr)) => Ok(Output {
+    let stdout = early.or_else(|| collect(&stdout, deadline));
+    let stderr = collect(&stderr, deadline);
+    let (Some(stdout), Some(stderr)) = (stdout, stderr) else {
+        return Err(timed_out(started.elapsed()));
+    };
+    Ok(if stdout.more {
+        Capped::Cut {
+            stdout: stdout.bytes,
+        }
+    } else {
+        Capped::Whole(Output {
             status,
-            stdout,
-            stderr,
-        }),
-        _ => Err(CommandError::TimedOut {
-            command,
-            after: timeout,
-        }),
+            stdout: stdout.bytes,
+            stderr: stderr.bytes,
+        })
+    })
+}
+
+/// Runs `cmd` to completion within `timeout`, killing it if it overruns.
+/// Non-zero exits are returned, not errors.
+pub fn output_within(cmd: &mut Command, timeout: Duration) -> Result<Output, CommandError> {
+    match collect_output(cmd, timeout, u64::MAX)? {
+        Capped::Whole(output) => Ok(output),
+        Capped::Cut { .. } => unreachable!("a read with no cap is never cut"),
     }
 }
 
@@ -119,81 +203,14 @@ pub fn output(cmd: &mut Command) -> Result<Output, CommandError> {
     output_within(cmd, DEFAULT_TIMEOUT)
 }
 
-/// Like [`output_within`], but reads at most `max` bytes of stdout. A command
-/// that has more is killed, and the flag says output was cut, so a huge diff
-/// is never held whole in memory. The exit status of a killed command isn't
-/// meaningful.
+/// Like [`output_within`], but reads at most `max` bytes of stdout, so a
+/// huge diff is never held whole in memory.
 pub fn output_capped(
     cmd: &mut Command,
     timeout: Duration,
     max: u64,
-) -> Result<(Output, bool), CommandError> {
-    let command = describe(cmd);
-    let mut child = cmd
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|source| CommandError::Spawn {
-            command: command.clone(),
-            source,
-        })?;
-    let mut pipe = child.stdout.take().expect("stdout is piped");
-    let (tx, stdout) = mpsc::channel();
-    thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = pipe.by_ref().take(max).read_to_end(&mut buf);
-        let mut probe = [0u8; 1];
-        let more = pipe.read(&mut probe).is_ok_and(|n| n > 0);
-        let _ = tx.send((buf, more));
-    });
-    let stderr = drain(child.stderr.take().expect("stderr is piped"));
-    let deadline = Instant::now() + timeout;
-    let mut read: Option<(Vec<u8>, bool)> = None;
-    let status: ExitStatus = loop {
-        if read.is_none() {
-            read = stdout.try_recv().ok();
-        }
-        if read.as_ref().is_some_and(|(_, more)| *more) {
-            let _ = child.kill();
-            break child.wait().map_err(|source| CommandError::Spawn {
-                command: command.clone(),
-                source,
-            })?;
-        }
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(5)),
-            Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(CommandError::TimedOut {
-                    command,
-                    after: timeout,
-                });
-            }
-            Err(source) => return Err(CommandError::Spawn { command, source }),
-        }
-    };
-    let (stdout, more) = match read {
-        Some(read) => read,
-        None => {
-            stdout
-                .recv_timeout(Duration::from_secs(1))
-                .map_err(|_| CommandError::TimedOut {
-                    command: command.clone(),
-                    after: timeout,
-                })?
-        }
-    };
-    let stderr = collect(&stderr, deadline).unwrap_or_default();
-    Ok((
-        Output {
-            status,
-            stdout,
-            stderr,
-        },
-        more,
-    ))
+) -> Result<Capped, CommandError> {
+    collect_output(cmd, timeout, max)
 }
 
 /// Runs `cmd` and returns its stdout, failing on a non-zero exit.
@@ -383,13 +400,44 @@ mod tests {
     fn capped_output_stops_a_command_that_has_more() {
         let mut cmd = quiet("sh");
         cmd.args(["-c", "yes | head -c 1000000"]);
-        let (out, cut) = output_capped(&mut cmd, Duration::from_secs(10), 100).expect("runs");
-        assert!(cut);
-        assert_eq!(out.stdout.len(), 100);
+        match output_capped(&mut cmd, Duration::from_secs(10), 100).expect("runs") {
+            Capped::Cut { stdout } => assert_eq!(stdout.len(), 100),
+            Capped::Whole(_) => panic!("output was cut"),
+        }
+    }
+
+    #[test]
+    fn capped_output_under_the_cap_is_whole() {
         let mut cmd = quiet("sh");
-        cmd.args(["-c", "printf abc"]);
-        let (out, cut) = output_capped(&mut cmd, Duration::from_secs(10), 100).expect("runs");
-        assert!(!cut && out.status.success());
-        assert_eq!(out.stdout, b"abc");
+        cmd.args(["-c", "printf abc; exit 3"]);
+        match output_capped(&mut cmd, Duration::from_secs(10), 100).expect("runs") {
+            Capped::Whole(out) => {
+                assert_eq!(out.stdout, b"abc");
+                assert_eq!(out.status.code(), Some(3));
+            }
+            Capped::Cut { .. } => panic!("nothing was cut"),
+        }
+    }
+
+    #[test]
+    fn stderr_is_capped_without_blocking_the_command() {
+        let mut cmd = quiet("sh");
+        cmd.args(["-c", "yes err | head -c 2000000 >&2; echo done"]);
+        let out = output(&mut cmd).expect("runs");
+        assert!(out.status.success());
+        assert_eq!(out.stdout, b"done\n");
+        assert_eq!(out.stderr.len() as u64, STDERR_BYTES);
+    }
+
+    #[test]
+    fn a_timeout_reports_the_time_allowed() {
+        let mut cmd = quiet("sleep");
+        cmd.arg("5");
+        let Err(CommandError::TimedOut { after, .. }) =
+            output_capped(&mut cmd, Duration::from_millis(100), 100)
+        else {
+            panic!("should time out");
+        };
+        assert_eq!(after, Duration::from_millis(100));
     }
 }

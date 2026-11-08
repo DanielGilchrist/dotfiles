@@ -11,8 +11,10 @@ use agent_core::ports::{AgentRecord, Listing, Store, StoreError, Unlisting};
 use nix::fcntl::{Flock, FlockArg};
 
 /// Pins and agent records under `$XDG_STATE_HOME/agent`. Read-modify-write
-/// cycles hold an advisory lock, so the CLI and a running TUI don't lose
-/// each other's updates.
+/// cycles hold one advisory lock for the whole store, so the CLI and a
+/// running TUI don't lose each other's updates. It is global because a hold
+/// is one small read and an atomic rename, and a lock per session would
+/// leave a file behind for each or race with `forget` removing it.
 pub struct FsStore {
     dir: PathBuf,
 }
@@ -59,10 +61,12 @@ impl FsStore {
     }
 
     fn read_activity(path: &Path) -> Result<Option<Activity>, StoreError> {
-        let Some(contents) = read_optional(path)? else {
-            return Ok(None);
+        let contents = match std::fs::read(path) {
+            Ok(contents) => contents,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(io_err(path)(e)),
         };
-        serde_json::from_str(&contents)
+        serde_json::from_slice(&contents)
             .map(Some)
             .map_err(|e| StoreError::Corrupt {
                 path: path.to_path_buf(),
@@ -83,6 +87,33 @@ impl FsStore {
             path,
             source: io::Error::from(errno),
         })
+    }
+
+    /// Sets a corrupt activity file aside as `<name>.<time>-<n>.corrupt`
+    /// and notes it in `errors.log`, so an agent's state can move on without
+    /// the loss going unseen. Neither step may fail the caller: a hook has
+    /// no way to say so and the TUI's terminal isn't a place to print.
+    fn quarantine(&self, path: &Path, why: &StoreError) {
+        let now = unix_seconds();
+        let aside = (0..u32::MAX)
+            .map(|n| path.with_extension(format!("{now}-{n}.corrupt")))
+            .find(|candidate| !candidate.exists());
+        if let Some(aside) = aside {
+            let _ = std::fs::rename(path, aside);
+        }
+        self.log(&format!("replaced a corrupt activity file: {why}"));
+    }
+
+    /// Appends to `errors.log`, moving it to `errors.log.old` once it passes
+    /// [`LOG_BYTES`].
+    fn log(&self, message: &str) {
+        let log = self.dir.join("errors.log");
+        if std::fs::metadata(&log).is_ok_and(|m| m.len() > LOG_BYTES) {
+            let _ = std::fs::rename(&log, self.dir.join("errors.log.old"));
+        }
+        if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(log) {
+            let _ = writeln!(file, "[{}] {message}", unix_seconds());
+        }
     }
 
     fn read_pins(&self) -> Result<Vec<SessionName>, StoreError> {
@@ -138,6 +169,15 @@ impl FsStore {
         write_atomic(&self.repos_path(), contents.as_bytes())?;
         Ok(true)
     }
+}
+
+/// How large `errors.log` grows before it is set aside.
+const LOG_BYTES: u64 = 64 * 1024;
+
+fn unix_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 fn io_err(path: &Path) -> impl FnOnce(io::Error) -> StoreError + '_ {
@@ -276,8 +316,14 @@ impl Store for FsStore {
     fn report(&self, name: &SessionName, event: Reported) -> Result<(), StoreError> {
         let _lock = self.lock()?;
         let path = self.activity_path(name);
-        // A corrupt file shouldn't stop an agent's state from moving on.
-        let previous = Self::read_activity(&path).ok().flatten();
+        let previous = match Self::read_activity(&path) {
+            Ok(previous) => previous,
+            Err(corrupt @ StoreError::Corrupt { .. }) => {
+                self.quarantine(&path, &corrupt);
+                None
+            }
+            Err(e) => return Err(e),
+        };
         let next = Activity::next(previous, event, SystemTime::now());
         let json = serde_json::to_vec(&next).expect("activity serializes");
         write_atomic(&path, &json)
@@ -412,6 +458,46 @@ mod tests {
         assert_eq!(store.last_selected().expect("succeeds"), None);
         store.set_last_selected(&name("fix")).expect("succeeds");
         assert_eq!(store.last_selected().expect("succeeds"), Some(name("fix")));
+    }
+
+    fn corrupt_files(dir: &Path) -> Vec<PathBuf> {
+        std::fs::read_dir(dir)
+            .expect("reads")
+            .map(|e| e.expect("entry").path())
+            .filter(|p| p.extension().is_some_and(|e| e == "corrupt"))
+            .collect()
+    }
+
+    #[test]
+    fn corrupt_activity_files_are_replaced_but_set_aside_and_logged() {
+        use agent_core::activity::MainEvent;
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let store = FsStore::new(dir.path().to_path_buf());
+        let activity = dir.path().join("activity");
+        std::fs::create_dir_all(&activity).expect("creates");
+        for bad in [&b"{not json"[..], &[0xff, 0xfe, 0x00][..]] {
+            std::fs::write(activity.join("a.json"), bad).expect("writes");
+            store
+                .report(&name("a"), Reported::main(MainEvent::Started))
+                .expect("reports");
+            assert!(store.activities().expect("reads").contains_key(&name("a")));
+        }
+        let kept = corrupt_files(&activity);
+        assert_eq!(kept.len(), 2, "{kept:?}");
+        let log = std::fs::read_to_string(dir.path().join("errors.log")).expect("logged");
+        assert_eq!(log.lines().count(), 2, "{log}");
+        assert!(log.starts_with('[') && log.contains("a.json"), "{log}");
+    }
+
+    #[test]
+    fn the_error_log_is_set_aside_once_it_grows_large() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let store = FsStore::new(dir.path().to_path_buf());
+        std::fs::write(dir.path().join("errors.log"), vec![b'x'; 70_000]).expect("writes");
+        store.log("fresh");
+        let log = std::fs::read_to_string(dir.path().join("errors.log")).expect("reads");
+        assert_eq!(log.lines().count(), 1);
+        assert!(dir.path().join("errors.log.old").exists());
     }
 
     #[test]

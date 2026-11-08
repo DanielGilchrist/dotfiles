@@ -14,7 +14,7 @@ use agent_core::ports::{
     FileDiff, FileState, Forge, Lines, LocalBranch, PullRequestHead, RemoteBranch, RemoteRef,
     RepoWorktrees, TrackedState, Uncommitted, Vcs, WorktreeFacts, WorktreeStart,
 };
-use agent_core::process::{self, CommandError};
+use agent_core::process::{self, Capped, CommandError};
 
 /// A diff over this many lines keeps only the first of them.
 const DIFF_LINES: usize = 5000;
@@ -640,11 +640,11 @@ impl Vcs for Git {
             "--first-parent",
         ])
         .arg(sha);
-        let (out, cut) = process::output_capped(&mut cmd, DIFF_TIMEOUT, DIFF_BYTES * 4)?;
-        if !cut && !out.status.success() {
-            return Err(process::failed(&cmd, &out));
+        match process::output_capped(&mut cmd, DIFF_TIMEOUT, DIFF_BYTES * 4)? {
+            Capped::Whole(out) if !out.status.success() => Err(process::failed(&cmd, &out)),
+            Capped::Whole(out) => Ok(split_commit(&String::from_utf8_lossy(&out.stdout), false)),
+            Capped::Cut { stdout } => Ok(split_commit(&String::from_utf8_lossy(&stdout), true)),
         }
-        Ok(split_commit(&String::from_utf8_lossy(&out.stdout), cut))
     }
 
     fn file_diff(
@@ -677,14 +677,18 @@ impl Vcs for Git {
                 true
             }
         };
-        let (out, cut) = process::output_capped(&mut cmd, DIFF_TIMEOUT, DIFF_BYTES)?;
-        // `--no-index` exits 1 when the files differ, and a diff cut short
-        // has its command killed.
-        let ok = cut || out.status.success() || (untracked && out.status.code() == Some(1));
-        if !ok {
-            return Err(process::failed(&cmd, &out));
-        }
-        let text = String::from_utf8_lossy(&out.stdout);
+        let (stdout, cut) = match process::output_capped(&mut cmd, DIFF_TIMEOUT, DIFF_BYTES)? {
+            Capped::Cut { stdout } => (stdout, true),
+            Capped::Whole(out) => {
+                // `--no-index` exits 1 when the files differ.
+                let ok = out.status.success() || (untracked && out.status.code() == Some(1));
+                if !ok {
+                    return Err(process::failed(&cmd, &out));
+                }
+                (out.stdout, false)
+            }
+        };
+        let text = String::from_utf8_lossy(&stdout);
         Ok(parse_diff(&text, DIFF_LINES, cut).unwrap_or_else(binary))
     }
 
