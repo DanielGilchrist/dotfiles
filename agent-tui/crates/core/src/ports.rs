@@ -33,10 +33,96 @@ pub struct WorktreeFacts {
     pub changed: Vec<Change>,
     /// The files with uncommitted state, counted against the last commit.
     pub pending: Vec<Change>,
-    /// The default branch the fork point is on, as `main`.
-    pub base: Option<String>,
+    /// What the fork point is measured against, and from where.
+    pub compared: Compared,
     /// Modified, staged and untracked files.
     pub dirty: usize,
+}
+
+/// What a worktree has checked out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Checkout {
+    Branch(String),
+    /// A detached HEAD, as its short sha.
+    Detached(String),
+}
+
+/// Where a checkout stands against origin's default branch, which decides
+/// what [3]'s second tab means. `base` is the full remote ref, `origin/main`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Compared {
+    /// The local branch the base is a remote copy of: `main` on `origin/main`.
+    Trunk {
+        branch: String,
+        base: String,
+    },
+    Branch {
+        branch: String,
+        base: String,
+    },
+    Detached {
+        sha: String,
+        base: String,
+    },
+    /// No default branch to compare with. `head` is the branch or short sha.
+    NoBase {
+        head: String,
+    },
+}
+
+impl Default for Compared {
+    fn default() -> Self {
+        Self::NoBase {
+            head: String::new(),
+        }
+    }
+}
+
+impl Compared {
+    pub fn of(checkout: Checkout, base: Option<&str>) -> Self {
+        match (checkout, base) {
+            (Checkout::Branch(head) | Checkout::Detached(head), None) => Self::NoBase { head },
+            (Checkout::Detached(sha), Some(base)) => Self::Detached {
+                sha,
+                base: base.to_string(),
+            },
+            (Checkout::Branch(branch), Some(base)) => {
+                let tracks = base.strip_prefix("origin/") == Some(branch.as_str());
+                let base = base.to_string();
+                if tracks {
+                    Self::Trunk { branch, base }
+                } else {
+                    Self::Branch { branch, base }
+                }
+            }
+        }
+    }
+
+    /// The second tab's name.
+    pub fn tab(&self) -> &'static str {
+        match self {
+            Self::Trunk { .. } => "Unpushed",
+            Self::Branch { .. } | Self::Detached { .. } | Self::NoBase { .. } => "Branch",
+        }
+    }
+
+    /// The branch or short sha the first row opens with.
+    pub fn head(&self) -> &str {
+        match self {
+            Self::Trunk { branch, .. } | Self::Branch { branch, .. } => branch,
+            Self::Detached { sha, .. } => sha,
+            Self::NoBase { head } => head,
+        }
+    }
+
+    pub fn base(&self) -> Option<&str> {
+        match self {
+            Self::Trunk { base, .. } | Self::Branch { base, .. } | Self::Detached { base, .. } => {
+                Some(base)
+            }
+            Self::NoBase { .. } => None,
+        }
+    }
 }
 
 /// A file changed since the fork point.

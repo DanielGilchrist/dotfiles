@@ -190,7 +190,10 @@ fn facts(k: usize) -> WorktreeFacts {
         behind: k % 2,
         pending: changed.clone(),
         changed,
-        base: Some("main".into()),
+        compared: agent_core::ports::Compared::Branch {
+            branch: "feature".into(),
+            base: "origin/main".into(),
+        },
         dirty: k % 4,
     }
 }

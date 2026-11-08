@@ -8,8 +8,9 @@ use agent_core::model::{Head, Worktree};
 use agent_core::names::{BranchName, NameError, PullRequest};
 use agent_core::paths::{AgentWorktree, RepoRoot};
 use agent_core::ports::{
-    BranchLog, BranchState, Change, DiffBase, Edit, Fetch, FileDiff, FileState, Forge, Lines,
-    LocalBranch, PullRequestHead, RemoteBranch, RepoWorktrees, Vcs, WorktreeFacts, WorktreeStart,
+    BranchLog, BranchState, Change, Checkout, Compared, DiffBase, Edit, Fetch, FileDiff, FileState,
+    Forge, Lines, LocalBranch, PullRequestHead, RemoteBranch, RepoWorktrees, Vcs, WorktreeFacts,
+    WorktreeStart,
 };
 use agent_core::process::{self, CommandError};
 
@@ -290,6 +291,22 @@ impl Git {
         Ok(BranchState::UpstreamGone { ahead })
     }
 
+    fn checkout(dir: &Path) -> Result<Checkout, CommandError> {
+        let mut cmd = git(dir);
+        cmd.args(["symbolic-ref", "--quiet", "--short", "HEAD"]);
+        let out = process::output(&mut cmd)?;
+        if out.status.success() {
+            return Ok(Checkout::Branch(
+                String::from_utf8_lossy(&out.stdout).trim().to_string(),
+            ));
+        }
+        let mut cmd = git(dir);
+        cmd.args(["rev-parse", "--short", "HEAD"]);
+        Ok(Checkout::Detached(
+            process::run(&mut cmd)?.trim().to_string(),
+        ))
+    }
+
     /// Origin's default branch, as seen from `dir` (any of the repo's
     /// worktrees: refs are shared).
     fn default_base(dir: &Path) -> Result<Option<String>, CommandError> {
@@ -508,10 +525,13 @@ impl Vcs for Git {
         let dirty = status.len();
         let mut pending = with_state(Self::numstat(worktree, "HEAD")?);
         pending.extend(untracked.iter().cloned());
-        let Some(base) = Self::default_base(worktree)? else {
+        let base = Self::default_base(worktree)?;
+        let compared = Compared::of(Self::checkout(worktree)?, base.as_deref());
+        let Some(base) = base else {
             return Ok(WorktreeFacts {
                 changed: pending.clone(),
                 pending,
+                compared,
                 dirty,
                 ..WorktreeFacts::default()
             });
@@ -540,7 +560,7 @@ impl Vcs for Git {
             behind,
             changed,
             pending,
-            base: Some(base.strip_prefix("origin/").unwrap_or(&base).to_string()),
+            compared,
             dirty,
         })
     }
@@ -771,6 +791,63 @@ mod tests {
     }
 
     #[test]
+    fn facts_classify_the_checkout_against_the_default_branch() {
+        let tmp = tempfile::tempdir().expect("a temp dir");
+        let origin = tmp.path().join("origin");
+        let work = tmp.path().join("work");
+        let run = |dir: &Path, args: &[&str]| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .output()
+                .expect("succeeds");
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        std::fs::create_dir_all(&origin).expect("creates");
+        run(&origin, &["init", "-q", "-b", "main"]);
+        run(&origin, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        run(
+            tmp.path(),
+            &["clone", "-q", origin.to_str().expect("succeeds"), "work"],
+        );
+        let compared = || Git.facts(&work).expect("succeeds").compared;
+        let base = || "origin/main".to_string();
+        assert_eq!(
+            compared(),
+            Compared::Trunk {
+                branch: "main".into(),
+                base: base()
+            }
+        );
+        run(&work, &["checkout", "-q", "-b", "fix-thing"]);
+        assert_eq!(
+            compared(),
+            Compared::Branch {
+                branch: "fix-thing".into(),
+                base: base()
+            }
+        );
+        run(&work, &["checkout", "-q", "--detach"]);
+        let sha = run(&work, &["rev-parse", "--short", "HEAD"]);
+        assert_eq!(compared(), Compared::Detached { sha, base: base() });
+        run(&work, &["checkout", "-q", "main"]);
+        run(&work, &["remote", "remove", "origin"]);
+        assert_eq!(
+            compared(),
+            Compared::NoBase {
+                head: "main".into()
+            }
+        );
+    }
+
+    #[test]
     fn facts_count_commits_both_ways_and_changes_since_the_fork() {
         let tmp = tempfile::tempdir().expect("a temp dir");
         let origin = tmp.path().join("origin");
@@ -809,7 +886,13 @@ mod tests {
         git(&work, &["fetch", "-q"]);
         let facts = Git.facts(&work).expect("succeeds");
         assert_eq!((facts.ahead, facts.behind, facts.dirty), (1, 1, 1));
-        assert_eq!(facts.base.as_deref(), Some("main"));
+        assert_eq!(
+            facts.compared,
+            Compared::Trunk {
+                branch: "main".into(),
+                base: "origin/main".into()
+            }
+        );
         std::fs::write(work.join("new.txt"), "x\n").expect("writes");
         let facts = Git.facts(&work).expect("succeeds");
         assert_eq!(

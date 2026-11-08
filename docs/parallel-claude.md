@@ -70,7 +70,7 @@ types into the embedded session. `?` shows every key.
 | `j k g G`, `↓ ↑ Home End` | Move in the focused panel, or scroll [0] when it has the keys |
 | `J` `K` | Scroll [0] from [2] or [3] without focusing it |
 | `⌃D ⌃U`, `PgDn PgUp` | Half a page / a page in the focused panel |
-| `[` `]` | Previous / next tab of the focused panel: [1] (agents, repo, pinned, opens on agents) or [3] (`Uncommitted`, `Changes`, opens on uncommitted) |
+| `[` `]` | Previous / next tab of the focused panel: [1] (agents, repo, pinned, opens on agents) or [3] (`Uncommitted`, then `Branch` or `Unpushed`, opens on uncommitted) |
 | `{` `}` | Previous / next repo |
 | `+` `_` | [0] full width / back |
 | `.` | In [1], show every checkout / only those with a session |
@@ -107,7 +107,7 @@ title show `◆ ! ✓` counts, and a bell rings when an agent you're not
 typing into starts waiting. Each agent's card has a second line saying
 what it's doing or what it said (the question, the tool, the last
 message), when there's room. Under the list, panel [2] lists the turn and
-its subagents and panel [3] lists the work in two tabs, `[` `]` to switch: `Uncommitted` (the default) lists only files with uncommitted state counted against the last commit, and `Changes` the whole branch's diff from where it forked. Its first row is the branch summary (`↑24 unpushed · 4 uncommitted`), which on `Changes` opens with what it compares against (`vs main · ↑24 unpushed · 4 uncommitted`), and hovering it shows the commits in [0]. Files carry lazygit's status code (staged letter green, unstaged red, `??` untracked, nothing for committed-only files, a `●` on folders holding uncommitted files), a `∩` on any file another agent
+its subagents and panel [3] lists the work in two tabs, `[` `]` to switch: `Uncommitted` (the default) lists only files with uncommitted state counted against the last commit, and `Branch` what this branch changes compared with where it left origin/main, like a PR plus your uncommitted work (on the trunk the tab is `Unpushed`: commits not yet on origin plus uncommitted work, which a push empties). Its first row is the branch summary (`↑24 unpushed · 4 uncommitted`), which on the second tab opens with what it compares against (`fix-thing vs origin/main · 3 commits · 2 uncommitted`, or `main vs origin/main · ↑26 commits · 4 uncommitted` on the trunk), and hovering it shows the commits in [0]. Files carry lazygit's status code (staged letter green, unstaged red, `??` untracked, nothing for committed-only files, a `●` on folders holding uncommitted files), a `∩` on any file another agent
 in the repo changed too, and `∩ n` in the title counting them. The right pane
 [0] shows what the cursor in the focused panel is on: the agent's terminal
 for [1], the turn document or a subagent's transcript for [2] (it follows

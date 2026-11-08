@@ -2438,7 +2438,10 @@ mod tests {
             Ok(agent_core::ports::WorktreeFacts {
                 ahead: 3,
                 dirty: 1,
-                base: Some("main".into()),
+                compared: agent_core::ports::Compared::Branch {
+                    branch: "fix".into(),
+                    base: "origin/main".into(),
+                },
                 changed: vec![
                     change("a/old.rs", 40, FileState::Committed),
                     change("a/hot.rs", 9, edited),
@@ -2482,6 +2485,29 @@ mod tests {
             crate::tree::ChangesScope::Since,
             "refocusing keeps the tab"
         );
+    }
+
+    #[test]
+    fn the_bracket_hint_names_the_second_tab_for_where_the_checkout_is() {
+        use agent_core::ports::Compared;
+        let mut m = model(&[]);
+        with_scopes(&mut m);
+        m.set_cursor(crate::model::Cursor::Entry(name("fix")));
+        let hint = |m: &Model| crate::keymap::Situation::of(m).next_changes_tab;
+        assert_eq!(hint(&m), "tab: branch");
+        m.toggle_changes_scope();
+        assert_eq!(hint(&m), "tab: uncommitted");
+        m.toggle_changes_scope();
+        let mut facts = match m.facts.get(&name("fix")) {
+            Some(Ok(facts)) => facts.clone(),
+            _ => panic!("facts"),
+        };
+        facts.compared = Compared::Trunk {
+            branch: "main".into(),
+            base: "origin/main".into(),
+        };
+        m.set_facts(&name("fix"), Ok(facts));
+        assert_eq!(hint(&m), "tab: unpushed");
     }
 
     #[test]

@@ -5,6 +5,7 @@
 
 use crate::model::{Model, Panel, Reach, View, Visibility};
 use crate::tree::{ChangesScope, ChangesView, Node};
+use agent_core::ports::Compared;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ctx {
@@ -151,7 +152,17 @@ impl Situation {
             toggle_worth_showing: m.visibility == Visibility::All || m.hidden() > 0,
             next_changes_tab: match m.changes_scope.toggled() {
                 ChangesScope::Uncommitted => "tab: uncommitted",
-                ChangesScope::Since => "tab: changes",
+                ChangesScope::Since => {
+                    let trunk = entry
+                        .and_then(|e| m.facts.get(e.name()))
+                        .and_then(|f| f.as_ref().ok())
+                        .is_some_and(|f| matches!(f.compared, Compared::Trunk { .. }));
+                    if trunk {
+                        "tab: unpushed"
+                    } else {
+                        "tab: branch"
+                    }
+                }
             },
             next_tab: match m.view.next() {
                 View::Focus => "tab: repo",
@@ -335,7 +346,7 @@ pub const BINDINGS: &[Binding] = &[
         Ctxs::of(&[Ctx::Changes]),
         RankBy(|_| Some(4)),
         By(|s| Some(s.next_changes_tab)),
-        "Cycle [3]'s tabs: Uncommitted, the files not yet committed, counted against the last commit, and Changes, everything since the fork from the default branch. The choice lasts for the session.",
+        "Cycle [3]'s tabs: Uncommitted, the files not yet committed, counted against the last commit, and the second tab: Branch, what this branch changes compared with where it left origin's default branch, like a PR plus your uncommitted work, or Unpushed on the trunk, the commits not yet on origin plus uncommitted work. The choice lasts for the session.",
     ),
     Binding::new(
         &["."],
@@ -667,7 +678,7 @@ mod tests {
             toggle: Some("show all"),
             toggle_worth_showing: true,
             next_tab: "tab: agents",
-            next_changes_tab: "tab: changes",
+            next_changes_tab: "tab: branch",
         }
     }
 
@@ -680,7 +691,7 @@ mod tests {
                 .and_then(|b| b.label_in(&situation(ctx)))
         };
         assert_eq!(label(Ctx::Agents), Some("tab: agents"));
-        assert_eq!(label(Ctx::Changes), Some("tab: changes"));
+        assert_eq!(label(Ctx::Changes), Some("tab: branch"));
         assert_eq!(label(Ctx::Turn), None);
     }
 
