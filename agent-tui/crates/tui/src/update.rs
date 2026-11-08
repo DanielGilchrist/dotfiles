@@ -1443,8 +1443,10 @@ fn on_confirm_key(m: &mut Model, confirm: Confirm, key: &KeyEvent) -> Vec<Effect
     }
 }
 
-/// A click or the wheel over [2] or [3]: focus it and put the cursor on the
-/// row clicked, or move it a row. `None` when it's over neither.
+/// A click over [2] or [3] focuses it with the cursor on the row clicked,
+/// taking the keys back from the agent. The wheel moves the cursor of the
+/// panel already focused and is ignored elsewhere, so it never changes
+/// focus. `None` when it's over neither.
 fn on_lower_panel(
     m: &mut Model,
     mouse: MouseEvent,
@@ -1457,35 +1459,49 @@ fn on_lower_panel(
         1
     };
     let row_at = |rows: &[(u16, usize)]| rows.iter().find(|(y, _)| *y == mouse.row).map(|r| r.1);
-    if m.areas.agent_panel.contains(at) {
+    let typing = matches!(m.focus(), Focus::Agent(_));
+    let over_agent = m.areas.agent_panel.contains(at);
+    let over_changes = m.areas.changes_panel.contains(at);
+    if !(over_agent || over_changes) {
+        return None;
+    }
+    if !clicked {
+        let focused = match m.panel {
+            Panel::Agent { .. } => over_agent,
+            Panel::Changes { .. } => over_changes,
+            _ => false,
+        };
+        if focused && !typing {
+            m.move_in_panel(step);
+        }
+        return Some(Vec::new());
+    }
+    if let Some(c) = m.pane.connection_mut() {
+        c.mode = Mode::Nav;
+    }
+    if over_agent {
         let row = row_at(&m.areas.agent_rows);
         let offset = match m.panel.listed() {
             Panel::Agent { offset } => offset,
             _ => 0,
         };
         m.panel = Panel::Agent { offset };
-        match (clicked, row) {
-            (true, Some(row)) => m.point_at_row(|_, _| row),
-            (true, None) => {}
-            (false, _) => m.move_in_panel(step),
+        if let Some(row) = row {
+            m.point_at_row(|_, _| row);
         }
         return Some(Vec::new());
     }
-    if m.areas.changes_panel.contains(at) {
+    {
         let row = row_at(&m.areas.change_rows);
         let file = match m.panel.listed() {
             Panel::Changes { file } => file,
             _ => 0,
         };
-        m.panel = Panel::Changes { file };
-        match (clicked, row) {
-            (true, Some(row)) => m.panel = Panel::Changes { file: row },
-            (true, None) => {}
-            (false, _) => m.move_in_panel(step),
-        }
-        return Some(Vec::new());
+        m.panel = Panel::Changes {
+            file: row.unwrap_or(file),
+        };
+        Some(Vec::new())
     }
-    None
 }
 
 fn on_mouse(m: &mut Model, mouse: MouseEvent) -> Vec<Effect> {
@@ -1507,6 +1523,9 @@ fn on_mouse(m: &mut Model, mouse: MouseEvent) -> Vec<Effect> {
             let up = matches!(mouse.kind, MouseEventKind::ScrollUp);
             m.docs.scroll_by(if up { -SCROLL } else { SCROLL });
             return Vec::new();
+        }
+        if m.previewing() {
+            return if clicked { enter_agent(m) } else { Vec::new() };
         }
         let forward = match m.focus() {
             Focus::Agent(c) => Some(c),

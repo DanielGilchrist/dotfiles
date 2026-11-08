@@ -2571,6 +2571,20 @@ mod tests {
     }
 
     #[test]
+    fn the_wheel_scrolls_only_the_focused_panel_and_never_moves_focus() {
+        let mut m = fleet(10);
+        m.set_cursor(Cursor::Entry(name("obs-layout-4")));
+        render(&mut m, (100, 30));
+        let (y, _) = m.areas.change_rows[2];
+        click(&mut m, 5, y, crossterm::event::MouseEventKind::ScrollDown);
+        assert!(
+            matches!(m.panel, Focused::Agents),
+            "a wheel over an unfocused [3] leaves focus on the list: {:?}",
+            m.panel
+        );
+    }
+
+    #[test]
     fn clicks_after_the_panel_scrolls_land_on_the_drawn_row() {
         let mut m = fleet(10);
         m.set_cursor(Cursor::Entry(name("obs-layout-4")));
