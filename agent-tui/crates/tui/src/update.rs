@@ -959,6 +959,31 @@ fn diff_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
             open_comment(m);
             return Some(effects);
         }
+        KeyCode::Char('V') => {
+            m.diff_view.anchor = match m.diff_view.anchor {
+                Some(_) => None,
+                None => Some(at),
+            };
+            return Some(effects);
+        }
+        KeyCode::Char(c @ ('J' | 'K')) => {
+            let forward = c == 'J';
+            if matches!(m.hover(), Some(crate::document::Hover::Diff(_))) {
+                if !m.step_file(forward) {
+                    m.info(if forward { "last file" } else { "first file" });
+                }
+                return Some(effects);
+            }
+            match crate::review::file(lines, at, forward) {
+                Some(to) => {
+                    m.diff_view.cursor = to;
+                    m.diff_view.anchor = None;
+                    m.diff_view.reveal = true;
+                }
+                None => m.info(if forward { "last file" } else { "first file" }),
+            }
+            return Some(effects);
+        }
         KeyCode::Char('e') => {
             let root = m.selected_entry()?.path()?.to_path_buf();
             let line = lines.get(at)?;
@@ -1067,6 +1092,21 @@ fn sanitize_paste(text: &str) -> String {
 /// Keys that choose the panel `j`/`k` act on, and those a panel gives its
 /// own meaning. `None` leaves the key to NAV.
 fn on_panel_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
+    if m.main_focused()
+        && code == KeyCode::Esc
+        && m.diff_view.anchor.is_some()
+        && matches!(
+            m.hover(),
+            Some(
+                crate::document::Hover::Diff(_)
+                    | crate::document::Hover::Folder(_)
+                    | crate::document::Hover::Commit(_)
+            )
+        )
+    {
+        m.diff_view.anchor = None;
+        return Some(Vec::new());
+    }
     if m.main_focused() && code == KeyCode::Esc && m.opened.take().is_some() {
         m.diff_view.owner = None;
         return Some(Vec::new());

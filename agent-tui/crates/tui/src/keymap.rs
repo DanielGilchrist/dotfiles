@@ -306,6 +306,13 @@ pub const BINDINGS: &[Binding] = &[
     ),
     Binding::new(
         &["J", "K"],
+        Ctxs::of(&[Ctx::Main]),
+        RankBy(|s| s.diff.then_some(6)),
+        By(|s| s.diff.then_some("file")),
+        "Jump to the previous or next file: in a file's diff it moves [3]'s cursor to the neighbouring file, in a folder or commit it jumps to the file's section.",
+    ),
+    Binding::new(
+        &["J", "K"],
         LISTS,
         RankBy(|s| s.hover.then_some(8)),
         By(|s| s.hover.then_some("scroll")),
@@ -335,6 +342,13 @@ pub const BINDINGS: &[Binding] = &[
         Hidden,
         By(|s| s.tree.then_some("fold all / unfold all")),
         "Collapse every folder in [3], or expand them all.",
+    ),
+    Binding::new(
+        &["V"],
+        Ctxs::of(&[Ctx::Main]),
+        Hidden,
+        By(|s| s.diff.then_some("select lines")),
+        "Start or end a selection of lines at the cursor. c then comments on all of them, and Esc drops the selection.",
     ),
     Binding::new(
         &["⏎"],

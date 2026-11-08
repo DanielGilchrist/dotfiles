@@ -3587,6 +3587,47 @@ mod tests {
     }
 
     #[test]
+    fn v_selects_a_range_for_one_comment_and_j_and_k_in_capitals_change_file() {
+        use crossterm::event::KeyCode;
+        let mut m = on_a_loaded_diff();
+        press(&mut m, KeyCode::Char('V'));
+        press(&mut m, KeyCode::Char('j'));
+        press(&mut m, KeyCode::Char('j'));
+        let text = screen(&render(&mut m, (140, 40))).join("\n");
+        assert!(text.matches('▌').count() >= 3, "{text}");
+        press(&mut m, KeyCode::Char('c'));
+        for c in "range".chars() {
+            press(&mut m, KeyCode::Char(c));
+        }
+        press(&mut m, KeyCode::Enter);
+        let draft: Vec<_> = m.drafts.values().flatten().collect();
+        assert_eq!(draft.len(), 1);
+        assert!(draft[0].label.ends_with(":20-21"), "{}", draft[0].label);
+        assert_eq!(draft[0].quoted.len(), 3);
+
+        press(&mut m, KeyCode::Char('V'));
+        press(&mut m, KeyCode::Esc);
+        assert!(
+            m.main_focused(),
+            "Esc drops a selection before it leaves [0]"
+        );
+        press(&mut m, KeyCode::Esc);
+        assert!(!m.main_focused());
+
+        let mut m = on_a_loaded_diff();
+        let before = m.panel.listed();
+        press(&mut m, KeyCode::Char('J'));
+        assert_ne!(
+            m.panel.listed(),
+            before,
+            "J moves [3]'s cursor to the next file"
+        );
+        assert!(m.main_focused());
+        press(&mut m, KeyCode::Char('K'));
+        assert_eq!(m.panel.listed(), before);
+    }
+
+    #[test]
     fn clicks_and_the_wheel_work_on_tree_rows() {
         let mut m = tree_fleet();
         render(&mut m, (100, 50));

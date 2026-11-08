@@ -1416,6 +1416,33 @@ impl Model {
             .filter(|r| matches!(r.node, Node::Folder { .. }))
     }
 
+    /// Moves [3]'s cursor to the next or previous file row, over folders and
+    /// the branch row, while [0] keeps the keys. `false` when there is none.
+    pub fn step_file(&mut self, forward: bool) -> bool {
+        let Panel::Changes { file } = self.panel.listed() else {
+            return false;
+        };
+        let rows = self.change_rows();
+        let mut at = file.min(rows.saturating_sub(1));
+        loop {
+            at = if forward {
+                at + 1
+            } else {
+                match at.checked_sub(1) {
+                    Some(at) => at,
+                    None => return false,
+                }
+            };
+            if at >= rows {
+                return false;
+            }
+            if self.change_at(at).is_some() {
+                self.set_changes_file(at);
+                return true;
+            }
+        }
+    }
+
     fn set_changes_file(&mut self, to: usize) {
         match &mut self.panel {
             Panel::Changes { file } | Panel::Main(Origin::Changes { file }) => *file = to,
