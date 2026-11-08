@@ -1250,7 +1250,14 @@ pub(super) fn subagent_rows(m: &Model, entry: &Entry, width: usize) -> Vec<Line<
 /// `queued: <first words>` for an agent with messages waiting, cut to
 /// `width`.
 pub(super) fn queued_line(m: &Model, name: &SessionName, width: usize) -> Option<String> {
-    let queue = &m.outboxes.get(name)?.queue;
+    let outbox = m.outboxes.get(name)?;
+    if outbox.stalled(m.activity(name).map(|a| a.events)) {
+        return Some(truncate_end(
+            &format!("queued · waiting for {name} to report"),
+            width,
+        ));
+    }
+    let queue = &outbox.queue;
     let first = crate::update::first_words(queue.front()?.as_ref());
     let more = match queue.len() {
         1 => String::new(),

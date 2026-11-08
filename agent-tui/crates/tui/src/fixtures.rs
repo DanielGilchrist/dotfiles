@@ -37,6 +37,7 @@ pub fn reported(state: State, secs_ago: u64) -> Activity {
         events: 1,
         asks: Vec::new(),
         subagents: BTreeMap::new(),
+        booting: false,
     }
 }
 

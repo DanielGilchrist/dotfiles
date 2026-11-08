@@ -7,7 +7,7 @@ use std::time::{Duration, Instant, SystemTime};
 use agent_core::actions::{Action, CommandLine, Context, EventName, Invocation};
 use agent_core::activity::{Activity, AgentId, State as ActivityState};
 use agent_core::config::ControlKey;
-use agent_core::model::RepoKey;
+use agent_core::model::{EntryState, RepoKey};
 use agent_core::names::{Prompt, SessionName};
 use agent_core::ops::{Approved, Launch};
 use agent_core::paths::{RepoRoot, Typed, typed_path};
@@ -19,9 +19,9 @@ use ratatui::layout::Position;
 use crate::document::Key;
 use crate::model::{
     Answer, Chord, Confirm, Cursor, Direction, Edge, Enter, Field, Focus, Follow, FormKind,
-    INFO_TTL, Inspection, Intent, Mode, Model, NamingState, NewAgent, Overlay, Pane, Panel, Phase,
-    Query, Reach, Screen, StatusKind, SubagentRead, Submission, TerminalFocus, Ticket, Unreachable,
-    View, WorkRoom, fuzzy_match, match_rank, repo_matches, unlisted,
+    HOLD_FOR, Hold, INFO_TTL, Inspection, Intent, Mode, Model, NamingState, NewAgent, Overlay,
+    Pane, Panel, Phase, Query, Reach, Screen, StatusKind, SubagentRead, Submission, TerminalFocus,
+    Ticket, Unreachable, View, WorkRoom, fuzzy_match, match_rank, repo_matches, unlisted,
 };
 use crate::worker::{Job, Msg, Outcome, SendError};
 
@@ -164,6 +164,7 @@ fn step(m: &mut Model, msg: Msg) -> Vec<Effect> {
         Msg::Resize => Vec::new(),
         Msg::Snapshot(Ok((snapshot, warnings))) => {
             m.load(snapshot);
+            track_live(m);
             forget_gone(m);
             if !warnings.is_empty() && warnings != m.last_warnings {
                 let more = if warnings.len() > 1 {
@@ -345,6 +346,8 @@ fn on_launched(m: &mut Model, ticket: Ticket, result: Result<Launch, String>) ->
     m.launching.retain(|(t, _)| *t != ticket);
     match result {
         Ok(launch) => {
+            m.launched_at
+                .insert(launch.session.clone(), SystemTime::now());
             if matches!(&m.overlay, Overlay::New(form) if matches!(form.phase, Phase::Submitting { ticket: t, .. } if t == ticket))
             {
                 m.overlay = Overlay::None;
@@ -428,6 +431,7 @@ fn on_activities(m: &mut Model, activities: HashMap<SessionName, Activity>) -> V
     m.activities = Some(activities);
     forget_subagents(m);
     m.revalidate();
+    release_holds(m);
     flush(m)
 }
 
@@ -514,6 +518,8 @@ fn forget_gone(m: &mut Model) {
     m.subagent_logs.retain(|(name, _), _| known.contains(name));
     m.facts.retain(|name, _| known.contains(name));
     m.outboxes.retain(|name, _| known.contains(name));
+    m.live_since.retain(|name, _| known.contains(name));
+    m.launched_at.retain(|name, _| known.contains(name));
     if m.peek.as_ref().is_some_and(|name| !known.contains(name)) {
         m.peek = None;
     }
@@ -644,6 +650,9 @@ fn activate(m: &mut Model, name: &SessionName) -> Vec<Effect> {
         name: name.clone(),
         ticket,
     };
+    if !matches!(enter, Enter::Attach) {
+        m.launched_at.insert(name.clone(), SystemTime::now());
+    }
     match enter {
         Enter::Attach | Enter::Resurrect => vec![Effect::Attach {
             name: name.clone(),
@@ -866,7 +875,14 @@ fn on_nav_key(m: &mut Model, key: KeyEvent) -> Vec<Effect> {
         return effects;
     }
     match key.code {
-        KeyCode::Char('q') => return vec![Effect::Quit],
+        KeyCode::Char('q') => {
+            let queued: usize = m.outboxes.values().map(|o| o.queue.len()).sum();
+            if queued == 0 {
+                return vec![Effect::Quit];
+            }
+            m.overlay = Overlay::Confirm(Confirm::Quit(queued));
+            return Vec::new();
+        }
         KeyCode::Esc => return enter_agent(m),
         KeyCode::Char('i') => {
             if let Some(entry) = selected {
@@ -1128,15 +1144,18 @@ fn talk(m: &mut Model, to: SessionName, text: String) -> Vec<Effect> {
 }
 
 /// Starts typing the first queued message into every agent that is live,
-/// at rest, and has reported since the last one went in. The worker checks
-/// the store again just before typing.
+/// ready for text (at rest, reported since its session started, past its
+/// boot), not being typed into by the user, and has reported since the last
+/// one went in. The worker checks the store again just before typing.
 fn flush(m: &mut Model) -> Vec<Effect> {
     let ready: Vec<SessionName> = m
         .outboxes
         .iter()
         .filter(|(_, o)| !o.in_flight && !o.queue.is_empty())
+        .filter(|(_, o)| o.hold.is_none_or(|h| h.at.elapsed() > HOLD_FOR))
         .filter(|(name, o)| {
-            m.at_rest(name)
+            m.ready_for_text(name)
+                && !m.typing_into(name)
                 && o.sent_at
                     .is_none_or(|at| m.activity(name).is_some_and(|a| a.events != at))
                 && m.snapshot()
@@ -1147,19 +1166,25 @@ fn flush(m: &mut Model) -> Vec<Effect> {
         .collect();
     let mut effects = Vec::new();
     for name in ready {
+        let not_before = m.not_before(&name);
         if let Some(outbox) = m.outboxes.get_mut(&name)
             && let Some(prompt) = outbox.queue.front().cloned()
         {
             outbox.in_flight = true;
-            effects.push(Effect::Job(Job::Reply { to: name, prompt }));
+            outbox.hold = None;
+            effects.push(Effect::Job(Job::Reply {
+                to: name,
+                prompt,
+                not_before,
+            }));
         }
     }
     effects
 }
 
 /// A typed message was delivered, or wasn't: the first of the queue is
-/// done if it was, kept for the next rest if the agent got busy, and
-/// dropped with the reason otherwise.
+/// done if it was, kept for fresh activity if the agent wasn't ready or its
+/// record couldn't be read, and dropped with the reason otherwise.
 fn on_sent(m: &mut Model, to: &SessionName, result: Result<(), SendError>) -> Vec<Effect> {
     let events = m.activity(to).map(|a| a.events);
     let Some(outbox) = m.outboxes.get_mut(to) else {
@@ -1170,6 +1195,7 @@ fn on_sent(m: &mut Model, to: &SessionName, result: Result<(), SendError>) -> Ve
         Ok(()) => {
             outbox.queue.pop_front();
             outbox.sent_at = events;
+            outbox.sent_instant = Some(Instant::now());
             let left = outbox.queue.len();
             if left == 0 {
                 m.outboxes.remove(to);
@@ -1178,7 +1204,19 @@ fn on_sent(m: &mut Model, to: &SessionName, result: Result<(), SendError>) -> Ve
                 m.info(format!("sent to {to} · {left} queued"));
             }
         }
-        Err(SendError::Busy) => {}
+        Err(SendError::Busy) => {
+            outbox.hold = Some(Hold {
+                events: Some(events.unwrap_or_default()),
+                at: Instant::now(),
+            });
+        }
+        Err(SendError::Unreadable(e)) => {
+            outbox.hold = Some(Hold {
+                events: None,
+                at: Instant::now(),
+            });
+            m.error(format!("couldn't read {to}'s activity: {e} · will retry"));
+        }
         Err(SendError::Failed(e)) => {
             let dropped = outbox.queue.pop_front();
             if outbox.queue.is_empty() {
@@ -1189,6 +1227,45 @@ fn on_sent(m: &mut Model, to: &SessionName, result: Result<(), SendError>) -> Ve
         }
     }
     flush(m)
+}
+
+/// Lifts the holds a fresh read of the store answers.
+fn release_holds(m: &mut Model) {
+    let events: HashMap<SessionName, u64> = m
+        .activities
+        .iter()
+        .flatten()
+        .map(|(name, a)| (name.clone(), a.events))
+        .collect();
+    for (name, outbox) in &mut m.outboxes {
+        if let Some(hold) = outbox.hold
+            && hold
+                .events
+                .is_none_or(|held| events.get(name).copied().unwrap_or_default() != held)
+        {
+            outbox.hold = None;
+        }
+    }
+}
+
+/// Notes which sessions are live now: one that wasn't before gets the
+/// moment it appeared, which a queued message needs a report to postdate.
+fn track_live(m: &mut Model) {
+    let Some(snapshot) = m.snapshot() else {
+        return;
+    };
+    let live: HashSet<SessionName> = snapshot
+        .entries()
+        .filter(|(_, e)| matches!(e.state(), EntryState::Live))
+        .map(|(_, e)| e.name().clone())
+        .collect();
+    let first = m.snapshots <= 1;
+    m.live_since.retain(|name, _| live.contains(name));
+    for name in live {
+        m.live_since
+            .entry(name)
+            .or_insert_with(|| (!first).then(SystemTime::now));
+    }
 }
 
 /// Drops what's queued for `to`, unless its first message is already being
@@ -1607,6 +1684,7 @@ fn on_confirm_key(m: &mut Model, confirm: Confirm, key: &KeyEvent) -> Vec<Effect
             drop_connection_to(m, running.name());
             vec![Effect::Job(Job::Kill(running))]
         }
+        (Confirm::Quit(_), KeyCode::Char('y') | KeyCode::Enter) => vec![Effect::Quit],
         (_, KeyCode::Esc | KeyCode::Char('n' | 'q')) => Vec::new(),
         (Confirm::Remove(proposal), KeyCode::Char(key)) => match proposal.answer(key) {
             Ok(Answer::Remove(approved)) => remove(m, approved),
@@ -4187,8 +4265,14 @@ mod tests {
                 result: Err(crate::worker::SendError::Busy),
             },
         );
-        assert_eq!(replies(&effects), ["first"], "still first, retried at rest");
+        assert!(
+            replies(&effects).is_empty(),
+            "held until the record changes"
+        );
         assert_eq!(queue(&m), ["first", "second"]);
+        set_state(&mut m, agent, done(), 5);
+        let all = m.activities.clone().expect("reported");
+        assert_eq!(replies(&update(&mut m, Msg::Activities(all))), ["first"]);
 
         let effects = sent(&mut m, agent);
         assert!(
@@ -4224,6 +4308,180 @@ mod tests {
                 .as_ref()
                 .is_some_and(|s| s.text.contains("no pty") && s.text.contains("rebase onto main"))
         );
+    }
+
+    const AGENT: &str = "auth-refresh-2";
+
+    fn report(m: &mut Model, mut activity: Activity) -> Vec<Effect> {
+        activity.events = m.activity(&name(AGENT)).map_or(0, |a| a.events) + 1;
+        update(m, Msg::Activities(HashMap::from([(name(AGENT), activity)])))
+    }
+
+    fn live_since(m: &mut Model, secs_ago: u64) {
+        m.live_since.insert(
+            name(AGENT),
+            Some(SystemTime::now() - Duration::from_secs(secs_ago)),
+        );
+    }
+
+    #[test]
+    fn a_record_from_before_a_restart_never_gets_typed_into() {
+        let mut m = crate::fixtures::fleet(10);
+        set_state(&mut m, AGENT, done(), 1);
+        live_since(&mut m, 2);
+        let effects = talk_to(&mut m, AGENT, "rebase");
+        assert!(
+            replies(&effects).is_empty(),
+            "the record is 5s old, the session 2s"
+        );
+        assert_eq!(replies(&tick(&mut m)), Vec::<String>::new());
+
+        let effects = report(&mut m, reported(done(), 0));
+        let [Effect::Job(Job::Reply { not_before, .. })] = effects.as_slice() else {
+            panic!("a report after the start sends it");
+        };
+        assert_eq!(
+            *not_before,
+            m.not_before(&name(AGENT)),
+            "the worker gets the bound"
+        );
+        assert!(not_before.is_some());
+    }
+
+    #[test]
+    fn a_session_resurrected_by_this_tui_waits_for_a_report_after_it() {
+        let mut m = crate::fixtures::fleet(10);
+        set_state(&mut m, AGENT, done(), 1);
+        m.launched_at.insert(name(AGENT), SystemTime::now());
+        assert_eq!(
+            replies(&talk_to(&mut m, AGENT, "rebase")),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn a_fresh_session_start_gets_quiet_time_for_a_startup_dialog() {
+        let mut m = crate::fixtures::fleet(10);
+        set_state(&mut m, AGENT, working(), 1);
+        live_since(&mut m, 30);
+        talk_to(&mut m, AGENT, "rebase");
+        let mut booted = reported(done(), 1);
+        booted.booting = true;
+        assert!(
+            replies(&report(&mut m, booted)).is_empty(),
+            "1s after SessionStart"
+        );
+        let mut quiet = reported(done(), 6);
+        quiet.booting = true;
+        assert_eq!(replies(&report(&mut m, quiet)), ["rebase"]);
+    }
+
+    #[test]
+    fn busy_holds_the_queue_until_the_record_changes() {
+        let mut m = crate::fixtures::fleet(10);
+        set_state(&mut m, AGENT, done(), 1);
+        talk_to(&mut m, AGENT, "rebase");
+        let busy = || Msg::Sent {
+            to: name(AGENT),
+            result: Err(SendError::Busy),
+        };
+        assert!(replies(&update(&mut m, busy())).is_empty(), "no hot loop");
+        assert_eq!(replies(&tick(&mut m)), Vec::<String>::new());
+        let same = m.activities.clone().expect("reported");
+        assert!(
+            replies(&update(&mut m, Msg::Activities(same))).is_empty(),
+            "unchanged"
+        );
+        let effects = report(&mut m, reported(done(), 0));
+        assert_eq!(replies(&effects), ["rebase"], "a changed record retries");
+    }
+
+    #[test]
+    fn an_unreadable_store_keeps_the_message_and_retries() {
+        let mut m = crate::fixtures::fleet(10);
+        set_state(&mut m, AGENT, done(), 1);
+        talk_to(&mut m, AGENT, "rebase");
+        let effects = update(
+            &mut m,
+            Msg::Sent {
+                to: name(AGENT),
+                result: Err(SendError::Unreadable("io".into())),
+            },
+        );
+        assert_eq!(replies(&effects), Vec::<String>::new());
+        assert_eq!(m.outboxes[&name(AGENT)].queue.len(), 1, "still queued");
+        let same = m.activities.clone().expect("reported");
+        assert_eq!(replies(&update(&mut m, Msg::Activities(same))), ["rebase"]);
+    }
+
+    #[test]
+    fn nothing_is_typed_while_the_user_types_into_that_agent() {
+        let mut m = crate::fixtures::fleet(10);
+        set_state(&mut m, AGENT, working(), 1);
+        talk_to(&mut m, AGENT, "rebase");
+        let term = agent_term::Terminal::spawn(
+            &agent_core::process::LaunchSpec::new("cat"),
+            agent_term::TermSize::of(ratatui::layout::Rect::new(0, 0, 80, 24)).expect("size"),
+            Box::new(agent_term::Vt100::new(
+                agent_term::TermSize::of(ratatui::layout::Rect::new(0, 0, 80, 24)).expect("size"),
+            )) as Box<dyn agent_term::Emulator>,
+        )
+        .expect("a pty");
+        m.pane = Pane::Connected(crate::model::Connection {
+            name: name(AGENT),
+            term,
+            others: None,
+            mode: Mode::Agent,
+            opened: Instant::now(),
+        });
+        assert_eq!(
+            replies(&report(&mut m, reported(done(), 0))),
+            Vec::<String>::new()
+        );
+        if let Some(c) = m.pane.connection_mut() {
+            c.mode = Mode::Nav;
+        }
+        assert_eq!(replies(&tick(&mut m)), ["rebase"], "resumes in NAV");
+    }
+
+    #[test]
+    fn a_queue_the_agent_never_reports_on_says_it_is_waiting() {
+        let mut m = crate::fixtures::fleet(10);
+        set_state(&mut m, AGENT, done(), 1);
+        talk_to(&mut m, AGENT, "/compact");
+        talk_to(&mut m, AGENT, "next");
+        sent(&mut m, AGENT);
+        let outbox = &m.outboxes[&name(AGENT)];
+        assert!(!outbox.stalled(Some(1)), "just sent");
+        let mut outbox = crate::model::Outbox {
+            sent_instant: Instant::now().checked_sub(crate::model::STALL_AFTER * 2),
+            ..Default::default()
+        };
+        outbox.queue.push_back("next".parse().expect("a prompt"));
+        outbox.sent_at = Some(1);
+        assert!(outbox.stalled(Some(1)));
+        assert!(!outbox.stalled(Some(2)), "it reported");
+        assert!(replies(&tick(&mut m)).is_empty(), "never sent blindly");
+    }
+
+    #[test]
+    fn q_with_queued_messages_asks_before_quitting() {
+        let mut m = crate::fixtures::fleet(10);
+        assert!(matches!(
+            update(&mut m, key(KeyCode::Char('q'))).as_slice(),
+            [Effect::Quit]
+        ));
+        set_state(&mut m, AGENT, working(), 1);
+        talk_to(&mut m, AGENT, "rebase");
+        assert!(update(&mut m, key(KeyCode::Char('q'))).is_empty());
+        assert!(matches!(m.overlay, Overlay::Confirm(Confirm::Quit(1))));
+        update(&mut m, key(KeyCode::Esc));
+        assert!(matches!(m.overlay, Overlay::None));
+        update(&mut m, key(KeyCode::Char('q')));
+        assert!(matches!(
+            update(&mut m, key(KeyCode::Char('y'))).as_slice(),
+            [Effect::Quit]
+        ));
     }
 
     #[test]

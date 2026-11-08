@@ -390,6 +390,12 @@ fn turn_body(m: &Model, name: &SessionName, columns: usize) -> Option<Body> {
                 dim(),
             )
         }));
+        if queue.stalled(m.activity(name).map(|a| a.events)) {
+            rows.push(Line::styled(
+                truncate_end(&format!("queued · waiting for {name} to report"), columns),
+                dim(),
+            ));
+        }
         rows.push(Line::raw(""));
     }
     let subagents = subagent_rows(m, entry, columns);

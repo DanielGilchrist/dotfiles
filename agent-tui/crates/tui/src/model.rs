@@ -697,6 +697,8 @@ impl Query {
 
 pub enum Confirm {
     Kill(Running),
+    /// Quitting would lose this many queued messages.
+    Quit(usize),
     Remove(Proposal),
 }
 
@@ -807,6 +809,39 @@ pub struct Outbox {
     /// How many events the agent had reported when the last one was typed:
     /// the next waits for it to report again, since hooks lag the typing.
     pub sent_at: Option<u64>,
+    /// When the last one was typed.
+    pub sent_instant: Option<Instant>,
+    /// The worker found the agent not ready or unreadable: wait for fresh
+    /// activity before asking again.
+    pub hold: Option<Hold>,
+}
+
+/// Why a queue isn't being flushed until the agent's record is read again.
+#[derive(Debug, Clone, Copy)]
+pub struct Hold {
+    /// The record's event count when the worker refused. `None` lifts the
+    /// hold at the next read of the store, whatever it says.
+    pub events: Option<u64>,
+    pub at: Instant,
+}
+
+/// How long a hold lasts with no new activity before the worker is asked
+/// again, which rechecks the store itself.
+pub const HOLD_FOR: Duration = Duration::from_secs(5);
+
+/// How long after typing a message with no hook report before the queue
+/// says it's waiting on the agent.
+pub const STALL_AFTER: Duration = Duration::from_secs(30);
+
+impl Outbox {
+    /// A message went in and the agent hasn't reported since, which a slash
+    /// or `!` command never does.
+    pub fn stalled(&self, events: Option<u64>) -> bool {
+        !self.queue.is_empty()
+            && !self.in_flight
+            && self.sent_at.is_some_and(|at| events == Some(at))
+            && self.sent_instant.is_some_and(|t| t.elapsed() > STALL_AFTER)
+    }
 }
 
 pub enum Overlay {
@@ -1029,6 +1064,11 @@ pub struct Model {
     pub peek: Option<SessionName>,
     /// Messages waiting for their agents to be at rest.
     pub outboxes: HashMap<SessionName, Outbox>,
+    /// When each running session was first seen live. `None` for sessions
+    /// already live at the first snapshot, whose start isn't known.
+    pub live_since: HashMap<SessionName, Option<SystemTime>>,
+    /// When this TUI last started or resurrected each session.
+    pub launched_at: HashMap<SessionName, SystemTime>,
     /// What the main view [0] reads when it isn't the terminal.
     pub docs: Documents,
     pub screen: Screen,
@@ -1088,6 +1128,8 @@ impl Model {
             subagent_reads: HashMap::new(),
             peek: None,
             outboxes: HashMap::new(),
+            live_since: HashMap::new(),
+            launched_at: HashMap::new(),
             docs: Documents::default(),
             screen: Screen::Split,
             sidebar_shown: true,
@@ -1400,10 +1442,26 @@ impl Model {
         Ok(entry.name())
     }
 
-    /// Whether the agent is live and between turns, so typed text can't
-    /// answer a permission prompt that opens before its report arrives.
-    pub fn at_rest(&self, name: &SessionName) -> bool {
-        self.activity(name).is_some_and(Activity::at_rest)
+    /// The moment a hook report has to postdate before typing into `name`
+    /// is safe: its session's latest start as far as this TUI knows.
+    pub fn not_before(&self, name: &SessionName) -> Option<SystemTime> {
+        let seen = self.live_since.get(name).copied().flatten();
+        let launched = self.launched_at.get(name).copied();
+        seen.max(launched)
+    }
+
+    /// Whether text typed now into `name` can't answer a prompt as far as
+    /// the record shows.
+    pub fn ready_for_text(&self, name: &SessionName) -> bool {
+        self.activity(name)
+            .is_some_and(|a| a.ready_for_text(self.not_before(name), SystemTime::now()))
+    }
+
+    /// Whether the user's keys are going to `name`'s terminal.
+    pub fn typing_into(&self, name: &SessionName) -> bool {
+        self.pane
+            .connection()
+            .is_some_and(|c| &c.name == name && c.mode == Mode::Agent)
     }
 
     /// The selected agent's subagents, oldest first, as [2] lists them.

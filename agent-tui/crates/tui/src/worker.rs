@@ -5,6 +5,8 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 
 use agent_core::actions::CommandLine;
+use std::time::SystemTime;
+
 use agent_core::activity::{Activity, AgentId};
 use agent_core::config::Sources;
 use agent_core::discover;
@@ -116,6 +118,8 @@ pub enum Outcome {
 pub enum SendError {
     /// The store says the agent isn't at rest: try again when it is.
     Busy,
+    /// The store couldn't be read, so nothing was typed: try again.
+    Unreadable(String),
     Failed(String),
 }
 
@@ -125,6 +129,9 @@ pub enum Job {
     Reply {
         to: SessionName,
         prompt: Prompt,
+        /// The agent must have reported after this: its session was live
+        /// by then, so the record isn't from an earlier run.
+        not_before: Option<SystemTime>,
     },
     Start {
         at: Startable,
@@ -611,13 +618,21 @@ fn run(backend: &Arc<Backend>, job: Job, msgs: &Sender<Msg>) -> Option<Msg> {
             Ok(()) => return None,
             Err(e) => Msg::Done(Err(describe(&e))),
         },
-        Job::Reply { to, prompt } => {
+        Job::Reply {
+            to,
+            prompt,
+            not_before,
+        } => {
             let result = match svc.store.activities() {
-                Ok(all) if all.get(&to).is_some_and(Activity::at_rest) => {
+                Ok(all)
+                    if all
+                        .get(&to)
+                        .is_some_and(|a| a.ready_for_text(not_before, SystemTime::now())) =>
+                {
                     ops::inject(svc, &to, &prompt).map_err(|e| SendError::Failed(err(e)))
                 }
                 Ok(_) => Err(SendError::Busy),
-                Err(e) => Err(SendError::Failed(describe(&e))),
+                Err(e) => Err(SendError::Unreadable(describe(&e))),
             };
             Msg::Sent { to, result }
         }

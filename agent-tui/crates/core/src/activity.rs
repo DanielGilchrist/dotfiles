@@ -242,7 +242,14 @@ pub struct Activity {
     /// Open questions, at most one per asker, oldest first.
     pub asks: Vec<Ask>,
     pub subagents: BTreeMap<AgentId, Subagent>,
+    /// The last thing reported was a session starting, which a dialog may
+    /// still be covering.
+    pub booting: bool,
 }
+
+/// How long a session that just reported starting must stay quiet before
+/// typed text is safe: a startup dialog (trust, resume) fires no hook.
+pub const BOOT_QUIET: Duration = Duration::from_secs(5);
 
 impl Activity {
     /// The activity after `reported` happened at `now`. The time in state
@@ -257,7 +264,15 @@ impl Activity {
             events: 0,
             asks: Vec::new(),
             subagents: BTreeMap::new(),
+            booting: false,
         });
+        let booting = matches!(
+            reported,
+            Reported {
+                origin: Origin::Main,
+                event: Event::Started
+            }
+        );
         let before = activity.state.clone();
         let answered = activity.answer(&reported);
         activity.apply(reported, answered, now);
@@ -266,6 +281,7 @@ impl Activity {
         }
         activity.heard = now;
         activity.events += 1;
+        activity.booting = booting;
         activity
     }
 
@@ -500,6 +516,19 @@ impl Activity {
             && self.running() == 0
     }
 
+    /// [`Self::at_rest`], and the harness has reported after `not_before`
+    /// (the session was live by then, so this isn't a record of an earlier
+    /// run), and a session that only just reported starting has had
+    /// [`BOOT_QUIET`] to show a dialog.
+    pub fn ready_for_text(&self, not_before: Option<SystemTime>, now: SystemTime) -> bool {
+        self.at_rest()
+            && not_before.is_none_or(|t| self.heard > t)
+            && !(self.booting
+                && now
+                    .duration_since(self.heard)
+                    .is_ok_and(|quiet| quiet < BOOT_QUIET))
+    }
+
     /// How many subagents are still running.
     pub fn running(&self) -> usize {
         self.subagents
@@ -562,6 +591,8 @@ struct Stored {
     asks: Vec<Ask>,
     #[serde(default)]
     subagents: BTreeMap<AgentId, Subagent>,
+    #[serde(default)]
+    booting: bool,
 }
 
 #[derive(Deserialize)]
@@ -587,6 +618,7 @@ impl From<Stored> for Activity {
             events,
             mut asks,
             subagents,
+            booting,
         } = stored;
         let state = match state {
             StoredState::Current(state) => state,
@@ -608,6 +640,7 @@ impl From<Stored> for Activity {
             events,
             asks,
             subagents,
+            booting,
         }
     }
 }
@@ -1132,6 +1165,36 @@ mod tests {
                 "{json}"
             );
         }
+    }
+
+    #[test]
+    fn text_waits_for_a_report_after_the_session_went_live() {
+        let a = run(vec![(10, main(finished(&[])))]);
+        assert!(a.ready_for_text(None, at(11)));
+        assert!(a.ready_for_text(Some(at(9)), at(11)));
+        assert!(
+            !a.ready_for_text(Some(at(10)), at(11)),
+            "heard at the bound"
+        );
+        assert!(
+            !a.ready_for_text(Some(at(20)), at(30)),
+            "a record from an earlier run"
+        );
+    }
+
+    #[test]
+    fn a_session_that_only_just_started_gets_time_to_show_a_dialog() {
+        let a = run(vec![(10, main(finished(&[]))), (20, main(Event::Started))]);
+        assert!(a.at_rest() && a.booting);
+        assert!(!a.ready_for_text(Some(at(15)), at(21)));
+        assert!(a.ready_for_text(Some(at(15)), at(20 + BOOT_QUIET.as_secs())));
+        let a = run(vec![
+            (20, main(Event::Started)),
+            (21, main(user("go"))),
+            (22, main(finished(&[]))),
+        ]);
+        assert!(!a.booting);
+        assert!(a.ready_for_text(Some(at(15)), at(23)));
     }
 
     #[test]

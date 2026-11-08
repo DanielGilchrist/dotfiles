@@ -68,7 +68,7 @@ types into the embedded session. `?` shows every key.
 | `J K` | From [2] or [3], scroll [0] two rows without focusing it |
 | `⌃D ⌃U` | Half a page in the list, or in [0] from [2] or [3] |
 | `+` `_` | [0] full width / back. Keys keep going to the focused panel, so `j` flips to the next file |
-| `t` | Message the selected live agent, from any panel and from the peek. An agent at rest gets it on `⏎`. Otherwise it is queued and typed the first time the agent is at rest, in order, one per rest. Queued messages show as `queued: …` on the card and in the status bar, and `⌃X` in the box clears them. Agents without hook activity can't be messaged |
+| `t` | Message the selected live agent, from any panel and from the peek. An agent at rest gets it on `⏎`. Otherwise it is queued and typed the first time the agent is at rest, in order, one per rest. Queued messages show as `queued: …` on the card and in the status bar, and `⌃X` in the box clears them. Nothing is typed until the agent reports after its session started, or while you're typing into it. `q` confirms if messages are queued. Agents without hook activity can't be messaged |
 | `v` | Peek: a floating window with the agent's live terminal at the pty's size. Keys never reach it. `t` talks, `i` or `⏎` enters AGENT, `Esc` or `v` closes |
 | `.` | Show every checkout, or only those with a live session (the default). `+7 hidden` in [1]'s corner says how many are left out |
 | `Space` / `/` | Switcher (fuzzy), `⌃N ⌃P` to move |

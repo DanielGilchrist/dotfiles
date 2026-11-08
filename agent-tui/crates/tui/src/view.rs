@@ -1499,6 +1499,18 @@ fn draw_confirm(frame: &mut Frame<'_>, confirm: &Confirm) {
             [destructive("y/⏎", "kill"), hints(&[("n/Esc", "cancel")])].concat(),
             warn,
         ),
+        Confirm::Quit(queued) => (
+            "Quit with messages queued".to_string(),
+            vec![
+                Line::raw(format!(
+                    "{queued} queued message{} would be lost. Agents keep running.",
+                    if *queued == 1 { "" } else { "s" }
+                )),
+                Line::styled("Queues live in this TUI, not on disk.", dim()),
+            ],
+            [destructive("y/⏎", "quit"), hints(&[("n/Esc", "stay")])].concat(),
+            warn,
+        ),
         Confirm::Remove(proposal) => {
             let plan = proposal.plan();
             let mut body = vec![match plan.deletes() {
@@ -1637,7 +1649,7 @@ fn draw_talk(frame: &mut Frame<'_>, m: &Model, to: &SessionName, text: &str) {
     } else {
         &[("⏎", "queue"), ("⌃X", "clear queue"), ("Esc", "close")]
     };
-    let title = if m.at_rest(to) {
+    let title = if m.ready_for_text(to) {
         format!("Message {to}")
     } else {
         format!("Message {to} · queued until it's at rest")
@@ -1715,20 +1727,54 @@ fn draw_peek(frame: &mut Frame<'_>, m: &Model) {
     title_spans.extend(title);
     title_spans.push(Span::raw(" "));
     let fits = line_width(&title_spans) + line_width(&keys) + 4 <= usize::from(area.width);
-    let block = Block::bordered()
+    let cropped = cols > area.width.saturating_sub(2) || rows > area.height.saturating_sub(2);
+    let mut block = Block::bordered()
         .border_type(BorderType::Double)
         .border_style(accent())
         .title_top(Line::from(title_spans))
         .title_top(Line::from(if fits { keys } else { Vec::new() }).right_aligned());
+    if cropped {
+        block = block.title_bottom(Line::styled(" cropped, showing the bottom ", dim()));
+    }
     let inner = block.inner(area);
     frame.render_widget(block, area);
     match &m.pane {
-        Pane::Connected(c) if &c.name == name => c.term.render(inner, frame.buffer_mut(), false),
+        Pane::Connected(c) if &c.name == name => {
+            if cropped {
+                render_bottom(&c.term, (cols, rows), inner, frame.buffer_mut());
+            } else {
+                c.term.render(inner, frame.buffer_mut(), false);
+            }
+        }
         _ => centered(
             frame,
             inner,
             vec![Line::styled(format!("attaching to {name}…"), dim())],
         ),
+    }
+}
+
+/// Draws a terminal of `size` into `area`, dropping rows from the top and
+/// columns from the right so the bottom, where the prompt is, stays visible.
+fn render_bottom(
+    term: &agent_term::Terminal<Box<dyn agent_term::Emulator>>,
+    (cols, rows): (u16, u16),
+    area: Rect,
+    buf: &mut ratatui::buffer::Buffer,
+) {
+    let full = Rect::new(0, 0, cols, rows);
+    let mut scratch = ratatui::buffer::Buffer::empty(full);
+    term.render(full, &mut scratch, false);
+    let skip = rows.saturating_sub(area.height);
+    for y in 0..area.height.min(rows) {
+        for x in 0..area.width.min(cols) {
+            if let (Some(from), Some(to)) = (
+                scratch.cell((x, y + skip)),
+                buf.cell_mut((area.x + x, area.y + y)),
+            ) {
+                *to = from.clone();
+            }
+        }
     }
 }
 
