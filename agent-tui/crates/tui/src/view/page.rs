@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use agent_core::activity::AgentId;
 use agent_core::model::{Head, RepoKey};
-use agent_core::names::SessionName;
+use agent_core::names::{CarriageReturn, SessionName, clean};
 use agent_core::ports::{BranchLog, Change, Compared, FileDiff, Lines};
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
@@ -260,10 +260,11 @@ fn mark_lines(m: &Model, out: &mut [Line<'static>], from: usize, top: usize, hei
         .selected_entry()
         .and_then(|e| m.drafts.get(e.name()))
         .map_or(&[][..], Vec::as_slice);
+    let rev = crate::update::commit_rev(m);
     let (lo, hi) = m.diff_view.span();
     for (at, line) in m.docs.lines().iter().enumerate() {
         let selected = m.main_focused() && (lo..=hi).contains(&at);
-        let commented = drafts.iter().any(|c| c.covers(line));
+        let commented = drafts.iter().any(|c| c.covers(line, rev.as_deref()));
         if !selected && !commented {
             continue;
         }
@@ -645,7 +646,7 @@ fn branch_rows(
             old: None,
             new: None,
             text: text.to_string(),
-            edit: 1,
+            edit: std::num::NonZeroUsize::MIN,
         };
     if log.commits.is_empty() && log.uncommitted.is_empty() {
         rows.push(Line::from(vec![
@@ -774,7 +775,7 @@ fn turn_body(m: &Model, name: &SessionName, columns: usize) -> Option<Body> {
         rows.push(Line::raw(""));
     }
     if let Some(queue) = m.outboxes.get(name) {
-        rows.extend(queue.queue.iter().map(|q| {
+        rows.extend(queue.iter().map(|q| {
             Line::styled(
                 truncate_end(
                     &format!("queued: {}", crate::update::first_words(q.as_ref())),
@@ -954,7 +955,8 @@ fn hard_wrap(text: &str, width: usize) -> Vec<String> {
     let width = width.max(1);
     let mut rows = vec![String::new()];
     let mut used = 0;
-    for c in text.chars().filter(|c| !c.is_control()) {
+    let text = clean(text, CarriageReturn::Drop, None);
+    for c in text.chars().filter(|&c| c != '\n' && c != '\t') {
         let w = c.width().unwrap_or(0);
         if used + w > width {
             rows.push(String::new());

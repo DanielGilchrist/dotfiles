@@ -398,7 +398,7 @@ pub const BINDINGS: &[Binding] = &[
         Ctxs::of(&[Ctx::Main]),
         RankBy(|s| s.diff.then_some(7)),
         By(|s| s.diff.then_some("edit line")),
-        "Open the file in $EDITOR at the line under the cursor. A removed line opens at the line that now follows it.",
+        "Open the file in $EDITOR at the line under the cursor. A removed line opens at the line that now follows it. Not available in a commit's diff.",
     ),
     Binding::new(
         &["e"],

@@ -605,7 +605,7 @@ impl Vcs for Git {
         if !cut && !out.status.success() {
             return Err(process::failed(&cmd, &out));
         }
-        Ok(split_commit(&String::from_utf8_lossy(&out.stdout)))
+        Ok(split_commit(&String::from_utf8_lossy(&out.stdout), cut))
     }
 
     fn file_diff(
@@ -657,9 +657,100 @@ impl Vcs for Git {
     }
 }
 
+/// Undoes git's quoting of a path with a quote, backslash or control
+/// character in it: `"a\"b"` with C escapes and octal bytes.
+fn unquote(token: &str) -> Option<String> {
+    let inner = token.strip_prefix('"')?.strip_suffix('"')?;
+    let mut bytes = Vec::with_capacity(inner.len());
+    let mut chars = inner.bytes().peekable();
+    while let Some(b) = chars.next() {
+        if b != b'\\' {
+            bytes.push(b);
+            continue;
+        }
+        let escaped = chars.next()?;
+        bytes.push(match escaped {
+            b'a' => 7,
+            b'b' => 8,
+            b'f' => 12,
+            b'n' => b'\n',
+            b'r' => b'\r',
+            b't' => b'\t',
+            b'v' => 11,
+            b'0'..=b'7' => {
+                let mut value = u32::from(escaped - b'0');
+                for _ in 0..2 {
+                    let digit = chars.next_if(|d| (b'0'..=b'7').contains(d))?;
+                    value = value * 8 + u32::from(digit - b'0');
+                }
+                u8::try_from(value).ok()?
+            }
+            other => other,
+        });
+    }
+    Some(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// A path as a header line gives it, minus the `prefix` git puts on it:
+/// possibly quoted, and followed by a tab when it has a space in it.
+fn header_path(raw: &str, prefix: &str) -> Option<String> {
+    let path = if raw.starts_with('"') {
+        unquote(raw)?
+    } else {
+        raw.strip_suffix('\t').unwrap_or(raw).to_string()
+    };
+    path.strip_prefix(prefix).map(str::to_string)
+}
+
+/// `x` in `a/x b/x`, which a path with ` b/` in it can't confuse: both halves
+/// are the same length.
+fn same_path_halves(rest: &str) -> Option<String> {
+    let path_len = rest.len().checked_sub(5)? / 2;
+    let (old, new) = (rest.get(..2 + path_len)?, rest.get(3 + path_len..)?);
+    let path = old.strip_prefix("a/")?;
+    (rest.as_bytes().get(2 + path_len) == Some(&b' ') && new.strip_prefix("b/") == Some(path))
+        .then(|| path.to_string())
+}
+
+/// The new path in `diff --git a/x b/y`, for diffs with no `+++` line.
+fn git_header_path(rest: &str) -> Option<String> {
+    let second = if rest.starts_with('"') {
+        let mut escaped = false;
+        let end = rest.char_indices().skip(1).find(|&(_, c)| {
+            let closes = c == '"' && !escaped;
+            escaped = c == '\\' && !escaped;
+            closes
+        })?;
+        rest[end.0 + 1..].trim_start()
+    } else if let Some(at) = rest.find(" \"") {
+        &rest[at + 1..]
+    } else {
+        return same_path_halves(rest).or_else(|| {
+            rest.strip_prefix("a/")?
+                .split(" b/")
+                .next()
+                .map(str::to_string)
+        });
+    };
+    header_path(second, "b/")
+}
+
+/// The path a file's chunk of `git show` output is about.
+fn chunk_path(chunk: &[&str]) -> Option<String> {
+    let first_of = |prefix: &str, strip: &str| {
+        chunk
+            .iter()
+            .find_map(|l| l.strip_prefix(prefix).and_then(|r| header_path(r, strip)))
+    };
+    first_of("+++ ", "b/")
+        .or_else(|| first_of("rename to ", ""))
+        .or_else(|| first_of("--- ", "a/"))
+        .or_else(|| git_header_path(chunk[0].strip_prefix("diff --git ")?))
+}
+
 /// The per-file diffs in `git show` output, in git's order, with their
-/// counts.
-fn split_commit(out: &str) -> Vec<(Change, FileDiff)> {
+/// counts. A `cut` output ended in the middle of its last file.
+fn split_commit(out: &str, cut: bool) -> Vec<(Change, FileDiff)> {
     let mut chunks: Vec<Vec<&str>> = Vec::new();
     for line in out.lines() {
         if line.starts_with("diff --git ") {
@@ -669,21 +760,15 @@ fn split_commit(out: &str) -> Vec<(Change, FileDiff)> {
             chunk.push(line);
         }
     }
+    let last = chunks.len().saturating_sub(1);
     chunks
         .into_iter()
-        .filter_map(|chunk| {
-            let path = chunk
-                .iter()
-                .find_map(|l| l.strip_prefix("+++ b/"))
-                .or_else(|| chunk.iter().find_map(|l| l.strip_prefix("--- a/")))
-                .or_else(|| {
-                    chunk[0]
-                        .strip_prefix("diff --git a/")
-                        .and_then(|rest| rest.split(" b/").next())
-                })?;
+        .enumerate()
+        .filter_map(|(i, chunk)| {
+            let path = chunk_path(&chunk)?;
             let text = chunk.join("\n");
-            let diff =
-                parse_diff(&text, DIFF_LINES, false).unwrap_or(FileDiff::Binary { bytes: None });
+            let diff = parse_diff(&text, DIFF_LINES, cut && i == last)
+                .unwrap_or(FileDiff::Binary { bytes: None });
             let lines = match &diff {
                 FileDiff::Binary { .. } => Lines::Binary,
                 FileDiff::Text { lines, .. } => Lines::Counted {
@@ -1314,7 +1399,7 @@ mod tests {
     #[test]
     fn a_commit_splits_into_files_with_counts() {
         let out = "diff --git a/src/a.rs b/src/a.rs\nindex 1..2 100644\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1,2 +1,2 @@\n-old\n+new\n keep\ndiff --git a/img.png b/img.png\nBinary files a/img.png and b/img.png differ\n";
-        let files = split_commit(out);
+        let files = split_commit(out, false);
         assert_eq!(files.len(), 2);
         assert_eq!(files[0].0.path, PathBuf::from("src/a.rs"));
         assert_eq!(
@@ -1326,5 +1411,50 @@ mod tests {
         );
         assert_eq!(files[1].0.path, PathBuf::from("img.png"));
         assert_eq!(files[1].0.lines, Lines::Binary);
+    }
+
+    #[test]
+    fn commit_paths_survive_quoting_tabs_deletions_and_renames() {
+        let out = concat!(
+            "diff --git \"a/q\\\"x.rs\" \"b/q\\\"x.rs\"\n--- \"a/q\\\"x.rs\"\n+++ \"b/q\\\"x.rs\"\n@@ -1 +1 @@\n-a\n+b\n",
+            "diff --git a/my file.rs b/my file.rs\n--- a/my file.rs\t\n+++ b/my file.rs\t\n@@ -1 +1 @@\n-a\n+b\n",
+            "diff --git \"a/caf\\303\\251.rs\" \"b/caf\\303\\251.rs\"\ndeleted file mode 100644\n--- \"a/caf\\303\\251.rs\"\n+++ /dev/null\n@@ -1 +0,0 @@\n-a\n",
+            "diff --git a/old.rs b/new name.rs\nsimilarity index 100%\nrename from old.rs\nrename to new name.rs\n",
+            "diff --git a/mode.sh b/mode.sh\nold mode 100644\nnew mode 100755\n",
+            "diff --git a/dir b/x b/dir b/x\nold mode 100644\nnew mode 100755\n",
+        );
+        let paths: Vec<_> = split_commit(out, false)
+            .into_iter()
+            .map(|(c, _)| c.path)
+            .collect();
+        assert_eq!(
+            paths,
+            [
+                PathBuf::from("q\"x.rs"),
+                PathBuf::from("my file.rs"),
+                PathBuf::from("caf\u{e9}.rs"),
+                PathBuf::from("new name.rs"),
+                PathBuf::from("mode.sh"),
+                PathBuf::from("dir b/x"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_cut_commit_says_so_in_its_last_file() {
+        let out = "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1,2 +1,2 @@\n-a\n+b\ndiff --git a/b.rs b/b.rs\n--- a/b.rs\n+++ b/b.rs\n@@ -1 +1 @@\n-x\n+par";
+        let files = split_commit(out, true);
+        let text = |i: usize| match &files[i].1 {
+            FileDiff::Text { lines, .. } => lines.clone(),
+            FileDiff::Binary { .. } => panic!("text"),
+        };
+        assert!(text(0).iter().all(|l| !l.contains("too big")));
+        assert!(
+            text(1)
+                .last()
+                .is_some_and(|l| l.contains("too big to show")),
+            "{:?}",
+            text(1)
+        );
     }
 }

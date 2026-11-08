@@ -20,7 +20,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use agent_core::config::Config;
-use agent_core::names::SessionName;
+use agent_core::names::{CarriageReturn, SessionName, clean};
 use agent_core::ops::Backend;
 use agent_core::ports::{ClientId, HarnessId};
 use agent_core::process::LaunchSpec;
@@ -281,7 +281,7 @@ impl Runtime {
         terminal: &mut DefaultTerminal,
         cwd: &Path,
         arg: Option<&Path>,
-        line: Option<usize>,
+        line: Option<std::num::NonZeroUsize>,
     ) -> Result<Edited> {
         let editor = std::env::var("EDITOR").unwrap_or_else(|_| "nvim".into());
         let argv =
@@ -377,7 +377,7 @@ impl Runtime {
                 Effect::Edit(open) => {
                     Self::fill_screen(m, terminal);
                     let mut line = None;
-                    let written;
+                    let mut transcript = None;
                     let (cwd, file) = match &open {
                         Open::Checkout(dir) => (dir, None),
                         Open::File { root, file } => (root, Some(file.as_path())),
@@ -396,9 +396,8 @@ impl Runtime {
                             line: at,
                         } => match write_transcript(name, text) {
                             Ok(path) => {
-                                written = path;
                                 line = Some(*at);
-                                (root, Some(written.as_path()))
+                                (root, transcript.insert(path).as_path().into())
                             }
                             Err(e) => {
                                 m.error(format!("{e:#}"));
@@ -479,10 +478,7 @@ impl Runtime {
         }
         let edited = std::fs::read_to_string(file.path())
             .with_context(|| format!("reading {}", file.path().display()))?;
-        let clean: String = edited
-            .chars()
-            .filter(|c| !c.is_control() || matches!(c, '\n' | '\t'))
-            .collect();
+        let clean = clean(&edited, CarriageReturn::Newline, None);
         Ok(Some(clean.trim_end().to_string()))
     }
 
@@ -494,6 +490,7 @@ impl Runtime {
 }
 
 pub fn run(options: Options) -> Result<()> {
+    clear_stale_transcripts(&std::env::temp_dir(), TRANSCRIPT_KEPT);
     let label = options
         .backend
         .harnesses
@@ -612,27 +609,91 @@ fn event_loop(
     Ok(())
 }
 
-/// Writes a transcript's Markdown under the temp dir and returns its path.
+const TRANSCRIPT_PREFIX: &str = "agent-transcript-";
+
+/// How long a transcript file stays: the editor may outlive the call, so
+/// they are cleared at startup once they are older than this.
+const TRANSCRIPT_KEPT: Duration = Duration::from_hours(24);
+
+/// Removes transcript files in `dir` older than `kept`.
+fn clear_stale_transcripts(dir: &Path, kept: Duration) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let stale = entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(TRANSCRIPT_PREFIX)
+            && entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .is_ok_and(|at| at.elapsed().is_ok_and(|age| age > kept));
+        if stale {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Writes a transcript's Markdown to a new private file (0600, a unique name
+/// that can't be a link planted in advance) under the temp dir and returns
+/// its path. The editor may detach and read it later, so it is left for
+/// [`clear_stale_transcripts`].
 fn write_transcript(name: &str, text: &str) -> Result<std::path::PathBuf> {
-    let dir = std::env::temp_dir().join("agent-transcripts");
-    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let safe: String = name
         .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' {
-                c
-            } else {
-                '_'
-            }
-        })
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .take(40)
         .collect();
-    let path = dir.join(format!("{safe}.md"));
-    std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
+    let mut file = tempfile::Builder::new()
+        .prefix(&format!("{TRANSCRIPT_PREFIX}{safe}-"))
+        .suffix(".md")
+        .tempfile()
+        .context("creating a transcript file")?;
+    std::io::Write::write_all(&mut file, text.as_bytes())
+        .with_context(|| format!("writing {}", file.path().display()))?;
+    let (_, path) = file.keep().context("keeping the transcript file")?;
     Ok(path)
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn old_transcript_files_are_cleared_and_other_files_and_new_ones_stay() {
+        let dir = tempfile::tempdir().expect("a dir");
+        let old = dir.path().join("agent-transcript-x-old.md");
+        let new = dir.path().join("agent-transcript-x-new.md");
+        let other = dir.path().join("notes.md");
+        for path in [&old, &new, &other] {
+            std::fs::write(path, "x").expect("written");
+        }
+        let day_ago = std::time::SystemTime::now() - std::time::Duration::from_hours(48);
+        std::fs::File::options()
+            .write(true)
+            .open(&old)
+            .and_then(|f| f.set_modified(day_ago))
+            .expect("aged");
+        super::clear_stale_transcripts(dir.path(), std::time::Duration::from_hours(24));
+        assert!(!old.exists() && new.exists() && other.exists());
+    }
+
+    #[test]
+    fn transcripts_get_their_own_private_file_each_time() {
+        let a = super::write_transcript("a.b/c", "one").expect("written");
+        let b = super::write_transcript("a_b/c", "two").expect("written");
+        assert_ne!(a, b, "names that sanitise alike don't share a file");
+        assert_eq!(std::fs::read_to_string(&a).expect("reads"), "one");
+        assert_eq!(std::fs::read_to_string(&b).expect("reads"), "two");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&a).expect("exists").permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        let _ = std::fs::remove_file(a);
+        let _ = std::fs::remove_file(b);
+    }
+
     #[test]
     fn base64_matches_the_standard_alphabet_and_padding() {
         assert_eq!(super::base64(b""), "");

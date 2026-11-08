@@ -1,6 +1,8 @@
 //! Reading a diff line by line: what each shown line is in its file, the
 //! cursor over them, and the comments a reviewer drafts for an agent.
 
+use agent_core::names::{CarriageReturn, clean};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,7 +33,7 @@ pub struct LineInfo {
     pub text: String,
     /// Where an editor should open for it: its line in the new file, or for
     /// a removed line the line that now follows it.
-    pub edit: usize,
+    pub edit: NonZeroUsize,
 }
 
 impl LineInfo {
@@ -44,17 +46,50 @@ impl LineInfo {
     }
 }
 
-/// `@@ -a,b +c,d @@` as `(a, c)`.
+/// A hunk's side of its header: where it starts and how many lines it covers.
+#[derive(Clone, Copy)]
+struct Range {
+    start: usize,
+    count: usize,
+}
+
+impl Range {
+    fn parse(range: &str) -> Option<Self> {
+        let (start, count) = match range.split_once(',') {
+            Some((start, count)) => (start, count.parse().ok()?),
+            None => (range, 1),
+        };
+        Some(Self {
+            start: start.parse().ok()?,
+            count,
+        })
+    }
+
+    /// The first line the hunk's lines count from: git names the line
+    /// before an empty range.
+    fn first(self) -> usize {
+        if self.count == 0 {
+            self.start + 1
+        } else {
+            self.start
+        }
+    }
+}
+
+/// `@@ -a,b +c,d @@` as the line each side's counting starts from.
 fn hunk_start(header: &str) -> Option<(usize, usize)> {
     let rest = header.strip_prefix("@@ -")?;
     let (old, rest) = rest.split_once(' ')?;
     let new = rest.strip_prefix('+')?.split(' ').next()?;
-    let number = |range: &str| range.split(',').next()?.parse().ok();
-    Some((number(old)?, number(new)?))
+    Some((Range::parse(old)?.first(), Range::parse(new)?.first()))
+}
+
+fn line_number(n: usize) -> NonZeroUsize {
+    NonZeroUsize::new(n).unwrap_or(NonZeroUsize::MIN)
 }
 
 /// The kind and file positions of each line of one file's diff text.
-pub fn classify(lines: &[String]) -> Vec<(LineKind, Option<usize>, Option<usize>, usize)> {
+pub fn classify(lines: &[String]) -> Vec<(LineKind, Option<usize>, Option<usize>, NonZeroUsize)> {
     let (mut old, mut new) = (1, 1);
     lines
         .iter()
@@ -63,22 +98,27 @@ pub fn classify(lines: &[String]) -> Vec<(LineKind, Option<usize>, Option<usize>
                 if let Some((o, n)) = hunk_start(line) {
                     (old, new) = (o, n);
                 }
-                return (LineKind::Header, None, None, new);
+                return (LineKind::Header, None, None, line_number(new));
             }
             match line.chars().next() {
                 Some('+') => {
                     new += 1;
-                    (LineKind::Added, None, Some(new - 1), new - 1)
+                    (LineKind::Added, None, Some(new - 1), line_number(new - 1))
                 }
                 Some('-') => {
                     old += 1;
-                    (LineKind::Removed, Some(old - 1), None, new.max(1))
+                    (LineKind::Removed, Some(old - 1), None, line_number(new))
                 }
-                Some('\\') => (LineKind::Header, None, None, new),
+                Some('\\') => (LineKind::Header, None, None, line_number(new)),
                 _ => {
                     old += 1;
                     new += 1;
-                    (LineKind::Context, Some(old - 1), Some(new - 1), new - 1)
+                    (
+                        LineKind::Context,
+                        Some(old - 1),
+                        Some(new - 1),
+                        line_number(new - 1),
+                    )
                 }
             }
         })
@@ -147,7 +187,6 @@ pub fn hunk(lines: &[LineInfo], from: usize, forward: bool) -> Option<usize> {
 
 /// The first line of the next file after `from`, or of the one `from` is
 /// in when going back.
-#[allow(dead_code)]
 pub fn file(lines: &[LineInfo], from: usize, forward: bool) -> Option<usize> {
     let mut starts = Vec::new();
     let mut previous: Option<&Path> = None;
@@ -167,12 +206,17 @@ pub fn file(lines: &[LineInfo], from: usize, forward: bool) -> Option<usize> {
     }
 }
 
-/// `path:42`, `path:10-14`, or for removed lines `path:7 (removed)`.
-pub fn label(path: &Path, selected: &[&LineInfo]) -> String {
-    let edits: Vec<usize> = selected.iter().map(|l| l.edit).collect();
-    let (Some(first), Some(last)) = (edits.first(), edits.last()) else {
-        return path.display().to_string();
+/// `path:42`, `path:10-14`, or for removed lines `path:7 (removed)`. In a
+/// commit's diff the path says which commit: `path@abc1234:42`.
+pub fn label(path: &Path, rev: Option<&str>, selected: &[&LineInfo]) -> String {
+    let at = match rev {
+        Some(rev) => format!("{}@{rev}", path.display()),
+        None => path.display().to_string(),
     };
+    let (Some(first), Some(last)) = (selected.first(), selected.last()) else {
+        return at;
+    };
+    let (first, last) = (first.edit, last.edit);
     let removed = selected.iter().all(|l| l.kind == LineKind::Removed);
     let range = if first == last {
         first.to_string()
@@ -180,13 +224,22 @@ pub fn label(path: &Path, selected: &[&LineInfo]) -> String {
         format!("{first}-{last}")
     };
     let note = if removed { " (removed)" } else { "" };
-    format!("{}:{range}{note}", path.display())
+    format!("{at}:{range}{note}")
+}
+
+/// Text from outside, as part of a message to an agent: `\r\n` becomes
+/// `\n` and other control characters, which would end the paste early,
+/// become `?`.
+fn outside_text(text: &str) -> String {
+    clean(text, CarriageReturn::Newline, Some('?'))
 }
 
 /// A comment on lines of a diff.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Comment {
     pub path: PathBuf,
+    /// The commit the lines are from, when they aren't the checkout's.
+    pub rev: Option<String>,
     /// The first line's place, which names the comment.
     pub at: (Option<usize>, Option<usize>),
     pub label: String,
@@ -198,24 +251,32 @@ pub struct Comment {
 const QUOTED: usize = 6;
 
 impl Comment {
-    pub fn on(selected: &[&LineInfo], text: String) -> Option<Self> {
+    pub fn on(selected: &[&LineInfo], rev: Option<&str>, text: &str) -> Option<Self> {
         let first = selected.first()?;
-        let mut quoted: Vec<String> = selected.iter().map(|l| l.text.clone()).collect();
+        let mut quoted: Vec<String> = selected
+            .iter()
+            .map(|l| outside_text(l.text.trim_end_matches('\r')))
+            .collect();
         if quoted.len() > QUOTED {
             quoted.truncate(QUOTED);
             quoted.push("...".into());
         }
         Some(Self {
             path: first.path.clone(),
+            rev: rev.map(str::to_string),
             at: (first.old, first.new),
-            label: label(&first.path, selected),
+            label: outside_text(&label(&first.path, rev, selected)),
             quoted,
-            text,
+            text: text.to_string(),
         })
     }
 
-    pub fn covers(&self, line: &LineInfo) -> bool {
-        self.path == line.path && self.at == (line.old, line.new)
+    pub fn same_place(&self, other: &Comment) -> bool {
+        self.path == other.path && self.rev == other.rev && self.at == other.at
+    }
+
+    pub fn covers(&self, line: &LineInfo, rev: Option<&str>) -> bool {
+        self.path == line.path && self.rev.as_deref() == rev && self.at == (line.old, line.new)
     }
 }
 
@@ -247,6 +308,7 @@ pub fn review_message(overview: &str, comments: &[Comment]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fixtures::{line_info, nz};
 
     fn text(lines: &[&str]) -> Vec<String> {
         lines.iter().map(|l| (*l).to_string()).collect()
@@ -284,10 +346,10 @@ mod tests {
         ]);
         let got = classify(&lines);
         assert_eq!(got[0].0, LineKind::Header);
-        assert_eq!(got[1], (LineKind::Context, Some(10), Some(20), 20));
-        assert_eq!(got[2], (LineKind::Removed, Some(11), None, 21));
-        assert_eq!(got[3], (LineKind::Added, None, Some(21), 21));
-        assert_eq!(got[4], (LineKind::Added, None, Some(22), 22));
+        assert_eq!(got[1], (LineKind::Context, Some(10), Some(20), nz(20)));
+        assert_eq!(got[2], (LineKind::Removed, Some(11), None, nz(21)));
+        assert_eq!(got[3], (LineKind::Added, None, Some(21), nz(21)));
+        assert_eq!(got[4], (LineKind::Added, None, Some(22), nz(22)));
         assert_eq!(got[5].0, LineKind::Header);
     }
 
@@ -329,16 +391,20 @@ mod tests {
             &["@@ -5,2 +5,2 @@", "-gone", "-gone2", "+one", " ctx"],
         )]);
         let pick = |r: std::ops::Range<usize>| lines[r].iter().collect::<Vec<_>>();
-        assert_eq!(label(Path::new("a.rs"), &pick(3..4)), "a.rs:5");
-        assert_eq!(label(Path::new("a.rs"), &pick(3..5)), "a.rs:5-6");
-        assert_eq!(label(Path::new("a.rs"), &pick(1..2)), "a.rs:5 (removed)");
+        assert_eq!(label(Path::new("a.rs"), None, &pick(3..4)), "a.rs:5");
+        assert_eq!(label(Path::new("a.rs"), None, &pick(3..5)), "a.rs:5-6");
+        assert_eq!(
+            label(Path::new("a.rs"), None, &pick(1..2)),
+            "a.rs:5 (removed)"
+        );
     }
 
     #[test]
     fn a_review_message_has_the_overview_then_each_comment_with_its_quote() {
         let lines = infos(&[("a.rs", &["@@ -1 +1 @@", "+let x = 3;"])]);
-        let comment = Comment::on(&[&lines[1]], "Use the limit.".into()).expect("a line");
-        assert!(comment.covers(&lines[1]));
+        let comment = Comment::on(&[&lines[1]], None, "Use the limit.").expect("a line");
+        assert!(comment.covers(&lines[1], None));
+        assert!(!comment.covers(&lines[1], Some("abc1234")));
         assert_eq!(
             review_message("", std::slice::from_ref(&comment)),
             "Review comments. Work through each one.\n\na.rs:1\n> +let x = 3;\nUse the limit."
@@ -351,19 +417,61 @@ mod tests {
     fn a_long_selection_is_quoted_in_part() {
         let lines: Vec<String> = (0..10).map(|i| format!("+l{i}")).collect();
         let mut all = infos(&[("a", &[])]);
-        all.extend(lines.iter().enumerate().map(|(i, l)| LineInfo {
-            row: i,
-            height: 1,
-            path: "a".into(),
-            kind: LineKind::Added,
-            old: None,
-            new: Some(i + 1),
-            text: l.clone(),
-            edit: i + 1,
-        }));
+        all.extend(
+            lines
+                .iter()
+                .enumerate()
+                .map(|(i, l)| line_info("a", l, i + 1)),
+        );
         let refs: Vec<&LineInfo> = all.iter().collect();
-        let comment = Comment::on(&refs, "x".into()).expect("lines");
+        let comment = Comment::on(&refs, None, "x").expect("lines");
         assert_eq!(comment.quoted.len(), QUOTED + 1);
         assert_eq!(comment.quoted.last().map(String::as_str), Some("..."));
+    }
+
+    #[test]
+    fn a_pure_deletion_names_the_line_that_now_follows_it() {
+        let lines = infos(&[(
+            "a.rs",
+            &[
+                "@@ -5,3 +4,0 @@",
+                "-a",
+                "-b",
+                "-c",
+                "@@ -9,0 +8,2 @@",
+                "+x",
+                "+y",
+            ],
+        )]);
+        assert_eq!(lines[1].edit, nz(5));
+        assert_eq!(lines[3].edit, nz(5));
+        assert_eq!(lines[5].edit, nz(8));
+        assert_eq!(lines[6].edit, nz(9));
+        let pick = |r: std::ops::Range<usize>| lines[r].iter().collect::<Vec<_>>();
+        assert_eq!(
+            label(Path::new("a.rs"), None, &pick(1..4)),
+            "a.rs:5 (removed)"
+        );
+    }
+
+    #[test]
+    fn a_comment_in_a_commit_names_it_and_only_covers_lines_of_it() {
+        let lines = infos(&[("a.rs", &["@@ -1 +1 @@", "+x"])]);
+        let comment = Comment::on(&[&lines[1]], Some("abc1234"), "No.").expect("a line");
+        assert_eq!(comment.label, "a.rs@abc1234:1");
+        assert!(comment.covers(&lines[1], Some("abc1234")));
+        assert!(!comment.covers(&lines[1], None));
+    }
+
+    #[test]
+    fn quoted_lines_lose_carriage_returns_and_control_characters() {
+        let lines = infos(&[("a.rs", &["@@ -1 +1 @@", "+let x = 1;\r", "+a\x1b[201~b\tc"])]);
+        let comment = Comment::on(&[&lines[1], &lines[2]], None, "Fix.").expect("lines");
+        assert_eq!(comment.quoted, ["+let x = 1;", "+a?[201~b\tc"]);
+        let message = review_message("", &[comment]);
+        assert!(
+            message.parse::<agent_core::names::Prompt>().is_ok(),
+            "{message:?}"
+        );
     }
 }

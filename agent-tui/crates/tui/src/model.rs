@@ -808,10 +808,18 @@ pub enum Unreachable {
     Unreported,
 }
 
+/// A message waiting to be typed, with the review comments it carries so a
+/// message that is never typed in can give them back.
+#[derive(Debug)]
+pub struct Queued {
+    pub prompt: Prompt,
+    pub comments: Vec<crate::review::Comment>,
+}
+
 /// What's queued to type into one agent, oldest first.
 #[derive(Debug, Default)]
 pub struct Outbox {
-    pub queue: VecDeque<Prompt>,
+    queue: VecDeque<Queued>,
     /// The first message is with the worker.
     pub in_flight: bool,
     /// How many events the agent had reported when the last one was typed:
@@ -842,10 +850,39 @@ pub const HOLD_FOR: Duration = Duration::from_secs(5);
 pub const STALL_AFTER: Duration = Duration::from_secs(30);
 
 impl Outbox {
+    pub fn push(&mut self, prompt: Prompt, comments: Vec<crate::review::Comment>) {
+        self.queue.push_back(Queued { prompt, comments });
+    }
+
+    pub fn pop(&mut self) -> Option<Queued> {
+        self.queue.pop_front()
+    }
+
+    pub fn front(&self) -> Option<&Prompt> {
+        self.queue.front().map(|q| &q.prompt)
+    }
+
+    pub fn len(&self) -> usize {
+        self.queue.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.queue.is_empty()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &Prompt> {
+        self.queue.iter().map(|q| &q.prompt)
+    }
+
+    /// Every queued message's comments, oldest first.
+    pub fn into_comments(self) -> Vec<crate::review::Comment> {
+        self.queue.into_iter().flat_map(|q| q.comments).collect()
+    }
+
     /// A message went in and the agent hasn't reported since, which a slash
     /// or `!` command never does.
     pub fn stalled(&self, events: Option<u64>) -> bool {
-        !self.queue.is_empty()
+        !self.is_empty()
             && !self.in_flight
             && self.sent_at.is_some_and(|at| events == Some(at))
             && self.sent_instant.is_some_and(|t| t.elapsed() > STALL_AFTER)
@@ -882,8 +919,8 @@ pub enum Overlay {
         to: SessionName,
         lines: Vec<crate::review::LineInfo>,
         text: String,
-        /// Whether it edits a comment already in the draft.
-        edits: bool,
+        /// The commit the lines are from, when they aren't the checkout's.
+        rev: Option<String>,
     },
     /// Working out what removing `name` would lose; the confirmation
     /// replaces this when the answer arrives.

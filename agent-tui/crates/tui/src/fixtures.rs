@@ -17,6 +17,24 @@ use crate::model::Model;
 use crate::update::update;
 use crate::worker::Msg;
 
+pub fn nz(n: usize) -> std::num::NonZeroUsize {
+    std::num::NonZeroUsize::new(n).expect("a line number")
+}
+
+/// An added line `new` of `path`, as the diff view lists it.
+pub fn line_info(path: &str, text: &str, new: usize) -> crate::review::LineInfo {
+    crate::review::LineInfo {
+        row: 0,
+        height: 1,
+        path: path.into(),
+        kind: crate::review::LineKind::Added,
+        old: None,
+        new: Some(new),
+        text: text.into(),
+        edit: nz(new),
+    }
+}
+
 pub fn name(s: &str) -> SessionName {
     s.parse().expect("parses")
 }

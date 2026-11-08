@@ -322,8 +322,11 @@ pub fn draw(frame: &mut Frame<'_>, m: &mut Model) {
         Overlay::Actions(target) => draw_actions(frame, m, target),
         Overlay::Talk { to, text } => draw_talk(frame, m, to, text),
         Overlay::Comment {
-            to, lines, text, ..
-        } => draw_comment(frame, to, lines, text),
+            to,
+            lines,
+            text,
+            rev,
+        } => draw_comment(frame, to, lines, text, rev.as_deref()),
         Overlay::Planning { name, .. } => draw_planning(frame, name),
     }
 }
@@ -646,7 +649,7 @@ fn draw_status_bar(frame: &mut Frame<'_>, m: &Model, area: Rect) {
             counts.pop();
         }
     }
-    let queued: usize = m.outboxes.values().map(|o| o.queue.len()).sum();
+    let queued: usize = m.outboxes.values().map(crate::model::Outbox::len).sum();
     if queued > 0 {
         let lead = [
             Span::styled(format!("{queued} queued"), dim()),
@@ -1551,7 +1554,7 @@ fn draw_talk(frame: &mut Frame<'_>, m: &Model, to: &SessionName, text: &str) {
     let queued: Vec<&str> = m
         .outboxes
         .get(to)
-        .map(|o| o.queue.iter().map(AsRef::as_ref).collect())
+        .map(|o| o.iter().map(AsRef::as_ref).collect())
         .unwrap_or_default();
     let shown = queued.len().min(3);
     let drafted = draft.len().min(3);
@@ -1642,6 +1645,7 @@ fn draw_comment(
     to: &SessionName,
     selected: &[crate::review::LineInfo],
     text: &str,
+    rev: Option<&str>,
 ) {
     let shown = selected.len().min(3);
     let height = u16::try_from(3 + shown + usize::from(selected.len() > shown)).unwrap_or(3);
@@ -1650,7 +1654,7 @@ fn draw_comment(
     let refs: Vec<&crate::review::LineInfo> = selected.iter().collect();
     let place = selected
         .first()
-        .map(|l| crate::review::label(&l.path, &refs))
+        .map(|l| crate::review::label(&l.path, rev, &refs))
         .unwrap_or_default();
     let block = overlay_block(
         &format!("Comment · {place} · for {to}"),

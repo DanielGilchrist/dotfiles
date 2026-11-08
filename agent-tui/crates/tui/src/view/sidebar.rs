@@ -1397,9 +1397,8 @@ pub(super) fn queued_line(m: &Model, name: &SessionName, width: usize) -> Option
             width,
         ));
     }
-    let queue = &outbox.queue;
-    let first = crate::update::first_words(queue.front()?.as_ref());
-    let more = match queue.len() {
+    let first = crate::update::first_words(outbox.front()?.as_ref());
+    let more = match outbox.len() {
         1 => String::new(),
         n => format!(" +{}", n - 1),
     };
@@ -3026,7 +3025,7 @@ mod tests {
         m.set_cursor(Cursor::Entry(name("obs-layout-4")));
         let outbox = m.outboxes.entry(name("obs-layout-4")).or_default();
         for text in ["rebase on main", "then run the tests"] {
-            outbox.queue.push_back(text.parse().expect("a prompt"));
+            outbox.push(text.parse().expect("a prompt"), Vec::new());
         }
         let text = screen(&render(&mut m, (100, 30))).join("\n");
         assert!(text.contains("queued: rebase on ma"), "{text}");
@@ -3444,8 +3443,8 @@ mod tests {
         press(&mut m, KeyCode::Char('j'));
         let effects = press(&mut m, KeyCode::Char('e'));
         assert!(
-            matches!(effects.as_slice(), [crate::update::Effect::Edit(crate::update::Open::At { file, line: 21, .. })]
-                if file.ends_with("sidebar.rs")),
+            matches!(effects.as_slice(), [crate::update::Effect::Edit(crate::update::Open::At { file, line, .. })]
+                if file.ends_with("sidebar.rs") && line.get() == 21),
             "the added line opens at its place in the new file"
         );
         press(&mut m, KeyCode::Char('k'));
@@ -3453,10 +3452,8 @@ mod tests {
         assert!(
             matches!(
                 effects.as_slice(),
-                [crate::update::Effect::Edit(crate::update::Open::At {
-                    line: 21,
-                    ..
-                })]
+                [crate::update::Effect::Edit(crate::update::Open::At { line, .. })]
+                    if line.get() == 21
             ),
             "a removed line opens where it was"
         );
@@ -3501,6 +3498,33 @@ mod tests {
         let text = screen(&render(&mut m, (140, 40))).join("\n");
         assert!(text.contains("✎"), "a commented line is marked\n{text}");
         assert!(text.contains("1 comment"), "{text}");
+    }
+
+    fn a_commits_lines_are_not_edited_and_comments_name_the_commit(m: &mut Model) {
+        use crossterm::event::KeyCode;
+        let effects = press(m, KeyCode::Char('e'));
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, crate::update::Effect::Edit(_))),
+            "e doesn't open the working tree's file for a commit's line"
+        );
+        assert!(
+            m.status
+                .as_ref()
+                .is_some_and(|s| s.text.contains("e opens the checkout")),
+            "and says why"
+        );
+        press(m, KeyCode::Char('c'));
+        press(m, KeyCode::Char('x'));
+        press(m, KeyCode::Enter);
+        let draft: Vec<_> = m.drafts.values().flatten().collect();
+        assert_eq!(draft.len(), 1);
+        assert!(
+            draft[0].label.starts_with("src/a.rs@abc1234:"),
+            "{}",
+            draft[0].label
+        );
     }
 
     #[test]
@@ -3575,6 +3599,7 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("+b"), "{text}");
+        a_commits_lines_are_not_edited_and_comments_name_the_commit(&mut m);
         press(&mut m, KeyCode::Char('j'));
         press(&mut m, KeyCode::Esc);
         assert!(

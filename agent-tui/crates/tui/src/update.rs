@@ -8,7 +8,7 @@ use agent_core::actions::{Action, CommandLine, Context, EventName, Invocation};
 use agent_core::activity::{Activity, AgentId, State as ActivityState};
 use agent_core::config::ControlKey;
 use agent_core::model::{EntryState, RepoKey};
-use agent_core::names::{Prompt, SessionName};
+use agent_core::names::{CarriageReturn, InvalidPrompt, Prompt, SessionName, clean};
 use agent_core::ops::{Approved, Launch};
 use agent_core::paths::{RepoRoot, Typed, typed_path};
 use agent_core::ports::{ClientId, Listing};
@@ -61,14 +61,14 @@ pub enum Open {
     At {
         root: PathBuf,
         file: PathBuf,
-        line: usize,
+        line: NonZeroUsize,
     },
     /// A subagent's transcript as Markdown, at `line`.
     Transcript {
         root: PathBuf,
         name: String,
         text: String,
-        line: usize,
+        line: NonZeroUsize,
     },
 }
 
@@ -173,7 +173,7 @@ fn step(m: &mut Model, msg: Msg) -> Vec<Effect> {
             if let Overlay::Talk { text: typed, .. } | Overlay::Comment { text: typed, .. } =
                 &mut m.overlay
             {
-                typed.push_str(&sanitize_paste(&text).replace('\r', ""));
+                typed.push_str(&clean(&text, CarriageReturn::Newline, None));
             }
             Vec::new()
         }
@@ -557,6 +557,7 @@ fn forget_gone(m: &mut Model) {
     m.subagent_logs.retain(|(name, _), _| known.contains(name));
     m.facts.retain(|name, _| known.contains(name));
     m.outboxes.retain(|name, _| known.contains(name));
+    m.drafts.retain(|name, _| known.contains(name));
     m.live_since.retain(|name, _| known.contains(name));
     m.launched_at.retain(|name, _| known.contains(name));
     if m.peek.as_ref().is_some_and(|name| !known.contains(name)) {
@@ -794,6 +795,14 @@ fn copy(m: &mut Model, text: String) -> Vec<Effect> {
     vec![Effect::Copy(text)]
 }
 
+/// The commit the diff in [0] is of, when it is one.
+pub fn commit_rev(m: &Model) -> Option<String> {
+    match m.hover() {
+        Some(crate::document::Hover::Commit(key)) => Some(key.sha),
+        _ => None,
+    }
+}
+
 /// Puts a comment on `lines` into `to`'s draft, replacing the one that is
 /// already on the first of them. Empty text deletes that one instead.
 fn add_comment(
@@ -801,33 +810,44 @@ fn add_comment(
     to: &SessionName,
     lines: &[crate::review::LineInfo],
     text: &str,
-    edits: bool,
+    rev: Option<String>,
 ) {
     let refs: Vec<&crate::review::LineInfo> = lines.iter().collect();
-    let Some(comment) = crate::review::Comment::on(&refs, text.trim().to_string()) else {
+    let Some(comment) = crate::review::Comment::on(&refs, rev.as_deref(), text.trim()) else {
         return;
     };
-    let draft = m.drafts.entry(to.clone()).or_default();
-    let at = draft
-        .iter()
-        .position(|c| c.path == comment.path && c.at == comment.at);
+    if let Some(c) = agent_core::names::first_control(text) {
+        m.info(format!(
+            "the comment has a control character ({c:?}) · Esc closes"
+        ));
+        m.overlay = Overlay::Comment {
+            to: to.clone(),
+            lines: lines.to_vec(),
+            text: text.to_string(),
+            rev,
+        };
+        return;
+    }
+    let at = m
+        .drafts
+        .get(to)
+        .and_then(|d| d.iter().position(|c| c.same_place(&comment)));
     match (at, text.trim().is_empty()) {
-        (Some(i), true) => {
-            draft.remove(i);
-        }
         (None, true) => {
-            let _ = edits;
             m.info("type a comment first · Esc closes");
             m.overlay = Overlay::Comment {
                 to: to.clone(),
                 lines: lines.to_vec(),
                 text: String::new(),
-                edits,
+                rev,
             };
             return;
         }
-        (Some(i), false) => draft[i] = comment,
-        (None, false) => draft.push(comment),
+        (Some(i), true) => {
+            m.drafts.entry(to.clone()).or_default().remove(i);
+        }
+        (Some(i), false) => m.drafts.entry(to.clone()).or_default()[i] = comment,
+        (None, false) => m.drafts.entry(to.clone()).or_default().push(comment),
     }
     if m.drafts.get(to).is_some_and(Vec::is_empty) {
         m.drafts.remove(to);
@@ -859,15 +879,16 @@ fn open_comment(m: &mut Model) {
     let Some(first) = lines.first() else {
         return;
     };
+    let rev = commit_rev(m);
     let existing = m
         .drafts
         .get(&name)
-        .and_then(|d| d.iter().find(|c| c.covers(first)));
+        .and_then(|d| d.iter().find(|c| c.covers(first, rev.as_deref())));
     m.overlay = Overlay::Comment {
         to: name,
         text: existing.map(|c| c.text.clone()).unwrap_or_default(),
-        edits: existing.is_some(),
         lines,
+        rev,
     };
 }
 
@@ -948,6 +969,22 @@ fn branch_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
     Some(effects)
 }
 
+/// `e` on a diff line: the checkout's file at that line. A commit's lines
+/// aren't the checkout's, so there it says so instead.
+fn edit_line(m: &mut Model) -> Option<Vec<Effect>> {
+    if commit_rev(m).is_some() {
+        m.info("e opens the checkout, not a commit");
+        return Some(Vec::new());
+    }
+    let root = m.selected_entry()?.path()?.to_path_buf();
+    let line = m.docs.lines().get(m.diff_view.cursor)?;
+    Some(vec![Effect::Edit(Open::At {
+        root,
+        file: line.path.clone(),
+        line: line.edit,
+    })])
+}
+
 /// Keys for [0] while it reads a diff: the line cursor, hunk jumps and
 /// editing at the line. `None` leaves the key to the plain document keys.
 fn diff_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
@@ -966,7 +1003,6 @@ fn diff_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
         return None;
     }
     let at = m.diff_view.cursor;
-    let mut effects = Vec::new();
     let to = match code {
         KeyCode::Char('j') | KeyCode::Down => crate::review::step(lines, at, 1),
         KeyCode::Char('k') | KeyCode::Up => crate::review::step(lines, at, -1),
@@ -982,11 +1018,11 @@ fn diff_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
                 -half
             });
             m.diff_view.follow_page = true;
-            return Some(effects);
+            return Some(Vec::new());
         }
         KeyCode::Char('c') => {
             open_comment(m);
-            return Some(effects);
+            return Some(Vec::new());
         }
         KeyCode::Char('y') => {
             let (from, to) = m.diff_view.span();
@@ -1004,7 +1040,7 @@ fn diff_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
                     .join("\n")
             } else {
                 let line = lines.get(at)?;
-                crate::review::label(&line.path, &[line])
+                crate::review::label(&line.path, commit_rev(m).as_deref(), &[line])
             };
             m.diff_view.anchor = None;
             return Some(copy(m, text));
@@ -1014,7 +1050,7 @@ fn diff_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
                 Some(_) => None,
                 None => Some(at),
             };
-            return Some(effects);
+            return Some(Vec::new());
         }
         KeyCode::Char(c @ ('J' | 'K')) => {
             let forward = c == 'J';
@@ -1022,7 +1058,7 @@ fn diff_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
                 if !m.step_file(forward) {
                     m.info(if forward { "last file" } else { "first file" });
                 }
-                return Some(effects);
+                return Some(Vec::new());
             }
             match crate::review::file(lines, at, forward) {
                 Some(to) => {
@@ -1032,25 +1068,16 @@ fn diff_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
                 }
                 None => m.info(if forward { "last file" } else { "first file" }),
             }
-            return Some(effects);
+            return Some(Vec::new());
         }
-        KeyCode::Char('e') => {
-            let root = m.selected_entry()?.path()?.to_path_buf();
-            let line = lines.get(at)?;
-            effects.push(Effect::Edit(Open::At {
-                root,
-                file: line.path.clone(),
-                line: line.edit.max(1),
-            }));
-            return Some(effects);
-        }
+        KeyCode::Char('e') => return edit_line(m),
         _ => return None,
     };
     if let Some(to) = to {
         m.diff_view.cursor = to;
         m.diff_view.reveal = true;
     }
-    Some(effects)
+    Some(Vec::new())
 }
 
 /// Keys for [0] while it reads a subagent's log: the entry cursor, folds and
@@ -1123,7 +1150,7 @@ fn log_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
                 .and_then(|(_, s)| s.description.clone())
                 .unwrap_or_else(|| "subagent".into());
             let (text, starts) = crate::log::markdown(detail, &title);
-            let line = starts.get(at).copied().unwrap_or(1);
+            let line = starts.get(at).copied().unwrap_or(NonZeroUsize::MIN);
             effects.push(Effect::Edit(Open::Transcript {
                 root,
                 name: format!("{}-{}", key.0.as_str(), key.1.as_str()),
@@ -1139,9 +1166,7 @@ fn log_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
 /// Control characters other than newlines and tabs could end a bracketed
 /// paste early and run the rest as keystrokes.
 fn sanitize_paste(text: &str) -> String {
-    text.chars()
-        .filter(|c| !c.is_control() || matches!(c, '\n' | '\r' | '\t'))
-        .collect()
+    clean(text, CarriageReturn::Keep, None)
 }
 
 /// Keys that choose the panel `j`/`k` act on, and those a panel gives its
@@ -1350,7 +1375,11 @@ fn on_nav_key(m: &mut Model, key: KeyEvent) -> Vec<Effect> {
     }
     match key.code {
         KeyCode::Char('q') => {
-            let queued: usize = m.outboxes.values().map(|o| o.queue.len()).sum::<usize>()
+            let queued: usize = m
+                .outboxes
+                .values()
+                .map(crate::model::Outbox::len)
+                .sum::<usize>()
                 + m.drafts.values().map(Vec::len).sum::<usize>();
             if queued == 0 {
                 return vec![Effect::Quit];
@@ -1613,17 +1642,24 @@ fn talk(m: &mut Model, to: SessionName, text: String) -> Vec<Effect> {
     } else {
         crate::review::review_message(&text, &draft)
     };
-    let Ok(prompt) = message.parse::<Prompt>() else {
-        m.info("type a message first · Esc closes");
-        m.overlay = Overlay::Talk { to, text };
-        return Vec::new();
+    let prompt = match message.parse::<Prompt>() {
+        Ok(prompt) => prompt,
+        Err(e) => {
+            m.info(match e {
+                InvalidPrompt::Empty => "type a message first · Esc closes".to_string(),
+                InvalidPrompt::Control(c) => {
+                    format!("the message has a control character ({c:?}) · Esc closes")
+                }
+            });
+            m.overlay = Overlay::Talk { to, text };
+            return Vec::new();
+        }
     };
     m.drafts.remove(&to);
     m.outboxes
         .entry(to.clone())
         .or_default()
-        .queue
-        .push_back(prompt);
+        .push(prompt, draft);
     let effects = flush(m);
     if m.outboxes.get(&to).is_some_and(|o| o.in_flight) {
         m.info(format!("sent to {to}"));
@@ -1635,6 +1671,22 @@ fn talk(m: &mut Model, to: SessionName, text: String) -> Vec<Effect> {
     effects
 }
 
+/// Puts comments that weren't delivered back in `to`'s draft, ahead of any
+/// drafted since, and returns how many.
+fn restore_comments(
+    m: &mut Model,
+    to: &SessionName,
+    mut comments: Vec<crate::review::Comment>,
+) -> usize {
+    let n = comments.len();
+    if n > 0 {
+        let draft = m.drafts.entry(to.clone()).or_default();
+        comments.append(draft);
+        *draft = comments;
+    }
+    n
+}
+
 /// Starts typing the first queued message into every agent that is live,
 /// ready for text (at rest, reported since its session started, past its
 /// boot), not being typed into by the user, and has reported since the last
@@ -1643,7 +1695,7 @@ fn flush(m: &mut Model) -> Vec<Effect> {
     let ready: Vec<SessionName> = m
         .outboxes
         .iter()
-        .filter(|(_, o)| !o.in_flight && !o.queue.is_empty())
+        .filter(|(_, o)| !o.in_flight && !o.is_empty())
         .filter(|(_, o)| o.hold.is_none_or(|h| h.at.elapsed() > HOLD_FOR))
         .filter(|(name, o)| {
             m.ready_for_text(name)
@@ -1660,7 +1712,7 @@ fn flush(m: &mut Model) -> Vec<Effect> {
     for name in ready {
         let not_before = m.not_before(&name);
         if let Some(outbox) = m.outboxes.get_mut(&name)
-            && let Some(prompt) = outbox.queue.front().cloned()
+            && let Some(prompt) = outbox.front().cloned()
         {
             outbox.in_flight = true;
             outbox.hold = None;
@@ -1685,10 +1737,10 @@ fn on_sent(m: &mut Model, to: &SessionName, result: Result<(), SendError>) -> Ve
     outbox.in_flight = false;
     match result {
         Ok(()) => {
-            outbox.queue.pop_front();
+            outbox.pop();
             outbox.sent_at = events;
             outbox.sent_instant = Some(Instant::now());
-            let left = outbox.queue.len();
+            let left = outbox.len();
             if left == 0 {
                 m.outboxes.remove(to);
                 m.info(format!("sent to {to}"));
@@ -1710,12 +1762,21 @@ fn on_sent(m: &mut Model, to: &SessionName, result: Result<(), SendError>) -> Ve
             m.error(format!("couldn't read {to}'s activity: {e} · will retry"));
         }
         Err(SendError::Failed(e)) => {
-            let dropped = outbox.queue.pop_front();
-            if outbox.queue.is_empty() {
+            let dropped = outbox.pop();
+            if outbox.is_empty() {
                 m.outboxes.remove(to);
             }
-            let words = dropped.map(|p| first_words(p.as_ref())).unwrap_or_default();
-            m.error(format!("couldn't send to {to}: {e} · dropped \"{words}\""));
+            let (words, comments) = dropped.map_or_else(Default::default, |q| {
+                (first_words(q.prompt.as_ref()), q.comments)
+            });
+            let back = match restore_comments(m, to, comments) {
+                0 => String::new(),
+                1 => " · its comment is back in the draft".to_string(),
+                n => format!(" · its {n} comments are back in the draft"),
+            };
+            m.error(format!(
+                "couldn't send to {to}: {e} · dropped \"{words}\"{back}"
+            ));
         }
     }
     flush(m)
@@ -1766,7 +1827,15 @@ fn clear_queue(m: &mut Model, to: &SessionName) {
     if m.outboxes.get(to).is_some_and(|o| o.in_flight) {
         m.info(format!("the first message to {to} is being typed"));
     } else if let Some(cleared) = m.outboxes.remove(to) {
-        m.info(format!("cleared {} queued for {to}", cleared.queue.len()));
+        let queued = cleared.len();
+        let back = match restore_comments(m, to, cleared.into_comments()) {
+            0 => String::new(),
+            n => format!(
+                " · {n} drafted comment{} kept",
+                if n == 1 { "" } else { "s" }
+            ),
+        };
+        m.info(format!("cleared {queued} queued for {to}{back}"));
     }
 }
 
@@ -1978,11 +2047,11 @@ fn on_overlay_key(m: &mut Model, key: KeyEvent) -> Vec<Effect> {
             to,
             lines,
             mut text,
-            edits,
+            rev,
         } => match key.code {
             KeyCode::Esc => Vec::new(),
             KeyCode::Enter => {
-                add_comment(m, &to, &lines, &text, edits);
+                add_comment(m, &to, &lines, &text, rev);
                 Vec::new()
             }
             _ => {
@@ -2000,7 +2069,7 @@ fn on_overlay_key(m: &mut Model, key: KeyEvent) -> Vec<Effect> {
                     to,
                     lines,
                     text,
-                    edits,
+                    rev,
                 };
                 Vec::new()
             }
@@ -5276,7 +5345,7 @@ mod tests {
         set_state(&mut m, "auth-refresh-2", working(), 1);
         let effects = talk_to(&mut m, "auth-refresh-2", "rebase");
         assert!(effects.is_empty(), "nothing is typed while it works");
-        assert_eq!(m.outboxes[&name("auth-refresh-2")].queue.len(), 1);
+        assert_eq!(m.outboxes[&name("auth-refresh-2")].len(), 1);
         assert_eq!(replies(&tick(&mut m)).len(), 0);
 
         let mut asking_now = crate::fixtures::asking("rm?", 1);
@@ -5309,7 +5378,6 @@ mod tests {
         talk_to(&mut m, agent, "second");
         let queue = |m: &Model| -> Vec<String> {
             m.outboxes[&name(agent)]
-                .queue
                 .iter()
                 .map(|p| p.as_str().to_string())
                 .collect()
@@ -5457,6 +5525,132 @@ mod tests {
         );
     }
 
+    fn drafted(path: &str, text: &str) -> crate::review::Comment {
+        let line = crate::fixtures::line_info(path, text, 1);
+        crate::review::Comment::on(&[&line], None, "Fix.").expect("a comment")
+    }
+
+    #[test]
+    fn a_review_of_a_crlf_file_queues_and_a_control_character_gets_its_own_message() {
+        let mut m = crate::fixtures::fleet(10);
+        let agent = "auth-refresh-2";
+        set_state(&mut m, agent, done(), 1);
+        m.drafts
+            .insert(name(agent), vec![drafted("a.rs", "+let x = 1;\r")]);
+        talk_to(&mut m, agent, "");
+        assert_eq!(m.outboxes[&name(agent)].len(), 1);
+        assert!(
+            !m.outboxes[&name(agent)]
+                .front()
+                .expect("queued")
+                .as_str()
+                .contains('\r')
+        );
+
+        talk_to(&mut m, "obs-layout-4", "a\x1b[201~b");
+        assert!(matches!(m.overlay, Overlay::Talk { .. }));
+        assert!(
+            m.status
+                .as_ref()
+                .is_some_and(|s| s.text.contains("control character")),
+            "{:?}",
+            m.status.as_ref().map(|s| &s.text)
+        );
+        update(&mut m, key(KeyCode::Esc));
+        talk_to(&mut m, "obs-layout-4", "  ");
+        assert!(
+            m.status
+                .as_ref()
+                .is_some_and(|s| s.text.contains("type a message first"))
+        );
+    }
+
+    #[test]
+    fn a_dismissed_empty_comment_leaves_no_draft_behind() {
+        let mut m = crate::fixtures::fleet(10);
+        let agent = name("auth-refresh-2");
+        let line = crate::fixtures::line_info("a.rs", "+x", 1);
+        add_comment(&mut m, &agent, &[line], "", None);
+        assert!(m.drafts.is_empty());
+    }
+
+    #[test]
+    fn a_comment_with_a_control_character_is_refused_and_keeps_its_box() {
+        let mut m = crate::fixtures::fleet(10);
+        let agent = name("auth-refresh-2");
+        let line = crate::fixtures::line_info("a.rs", "+x", 1);
+        add_comment(&mut m, &agent, &[line], "a\x1bb", Some("abc1234".into()));
+        assert!(m.drafts.is_empty());
+        assert!(
+            matches!(&m.overlay, Overlay::Comment { text, rev, .. }
+                if text == "a\x1bb" && rev.as_deref() == Some("abc1234")),
+            "the box stays with its commit"
+        );
+        assert!(
+            m.status
+                .as_ref()
+                .is_some_and(|s| s.text.contains("control character"))
+        );
+    }
+
+    #[test]
+    fn restored_comments_keep_a_newer_one_on_the_same_line() {
+        let mut m = crate::fixtures::fleet(10);
+        let agent = name("auth-refresh-2");
+        m.drafts.insert(agent.clone(), vec![drafted("a.rs", "+x")]);
+        assert_eq!(
+            restore_comments(&mut m, &agent, vec![drafted("a.rs", "+x")]),
+            1
+        );
+        assert_eq!(m.drafts[&agent].len(), 2);
+    }
+
+    #[test]
+    fn drafts_go_with_their_agent() {
+        let mut m = crate::fixtures::fleet(10);
+        m.drafts
+            .insert(name("auth-refresh-2"), vec![drafted("a.rs", "+x")]);
+        m.drafts
+            .insert(name("removed-agent"), vec![drafted("a.rs", "+x")]);
+        forget_gone(&mut m);
+        assert!(m.drafts.contains_key(&name("auth-refresh-2")));
+        assert!(!m.drafts.contains_key(&name("removed-agent")));
+    }
+
+    #[test]
+    fn a_review_that_fails_to_send_gives_its_comments_back_and_one_that_sends_does_not() {
+        let mut m = crate::fixtures::fleet(10);
+        let agent = "auth-refresh-2";
+        set_state(&mut m, agent, done(), 1);
+        m.drafts.insert(name(agent), vec![drafted("a.rs", "+x")]);
+        talk_to(&mut m, agent, "");
+        assert!(m.drafts.is_empty(), "queued, so not in the draft");
+        m.drafts.insert(name(agent), vec![drafted("b.rs", "+y")]);
+        update(
+            &mut m,
+            Msg::Sent {
+                to: name(agent),
+                result: Err(crate::worker::SendError::Failed("no pty".into())),
+            },
+        );
+        let paths: Vec<_> = m.drafts[&name(agent)]
+            .iter()
+            .map(|c| c.path.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(paths, ["a.rs", "b.rs"], "back ahead of newer comments");
+        assert!(
+            m.status
+                .as_ref()
+                .is_some_and(|s| s.text.contains("back in the draft"))
+        );
+
+        m.drafts.clear();
+        m.drafts.insert(name(agent), vec![drafted("a.rs", "+x")]);
+        talk_to(&mut m, agent, "");
+        sent(&mut m, agent);
+        assert!(m.drafts.is_empty(), "delivered comments stay gone");
+    }
+
     const AGENT: &str = "auth-refresh-2";
 
     fn report(m: &mut Model, mut activity: Activity) -> Vec<Effect> {
@@ -5556,7 +5750,7 @@ mod tests {
             },
         );
         assert_eq!(replies(&effects), Vec::<String>::new());
-        assert_eq!(m.outboxes[&name(AGENT)].queue.len(), 1, "still queued");
+        assert_eq!(m.outboxes[&name(AGENT)].len(), 1, "still queued");
         let same = m.activities.clone().expect("reported");
         assert_eq!(replies(&update(&mut m, Msg::Activities(same))), ["rebase"]);
     }
@@ -5600,11 +5794,9 @@ mod tests {
         sent(&mut m, AGENT);
         let outbox = &m.outboxes[&name(AGENT)];
         assert!(!outbox.stalled(Some(1)), "just sent");
-        let mut outbox = crate::model::Outbox {
-            sent_instant: Instant::now().checked_sub(crate::model::STALL_AFTER * 2),
-            ..Default::default()
-        };
-        outbox.queue.push_back("next".parse().expect("a prompt"));
+        let mut outbox = crate::model::Outbox::default();
+        outbox.push("next".parse().expect("a prompt"), Vec::new());
+        outbox.sent_instant = Instant::now().checked_sub(crate::model::STALL_AFTER * 2);
         outbox.sent_at = Some(1);
         assert!(outbox.stalled(Some(1)));
         assert!(!outbox.stalled(Some(2)), "it reported");
@@ -5639,7 +5831,7 @@ mod tests {
         talk_to(&mut m, agent, "one");
         talk_to(&mut m, agent, "two");
         m.set_cursor(Cursor::Entry(name("obs-layout-4")));
-        assert_eq!(m.outboxes[&name(agent)].queue.len(), 2);
+        assert_eq!(m.outboxes[&name(agent)].len(), 2);
 
         m.set_cursor(Cursor::Entry(name(agent)));
         update(&mut m, key(KeyCode::Char('s')));
@@ -5806,7 +5998,7 @@ mod tests {
         let effects = update(&mut m, key(KeyCode::Char('e')));
         assert!(
             matches!(effects.as_slice(), [Effect::Edit(Open::Transcript { text, line, .. })]
-                if text.lines().nth(line - 1) == Some("### Bash ls")),
+                if text.lines().nth(line.get() - 1) == Some("### Bash ls")),
             "e opens the rendered transcript at the cursor's entry"
         );
         update(&mut m, key(KeyCode::Esc));
@@ -5832,25 +6024,16 @@ mod tests {
 
     #[test]
     fn comments_on_diff_lines_make_a_draft_that_s_sends_as_one_review() {
-        use crate::review::{Comment, LineInfo, LineKind};
+        use crate::review::Comment;
         let mut m = delegating();
         let name = m.selected_entry().expect("selected").name().clone();
-        let line = |text: &str, new: usize| LineInfo {
-            row: 0,
-            height: 1,
-            path: "a.rs".into(),
-            kind: LineKind::Added,
-            old: None,
-            new: Some(new),
-            text: text.into(),
-            edit: new,
-        };
+        let line = |text: &str, new: usize| crate::fixtures::line_info("a.rs", text, new);
         let lines = vec![line("+let x = 3;", 4)];
-        add_comment(&mut m, &name, &lines, "Use the limit.", false);
-        add_comment(&mut m, &name, &[line("+more", 9)], "Why?", false);
+        add_comment(&mut m, &name, &lines, "Use the limit.", None);
+        add_comment(&mut m, &name, &[line("+more", 9)], "Why?", None);
         assert_eq!(m.drafts[&name].len(), 2);
 
-        add_comment(&mut m, &name, &lines, "Use the configured limit.", true);
+        add_comment(&mut m, &name, &lines, "Use the configured limit.", None);
         assert_eq!(
             m.drafts[&name].len(),
             2,
@@ -5858,7 +6041,7 @@ mod tests {
         );
         assert_eq!(m.drafts[&name][0].text, "Use the configured limit.");
 
-        add_comment(&mut m, &name, &[line("+more", 9)], "", true);
+        add_comment(&mut m, &name, &[line("+more", 9)], "", None);
         assert_eq!(
             m.drafts[&name].len(),
             1,
@@ -5870,14 +6053,13 @@ mod tests {
         update(&mut m, key(KeyCode::Char('o')));
         update(&mut m, key(KeyCode::Enter));
         assert!(m.drafts.is_empty(), "the draft clears once it is queued");
-        let queued = &m.outboxes[&name].queue;
-        let sent: &str = queued.back().expect("queued").as_ref();
+        let sent: &str = m.outboxes[&name].iter().last().expect("queued").as_ref();
         assert!(sent.starts_with("Review comments."), "{sent}");
         assert!(
             sent.contains("\n\no\n\na.rs:4\n> +let x = 3;\nUse the configured limit."),
             "{sent}"
         );
-        let _ = Comment::on(&[&line("+x", 1)], String::new());
+        let _ = Comment::on(&[&line("+x", 1)], None, "");
     }
 
     #[test]

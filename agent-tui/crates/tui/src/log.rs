@@ -4,6 +4,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::fmt::Write;
+use std::num::NonZeroUsize;
 
 use agent_core::ports::{Call, CallState, LogEntry, SubagentDetail, Target};
 
@@ -197,9 +198,26 @@ pub struct LogView {
     pub follow_page: bool,
 }
 
+/// `text` in a code fence long enough that no run of backticks inside it
+/// ends the fence early.
+fn fenced(text: &str) -> String {
+    let mut longest = 0;
+    let mut run = 0;
+    for c in text.chars() {
+        if c == '`' {
+            run += 1;
+            longest = longest.max(run);
+        } else {
+            run = 0;
+        }
+    }
+    let fence = "`".repeat((longest + 1).max(3));
+    format!("{fence}\n{text}\n{fence}")
+}
+
 /// The transcript as Markdown for `$EDITOR`, and the line each entry starts
 /// on, in the order [`entries`] lists them.
-pub fn markdown(detail: &SubagentDetail, title: &str) -> (String, Vec<usize>) {
+pub fn markdown(detail: &SubagentDetail, title: &str) -> (String, Vec<NonZeroUsize>) {
     let mut out = String::new();
     let mut starts = Vec::new();
     let _ = write!(out, "# {title}\n\n");
@@ -210,14 +228,15 @@ pub fn markdown(detail: &SubagentDetail, title: &str) -> (String, Vec<usize>) {
         let _ = write!(out, "## Report\n\n{report}\n\n");
     }
     out.push_str("## Activity\n\n");
+    let mut newlines = out.matches('\n').count();
     for entry in entries(detail) {
-        starts.push(out.matches('\n').count() + 1);
+        starts.push(NonZeroUsize::MIN.saturating_add(newlines));
         let mut text = String::new();
         let single = |text: &mut String, call: &Call| {
             let _ = write!(text, "### {} {}\n\n", call.tool, target_text(&call.target));
-            let _ = write!(text, "```\n{}\n```\n\n", call.input);
+            let _ = write!(text, "{}\n\n", fenced(&call.input));
             if !call.output.is_empty() {
-                let _ = write!(text, "Result:\n\n```\n{}\n```\n\n", call.output);
+                let _ = write!(text, "Result:\n\n{}\n\n", fenced(&call.output));
             }
         };
         match entry {
@@ -234,6 +253,7 @@ pub fn markdown(detail: &SubagentDetail, title: &str) -> (String, Vec<usize>) {
                 }
             }
         }
+        newlines += text.matches('\n').count();
         out.push_str(&text);
     }
     (out, starts)
@@ -437,9 +457,9 @@ mod tests {
         let (text, starts) = markdown(&d, "Title");
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(starts.len(), 3);
-        assert_eq!(lines[starts[0] - 1], "### Prompt");
-        assert_eq!(lines[starts[1] - 1], "Hello.");
-        assert_eq!(lines[starts[2] - 1], "### Bash ls");
+        assert_eq!(lines[starts[0].get() - 1], "### Prompt");
+        assert_eq!(lines[starts[1].get() - 1], "Hello.");
+        assert_eq!(lines[starts[2].get() - 1], "### Bash ls");
     }
 
     #[test]
@@ -451,5 +471,30 @@ mod tests {
         assert!(nav.is_open(3));
         nav.toggle(2);
         assert!(!nav.is_open(2) && !nav.is_open(3));
+    }
+
+    #[test]
+    fn output_with_backticks_gets_a_longer_fence() {
+        assert_eq!(fenced("ls"), "```\nls\n```");
+        assert_eq!(fenced("a ``` b"), "````\na ``` b\n````");
+        assert_eq!(fenced("`````x"), "``````\n`````x\n``````");
+        let mut c = call(
+            "Bash",
+            Target::Command("x".into()),
+            CallState::Done(Summary::NoOutput),
+        );
+        c.input = "echo '```'".into();
+        c.output = "````\nout".into();
+        let mut d = detail(vec![LogEntry::Called(c)]);
+        d.report = Some("done".into());
+        let (text, starts) = markdown(&d, "T");
+        assert!(text.contains("````\necho '```'\n````\n"), "{text}");
+        assert!(text.contains("`````\n````\nout\n`````\n"), "{text}");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines[starts[1].get() - 1],
+            "### Bash x",
+            "starts stay right after a report and a long fence"
+        );
     }
 }

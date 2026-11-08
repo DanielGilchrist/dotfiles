@@ -187,6 +187,48 @@ impl FromStr for BranchName {
     }
 }
 
+/// The first control character in `text` other than a newline or tab, which
+/// could end a bracketed paste early and run the rest as keystrokes.
+#[must_use]
+pub fn first_control(text: &str) -> Option<char> {
+    text.chars()
+        .find(|c| c.is_control() && !matches!(c, '\n' | '\t'))
+}
+
+/// What [`clean`] does with carriage returns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CarriageReturn {
+    Keep,
+    Drop,
+    /// `\r\n` and a lone `\r` both become `\n`.
+    Newline,
+}
+
+/// `text` without its control characters other than newlines and tabs:
+/// each is removed, or becomes `replacement` when there is one. Carriage
+/// returns follow `cr`.
+#[must_use]
+pub fn clean(text: &str, cr: CarriageReturn, replacement: Option<char>) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\r' => match cr {
+                CarriageReturn::Keep => out.push(c),
+                CarriageReturn::Drop => {}
+                CarriageReturn::Newline => {
+                    chars.next_if_eq(&'\n');
+                    out.push('\n');
+                }
+            },
+            '\n' | '\t' => out.push(c),
+            c if c.is_control() => out.extend(replacement),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// Text to send an agent: not blank, and no control characters other than
 /// newlines and tabs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -201,10 +243,7 @@ impl FromStr for Prompt {
         if s.trim().is_empty() {
             return Err(InvalidPrompt::Empty);
         }
-        if let Some(c) = s
-            .chars()
-            .find(|c| c.is_control() && !matches!(c, '\n' | '\t'))
-        {
+        if let Some(c) = first_control(s) {
             return Err(InvalidPrompt::Control(c));
         }
         Ok(Self(s.into()))
@@ -386,5 +425,18 @@ mod tests {
         );
         assert!("https://github.com/acme/api".parse::<Checkout>().is_err());
         assert!("".parse::<Checkout>().is_err());
+    }
+
+    #[test]
+    fn cleaning_text_handles_carriage_returns_and_other_controls_apart() {
+        use CarriageReturn::{Drop, Keep, Newline};
+        assert_eq!(
+            clean("a\r\nb\rc\x1bd\te", Newline, Some('?')),
+            "a\nb\nc?d\te"
+        );
+        assert_eq!(clean("a\r\nb\x1b", Keep, None), "a\r\nb");
+        assert_eq!(clean("a\r\nb\x07", Drop, None), "a\nb");
+        assert_eq!(first_control("a\r"), Some('\r'));
+        assert_eq!(first_control("a\n\tb"), None);
     }
 }
