@@ -1073,7 +1073,7 @@ enum Work<'a> {
     Facts {
         facts: &'a WorktreeFacts,
         head: Option<Line<'static>>,
-        list: Vec<TreeRow>,
+        list: std::sync::Arc<Vec<TreeRow>>,
     },
     Unreadable(String),
 }
@@ -1997,8 +1997,8 @@ mod tests {
 
         let done = name("auth-refresh-2");
         m.set_cursor(Cursor::Entry(done.clone()));
-        m.facts.insert(
-            done.clone(),
+        m.set_facts(
+            &done,
             Ok(WorktreeFacts {
                 ahead: 0,
                 ..WorktreeFacts::default()

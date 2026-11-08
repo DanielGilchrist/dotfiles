@@ -176,6 +176,21 @@ impl View {
     }
 }
 
+struct CachedTree {
+    generation: u64,
+    view: ChangesView,
+    collapsed: HashSet<PathBuf>,
+    rows: std::sync::Arc<Vec<TreeRow>>,
+}
+
+/// What [3]'s cursor is on, by identity so a refresh can't move it to
+/// another row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RowId {
+    Branch,
+    Path(PathBuf),
+}
+
 /// What the sidebar selection points at, by identity so it survives refreshes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Cursor {
@@ -1049,6 +1064,9 @@ pub struct Model {
     /// The folders each agent's [3] has closed. A folder that isn't named
     /// is open, so one that appears starts open.
     pub collapsed: HashMap<SessionName, HashSet<PathBuf>>,
+    /// The tree built for each agent, rebuilt only when its facts, the view
+    /// or its closed folders change.
+    tree_cache: std::cell::RefCell<HashMap<SessionName, CachedTree>>,
     /// Each agent's git facts, or why they couldn't be read, as last read.
     pub facts: HashMap<SessionName, Result<WorktreeFacts, String>>,
     /// When each agent's facts were last asked for.
@@ -1130,6 +1148,7 @@ impl Model {
             facts_generation: HashMap::new(),
             changes_view: ChangesView::default(),
             collapsed: HashMap::new(),
+            tree_cache: std::cell::RefCell::new(HashMap::new()),
             inspections: HashMap::new(),
             acknowledged: None,
             last_bell: None,
@@ -1275,19 +1294,57 @@ impl Model {
     }
 
     /// The folders and files [3] lists under the readiness row.
-    pub fn change_list(&self) -> Vec<TreeRow> {
+    pub fn change_list(&self) -> std::sync::Arc<Vec<TreeRow>> {
         let none = HashSet::new();
-        let collapsed = self
-            .selected_entry()
-            .and_then(|e| self.collapsed.get(e.name()))
-            .unwrap_or(&none);
-        tree::build(self.changes(), self.changes_view, collapsed)
+        let Some(name) = self.selected_entry().map(|e| e.name().clone()) else {
+            return std::sync::Arc::new(Vec::new());
+        };
+        let collapsed = self.collapsed.get(&name).unwrap_or(&none);
+        let generation = self.facts_generation.get(&name).copied().unwrap_or(0);
+        let mut cache = self.tree_cache.borrow_mut();
+        if let Some(hit) = cache.get(&name).filter(|c| {
+            c.generation == generation && c.view == self.changes_view && c.collapsed == *collapsed
+        }) {
+            return hit.rows.clone();
+        }
+        let rows = std::sync::Arc::new(tree::build(self.changes(), self.changes_view, collapsed));
+        cache.insert(
+            name,
+            CachedTree {
+                generation,
+                view: self.changes_view,
+                collapsed: collapsed.clone(),
+                rows: rows.clone(),
+            },
+        );
+        rows
+    }
+
+    /// Records `name`'s freshly read facts: the generation moves on, the
+    /// closed folders that no longer exist are forgotten, and [3]'s cursor
+    /// stays on the row it was on.
+    pub fn set_facts(&mut self, name: &SessionName, facts: Result<WorktreeFacts, String>) {
+        let selected = self.selected_entry().is_some_and(|e| e.name() == name);
+        let anchor = selected.then(|| self.changes_anchor()).flatten();
+        *self.facts_generation.entry(name.clone()).or_default() += 1;
+        self.facts.insert(name.clone(), facts);
+        if let Some(Ok(facts)) = self.facts.get(name) {
+            let existing = tree::folders(&facts.changed);
+            if let Some(closed) = self.collapsed.get_mut(name) {
+                closed.retain(|p| existing.contains(p));
+            }
+        } else {
+            self.collapsed.remove(name);
+        }
+        if let Some(anchor) = anchor {
+            self.restore_changes_anchor(&anchor);
+        }
     }
 
     /// What [3]'s row `row` is, none for the branch row.
     pub fn change_row(&self, row: usize) -> Option<TreeRow> {
         let at = row.checked_sub(usize::from(self.branch_row()))?;
-        self.change_list().into_iter().nth(at)
+        self.change_list().get(at).cloned()
     }
 
     /// The file on [3]'s row `row`, none for the branch row and folders.
@@ -1308,9 +1365,17 @@ impl Model {
             .filter(|r| matches!(r.node, Node::Folder { .. }))
     }
 
-    /// Moves [3]'s cursor to the row for `path`, or the first row under it
-    /// when it has none.
-    fn point_changes_at(&mut self, path: &Path) {
+    fn set_changes_file(&mut self, to: usize) {
+        match &mut self.panel {
+            Panel::Changes { file } | Panel::Main(Origin::Changes { file }) => *file = to,
+            _ => {}
+        }
+    }
+
+    /// Moves [3]'s cursor to the row for `path`, or the nearest row that
+    /// stands for it: the first under it, or the folder that holds it.
+    /// Whether there was one.
+    fn point_changes_at(&mut self, path: &Path) -> bool {
         let skip = usize::from(self.branch_row());
         let list = self.change_list();
         let at = list
@@ -1322,8 +1387,41 @@ impl Model {
                     path.starts_with(&r.path) && matches!(r.node, Node::Folder { .. })
                 })
             });
-        if let (Some(at), Panel::Changes { file }) = (at, &mut self.panel) {
-            *file = at + skip;
+        if let Some(at) = at {
+            self.set_changes_file(at + skip);
+        }
+        at.is_some()
+    }
+
+    /// What [3]'s cursor is on, if [3] has it.
+    pub fn changes_anchor(&self) -> Option<RowId> {
+        let (Panel::Changes { file } | Panel::Main(Origin::Changes { file })) = self.panel else {
+            return None;
+        };
+        let row = file.min(self.change_rows().checked_sub(1)?);
+        if self.branch_row() && row == 0 {
+            return Some(RowId::Branch);
+        }
+        self.change_row(row).map(|r| RowId::Path(r.path))
+    }
+
+    /// Puts [3]'s cursor back on `anchor` after the list changed under it,
+    /// or on the nearest row when it's gone.
+    pub fn restore_changes_anchor(&mut self, anchor: &RowId) {
+        let (Panel::Changes { file } | Panel::Main(Origin::Changes { file })) = self.panel else {
+            return;
+        };
+        let found = match anchor {
+            RowId::Branch if self.branch_row() => {
+                self.set_changes_file(0);
+                true
+            }
+            RowId::Branch => false,
+            RowId::Path(path) => self.point_changes_at(path),
+        };
+        if !found {
+            let last = self.change_rows().saturating_sub(1);
+            self.set_changes_file(file.min(last));
         }
     }
 
@@ -1346,7 +1444,8 @@ impl Model {
         }
     }
 
-    /// Opens or closes the folder under [3]'s cursor.
+    /// Opens or closes the folder under [3]'s cursor. A chain row closes
+    /// at its deepest folder and opens every folder it stands for.
     pub fn toggle_folder(&mut self) {
         let Some(folder) = self.folder_under_cursor() else {
             return;
@@ -1355,7 +1454,11 @@ impl Model {
             return;
         };
         let closed = self.collapsed.entry(name).or_default();
-        if !closed.remove(&folder.path) {
+        if matches!(folder.node, Node::Folder { open: false }) {
+            for path in &folder.chain {
+                closed.remove(path);
+            }
+        } else {
             closed.insert(folder.path);
         }
     }

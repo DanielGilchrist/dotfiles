@@ -78,6 +78,9 @@ pub struct TreeRow {
     pub label: String,
     /// The whole path from the checkout's root.
     pub path: PathBuf,
+    /// A folder row's every real folder, outermost first and ending at
+    /// `path`: a chain row stands for all of them. Empty for files.
+    pub chain: Vec<PathBuf>,
     pub counts: Counts,
 }
 
@@ -109,6 +112,7 @@ fn emit(
     for (name, child) in &dir.dirs {
         let mut label = name.clone();
         let mut path = base.join(name);
+        let mut chain = vec![path.clone()];
         let mut child = child;
         while child.files.is_empty() && child.dirs.len() == 1 {
             let Some((next, only)) = child.dirs.iter().next() else {
@@ -116,14 +120,16 @@ fn emit(
             };
             label = format!("{label}/{next}");
             path = path.join(next);
+            chain.push(path.clone());
             child = only;
         }
-        let open = !collapsed.contains(&path);
+        let open = !chain.iter().any(|p| collapsed.contains(p));
         out.push(TreeRow {
             node: Node::Folder { open },
             depth,
             label,
             path: path.clone(),
+            chain,
             counts: child.counts(changes),
         });
         if open {
@@ -138,13 +144,16 @@ fn emit(
             depth,
             label: name.clone(),
             path: changes[*i].path.clone(),
+            chain: Vec::new(),
             counts: Counts::of(&changes[*i]),
         });
     }
 }
 
-/// The rows [3] lists. `collapsed` holds the paths of the folders that are
-/// closed; a folder it doesn't name is open, so one that appears starts open.
+/// The rows [3] lists. `collapsed` holds the paths of the real folders that
+/// are closed, however the rows chain them; a row is closed when any folder
+/// of its chain is, and a folder it doesn't name is open, so one that
+/// appears starts open.
 pub fn build(changes: &[Change], view: ChangesView, collapsed: &HashSet<PathBuf>) -> Vec<TreeRow> {
     let mut out = Vec::new();
     match view {
@@ -155,6 +164,7 @@ pub fn build(changes: &[Change], view: ChangesView, collapsed: &HashSet<PathBuf>
                     depth: 0,
                     label: change.path.to_string_lossy().into_owned(),
                     path: change.path.clone(),
+                    chain: Vec::new(),
                     counts: Counts::of(change),
                 });
             }
@@ -182,12 +192,16 @@ pub fn build(changes: &[Change], view: ChangesView, collapsed: &HashSet<PathBuf>
     out
 }
 
-/// Every folder the tree has, closed or not, for collapsing them all.
+/// Every real folder the changes sit under, intermediate ones of a chain
+/// included.
 pub fn folders(changes: &[Change]) -> HashSet<PathBuf> {
-    build(changes, ChangesView::Tree, &HashSet::new())
-        .into_iter()
-        .filter(|r| matches!(r.node, Node::Folder { .. }))
-        .map(|r| r.path)
+    changes
+        .iter()
+        .flat_map(|c| {
+            let mut ancestors: Vec<&Path> = c.path.ancestors().skip(1).collect();
+            ancestors.retain(|p| !p.as_os_str().is_empty());
+            ancestors.into_iter().map(Path::to_path_buf)
+        })
         .collect()
 }
 

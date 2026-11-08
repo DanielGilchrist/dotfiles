@@ -239,8 +239,7 @@ fn step(m: &mut Model, msg: Msg) -> Vec<Effect> {
         }
         Msg::Inspected { name, facts } => {
             if m.inspections.contains_key(&name) {
-                *m.facts_generation.entry(name.clone()).or_default() += 1;
-                m.facts.insert(name, facts);
+                m.set_facts(&name, facts);
             }
             Vec::new()
         }
@@ -1461,8 +1460,7 @@ fn on_help_key(m: &Model, help: &mut HelpState, key: &KeyEvent) -> bool {
         help.selected = help.selected.saturating_add_signed(by).min(last);
     };
     match key.code {
-        KeyCode::Esc if !help.typing => return false,
-        KeyCode::Char('?' | 'q') if !help.typing => return false,
+        KeyCode::Esc | KeyCode::Char('?' | 'q') if !help.typing => return false,
         KeyCode::Enter => help.typing = false,
         KeyCode::Esc => {
             help.filter.clear();
@@ -2347,8 +2345,8 @@ mod tests {
                 lines: agent_core::ports::Lines::Untracked,
             })
             .collect();
-        m.facts.insert(
-            name("fix"),
+        m.set_facts(
+            &name("fix"),
             Ok(agent_core::ports::WorktreeFacts {
                 changed,
                 ..Default::default()
@@ -2367,8 +2365,8 @@ mod tests {
                 },
             })
             .collect();
-        m.facts.insert(
-            name("fix"),
+        m.set_facts(
+            &name("fix"),
             Ok(agent_core::ports::WorktreeFacts {
                 changed,
                 ..Default::default()
@@ -2377,7 +2375,7 @@ mod tests {
     }
 
     fn tree_labels(m: &Model) -> Vec<String> {
-        m.change_list().into_iter().map(|r| r.label).collect()
+        m.change_list().iter().map(|r| r.label.clone()).collect()
     }
 
     const PATHS: [&str; 5] = [
@@ -2486,6 +2484,172 @@ mod tests {
                 .get(&other)
                 .is_none_or(std::collections::HashSet::is_empty)
         );
+    }
+
+    fn closed(m: &Model) -> Vec<String> {
+        m.collapsed
+            .get(&name("fix"))
+            .into_iter()
+            .flatten()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    #[test]
+    fn a_closed_chain_stays_closed_when_it_splits_and_when_it_merges_back() {
+        let mut m = model(&[]);
+        m.changes_view = ChangesView::Tree;
+        with_paths(&mut m, &["a/b/c/x.rs", "top.rs"]);
+        m.panel = Panel::Changes { file: 0 };
+        update(&mut m, key(KeyCode::Enter));
+        assert_eq!(tree_labels(&m), ["a/b/c", "top.rs"]);
+        assert_eq!(closed(&m), ["a/b/c"]);
+
+        with_paths(&mut m, &["a/b/c/x.rs", "a/y.rs", "top.rs"]);
+        assert_eq!(tree_labels(&m), ["a", "b/c", "y.rs", "top.rs"]);
+        let rows = m.change_list();
+        assert_eq!(rows[0].node, crate::tree::Node::Folder { open: true });
+        assert_eq!(rows[1].node, crate::tree::Node::Folder { open: false });
+
+        with_paths(&mut m, &["a/b/c/x.rs", "top.rs"]);
+        assert_eq!(tree_labels(&m), ["a/b/c", "top.rs"], "merged and closed");
+    }
+
+    #[test]
+    fn closing_an_outer_folder_keeps_a_chain_it_merges_into_closed_and_enter_opens_all_of_it() {
+        let mut m = model(&[]);
+        m.changes_view = ChangesView::Tree;
+        with_paths(&mut m, &["a/b/c/x.rs", "a/y.rs"]);
+        m.panel = Panel::Changes { file: 0 };
+        update(&mut m, key(KeyCode::Enter));
+        assert_eq!(closed(&m), ["a"]);
+        with_paths(&mut m, &["a/b/c/x.rs"]);
+        assert_eq!(tree_labels(&m), ["a/b/c"]);
+        assert_eq!(
+            m.change_list()[0].node,
+            crate::tree::Node::Folder { open: false },
+            "the outer folder was closed"
+        );
+        m.panel = Panel::Changes { file: 0 };
+        update(&mut m, key(KeyCode::Enter));
+        assert!(closed(&m).is_empty(), "{:?}", closed(&m));
+        assert_eq!(tree_labels(&m), ["a/b/c", "x.rs"]);
+    }
+
+    #[test]
+    fn dash_closes_the_intermediate_folders_of_a_chain_too() {
+        let mut m = model(&[]);
+        m.changes_view = ChangesView::Tree;
+        with_paths(&mut m, &["a/b/c/x.rs", "top.rs"]);
+        m.panel = Panel::Changes { file: 0 };
+        update(&mut m, key(KeyCode::Char('-')));
+        assert_eq!(closed(&m), ["a", "a/b", "a/b/c"]);
+        with_paths(&mut m, &["a/b/c/x.rs", "a/b/y.rs", "top.rs"]);
+        assert_eq!(
+            tree_labels(&m),
+            ["a/b", "top.rs"],
+            "still closed after a split"
+        );
+    }
+
+    #[test]
+    fn closed_folders_that_no_longer_exist_are_forgotten() {
+        let mut m = model(&[]);
+        m.changes_view = ChangesView::Tree;
+        with_paths(&mut m, &["a/b/x.rs", "d/y.rs"]);
+        update(&mut m, key(KeyCode::Char('3')));
+        update(&mut m, key(KeyCode::Char('-')));
+        assert_eq!(closed(&m), ["a", "a/b", "d"]);
+        with_paths(&mut m, &["d/y.rs"]);
+        assert_eq!(closed(&m), ["d"]);
+    }
+
+    #[test]
+    fn the_changes_cursor_stays_on_its_file_when_rows_appear_above_it() {
+        let mut m = model(&[]);
+        m.changes_view = ChangesView::Tree;
+        with_paths(&mut m, &["b.rs", "c.rs"]);
+        update(&mut m, key(KeyCode::Char('3')));
+        update(&mut m, key(KeyCode::Char('j')));
+        let on = |m: &Model| m.file_under_cursor().map(|(_, f)| f);
+        assert_eq!(on(&m), Some("c.rs".into()));
+        let refreshed = |m: &mut Model, paths: &[&str]| {
+            let changed = paths
+                .iter()
+                .map(|p| agent_core::ports::Change {
+                    path: (*p).into(),
+                    lines: agent_core::ports::Lines::Untracked,
+                })
+                .collect();
+            update(
+                m,
+                Msg::Inspected {
+                    name: name("fix"),
+                    facts: Ok(agent_core::ports::WorktreeFacts {
+                        changed,
+                        ..Default::default()
+                    }),
+                },
+            );
+        };
+        m.inspections.insert(
+            name("fix"),
+            Inspection {
+                events: None,
+                at: Instant::now(),
+            },
+        );
+        refreshed(&mut m, &["a.rs", "aa/z.rs", "b.rs", "c.rs"]);
+        assert_eq!(on(&m), Some("c.rs".into()), "rows above came and went");
+        refreshed(&mut m, &["a.rs", "b.rs"]);
+        assert_eq!(
+            on(&m),
+            Some("b.rs".into()),
+            "the file is gone, so the nearest row"
+        );
+    }
+
+    #[test]
+    fn the_changes_cursor_on_a_folder_follows_it_when_its_chain_changes() {
+        let mut m = model(&[]);
+        m.changes_view = ChangesView::Tree;
+        with_paths(&mut m, &["a/b/x.rs", "top.rs"]);
+        m.panel = Panel::Changes { file: 0 };
+        with_paths(&mut m, &["a/b/x.rs", "a/y.rs", "top.rs"]);
+        assert_eq!(
+            m.change_row(match m.panel {
+                Panel::Changes { file } => file,
+                _ => unreachable!(),
+            })
+            .map(|r| r.label),
+            Some("b".into()),
+            "the chain split and the cursor stays on the same folder, a/b"
+        );
+    }
+
+    #[test]
+    fn the_tree_is_built_once_per_generation_view_and_fold_state() {
+        let mut m = model(&[]);
+        m.changes_view = ChangesView::Tree;
+        with_paths(&mut m, &PATHS);
+        let first = m.change_list();
+        assert!(std::sync::Arc::ptr_eq(&first, &m.change_list()));
+        m.panel = Panel::Changes { file: 0 };
+        m.toggle_folder();
+        let folded = m.change_list();
+        assert!(
+            !std::sync::Arc::ptr_eq(&first, &folded),
+            "fold state changed"
+        );
+        assert!(std::sync::Arc::ptr_eq(&folded, &m.change_list()));
+        m.toggle_changes_view();
+        assert!(!std::sync::Arc::ptr_eq(&folded, &m.change_list()), "view");
+        m.toggle_changes_view();
+        let before = m.change_list();
+        with_paths(&mut m, &PATHS);
+        assert!(!std::sync::Arc::ptr_eq(&before, &m.change_list()), "facts");
     }
 
     #[test]
@@ -4637,7 +4801,10 @@ mod tests {
         let mut m = crate::fixtures::fleet(10);
         set_state(&mut m, AGENT, done(), 1);
         live_since(&mut m, 2);
-        assert!(replies(&talk_to(&mut m, AGENT, "rebase")).is_empty());
+        assert_eq!(
+            replies(&talk_to(&mut m, AGENT, "rebase")),
+            Vec::<String>::new()
+        );
         live_since(&mut m, 90);
         assert_eq!(replies(&tick(&mut m)), ["rebase"]);
     }
