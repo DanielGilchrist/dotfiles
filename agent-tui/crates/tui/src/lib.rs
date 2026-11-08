@@ -3,6 +3,7 @@ mod keymap;
 mod log;
 mod model;
 mod palette;
+mod review;
 mod tree;
 mod update;
 mod view;
@@ -365,6 +366,14 @@ impl Runtime {
                     let (cwd, file) = match &open {
                         Open::Checkout(dir) => (dir, None),
                         Open::File { root, file } => (root, Some(file.as_path())),
+                        Open::At {
+                            root,
+                            file,
+                            line: at,
+                        } => {
+                            line = Some(*at);
+                            (root, Some(file.as_path()))
+                        }
                         Open::Transcript {
                             root,
                             name,

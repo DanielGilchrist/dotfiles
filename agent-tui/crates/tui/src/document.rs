@@ -12,6 +12,8 @@ use agent_core::names::SessionName;
 use agent_core::ports::{BranchLog, Change, Compared, DiffBase, FileDiff, Lines};
 use ratatui::text::Line;
 
+use crate::review::LineInfo;
+
 /// The cursor must rest on a file this long before its diff is asked for, so
 /// holding `j` doesn't start a read per file.
 pub const REST: Duration = Duration::from_millis(60);
@@ -220,7 +222,7 @@ impl Hover {
     }
 
     /// The document a read has to produce for this, if it needs one.
-    fn key(&self) -> Option<Key> {
+    pub fn key(&self) -> Option<Key> {
         match self {
             Self::Diff(key) => Some(Key::Diff(key.clone())),
             Self::Branch(key) => Some(Key::Branch(key.clone())),
@@ -276,6 +278,8 @@ pub struct Documents {
     shown: Option<(Key, Loaded)>,
     /// Rows built from a document at a width, so a frame doesn't rebuild them.
     rows: Option<(Key, usize, Vec<Line<'static>>)>,
+    /// The lines of the diff the rows show, for the cursor.
+    lines: Vec<LineInfo>,
 }
 
 impl Documents {
@@ -419,6 +423,31 @@ impl Documents {
         self.rows.as_ref().map_or(&[], |(_, _, rows)| rows)
     }
 
+    /// The diff lines behind the rows last built.
+    pub fn lines(&self) -> &[LineInfo] {
+        &self.lines
+    }
+
+    /// Rows and the diff lines behind them for the document under `key` at
+    /// `width`, built once.
+    pub fn rows_with_lines(
+        &mut self,
+        key: &Key,
+        width: usize,
+        build: impl FnOnce() -> (Vec<Line<'static>>, Vec<LineInfo>),
+    ) -> &[Line<'static>] {
+        if !self
+            .rows
+            .as_ref()
+            .is_some_and(|(k, w, _)| k == key && *w == width)
+        {
+            let (rows, lines) = build();
+            self.rows = Some((key.clone(), width, rows));
+            self.lines = lines;
+        }
+        self.rows.as_ref().map_or(&[], |(_, _, rows)| rows)
+    }
+
     /// Rows for the document under `key` at `width`, built once.
     pub fn rows(
         &mut self,
@@ -432,6 +461,7 @@ impl Documents {
             .is_some_and(|(k, w, _)| k == key && *w == width)
         {
             self.rows = Some((key.clone(), width, build()));
+            self.lines = Vec::new();
         }
         self.rows.as_ref().map_or(&[], |(_, _, rows)| rows)
     }

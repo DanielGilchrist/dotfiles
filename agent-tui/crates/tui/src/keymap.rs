@@ -85,6 +85,8 @@ pub struct Situation {
     pub folder: Option<bool>,
     pub tree: bool,
     pub subagent_row: bool,
+    /// [0] reads a diff: a file's, a folder's or a commit's.
+    pub diff: bool,
     pub left_agent: bool,
     pub can_edit_checkout: bool,
     pub has_actions: bool,
@@ -142,6 +144,10 @@ impl Situation {
                 .map(|r| matches!(r.node, Node::Folder { open: true })),
             tree: m.changes_view == ChangesView::Tree,
             subagent_row: m.subagent_selected().is_some(),
+            diff: matches!(
+                m.hover(),
+                Some(crate::document::Hover::Diff(_) | crate::document::Hover::Folder(_))
+            ),
             left_agent,
             can_edit_checkout: selected.is_some(),
             has_actions: entry.is_some() && !m.actions.is_empty(),
@@ -322,6 +328,13 @@ pub const BINDINGS: &[Binding] = &[
     ),
     Binding::new(
         &["e"],
+        Ctxs::of(&[Ctx::Main]),
+        RankBy(|s| s.diff.then_some(7)),
+        By(|s| s.diff.then_some("edit line")),
+        "Open the file in $EDITOR at the line under the cursor. A removed line opens at the line that now follows it.",
+    ),
+    Binding::new(
+        &["e"],
         Ctxs::of(&[Ctx::Turn, Ctx::Main]),
         RankBy(|s| s.subagent_row.then_some(7)),
         By(|s| s.subagent_row.then_some("edit transcript")),
@@ -345,7 +358,7 @@ pub const BINDINGS: &[Binding] = &[
         &["e"],
         Ctxs::of(&[Ctx::Agents, Ctx::Main]),
         RankBy(|s| (s.ctx == Ctx::Agents).then_some(0)),
-        By(|s| (s.can_edit_checkout && !(s.ctx == Ctx::Main && s.subagent_row)).then_some("edit checkout")),
+        By(|s| (s.can_edit_checkout && !(s.ctx == Ctx::Main && (s.subagent_row || s.diff))).then_some("edit checkout")),
         "Open the agent's checkout (or the repo's) in $EDITOR.",
     ),
     Binding::new(
@@ -361,6 +374,13 @@ pub const BINDINGS: &[Binding] = &[
         RankBy(|_| Some(4)),
         By(|s| Some(s.next_changes_tab)),
         "Cycle [3]'s tabs: Uncommitted, the files not yet committed, counted against the last commit, and the second tab: Branch, what this branch changes compared with where it left origin's default branch, like a PR plus your uncommitted work, or Unpushed on the trunk, the commits not yet on origin plus uncommitted work. The choice lasts for the session.",
+    ),
+    Binding::new(
+        &["[", "]"],
+        Ctxs::of(&[Ctx::Main]),
+        RankBy(|s| s.diff.then_some(7)),
+        By(|s| s.diff.then_some("hunk")),
+        "Jump to the previous or next hunk of the diff.",
     ),
     Binding::new(
         &["."],
@@ -433,7 +453,13 @@ pub const BINDINGS: &[Binding] = &[
         &["j", "k"],
         PANELS,
         RankBy(|s| (s.ctx == Ctx::Main).then_some(8)),
-        By(|s| Some(if s.ctx == Ctx::Main { "scroll" } else { "move" })),
+        By(|s| {
+            Some(match (s.ctx, s.diff) {
+                (Ctx::Main, true) => "line",
+                (Ctx::Main, false) => "scroll",
+                _ => "move",
+            })
+        }),
         "Move the selection or cursor in the focused panel, or scroll [0] when it has the keys.",
     )
     .with(&["↓", "↑"]),
@@ -686,6 +712,7 @@ mod tests {
             folder: Some(true),
             tree: true,
             subagent_row: true,
+            diff: false,
             left_agent: true,
             can_edit_checkout: true,
             has_actions: true,

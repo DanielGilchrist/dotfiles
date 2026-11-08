@@ -3394,6 +3394,87 @@ mod tests {
         );
     }
 
+    fn press(m: &mut Model, code: crossterm::event::KeyCode) -> Vec<crate::update::Effect> {
+        crate::update::update(
+            m,
+            crate::worker::Msg::Key(crossterm::event::KeyEvent::new(
+                code,
+                crossterm::event::KeyModifiers::NONE,
+            )),
+        )
+    }
+
+    fn on_a_loaded_diff() -> Model {
+        use crate::document::Doc;
+        use agent_core::ports::FileDiff;
+        let mut m = tree_fleet();
+        m.panel = Focused::Changes { file: 2 };
+        m.settle_main();
+        std::thread::sleep(crate::document::REST + std::time::Duration::from_millis(20));
+        let key = m.docs.due(std::time::Instant::now()).expect("due");
+        let lines = [
+            "@@ -10,3 +20,4 @@",
+            " ctx",
+            "-gone",
+            "+one",
+            "+two",
+            "@@ -40 +50 @@",
+            "+far",
+        ];
+        m.docs.loaded(
+            &key,
+            Ok(Doc::Diff(FileDiff::Text {
+                lines: lines.iter().map(|l| (*l).to_string()).collect(),
+                more: 0,
+            })),
+        );
+        m.settle_main();
+        render(&mut m, (140, 40));
+        m.panel = m.panel.into_main();
+        m
+    }
+
+    #[test]
+    fn the_diff_cursor_walks_lines_jumps_hunks_and_edits_at_the_line() {
+        use crossterm::event::KeyCode;
+        let mut m = on_a_loaded_diff();
+        let text = screen(&render(&mut m, (140, 40))).join("\n");
+        assert!(text.contains("▌ ctx"), "{text}");
+        press(&mut m, KeyCode::Char('j'));
+        press(&mut m, KeyCode::Char('j'));
+        let effects = press(&mut m, KeyCode::Char('e'));
+        assert!(
+            matches!(effects.as_slice(), [crate::update::Effect::Edit(crate::update::Open::At { file, line: 21, .. })]
+                if file.ends_with("sidebar.rs")),
+            "the added line opens at its place in the new file"
+        );
+        press(&mut m, KeyCode::Char('k'));
+        let effects = press(&mut m, KeyCode::Char('e'));
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [crate::update::Effect::Edit(crate::update::Open::At {
+                    line: 21,
+                    ..
+                })]
+            ),
+            "a removed line opens where it was"
+        );
+        press(&mut m, KeyCode::Char(']'));
+        let text = screen(&render(&mut m, (140, 40))).join("\n");
+        assert!(
+            text.contains("▌+far"),
+            "] lands on the next hunk's first line\n{text}"
+        );
+        press(&mut m, KeyCode::Char('['));
+        press(&mut m, KeyCode::Char('['));
+        let text = screen(&render(&mut m, (140, 40))).join("\n");
+        assert!(text.contains("▌ ctx"), "[ goes back a hunk\n{text}");
+        press(&mut m, KeyCode::Char('G'));
+        let text = screen(&render(&mut m, (140, 40))).join("\n");
+        assert!(text.contains("▌+far"), "{text}");
+    }
+
     #[test]
     fn clicks_and_the_wheel_work_on_tree_rows() {
         let mut m = tree_fleet();

@@ -1090,6 +1090,10 @@ pub struct Model {
     pub subagent_reads: HashMap<SubagentKey, SubagentRead>,
     /// [0]'s subagent log: cursor, expansion and layout.
     pub log_view: crate::log::LogView,
+    /// [0]'s diff: the cursor over its lines.
+    pub diff_view: crate::review::DiffView,
+    /// Comments drafted on diffs for each agent, until sent.
+    pub drafts: HashMap<SessionName, Vec<crate::review::Comment>>,
     /// The agent whose terminal the peek float shows.
     pub peek: Option<SessionName>,
     /// Messages waiting for their agents to be at rest.
@@ -1161,6 +1165,8 @@ impl Model {
             subagent_logs: HashMap::new(),
             subagent_reads: HashMap::new(),
             log_view: crate::log::LogView::default(),
+            diff_view: crate::review::DiffView::default(),
+            drafts: HashMap::new(),
             peek: None,
             outboxes: HashMap::new(),
             live_since: HashMap::new(),

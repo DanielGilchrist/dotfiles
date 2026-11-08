@@ -57,6 +57,12 @@ pub enum Open {
     Checkout(PathBuf),
     /// A file, relative to the checkout the editor runs in.
     File { root: PathBuf, file: PathBuf },
+    /// A file at a line.
+    At {
+        root: PathBuf,
+        file: PathBuf,
+        line: usize,
+    },
     /// A subagent's transcript as Markdown, at `line`.
     Transcript {
         root: PathBuf,
@@ -767,6 +773,57 @@ fn edit_transcript(m: &mut Model) -> Option<Vec<Effect>> {
     }
 }
 
+/// Keys for [0] while it reads a diff: the line cursor, hunk jumps and
+/// editing at the line. `None` leaves the key to the plain document keys.
+fn diff_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
+    if !matches!(
+        m.hover(),
+        Some(crate::document::Hover::Diff(_) | crate::document::Hover::Folder(_))
+    ) {
+        return None;
+    }
+    let lines = m.docs.lines();
+    if lines.is_empty() {
+        return None;
+    }
+    let at = m.diff_view.cursor;
+    let mut effects = Vec::new();
+    let to = match code {
+        KeyCode::Char('j') | KeyCode::Down => crate::review::step(lines, at, 1),
+        KeyCode::Char('k') | KeyCode::Up => crate::review::step(lines, at, -1),
+        KeyCode::Char('g') | KeyCode::Home => crate::review::first(lines),
+        KeyCode::Char('G') | KeyCode::End => crate::review::last(lines),
+        KeyCode::Char(']') => crate::review::hunk(lines, at, true),
+        KeyCode::Char('[') => crate::review::hunk(lines, at, false),
+        KeyCode::PageDown | KeyCode::PageUp => {
+            let half = m.docs.half_page() * 2;
+            m.docs.scroll_by(if code == KeyCode::PageDown {
+                half
+            } else {
+                -half
+            });
+            m.diff_view.follow_page = true;
+            return Some(effects);
+        }
+        KeyCode::Char('e') => {
+            let root = m.selected_entry()?.path()?.to_path_buf();
+            let line = lines.get(at)?;
+            effects.push(Effect::Edit(Open::At {
+                root,
+                file: line.path.clone(),
+                line: line.edit.max(1),
+            }));
+            return Some(effects);
+        }
+        _ => return None,
+    };
+    if let Some(to) = to {
+        m.diff_view.cursor = to;
+        m.diff_view.reveal = true;
+    }
+    Some(effects)
+}
+
 /// Keys for [0] while it reads a subagent's log: the entry cursor, folds and
 /// the transcript in the editor. `None` leaves the key to the plain
 /// document keys.
@@ -857,7 +914,7 @@ fn sanitize_paste(text: &str) -> String {
 /// own meaning. `None` leaves the key to NAV.
 fn on_panel_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
     if m.main_focused()
-        && let Some(effects) = log_key(m, code)
+        && let Some(effects) = log_key(m, code).or_else(|| diff_key(m, code))
     {
         return Some(effects);
     }
@@ -1049,6 +1106,7 @@ fn on_nav_key(m: &mut Model, key: KeyEvent) -> Vec<Effect> {
             Panel::Changes { .. } | Panel::Agent { .. } | Panel::Main(_) => {
                 m.docs.scroll_by(m.docs.half_page());
                 m.log_view.follow_page = m.main_focused();
+                m.diff_view.follow_page = m.main_focused();
             }
             Panel::Agents => m.page_in_panel(m.half_page()),
         },
@@ -1056,6 +1114,7 @@ fn on_nav_key(m: &mut Model, key: KeyEvent) -> Vec<Effect> {
             Panel::Changes { .. } | Panel::Agent { .. } | Panel::Main(_) => {
                 m.docs.scroll_by(-m.docs.half_page());
                 m.log_view.follow_page = m.main_focused();
+                m.diff_view.follow_page = m.main_focused();
             }
             Panel::Agents => m.page_in_panel(-m.half_page()),
         },

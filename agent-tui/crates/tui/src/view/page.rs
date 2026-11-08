@@ -2,6 +2,7 @@
 //! terminal.
 
 use std::fmt::Write;
+use std::path::Path;
 use std::time::Instant;
 
 use agent_core::activity::AgentId;
@@ -21,6 +22,7 @@ use super::{
 };
 use crate::document::{BranchKey, DiffKey, Doc, FolderDocs, FolderKey, Hover, Key, Resolved};
 use crate::model::{AgentStatus, Model, SubagentKey};
+use crate::review::{self, LineInfo};
 
 /// [0]'s title, what its top border says on the right, its bottom-right
 /// corner and its rows.
@@ -52,6 +54,8 @@ struct Body {
     entries: Vec<(usize, usize)>,
     /// The log's entry the cursor is on, and which subagent it belongs to.
     nav: Option<SubagentKey>,
+    /// A diff, whose lines the cursor moves over.
+    diff: bool,
 }
 
 impl Body {
@@ -64,6 +68,7 @@ impl Body {
             pinned: Vec::new(),
             entries: Vec::new(),
             nav: None,
+            diff: false,
         }
     }
 }
@@ -105,9 +110,17 @@ pub(super) fn page(m: &mut Model, area: Rect, width: usize, border: Style) -> Op
     if let Some(key) = &body.nav {
         reveal(m, key, &body.entries, height);
     }
+    let diff = body.diff && matches!(body.rows, Rows::Cached);
+    if diff {
+        settle_diff(m, hover.key().map(|k| k.slot()));
+        reveal_line(m, height);
+    }
     let top = m.docs.place(total, height, body.tails);
     if let Some(key) = &body.nav {
         follow_page(m, key, &body.entries, top);
+    }
+    if diff {
+        follow_page_line(m, top);
     }
     let mut lines: Vec<Line<'static>> = Vec::new();
     if let Some(question) = question {
@@ -129,6 +142,9 @@ pub(super) fn page(m: &mut Model, area: Rect, width: usize, border: Style) -> Op
     match &body.rows {
         Rows::Built(rows) => lines.extend(rows.iter().skip(top).take(height).cloned()),
         Rows::Cached => lines.extend(m.docs.cached().iter().skip(top).take(height).cloned()),
+    }
+    if diff {
+        mark_lines(m, &mut lines, from, top, height);
     }
     if let Some(key) = &body.nav
         && m.main_focused()
@@ -183,6 +199,85 @@ pub(super) fn page(m: &mut Model, area: Rect, width: usize, border: Style) -> Op
         corner,
         lines,
     })
+}
+
+/// Starts the diff cursor afresh on another document and keeps it on a line.
+fn settle_diff(m: &mut Model, slot: Option<crate::document::Slot>) {
+    let first = review::first(m.docs.lines()).unwrap_or(0);
+    let last = review::last(m.docs.lines()).unwrap_or(0);
+    let view = &mut m.diff_view;
+    if view.owner != slot {
+        view.owner = slot;
+        view.cursor = first;
+        view.anchor = None;
+    }
+    view.cursor = view.cursor.clamp(first, last);
+    view.anchor = view.anchor.map(|a| a.min(last));
+}
+
+/// Scrolls so the cursor's lines show, once, after a key moved it.
+fn reveal_line(m: &mut Model, height: usize) {
+    if !std::mem::take(&mut m.diff_view.reveal) {
+        return;
+    }
+    let (from, to) = m.diff_view.span();
+    let lines = m.docs.lines();
+    let (Some(first), Some(last)) = (lines.get(from), lines.get(to)) else {
+        return;
+    };
+    let (start, end) = (first.row, last.row + last.height);
+    let top = m.docs.scroll;
+    if start < top {
+        m.docs.scroll = start;
+    } else if end > top + height {
+        m.docs.scroll = end.saturating_sub(height).min(start);
+    }
+}
+
+/// Moves the cursor onto the first line on screen after a page scroll.
+fn follow_page_line(m: &mut Model, top: usize) {
+    if !std::mem::take(&mut m.diff_view.follow_page) {
+        return;
+    }
+    let lines = m.docs.lines();
+    let at = lines
+        .iter()
+        .position(|l| l.selectable() && l.row + l.height > top)
+        .or_else(|| review::last(lines));
+    if let Some(at) = at {
+        m.diff_view.cursor = at;
+        m.diff_view.anchor = None;
+    }
+}
+
+/// `▌` in the gutter of the cursor's lines while [0] has the keys, and `✎`
+/// on lines the agent's draft comments on.
+fn mark_lines(m: &Model, out: &mut [Line<'static>], from: usize, top: usize, height: usize) {
+    let drafts = m
+        .selected_entry()
+        .and_then(|e| m.drafts.get(e.name()))
+        .map_or(&[][..], Vec::as_slice);
+    let (lo, hi) = m.diff_view.span();
+    for (at, line) in m.docs.lines().iter().enumerate() {
+        let selected = m.main_focused() && (lo..=hi).contains(&at);
+        let commented = drafts.iter().any(|c| c.covers(line));
+        if !selected && !commented {
+            continue;
+        }
+        let mark = if selected {
+            Span::styled("▌", accent())
+        } else {
+            Span::styled("✎", warning())
+        };
+        for row in line.row.max(top)..(line.row + line.height).min(top + height) {
+            if let Some(first) = out
+                .get_mut(from + row - top)
+                .and_then(|l| l.spans.first_mut())
+            {
+                *first = mark.clone();
+            }
+        }
+    }
 }
 
 /// Scrolls so the cursor's entry shows, once, after a key moved it.
@@ -255,11 +350,12 @@ fn diff_body(m: &mut Model, hover: &DiffKey, columns: usize, budget: usize) -> B
     let rows = match m.docs.resolve() {
         Resolved::Current(key, loaded) | Resolved::Stale(key, loaded) => {
             let (key, loaded) = (key.clone(), loaded.clone());
-            m.docs.rows(&key, columns, || match loaded.as_ref() {
-                Ok(Doc::Diff(diff)) => diff_rows(Ok(diff), columns),
-                Ok(Doc::Branch(_) | Doc::Folder(_)) => Vec::new(),
-                Err(e) => diff_rows(Err(e), columns),
-            });
+            m.docs
+                .rows_with_lines(&key, columns, || match loaded.as_ref() {
+                    Ok(Doc::Diff(diff)) => diff_rows_info(&hover.path, Ok(diff), columns, 0),
+                    Ok(Doc::Branch(_) | Doc::Folder(_)) => (Vec::new(), Vec::new()),
+                    Err(e) => diff_rows_info(&hover.path, Err(e), columns, 0),
+                });
             Rows::Cached
         }
         Resolved::Missing => Rows::Built(Vec::new()),
@@ -299,6 +395,7 @@ fn diff_body(m: &mut Model, hover: &DiffKey, columns: usize, budget: usize) -> B
         pinned: Vec::new(),
         entries: Vec::new(),
         nav: None,
+        diff: true,
     }
 }
 
@@ -311,16 +408,16 @@ fn folder_body(m: &mut Model, hover: &FolderKey, columns: usize, budget: usize) 
         Resolved::Current(key, loaded) | Resolved::Stale(key, loaded) => {
             let (key, loaded) = (key.clone(), loaded.clone());
             m.docs
-                .rows(&key, columns, || match (&key, loaded.as_ref()) {
+                .rows_with_lines(&key, columns, || match (&key, loaded.as_ref()) {
                     (Key::Folder(folder), Ok(Doc::Folder(docs))) => {
                         folder_rows(folder, Some(Ok(docs)), columns)
                     }
                     (Key::Folder(folder), Err(e)) => folder_rows(folder, Some(Err(e)), columns),
-                    _ => Vec::new(),
+                    _ => (Vec::new(), Vec::new()),
                 });
             Rows::Cached
         }
-        Resolved::Missing => Rows::Built(folder_rows(hover, None, columns)),
+        Resolved::Missing => Rows::Built(folder_rows(hover, None, columns).0),
     };
     let (mut added, mut removed) = (0, 0);
     for change in &hover.files {
@@ -383,8 +480,9 @@ fn folder_rows(
     folder: &FolderKey,
     docs: Option<Result<&FolderDocs, &String>>,
     columns: usize,
-) -> Vec<Line<'static>> {
+) -> (Vec<Line<'static>>, Vec<LineInfo>) {
     let mut rows: Vec<Line<'static>> = Vec::new();
+    let mut infos: Vec<LineInfo> = Vec::new();
     for change in &folder.files {
         let rel = change
             .path
@@ -403,9 +501,9 @@ fn folder_rows(
         Some(Err(e)) => {
             rows.push(Line::raw(""));
             rows.extend(diff_rows(Err(e), columns));
-            return rows;
+            return (rows, infos);
         }
-        None => return rows,
+        None => return (rows, infos),
     };
     for file in &docs.files {
         rows.push(Line::raw(""));
@@ -423,7 +521,10 @@ fn folder_rows(
             head.extend(counts);
         }
         rows.push(Line::from(head));
-        rows.extend(diff_rows(file.diff.as_ref(), columns));
+        let (diff, lines) =
+            diff_rows_info(&file.change.path, file.diff.as_ref(), columns, rows.len());
+        rows.extend(diff);
+        infos.extend(lines);
     }
     if docs.more_files > 0 {
         rows.push(Line::raw(""));
@@ -432,7 +533,7 @@ fn folder_rows(
             dim(),
         ));
     }
-    rows
+    (rows, infos)
 }
 
 /// The branch: how far it is from shipping, its commits and the files not
@@ -468,6 +569,7 @@ fn branch_body(m: &mut Model, key: &BranchKey, columns: usize) -> Body {
         pinned: Vec::new(),
         entries: Vec::new(),
         nav: None,
+        diff: true,
     }
 }
 
@@ -689,46 +791,76 @@ fn log_body(m: &Model, name: &SessionName, id: &AgentId, columns: usize, budget:
 }
 
 fn diff_rows(loaded: Result<&FileDiff, &String>, width: usize) -> Vec<Line<'static>> {
+    diff_rows_info(Path::new(""), loaded, width, 0).0
+}
+
+/// A diff's rows, each after a one column gutter for the cursor, and what
+/// each of its lines is. `offset` is the document row the first one lands on.
+fn diff_rows_info(
+    path: &Path,
+    loaded: Result<&FileDiff, &String>,
+    width: usize,
+    offset: usize,
+) -> (Vec<Line<'static>>, Vec<LineInfo>) {
+    let gutter = || Span::raw(" ");
+    let note = |text: String, style: Style| {
+        (
+            vec![Line::from(vec![gutter(), Span::styled(text, style)])],
+            Vec::new(),
+        )
+    };
+    let width = width.saturating_sub(1).max(1);
     match loaded {
-        Err(e) => vec![Line::styled(
-            e.lines().next().unwrap_or_default().to_string(),
-            error(),
-        )],
-        Ok(FileDiff::Binary { bytes }) => vec![Line::styled(
+        Err(e) => note(e.lines().next().unwrap_or_default().to_string(), error()),
+        Ok(FileDiff::Binary { bytes }) => note(
             match bytes {
                 Some(bytes) => format!("binary · {}", size(*bytes)),
                 None => "binary".to_string(),
             },
             dim(),
-        )],
+        ),
         Ok(FileDiff::Text { lines, more }) => {
             let mut rows: Vec<Line<'static>> = Vec::new();
-            for line in lines {
+            let mut infos = Vec::new();
+            for (line, (kind, old, new, edit)) in lines.iter().zip(review::classify(lines)) {
                 let style = match line.chars().next() {
                     Some('+') => success(),
                     Some('-') => error(),
                     Some('@') => dim(),
                     _ => Style::new(),
                 };
-                if line.starts_with("@@") {
-                    rows.push(Line::styled(truncate_end(line, width), style));
-                    continue;
-                }
-                rows.extend(
+                let cut = if line.starts_with("@@") {
+                    vec![truncate_end(line, width)]
+                } else {
                     hard_wrap(&line.replace('\t', "    "), width)
-                        .into_iter()
-                        .map(|row| Line::styled(row, style)),
+                };
+                infos.push(LineInfo {
+                    row: offset + rows.len(),
+                    height: cut.len(),
+                    path: path.to_path_buf(),
+                    kind,
+                    old,
+                    new,
+                    text: line.clone(),
+                    edit,
+                });
+                rows.extend(
+                    cut.into_iter()
+                        .map(|row| Line::from(vec![gutter(), Span::styled(row, style)])),
                 );
             }
             if *more > 0 {
-                rows.push(Line::styled(
-                    format!("{} more lines · e open", thousands(*more)),
-                    dim(),
-                ));
+                rows.push(Line::from(vec![
+                    gutter(),
+                    Span::styled(format!("{} more lines · e open", thousands(*more)), dim()),
+                ]));
             } else if rows.is_empty() {
-                rows.push(Line::styled("no changes to show", dim()));
+                rows.push(Line::from(vec![
+                    gutter(),
+                    Span::styled("no changes to show", dim()),
+                ]));
             }
-            rows
+            (rows, infos)
         }
     }
 }
