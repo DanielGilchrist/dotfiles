@@ -218,7 +218,7 @@ NAV. The table in `crates/tui/src/keymap.rs` is the source of truth for the foot
 | `e` | edit: in [1] and [0] the checkout in `$EDITOR`, in [3] the file under the cursor (or on a folder, `$EDITOR` in that folder), in [2] on a subagent row, and in [0] on a subagent's log or the activity, that transcript as Markdown (at the cursor's entry from [0]), run in the agent's checkout. On [2]'s activity row it opens the checkout |
 | `d` | kill session, **with confirmation (owner)**: `y` or `⏎`, since it can be resurrected |
 | `D` | remove session, worktree and branch (confirmation, or `Y` if commits would be lost) |
-| `x` | actions overlay ("Run on <agent>"): the configured actions, one key each. `Esc` closes |
+| `x` | actions overlay ("Run on <agent>"): the configured actions, one key each. `Esc` closes. After an action the TUI rechecks other windows shortly after, so a window the action opened pauses the pane promptly. |
 | `?` | keybindings (see Help) |
 | `q` | quit |
 

@@ -14,6 +14,19 @@ label = "dev server"
 terminal_event = { name = "agent-spawn-dev", value = "{path}" }
 
 [[action]]
+key = "t"
+label = "open in tab"
+# wezterm/agent_open.lua handles these two: focus the window already showing
+# the agent (`agent windows <name>` finds it), or open it in a new tab or a
+# split right of the TUI. They need the TUI to run on this machine.
+terminal_event = { name = "agent-open", value = "tab|{name}|{path}" }
+
+[[action]]
+key = "r"
+label = "open right"
+terminal_event = { name = "agent-open", value = "right|{name}|{path}" }
+
+[[action]]
 key = "o"
 label = "open PR"
 # gh finds the PR from the checkout's branch; with none, its error lands

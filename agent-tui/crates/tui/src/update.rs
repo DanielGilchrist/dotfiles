@@ -520,6 +520,7 @@ fn tick_effects(m: &mut Model) -> Vec<Effect> {
     let mut effects = check_timed_out(m);
     effects.extend(ask_for_name(m));
     effects.extend(bell(m));
+    effects.extend(recheck_elsewhere_when_due(m));
     effects.extend(flush(m));
     effects.extend(look(m, SEEN_AFTER).map(Effect::Job));
     effects.extend(preview(m));
@@ -530,6 +531,10 @@ fn tick_effects(m: &mut Model) -> Vec<Effect> {
     effects.extend(check_dir(m));
     effects
 }
+
+/// How long after an action the TUI looks for the window it may have opened,
+/// which gives the terminal time to start the client.
+const ELSEWHERE_RECHECK_AFTER: Duration = Duration::from_secs(1);
 
 /// How long a check may take before the pane attaches without it.
 const CHECK_TIMEOUT: Duration = Duration::from_secs(2);
@@ -723,6 +728,15 @@ pub fn recheck_elsewhere(m: &mut Model) -> Option<Look> {
             Some(looking(m, Need::Refresh))
         }
     }
+}
+
+/// Looks for other windows once an action has had time to open one. A pane
+/// waiting on its own look or client keeps the ask for the tick after.
+fn recheck_elsewhere_when_due(m: &mut Model) -> Option<Effect> {
+    m.elsewhere_due.filter(|due| m.clock.mono >= *due)?;
+    let look = recheck_elsewhere(m)?;
+    m.elsewhere_due = None;
+    Some(Effect::CheckElsewhere(look))
 }
 
 /// A new look, which makes every look before it stale.
@@ -2353,16 +2367,20 @@ fn run_action(m: &mut Model, target: &SessionName, action: &Action) -> Vec<Effec
         repo: repo.key().root().map(agent_core::paths::RepoRoot::path),
     };
     match action.invoke(ctx) {
-        Ok(Invocation::Run(launch)) => vec![Effect::Job(Job::Run {
-            label: format!("{} on {target}", action.label),
-            launch,
-        })],
+        Ok(Invocation::Run(launch)) => {
+            m.elsewhere_due = Some(m.clock.mono + ELSEWHERE_RECHECK_AFTER);
+            vec![Effect::Job(Job::Run {
+                label: format!("{} on {target}", action.label),
+                launch,
+            })]
+        }
         Ok(Invocation::Interactive(launch)) => vec![Effect::Interactive {
             label: action.label.to_string(),
             launch,
         }],
         Ok(Invocation::TerminalEvent { name, value }) => {
             m.info(format!("sent {} for {target}", action.label));
+            m.elsewhere_due = Some(m.clock.mono + ELSEWHERE_RECHECK_AFTER);
             vec![Effect::TerminalEvent { name, value }]
         }
         Err(missing) => {
@@ -5205,6 +5223,59 @@ mod tests {
             ("tests on fix", Some("bin/test"))
         );
         assert_eq!(launch.args, ["fix", "/src/api"]);
+    }
+
+    fn asked_needs(effects: &[Effect]) -> Vec<Need> {
+        effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::CheckElsewhere(look) => Some(look.need),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn after_action(key_char: char) -> Model {
+        let mut m = model(&[]);
+        with_actions(&mut m);
+        update(&mut m, key(KeyCode::Char('x')));
+        update(&mut m, key(KeyCode::Char(key_char)));
+        m.preview_at = None;
+        m
+    }
+
+    #[test]
+    fn an_action_that_leaves_the_tui_running_is_followed_shortly_by_one_look_for_other_windows() {
+        for action in ['s', 't'] {
+            let mut m = after_action(action);
+            let early = later(
+                &m,
+                ELSEWHERE_RECHECK_AFTER.saturating_sub(Duration::from_millis(1)),
+            );
+            assert!(asked_needs(&tick_at(&mut m, early)).is_empty(), "not yet");
+            let due = later(&m, ELSEWHERE_RECHECK_AFTER);
+            assert_eq!(asked_needs(&tick_at(&mut m, due)), [Need::Refresh]);
+            let after = later(&m, ELSEWHERE_RECHECK_AFTER * 2);
+            assert!(
+                asked_needs(&tick_at(&mut m, after)).is_empty(),
+                "asked once"
+            );
+        }
+    }
+
+    #[test]
+    fn the_look_after_an_action_waits_for_a_pane_that_is_checking_and_asks_once_it_settles() {
+        let mut m = after_action('s');
+        let due = later(&m, ELSEWHERE_RECHECK_AFTER);
+        m.pane = Pane::Checking {
+            name: name("fix"),
+            then: AfterCheck::Preview,
+            until: due.mono + Duration::from_secs(60),
+        };
+        assert!(asked_needs(&tick_at(&mut m, due)).is_empty(), "deferred");
+        m.pane = Pane::Empty;
+        let next = later(&m, Duration::from_millis(100));
+        assert_eq!(asked_needs(&tick_at(&mut m, next)), [Need::Refresh]);
     }
 
     #[test]

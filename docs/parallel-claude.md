@@ -143,6 +143,11 @@ label = "dev server"
 terminal_event = { name = "agent-spawn-dev", value = "{path}" }
 
 [[action]]
+key = "t"
+label = "open in tab"
+terminal_event = { name = "agent-open", value = "tab|{name}|{path}" }
+
+[[action]]
 key = "g"
 label = "lazygit"
 interactive = ["lazygit"]
@@ -194,6 +199,18 @@ success = "green"    # finished activities, added lines
 | `CMD+Left` / `CMD+Right` | Cycle tabs, skipping the `agent` tab |
 | `Shift+Alt+{` / `}` | Move tabs (the `agent` tab stays put) |
 
+The `agent-open` event (`wezterm/agent_open.lua`) backs the `t` (open in tab)
+and `r` (open right) actions in `~/.config/agent/config.toml`, run with `x`
+then the key. The payload is `<tab|right>|<name>|<cwd>`. The handler asks
+`agent windows <name>` which clients show the agent. If a local pane runs one
+of them (unless it's inside the `agent` TUI), that pane's tab and window are
+focused. Otherwise `agent attach <name>` opens in a new tab or in a split
+right of the TUI, or `agent repo` for a repo session. The agent is then open
+elsewhere, so the TUI pauses its own view of it within a few seconds. The
+handler runs on the machine whose wezterm draws the TUI and refuses a `cwd`
+that isn't a directory there, so over SSH these actions only say so. Panes
+that aren't local can't be inspected, so they are never matched.
+
 ## Commands
 
 `agent <cmd> --help` has the details. Fish completions come from
@@ -216,6 +233,7 @@ success = "green"    # finished activities, added lines
 | `agent add [<path>]` | Keep the repo holding the path (default: the cwd) listed in the TUI with nothing running in it. |
 | `agent forget [<path>]` | Drop it from the list. It stays while sessions or worktrees belong to it. |
 | `agent merged` | Worktrees whose branch can be removed without losing work. |
+| `agent windows <name>` | Print the client pids of the windows showing the session, one per line (the TUI's own previews and other TUIs' don't count). |
 | `agent prompt <name> <text>` / `--file` | Type a prompt into a running agent and submit it. |
 | `agent dump <name>` | Print an agent's screen with ANSI styling. |
 | `agent pin [<name>]` / `agent unpin` | Pin to the top of the TUI. |

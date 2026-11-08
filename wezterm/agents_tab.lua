@@ -1,5 +1,6 @@
 local wezterm = require("wezterm")
 local tab_utils = require("utils.tab")
+local shell = require("utils.shell")
 local dev_tabs = require("dev_tabs")
 
 ---@class AgentsTabModule
@@ -52,11 +53,6 @@ local function find_agents_anywhere(window)
   return nil
 end
 
--- macOS GUI apps don't inherit shell PATH; route through the user's login
--- shell so its profile (which sources Homebrew etc.) sets PATH up for the
--- TUI and the zellij, git and harness processes it runs.
-local SHELL = os.getenv("SHELL") or "/bin/sh"
-
 -- MoveTab acts on the active tab, so we activate-move-restore.
 local function pin_to_zero(window, tab)
   local prev = window:active_tab()
@@ -67,7 +63,7 @@ end
 
 local function spawn_agents_tab(window)
   local tab = window:mux_window():spawn_tab({
-    args = { SHELL, "-l", "-c", "exec agent" },
+    args = shell.login("exec agent"),
   })
   if not tab then return nil end
   wezterm.GLOBAL.agents_tab_id = tab:tab_id()

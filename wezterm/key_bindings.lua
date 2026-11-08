@@ -4,6 +4,7 @@ local io = require("io")
 local wezterm = require("wezterm")
 local key_utils = require("utils.key")
 local os_utils = require("utils.os")
+local process_utils = require("utils.process")
 local agents_tab = require("agents_tab")
 local dev_tabs = require("dev_tabs")
 local commands = require("commands")
@@ -15,18 +16,6 @@ local worktree_picker = require("worktree_picker")
 ---@return Key
 local function keybind(mods, key, action)
   return { mods = mods, key = key, action = action }
-end
-
----@param info table|nil LocalProcessInfo
----@param needle string
----@return boolean
-local function process_tree_has(info, needle)
-  if not info then return false end
-  if (info.name or ""):find(needle, 1, true) then return true end
-  for _, child in pairs(info.children or {}) do
-    if process_tree_has(child, needle) then return true end
-  end
-  return false
 end
 
 ---@param key1 string
@@ -127,7 +116,9 @@ config.keys = {
     local process_name = pane:get_foreground_process_name() or ""
     -- zellij may run under a shell or the `agent` TUI, so look through the
     -- foreground process's children too.
-    if process_name:find("zellij") or process_tree_has(pane:get_foreground_process_info(), "zellij") then
+    if process_name:find("zellij") or process_utils.any(pane:get_foreground_process_info(), function(p)
+      return (p.name or ""):find("zellij", 1, true) ~= nil
+    end) then
       -- Ctrl+s then e: scroll mode → EditScrollback (zellij/config.kdl).
       window:perform_action(wezterm.action.Multiple({
         wezterm.action.SendKey({ key = "s", mods = keys.CTRL }),

@@ -7,6 +7,7 @@ local wezterm = require("wezterm")
 ---@field which fun(name: string, fallback: string): string
 ---@field fish fun(): string
 ---@field quote fun(s: string): string
+---@field login fun(command: string): string[]
 ---@field trim fun(s: string|nil): string
 ---@field run fun(args: string[]): boolean, string
 local M = {}
@@ -32,6 +33,18 @@ end
 ---@return string
 function M.fish()
   return M.which("fish", "/opt/homebrew/bin/fish")
+end
+
+-- macOS GUI apps don't inherit shell PATH; route through the user's login
+-- shell so its profile (which sources Homebrew etc.) sets PATH up for the
+-- TUI and the zellij, git and harness processes it runs.
+local SHELL = os.getenv("SHELL") or "/bin/sh"
+
+---The argv that runs <command> in the user's login shell.
+---@param command string
+---@return string[]
+function M.login(command)
+  return { SHELL, "-l", "-c", command }
 end
 
 ---Single-quote a string for safe inclusion in a fish-shell command.

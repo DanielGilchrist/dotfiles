@@ -1436,6 +1436,9 @@ pub struct Model {
     pub last_bell: Option<Instant>,
     /// A bell held back by the rate limit, to ring when it allows.
     pub bell_due: Option<Instant>,
+    /// When to look for other windows again, set by an action that may have
+    /// opened one.
+    pub elsewhere_due: Option<Instant>,
     pub terminal: TerminalFocus,
     /// Which checkouts [1] lists.
     pub visibility: Visibility,
@@ -1505,6 +1508,7 @@ impl Model {
             acknowledged: None,
             last_bell: None,
             bell_due: None,
+            elsewhere_due: None,
             terminal: TerminalFocus::Focused,
             visibility: Visibility::Active,
             facts_reads: 0,
