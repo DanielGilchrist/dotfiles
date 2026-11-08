@@ -20,11 +20,12 @@ use crate::document::Key;
 use crate::keymap::Situation;
 use crate::model::{
     Answer, Chord, Confirm, Cursor, Direction, Edge, Enter, Field, Focus, Follow, FormKind,
-    HOLD_FOR, HelpState, Hold, INFO_TTL, Inspection, Intent, Mode, Model, NamingState, NewAgent,
+    HelpState, INFO_TTL, Inspection, Intent, Listed, Mode, Model, NamingState, NewAgent, Outbox,
     Overlay, Pane, Panel, Phase, Query, Reach, Screen, StatusKind, SubagentRead, Submission,
-    TerminalFocus, Ticket, Unreachable, View, WorkRoom, fuzzy_match, match_rank, repo_matches,
-    unlisted,
+    TerminalFocus, Ticket, TurnRow, Unreachable, View, WorkRoom, fuzzy_match, match_rank,
+    repo_matches, unlisted,
 };
+use crate::track::{LiveSince, Release, Seen};
 use crate::tree::ChangesView;
 use crate::worker::{Job, Msg, Outcome, SendError};
 
@@ -143,7 +144,6 @@ fn own_client(m: &Model) -> Option<ClientId> {
 
 pub fn update(m: &mut Model, msg: Msg) -> Vec<Effect> {
     let effects = step(m, msg);
-    m.hold_hovered_subagent();
     forget_subagents(m);
     effects
 }
@@ -192,6 +192,7 @@ fn step(m: &mut Model, msg: Msg) -> Vec<Effect> {
         Msg::Resize => Vec::new(),
         Msg::Snapshot(Ok((snapshot, warnings))) => {
             m.load(snapshot);
+            m.hold_turn_row();
             track_live(m);
             forget_gone(m);
             if !warnings.is_empty() && warnings != m.last_warnings {
@@ -257,7 +258,7 @@ fn step(m: &mut Model, msg: Msg) -> Vec<Effect> {
             Vec::new()
         }
         Msg::Inspected { name, facts } => {
-            if m.inspections.contains_key(&name) {
+            if m.tracked(&name).is_some_and(|t| t.inspection.is_some()) {
                 m.set_facts(&name, facts);
             }
             Vec::new()
@@ -267,9 +268,12 @@ fn step(m: &mut Model, msg: Msg) -> Vec<Effect> {
             Vec::new()
         }
         Msg::Subagent { name, id, detail } => {
-            let key = (name, id);
-            if m.subagent_reads.contains_key(&key) {
-                m.subagent_logs.insert(key, detail);
+            if let Some(watched) = m
+                .agents
+                .get_mut(&name)
+                .and_then(|t| t.subagents.get_mut(&id))
+            {
+                watched.log = Some(detail);
             }
             Vec::new()
         }
@@ -373,8 +377,7 @@ fn on_launched(m: &mut Model, ticket: Ticket, result: Result<Launch, String>) ->
     m.launching.retain(|(t, _)| *t != ticket);
     match result {
         Ok(launch) => {
-            m.launched_at
-                .insert(launch.session.clone(), SystemTime::now());
+            m.track(&launch.session).launched(SystemTime::now());
             if matches!(&m.overlay, Overlay::New(form) if matches!(form.phase, Phase::Submitting { ticket: t, .. } if t == ticket))
             {
                 m.overlay = Overlay::None;
@@ -456,7 +459,7 @@ fn on_activities(m: &mut Model, activities: HashMap<SessionName, Activity>) -> V
         m.bell_due = Some(m.bell_due.map_or(allowed, |due| due.min(allowed)));
     }
     m.activities = Some(activities);
-    forget_subagents(m);
+    m.hold_turn_row();
     m.revalidate();
     release_holds(m);
     flush(m)
@@ -467,16 +470,18 @@ fn forget_subagents(m: &mut Model) {
     let Some(activities) = &m.activities else {
         return;
     };
-    let held = m.held_subagent.as_ref().map(|h| (&h.by, &h.id));
-    let listed = |(name, id): &(SessionName, AgentId)| {
-        held == Some((name, id))
-            || activities
-                .get(name)
-                .is_some_and(|a| a.subagents.contains_key(id))
+    let cursor = match m.panel.turn_row() {
+        Some(TurnRow::Subagent { by, id }) => Some((by, id)),
+        _ => None,
     };
-    m.subagent_reads.retain(|key, _| listed(key));
-    m.subagent_logs.retain(|key, _| listed(key));
-    m.log_view.navs.retain(|key, _| listed(key));
+    for (name, tracked) in &mut m.agents {
+        tracked.subagents.retain(|id, _| {
+            cursor == Some((name, id))
+                || activities
+                    .get(name)
+                    .is_some_and(|a| a.subagents.contains_key(id))
+        });
+    }
 }
 
 /// Asks for what [3]'s cursor is on once it has rested there.
@@ -508,19 +513,20 @@ fn read_subagent(m: &mut Model) -> Option<Effect> {
     let events = m.activity(&name)?.events;
     let now = Instant::now();
     let key = (name.clone(), id.clone());
-    if matches!(m.subagent_logs.get(&key), Some(Ok(Some(detail))) if matches!(detail.outcome, agent_core::ports::Outcome::Finished { .. }))
+    let watched = m.watched(&key);
+    if matches!(watched.and_then(|w| w.log.as_ref()), Some(Ok(Some(detail))) if matches!(detail.outcome, agent_core::ports::Outcome::Finished { .. }))
     {
         return None;
     }
-    let due = m.subagent_reads.get(&key).is_none_or(|last| {
+    let due = watched.and_then(|w| w.read).is_none_or(|last| {
         now >= last.at + SUBAGENT_SLOW_REFRESH
             || (last.events != events && now >= last.at + SUBAGENT_REFRESH)
     });
     if !due {
         return None;
     }
-    m.subagent_reads
-        .insert(key, SubagentRead { events, at: now });
+    m.track(&name).subagents.entry(id.clone()).or_default().read =
+        Some(SubagentRead { events, at: now });
     Some(Effect::ReadSubagent { name, id, workdir })
 }
 
@@ -553,14 +559,30 @@ fn forget_gone(m: &mut Model) {
         return;
     };
     let known: HashSet<SessionName> = snapshot.entries().map(|(_, e)| e.name().clone()).collect();
-    m.inspections.retain(|name, _| known.contains(name));
-    m.subagent_reads.retain(|(name, _), _| known.contains(name));
-    m.subagent_logs.retain(|(name, _), _| known.contains(name));
-    m.facts.retain(|name, _| known.contains(name));
-    m.outboxes.retain(|name, _| known.contains(name));
-    m.drafts.retain(|name, _| known.contains(name));
-    m.live_since.retain(|name, _| known.contains(name));
-    m.launched_at.retain(|name, _| known.contains(name));
+    let now = SystemTime::now();
+    for (name, tracked) in &mut m.agents {
+        if known.contains(name) {
+            tracked.listed();
+        }
+    }
+    let gone: Vec<SessionName> = m
+        .agents
+        .iter()
+        .filter(|(name, t)| !known.contains(*name) && !t.seen.pending(now))
+        .map(|(name, _)| name.clone())
+        .collect();
+    for name in gone {
+        let Some(tracked) = m.agents.remove(&name) else {
+            continue;
+        };
+        let queued = tracked.outbox.as_ref().map_or(0, Outbox::len);
+        let drafted = tracked.draft.len();
+        if matches!(tracked.seen, Seen::Pending { .. }) && queued + drafted > 0 {
+            m.error(format!(
+                "{name} never started · dropped {queued} queued and {drafted} drafted for it"
+            ));
+        }
+    }
     if m.peek.as_ref().is_some_and(|name| !known.contains(name)) {
         m.peek = None;
     }
@@ -581,11 +603,14 @@ fn inspect(m: &mut Model) -> Vec<Effect> {
         .filter(|(_, e)| e.head().is_some())
         .filter_map(|(_, entry)| {
             let events = m.activity(entry.name()).map(|a| a.events);
-            let failing = matches!(m.facts.get(entry.name()), Some(Err(_)));
-            let due = m.inspections.get(entry.name()).is_none_or(|last| {
-                now >= last.at + SLOW_REFRESH
-                    || (!failing && last.events != events && now >= last.at + REINSPECT_AFTER)
-            });
+            let failing = matches!(m.facts(entry.name()), Some(Err(_)));
+            let due = m
+                .tracked(entry.name())
+                .and_then(|t| t.inspection)
+                .is_none_or(|last| {
+                    now >= last.at + SLOW_REFRESH
+                        || (!failing && last.events != events && now >= last.at + REINSPECT_AFTER)
+                });
             if !due {
                 return None;
             }
@@ -594,8 +619,7 @@ fn inspect(m: &mut Model) -> Vec<Effect> {
         .collect();
     due.into_iter()
         .map(|(name, worktree, events)| {
-            m.inspections
-                .insert(name.clone(), Inspection { events, at: now });
+            m.track(&name).inspection = Some(Inspection { events, at: now });
             Effect::Inspect { name, worktree }
         })
         .collect()
@@ -692,7 +716,7 @@ fn activate(m: &mut Model, name: &SessionName) -> Vec<Effect> {
         ticket,
     };
     if !matches!(enter, Enter::Attach) {
-        m.launched_at.insert(name.clone(), SystemTime::now());
+        m.track(name).launched(SystemTime::now());
     }
     match enter {
         Enter::Attach | Enter::Resurrect => vec![Effect::Attach {
@@ -765,7 +789,7 @@ fn on_peek_key(m: &mut Model, code: KeyCode) -> Vec<Effect> {
 fn edit_transcript(m: &mut Model) -> Option<Vec<Effect>> {
     let key = m.subagent_selected()?;
     let root = m.selected_entry()?.path()?.to_path_buf();
-    match m.subagent_logs.get(&key) {
+    match m.watched(&key).and_then(|w| w.log.as_ref()) {
         Some(Ok(Some(detail))) if !detail.transcript.as_os_str().is_empty() => {
             Some(vec![Effect::Edit(Open::File {
                 root,
@@ -829,10 +853,7 @@ fn add_comment(
         };
         return;
     }
-    let at = m
-        .drafts
-        .get(to)
-        .and_then(|d| d.iter().position(|c| c.same_place(&comment)));
+    let at = m.draft(to).iter().position(|c| c.same_place(&comment));
     match (at, text.trim().is_empty()) {
         (None, true) => {
             m.info("type a comment first · Esc closes");
@@ -845,16 +866,13 @@ fn add_comment(
             return;
         }
         (Some(i), true) => {
-            m.drafts.entry(to.clone()).or_default().remove(i);
+            m.track(to).draft.remove(i);
         }
-        (Some(i), false) => m.drafts.entry(to.clone()).or_default()[i] = comment,
-        (None, false) => m.drafts.entry(to.clone()).or_default().push(comment),
-    }
-    if m.drafts.get(to).is_some_and(Vec::is_empty) {
-        m.drafts.remove(to);
+        (Some(i), false) => m.track(to).draft[i] = comment,
+        (None, false) => m.track(to).draft.push(comment),
     }
     m.diff_view.anchor = None;
-    let n = m.drafts.get(to).map_or(0, Vec::len);
+    let n = m.draft(to).len();
     m.info(format!(
         "{n} comment{} drafted for {to} · s sends them",
         if n == 1 { "" } else { "s" }
@@ -882,9 +900,9 @@ fn open_comment(m: &mut Model) {
     };
     let rev = commit_rev(m);
     let existing = m
-        .drafts
-        .get(&name)
-        .and_then(|d| d.iter().find(|c| c.covers(first, rev.as_deref())));
+        .draft(&name)
+        .iter()
+        .find(|c| c.covers(first, rev.as_deref()));
     m.overlay = Overlay::Comment {
         to: name,
         text: existing.map(|c| c.text.clone()).unwrap_or_default(),
@@ -1086,13 +1104,26 @@ fn diff_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
 /// document keys.
 fn log_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
     let key = m.subagent_selected()?;
-    let Some(Ok(Some(detail))) = m.subagent_logs.get(&key) else {
+    let editing = (code == KeyCode::Char('e'))
+        .then(|| {
+            let root = m.selected_entry()?.path()?.to_path_buf();
+            let title = m
+                .subagent_rows()
+                .into_iter()
+                .find(|(id, _)| **id == key.1)
+                .and_then(|(_, s)| s.description.clone())
+                .unwrap_or_else(|| "subagent".into());
+            Some((root, title))
+        })
+        .flatten();
+    let watched = m.agents.get_mut(&key.0)?.subagents.get_mut(&key.1)?;
+    let Some(Ok(Some(detail))) = &watched.log else {
         return None;
     };
     let entries = crate::log::entries(detail);
     let last = entries.len().checked_sub(1)?;
     let running = !matches!(detail.outcome, agent_core::ports::Outcome::Finished { .. });
-    let nav = m.log_view.navs.entry(key.clone()).or_default();
+    let nav = &mut watched.nav;
     let at = nav
         .cursor
         .unwrap_or(if running { last } else { 0 })
@@ -1143,13 +1174,7 @@ fn log_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
             return Some(copy(m, text));
         }
         KeyCode::Char('e') => {
-            let root = m.selected_entry()?.path()?.to_path_buf();
-            let title = m
-                .subagent_rows()
-                .into_iter()
-                .find(|(id, _)| **id == key.1)
-                .and_then(|(_, s)| s.description.clone())
-                .unwrap_or_else(|| "subagent".into());
+            let (root, title) = editing?;
             let (text, starts) = crate::log::markdown(detail, &title);
             let line = starts.get(at).copied().unwrap_or(NonZeroUsize::MIN);
             effects.push(Effect::Edit(Open::Transcript {
@@ -1214,7 +1239,7 @@ fn on_panel_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
     }
     if m.main_focused() {
         match code {
-            KeyCode::Esc | KeyCode::Char('1' | '2' | '3') => m.panel = m.panel.listed(),
+            KeyCode::Esc | KeyCode::Char('1' | '2' | '3') => m.panel.leave_document(),
             KeyCode::Char('j') | KeyCode::Down => m.docs.scroll_by(1),
             KeyCode::Char('k') | KeyCode::Up => m.docs.scroll_by(-1),
             KeyCode::Char('g') | KeyCode::Home => m.docs.scroll_to_start(),
@@ -1228,8 +1253,8 @@ fn on_panel_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
             return Some(Vec::new());
         }
     }
-    match (code, m.panel.listed()) {
-        (KeyCode::Esc | KeyCode::Char('1'), Panel::Agent { .. } | Panel::Changes { .. }) => {
+    match (code, m.panel.list()) {
+        (KeyCode::Esc | KeyCode::Char('1'), Listed::Agent { .. } | Listed::Changes { .. }) => {
             m.panel = Panel::Agents;
             Some(Vec::new())
         }
@@ -1245,8 +1270,7 @@ fn on_panel_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
             Some(Vec::new())
         }
         (KeyCode::Char('2'), _) => {
-            m.panel = Panel::Agent { offset: 0 };
-            m.subagent = None;
+            m.panel = Panel::turn();
             Some(Vec::new())
         }
         (KeyCode::Char('3'), _) if m.change_rows() == 0 => {
@@ -1261,25 +1285,25 @@ fn on_panel_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
             m.panel = Panel::Changes { file: 0 };
             Some(Vec::new())
         }
-        (KeyCode::Enter, Panel::Changes { .. }) if m.folder_under_cursor().is_some() => {
+        (KeyCode::Enter, Listed::Changes { .. }) if m.folder_under_cursor().is_some() => {
             m.toggle_folder();
             Some(Vec::new())
         }
-        (KeyCode::Char('`'), Panel::Changes { .. }) => {
+        (KeyCode::Char('`'), Listed::Changes { .. }) => {
             m.toggle_changes_view();
             Some(Vec::new())
         }
-        (KeyCode::Char('-' | '='), Panel::Changes { .. })
+        (KeyCode::Char('-' | '='), Listed::Changes { .. })
             if m.changes_view == ChangesView::Flat =>
         {
             m.info("the flat list has no folders · ` shows the tree");
             Some(Vec::new())
         }
-        (KeyCode::Char(c @ ('-' | '=')), Panel::Changes { .. }) => {
+        (KeyCode::Char(c @ ('-' | '=')), Listed::Changes { .. }) => {
             m.fold_all(c == '-');
             Some(Vec::new())
         }
-        (KeyCode::Char('e'), Panel::Changes { .. }) if m.folder_under_cursor().is_some() => {
+        (KeyCode::Char('e'), Listed::Changes { .. }) if m.folder_under_cursor().is_some() => {
             let root = m
                 .selected_entry()
                 .and_then(|e| e.path())
@@ -1293,21 +1317,21 @@ fn on_panel_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
                 }
             }
         }
-        (KeyCode::Enter | KeyCode::Char('0'), Panel::Changes { .. } | Panel::Agent { .. })
+        (KeyCode::Enter | KeyCode::Char('0'), Listed::Changes { .. } | Listed::Agent { .. })
             if m.hover().is_some() =>
         {
-            m.panel = m.panel.into_main();
+            m.panel.focus_document();
             m.opened = None;
             Some(Vec::new())
         }
-        (KeyCode::Char('0'), Panel::Agents) => m
+        (KeyCode::Char('0'), Listed::Agents) => m
             .selected_entry()
             .map(|e| e.name().clone())
             .map(|name| activate(m, &name)),
-        (KeyCode::Char('e'), Panel::Changes { .. }) => m
+        (KeyCode::Char('e'), Listed::Changes { .. }) => m
             .file_under_cursor()
             .map(|(root, file)| vec![Effect::Edit(Open::File { root, file })]),
-        (KeyCode::Char('e'), Panel::Agent { .. }) => edit_transcript(m),
+        (KeyCode::Char('e'), Listed::Agent { .. }) => edit_transcript(m),
         _ => None,
     }
 }
@@ -1333,10 +1357,10 @@ fn panel_focusable(m: &Model, number: usize) -> bool {
 }
 
 fn cycle_panel(m: &mut Model, direction: Direction) -> Vec<Effect> {
-    let current = match m.panel.listed() {
-        Panel::Agent { .. } => 2,
-        Panel::Changes { .. } => 3,
-        _ => 1,
+    let current = match m.panel.list() {
+        Listed::Agent { .. } => 2,
+        Listed::Changes { .. } => 3,
+        Listed::Agents => 1,
     };
     let step = match direction {
         Direction::Forward => 1,
@@ -1376,12 +1400,7 @@ fn on_nav_key(m: &mut Model, key: KeyEvent) -> Vec<Effect> {
     }
     match key.code {
         KeyCode::Char('q') => {
-            let queued: usize = m
-                .outboxes
-                .values()
-                .map(crate::model::Outbox::len)
-                .sum::<usize>()
-                + m.drafts.values().map(Vec::len).sum::<usize>();
+            let queued = m.queued() + m.drafted();
             if queued == 0 {
                 return vec![Effect::Quit];
             }
@@ -1637,7 +1656,7 @@ fn open_peek(m: &mut Model) {
 
 /// Queues a message for its agent and sends the first one that can go.
 fn talk(m: &mut Model, to: SessionName, text: String) -> Vec<Effect> {
-    let draft = m.drafts.get(&to).cloned().unwrap_or_default();
+    let draft = m.draft(&to).to_vec();
     let message = if draft.is_empty() {
         text.clone()
     } else {
@@ -1656,13 +1675,17 @@ fn talk(m: &mut Model, to: SessionName, text: String) -> Vec<Effect> {
             return Vec::new();
         }
     };
-    m.drafts.remove(&to);
-    m.outboxes
-        .entry(to.clone())
-        .or_default()
-        .push(prompt, draft);
+    let tracked = m.track(&to);
+    tracked.draft.clear();
+    match &mut tracked.outbox {
+        Some(outbox) => outbox.push(prompt, draft),
+        None => tracked.outbox = Some(Outbox::new(prompt, draft)),
+    }
     let effects = flush(m);
-    if m.outboxes.get(&to).is_some_and(|o| o.in_flight) {
+    if m.tracked(&to)
+        .and_then(|t| t.outbox.as_ref())
+        .is_some_and(Outbox::in_flight)
+    {
         m.info(format!("sent to {to}"));
     } else if m.awaiting_report(&to) {
         m.info(format!("queued · waiting for {to} to report"));
@@ -1681,7 +1704,7 @@ fn restore_comments(
 ) -> usize {
     let n = comments.len();
     if n > 0 {
-        let draft = m.drafts.entry(to.clone()).or_default();
+        let draft = &mut m.track(to).draft;
         comments.append(draft);
         *draft = comments;
     }
@@ -1694,15 +1717,14 @@ fn restore_comments(
 /// one went in. The worker checks the store again just before typing.
 fn flush(m: &mut Model) -> Vec<Effect> {
     let ready: Vec<SessionName> = m
-        .outboxes
+        .agents
         .iter()
-        .filter(|(_, o)| !o.in_flight && !o.is_empty())
-        .filter(|(_, o)| o.hold.is_none_or(|h| h.at.elapsed() > HOLD_FOR))
+        .filter_map(|(name, t)| Some((name, t.outbox.as_ref()?)))
+        .filter(|(_, o)| o.unheld())
         .filter(|(name, o)| {
             m.ready_for_text(name)
                 && !m.typing_into(name)
-                && o.sent_at
-                    .is_none_or(|at| m.activity(name).is_some_and(|a| a.events != at))
+                && !o.awaits_report(m.activity(name).map(|a| a.events))
                 && m.snapshot()
                     .and_then(|s| s.entry(name))
                     .is_some_and(|(_, e)| m.talkable(e).is_ok())
@@ -1712,11 +1734,8 @@ fn flush(m: &mut Model) -> Vec<Effect> {
     let mut effects = Vec::new();
     for name in ready {
         let not_before = m.not_before(&name);
-        if let Some(outbox) = m.outboxes.get_mut(&name)
-            && let Some(prompt) = outbox.front().cloned()
-        {
-            outbox.in_flight = true;
-            outbox.hold = None;
+        if let Some(outbox) = m.agents.get_mut(&name).and_then(|t| t.outbox.as_mut()) {
+            let prompt = outbox.start();
             effects.push(Effect::Job(Job::Reply {
                 to: name,
                 prompt,
@@ -1732,45 +1751,39 @@ fn flush(m: &mut Model) -> Vec<Effect> {
 /// record couldn't be read, and dropped with the reason otherwise.
 fn on_sent(m: &mut Model, to: &SessionName, result: Result<(), SendError>) -> Vec<Effect> {
     let events = m.activity(to).map(|a| a.events);
-    let Some(outbox) = m.outboxes.get_mut(to) else {
+    let Some(tracked) = m.agents.get_mut(to) else {
         return Vec::new();
     };
-    outbox.in_flight = false;
+    let Some(mut outbox) = tracked.outbox.take() else {
+        return Vec::new();
+    };
     match result {
         Ok(()) => {
-            outbox.pop();
-            outbox.sent_at = events;
-            outbox.sent_instant = Some(Instant::now());
-            let left = outbox.len();
-            if left == 0 {
-                m.outboxes.remove(to);
-                m.info(format!("sent to {to}"));
-            } else {
-                m.info(format!("sent to {to} · {left} queued"));
+            let typed = events.map(|events| crate::track::Typed {
+                events,
+                at: Instant::now(),
+            });
+            tracked.outbox = outbox.delivered(typed);
+            match tracked.outbox.as_ref().map(Outbox::len) {
+                None => m.info(format!("sent to {to}")),
+                Some(left) => m.info(format!("sent to {to} · {left} queued")),
             }
         }
         Err(SendError::Busy) => {
-            outbox.hold = Some(Hold {
-                events: Some(events.unwrap_or_default()),
-                at: Instant::now(),
-            });
+            let release = events.map_or(Release::NextRead, Release::NewEvents);
+            outbox.refused(release, Instant::now());
+            tracked.outbox = Some(outbox);
         }
         Err(SendError::Unreadable(e)) => {
-            outbox.hold = Some(Hold {
-                events: None,
-                at: Instant::now(),
-            });
+            outbox.refused(Release::NextRead, Instant::now());
+            tracked.outbox = Some(outbox);
             m.error(format!("couldn't read {to}'s activity: {e} · will retry"));
         }
         Err(SendError::Failed(e)) => {
-            let dropped = outbox.pop();
-            if outbox.is_empty() {
-                m.outboxes.remove(to);
-            }
-            let (words, comments) = dropped.map_or_else(Default::default, |q| {
-                (first_words(q.prompt.as_ref()), q.comments)
-            });
-            let back = match restore_comments(m, to, comments) {
+            let (dropped, rest) = outbox.dropped();
+            tracked.outbox = rest;
+            let words = first_words(dropped.prompt.as_ref());
+            let back = match restore_comments(m, to, dropped.comments) {
                 0 => String::new(),
                 1 => " · its comment is back in the draft".to_string(),
                 n => format!(" · its {n} comments are back in the draft"),
@@ -1791,13 +1804,9 @@ fn release_holds(m: &mut Model) {
         .flatten()
         .map(|(name, a)| (name.clone(), a.events))
         .collect();
-    for (name, outbox) in &mut m.outboxes {
-        if let Some(hold) = outbox.hold
-            && hold
-                .events
-                .is_none_or(|held| events.get(name).copied().unwrap_or_default() != held)
-        {
-            outbox.hold = None;
+    for (name, tracked) in &mut m.agents {
+        if let Some(outbox) = &mut tracked.outbox {
+            outbox.read(events.get(name).copied());
         }
     }
 }
@@ -1814,20 +1823,31 @@ fn track_live(m: &mut Model) {
         .map(|(_, e)| e.name().clone())
         .collect();
     let first = m.snapshots <= 1;
-    m.live_since.retain(|name, _| live.contains(name));
+    for (name, tracked) in &mut m.agents {
+        if !live.contains(name) {
+            tracked.live_since = None;
+        }
+    }
     for name in live {
-        m.live_since
-            .entry(name)
-            .or_insert_with(|| (!first).then(SystemTime::now));
+        m.track(&name).live_since.get_or_insert_with(|| {
+            if first {
+                LiveSince::Unknown
+            } else {
+                LiveSince::Since(SystemTime::now())
+            }
+        });
     }
 }
 
 /// Drops what's queued for `to`, unless its first message is already being
 /// typed.
 fn clear_queue(m: &mut Model, to: &SessionName) {
-    if m.outboxes.get(to).is_some_and(|o| o.in_flight) {
+    let Some(tracked) = m.agents.get_mut(to) else {
+        return;
+    };
+    if tracked.outbox.as_ref().is_some_and(Outbox::in_flight) {
         m.info(format!("the first message to {to} is being typed"));
-    } else if let Some(cleared) = m.outboxes.remove(to) {
+    } else if let Some(cleared) = tracked.outbox.take() {
         let queued = cleared.len();
         let back = match restore_comments(m, to, cleared.into_comments()) {
             0 => String::new(),
@@ -2383,11 +2403,10 @@ fn on_lower_panel(
     }
     if over_agent {
         let row = row_at(&m.areas.agent_rows);
-        let offset = match m.panel.listed() {
-            Panel::Agent { offset } => offset,
-            _ => 0,
-        };
-        m.panel = Panel::Agent { offset };
+        m.panel.leave_document();
+        if !matches!(m.panel, Panel::Agent { .. }) {
+            m.panel = Panel::turn();
+        }
         if let Some(row) = row {
             m.point_at_row(|_, _| row);
         }
@@ -2395,8 +2414,8 @@ fn on_lower_panel(
     }
     {
         let row = row_at(&m.areas.change_rows);
-        let file = match m.panel.listed() {
-            Panel::Changes { file } => file,
+        let file = match m.panel.list() {
+            Listed::Changes { file } => file,
             _ => 0,
         };
         m.panel = Panel::Changes {
@@ -2421,7 +2440,7 @@ fn on_mouse(m: &mut Model, mouse: MouseEvent) -> Vec<Effect> {
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
         );
         if clicked && m.shows_document() {
-            m.panel = m.panel.into_main();
+            m.panel.focus_document();
             return Vec::new();
         }
         if scrolling && m.shows_document() {
@@ -2558,7 +2577,7 @@ mod tests {
             Some("idle"),
             "stops at the end rather than wrapping"
         );
-        m.panel = Panel::Agent { offset: 0 };
+        m.panel = Panel::turn();
         m.docs.page = 6;
         update(
             &mut m,
@@ -3036,7 +3055,7 @@ mod tests {
         m.toggle_changes_scope();
         assert_eq!(hint(&m), "tab: uncommitted");
         m.toggle_changes_scope();
-        let mut facts = match m.facts.get(&name("fix")) {
+        let mut facts = match m.facts(&name("fix")) {
             Some(Ok(facts)) => facts.clone(),
             _ => panic!("facts"),
         };
@@ -3137,18 +3156,13 @@ mod tests {
         update(&mut m, key(KeyCode::Char('=')));
         assert_eq!(tree_labels(&m).len(), 5);
         let other = name("api");
-        assert!(
-            m.collapsed
-                .get(&other)
-                .is_none_or(std::collections::HashSet::is_empty)
-        );
+        assert!(m.tracked(&other).is_none_or(|t| t.collapsed.is_empty()));
     }
 
     fn closed(m: &Model) -> Vec<String> {
-        m.collapsed
-            .get(&name("fix"))
+        m.tracked(&name("fix"))
             .into_iter()
-            .flatten()
+            .flat_map(|t| &t.collapsed)
             .map(|p| p.to_string_lossy().into_owned())
             .collect::<std::collections::BTreeSet<_>>()
             .into_iter()
@@ -3250,13 +3264,10 @@ mod tests {
                 },
             );
         };
-        m.inspections.insert(
-            name("fix"),
-            Inspection {
-                events: None,
-                at: Instant::now(),
-            },
-        );
+        m.track(&name("fix")).inspection = Some(Inspection {
+            events: None,
+            at: Instant::now(),
+        });
         refreshed(&mut m, &["a.rs", "aa/z.rs", "b.rs", "c.rs"]);
         assert_eq!(on(&m), Some("c.rs".into()), "rows above came and went");
         refreshed(&mut m, &["a.rs", "b.rs"]);
@@ -3343,7 +3354,7 @@ mod tests {
         with_changes(&mut m, 3);
         with_turn(&mut m);
         update(&mut m, key(KeyCode::Char('2')));
-        assert_eq!(m.panel, Panel::Agent { offset: 0 });
+        assert_eq!(m.panel, Panel::turn());
         update(&mut m, key(KeyCode::Char('3')));
         assert_eq!(m.panel, Panel::Changes { file: 0 });
         assert!(update(&mut m, key(KeyCode::Esc)).is_empty());
@@ -3388,7 +3399,7 @@ mod tests {
         update(&mut m, key(KeyCode::Char('2')));
         update(&mut m, key(KeyCode::Char('j')));
         update(&mut m, key(KeyCode::Char('j')));
-        assert_eq!(m.panel, Panel::Agent { offset: 0 });
+        assert_eq!(m.panel, Panel::turn());
         assert_eq!(m.row_at(), 0, "[2] has only its turn row");
         update(&mut m, key(KeyCode::Char('1')));
         update(&mut m, key(KeyCode::Char('j')));
@@ -3410,11 +3421,7 @@ mod tests {
         update(&mut m, key(KeyCode::Char('{')));
         update(&mut m, key(KeyCode::Char('2')));
         m.revalidate();
-        assert_eq!(
-            m.panel,
-            Panel::Agent { offset: 0 },
-            "the same agent keeps [2]"
-        );
+        assert_eq!(m.panel, Panel::turn(), "the same agent keeps [2]");
         update(&mut m, key(KeyCode::Esc));
         update(&mut m, key(KeyCode::Char('[')));
         update(&mut m, key(KeyCode::Char('g')));
@@ -3429,7 +3436,7 @@ mod tests {
         with_changes(&mut m, 3);
         with_turn(&mut m);
         update(&mut m, key(KeyCode::Tab));
-        assert_eq!(m.panel, Panel::Agent { offset: 0 });
+        assert_eq!(m.panel, Panel::turn());
         update(&mut m, key(KeyCode::Tab));
         assert_eq!(m.panel, Panel::Changes { file: 0 });
         update(&mut m, key(KeyCode::Tab));
@@ -3437,7 +3444,7 @@ mod tests {
         update(&mut m, key(KeyCode::BackTab));
         assert_eq!(m.panel, Panel::Changes { file: 0 });
         update(&mut m, key(KeyCode::BackTab));
-        assert_eq!(m.panel, Panel::Agent { offset: 0 });
+        assert_eq!(m.panel, Panel::turn());
     }
 
     #[test]
@@ -3446,7 +3453,7 @@ mod tests {
         with_changes(&mut m, 3);
         with_turn(&mut m);
         update(&mut m, key(KeyCode::Char('l')));
-        assert_eq!(m.panel, Panel::Agent { offset: 0 });
+        assert_eq!(m.panel, Panel::turn());
         update(&mut m, key(KeyCode::Char('l')));
         assert_eq!(m.panel, Panel::Changes { file: 0 });
         update(&mut m, key(KeyCode::Char('l')));
@@ -3454,8 +3461,11 @@ mod tests {
         update(&mut m, key(KeyCode::Char('h')));
         assert_eq!(m.panel, Panel::Changes { file: 0 });
         update(&mut m, key(KeyCode::Char('h')));
-        assert_eq!(m.panel, Panel::Agent { offset: 0 });
-        m.panel = Panel::Main(crate::model::Origin::Turn { offset: 0 });
+        assert_eq!(m.panel, Panel::turn());
+        m.panel = Panel::Main(crate::model::Origin::Turn {
+            offset: 0,
+            row: crate::model::TurnRow::Turn,
+        });
         update(&mut m, key(KeyCode::Char('l')));
         assert_eq!(m.panel, Panel::Changes { file: 0 });
     }
@@ -3483,7 +3493,7 @@ mod tests {
         with_changes(&mut m, 0);
         with_turn(&mut m);
         update(&mut m, key(KeyCode::BackTab));
-        assert_eq!(m.panel, Panel::Agent { offset: 0 }, "no files");
+        assert_eq!(m.panel, Panel::turn(), "no files");
         m.work_room = WorkRoom::TooShort;
         with_changes(&mut m, 3);
         update(&mut m, key(KeyCode::Tab));
@@ -3495,7 +3505,10 @@ mod tests {
         let mut m = model(&[]);
         with_changes(&mut m, 3);
         with_turn(&mut m);
-        m.panel = Panel::Main(crate::model::Origin::Turn { offset: 0 });
+        m.panel = Panel::Main(crate::model::Origin::Turn {
+            offset: 0,
+            row: crate::model::TurnRow::Turn,
+        });
         update(&mut m, key(KeyCode::Tab));
         assert_eq!(m.panel, Panel::Changes { file: 0 });
         m.panel = Panel::Main(crate::model::Origin::Changes { file: 0 });
@@ -3527,7 +3540,7 @@ mod tests {
         update(&mut m, key(KeyCode::Char('2')));
         update(&mut m, key(KeyCode::Char(']')));
         assert_eq!(m.view, View::Focus, "[2] has no tabs");
-        assert_eq!(m.panel, Panel::Agent { offset: 0 });
+        assert_eq!(m.panel, Panel::turn());
     }
 
     #[test]
@@ -4336,7 +4349,7 @@ mod tests {
             names
         };
         let earlier = |m: &mut Model, secs| {
-            for last in m.inspections.values_mut() {
+            for last in m.agents.values_mut().filter_map(|t| t.inspection.as_mut()) {
                 last.at -= Duration::from_secs(secs);
             }
         };
@@ -4856,11 +4869,93 @@ mod tests {
         assert_eq!(m.row_at(), 0);
         update(&mut m, key(KeyCode::Char('k')));
         assert_eq!(m.row_at(), 0);
-        assert_eq!(
-            m.panel,
-            Panel::Agent { offset: 0 },
-            "j moves the cursor, not a scroll"
+        assert_eq!(m.panel, Panel::turn(), "j moves the cursor, not a scroll");
+    }
+
+    #[test]
+    fn the_cursor_row_lives_in_the_panel_and_goes_when_the_panel_is_left_and_refocused() {
+        let mut m = delegating();
+        update(&mut m, key(KeyCode::Char('2')));
+        assert_eq!(m.panel, Panel::turn());
+        update(&mut m, key(KeyCode::Char('j')));
+        let Panel::Agent {
+            row: TurnRow::Subagent { by, id },
+            ..
+        } = m.panel.clone()
+        else {
+            panic!("the cursor is on a subagent: {:?}", m.panel);
+        };
+        assert_eq!(by, name("obs-layout-4"));
+        assert!(
+            m.watched(&(by.clone(), id.clone()))
+                .and_then(|w| w.held.as_ref())
+                .is_some_and(agent_core::activity::Subagent::is_running),
+            "remembered as listed"
         );
+
+        update(&mut m, key(KeyCode::Enter));
+        assert!(m.main_focused());
+        assert_eq!(
+            m.panel.turn_row().and_then(|row| match row {
+                TurnRow::Subagent { id, .. } => Some(id.clone()),
+                TurnRow::Turn => None,
+            }),
+            Some(id),
+            "the cursor stays on its row while [0] has the keys"
+        );
+
+        update(&mut m, key(KeyCode::Esc));
+        update(&mut m, key(KeyCode::Esc));
+        assert_eq!(m.panel, Panel::Agents);
+        assert_eq!(m.panel.turn_row(), None);
+        update(&mut m, key(KeyCode::Char('2')));
+        assert_eq!(m.panel, Panel::turn(), "refocusing starts on the turn");
+    }
+
+    #[test]
+    fn a_held_row_is_marked_finished_once_its_agent_stops_listing_it() {
+        let mut m = delegating();
+        update(&mut m, key(KeyCode::Char('2')));
+        update(&mut m, key(KeyCode::Char('j')));
+        let (agent, id) = m.subagent_selected().expect("a subagent is selected");
+        let mut cleared = m.activities.clone().expect("reported");
+        cleared
+            .get_mut(&agent)
+            .expect("has activity")
+            .subagents
+            .remove(&id);
+        update(&mut m, Msg::Activities(cleared));
+        let Some(TurnRow::Subagent { by, id }) = m.panel.turn_row() else {
+            panic!("the cursor stays on the row");
+        };
+        assert!(
+            m.watched(&(by.clone(), id.clone()))
+                .and_then(|w| w.held.as_ref())
+                .is_some_and(|h| !h.is_running()),
+            "nothing will say it finished afterwards"
+        );
+
+        m.set_cursor(Cursor::Entry(name("auth-refresh-2")));
+        assert_eq!(m.panel.turn_row(), None, "another selection drops the row");
+        assert_eq!(m.subagent_rows().len(), 0);
+    }
+
+    #[test]
+    fn a_result_for_an_agent_that_was_never_asked_about_is_dropped() {
+        let mut m = crate::fixtures::fleet(10);
+        let facts = match m.facts(&name("obs-layout-4")) {
+            Some(Ok(facts)) => facts.clone(),
+            _ => panic!("facts"),
+        };
+        let stranger = name("removed-agent");
+        update(
+            &mut m,
+            Msg::Inspected {
+                name: stranger.clone(),
+                facts: Ok(facts),
+            },
+        );
+        assert!(m.tracked(&stranger).is_none());
     }
 
     #[test]
@@ -4880,7 +4975,7 @@ mod tests {
         update(&mut m, Msg::Activities(cleared));
         assert_eq!(m.subagent_rows().len(), 3, "the hovered row stays");
         assert_eq!(m.subagent_selected(), Some((agent.clone(), id.clone())));
-        assert!(m.subagent_reads.contains_key(&(agent.clone(), id.clone())));
+        assert!(m.watched(&(agent.clone(), id.clone())).is_some());
         assert!(matches!(
             m.hover(),
             Some(crate::document::Hover::Subagent(_, ref held)) if *held == id
@@ -4888,8 +4983,10 @@ mod tests {
 
         update(&mut m, key(KeyCode::Char('j')));
         assert_eq!(m.subagent_rows().len(), 2, "gone once the cursor moved on");
-        assert!(m.held_subagent.is_some_and(|held| held.id != id));
-        assert!(!m.subagent_reads.contains_key(&(agent, id)));
+        assert!(
+            matches!(m.panel.turn_row(), Some(TurnRow::Subagent { id: held, .. }) if *held != id)
+        );
+        assert!(m.watched(&(agent, id)).is_none());
     }
 
     #[test]
@@ -4907,8 +5004,13 @@ mod tests {
             reads(tick(&mut m)).is_empty(),
             "within the refresh interval"
         );
-        for last in m.subagent_reads.values_mut() {
-            last.at -= SUBAGENT_REFRESH;
+        for read in m
+            .agents
+            .values_mut()
+            .flat_map(|t| t.subagents.values_mut())
+            .filter_map(|w| w.read.as_mut())
+        {
+            read.at -= SUBAGENT_REFRESH;
         }
         assert_eq!(reads(tick(&mut m)).len(), 1, "after it");
 
@@ -4925,7 +5027,8 @@ mod tests {
             },
         );
         assert_eq!(
-            m.subagent_logs.get(&(name.clone(), id.clone())),
+            m.watched(&(name.clone(), id.clone()))
+                .and_then(|w| w.log.as_ref()),
             Some(&Ok(Some(detail.clone())))
         );
 
@@ -4933,7 +5036,7 @@ mod tests {
         gone.get_mut(&name).expect("has activity").subagents.clear();
         update(&mut m, Msg::Activities(gone));
         update(&mut m, key(KeyCode::Char('g')));
-        assert!(m.subagent_logs.is_empty() && m.subagent_reads.is_empty());
+        assert_eq!(m.watching(), 0);
         update(
             &mut m,
             Msg::Subagent {
@@ -4943,7 +5046,7 @@ mod tests {
             },
         );
         assert!(
-            m.subagent_logs.is_empty(),
+            m.watching() == 0,
             "a late answer for an unwatched subagent is dropped"
         );
     }
@@ -5095,7 +5198,7 @@ mod tests {
             m.docs.scroll, 2,
             "j scrolls the document, not the file list"
         );
-        assert_eq!(m.panel.listed(), Panel::Changes { file: 0 });
+        assert!(matches!(m.panel.list(), Listed::Changes { file: 0 }));
         update(&mut m, key(KeyCode::Char('G')));
         assert_eq!(m.docs.scroll, usize::MAX);
         update(&mut m, key(KeyCode::Char('g')));
@@ -5341,7 +5444,7 @@ mod tests {
         set_state(&mut m, "auth-refresh-2", working(), 1);
         let effects = talk_to(&mut m, "auth-refresh-2", "rebase");
         assert!(effects.is_empty(), "nothing is typed while it works");
-        assert_eq!(m.outboxes[&name("auth-refresh-2")].len(), 1);
+        assert_eq!(m.outbox(&name("auth-refresh-2")).expect("queued").len(), 1);
         assert_eq!(replies(&tick(&mut m)).len(), 0);
 
         let mut asking_now = crate::fixtures::asking("rm?", 1);
@@ -5373,7 +5476,8 @@ mod tests {
         talk_to(&mut m, agent, "first");
         talk_to(&mut m, agent, "second");
         let queue = |m: &Model| -> Vec<String> {
-            m.outboxes[&name(agent)]
+            m.outbox(&name(agent))
+                .expect("queued")
                 .iter()
                 .map(|p| p.as_str().to_string())
                 .collect()
@@ -5412,7 +5516,7 @@ mod tests {
         let all = m.activities.clone().expect("reported");
         assert_eq!(replies(&update(&mut m, Msg::Activities(all))), ["second"]);
         sent(&mut m, agent);
-        assert!(m.outboxes.is_empty());
+        assert_eq!(m.queued(), 0);
     }
 
     fn status(m: &Model) -> String {
@@ -5513,7 +5617,7 @@ mod tests {
                 result: Err(crate::worker::SendError::Failed("no pty".into())),
             },
         );
-        assert!(m.outboxes.is_empty());
+        assert_eq!(m.queued(), 0);
         assert!(
             m.status
                 .as_ref()
@@ -5531,14 +5635,13 @@ mod tests {
         let mut m = crate::fixtures::fleet(10);
         let agent = "auth-refresh-2";
         set_state(&mut m, agent, done(), 1);
-        m.drafts
-            .insert(name(agent), vec![drafted("a.rs", "+let x = 1;\r")]);
+        m.track(&name(agent)).draft = vec![drafted("a.rs", "+let x = 1;\r")];
         talk_to(&mut m, agent, "");
-        assert_eq!(m.outboxes[&name(agent)].len(), 1);
+        assert_eq!(m.outbox(&name(agent)).expect("queued").len(), 1);
         assert!(
-            !m.outboxes[&name(agent)]
-                .front()
+            !m.outbox(&name(agent))
                 .expect("queued")
+                .front()
                 .as_str()
                 .contains('\r')
         );
@@ -5567,7 +5670,7 @@ mod tests {
         let agent = name("auth-refresh-2");
         let line = crate::fixtures::line_info("a.rs", "+x", 1);
         add_comment(&mut m, &agent, &[line], "", None);
-        assert!(m.drafts.is_empty());
+        assert_eq!(m.drafted(), 0);
     }
 
     #[test]
@@ -5576,7 +5679,7 @@ mod tests {
         let agent = name("auth-refresh-2");
         let line = crate::fixtures::line_info("a.rs", "+x", 1);
         add_comment(&mut m, &agent, &[line], "a\x1bb", Some("abc1234".into()));
-        assert!(m.drafts.is_empty());
+        assert_eq!(m.drafted(), 0);
         assert!(
             matches!(&m.overlay, Overlay::Comment { text, rev, .. }
                 if text == "a\x1bb" && rev.as_deref() == Some("abc1234")),
@@ -5593,24 +5696,108 @@ mod tests {
     fn restored_comments_keep_a_newer_one_on_the_same_line() {
         let mut m = crate::fixtures::fleet(10);
         let agent = name("auth-refresh-2");
-        m.drafts.insert(agent.clone(), vec![drafted("a.rs", "+x")]);
+        m.track(&agent.clone()).draft = vec![drafted("a.rs", "+x")];
         assert_eq!(
             restore_comments(&mut m, &agent, vec![drafted("a.rs", "+x")]),
             1
         );
-        assert_eq!(m.drafts[&agent].len(), 2);
+        assert_eq!(m.draft(&agent).len(), 2);
     }
 
     #[test]
-    fn drafts_go_with_their_agent() {
+    fn everything_known_about_an_agent_goes_with_it() {
         let mut m = crate::fixtures::fleet(10);
-        m.drafts
-            .insert(name("auth-refresh-2"), vec![drafted("a.rs", "+x")]);
-        m.drafts
-            .insert(name("removed-agent"), vec![drafted("a.rs", "+x")]);
+        let kept = name("auth-refresh-2");
+        let gone = name("removed-agent");
+        let facts = match m.facts(&name("obs-layout-4")) {
+            Some(Ok(facts)) => facts.clone(),
+            _ => panic!("facts"),
+        };
+        for who in [&kept, &gone] {
+            m.set_facts(who, Ok(facts.clone()));
+            let tracked = m.track(who);
+            tracked.collapsed.insert("src".into());
+            tracked.draft = vec![drafted("a.rs", "+x")];
+            tracked.inspection = Some(Inspection {
+                events: None,
+                at: Instant::now(),
+            });
+            tracked.outbox = Some(crate::track::queued("rebase"));
+            tracked.live_since = Some(LiveSince::Unknown);
+            tracked.launched(SystemTime::now());
+            tracked.listed();
+            m.set_log(
+                (who.clone(), AgentId::new("s1")),
+                Ok(Some(crate::log::fixtures::detail(Vec::new()))),
+            );
+        }
         forget_gone(&mut m);
-        assert!(m.drafts.contains_key(&name("auth-refresh-2")));
-        assert!(!m.drafts.contains_key(&name("removed-agent")));
+        assert!(m.tracked(&kept).is_some());
+        assert!(m.watched(&(kept, AgentId::new("s1"))).is_some());
+        assert!(m.tracked(&gone).is_none(), "nothing about it is kept");
+        assert!(m.agents.keys().all(|name| *name != gone));
+    }
+
+    #[test]
+    fn a_launch_is_kept_until_its_session_has_been_listed_once() {
+        let mut m = crate::fixtures::fleet(10);
+        let slow = name("slow-checkout");
+        let launched = SystemTime::now();
+        m.track(&slow).launched(launched);
+        forget_gone(&mut m);
+        assert_eq!(
+            m.tracked(&slow).map(|t| t.seen),
+            Some(Seen::Pending {
+                launched_at: launched
+            }),
+            "a snapshot without it yet keeps the launch"
+        );
+        assert!(m.not_before(&slow).is_some());
+
+        m.track(&slow).listed();
+        assert_eq!(m.not_before(&slow), Some(launched), "kept once listed");
+        forget_gone(&mut m);
+        assert!(m.tracked(&slow).is_none(), "gone once it has been listed");
+    }
+
+    #[test]
+    fn a_launch_that_never_shows_up_is_dropped_after_a_while_and_says_what_it_took() {
+        let mut m = crate::fixtures::fleet(10);
+        let late = name("never-starts");
+        let quiet = name("quiet-never-starts");
+        let long_ago = SystemTime::now() - crate::track::PENDING_LAUNCH_FOR * 2;
+        for who in [&late, &quiet] {
+            m.track(who).launched(long_ago);
+        }
+        let tracked = m.track(&late);
+        tracked.outbox = Some(crate::track::queued("rebase"));
+        tracked.draft = vec![drafted("a.rs", "+x")];
+        forget_gone(&mut m);
+        assert!(m.tracked(&late).is_none() && m.tracked(&quiet).is_none());
+        assert!(
+            status(&m).contains("never-starts never started")
+                && status(&m).contains("dropped 1 queued and 1 drafted"),
+            "{}",
+            status(&m)
+        );
+        assert_eq!(m.queued() + m.drafted(), 0);
+    }
+
+    #[test]
+    fn generations_never_repeat_for_an_agent_removed_and_recreated() {
+        let mut m = crate::fixtures::fleet(10);
+        let facts = match m.facts(&name("obs-layout-4")) {
+            Some(Ok(facts)) => facts.clone(),
+            _ => panic!("facts"),
+        };
+        let again = name("removed-agent");
+        m.set_facts(&again, Ok(facts.clone()));
+        let first = m.tracked(&again).expect("tracked").generation;
+        m.track(&again).listed();
+        forget_gone(&mut m);
+        assert!(m.tracked(&again).is_none());
+        m.set_facts(&again, Ok(facts));
+        assert!(m.tracked(&again).expect("tracked").generation > first);
     }
 
     #[test]
@@ -5618,10 +5805,10 @@ mod tests {
         let mut m = crate::fixtures::fleet(10);
         let agent = "auth-refresh-2";
         set_state(&mut m, agent, done(), 1);
-        m.drafts.insert(name(agent), vec![drafted("a.rs", "+x")]);
+        m.track(&name(agent)).draft = vec![drafted("a.rs", "+x")];
         talk_to(&mut m, agent, "");
-        assert!(m.drafts.is_empty(), "queued, so not in the draft");
-        m.drafts.insert(name(agent), vec![drafted("b.rs", "+y")]);
+        assert!(m.drafted() == 0, "queued, so not in the draft");
+        m.track(&name(agent)).draft = vec![drafted("b.rs", "+y")];
         update(
             &mut m,
             Msg::Sent {
@@ -5629,7 +5816,8 @@ mod tests {
                 result: Err(crate::worker::SendError::Failed("no pty".into())),
             },
         );
-        let paths: Vec<_> = m.drafts[&name(agent)]
+        let paths: Vec<_> = m
+            .draft(&name(agent))
             .iter()
             .map(|c| c.path.to_string_lossy().into_owned())
             .collect();
@@ -5640,11 +5828,13 @@ mod tests {
                 .is_some_and(|s| s.text.contains("back in the draft"))
         );
 
-        m.drafts.clear();
-        m.drafts.insert(name(agent), vec![drafted("a.rs", "+x")]);
+        for tracked in m.agents.values_mut() {
+            tracked.draft.clear();
+        }
+        m.track(&name(agent)).draft = vec![drafted("a.rs", "+x")];
         talk_to(&mut m, agent, "");
         sent(&mut m, agent);
-        assert!(m.drafts.is_empty(), "delivered comments stay gone");
+        assert!(m.drafted() == 0, "delivered comments stay gone");
     }
 
     const AGENT: &str = "auth-refresh-2";
@@ -5655,10 +5845,9 @@ mod tests {
     }
 
     fn live_since(m: &mut Model, secs_ago: u64) {
-        m.live_since.insert(
-            name(AGENT),
-            Some(SystemTime::now() - Duration::from_secs(secs_ago)),
-        );
+        m.track(&name(AGENT)).live_since = Some(LiveSince::Since(
+            SystemTime::now() - Duration::from_secs(secs_ago),
+        ));
     }
 
     #[test]
@@ -5689,7 +5878,7 @@ mod tests {
     fn a_session_resurrected_by_this_tui_waits_for_a_report_after_it() {
         let mut m = crate::fixtures::fleet(10);
         set_state(&mut m, AGENT, done(), 1);
-        m.launched_at.insert(name(AGENT), SystemTime::now());
+        m.track(&name(AGENT)).launched(SystemTime::now());
         assert_eq!(
             replies(&talk_to(&mut m, AGENT, "rebase")),
             Vec::<String>::new()
@@ -5746,7 +5935,11 @@ mod tests {
             },
         );
         assert_eq!(replies(&effects), Vec::<String>::new());
-        assert_eq!(m.outboxes[&name(AGENT)].len(), 1, "still queued");
+        assert_eq!(
+            m.outbox(&name(AGENT)).expect("queued").len(),
+            1,
+            "still queued"
+        );
         let same = m.activities.clone().expect("reported");
         assert_eq!(replies(&update(&mut m, Msg::Activities(same))), ["rebase"]);
     }
@@ -5788,12 +5981,15 @@ mod tests {
         talk_to(&mut m, AGENT, "/compact");
         talk_to(&mut m, AGENT, "next");
         sent(&mut m, AGENT);
-        let outbox = &m.outboxes[&name(AGENT)];
+        let outbox = &m.outbox(&name(AGENT)).expect("queued");
         assert!(!outbox.stalled(Some(1)), "just sent");
-        let mut outbox = crate::model::Outbox::default();
-        outbox.push("next".parse().expect("a prompt"), Vec::new());
-        outbox.sent_instant = Instant::now().checked_sub(crate::model::STALL_AFTER * 2);
-        outbox.sent_at = Some(1);
+        let mut outbox = crate::track::queued("next");
+        outbox.last_typed = Some(crate::track::Typed {
+            events: 1,
+            at: Instant::now()
+                .checked_sub(crate::track::STALL_AFTER * 2)
+                .expect("the clock has run that long"),
+        });
         assert!(outbox.stalled(Some(1)));
         assert!(!outbox.stalled(Some(2)), "it reported");
         assert!(replies(&tick(&mut m)).is_empty(), "never sent blindly");
@@ -5827,7 +6023,7 @@ mod tests {
         talk_to(&mut m, agent, "one");
         talk_to(&mut m, agent, "two");
         m.set_cursor(Cursor::Entry(name("obs-layout-4")));
-        assert_eq!(m.outboxes[&name(agent)].len(), 2);
+        assert_eq!(m.outbox(&name(agent)).expect("queued").len(), 2);
 
         m.set_cursor(Cursor::Entry(name(agent)));
         update(&mut m, key(KeyCode::Char('s')));
@@ -5835,7 +6031,7 @@ mod tests {
             &mut m,
             Msg::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL)),
         );
-        assert!(!m.outboxes.contains_key(&name(agent)));
+        assert!(m.outbox(&name(agent)).is_none());
         assert!(matches!(m.overlay, Overlay::Talk { .. }), "the box stays");
     }
 
@@ -5853,11 +6049,7 @@ mod tests {
         update(&mut m, key(KeyCode::Char('v')));
         update(&mut m, key(KeyCode::Esc));
         assert!(!m.peeking());
-        assert_eq!(
-            m.panel,
-            Panel::Agent { offset: 0 },
-            "Esc closed only the peek"
-        );
+        assert_eq!(m.panel, Panel::turn(), "Esc closed only the peek");
     }
 
     #[test]
@@ -5926,7 +6118,7 @@ mod tests {
         let effects = update(&mut m, key(KeyCode::Char('e')));
         assert!(edits(&effects) == 0, "not read yet");
 
-        m.subagent_logs.insert(
+        m.set_log(
             key_of,
             Ok(Some(agent_core::ports::SubagentDetail {
                 transcript: "/p/s/subagents/agent-a1.jsonl".into(),
@@ -5958,8 +6150,7 @@ mod tests {
         if finished {
             d.outcome = agent_core::ports::Outcome::Finished { report: None };
         }
-        m.subagent_logs
-            .insert((name.clone(), id.clone()), Ok(Some(d)));
+        m.set_log((name.clone(), id.clone()), Ok(Some(d)));
         (name, id)
     }
 
@@ -5970,7 +6161,7 @@ mod tests {
         update(&mut m, key(KeyCode::Char('j')));
         let key_ = with_log(&mut m, true);
         update(&mut m, key(KeyCode::Char('0')));
-        let nav = |m: &Model| m.log_view.navs.get(&key_).cloned().unwrap_or_default();
+        let nav = |m: &Model| m.watched(&key_).map(|w| w.nav.clone()).unwrap_or_default();
 
         update(&mut m, key(KeyCode::Char('j')));
         assert_eq!(
@@ -6018,7 +6209,11 @@ mod tests {
         update(&mut m, key(KeyCode::Char('G')));
         update(&mut m, key(KeyCode::Char('j')));
         assert_eq!(
-            m.log_view.navs.values().next().and_then(|n| n.cursor),
+            m.agents
+                .values()
+                .flat_map(|t| t.subagents.values())
+                .next()
+                .and_then(|w| w.nav.cursor),
             Some(4)
         );
     }
@@ -6032,19 +6227,19 @@ mod tests {
         let lines = vec![line("+let x = 3;", 4)];
         add_comment(&mut m, &name, &lines, "Use the limit.", None);
         add_comment(&mut m, &name, &[line("+more", 9)], "Why?", None);
-        assert_eq!(m.drafts[&name].len(), 2);
+        assert_eq!(m.draft(&name).len(), 2);
 
         add_comment(&mut m, &name, &lines, "Use the configured limit.", None);
         assert_eq!(
-            m.drafts[&name].len(),
+            m.draft(&name).len(),
             2,
             "the same line replaces its comment"
         );
-        assert_eq!(m.drafts[&name][0].text, "Use the configured limit.");
+        assert_eq!(m.draft(&name)[0].text, "Use the configured limit.");
 
         add_comment(&mut m, &name, &[line("+more", 9)], "", None);
         assert_eq!(
-            m.drafts[&name].len(),
+            m.draft(&name).len(),
             1,
             "empty text on a commented line deletes it"
         );
@@ -6053,8 +6248,14 @@ mod tests {
         assert!(matches!(m.overlay, Overlay::Talk { .. }));
         update(&mut m, key(KeyCode::Char('o')));
         update(&mut m, key(KeyCode::Enter));
-        assert!(m.drafts.is_empty(), "the draft clears once it is queued");
-        let sent: &str = m.outboxes[&name].iter().last().expect("queued").as_ref();
+        assert!(m.drafted() == 0, "the draft clears once it is queued");
+        let sent: &str = m
+            .outbox(&name)
+            .expect("queued")
+            .iter()
+            .last()
+            .expect("queued")
+            .as_ref();
         assert!(sent.starts_with("Review comments."), "{sent}");
         assert!(
             sent.contains("\n\no\n\na.rs:4\n> +let x = 3;\nUse the configured limit."),

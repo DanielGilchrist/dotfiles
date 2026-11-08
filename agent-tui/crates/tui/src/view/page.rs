@@ -156,10 +156,8 @@ pub(super) fn page(m: &mut Model, area: Rect, width: usize, border: Style) -> Op
     if let Some(key) = &body.nav
         && m.main_focused()
         && let Some(&(start, len)) = m
-            .log_view
-            .navs
-            .get(key)
-            .and_then(|nav| nav.cursor)
+            .watched(key)
+            .and_then(|w| w.nav.cursor)
             .and_then(|at| body.entries.get(at))
     {
         for row in start.max(top)..(start + len).min(top + height) {
@@ -260,10 +258,7 @@ fn follow_page_line(m: &mut Model, top: usize) {
 /// `▌` in the gutter of the cursor's lines while [0] has the keys, and `✎`
 /// on lines the agent's draft comments on.
 fn mark_lines(m: &Model, out: &mut [Line<'static>], from: usize, top: usize, height: usize) {
-    let drafts = m
-        .selected_entry()
-        .and_then(|e| m.drafts.get(e.name()))
-        .map_or(&[][..], Vec::as_slice);
+    let drafts = m.selected_entry().map_or(&[][..], |e| m.draft(e.name()));
     let rev = crate::update::commit_rev(m);
     let (lo, hi) = m.diff_view.span();
     for (at, line) in m.docs.lines().iter().enumerate() {
@@ -294,10 +289,8 @@ fn reveal(m: &mut Model, key: &SubagentKey, entries: &[(usize, usize)], height: 
         return;
     }
     let Some(&(start, len)) = m
-        .log_view
-        .navs
-        .get(key)
-        .and_then(|nav| nav.cursor)
+        .watched(key)
+        .and_then(|w| w.nav.cursor)
         .and_then(|at| entries.get(at))
     else {
         return;
@@ -319,7 +312,13 @@ fn follow_page(m: &mut Model, key: &SubagentKey, entries: &[(usize, usize)], top
         .iter()
         .position(|&(start, len)| start + len > top)
         .unwrap_or(entries.len().saturating_sub(1));
-    m.log_view.navs.entry(key.clone()).or_default().cursor = Some(at);
+    if let Some(watched) = m
+        .agents
+        .get_mut(&key.0)
+        .and_then(|t| t.subagents.get_mut(&key.1))
+    {
+        watched.nav.cursor = Some(at);
+    }
 }
 
 /// `names` as far as `room` columns allow, the rest counted: `a, b +2`.
@@ -773,7 +772,7 @@ fn repo_body(m: &Model, key: &RepoKey, columns: usize) -> Option<Body> {
     });
     for entry in repo.entries().iter().filter(|e| m.shown(e)) {
         let mut line = status_line(m, entry, columns.saturating_sub(2));
-        let work = m.facts.get(entry.name());
+        let work = m.facts(entry.name());
         if let Some(Ok(facts)) = work {
             let d = facts.diff();
             if d.files > 0 {
@@ -818,7 +817,7 @@ fn turn_body(m: &Model, name: &SessionName, columns: usize) -> Option<Body> {
         rows.extend(wrap(&message, columns).into_iter().map(Line::raw));
         rows.push(Line::raw(""));
     }
-    if let Some(queue) = m.outboxes.get(name) {
+    if let Some(queue) = m.tracked(name).and_then(|t| t.outbox.as_ref()) {
         rows.extend(queue.iter().map(|q| {
             Line::styled(
                 truncate_end(
@@ -880,7 +879,7 @@ fn log_body(m: &Model, name: &SessionName, id: &AgentId, columns: usize, budget:
         ..Body::built(title.clone(), vec![Line::styled(text, style)])
     };
     let key = (name.clone(), id.clone());
-    let detail = match m.subagent_logs.get(&key) {
+    let detail = match m.watched(&key).and_then(|w| w.log.as_ref()) {
         None => {
             return Body {
                 loading: true,
@@ -896,7 +895,7 @@ fn log_body(m: &Model, name: &SessionName, id: &AgentId, columns: usize, budget:
         .and_then(|e| e.path())
         .map(|p| p.to_string_lossy().into_owned());
     let home = std::env::var("HOME").ok();
-    let nav = m.log_view.navs.get(&key).cloned().unwrap_or_default();
+    let nav = m.watched(&key).map(|w| w.nav.clone()).unwrap_or_default();
     let rendered = log::render(
         detail,
         subagent,

@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
@@ -12,14 +12,14 @@ use agent_core::model::{
 use agent_core::names::{AgentName, BranchName, Checkout, Prompt, SessionName};
 use agent_core::ops::{Approved, Hazardous, RemovalPlan};
 use agent_core::paths::{RepoRoot, Typed, typed_path};
-use agent_core::ports::{
-    Change, FileState, HarnessId, Readiness, SubagentDetail, Uncommitted, WorktreeFacts,
-};
+use agent_core::ports::{Change, FileState, HarnessId, Readiness, Uncommitted, WorktreeFacts};
 use agent_term::{Emulator, Terminal};
 use ratatui::layout::Rect;
 
 use crate::document::{BranchKey, CommitKey, DiffKey, Documents, FolderKey, Hover, Key};
 use crate::palette::Palette;
+use crate::track::{CachedTree, LiveSince};
+pub use crate::track::{Outbox, Tracked, Watched};
 use crate::tree::{self, ChangesScope, ChangesView, Node, TreeRow};
 
 pub const PREVIEW_DEBOUNCE: Duration = Duration::from_millis(150);
@@ -31,12 +31,13 @@ pub const NAMING_DEBOUNCE: Duration = Duration::from_millis(900);
 const NAMING_MIN_WORDS: usize = 3;
 
 /// The sidebar panel `j`/`k` act on in NAV, and how far it has moved.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Panel {
     /// [1]: they move the selection.
     Agents,
-    /// [2]: they scroll the selected agent's details down `offset` rows.
-    Agent { offset: usize },
+    /// [2]: they scroll the selected agent's details down `offset` rows
+    /// and move the cursor over the turn and its subagents.
+    Agent { offset: usize, row: TurnRow },
     /// [3]: they move the cursor over the selected agent's changed files.
     Changes { file: usize },
     /// The keys are in the document [0] shows for the list panel it came
@@ -45,35 +46,84 @@ pub enum Panel {
 }
 
 /// The list panel a focused document in [0] came from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Origin {
-    Turn { offset: usize },
+    Turn { offset: usize, row: TurnRow },
+    Changes { file: usize },
+}
+
+/// The row [2]'s cursor is on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TurnRow {
+    Turn,
+    /// A subagent of the agent `by`.
+    Subagent {
+        by: SessionName,
+        id: AgentId,
+    },
+}
+
+/// The list panel the keys act on, whether they're in it or in the document
+/// [0] shows for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Listed<'a> {
+    Agents,
+    Agent { offset: usize, row: &'a TurnRow },
     Changes { file: usize },
 }
 
 impl Origin {
-    fn panel(self) -> Panel {
+    fn into_panel(self) -> Panel {
         match self {
-            Self::Turn { offset } => Panel::Agent { offset },
+            Self::Turn { offset, row } => Panel::Agent { offset, row },
             Self::Changes { file } => Panel::Changes { file },
         }
     }
 }
 
 impl Panel {
-    /// The list panel, with the focus on its document taken away.
-    pub fn listed(self) -> Self {
+    /// [2] with the cursor on the turn, scrolled to the top.
+    pub const fn turn() -> Self {
+        Self::Agent {
+            offset: 0,
+            row: TurnRow::Turn,
+        }
+    }
+
+    pub fn list(&self) -> Listed<'_> {
         match self {
-            Self::Main(from) => from.panel(),
-            panel => panel,
+            Self::Agents => Listed::Agents,
+            Self::Agent { offset, row } | Self::Main(Origin::Turn { offset, row }) => {
+                Listed::Agent {
+                    offset: *offset,
+                    row,
+                }
+            }
+            Self::Changes { file } | Self::Main(Origin::Changes { file }) => {
+                Listed::Changes { file: *file }
+            }
+        }
+    }
+
+    /// Takes the focus from the document, leaving the list panel it came
+    /// from.
+    pub fn leave_document(&mut self) {
+        if let Self::Main(_) = self
+            && let Self::Main(from) = std::mem::replace(self, Self::Agents)
+        {
+            *self = from.into_panel();
         }
     }
 
     fn origin(self) -> Option<Origin> {
-        match self.listed() {
-            Self::Agent { offset } => Some(Origin::Turn { offset }),
-            Self::Changes { file } => Some(Origin::Changes { file }),
-            Self::Agents | Self::Main(_) => None,
+        match self {
+            Self::Agent { offset, row } | Self::Main(Origin::Turn { offset, row }) => {
+                Some(Origin::Turn { offset, row })
+            }
+            Self::Changes { file } | Self::Main(Origin::Changes { file }) => {
+                Some(Origin::Changes { file })
+            }
+            Self::Agents => None,
         }
     }
 
@@ -82,21 +132,40 @@ impl Panel {
     pub fn with_list(self, list: Self) -> Self {
         match (self, list.origin()) {
             (Self::Main(_), Some(from)) => Self::Main(from),
-            _ => list,
+            (_, from) => from.map_or(Self::Agents, Origin::into_panel),
         }
     }
 
-    /// The same panel with the keys in its document. [1] has none.
-    pub fn into_main(self) -> Self {
-        match self {
-            Self::Agent { offset } => Self::Main(Origin::Turn { offset }),
-            Self::Changes { file } => Self::Main(Origin::Changes { file }),
-            panel => panel,
-        }
+    /// Puts the keys in the panel's document. [1] has none.
+    pub fn focus_document(&mut self) {
+        let from = match std::mem::replace(self, Self::Agents) {
+            Self::Agent { offset, row } => Origin::Turn { offset, row },
+            Self::Changes { file } => Origin::Changes { file },
+            panel => {
+                *self = panel;
+                return;
+            }
+        };
+        *self = Self::Main(from);
     }
 
-    pub fn in_main(self) -> bool {
+    pub fn in_main(&self) -> bool {
         matches!(self, Self::Main(_))
+    }
+
+    /// The row of [2]'s cursor, while [2] or its document has the keys.
+    pub fn turn_row(&self) -> Option<&TurnRow> {
+        match self.list() {
+            Listed::Agent { row, .. } => Some(row),
+            Listed::Agents | Listed::Changes { .. } => None,
+        }
+    }
+
+    fn turn_row_mut(&mut self) -> Option<&mut TurnRow> {
+        match self {
+            Self::Agent { row, .. } | Self::Main(Origin::Turn { row, .. }) => Some(row),
+            Self::Agents | Self::Changes { .. } | Self::Main(Origin::Changes { .. }) => None,
+        }
     }
 }
 
@@ -172,14 +241,6 @@ impl View {
     pub fn previous(self) -> Self {
         Self::ALL[(self.index() + Self::ALL.len() - 1) % Self::ALL.len()]
     }
-}
-
-struct CachedTree {
-    generation: u64,
-    view: ChangesView,
-    scope: ChangesScope,
-    collapsed: HashSet<PathBuf>,
-    rows: std::sync::Arc<Vec<TreeRow>>,
 }
 
 /// What [3]'s cursor is on, by identity so a refresh can't move it to
@@ -516,16 +577,6 @@ impl Target {
     }
 }
 
-/// The subagent row under [2]'s cursor as it was last listed, and whose.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Held {
-    pub by: SessionName,
-    pub id: AgentId,
-    /// Marked finished once the activity drops it, since nothing will say
-    /// so afterwards.
-    pub subagent: Subagent,
-}
-
 /// What a working agent is busy with.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Doing {
@@ -810,87 +861,6 @@ pub enum Unreachable {
     Unreported,
 }
 
-/// A message waiting to be typed, with the review comments it carries so a
-/// message that is never typed in can give them back.
-#[derive(Debug)]
-pub struct Queued {
-    pub prompt: Prompt,
-    pub comments: Vec<crate::review::Comment>,
-}
-
-/// What's queued to type into one agent, oldest first.
-#[derive(Debug, Default)]
-pub struct Outbox {
-    queue: VecDeque<Queued>,
-    /// The first message is with the worker.
-    pub in_flight: bool,
-    /// How many events the agent had reported when the last one was typed:
-    /// the next waits for it to report again, since hooks lag the typing.
-    pub sent_at: Option<u64>,
-    /// When the last one was typed.
-    pub sent_instant: Option<Instant>,
-    /// The worker found the agent not ready or unreadable: wait for fresh
-    /// activity before asking again.
-    pub hold: Option<Hold>,
-}
-
-/// Why a queue isn't being flushed until the agent's record is read again.
-#[derive(Debug, Clone, Copy)]
-pub struct Hold {
-    /// The record's event count when the worker refused. `None` lifts the
-    /// hold at the next read of the store, whatever it says.
-    pub events: Option<u64>,
-    pub at: Instant,
-}
-
-/// How long a hold lasts with no new activity before the worker is asked
-/// again, which rechecks the store itself.
-pub const HOLD_FOR: Duration = Duration::from_secs(5);
-
-/// How long after typing a message with no hook report before the queue
-/// says it's waiting on the agent.
-pub const STALL_AFTER: Duration = Duration::from_secs(30);
-
-impl Outbox {
-    pub fn push(&mut self, prompt: Prompt, comments: Vec<crate::review::Comment>) {
-        self.queue.push_back(Queued { prompt, comments });
-    }
-
-    pub fn pop(&mut self) -> Option<Queued> {
-        self.queue.pop_front()
-    }
-
-    pub fn front(&self) -> Option<&Prompt> {
-        self.queue.front().map(|q| &q.prompt)
-    }
-
-    pub fn len(&self) -> usize {
-        self.queue.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.queue.is_empty()
-    }
-
-    pub fn iter(&self) -> impl Iterator<Item = &Prompt> {
-        self.queue.iter().map(|q| &q.prompt)
-    }
-
-    /// Every queued message's comments, oldest first.
-    pub fn into_comments(self) -> Vec<crate::review::Comment> {
-        self.queue.into_iter().flat_map(|q| q.comments).collect()
-    }
-
-    /// A message went in and the agent hasn't reported since, which a slash
-    /// or `!` command never does.
-    pub fn stalled(&self, events: Option<u64>) -> bool {
-        !self.is_empty()
-            && !self.in_flight
-            && self.sent_at.is_some_and(|at| events == Some(at))
-            && self.sent_instant.is_some_and(|t| t.elapsed() > STALL_AFTER)
-    }
-}
-
 /// The keybindings list: what's typed to narrow it, the row under the
 /// cursor and, as view state, the first visible line.
 #[derive(Debug, Default, Clone)]
@@ -1108,22 +1078,11 @@ pub struct Model {
     pub activities: Option<HashMap<SessionName, Activity>>,
     /// The clock for this frame, so every row, count and title agrees.
     pub now: SystemTime,
-    /// How many times each agent's git facts have been read, which tells a
-    /// document read from them that they may have changed.
-    pub facts_generation: HashMap<SessionName, u64>,
     /// How [3] lists the changed files, for the whole session.
     pub changes_view: ChangesView,
     pub changes_scope: ChangesScope,
-    /// The folders each agent's [3] has closed. A folder that isn't named
-    /// is open, so one that appears starts open.
-    pub collapsed: HashMap<SessionName, HashSet<PathBuf>>,
-    /// The tree built for each agent, rebuilt only when its facts, the view
-    /// or its closed folders change.
-    tree_cache: std::cell::RefCell<HashMap<SessionName, CachedTree>>,
-    /// Each agent's git facts, or why they couldn't be read, as last read.
-    pub facts: HashMap<SessionName, Result<WorktreeFacts, String>>,
-    /// When each agent's facts were last asked for.
-    pub inspections: HashMap<SessionName, Inspection>,
+    /// What is known about each agent, dropped when it leaves the snapshot.
+    pub agents: HashMap<SessionName, Tracked>,
     /// The finished turn last marked seen, so it's marked once.
     pub acknowledged: Option<(SessionName, u64)>,
     pub last_bell: Option<Instant>,
@@ -1132,34 +1091,17 @@ pub struct Model {
     pub terminal: TerminalFocus,
     /// Which checkouts [1] lists.
     pub visibility: Visibility,
-    /// The subagent row [2]'s cursor is on while it's focused. The turn row
-    /// while it's unset or gone.
-    pub subagent: Option<AgentId>,
-    /// The row under [2]'s cursor as it last was listed, kept so a new
-    /// prompt clearing finished subagents doesn't take it from under the
-    /// cursor. Dropped once the cursor leaves it.
-    pub held_subagent: Option<Held>,
-    /// What each subagent being watched was told and has done, as last read.
-    pub subagent_logs: HashMap<SubagentKey, Result<Option<SubagentDetail>, String>>,
-    /// When each subagent's transcript was last asked for.
-    pub subagent_reads: HashMap<SubagentKey, SubagentRead>,
-    /// [0]'s subagent log: cursor, expansion and layout.
+    /// How many times any agent's git facts have been read, so a read's
+    /// generation never repeats across agents that come and go.
+    facts_reads: u64,
+    /// [0]'s subagent log: layout flags.
     pub log_view: crate::log::LogView,
     /// [0]'s diff: the cursor over its lines.
     pub diff_view: crate::review::DiffView,
     /// What the branch view opened in [0], until `Esc` goes back to it.
     pub opened: Option<Opened>,
-    /// Comments drafted on diffs for each agent, until sent.
-    pub drafts: HashMap<SessionName, Vec<crate::review::Comment>>,
     /// The agent whose terminal the peek float shows.
     pub peek: Option<SessionName>,
-    /// Messages waiting for their agents to be at rest.
-    pub outboxes: HashMap<SessionName, Outbox>,
-    /// When each running session was first seen live. `None` for sessions
-    /// already live at the first snapshot, whose start isn't known.
-    pub live_since: HashMap<SessionName, Option<SystemTime>>,
-    /// When this TUI last started or resurrected each session.
-    pub launched_at: HashMap<SessionName, SystemTime>,
     /// What the main view [0] reads when it isn't the terminal.
     pub docs: Documents,
     pub screen: Screen,
@@ -1205,30 +1147,19 @@ impl Model {
             snapshots: 0,
             activities: None,
             now: SystemTime::now(),
-            facts: HashMap::new(),
-            facts_generation: HashMap::new(),
+            agents: HashMap::new(),
             changes_view: ChangesView::default(),
             changes_scope: ChangesScope::default(),
-            collapsed: HashMap::new(),
-            tree_cache: std::cell::RefCell::new(HashMap::new()),
-            inspections: HashMap::new(),
             acknowledged: None,
             last_bell: None,
             bell_due: None,
             terminal: TerminalFocus::Focused,
             visibility: Visibility::Active,
-            subagent: None,
-            held_subagent: None,
-            subagent_logs: HashMap::new(),
-            subagent_reads: HashMap::new(),
+            facts_reads: 0,
             log_view: crate::log::LogView::default(),
             diff_view: crate::review::DiffView::default(),
             opened: None,
-            drafts: HashMap::new(),
             peek: None,
-            outboxes: HashMap::new(),
-            live_since: HashMap::new(),
-            launched_at: HashMap::new(),
             docs: Documents::default(),
             screen: Screen::Split,
             sidebar_shown: true,
@@ -1294,7 +1225,7 @@ impl Model {
     }
 
     pub fn changes(&self) -> &[Change] {
-        match self.selected_entry().and_then(|e| self.facts.get(e.name())) {
+        match self.selected_entry().and_then(|e| self.facts(e.name())) {
             Some(Ok(facts)) => self.changes_scope.of(facts),
             Some(Err(_)) | None => &[],
         }
@@ -1314,22 +1245,20 @@ impl Model {
     }
 
     fn move_in_panel_by(&mut self, delta: isize, wrap: Wrap) {
-        self.panel = match self.panel {
-            Panel::Main(_) => self.panel,
-            Panel::Agents => {
-                self.move_cursor_by(delta, wrap);
-                Panel::Agents
-            }
+        match &self.panel {
+            Panel::Main(_) => {}
+            Panel::Agents => self.move_cursor_by(delta, wrap),
             Panel::Agent { .. } => {
                 self.point_at_row(|at, last| at.saturating_add_signed(delta).min(last));
-                self.panel
             }
-            Panel::Changes { file } => Panel::Changes {
-                file: file
-                    .saturating_add_signed(delta)
-                    .min(self.change_rows().saturating_sub(1)),
-            },
-        };
+            Panel::Changes { file } => {
+                self.panel = Panel::Changes {
+                    file: file
+                        .saturating_add_signed(delta)
+                        .min(self.change_rows().saturating_sub(1)),
+                };
+            }
+        }
     }
 
     /// Half the focused panel's rows, at least one.
@@ -1340,24 +1269,24 @@ impl Model {
     }
 
     pub fn panel_to_edge(&mut self, edge: Edge) {
-        self.panel = match (self.panel, edge) {
-            (Panel::Main(_), _) => self.panel,
-            (Panel::Agents, _) => {
-                self.move_to_edge(edge);
-                Panel::Agents
-            }
-            (Panel::Agent { .. }, edge) => {
+        match &self.panel {
+            Panel::Main(_) => {}
+            Panel::Agents => self.move_to_edge(edge),
+            Panel::Agent { .. } => {
                 self.point_at_row(|_, last| match edge {
                     Edge::First => 0,
                     Edge::Last => last,
                 });
-                self.panel
             }
-            (Panel::Changes { .. }, Edge::First) => Panel::Changes { file: 0 },
-            (Panel::Changes { .. }, Edge::Last) => Panel::Changes {
-                file: self.change_rows().saturating_sub(1),
-            },
-        };
+            Panel::Changes { .. } => {
+                self.panel = Panel::Changes {
+                    file: match edge {
+                        Edge::First => 0,
+                        Edge::Last => self.change_rows().saturating_sub(1),
+                    },
+                };
+            }
+        }
     }
 
     /// Whether [3] leads with the branch row, which is a row the cursor can be
@@ -1366,7 +1295,7 @@ impl Model {
         let Some(entry) = self.selected_entry() else {
             return false;
         };
-        let Some(Ok(facts)) = self.facts.get(entry.name()) else {
+        let Some(Ok(facts)) = self.facts(entry.name()) else {
             return false;
         };
         self.changes_scope == ChangesScope::Since
@@ -1380,33 +1309,73 @@ impl Model {
 
     /// The folders and files [3] lists under the readiness row.
     pub fn change_list(&self) -> std::sync::Arc<Vec<TreeRow>> {
-        let none = HashSet::new();
-        let Some(name) = self.selected_entry().map(|e| e.name().clone()) else {
+        let Some(tracked) = self
+            .selected_entry()
+            .and_then(|e| self.agents.get(e.name()))
+        else {
             return std::sync::Arc::new(Vec::new());
         };
-        let collapsed = self.collapsed.get(&name).unwrap_or(&none);
-        let generation = self.facts_generation.get(&name).copied().unwrap_or(0);
-        let mut cache = self.tree_cache.borrow_mut();
-        if let Some(hit) = cache.get(&name).filter(|c| {
-            c.generation == generation
+        let mut cache = tracked.tree.borrow_mut();
+        if let Some(hit) = cache.as_ref().filter(|c| {
+            c.generation == tracked.generation
                 && c.view == self.changes_view
                 && c.scope == self.changes_scope
-                && c.collapsed == *collapsed
+                && c.collapsed == tracked.collapsed
         }) {
             return hit.rows.clone();
         }
-        let rows = std::sync::Arc::new(tree::build(self.changes(), self.changes_view, collapsed));
-        cache.insert(
-            name,
-            CachedTree {
-                generation,
-                view: self.changes_view,
-                scope: self.changes_scope,
-                collapsed: collapsed.clone(),
-                rows: rows.clone(),
-            },
-        );
+        let rows = std::sync::Arc::new(tree::build(
+            self.changes(),
+            self.changes_view,
+            &tracked.collapsed,
+        ));
+        *cache = Some(CachedTree {
+            generation: tracked.generation,
+            view: self.changes_view,
+            scope: self.changes_scope,
+            collapsed: tracked.collapsed.clone(),
+            rows: rows.clone(),
+        });
         rows
+    }
+
+    /// What is known about `name`, if anything is.
+    pub fn tracked(&self, name: &SessionName) -> Option<&Tracked> {
+        self.agents.get(name)
+    }
+
+    /// `name`'s record, started if there is none.
+    pub fn track(&mut self, name: &SessionName) -> &mut Tracked {
+        self.agents.entry(name.clone()).or_default()
+    }
+
+    /// What is known about `name`'s subagent `id`, if it is being watched.
+    pub fn watched(&self, (name, id): &SubagentKey) -> Option<&Watched> {
+        self.agents.get(name)?.subagents.get(id)
+    }
+
+    /// `name`'s git facts, or why they couldn't be read, as last read.
+    pub fn facts(&self, name: &SessionName) -> Option<&Result<WorktreeFacts, String>> {
+        self.agents.get(name)?.facts.as_ref()
+    }
+
+    /// The comments drafted on diffs for `name`, until sent.
+    pub fn draft(&self, name: &SessionName) -> &[crate::review::Comment] {
+        self.agents.get(name).map_or(&[], |t| t.draft.as_slice())
+    }
+
+    /// How many comments are drafted across every agent.
+    pub fn drafted(&self) -> usize {
+        self.agents.values().map(|t| t.draft.len()).sum()
+    }
+
+    /// How many messages are queued across every agent.
+    pub fn queued(&self) -> usize {
+        self.agents
+            .values()
+            .filter_map(|t| t.outbox.as_ref())
+            .map(Outbox::len)
+            .sum()
     }
 
     /// Records `name`'s freshly read facts: the generation moves on, the
@@ -1415,17 +1384,19 @@ impl Model {
     pub fn set_facts(&mut self, name: &SessionName, facts: Result<WorktreeFacts, String>) {
         let selected = self.selected_entry().is_some_and(|e| e.name() == name);
         let anchor = selected.then(|| self.changes_anchor()).flatten();
-        *self.facts_generation.entry(name.clone()).or_default() += 1;
-        self.facts.insert(name.clone(), facts);
-        if let Some(Ok(facts)) = self.facts.get(name) {
-            let mut existing = tree::folders(&facts.changed);
-            existing.extend(tree::folders(&facts.pending));
-            if let Some(closed) = self.collapsed.get_mut(name) {
-                closed.retain(|p| existing.contains(p));
+        self.facts_reads += 1;
+        let generation = self.facts_reads;
+        let tracked = self.track(name);
+        tracked.generation = generation;
+        match &facts {
+            Ok(facts) => {
+                let mut existing = tree::folders(&facts.changed);
+                existing.extend(tree::folders(&facts.pending));
+                tracked.collapsed.retain(|p| existing.contains(p));
             }
-        } else {
-            self.collapsed.remove(name);
+            Err(_) => tracked.collapsed.clear(),
         }
+        tracked.facts = Some(facts);
         if let Some(anchor) = anchor {
             self.restore_changes_anchor(&anchor);
         }
@@ -1447,7 +1418,7 @@ impl Model {
 
     /// The folder under [3]'s cursor.
     pub fn folder_under_cursor(&self) -> Option<TreeRow> {
-        let Panel::Changes { file } = self.panel.listed() else {
+        let Listed::Changes { file } = self.panel.list() else {
             return None;
         };
         let row = file.min(self.change_rows().checked_sub(1)?);
@@ -1458,7 +1429,7 @@ impl Model {
     /// Moves [3]'s cursor to the next or previous file row, over folders and
     /// the branch row, while [0] keeps the keys. `false` when there is none.
     pub fn step_file(&mut self, forward: bool) -> bool {
-        let Panel::Changes { file } = self.panel.listed() else {
+        let Listed::Changes { file } = self.panel.list() else {
             return false;
         };
         let rows = self.change_rows();
@@ -1544,7 +1515,7 @@ impl Model {
 
     /// The path of the row [3]'s cursor is on, if it's a file or folder.
     fn changes_cursor_path(&self) -> Option<PathBuf> {
-        let Panel::Changes { file } = self.panel.listed() else {
+        let Listed::Changes { file } = self.panel.list() else {
             return None;
         };
         let row = file.min(self.change_rows().checked_sub(1)?);
@@ -1581,7 +1552,7 @@ impl Model {
         let Some(name) = self.selected_entry().map(|e| e.name().clone()) else {
             return;
         };
-        let closed = self.collapsed.entry(name).or_default();
+        let closed = &mut self.track(&name).collapsed;
         if matches!(folder.node, Node::Folder { open: false }) {
             for path in &folder.chain {
                 closed.remove(path);
@@ -1603,7 +1574,7 @@ impl Model {
         } else {
             HashSet::new()
         };
-        self.collapsed.insert(name, all);
+        self.track(&name).collapsed = all;
         if let Some(path) = was {
             self.point_changes_at(&path);
         }
@@ -1612,7 +1583,7 @@ impl Model {
     /// What [3]'s cursor is on and the checkout it's in, unless the keys are
     /// going to the agent.
     fn changes_hover(&self) -> Option<(Hover, PathBuf)> {
-        let Panel::Changes { file } = self.panel.listed() else {
+        let Listed::Changes { file } = self.panel.list() else {
             return None;
         };
         if matches!(self.focus(), Focus::Agent(_)) {
@@ -1622,7 +1593,7 @@ impl Model {
         let row = file.min(self.change_rows().checked_sub(1)?);
         let root = entry.path()?.to_path_buf();
         let name = entry.name().clone();
-        let generation = self.facts_generation.get(&name).copied().unwrap_or(0);
+        let generation = self.tracked(&name).map_or(0, |t| t.generation);
         if self.panel.in_main()
             && let Some(opened) = &self.opened
         {
@@ -1645,7 +1616,7 @@ impl Model {
             return Some((hover, root));
         }
         let folder = self.folder_under_cursor().map(|r| r.path);
-        let hover = match (row, self.change_at(row), self.facts.get(&name)) {
+        let hover = match (row, self.change_at(row), self.facts(&name)) {
             (_, None, _) if folder.is_none() && !self.branch_row() => return None,
             (_, None, _) if folder.is_some() => {
                 let path = folder.unwrap_or_default();
@@ -1693,13 +1664,13 @@ impl Model {
     /// Which item of its panel the cursor is on, of how many, for [0]'s
     /// title while the sidebar is out of sight.
     pub fn position(&self) -> Option<(usize, usize)> {
-        match self.panel.listed() {
-            Panel::Agents | Panel::Main(_) => None,
-            Panel::Changes { file } => {
+        match self.panel.list() {
+            Listed::Agents => None,
+            Listed::Changes { file } => {
                 let rows = self.change_rows();
                 Some((file.min(rows.checked_sub(1)?) + 1, rows))
             }
-            Panel::Agent { .. } => Some((self.row_at() + 1, self.subagent_rows().len() + 1)),
+            Listed::Agent { .. } => Some((self.row_at() + 1, self.subagent_rows().len() + 1)),
         }
     }
 
@@ -1735,14 +1706,14 @@ impl Model {
     pub fn settle_main(&mut self) {
         let hover = self.hover();
         if hover.is_none() {
-            self.panel = self.panel.listed();
+            self.panel.leave_document();
         }
         self.docs.settle(hover.as_ref(), Instant::now());
     }
 
     /// The selected agent's checkout and the file under [3]'s cursor in it.
     pub fn file_under_cursor(&self) -> Option<(PathBuf, PathBuf)> {
-        let Panel::Changes { file } = self.panel.listed() else {
+        let Listed::Changes { file } = self.panel.list() else {
             return None;
         };
         let root = self.selected_entry()?.path()?;
@@ -1825,9 +1796,12 @@ impl Model {
     /// is safe: its session's latest start as far as this TUI knows. A
     /// record that has itself launched since doesn't need it.
     pub fn not_before(&self, name: &SessionName) -> Option<SystemTime> {
-        let seen = self.live_since.get(name).copied().flatten();
-        let launched = self.launched_at.get(name).copied();
-        seen.max(launched)
+        let tracked = self.agents.get(name)?;
+        let seen = match tracked.live_since {
+            Some(LiveSince::Since(at)) => Some(at),
+            Some(LiveSince::Unknown) | None => None,
+        };
+        seen.max(tracked.seen.launched_at())
     }
 
     /// `name` is at rest but hasn't reported since its session started and
@@ -1864,56 +1838,62 @@ impl Model {
             return Vec::new();
         };
         let mut rows: Vec<_> = activity.subagents.iter().collect();
-        if let Some(held) = &self.held_subagent
-            && held.by == *entry.name()
-            && !activity.subagents.contains_key(&held.id)
+        if let Some(TurnRow::Subagent { by, id }) = self.panel.turn_row()
+            && by == entry.name()
+            && !activity.subagents.contains_key(id)
+            && let Some(held) = self
+                .agents
+                .get(by)
+                .and_then(|t| t.subagents.get(id))
+                .and_then(|w| w.held.as_ref())
         {
-            rows.push((&held.id, &held.subagent));
+            rows.push((id, held));
         }
         rows.sort_by_key(|(_, s)| s.since);
         rows
     }
 
-    /// Remembers the row [2]'s cursor is on while it's listed, and keeps
-    /// the memory only while the cursor stays on that row.
-    pub fn hold_hovered_subagent(&mut self) {
-        let hovered = match (self.panel.listed(), self.selected_entry(), &self.subagent) {
-            (Panel::Agent { .. }, Some(entry), Some(id))
-                if matches!(entry.state(), EntryState::Live) =>
-            {
-                Some((entry.name().clone(), id.clone()))
-            }
-            _ => None,
-        };
-        let Some((name, id)) = hovered else {
-            self.held_subagent = None;
+    /// Keeps the subagent under [2]'s cursor as its agent last listed it,
+    /// marks it finished once the activity drops it, and forgets it when the
+    /// cursor has left its agent or its live session.
+    pub fn hold_turn_row(&mut self) {
+        let Some(TurnRow::Subagent { by, id }) = self.panel.turn_row() else {
             return;
         };
-        let listed = self
-            .activity(&name)
-            .and_then(|a| a.subagents.get(&id))
-            .cloned();
+        let live = self
+            .selected_entry()
+            .is_some_and(|e| e.name() == by && matches!(e.state(), EntryState::Live));
+        let listed = live
+            .then(|| self.activity(by).and_then(|a| a.subagents.get(id)).cloned())
+            .flatten();
         let now = self.now;
-        self.held_subagent = match (listed, self.held_subagent.take()) {
-            (Some(subagent), _) => Some(Held {
-                by: name,
-                id,
-                subagent,
-            }),
-            (None, Some(mut held)) if held.by == name && held.id == id => {
-                held.subagent.finish(now);
-                Some(held)
-            }
-            (None, _) => None,
+        let Some(watched) = self
+            .agents
+            .get_mut(by)
+            .and_then(|t| t.subagents.get_mut(id))
+        else {
+            return;
         };
+        match (live, listed) {
+            (false, _) => watched.held = None,
+            (true, Some(subagent)) => watched.held = Some(subagent),
+            (true, None) => {
+                if let Some(held) = &mut watched.held {
+                    held.finish(now);
+                }
+            }
+        }
     }
 
     /// Where [2]'s cursor is among its rows: 0 is the turn, then the
     /// subagents. The turn while it points at a subagent that's gone.
     pub fn row_at(&self) -> usize {
-        self.subagent
-            .as_ref()
-            .and_then(|id| self.subagent_rows().iter().position(|(row, _)| *row == id))
+        let Some(TurnRow::Subagent { id, .. }) = self.panel.turn_row() else {
+            return 0;
+        };
+        self.subagent_rows()
+            .iter()
+            .position(|(row, _)| *row == id)
             .map_or(0, |at| at + 1)
     }
 
@@ -1922,14 +1902,26 @@ impl Model {
     pub fn point_at_row(&mut self, to: impl FnOnce(usize, usize) -> usize) {
         let rows = self.subagent_rows();
         let row = to(self.row_at(), rows.len()).min(rows.len());
-        self.subagent = row.checked_sub(1).map(|at| rows[at].0.clone());
+        let pointed = match (row.checked_sub(1), self.selected_entry()) {
+            (Some(at), Some(entry)) => Some((entry.name().clone(), rows[at].0.clone())),
+            _ => None,
+        };
+        let Some((by, id)) = pointed else {
+            if let Some(row) = self.panel.turn_row_mut() {
+                *row = TurnRow::Turn;
+            }
+            return;
+        };
+        self.track(&by).subagents.entry(id.clone()).or_default();
+        if let Some(row) = self.panel.turn_row_mut() {
+            *row = TurnRow::Subagent { by, id };
+        }
+        self.hold_turn_row();
     }
 
     /// The subagent [2]'s cursor is on, while [2] is focused.
     pub fn subagent_selected(&self) -> Option<(SessionName, AgentId)> {
-        let Panel::Agent { .. } = self.panel.listed() else {
-            return None;
-        };
+        self.panel.turn_row()?;
         let name = self.selected_entry()?.name().clone();
         let rows = self.subagent_rows();
         let (id, _) = rows.get(self.row_at().checked_sub(1)?)?;
@@ -1942,15 +1934,13 @@ impl Model {
         if matches!(self.focus(), Focus::Agent(_)) {
             return None;
         }
-        match self.panel.listed() {
-            Panel::Agents | Panel::Main(_) => match self.cursor() {
-                Some(Cursor::Repo(key)) if self.panel == Panel::Agents => {
-                    Some(Hover::Repo(key.clone()))
-                }
+        match self.panel.list() {
+            Listed::Agents => match self.cursor() {
+                Some(Cursor::Repo(key)) => Some(Hover::Repo(key.clone())),
                 _ => None,
             },
-            Panel::Changes { .. } => self.changes_hover().map(|(hover, _)| hover),
-            Panel::Agent { .. } => {
+            Listed::Changes { .. } => self.changes_hover().map(|(hover, _)| hover),
+            Listed::Agent { .. } => {
                 let entry = self.selected_entry()?;
                 self.activity(entry.name())?;
                 let name = entry.name().clone();
@@ -3336,6 +3326,47 @@ pub fn invalid_chars(name: &str) -> Vec<(usize, char)> {
             !allowed
         })
         .collect()
+}
+
+#[cfg(test)]
+impl Model {
+    /// [2]'s cursor on the selected agent's subagent `id`.
+    pub fn point_at_subagent(&mut self, id: &str) {
+        let by = self
+            .selected_entry()
+            .expect("an agent is selected")
+            .name()
+            .clone();
+        let offset = match self.panel.list() {
+            Listed::Agent { offset, .. } => offset,
+            _ => 0,
+        };
+        self.panel = Panel::Agent {
+            offset,
+            row: TurnRow::Subagent {
+                by,
+                id: AgentId::new(id),
+            },
+        };
+    }
+
+    /// `key`'s transcript as if it had been read.
+    pub fn set_log(
+        &mut self,
+        key: SubagentKey,
+        log: Result<Option<agent_core::ports::SubagentDetail>, String>,
+    ) {
+        self.track(&key.0).subagents.entry(key.1).or_default().log = Some(log);
+    }
+
+    /// How many subagents are being watched across every agent.
+    pub fn watching(&self) -> usize {
+        self.agents.values().map(|t| t.subagents.len()).sum()
+    }
+
+    pub fn outbox(&self, name: &SessionName) -> Option<&Outbox> {
+        self.agents.get(name)?.outbox.as_ref()
+    }
 }
 
 #[cfg(test)]

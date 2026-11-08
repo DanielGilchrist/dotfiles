@@ -185,13 +185,6 @@ impl Nav {
 /// What the view and the keys share about [0]'s subagent log.
 #[derive(Debug, Default)]
 pub struct LogView {
-    pub navs: HashMap<
-        (
-            agent_core::names::SessionName,
-            agent_core::activity::AgentId,
-        ),
-        Nav,
-    >,
     /// Scroll to show the cursor's entry at the next draw.
     pub reveal: bool,
     /// Move the cursor onto the page at the next draw.

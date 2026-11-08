@@ -170,7 +170,7 @@ impl Situation {
                 .lines()
                 .get(m.diff_view.cursor)
                 .is_some_and(|l| l.kind == crate::review::LineKind::Commit),
-            draft: entry.is_some_and(|e| m.drafts.contains_key(e.name())),
+            draft: entry.is_some_and(|e| !m.draft(e.name()).is_empty()),
             left_agent,
             can_edit_checkout: selected.is_some(),
             has_actions: entry.is_some() && !m.actions.is_empty(),
@@ -183,7 +183,7 @@ impl Situation {
                 ChangesScope::Uncommitted => "tab: uncommitted",
                 ChangesScope::Since => {
                     let trunk = entry
-                        .and_then(|e| m.facts.get(e.name()))
+                        .and_then(|e| m.facts(e.name()))
                         .and_then(|f| f.as_ref().ok())
                         .is_some_and(|f| matches!(f.compared, Compared::Trunk { .. }));
                     if trunk {

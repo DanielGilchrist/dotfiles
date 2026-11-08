@@ -277,16 +277,27 @@ pub enum Resolved<'a> {
     Missing,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum Tail {
+    /// Not a log, or not drawn as one yet.
+    #[default]
+    Off,
+    Following,
+    Paused,
+    /// Paused, while what is drawn isn't a log for a moment (a read that
+    /// failed, say): it resumes paused, not at the end.
+    Suspended,
+}
+
 #[derive(Default)]
 pub struct Documents {
     /// Rows scrolled past, clamped when drawn.
     pub scroll: usize,
     /// Rows of [0] as last drawn, for paging.
     pub page: usize,
-    /// Whether the document on screen is a log that follows its end, and
-    /// whether it is: scrolling up pauses it and reaching the end resumes.
-    tails: bool,
-    following: bool,
+    /// Whether the document on screen is a log that follows its end:
+    /// scrolling up pauses it and reaching the end resumes.
+    tail: Tail,
     /// What the scroll belongs to: moving to another item starts afresh.
     item: Option<Item>,
     wanted: Option<Wanted>,
@@ -318,7 +329,10 @@ impl Documents {
         if self.item.as_ref() != Some(&item) {
             self.item = Some(item);
             self.scroll = 0;
-            self.following = true;
+            self.tail = match self.tail {
+                Tail::Off | Tail::Suspended => Tail::Off,
+                Tail::Following | Tail::Paused => Tail::Following,
+            };
         }
         let Some(key) = hover.key() else {
             self.wanted = None;
@@ -479,24 +493,32 @@ impl Documents {
     pub fn scroll_by(&mut self, delta: isize) {
         self.scroll = self.scroll.saturating_add_signed(delta);
         if delta < 0 {
-            self.following = false;
+            self.pause();
         }
     }
 
     /// Stops following the end of a log without moving.
     pub fn pause(&mut self) {
-        self.following = false;
+        self.tail = match self.tail {
+            Tail::Following => Tail::Paused,
+            Tail::Off => Tail::Suspended,
+            tail => tail,
+        };
     }
 
     pub fn scroll_to_start(&mut self) {
         self.scroll = 0;
-        self.following = false;
+        self.pause();
     }
 
     /// Past the last row, which drawing clamps to it, and following again.
     pub fn scroll_to_end(&mut self) {
         self.scroll = usize::MAX;
-        self.following = true;
+        self.tail = match self.tail {
+            Tail::Paused => Tail::Following,
+            Tail::Suspended => Tail::Off,
+            tail => tail,
+        };
     }
 
     /// The first row shown of `total` rows in `height`, and the scroll kept
@@ -504,31 +526,34 @@ impl Documents {
     /// scrolled up, and following resumes on reaching the end again.
     pub fn place(&mut self, total: usize, height: usize, tails: bool) -> usize {
         let last = total.saturating_sub(height);
-        if self.tails && self.following && !tails {
+        if self.tail == Tail::Following && !tails {
             self.scroll = 0;
         }
-        self.tails = tails;
         self.page = height;
-        let top = if tails && self.following {
+        let top = if tails && matches!(self.tail, Tail::Off | Tail::Following) {
             last
         } else {
             self.scroll.min(last)
         };
-        if tails && top >= last {
-            self.following = true;
-        }
+        self.tail = match (tails, self.tail) {
+            (false, Tail::Off | Tail::Following) => Tail::Off,
+            (false, Tail::Paused | Tail::Suspended) => Tail::Suspended,
+            (true, Tail::Off | Tail::Following) => Tail::Following,
+            (true, Tail::Paused | Tail::Suspended) if top >= last => Tail::Following,
+            (true, Tail::Paused | Tail::Suspended) => Tail::Paused,
+        };
         self.scroll = top;
         top
     }
 
     /// Whether the log on screen follows its end.
     pub fn following(&self) -> bool {
-        self.tails && self.following
+        self.tail == Tail::Following
     }
 
     /// Whether the log on screen was scrolled away from its end.
     pub fn paused(&self) -> bool {
-        self.tails && !self.following
+        self.tail == Tail::Paused
     }
 
     /// Half the rows of [0], at least one.
@@ -738,6 +763,31 @@ mod tests {
 
     fn log() -> Hover {
         Hover::Subagent("fix".parse().expect("parses"), AgentId::new("s1"))
+    }
+
+    #[test]
+    fn a_paused_log_stays_paused_through_a_draw_that_is_not_a_log() {
+        let mut docs = Documents::default();
+        let t0 = Instant::now();
+        docs.settle(Some(&log()), t0);
+        docs.place(40, 10, true);
+        docs.scroll_by(-5);
+        assert_eq!(docs.place(40, 10, true), 25);
+        assert!(docs.paused());
+
+        docs.place(40, 10, false);
+        assert!(!docs.paused() && !docs.following(), "not a log meanwhile");
+        assert_eq!(docs.place(44, 10, true), 25, "back where it was");
+        assert!(docs.paused());
+
+        docs.settle(Some(&Hover::Turn("fix".parse().expect("parses"))), t0);
+        docs.place(44, 10, false);
+        docs.settle(Some(&log()), t0);
+        assert_eq!(
+            docs.place(44, 10, true),
+            34,
+            "another item starts at the end"
+        );
     }
 
     #[test]

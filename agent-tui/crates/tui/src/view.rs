@@ -635,7 +635,7 @@ fn draw_status_bar(frame: &mut Frame<'_>, m: &Model, area: Rect) {
         };
         counts.splice(0..0, [Span::raw(key), Span::raw(" ")]);
     }
-    let comments: usize = m.drafts.values().map(Vec::len).sum();
+    let comments = m.drafted();
     if comments > 0 {
         let lead = [
             Span::styled(
@@ -649,7 +649,7 @@ fn draw_status_bar(frame: &mut Frame<'_>, m: &Model, area: Rect) {
             counts.pop();
         }
     }
-    let queued: usize = m.outboxes.values().map(crate::model::Outbox::len).sum();
+    let queued = m.queued();
     if queued > 0 {
         let lead = [
             Span::styled(format!("{queued} queued"), dim()),
@@ -1550,10 +1550,10 @@ fn draw_actions(frame: &mut Frame<'_>, m: &Model, target: &SessionName) {
 }
 
 fn draw_talk(frame: &mut Frame<'_>, m: &Model, to: &SessionName, text: &str) {
-    let draft = m.drafts.get(to).map_or(&[][..], Vec::as_slice);
+    let draft = m.draft(to);
     let queued: Vec<&str> = m
-        .outboxes
-        .get(to)
+        .tracked(to)
+        .and_then(|t| t.outbox.as_ref())
         .map(|o| o.iter().map(AsRef::as_ref).collect())
         .unwrap_or_default();
     let shown = queued.len().min(3);

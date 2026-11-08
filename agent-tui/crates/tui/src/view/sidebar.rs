@@ -24,8 +24,8 @@ use super::{
     truncate_start, warning,
 };
 use crate::model::{
-    AgentStatus, Cursor, Doing, Extent, Failure, Fold, ListScroll, Model, Panel as Focused, Place,
-    Pulse, Row, Target, WorkRoom,
+    AgentStatus, Cursor, Doing, Extent, Failure, Fold, ListScroll, Listed, Model, Panel as Focused,
+    Place, Pulse, Row, Target, WorkRoom,
 };
 use crate::tree::{ChangesScope, Counts, Node, TreeRow};
 
@@ -310,7 +310,7 @@ impl<'m> Deck<'m> {
     fn new(m: &'m Model, snapshot: &'m Snapshot, inner: usize, rows: usize) -> Self {
         let mut changed_by: HashMap<_, Vec<_>> = HashMap::new();
         for (repo, entry) in snapshot.entries() {
-            if let Some(Ok(facts)) = m.facts.get(entry.name()) {
+            if let Some(Ok(facts)) = m.facts(entry.name()) {
                 for change in &facts.changed {
                     changed_by
                         .entry((repo.key(), change.path.as_path()))
@@ -491,7 +491,7 @@ impl<'m> Deck<'m> {
     /// Files this agent changed that others in its repo changed too, with
     /// the others that changed each.
     fn overlaps(&self, repo: &Repo, entry: &Entry) -> HashMap<PathBuf, Vec<&'m Entry>> {
-        let Some(Ok(mine)) = self.m.facts.get(entry.name()) else {
+        let Some(Ok(mine)) = self.m.facts(entry.name()) else {
             return HashMap::new();
         };
         mine.changed
@@ -516,7 +516,7 @@ impl<'m> Deck<'m> {
         let Some(activity) = m.activity(entry.name()) else {
             return (Vec::new(), None);
         };
-        let cursor = matches!(m.panel.listed(), Focused::Agent { .. }).then(|| m.row_at());
+        let cursor = matches!(m.panel.list(), Listed::Agent { .. }).then(|| m.row_at());
         let mut rows = vec![Line::raw(turn_row(
             activity.prompt.as_deref(),
             self.content,
@@ -1148,7 +1148,7 @@ impl Work<'_> {
 
 /// What [3] has to say about the selected agent, if anything.
 fn work_of<'m>(m: &'m Model, entry: &Entry) -> Option<Work<'m>> {
-    match m.facts.get(entry.name()) {
+    match m.facts(entry.name()) {
         Some(Ok(facts)) => {
             let head = m.branch_row().then(|| compared_summary(facts));
             let list = m.change_list();
@@ -1218,10 +1218,19 @@ fn lower_panels(deck: &Deck<'_>, repo: &Repo, entry: &Entry, area: Rect) -> Lowe
     let mut change_rows = Vec::new();
     let agent = (turn_height > 0).then(|| {
         let inside = turn_height - 2;
-        let first = match (m.panel.listed(), turn_cursor) {
-            (Focused::Agent { offset }, Some(row)) => {
+        let first = match (m.panel.list(), turn_cursor) {
+            (
+                Listed::Agent {
+                    offset,
+                    row: turn_row,
+                },
+                Some(row),
+            ) => {
                 let first = scroll(offset, row, inside, turn.len());
-                focus = Focused::Agent { offset: first };
+                focus = Focused::Agent {
+                    offset: first,
+                    row: turn_row.clone(),
+                };
                 first
             }
             _ => 0,
@@ -1236,8 +1245,8 @@ fn lower_panels(deck: &Deck<'_>, repo: &Repo, entry: &Entry, area: Rect) -> Lowe
     let changes = work.filter(|_| work_height > 0).map(|work| {
         let area = at(turn_height, work_height);
         let inside = work_height - 2;
-        let cursor = match m.panel.listed() {
-            Focused::Changes { file } => {
+        let cursor = match m.panel.list() {
+            Listed::Changes { file } => {
                 let row = file.min(work_rows - 1);
                 focus = Focused::Changes { file: row };
                 Some(row)
@@ -1371,7 +1380,7 @@ pub(super) fn others_on(m: &Model, name: &SessionName, path: &Path) -> Vec<Strin
     repo.entries()
         .iter()
         .filter(|e| e.name() != name)
-        .filter(|e| match m.facts.get(e.name()) {
+        .filter(|e| match m.facts(e.name()) {
             Some(Ok(facts)) => facts.changed.iter().any(|c| c.path == path),
             _ => false,
         })
@@ -1402,14 +1411,14 @@ pub(super) fn subagent_rows(m: &Model, entry: &Entry, width: usize) -> Vec<Line<
 /// `queued: <first words>` for an agent with messages waiting, cut to
 /// `width`.
 pub(super) fn queued_line(m: &Model, name: &SessionName, width: usize) -> Option<String> {
-    let outbox = m.outboxes.get(name)?;
+    let outbox = m.tracked(name)?.outbox.as_ref()?;
     if outbox.stalled(m.activity(name).map(|a| a.events)) {
         return Some(truncate_end(
             &format!("queued · waiting for {name} to report"),
             width,
         ));
     }
-    let first = crate::update::first_words(outbox.front()?.as_ref());
+    let first = crate::update::first_words(outbox.front().as_ref());
     let more = match outbox.len() {
         1 => String::new(),
         n => format!(" +{}", n - 1),
@@ -1461,8 +1470,8 @@ pub(super) fn draw(frame: &mut Frame<'_>, m: &mut Model, area: Rect, border: Sty
     let nav = sidebar_focused(m);
     let style_of = |focused: bool| if focused { border } else { dim() };
     let agents = matches!(m.panel, Focused::Agents);
-    let agent = matches!(m.panel.listed(), Focused::Agent { .. });
-    let files = matches!(m.panel.listed(), Focused::Changes { .. });
+    let agent = matches!(m.panel.list(), Listed::Agent { .. });
+    let files = matches!(m.panel.list(), Listed::Changes { .. });
     // Overview's folds and the tier depend on the list's room, so it's
     // measured before anything asks for the rows.
     m.areas.sidebar = Rect::new(
@@ -1483,15 +1492,16 @@ pub(super) fn draw(frame: &mut Frame<'_>, m: &mut Model, area: Rect, border: Sty
         return;
     };
     // A focused panel that stopped existing hands the focus back.
-    let laid = if std::mem::discriminant(&laid.focus) == std::mem::discriminant(&m.panel.listed()) {
-        laid
-    } else {
-        m.panel = laid.focus;
-        match lay_out(m, area) {
-            Some(laid) => laid,
-            None => return,
-        }
-    };
+    let laid =
+        if std::mem::discriminant(&laid.focus.list()) == std::mem::discriminant(&m.panel.list()) {
+            laid
+        } else {
+            m.panel = laid.focus;
+            match lay_out(m, area) {
+                Some(laid) => laid,
+                None => return,
+            }
+        };
     m.areas.page = match laid.focus {
         Focused::Agents => usize::from(laid.list.area.height),
         Focused::Agent { .. } => laid
@@ -1550,7 +1560,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, m: &mut Model, area: Rect, border: Sty
         let block = panel(title, corner, style_of(files), nav && files);
         frame.render_widget(Paragraph::new(lines).block(block), area);
     }
-    m.panel = m.panel.with_list(laid.focus);
+    m.panel = std::mem::replace(&mut m.panel, Focused::Agents).with_list(laid.focus);
     m.work_room = laid.room;
     m.scroll = laid.scroll;
     m.areas.rows = laid.hits;
@@ -1839,7 +1849,7 @@ mod tests {
         let mut m = fleet(10);
         m.set_cursor(Cursor::Entry(name("obs-layout-4")));
         m.changes_view = crate::tree::ChangesView::Flat;
-        let Some(Ok(facts)) = m.facts.get_mut(&name("obs-layout-4")) else {
+        let Some(Ok(facts)) = m.track(&name("obs-layout-4")).facts.as_mut() else {
             panic!("facts")
         };
         facts.ahead = 24;
@@ -2013,22 +2023,24 @@ mod tests {
 
     #[test]
     fn every_size_and_fleet_fits_its_column() {
-        let panels = [
-            Focused::Agents,
-            Focused::Agent { offset: 0 },
-            Focused::Changes { file: 0 },
-        ];
+        let panels = || {
+            [
+                Focused::Agents,
+                Focused::turn(),
+                Focused::Changes { file: 0 },
+            ]
+        };
         for size in SIZES {
             for agents in FLEETS {
                 for (view, panel) in View::ALL
                     .into_iter()
-                    .flat_map(|view| panels.map(|panel| (view, panel)))
+                    .flat_map(|view| panels().map(|panel| (view, panel)))
                 {
                     let mut m = fleet(agents);
                     while m.view != view {
                         m.toggle_view();
                     }
-                    m.panel = panel;
+                    m.panel = panel.clone();
                     let context = format!("{size:?}, {agents} agents, {view:?}, {panel:?}");
                     let laid = laid(&mut m, size);
                     let column = column(&m, size);
@@ -2348,19 +2360,19 @@ mod tests {
             "no cursor mark while [1] has the keys"
         );
 
-        m.panel = Focused::Agent { offset: 0 };
+        m.panel = Focused::turn();
         let lines = agent_lines(&laid(&mut m, (200, 50)));
         assert!(
             lines[0].starts_with('▌'),
             "the cursor starts on the turn\n{}",
             lines.join("\n")
         );
-        m.subagent = Some(AgentId::new("s1"));
+        m.point_at_subagent("s1");
         let lines = agent_lines(&laid(&mut m, (200, 50)));
         assert!(lines[2].starts_with('▌'), "{}", lines.join("\n"));
         assert_eq!(lines.iter().filter(|l| l.starts_with('▌')).count(), 1);
 
-        m.subagent = Some(AgentId::new("s0"));
+        m.point_at_subagent("s0");
         for height in [14, 16, 20] {
             let lines = agent_lines(&laid(&mut m, (80, height)));
             assert!(
@@ -2384,7 +2396,7 @@ mod tests {
         for size in SIZES {
             for (panel, overlay) in [
                 (Focused::Agents, Overlay::None),
-                (Focused::Agent { offset: 0 }, Overlay::None),
+                (Focused::turn(), Overlay::None),
                 (
                     Focused::Agents,
                     Overlay::Help(crate::model::HelpState::default()),
@@ -2434,7 +2446,7 @@ mod tests {
             .iter()
             .position(|l| text(l).contains("obs-layout-4"))
             .expect("selected");
-        m.panel = Focused::Agent { offset: 0 };
+        m.panel = Focused::turn();
         laid(&mut m, (80, 24));
         assert_eq!(m.scroll.offset, offset, "the 3-row window isn't remembered");
         m.panel = Focused::Agents;
@@ -2514,8 +2526,7 @@ mod tests {
 
         let mut m = fleet(8);
         m.set_cursor(Cursor::Entry(name("rate-limit-1")));
-        m.facts
-            .insert(name("rate-limit-1"), Err("fatal: not a repo\nmore".into()));
+        m.track(&name("rate-limit-1")).facts = Some(Err("fatal: not a repo\nmore".into()));
         let laid = laid(&mut m, (200, 50));
         let (panel, changes) = laid.changes.as_ref().expect("[3] shows");
         assert_eq!(texts(&panel.lines), [" git: fatal: not a repo"]);
@@ -2556,7 +2567,7 @@ mod tests {
             Focused::Changes { file: 0 },
             "one file, so the last row"
         );
-        m.facts.remove(&name("rate-limit-1"));
+        m.track(&name("rate-limit-1")).facts = None;
         assert_eq!(laid(&mut m, (200, 50)).focus, Focused::Agents);
     }
 
@@ -2605,8 +2616,8 @@ mod tests {
                 .any(|r| r.contains('▌') && r.contains(['├', '└']))
         );
 
-        m.panel = Focused::Agent { offset: 0 };
-        m.subagent = Some(AgentId::new("s1"));
+        m.panel = Focused::turn();
+        m.point_at_subagent("s1");
         let rows = screen(&render(&mut m, (200, 50)));
         let marked: Vec<&String> = rows
             .iter()
@@ -2616,7 +2627,7 @@ mod tests {
         assert!(marked[0].contains("Reverting memo edit"), "{}", marked[0]);
 
         // In a short column [2] scrolls, and the cursor's row stays on screen.
-        m.subagent = Some(AgentId::new("s0"));
+        m.point_at_subagent("s0");
         for height in [14, 17, 20] {
             let rows = screen(&render(&mut m, (100, height)));
             assert!(
@@ -2728,7 +2739,7 @@ mod tests {
             terminal.backend().buffer()[(area.x - 2, area.y - 1)].fg
         };
         assert_ne!(border(&terminal), Color::Cyan, "[3] has the keys");
-        m.panel = m.panel.into_main();
+        m.panel.focus_document();
         let terminal = render(&mut m, (100, 30));
         assert_eq!(border(&terminal), Color::Cyan, "[0] has them now");
     }
@@ -2779,7 +2790,7 @@ mod tests {
     fn the_turn_document_shows_the_whole_prompt_message_and_subagents() {
         let mut m = fleet(10);
         m.set_cursor(Cursor::Entry(name("auth-refresh-2")));
-        m.panel = Focused::Agent { offset: 0 };
+        m.panel = Focused::turn();
         let text = screen(&render(&mut m, (100, 30))).join("\n");
         assert!(text.contains("[0] Turn"), "{text}");
         assert!(text.contains("› go"), "{text}");
@@ -2793,7 +2804,7 @@ mod tests {
         );
 
         m.set_cursor(Cursor::Entry(name("obs-layout-4")));
-        m.panel = Focused::Agent { offset: 0 };
+        m.panel = Focused::turn();
         let text = screen(&render(&mut m, (100, 30))).join("\n");
         assert!(text.contains("Subagents"), "{text}");
         assert!(text.contains("Reverting memo edit"), "{text}");
@@ -2803,14 +2814,13 @@ mod tests {
     fn a_stopped_subagent_says_stopped_and_why() {
         let mut m = fleet(10);
         m.set_cursor(Cursor::Entry(name("obs-layout-4")));
-        m.panel = Focused::Agent { offset: 0 };
-        m.subagent = Some(AgentId::new("s1"));
+        m.panel = Focused::turn();
+        m.point_at_subagent("s1");
         let mut detail = log_of(2, false);
         detail.outcome = agent_core::ports::Outcome::Stopped {
             reason: "API Error: overloaded".into(),
         };
-        m.subagent_logs
-            .insert((name("obs-layout-4"), AgentId::new("s1")), Ok(Some(detail)));
+        m.set_log((name("obs-layout-4"), AgentId::new("s1")), Ok(Some(detail)));
         let text = screen(&render(&mut m, (100, 30))).join("\n");
         assert!(text.contains("stopped"), "{text}");
         assert!(text.contains("API Error: overloaded"), "{text}");
@@ -2821,15 +2831,15 @@ mod tests {
     fn a_subagents_log_follows_its_tail_and_pauses_when_scrolled_up() {
         let mut m = fleet(10);
         m.set_cursor(Cursor::Entry(name("obs-layout-4")));
-        m.panel = Focused::Agent { offset: 0 };
-        m.subagent = Some(AgentId::new("s1"));
+        m.panel = Focused::turn();
+        m.point_at_subagent("s1");
         let loading = screen(&render(&mut m, (100, 30))).join("\n");
         assert!(
             loading.contains("[0] Reverting memo edit · general-purpose"),
             "{loading}"
         );
 
-        m.subagent_logs.insert(
+        m.set_log(
             (name("obs-layout-4"), AgentId::new("s1")),
             Ok(Some(log_of(40, false))),
         );
@@ -2860,7 +2870,7 @@ mod tests {
         let text = screen(&render(&mut m, (100, 30))).join("\n");
         assert!(text.contains("following"), "G resumes\n{text}");
 
-        m.subagent_logs.insert(
+        m.set_log(
             (name("obs-layout-4"), AgentId::new("s1")),
             Ok(Some(log_of(2, true))),
         );
@@ -2889,10 +2899,9 @@ mod tests {
     fn a_subagent_without_a_transcript_says_so() {
         let mut m = fleet(10);
         m.set_cursor(Cursor::Entry(name("obs-layout-4")));
-        m.panel = Focused::Agent { offset: 0 };
-        m.subagent = Some(AgentId::new("s1"));
-        m.subagent_logs
-            .insert((name("obs-layout-4"), AgentId::new("s1")), Ok(None));
+        m.panel = Focused::turn();
+        m.point_at_subagent("s1");
+        m.set_log((name("obs-layout-4"), AgentId::new("s1")), Ok(None));
         let text = screen(&render(&mut m, (100, 30))).join("\n");
         assert!(text.contains("no transcript for this subagent"), "{text}");
     }
@@ -3074,10 +3083,9 @@ mod tests {
     fn a_card_says_what_is_queued_for_its_agent() {
         let mut m = fleet(10);
         m.set_cursor(Cursor::Entry(name("obs-layout-4")));
-        let outbox = m.outboxes.entry(name("obs-layout-4")).or_default();
-        for text in ["rebase on main", "then run the tests"] {
-            outbox.push(text.parse().expect("a prompt"), Vec::new());
-        }
+        let mut outbox = crate::track::queued("rebase on main");
+        outbox.push("then run the tests".parse().expect("a prompt"), Vec::new());
+        m.track(&name("obs-layout-4")).outbox = Some(outbox);
         let text = screen(&render(&mut m, (100, 30))).join("\n");
         assert!(text.contains("queued: rebase on ma"), "{text}");
         assert!(text.contains("+1"), "{text}");
@@ -3108,8 +3116,8 @@ mod tests {
     fn a_running_call_reads_how_long_it_has_run() {
         let mut m = fleet(10);
         m.set_cursor(Cursor::Entry(name("obs-layout-4")));
-        m.panel = Focused::Agent { offset: 0 };
-        m.subagent = Some(AgentId::new("s1"));
+        m.panel = Focused::turn();
+        m.point_at_subagent("s1");
         let mut all = m.activities.take().expect("reported");
         let sub = all
             .get_mut(&name("obs-layout-4"))
@@ -3122,7 +3130,7 @@ mod tests {
             since: SystemTime::now() - std::time::Duration::from_secs(12),
         });
         m.activities = Some(all);
-        m.subagent_logs.insert(
+        m.set_log(
             (name("obs-layout-4"), AgentId::new("s1")),
             Ok(Some(log_of(2, false))),
         );
@@ -3150,14 +3158,14 @@ mod tests {
     fn the_footer_ranks_hints_fits_what_it_can_and_never_repeats() {
         for panel in [
             Focused::Agents,
-            Focused::Agent { offset: 0 },
+            Focused::turn(),
             Focused::Changes { file: 0 },
         ] {
             let mut counts = Vec::new();
             for size in [(80, 24), (100, 30), (200, 50)] {
                 let mut m = fleet(10);
                 m.set_cursor(Cursor::Entry(name("obs-layout-4")));
-                m.panel = panel;
+                m.panel = panel.clone();
                 let footer = footer_of(&mut m, size);
                 let words = hint_words(&footer);
                 let mut sorted = words.clone();
@@ -3209,7 +3217,7 @@ mod tests {
     fn the_help_lists_local_keys_before_global_ones_for_each_panel() {
         for (panel, title) in [
             (Focused::Agents, "[1] Agents"),
-            (Focused::Agent { offset: 0 }, "[2] Turn"),
+            (Focused::turn(), "[2] Turn"),
             (Focused::Changes { file: 0 }, "[3] Changes"),
         ] {
             let mut m = open_help(panel);
@@ -3328,7 +3336,7 @@ mod tests {
         let mut m = fleet(10);
         m.set_cursor(Cursor::Entry(name("obs-layout-4")));
         m.changes_view = crate::tree::ChangesView::Tree;
-        let Some(Ok(facts)) = m.facts.get_mut(&name("obs-layout-4")) else {
+        let Some(Ok(facts)) = m.track(&name("obs-layout-4")).facts.as_mut() else {
             panic!("facts")
         };
         facts.changed = [
@@ -3482,7 +3490,7 @@ mod tests {
         );
         m.settle_main();
         render(&mut m, (140, 40));
-        m.panel = m.panel.into_main();
+        m.panel.focus_document();
         m
     }
 
@@ -3546,7 +3554,7 @@ mod tests {
         }
         press(&mut m, KeyCode::Enter);
         assert!(matches!(m.overlay, crate::model::Overlay::None));
-        assert_eq!(m.drafts.values().map(Vec::len).sum::<usize>(), 1);
+        assert_eq!(m.drafted(), 1);
         press(&mut m, KeyCode::Char('k'));
         let text = screen(&render(&mut m, (140, 40))).join("\n");
         assert!(text.contains("✎"), "a commented line is marked\n{text}");
@@ -3571,7 +3579,7 @@ mod tests {
         press(m, KeyCode::Char('c'));
         press(m, KeyCode::Char('x'));
         press(m, KeyCode::Enter);
-        let draft: Vec<_> = m.drafts.values().flatten().collect();
+        let draft: Vec<_> = m.agents.values().flat_map(|t| &t.draft).collect();
         assert_eq!(draft.len(), 1);
         assert!(
             draft[0].label.starts_with("src/a.rs@abc1234:"),
@@ -3606,7 +3614,7 @@ mod tests {
             })),
         );
         render(&mut m, (140, 40));
-        m.panel = m.panel.into_main();
+        m.panel.focus_document();
         let text = screen(&render(&mut m, (140, 40))).join("\n");
         assert!(
             text.contains("▌abc1234"),
@@ -3681,7 +3689,7 @@ mod tests {
             press(&mut m, KeyCode::Char(c));
         }
         press(&mut m, KeyCode::Enter);
-        let draft: Vec<_> = m.drafts.values().flatten().collect();
+        let draft: Vec<_> = m.agents.values().flat_map(|t| &t.draft).collect();
         assert_eq!(draft.len(), 1);
         assert!(draft[0].label.ends_with(":20-21"), "{}", draft[0].label);
         assert_eq!(draft[0].quoted.len(), 3);
@@ -3696,16 +3704,16 @@ mod tests {
         assert!(!m.main_focused());
 
         let mut m = on_a_loaded_diff();
-        let before = m.panel.listed();
+        let file = |m: &Model| match m.panel.list() {
+            Listed::Changes { file } => file,
+            other => panic!("[3] has the keys: {other:?}"),
+        };
+        let before = file(&m);
         press(&mut m, KeyCode::Char('J'));
-        assert_ne!(
-            m.panel.listed(),
-            before,
-            "J moves [3]'s cursor to the next file"
-        );
+        assert_ne!(file(&m), before, "J moves [3]'s cursor to the next file");
         assert!(m.main_focused());
         press(&mut m, KeyCode::Char('K'));
-        assert_eq!(m.panel.listed(), before);
+        assert_eq!(file(&m), before);
     }
 
     #[test]

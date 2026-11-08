@@ -290,7 +290,9 @@ pub fn fleet(n: usize) -> Model {
     m.view = crate::model::View::Focus;
     update(&mut m, Msg::Snapshot(Ok((snapshot, Vec::new()))));
     m.activities = Some(activities);
-    m.facts = facts_of;
+    for (name, facts) in facts_of {
+        m.track(&name).facts = Some(facts);
+    }
     m.revalidate();
     m.changes_view = crate::tree::ChangesView::Flat;
     m

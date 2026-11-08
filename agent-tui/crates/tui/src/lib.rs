@@ -4,6 +4,7 @@ mod log;
 mod model;
 mod palette;
 mod review;
+mod track;
 mod tree;
 mod update;
 mod view;
