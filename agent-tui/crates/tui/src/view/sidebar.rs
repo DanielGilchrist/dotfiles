@@ -651,39 +651,6 @@ fn tree(
         .collect()
 }
 
-/// The branch row on the Uncommitted tab: `↑24 unpushed · 4 uncommitted`,
-/// each part left out when it's zero, then `behind n` when the default
-/// branch moved on.
-fn branch_summary(facts: &WorktreeFacts, scope: ChangesScope) -> Line<'static> {
-    if scope == ChangesScope::Since {
-        return compared_summary(facts);
-    }
-    let mut parts: Vec<Vec<Span<'static>>> = Vec::new();
-    if facts.ahead > 0 {
-        parts.push(vec![
-            Span::styled("↑", dim()),
-            Span::raw(format!("{} unpushed", facts.ahead)),
-        ]);
-    }
-    if facts.dirty > 0 {
-        parts.push(vec![Span::raw(format!("{} uncommitted", facts.dirty))]);
-    }
-    if facts.behind > 0 {
-        parts.push(vec![Span::raw(format!("behind {}", facts.behind))]);
-    }
-    if parts.is_empty() {
-        return Line::from(Span::raw("nothing to commit or push"));
-    }
-    let mut spans = Vec::new();
-    for (i, part) in parts.into_iter().enumerate() {
-        if i > 0 {
-            spans.push(Span::styled(" · ", dim()));
-        }
-        spans.extend(part);
-    }
-    Line::from(spans)
-}
-
 /// The branch row on the second tab, short enough for the narrow sidebar:
 /// `↑27 · 4 uncommitted`, `↓n` when behind. [0] says what is compared.
 fn compared_summary(facts: &WorktreeFacts) -> Line<'static> {
@@ -1168,9 +1135,7 @@ impl Work<'_> {
 fn work_of<'m>(m: &'m Model, entry: &Entry) -> Option<Work<'m>> {
     match m.facts.get(entry.name()) {
         Some(Ok(facts)) => {
-            let head = m
-                .branch_row()
-                .then(|| branch_summary(facts, m.changes_scope));
+            let head = m.branch_row().then(|| compared_summary(facts));
             let list = m.change_list();
             (!list.is_empty() || head.is_some()).then_some(Work::Facts { facts, head, list })
         }
@@ -1545,7 +1510,19 @@ pub(super) fn draw(frame: &mut Frame<'_>, m: &mut Model, area: Rect, border: Sty
             title.push(Span::styled(format!("∩ {}", changes.shared), warning()));
         }
         let title = fit(title, usize::from(area.width).saturating_sub(4));
-        let block = panel(title, Vec::new(), style_of(files), nav && files);
+        let corner = vec![Span::styled(
+            format!(
+                "{} {}",
+                changes.diff.files,
+                if changes.diff.files == 1 {
+                    "file"
+                } else {
+                    "files"
+                }
+            ),
+            style_of(files),
+        )];
+        let block = panel(title, corner, style_of(files), nav && files);
         frame.render_widget(Paragraph::new(lines).block(block), area);
     }
     m.panel = m.panel.with_list(laid.focus);
@@ -1731,26 +1708,6 @@ mod tests {
     }
 
     #[test]
-    fn the_branch_row_reads_unpushed_and_uncommitted_and_leaves_out_zeros() {
-        let read = |ahead, dirty, behind| {
-            text(&branch_summary(
-                &WorktreeFacts {
-                    ahead,
-                    dirty,
-                    behind,
-                    ..WorktreeFacts::default()
-                },
-                ChangesScope::Uncommitted,
-            ))
-        };
-        assert_eq!(read(24, 4, 0), "↑24 unpushed · 4 uncommitted");
-        assert_eq!(read(0, 2, 0), "2 uncommitted");
-        assert_eq!(read(3, 0, 0), "↑3 unpushed");
-        assert_eq!(read(3, 0, 2), "↑3 unpushed · behind 2");
-        assert_eq!(read(0, 0, 0), "nothing to commit or push");
-    }
-
-    #[test]
     fn the_second_tab_row_is_short() {
         let branch = || Compared::Branch {
             branch: "fix-thing".into(),
@@ -1761,16 +1718,13 @@ mod tests {
             base: "origin/main".into(),
         };
         let read = |compared, ahead, dirty, behind| {
-            text(&branch_summary(
-                &WorktreeFacts {
-                    ahead,
-                    dirty,
-                    behind,
-                    compared,
-                    ..WorktreeFacts::default()
-                },
-                ChangesScope::Since,
-            ))
+            text(&compared_summary(&WorktreeFacts {
+                ahead,
+                dirty,
+                behind,
+                compared,
+                ..WorktreeFacts::default()
+            }))
         };
         assert_eq!(read(branch(), 3, 2, 0), "↑3 · 2 uncommitted");
         assert_eq!(read(branch(), 1, 0, 2), "↑1 · ↓2");
@@ -1833,7 +1787,7 @@ mod tests {
     }
 
     #[test]
-    fn each_tab_totals_its_own_files_and_both_keep_the_branch_row_first() {
+    fn each_tab_totals_its_own_files_and_only_the_second_leads_with_the_branch_row() {
         use agent_core::ports::{Change, Lines};
         let change = |path: &str, added, removed| Change {
             path: path.into(),
@@ -1867,16 +1821,16 @@ mod tests {
             ));
             m.toggle_changes_scope();
         }
-        assert_eq!(shown[0].0, " ↑24 unpushed · 4 uncommitted");
         assert_eq!(
-            shown[1].0, " ↑24 · 4 uncommitted",
-            "the branch row leads both tabs"
+            shown[0].0.trim(),
+            "b.rs                                     +2"
         );
+        assert_eq!(shown[1].0, " ↑24 · 4 uncommitted");
         assert_eq!(shown[0].1, 1);
         assert_eq!((shown[0].2, shown[0].3), (2, 0));
-        assert_eq!(shown[0].4, 2, "the branch row and one file");
+        assert_eq!(shown[0].4, 1, "one file");
         assert_eq!((shown[1].1, shown[1].2, shown[1].3), (2, 57, 6));
-        assert_eq!(shown[1].4, 3);
+        assert_eq!(shown[1].4, 3, "the branch row and two files");
     }
 
     #[test]
@@ -2299,6 +2253,7 @@ mod tests {
         let mut m = fleet(8);
         m.show_view(View::Overview);
         m.set_cursor(Cursor::Entry(name("payroll-fix-3")));
+        m.toggle_changes_scope();
         let first = laid(&mut m, (200, 50));
         let (panel, _) = first.changes.as_ref().expect("[3] shows");
         let lines = texts(&panel.lines);
@@ -2326,7 +2281,7 @@ mod tests {
         let first = laid(&mut m, (200, 50));
         let (panel, changes) = first.changes.as_ref().expect("[3] shows");
         assert_eq!(changes.diff.files, 0);
-        assert_eq!(texts(&panel.lines), [" nothing to commit or push"]);
+        assert_eq!(texts(&panel.lines), [" no changes"]);
         assert!(
             panel.lines[0].spans[1]
                 .style
@@ -2463,6 +2418,7 @@ mod tests {
             let mut m = fleet(8);
             m.show_view(View::Overview);
             m.set_cursor(Cursor::Entry(name("payroll-fix-3")));
+            m.toggle_changes_scope();
             let laid = laid(&mut m, (80, height));
             let Some((panel, changes)) = laid.changes.as_ref() else {
                 continue;
@@ -2561,8 +2517,8 @@ mod tests {
         let clamped = laid(&mut m, (200, 50));
         assert_eq!(
             clamped.focus,
-            Focused::Changes { file: 1 },
-            "the readiness row and one file, so the last row"
+            Focused::Changes { file: 0 },
+            "one file, so the last row"
         );
         m.facts.remove(&name("rate-limit-1"));
         assert_eq!(laid(&mut m, (200, 50)).focus, Focused::Agents);
@@ -2645,7 +2601,7 @@ mod tests {
             render(&mut m, (100, 30));
             m.areas.terminal
         };
-        m.panel = Focused::Changes { file: 1 };
+        m.panel = Focused::Changes { file: 0 };
         m.settle_main();
         std::thread::sleep(crate::document::REST + std::time::Duration::from_millis(20));
         let key = m.docs.due(std::time::Instant::now()).expect("due");
@@ -2879,6 +2835,7 @@ mod tests {
         use agent_core::ports::BranchLog;
         let mut m = fleet(10);
         m.set_cursor(Cursor::Entry(name("obs-layout-4")));
+        m.toggle_changes_scope();
         m.panel = Focused::Changes { file: 0 };
         m.settle_main();
         std::thread::sleep(crate::document::REST + std::time::Duration::from_millis(20));
@@ -2895,10 +2852,7 @@ mod tests {
             text.contains("[0] Branch · feature vs origin/main"),
             "{text}"
         );
-        assert!(
-            text.contains("What feature changes since it left origin/main"),
-            "{text}"
-        );
+        assert!(!text.contains("since it left"), "{text}");
         assert!(
             text.contains("Commits (1)") && text.contains("abc1234 Fix the rounding"),
             "{text}"
@@ -2938,6 +2892,7 @@ mod tests {
     fn clicks_and_the_wheel_land_on_the_rows_drawn_in_two_and_three_and_in_the_document() {
         let mut m = fleet(10);
         m.set_cursor(Cursor::Entry(name("obs-layout-4")));
+        m.toggle_changes_scope();
         render(&mut m, (100, 30));
         let (y, row) = m.areas.change_rows[2];
         assert_eq!(row, 2);
@@ -3006,6 +2961,7 @@ mod tests {
     fn clicks_after_the_panel_scrolls_land_on_the_drawn_row() {
         let mut m = fleet(10);
         m.set_cursor(Cursor::Entry(name("obs-layout-4")));
+        m.toggle_changes_scope();
         m.panel = Focused::Changes { file: 4 };
         render(&mut m, (100, 16));
         let rows = m.areas.change_rows.clone();
@@ -3353,7 +3309,7 @@ mod tests {
     #[test]
     fn a_folder_in_main_lists_the_files_under_it_with_counts() {
         let mut m = tree_fleet();
-        m.panel = Focused::Changes { file: 1 };
+        m.panel = Focused::Changes { file: 0 };
         let text = screen(&render(&mut m, (140, 40))).join("\n");
         assert!(text.contains("[0] crates/tui/src/"), "{text}");
         assert!(text.contains("3 files"), "{text}");
@@ -3368,26 +3324,26 @@ mod tests {
     fn clicks_and_the_wheel_work_on_tree_rows() {
         let mut m = tree_fleet();
         render(&mut m, (100, 50));
-        let (y, row) = m.areas.change_rows[3];
-        assert_eq!(row, 3);
+        let (y, row) = m.areas.change_rows[2];
+        assert_eq!(row, 2);
         click(&mut m, 5, y, left());
-        assert_eq!(m.panel, Focused::Changes { file: 3 });
+        assert_eq!(m.panel, Focused::Changes { file: 2 });
         assert_eq!(
-            m.change_row(3).map(|r| r.label),
+            m.change_row(2).map(|r| r.label),
             Some("sidebar.rs".to_string())
         );
         assert!(matches!(m.hover(), Some(crate::document::Hover::Diff(_))));
-        let (y, _) = m.areas.change_rows[1];
+        let (y, _) = m.areas.change_rows[0];
         click(&mut m, 5, y, left());
         assert!(matches!(m.hover(), Some(crate::document::Hover::Folder(_))));
         click(&mut m, 5, y, crossterm::event::MouseEventKind::ScrollDown);
-        assert_eq!(m.panel, Focused::Changes { file: 2 });
+        assert_eq!(m.panel, Focused::Changes { file: 1 });
     }
 
     #[test]
     fn a_folded_folder_shows_a_closed_arrow_and_the_rows_below_move_up() {
         let mut m = tree_fleet();
-        m.panel = Focused::Changes { file: 1 };
+        m.panel = Focused::Changes { file: 0 };
         crate::update::update(
             &mut m,
             crate::worker::Msg::Key(crossterm::event::KeyEvent::new(

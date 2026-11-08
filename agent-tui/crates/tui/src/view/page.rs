@@ -355,11 +355,7 @@ fn branch_rows(
     behind: usize,
     columns: usize,
 ) -> Vec<Line<'static>> {
-    let mut rows: Vec<Line<'static>> = wrap(&compared_explanation(compared), columns)
-        .into_iter()
-        .map(|row| Line::styled(row, dim()))
-        .collect();
-    rows.push(Line::raw(""));
+    let mut rows: Vec<Line<'static>> = Vec::new();
     if log.commits.is_empty() && log.uncommitted.is_empty() {
         rows.push(Line::styled("nothing ahead of the default branch", dim()));
     }
@@ -411,25 +407,6 @@ fn compared_title(compared: &Compared) -> String {
     match compared.base() {
         Some(base) => format!("{} vs {base}", compared.head()),
         None => format!("{} · no base", compared.head()),
-    }
-}
-
-fn compared_explanation(compared: &Compared) -> String {
-    let head = compared.head();
-    match compared {
-        Compared::Trunk { base, .. } => format!(
-            "Commits on {head} that aren't on {base} yet, then uncommitted work. Pushing empties the commits."
-        ),
-        Compared::Branch { base, .. } => format!(
-            "What {head} changes since it left {base}, like a pull request, then uncommitted work."
-        ),
-        Compared::Detached { base, .. } => {
-            format!("What {head} changes since it left {base}, then uncommitted work.")
-        }
-        Compared::NoBase { .. } => {
-            "There is no default branch to compare with, so only uncommitted work is listed."
-                .to_string()
-        }
     }
 }
 

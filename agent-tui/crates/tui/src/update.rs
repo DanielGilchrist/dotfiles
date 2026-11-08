@@ -2476,7 +2476,7 @@ mod tests {
         );
         update(&mut m, key(KeyCode::Char('[')));
         assert_eq!(m.changes_scope, crate::tree::ChangesScope::Uncommitted);
-        assert_eq!(m.panel, Panel::Changes { file: 1 });
+        assert_eq!(m.panel, Panel::Changes { file: 0 });
         update(&mut m, key(KeyCode::Char(']')));
         update(&mut m, key(KeyCode::Char('1')));
         update(&mut m, key(KeyCode::Char('3')));
@@ -2511,7 +2511,7 @@ mod tests {
     }
 
     #[test]
-    fn a_row_missing_from_the_other_tab_sends_the_cursor_to_the_branch_row() {
+    fn a_row_missing_from_the_other_tab_sends_the_cursor_to_the_first_row() {
         let mut m = model(&[]);
         m.changes_view = ChangesView::Flat;
         with_scopes(&mut m);
@@ -4483,11 +4483,7 @@ mod tests {
         m.set_cursor(Cursor::Entry(name("obs-layout-4")));
         assert_eq!(diff_reads(tick(&mut m)), [""; 0], "[3] isn't focused");
         update(&mut m, key(KeyCode::Char('3')));
-        update(&mut m, key(KeyCode::Char('j')));
-        assert!(
-            matches!(m.panel, Panel::Changes { file: 1 }),
-            "row 0 is the branch"
-        );
+        assert!(matches!(m.panel, Panel::Changes { file: 0 }));
         assert_eq!(
             diff_reads(tick(&mut m)),
             [""; 0],
@@ -4511,7 +4507,7 @@ mod tests {
             Msg::Key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL)),
         );
         assert_eq!(m.docs.scroll, 5, "half a page of [0], not of the list");
-        assert!(matches!(m.panel, Panel::Changes { file: 1 }));
+        assert!(matches!(m.panel, Panel::Changes { file: 0 }));
         update(
             &mut m,
             Msg::Key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL)),
@@ -4653,8 +4649,12 @@ mod tests {
     fn the_readiness_row_is_the_first_row_of_changes_and_reads_the_branch() {
         let mut m = crate::fixtures::fleet(10);
         m.set_cursor(Cursor::Entry(name("obs-layout-4")));
-        assert!(m.branch_row(), "obs-layout-4 is ahead in the fixture");
+        assert!(!m.branch_row(), "Uncommitted lists only its files");
         update(&mut m, key(KeyCode::Char('3')));
+        assert!(matches!(m.hover(), Some(crate::document::Hover::Diff(_))));
+        update(&mut m, key(KeyCode::Char(']')));
+        assert!(m.branch_row(), "obs-layout-4 is ahead in the fixture");
+        update(&mut m, key(KeyCode::Char('g')));
         assert!(matches!(m.hover(), Some(crate::document::Hover::Branch(_))));
         assert_eq!(m.change_rows(), m.changes().len() + 1);
         assert_eq!(

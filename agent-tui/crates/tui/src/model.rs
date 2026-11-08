@@ -1275,8 +1275,8 @@ impl Model {
         };
     }
 
-    /// Whether [3] leads with the readiness row, which is a row the cursor
-    /// can be on, for the branch.
+    /// Whether [3] leads with the branch row, which is a row the cursor can be
+    /// on. Only the second tab has it.
     pub fn branch_row(&self) -> bool {
         let Some(entry) = self.selected_entry() else {
             return false;
@@ -1284,7 +1284,8 @@ impl Model {
         let Some(Ok(facts)) = self.facts.get(entry.name()) else {
             return false;
         };
-        shows_readiness(entry, &self.status(entry), facts.readiness())
+        self.changes_scope == ChangesScope::Since
+            && shows_readiness(entry, &self.status(entry), facts.readiness())
     }
 
     /// The rows [3]'s cursor moves over: the branch, then the files.
@@ -1512,6 +1513,7 @@ impl Model {
         let generation = self.facts_generation.get(&name).copied().unwrap_or(0);
         let folder = self.folder_under_cursor().map(|r| r.path);
         let hover = match (row, self.change_at(row), self.facts.get(&name)) {
+            (_, None, _) if folder.is_none() && !self.branch_row() => return None,
             (_, None, _) if folder.is_some() => Hover::Folder(FolderKey {
                 name,
                 path: folder.unwrap_or_default(),
