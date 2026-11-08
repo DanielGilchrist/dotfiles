@@ -16,6 +16,7 @@ use agent_core::ports::{Change, HarnessId, SubagentDetail, WorktreeFacts};
 use agent_term::{Emulator, Terminal};
 use ratatui::layout::Rect;
 
+use crate::document::{DiffKey, Documents};
 use crate::palette::Palette;
 
 pub const PREVIEW_DEBOUNCE: Duration = Duration::from_millis(150);
@@ -917,6 +918,8 @@ pub struct Model {
     pub subagent_logs: HashMap<SubagentKey, Result<Option<SubagentDetail>, String>>,
     /// When each subagent's transcript was last asked for.
     pub subagent_reads: HashMap<SubagentKey, SubagentRead>,
+    /// What the main view [0] reads when it isn't the terminal.
+    pub docs: Documents,
 }
 
 impl Model {
@@ -967,6 +970,7 @@ impl Model {
             subagent: None,
             subagent_logs: HashMap::new(),
             subagent_reads: HashMap::new(),
+            docs: Documents::default(),
         }
     }
 
@@ -1078,6 +1082,32 @@ impl Model {
                 file: self.changes().len().saturating_sub(1),
             },
         };
+    }
+
+    /// The diff the main view reads: the file under [3]'s cursor, unless the
+    /// keys are going to the agent.
+    pub fn hovered_diff(&self) -> Option<(DiffKey, PathBuf)> {
+        let Panel::Changes { file } = self.panel else {
+            return None;
+        };
+        if matches!(self.focus(), Focus::Agent(_)) {
+            return None;
+        }
+        let entry = self.selected_entry()?;
+        let changes = self.changes();
+        let change = changes.get(file.min(changes.len().checked_sub(1)?))?;
+        let key = DiffKey {
+            name: entry.name().clone(),
+            path: change.path.clone(),
+            lines: change.lines,
+        };
+        Some((key, entry.path()?.to_path_buf()))
+    }
+
+    /// Points the main view at what the cursor is on.
+    pub fn settle_main(&mut self) {
+        let hover = self.hovered_diff().map(|(key, _)| key);
+        self.docs.settle(hover, Instant::now());
     }
 
     /// The selected agent's checkout and the file under [3]'s cursor in it.

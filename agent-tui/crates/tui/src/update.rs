@@ -16,6 +16,7 @@ use agent_term::{CellPos, encode_key, encode_mouse};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind};
 use ratatui::layout::Position;
 
+use crate::document::DiffKey;
 use crate::model::{
     Answer, Chord, Confirm, Cursor, Direction, Edge, Enter, Field, Focus, Follow, FormKind,
     INFO_TTL, Inspection, Intent, Mode, Model, NamingState, NewAgent, Overlay, Pane, Panel, Phase,
@@ -43,6 +44,9 @@ const SUBAGENT_REFRESH: Duration = Duration::from_secs(2);
 /// without a hook firing.
 const SUBAGENT_SLOW_REFRESH: Duration = Duration::from_secs(10);
 
+/// Rows `J` and `K` scroll the main view by.
+const SCROLL: isize = 2;
+
 /// What `$EDITOR` opens.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Open {
@@ -57,6 +61,11 @@ pub enum Effect {
     /// Read git facts about an agent's worktree.
     Inspect {
         name: SessionName,
+        worktree: PathBuf,
+    },
+    /// Read a file's diff in a worktree.
+    ReadDiff {
+        key: DiffKey,
         worktree: PathBuf,
     },
     /// Read what a subagent of an agent working in `workdir` has done.
@@ -216,6 +225,10 @@ pub fn update(m: &mut Model, msg: Msg) -> Vec<Effect> {
             }
             Vec::new()
         }
+        Msg::Diff { key, result } => {
+            m.docs.loaded(&key, result);
+            Vec::new()
+        }
         Msg::Subagent { name, id, detail } => {
             let key = (name, id);
             if m.subagent_reads.contains_key(&key) {
@@ -277,6 +290,7 @@ pub fn tick(m: &mut Model) -> Vec<Effect> {
     effects.extend(preview(m));
     effects.extend(inspect(m));
     effects.extend(read_subagent(m));
+    effects.extend(read_diff(m));
     effects
 }
 
@@ -422,6 +436,16 @@ fn forget_subagents(m: &mut Model) {
     m.subagent_logs.retain(|key, _| listed(key));
 }
 
+/// Asks for the diff of the file under [3]'s cursor once the cursor has
+/// rested on it.
+fn read_diff(m: &mut Model) -> Option<Effect> {
+    m.settle_main();
+    let (key, worktree) = m.hovered_diff()?;
+    let due = m.docs.due(Instant::now())?;
+    debug_assert_eq!(due, key);
+    Some(Effect::ReadDiff { key: due, worktree })
+}
+
 /// Asks for what the subagent under [2]'s cursor has done: when it's first
 /// shown, soon after its agent reports something, and every
 /// [`SUBAGENT_SLOW_REFRESH`] regardless.
@@ -478,6 +502,7 @@ fn forget_gone(m: &mut Model) {
     m.subagent_reads.retain(|(name, _), _| known.contains(name));
     m.subagent_logs.retain(|(name, _), _| known.contains(name));
     m.facts.retain(|name, _| known.contains(name));
+    m.docs.forget(|name| known.contains(name));
 }
 
 /// Asks for git facts about every agent with a checkout: soon after it
@@ -728,8 +753,18 @@ fn on_nav_key(m: &mut Model, key: KeyEvent) -> Vec<Effect> {
             (_, Some(entry)) => return activate(m, entry.name()),
             _ => {}
         },
-        KeyCode::Char('d') if ctrl(&key, 'd') => m.page_in_panel(m.half_page()),
-        KeyCode::Char('u') if ctrl(&key, 'u') => m.page_in_panel(-m.half_page()),
+        KeyCode::Char('d') if ctrl(&key, 'd') => match m.panel {
+            Panel::Changes { .. } => m.docs.scroll_by(m.docs.half_page()),
+            _ => m.page_in_panel(m.half_page()),
+        },
+        KeyCode::Char('u') if ctrl(&key, 'u') => match m.panel {
+            Panel::Changes { .. } => m.docs.scroll_by(-m.docs.half_page()),
+            _ => m.page_in_panel(-m.half_page()),
+        },
+        KeyCode::Char('J') if matches!(m.panel, Panel::Changes { .. }) => m.docs.scroll_by(SCROLL),
+        KeyCode::Char('K') if matches!(m.panel, Panel::Changes { .. }) => {
+            m.docs.scroll_by(-SCROLL);
+        }
         KeyCode::PageDown => m.page_in_panel(m.half_page() * 2),
         KeyCode::PageUp => m.page_in_panel(-m.half_page() * 2),
         KeyCode::Char('j') | KeyCode::Down => m.move_in_panel(1),
@@ -1356,6 +1391,11 @@ fn on_mouse(m: &mut Model, mouse: MouseEvent) -> Vec<Effect> {
             mouse.kind,
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
         );
+        if scrolling && m.hovered_diff().is_some() {
+            let up = matches!(mouse.kind, MouseEventKind::ScrollUp);
+            m.docs.scroll_by(if up { -SCROLL } else { SCROLL });
+            return Vec::new();
+        }
         let forward = match m.focus() {
             Focus::Agent(c) => Some(c),
             Focus::Nav(Some(_)) if clicked => return enter_agent(m),
@@ -3387,5 +3427,68 @@ mod tests {
             "still s1, now first"
         );
         assert_eq!(m.subagent_at(), 0);
+    }
+
+    fn diff_reads(effects: Vec<Effect>) -> Vec<String> {
+        effects
+            .into_iter()
+            .filter_map(|e| match e {
+                Effect::ReadDiff { key, worktree } => {
+                    Some(format!("{} {}", key.path.display(), worktree.display()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_diff_under_the_changes_cursor_is_read_once_the_cursor_rests_and_scrolls_with_j_k_and_ctrl_d()
+     {
+        let mut m = crate::fixtures::fleet(10);
+        m.set_cursor(Cursor::Entry(name("obs-layout-4")));
+        assert_eq!(diff_reads(tick(&mut m)), [""; 0], "[3] isn't focused");
+        update(&mut m, key(KeyCode::Char('3')));
+        assert!(matches!(m.panel, Panel::Changes { file: 0 }));
+        assert_eq!(
+            diff_reads(tick(&mut m)),
+            [""; 0],
+            "the cursor hasn't rested"
+        );
+        std::thread::sleep(crate::document::REST + Duration::from_millis(20));
+        assert_eq!(
+            diff_reads(tick(&mut m)),
+            ["src/triage/flow.ts /w/heucristic0/obs-layout-4"]
+        );
+        assert_eq!(diff_reads(tick(&mut m)), [""; 0], "asked once");
+
+        m.docs.page = 10;
+        update(&mut m, key(KeyCode::Char('J')));
+        assert_eq!(m.docs.scroll, 2);
+        update(&mut m, key(KeyCode::Char('K')));
+        update(&mut m, key(KeyCode::Char('K')));
+        assert_eq!(m.docs.scroll, 0);
+        update(
+            &mut m,
+            Msg::Key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL)),
+        );
+        assert_eq!(m.docs.scroll, 5, "half a page of [0], not of the list");
+        assert!(matches!(m.panel, Panel::Changes { file: 0 }));
+        update(
+            &mut m,
+            Msg::Key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL)),
+        );
+        assert_eq!(m.docs.scroll, 0);
+
+        update(&mut m, key(KeyCode::Char('j')));
+        m.settle_main();
+        assert_eq!(m.docs.scroll, 0, "another file starts at the top");
+    }
+
+    #[test]
+    fn j_and_k_keep_moving_the_list_and_scroll_nothing_from_the_list() {
+        let mut m = crate::fixtures::fleet(10);
+        m.docs.page = 10;
+        update(&mut m, key(KeyCode::Char('J')));
+        assert_eq!(m.docs.scroll, 0, "the terminal doesn't scroll from NAV");
     }
 }

@@ -1817,6 +1817,31 @@ fn pad(area: Rect, lines: Vec<Line<'static>>) -> Panel {
     Panel { area, lines }
 }
 
+/// The selected agent's state as one line: its glyph, name, what it's doing
+/// and for how long, cut to `width` by dropping what it's doing first.
+pub(super) fn status_line(m: &Model, entry: &Entry, width: usize) -> Vec<Span<'static>> {
+    let status = m.status(entry);
+    let heard = m.activity(entry.name()).map_or(m.now, |a| a.heard);
+    let time = time_in_state(&status, m.now);
+    let mut spans = vec![
+        glyph(&status),
+        Span::raw(" "),
+        Span::styled(entry.label().to_string(), bold()),
+    ];
+    let room = width.saturating_sub(line_width(&spans) + line_width(&time) + 4);
+    if let Some(gist) = Gist::of(&status, heard, m.now)
+        && room >= 8
+    {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(gist.line(Form::Long, room).0, gist.style()));
+    }
+    if !time.is_empty() {
+        spans.push(Span::raw("  "));
+        spans.extend(time);
+    }
+    spans
+}
+
 /// The three panels in `area`, the one `j`/`k` act on with `border` (the
 /// accent while the sidebar has the keys) and the others DIM.
 pub(super) fn draw(frame: &mut Frame<'_>, m: &mut Model, area: Rect, border: Style) {
@@ -1941,12 +1966,12 @@ pub(super) fn draw(frame: &mut Frame<'_>, m: &mut Model, area: Rect, border: Sty
 /// Whether text `wide` columns wide fits beside `title` in a border
 /// `width` wide: two corners, both titles' padding and one `─` between
 /// them, so neither overwrites the other and they never touch.
-fn fits_beside(title: &[Span<'static>], wide: usize, width: usize) -> bool {
+pub(super) fn fits_beside(title: &[Span<'static>], wide: usize, width: usize) -> bool {
     line_width(title) + 7 + wide <= width
 }
 
 /// `spans` with a space each side, as the border titles have.
-fn pad_title(mut spans: Vec<Span<'static>>) -> Vec<Span<'static>> {
+pub(super) fn pad_title(mut spans: Vec<Span<'static>>) -> Vec<Span<'static>> {
     if !spans.is_empty() {
         spans.insert(0, Span::raw(" "));
         spans.push(Span::raw(" "));
@@ -3241,5 +3266,62 @@ mod tests {
                 rows.join("\n")
             );
         }
+    }
+
+    #[test]
+    fn a_file_under_changes_cursor_replaces_the_terminal_with_its_diff_and_the_pty_keeps_its_size()
+    {
+        let mut m = fleet(10);
+        m.set_cursor(Cursor::Entry(name("obs-layout-4")));
+        let before = {
+            render(&mut m, (100, 30));
+            m.areas.terminal
+        };
+        m.panel = Focused::Changes { file: 0 };
+        m.settle_main();
+        std::thread::sleep(crate::document::REST + std::time::Duration::from_millis(20));
+        let key = m.docs.due(std::time::Instant::now()).expect("due");
+        m.docs.loaded(
+            &key,
+            Ok(agent_core::ports::FileDiff::Text {
+                lines: vec![
+                    "@@ -1,2 +1,3 @@".into(),
+                    " keep".into(),
+                    "-gone".into(),
+                    "+added".into(),
+                ],
+                more: 4000,
+            }),
+        );
+        let terminal = render(&mut m, (100, 30));
+        assert_eq!(
+            m.areas.terminal, before,
+            "[0] changing content never resizes the pty"
+        );
+        let rows = screen(&terminal);
+        let text = rows.join("\n");
+        assert!(text.contains("[0] src/triage/flow.ts +9 −3"), "{text}");
+        assert!(text.contains("+added") && text.contains("-gone"), "{text}");
+        assert!(text.contains("4,000 more lines · e open"), "{text}");
+        assert!(
+            rows[0].contains("obs-layout-4"),
+            "the agent's status sits top right\n{}",
+            rows[0]
+        );
+        let buffer = terminal.backend().buffer();
+        let added = rows
+            .iter()
+            .position(|r| r.contains("+added"))
+            .expect("a row");
+        let at = rows[added].find("+added").expect("a column");
+        let col = rows[added][..at].chars().count();
+        assert_eq!(
+            buffer[(
+                u16::try_from(col).expect("fits"),
+                u16::try_from(added).expect("fits")
+            )]
+                .fg,
+            Color::Green
+        );
     }
 }

@@ -23,6 +23,7 @@ use crate::model::{
 use crate::palette::Palette;
 use crate::update::{Pick, Picks, Unusable, picker_matches, switcher_matches};
 
+mod page;
 mod sidebar;
 
 const SIDEBAR_MAX: u16 = 48;
@@ -302,6 +303,7 @@ fn display_path(path: &Path) -> String {
 /// status bar carrying the mode badge and context hints.
 pub fn draw(frame: &mut Frame<'_>, m: &mut Model) {
     PALETTE.set(m.palette);
+    m.settle_main();
     let [body, footer] =
         Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(frame.area());
     let borders = 2;
@@ -327,14 +329,26 @@ pub fn draw(frame: &mut Frame<'_>, m: &mut Model) {
         m.panel = Panel::Agents;
     }
 
-    let (title, path) = pane_title(m, usize::from(right.width));
     let pane_focused = matches!(m.focus(), Focus::Agent(_));
-    // Padding keeps the agent's own full-width rules off our border.
-    let pane = panel(title, path, pane_style, pane_focused).padding(Padding::horizontal(1));
-    let terminal = pane.inner(right);
+    // Padding keeps the agent's own full-width rules off our border. The
+    // terminal's rect never depends on what [0] shows, so switching between
+    // it and a document never resizes the agent's pty.
+    let padding = Padding::horizontal(1);
+    let terminal = Block::bordered().padding(padding).inner(right);
     m.areas.terminal = terminal;
-    frame.render_widget(pane, right);
-    draw_terminal(frame, m, terminal);
+    if let Some(page) = page::diff(m, terminal, usize::from(right.width), pane_style) {
+        let block = panel(page.title, page.corner, pane_style, pane_focused)
+            .padding(padding)
+            .title_top(Line::from(sidebar::pad_title(page.right)).right_aligned());
+        frame.render_widget(Paragraph::new(page.lines).block(block), right);
+    } else {
+        let (title, path) = pane_title(m, usize::from(right.width));
+        frame.render_widget(
+            panel(title, path, pane_style, pane_focused).padding(padding),
+            right,
+        );
+        draw_terminal(frame, m, terminal);
+    }
 
     draw_status_bar(frame, m, footer);
 
@@ -489,7 +503,7 @@ fn pane_title(m: &Model, width: usize) -> (Vec<Span<'static>>, Vec<Span<'static>
     };
     let identifier = bold();
     let repo_name = repo.name().into_owned();
-    let mut title = Vec::new();
+    let mut title = vec![Span::raw("[0] ")];
     match entry {
         Some(e) if e.name().as_str() != repo_name => {
             title.push(Span::styled(repo_name, dim()));
@@ -622,7 +636,11 @@ fn draw_status_bar(frame: &mut Frame<'_>, m: &Model, area: Rect) {
         let entry = selected.and_then(|(_, e)| e);
         match m.panel {
             Panel::Changes { .. } => {
-                hints.extend([ranked("e", "edit file", 8), ranked("Esc", "agents", 7)]);
+                hints.extend([
+                    ranked("e", "edit file", 8),
+                    ranked("J/K", "scroll", 8),
+                    ranked("Esc", "agents", 7),
+                ]);
             }
             Panel::Agent { .. } => hints.push(ranked("Esc", "agents", 7)),
             Panel::Agents => {}

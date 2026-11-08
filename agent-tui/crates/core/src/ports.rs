@@ -42,6 +42,16 @@ pub struct Change {
     pub lines: Lines,
 }
 
+/// A changed file as a diff, for reading.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileDiff {
+    /// The hunks, one entry per line, without git's header. `more` lines
+    /// beyond what's kept were left out.
+    Text { lines: Vec<String>, more: usize },
+    /// Not text: its size on disk now, when it still exists.
+    Binary { bytes: Option<u64> },
+}
+
 /// How a changed file's lines changed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Lines {
@@ -213,6 +223,16 @@ pub trait Vcs: Send + Sync {
     /// What a worktree has done since it forked from the default branch,
     /// without taking locks the agent working in it might need.
     fn facts(&self, worktree: &Path) -> Result<WorktreeFacts, CommandError>;
+    /// `path`'s change since the worktree forked from the default branch,
+    /// committed and uncommitted together. `lines` says what kind of change
+    /// facts found, so a new untracked file is shown whole. Slow on big
+    /// diffs: call it off the UI thread.
+    fn file_diff(
+        &self,
+        worktree: &Path,
+        path: &Path,
+        lines: Lines,
+    ) -> Result<FileDiff, CommandError>;
 }
 
 /// What to fetch from origin, and the remote-tracking branch it lands in.

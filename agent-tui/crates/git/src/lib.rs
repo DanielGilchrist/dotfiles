@@ -8,10 +8,15 @@ use agent_core::model::{Head, Worktree};
 use agent_core::names::{BranchName, NameError, PullRequest};
 use agent_core::paths::{AgentWorktree, RepoRoot};
 use agent_core::ports::{
-    BranchState, Change, Fetch, Forge, Lines, LocalBranch, PullRequestHead, RemoteBranch,
+    BranchState, Change, Fetch, FileDiff, Forge, Lines, LocalBranch, PullRequestHead, RemoteBranch,
     RepoWorktrees, Vcs, WorktreeFacts, WorktreeStart,
 };
 use agent_core::process::{self, CommandError};
+
+/// A diff over this many lines keeps only the first of them.
+const DIFF_LINES: usize = 5000;
+/// A diff that takes longer than this to produce is given up on.
+const DIFF_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// A checkout of a large repo can take minutes.
 const CHECKOUT_TIMEOUT: Duration = Duration::from_secs(600);
@@ -494,9 +499,63 @@ impl Vcs for Git {
         })
     }
 
+    fn file_diff(
+        &self,
+        worktree: &Path,
+        path: &Path,
+        lines: Lines,
+    ) -> Result<FileDiff, CommandError> {
+        let binary = || FileDiff::Binary {
+            bytes: std::fs::metadata(worktree.join(path)).ok().map(|m| m.len()),
+        };
+        if lines == Lines::Binary {
+            return Ok(binary());
+        }
+        let mut cmd = git(worktree);
+        cmd.args(["diff", "--no-color", "--no-ext-diff"]);
+        match lines {
+            Lines::Untracked => {
+                cmd.args(["--no-index", "--", "/dev/null"]).arg(path);
+            }
+            Lines::Counted { .. } | Lines::Binary => {
+                let base = match Self::default_base(worktree)? {
+                    Some(base) => {
+                        let mut merge = git(worktree);
+                        merge.args(["merge-base", "HEAD", &base]);
+                        process::run(&mut merge)?.trim().to_string()
+                    }
+                    None => "HEAD".to_string(),
+                };
+                cmd.arg(base).arg("--").arg(path);
+            }
+        }
+        let out = process::output_within(&mut cmd, DIFF_TIMEOUT)?;
+        // `--no-index` exits 1 when the files differ.
+        let ok =
+            out.status.success() || (lines == Lines::Untracked && out.status.code() == Some(1));
+        if !ok {
+            return Err(process::failed(&cmd, &out));
+        }
+        Ok(parse_diff(&String::from_utf8_lossy(&out.stdout), DIFF_LINES).unwrap_or_else(binary))
+    }
+
     fn delete_branch(&self, repo: &RepoRoot, branch: LocalBranch) -> Result<(), CommandError> {
         process::run(git(repo.path()).args(["branch", "-D", branch.name().as_str()])).map(drop)
     }
+}
+
+/// The hunks of `git diff` output, from the first `@@`, at most `keep` lines
+/// of them. `None` when git says the file is binary.
+fn parse_diff(out: &str, keep: usize) -> Option<FileDiff> {
+    let mut lines = out.lines().skip_while(|l| !l.starts_with("@@")).peekable();
+    if lines.peek().is_none() && out.lines().any(|l| l.starts_with("Binary files")) {
+        return None;
+    }
+    let kept: Vec<String> = lines.by_ref().take(keep).map(str::to_string).collect();
+    Some(FileDiff::Text {
+        lines: kept,
+        more: lines.count(),
+    })
 }
 
 #[cfg(test)]
@@ -682,6 +741,102 @@ mod tests {
                 },
             ],
             "uncommitted and untracked work counts too"
+        );
+    }
+
+    #[test]
+    fn diffs_keep_the_hunks_cap_their_length_and_spot_binaries() {
+        let out =
+            "diff --git a/x b/x\nindex 1..2 100644\n--- a/x\n+++ b/x\n@@ -1 +1,2 @@\n a\n+b\n+c\n";
+        assert_eq!(
+            parse_diff(out, 10),
+            Some(FileDiff::Text {
+                lines: vec![
+                    "@@ -1 +1,2 @@".into(),
+                    " a".into(),
+                    "+b".into(),
+                    "+c".into()
+                ],
+                more: 0
+            })
+        );
+        assert_eq!(
+            parse_diff(out, 2),
+            Some(FileDiff::Text {
+                lines: vec!["@@ -1 +1,2 @@".into(), " a".into()],
+                more: 2
+            })
+        );
+        assert_eq!(parse_diff("Binary files a/x and b/x differ\n", 10), None);
+        assert_eq!(
+            parse_diff("", 10),
+            Some(FileDiff::Text {
+                lines: Vec::new(),
+                more: 0
+            }),
+            "a mode change alone has no hunks"
+        );
+    }
+
+    #[test]
+    fn a_files_diff_runs_from_the_fork_and_shows_a_new_file_whole() {
+        let tmp = tempfile::tempdir().expect("a temp dir");
+        let origin = tmp.path().join("origin");
+        let work = tmp.path().join("work");
+        let git = |dir: &Path, args: &[&str]| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .output()
+                .expect("succeeds");
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        std::fs::create_dir_all(&origin).expect("creates");
+        git(&origin, &["init", "-q", "-b", "main"]);
+        std::fs::write(origin.join("a.txt"), "one\n").expect("writes");
+        git(&origin, &["add", "a.txt"]);
+        git(&origin, &["commit", "-q", "-m", "init"]);
+        git(
+            tmp.path(),
+            &["clone", "-q", origin.to_str().expect("succeeds"), "work"],
+        );
+        std::fs::write(work.join("a.txt"), "one\ntwo\n").expect("writes");
+        git(&work, &["commit", "-q", "-am", "two"]);
+        std::fs::write(work.join("a.txt"), "one\ntwo\nthree\n").expect("writes");
+        std::fs::write(work.join("new.txt"), "x\ny\n").expect("writes");
+        let counted = Lines::Counted {
+            added: 2,
+            removed: 0,
+        };
+        let FileDiff::Text { lines, more } = Git
+            .file_diff(&work, Path::new("a.txt"), counted)
+            .expect("succeeds")
+        else {
+            panic!("a text diff");
+        };
+        assert_eq!(more, 0);
+        assert_eq!(
+            lines[1..],
+            [" one", "+two", "+three"],
+            "committed and uncommitted together"
+        );
+        let FileDiff::Text { lines, .. } = Git
+            .file_diff(&work, Path::new("new.txt"), Lines::Untracked)
+            .expect("succeeds")
+        else {
+            panic!("a text diff");
+        };
+        assert_eq!(lines[1..], ["+x", "+y"]);
+        assert_eq!(
+            Git.file_diff(&work, Path::new("new.txt"), Lines::Binary)
+                .expect("succeeds"),
+            FileDiff::Binary { bytes: Some(4) }
         );
     }
 

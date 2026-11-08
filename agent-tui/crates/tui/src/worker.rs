@@ -12,9 +12,12 @@ use agent_core::model::{Removable, Running, Snapshot, Startable};
 use agent_core::names::{AgentName, Prompt, SessionName};
 use agent_core::ops::{self, Approved, Backend, Launch, RemovalPlan, Removed};
 use agent_core::paths::RepoRoot;
-use agent_core::ports::{ClientId, HarnessId, HostError, SubagentDetail, WorktreeFacts};
+use agent_core::ports::{
+    ClientId, FileDiff, HarnessId, HostError, Lines, SubagentDetail, WorktreeFacts,
+};
 use crossterm::event::{KeyEvent, MouseEvent};
 
+use crate::document::DiffKey;
 use crate::model::{Launchable, RepoChoice, Ticket};
 
 /// How much of a failed action's stderr is read for its last line.
@@ -25,6 +28,9 @@ const INSPECTORS: usize = 2;
 
 /// Threads reading subagent transcripts.
 const SUBAGENT_READERS: usize = 1;
+
+/// Threads reading file diffs.
+const DIFF_READERS: usize = 2;
 
 /// How often the refresh thread checks what agents reported through hooks.
 const ACTIVITY_POLL: std::time::Duration = std::time::Duration::from_millis(500);
@@ -71,6 +77,11 @@ pub enum Msg {
     Inspected {
         name: SessionName,
         facts: Result<WorktreeFacts, String>,
+    },
+    /// A file's diff, read for `key`.
+    Diff {
+        key: DiffKey,
+        result: Result<FileDiff, String>,
     },
     /// What a subagent was told and has done, or `None` when its harness
     /// has no record of it yet.
@@ -198,6 +209,7 @@ pub struct Workers {
     pub jobs: Sender<Job>,
     inspector: Arc<Inspector>,
     subagents: Arc<SubagentReader>,
+    diffs: Arc<DiffReader>,
     pub refresh: Sender<()>,
     worker: Option<JoinHandle<()>>,
 }
@@ -206,6 +218,12 @@ impl Workers {
     /// Asks for git facts about an agent's worktree.
     pub fn inspect(&self, name: SessionName, worktree: PathBuf) {
         self.inspector.request(name, worktree);
+    }
+
+    /// Asks for a file's diff in `worktree`.
+    pub fn read_diff(&self, key: &DiffKey, worktree: PathBuf) {
+        self.diffs
+            .request((key.name.clone(), key.path.clone()), (worktree, key.lines));
     }
 
     /// Asks for what subagent `id` of an agent working in `workdir` has done.
@@ -305,6 +323,33 @@ fn spawn_inspectors(backend: &Arc<Backend>, msgs: &Sender<Msg>) -> Arc<Inspector
     inspector
 }
 
+/// Reads file diffs on [`DIFF_READERS`] threads.
+type DiffReader = Queue<(SessionName, PathBuf), (PathBuf, Lines)>;
+
+fn spawn_diff_readers(backend: &Arc<Backend>, msgs: &Sender<Msg>) -> Arc<DiffReader> {
+    let reader = Arc::new(DiffReader::new());
+    for _ in 0..DIFF_READERS {
+        let reader = Arc::clone(&reader);
+        let backend = Arc::clone(backend);
+        let msgs = msgs.clone();
+        thread::spawn(move || {
+            loop {
+                let ((name, path), (worktree, lines)) = reader.next();
+                let result = backend
+                    .vcs
+                    .file_diff(&worktree, &path, lines)
+                    .map_err(|e| describe(&e));
+                reader.done(&(name.clone(), path.clone()));
+                let key = DiffKey { name, path, lines };
+                if msgs.send(Msg::Diff { key, result }).is_err() {
+                    return;
+                }
+            }
+        });
+    }
+    reader
+}
+
 /// Reads subagent transcripts on [`SUBAGENT_READERS`] threads.
 type SubagentReader = Queue<(SessionName, AgentId), PathBuf>;
 
@@ -383,6 +428,7 @@ pub fn spawn(backend: Arc<Backend>, sources: Sources, msgs: Sender<Msg>) -> Work
 
     let inspector = spawn_inspectors(&backend, &msgs);
     let subagents = spawn_subagent_readers(&backend, &msgs);
+    let diffs = spawn_diff_readers(&backend, &msgs);
     let (jobs, rx) = mpsc::channel::<Job>();
     let after = refresh.clone();
     let worker = thread::spawn(move || {
@@ -402,6 +448,7 @@ pub fn spawn(backend: Arc<Backend>, sources: Sources, msgs: Sender<Msg>) -> Work
         jobs,
         inspector,
         subagents,
+        diffs,
         refresh,
         worker: Some(worker),
     }
