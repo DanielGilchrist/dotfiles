@@ -3,7 +3,6 @@ use std::path::Path;
 use std::time::SystemTime;
 
 use agent_core::actions::Kind;
-use agent_core::config::Keys;
 use agent_core::model::{Entry, EntryKind, Head};
 use agent_core::names::{Checkout, SessionName};
 use agent_core::ops::Deletes;
@@ -11,14 +10,15 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Clear, Padding, Paragraph};
+use ratatui::widgets::{Block, BorderType, Clear, Padding, Paragraph, Wrap};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::keymap::{self, Situation};
 use crate::model::{
-    AgentStatus, Blocked, Confirm, Derived, Enter, Field, Focus, FormKind, Launchable, Load, Model,
-    NameCheck, NameSource, NamingState, NewAgent, OfferEffect, Overlay, Pane, Panel, Phase,
-    Proposal, Pulse, Query, Reach, RepoInput, Row, Screen, StatusKind, Submission, View,
-    Visibility, Waiting, WorkRoom, fuzzy_match, invalid_chars, repo_matches,
+    AgentStatus, Blocked, Confirm, Derived, Enter, Field, Focus, FormKind, HelpState, Launchable,
+    Load, Model, NameCheck, NameSource, NamingState, NewAgent, OfferEffect, Overlay, Pane, Phase,
+    Proposal, Pulse, Query, Reach, RepoInput, Row, Screen, StatusKind, Submission, View, Waiting,
+    WorkRoom, fuzzy_match, invalid_chars, repo_matches,
 };
 use crate::palette::Palette;
 use crate::update::{Pick, Picks, Unusable, picker_matches, switcher_matches};
@@ -37,41 +37,6 @@ const SPINNER: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "�
 const NARROW: u16 = 60;
 /// A name keeps at least this many columns before row details give way.
 const NAME_MIN: usize = 8;
-/// The NAV and switcher sections of the help; the AGENT section names the
-/// configured keys.
-const NAV_HELP: &[(&str, &str)] = &[
-    ("⏎ l", "attach or start"),
-    ("Esc", "back a level"),
-    ("i", "type to the agent"),
-    ("0", "attach / focus [0]"),
-    ("1 2 3", "focus panel"),
-    ("j k g G", "move, first, last"),
-    ("⌃D ⌃U", "half page"),
-    ("J K", "scroll [0] from [3]"),
-    ("{ }", "prev / next repo"),
-    ("Tab ⇧Tab", "next / prev panel"),
-    ("[ ]", "prev / next tab"),
-    ("+ _", "[0] wide / back"),
-    (".", "all / running only"),
-    ("Space /", "switch agent"),
-];
-
-const ACT_HELP: &[(&str, &str)] = &[
-    ("p", "repos: focus or add"),
-    ("m", "pin / unpin"),
-    ("n c", "new / check out"),
-    ("e", "edit [3] file/[2] log"),
-    ("t", "message, queued"),
-    ("v", "peek at terminal"),
-    ("d", "kill session"),
-    ("D", "remove worktree"),
-    ("x", "run an action"),
-    ("a", "next needing you"),
-    ("q", "quit"),
-];
-
-const SWITCH_HELP: &[(&str, &str)] = &[("⌃N ⌃P", "move in the list"), ("⏎ Esc", "pick / close")];
-
 thread_local! {
     /// Set from the model at the start of each draw. Styles are chosen deep
     /// in helpers that only see what they draw, and tests draw on their own
@@ -345,7 +310,7 @@ pub fn draw(frame: &mut Frame<'_>, m: &mut Model) {
         Overlay::Switcher(query) => draw_switcher(frame, m, query),
         Overlay::Picker(query) => draw_picker(frame, m, query),
         Overlay::Confirm(confirm) => draw_confirm(frame, confirm),
-        Overlay::Help => draw_help(frame, m.keys),
+        Overlay::Help(help) => draw_help(frame, m, help),
         Overlay::Actions(target) => draw_actions(frame, m, target),
         Overlay::Talk { to, text } => draw_talk(frame, m, to, text),
         Overlay::Planning { name, .. } => draw_planning(frame, name),
@@ -605,6 +570,11 @@ fn draw_status_bar(frame: &mut Frame<'_>, m: &Model, area: Rect) {
     let focus = m.focus();
     let nav = m.keys.nav().to_string();
     let twice = format!("{nav} {nav}");
+    let table = if matches!(focus, Focus::Agent(_) | Focus::Overlay(Overlay::New(_))) {
+        Vec::new()
+    } else {
+        keymap::footer(&Situation::of(m), &nav)
+    };
     let mut hints: Vec<Hint<'_>> = Vec::new();
     if let Focus::Agent(_) = focus {
         hints.extend([ranked(&nav, "nav", 9), ranked(&twice, "previous", 8)]);
@@ -615,12 +585,6 @@ fn draw_status_bar(frame: &mut Frame<'_>, m: &Model, area: Rect) {
             ranked("⇧Tab", "previous field", 2),
             ranked("⌃R", "use suggestion", 1),
         ]);
-    } else if m.peeking() && !matches!(focus, Focus::Overlay(_)) {
-        hints.extend([
-            ranked("t", "talk", 9),
-            ranked("i", "type", 9),
-            ranked("Esc", "close", 9),
-        ]);
     } else if let Focus::Overlay(Overlay::Switcher(_) | Overlay::Picker(_) | Overlay::Talk { .. }) =
         focus
     {
@@ -628,87 +592,7 @@ fn draw_status_bar(frame: &mut Frame<'_>, m: &Model, area: Rect) {
         // compete with it.
         hints.push(ranked("?", "keys", 9));
     } else {
-        let selected = m.selected();
-        let entry = selected.and_then(|(_, e)| e);
-        match m.panel {
-            _ if m.main_focused() => hints.extend([
-                ranked("j/k", "scroll", 8),
-                if m.docs.paused() {
-                    ranked("G", "follow", 9)
-                } else {
-                    ranked("G", "end", 6)
-                },
-                ranked("i", "type", 8),
-                ranked("t", "talk", 6),
-                ranked("Esc", "back", 9),
-            ]),
-            Panel::Changes { .. } => hints.extend([
-                ranked("⏎", "diff", 9),
-                ranked("J/K", "scroll", 8),
-                ranked("e", "edit", 7),
-                ranked("i", "type", 8),
-                ranked("t", "talk", 6),
-                ranked("Esc", "back", 9),
-            ]),
-            Panel::Agent { .. } => hints.extend([
-                ranked("⏎", "open", 9),
-                ranked("J/K", "scroll", 8),
-                ranked("e", "edit", 7),
-                ranked("i", "type", 8),
-                ranked("t", "talk", 6),
-                ranked("Esc", "back", 9),
-            ]),
-            Panel::Agents | Panel::Main(_) => {}
-        }
-        match (selected, entry.map(|e| m.reach(e))) {
-            _ if matches!(m.panel, Panel::Changes { .. } | Panel::Agent { .. })
-                || m.main_focused() => {}
-            (Some((_, None)), _) => hints.push(ranked("⏎", "focus", 7)),
-            (
-                _,
-                Some(Reach::Other {
-                    enter,
-                    kill,
-                    remove,
-                }),
-            ) => {
-                hints.push(ranked("⏎", enter.verb(), 7));
-                hints.extend(kill.map(|_| ranked("d", "kill", 2)));
-                hints.extend(remove.map(|_| ranked("D", "remove", 1)));
-            }
-            (_, Some(Reach::Own) | None) => {}
-        }
-        hints.push(ranked("Space", "switch", 5));
-        if let Some(entry) = entry {
-            let pin = match entry.pin() {
-                Some(_) => "unpin",
-                None => "pin",
-            };
-            hints.push(ranked("m", pin, 3));
-            if m.talkable(entry).is_ok() {
-                hints.push(ranked("t", "talk", 5));
-                hints.push(ranked("v", "peek", 4));
-            }
-        }
-        hints.push(ranked("n", "new", 4));
-        if m.view != View::Pinned && (m.visibility == Visibility::All || m.hidden() > 0) {
-            hints.push(ranked(
-                ".",
-                if m.visibility == Visibility::All {
-                    "active only"
-                } else {
-                    "show all"
-                },
-                1,
-            ));
-        }
-        if m.panel == Panel::Agents {
-            hints.push(ranked("]", m.view.next().hint(), 6));
-        }
-        if entry.is_some() && !m.actions.is_empty() {
-            hints.push(ranked("x", "actions", 0));
-        }
-        hints.push(ranked("?", "keys", 9));
+        hints.extend(table.iter().map(|h| ranked(&h.keys, h.label, h.rank)));
     }
 
     // What needs you, led by the key that goes there. It shows and hides
@@ -793,6 +677,7 @@ fn draw_status_bar(frame: &mut Frame<'_>, m: &Model, area: Rect) {
     }
     let label = match focus {
         Focus::Agent(_) => " AGENT ",
+        _ if m.peeking() => " PEEK  ",
         Focus::Nav(_) | Focus::Overlay(_) => "  NAV  ",
     };
     let mut left = vec![badge(label), Span::raw("  ")];
@@ -1644,15 +1529,16 @@ fn draw_talk(frame: &mut Frame<'_>, m: &Model, to: &SessionName, text: &str) {
     let height = u16::try_from(3 + shown + usize::from(queued.len() > shown)).unwrap_or(3);
     let area = centred(frame, 72, height);
     clear_around(frame, area);
-    let hint_keys: &[(&str, &str)] = if queued.is_empty() {
-        &[("⏎", "send"), ("Esc", "close")]
-    } else {
-        &[("⏎", "queue"), ("⌃X", "clear queue"), ("Esc", "close")]
+    let ready = m.ready_for_text(to);
+    let hint_keys: &[(&str, &str)] = match (ready, queued.is_empty()) {
+        (true, true) => &[("⏎", "send"), ("Esc", "close")],
+        (_, true) => &[("⏎", "queue"), ("Esc", "close")],
+        (_, false) => &[("⏎", "queue"), ("⌃X", "clear queue"), ("Esc", "close")],
     };
-    let title = if m.ready_for_text(to) {
-        format!("Message {to}")
+    let title = if ready {
+        format!("Send to {to}")
     } else {
-        format!("Message {to} · queued until it's at rest")
+        format!("Send to {to} · queues until it's at rest")
     };
     let block = overlay_block(&title, hints(hint_keys), dim());
     let inner = block.inner(area);
@@ -1716,12 +1602,13 @@ fn draw_peek(frame: &mut Frame<'_>, m: &Model) {
         |(_, entry)| sidebar::status_line(m, entry, 0),
     );
     let mut keys = Vec::new();
-    for (key, what) in [("t", "talk"), ("i", "type"), ("Esc", "close")] {
+    let nav = m.keys.nav().to_string();
+    for hint in keymap::footer(&Situation::of(m), &nav) {
         if !keys.is_empty() {
             keys.push(Span::styled(" · ", dim()));
         }
-        keys.push(Span::raw(key));
-        keys.push(Span::styled(format!(" {what}"), dim()));
+        keys.push(Span::raw(hint.keys));
+        keys.push(Span::styled(format!(" {}", hint.label), dim()));
     }
     let mut title_spans = vec![Span::raw(" ")];
     title_spans.extend(title);
@@ -1782,82 +1669,125 @@ fn pad(text: &str, width: usize) -> String {
     format!("{text}{}", " ".repeat(width.saturating_sub(text.width())))
 }
 
-fn help_section<K: AsRef<str>>(
-    section: &'static str,
-    keys: &[(K, &'static str)],
-) -> Vec<Line<'static>> {
-    let mut lines = vec![Line::from(vec![Span::raw(" "), badge(section)])];
-    lines.extend(keys.iter().map(|(key, desc)| {
-        Line::from(vec![
-            Span::raw(format!("   {:<10}", key.as_ref())),
-            Span::raw(*desc),
-        ])
-    }));
-    lines
-}
-
-/// Sections packed into as many columns as the height needs: each fills
-/// to the room there is before the next starts.
-fn draw_help(frame: &mut Frame<'_>, keys: Keys) {
-    let nav = keys.nav();
-    let agent = [
-        (nav.to_string(), "back to NAV"),
-        (format!("{nav} {nav}"), "previous agent"),
-    ];
-    let states: Vec<Line<'static>> =
-        std::iter::once(Line::from(vec![Span::raw(" "), badge(" STATES ")]))
-            .chain(
-                [
-                    "◆ asking  ! failed  ✓ done",
-                    "⠹ working  ⠹? quiet  ● idle",
-                    "○ exited  · no session",
-                ]
-                .map(|row| Line::raw(format!("   {row}"))),
-            )
-            .collect();
-    let sections: Vec<Vec<Line<'static>>> = vec![
-        help_section(" NAV ", NAV_HELP),
-        states,
-        help_section(" ACT ", ACT_HELP),
-        help_section(" AGENT ", &agent),
-        help_section(" SWITCH / REPOS ", SWITCH_HELP),
-    ];
-    let available = usize::from(frame.area().height.saturating_sub(4));
-    let mut columns: Vec<Vec<Line<'static>>> = Vec::new();
-    let mut column: Vec<Line<'static>> = Vec::new();
-    for section in sections {
-        if !column.is_empty() && column.len() + 1 + section.len() > available {
-            columns.push(std::mem::take(&mut column));
-        }
-        if !column.is_empty() {
-            column.push(Line::raw(""));
-        }
-        column.extend(section);
-    }
-    columns.push(column);
-    let widths: Vec<usize> = columns
-        .iter()
-        .map(|c| c.iter().map(Line::width).max().unwrap_or(0) + 2)
-        .collect();
-    let height = columns.iter().map(Vec::len).max().unwrap_or(0);
-    let area = centred(
-        frame,
-        u16::try_from(widths.iter().sum::<usize>() + 2).unwrap_or(u16::MAX),
-        u16::try_from(height + 2).unwrap_or(u16::MAX),
-    );
+/// The keybindings list: the focused context's keys, then the global ones,
+/// one row each with the one under the cursor highlighted, and below it
+/// a longer description of that row. Keys that do nothing here aren't
+/// listed.
+fn draw_help(frame: &mut Frame<'_>, m: &Model, state: &HelpState) {
+    let nav = m.keys.nav().to_string();
+    let situation = Situation::of(m);
+    let help = keymap::help(&situation, &nav, &state.filter);
+    let area = centred(frame, 78, 26);
     clear_around(frame, area);
-    let block = overlay_block("Keys", hints(&[("any key", "close")]), dim());
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    let constraints: Vec<Constraint> = widths
+    let describe = if area.height >= 12 { 5 } else { 0 };
+    let [list_area, describe_area] =
+        Layout::vertical([Constraint::Min(3), Constraint::Length(describe)]).areas(area);
+
+    let selected = state.selected.min(help.len().saturating_sub(1));
+    let mut block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(dim())
+        .title_top(Line::styled(" Keybindings ", bold()).left_aligned())
+        .title_top(Line::styled(" (type to filter) ", dim()).right_aligned())
+        .title_bottom(
+            Line::styled(
+                format!(
+                    " {} of {} ",
+                    usize::from(help.len() > 0) + selected,
+                    help.len()
+                ),
+                dim(),
+            )
+            .right_aligned(),
+        );
+    if state.typing || !state.filter.is_empty() {
+        block = block.title_bottom(
+            Line::from(vec![
+                Span::raw(format!(" filter: {}", state.filter)),
+                Span::styled("█ ", dim()),
+            ])
+            .left_aligned(),
+        );
+    }
+    let inner = block.inner(list_area);
+    frame.render_widget(block, list_area);
+
+    let width = usize::from(inner.width);
+    let key_width = help
+        .local
         .iter()
-        .map(|w| Constraint::Length(u16::try_from(*w).unwrap_or(u16::MAX)))
-        .collect();
-    for (column, rect) in columns
-        .into_iter()
-        .zip(Layout::horizontal(constraints).split(inner).iter())
-    {
-        frame.render_widget(Paragraph::new(column), *rect);
+        .chain(&help.global)
+        .map(|r| r.keys.width())
+        .max()
+        .unwrap_or(0)
+        .min(20);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut selected_line = 0;
+    let mut index = 0;
+    for (title, rows) in [("Local", &help.local), ("Global", &help.global)] {
+        if rows.is_empty() {
+            continue;
+        }
+        let mut header = vec![Span::styled(format!(" {title}"), bold())];
+        if title == "Local" {
+            header.push(Span::styled(format!("  {}", situation.ctx.name()), dim()));
+        }
+        lines.push(Line::from(header));
+        for row in rows {
+            let text = pad(
+                &format!("  {}  {}", pad(&row.keys, key_width), row.label),
+                width,
+            );
+            if index == selected {
+                selected_line = lines.len();
+                lines.push(Line::styled(
+                    text,
+                    Style::new().add_modifier(Modifier::REVERSED),
+                ));
+            } else {
+                lines.push(Line::from(vec![
+                    Span::raw(format!("  {}", pad(&row.keys, key_width))),
+                    Span::raw(format!("  {}", row.label)),
+                ]));
+            }
+            index += 1;
+        }
+    }
+    if lines.is_empty() {
+        lines.push(Line::styled("  no key matches", dim()));
+    }
+    let visible = usize::from(inner.height);
+    let offset = scroll(state.offset.get(), selected_line, visible, lines.len());
+    state.offset.set(offset);
+    frame.render_widget(
+        Paragraph::new(
+            lines
+                .into_iter()
+                .skip(offset)
+                .take(visible)
+                .collect::<Vec<_>>(),
+        ),
+        inner,
+    );
+
+    if describe > 0 {
+        let escape = if state.typing || !state.filter.is_empty() {
+            "clear filter"
+        } else {
+            "close"
+        };
+        let block = Block::bordered()
+            .border_type(BorderType::Rounded)
+            .border_style(dim())
+            .title_top(Line::styled(" Description ", bold()).left_aligned())
+            .title_bottom(Line::from(hints(&[("Esc", escape)])).right_aligned());
+        let inner = block.inner(describe_area);
+        frame.render_widget(block, describe_area);
+        let text = help.get(selected).map_or("", |row| row.long);
+        frame.render_widget(
+            Paragraph::new(format!(" {text}")).wrap(Wrap { trim: true }),
+            inner,
+        );
     }
 }
 

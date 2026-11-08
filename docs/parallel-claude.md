@@ -58,31 +58,35 @@ types into the embedded session. `?` shows every key.
 
 | Key | Action |
 |---|---|
-| `⏎` / `l` | In [1], attach the selected agent (resurrect or start it if needed). In [2] and [3], focus the document in [0] |
-| `0` | The same as `⏎` in every focus |
-| `i` | Type to the selected agent from anywhere, and `⌃\` comes back to where you were |
-| `Esc` | Back one level: a focused document to its panel, [2] or [3] to [1], then to the agent you left |
+| `⏎` | In [1], attach the agent (start or resurrect it if needed) or focus the repo. In [2] and [3], open the item in [0]. In the peek, attach |
+| `i` | Attach the selected agent from any panel |
+| `0` | Same as `⏎` in [1], [2] and [3] |
+| `s` | Send a message without attaching: now if the agent is at rest, otherwise queued. `⌃X` clears the queue (`t` says `send is s now`) |
+| `v` | Peek: a read-only float of the agent's terminal. `⏎` or `i` attaches, `s` sends, `Esc` or `v` closes |
 | `⌃\` | Back to NAV from an agent. Twice goes to the previous agent |
-| `1` `2` `3` | Focus the list [1] (and the terminal in [0], without typing), the turn [2] and the changes [3]. Each is a plain list whose cursor decides what [0] shows |
-| `j k g G`, `{ }` | Move in the focused panel, previous / next repo. With [0] focused they scroll it and jump to its top and bottom |
-| `J K` | From [2] or [3], scroll [0] two rows without focusing it |
-| `⌃D ⌃U` | Half a page in the list, or in [0] from [2] or [3] |
-| `+` `_` | [0] full width / back. Keys keep going to the focused panel, so `j` flips to the next file |
-| `t` | Message the selected live agent, from any panel and from the peek. An agent at rest gets it on `⏎`. Otherwise it is queued and typed the first time the agent is at rest, in order, one per rest. Queued messages show as `queued: …` on the card and in the status bar, and `⌃X` in the box clears them. Nothing is typed until the agent reports after its session started, or while you're typing into it. `q` confirms if messages are queued. Agents without hook activity can't be messaged |
-| `v` | Peek: a floating window with the agent's live terminal at the pty's size. Keys never reach it. `t` talks, `i` or `⏎` enters AGENT, `Esc` or `v` closes |
-| `.` | Show every checkout, or only those with a live session (the default). `+7 hidden` in [1]'s corner says how many are left out |
+| `h` `l`, `⇧Tab` `Tab` | Previous / next left panel ([1], [2], [3]), also from [0] |
+| `1` `2` `3` | Focus the list [1], the turn and Changes panels. Focusing [2] or [3] expands it only as far as its content needs: from the other lower panel's spare rows first, then the list, and only then does the other panel collapse to its title line (at the smallest sizes the collapse can leave it a few blank rows) |
+| `Esc` | Back one level: [0] to its panel, [2] or [3] to [1], and from [1] to the agent you left |
+| `j k g G`, `↓ ↑ Home End` | Move in the focused panel, or scroll [0] when it has the keys |
+| `J` `K` | Scroll [0] from [2] or [3] without focusing it |
+| `⌃D ⌃U`, `PgDn PgUp` | Half a page / a page in the focused panel |
+| `[` `]` | Previous / next tab of [1] (repo, agents, pinned) |
+| `{` `}` | Previous / next repo |
+| `+` `_` | [0] full width / back |
+| `.` | In [1], show every checkout / only those with a session |
 | `Space` / `/` | Switcher (fuzzy), `⌃N ⌃P` to move |
-| `Tab` / `⇧Tab` | Focus the next / previous left panel: [1], [2], [3], wrapping and skipping one with nothing to focus. In AGENT mode they go to the agent |
-| `[` / `]` | Cycle the focused panel's tabs. Only [1] has them: the repo, all agents, pinned. The title names them where the width allows, the active one bold, and the footer's `]` hint names the next |
 | `m` | Pin / unpin (pinned agents get their own tab) |
 | `n` | New agent form: prompt (`⌃E` edits it in $EDITOR), name (suggested from the prompt or a Linear/GitHub link), repo (listed, from the catalogue, or a path) |
 | `c` | Check out for review: a branch name or a GitHub PR link, name (suggested from it), repo (a PR link picks the repo it names). Fetches the branch if git doesn't know it, asks `gh` for a PR's branch (a fork's PR lands on a `pr/N` branch), and attaches instead if an agent already has the branch checked out |
 | `p` | Repo picker: `⏎` focuses a listed repo, or adds one from the catalogue or by a typed path (`~/code/foo`) |
-| `e` | Open the agent's worktree in $EDITOR, or in Changes the file under the cursor (`⏎` there reads its diff instead), or in the turn panel on a subagent row its whole transcript |
+| `e` | Edit: the agent's checkout in $EDITOR, in [3] the file under the cursor, in [2] a subagent's transcript |
 | `d` / `D` | Kill the session / remove session, worktree and branch (confirms, lists anything that would be lost) |
 | `x` | Run a configured action on the selected agent (see below) |
-| `a` | Jump to the agent that needs you most (asking, failed, then finished), into AGENT |
+| `a` | Attach the agent that needs you most (asking, failed, then finished) |
+| `?` | Keybindings: the focused panel's keys first, then the global ones. Type to filter, `Esc` clears then closes |
 | `q` | Quit (agents keep running) |
+
+The footer shows as many hints as fit, most important for the focused panel first.
 
 ### What agents are doing
 

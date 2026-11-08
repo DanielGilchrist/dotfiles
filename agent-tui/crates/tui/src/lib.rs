@@ -1,4 +1,5 @@
 mod document;
+mod keymap;
 mod model;
 mod palette;
 mod update;

@@ -17,11 +17,13 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent
 use ratatui::layout::Position;
 
 use crate::document::Key;
+use crate::keymap::Situation;
 use crate::model::{
     Answer, Chord, Confirm, Cursor, Direction, Edge, Enter, Field, Focus, Follow, FormKind,
-    HOLD_FOR, Hold, INFO_TTL, Inspection, Intent, Mode, Model, NamingState, NewAgent, Overlay,
-    Pane, Panel, Phase, Query, Reach, Screen, StatusKind, SubagentRead, Submission, TerminalFocus,
-    Ticket, Unreachable, View, WorkRoom, fuzzy_match, match_rank, repo_matches, unlisted,
+    HOLD_FOR, HelpState, Hold, INFO_TTL, Inspection, Intent, Mode, Model, NamingState, NewAgent,
+    Overlay, Pane, Panel, Phase, Query, Reach, Screen, StatusKind, SubagentRead, Submission,
+    TerminalFocus, Ticket, Unreachable, View, WorkRoom, fuzzy_match, match_rank, repo_matches,
+    unlisted,
 };
 use crate::worker::{Job, Msg, Outcome, SendError};
 
@@ -703,6 +705,8 @@ fn on_key(m: &mut Model, key: KeyEvent) -> Vec<Effect> {
     on_nav_key(m, key)
 }
 
+const SEND_MOVED: &str = "send is s now";
+
 /// The peek float reads the terminal and passes nothing to it.
 fn on_peek_key(m: &mut Model, code: KeyCode) -> Vec<Effect> {
     let Some(name) = m.peek.clone() else {
@@ -710,7 +714,8 @@ fn on_peek_key(m: &mut Model, code: KeyCode) -> Vec<Effect> {
     };
     match code {
         KeyCode::Esc | KeyCode::Char('v') => m.peek = None,
-        KeyCode::Char('t') => open_talk(m, &name),
+        KeyCode::Char('s') => open_talk(m, &name),
+        KeyCode::Char('t') => m.info(SEND_MOVED),
         KeyCode::Char('i') | KeyCode::Enter => return activate(m, &name),
         _ => {}
     }
@@ -755,7 +760,7 @@ fn on_panel_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
             KeyCode::Char('G') | KeyCode::End => m.docs.scroll_to_end(),
             KeyCode::PageDown => m.docs.scroll_by(m.docs.half_page() * 2),
             KeyCode::PageUp => m.docs.scroll_by(-m.docs.half_page() * 2),
-            KeyCode::Enter | KeyCode::Char('l' | '0') => {}
+            KeyCode::Enter | KeyCode::Char('0') => {}
             _ => return None,
         }
         if !matches!(code, KeyCode::Char('1' | '2' | '3')) {
@@ -795,10 +800,9 @@ fn on_panel_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
             m.panel = Panel::Changes { file: 0 };
             Some(Vec::new())
         }
-        (
-            KeyCode::Enter | KeyCode::Char('l' | '0'),
-            Panel::Changes { .. } | Panel::Agent { .. },
-        ) if m.hover().is_some() => {
+        (KeyCode::Enter | KeyCode::Char('0'), Panel::Changes { .. } | Panel::Agent { .. })
+            if m.hover().is_some() =>
+        {
             m.panel = m.panel.into_main();
             Some(Vec::new())
         }
@@ -889,7 +893,7 @@ fn on_nav_key(m: &mut Model, key: KeyEvent) -> Vec<Effect> {
                 return activate(m, entry.name());
             }
         }
-        KeyCode::Enter | KeyCode::Char('l') => match (m.cursor().cloned(), selected) {
+        KeyCode::Enter => match (m.cursor().cloned(), selected) {
             (Some(Cursor::Repo(key)), _) => {
                 m.view = View::Focus;
                 m.select_repo(&key);
@@ -921,8 +925,8 @@ fn on_nav_key(m: &mut Model, key: KeyEvent) -> Vec<Effect> {
         KeyCode::Char('{') => m.jump_repo(-1),
         KeyCode::Char(']') => cycle_tab(m, Direction::Forward),
         KeyCode::Char('[') => cycle_tab(m, Direction::Back),
-        KeyCode::Tab => return cycle_panel(m, Direction::Forward),
-        KeyCode::BackTab => return cycle_panel(m, Direction::Back),
+        KeyCode::Tab | KeyCode::Char('l') => return cycle_panel(m, Direction::Forward),
+        KeyCode::BackTab | KeyCode::Char('h') => return cycle_panel(m, Direction::Back),
         KeyCode::Char('+') => m.screen = Screen::Full,
         KeyCode::Char('_') => m.screen = Screen::Split,
         KeyCode::Char('.') if m.view == View::Pinned => {
@@ -931,7 +935,7 @@ fn on_nav_key(m: &mut Model, key: KeyEvent) -> Vec<Effect> {
         KeyCode::Char('.') => m.visibility = m.visibility.toggled(),
         KeyCode::Char('p') => m.overlay = Overlay::Picker(Query::default()),
         KeyCode::Char(' ' | '/') => m.overlay = Overlay::Switcher(Query::default()),
-        KeyCode::Char('?') => m.overlay = Overlay::Help,
+        KeyCode::Char('?') => m.overlay = Overlay::Help(HelpState::default()),
         KeyCode::Char('m') => {
             if let Some(entry) = selected {
                 let name = entry.name().clone();
@@ -943,11 +947,12 @@ fn on_nav_key(m: &mut Model, key: KeyEvent) -> Vec<Effect> {
         }
         KeyCode::Char('n') => open_form(m, FormKind::New),
         KeyCode::Char('c') => open_form(m, FormKind::Checkout),
-        KeyCode::Char('t') => {
+        KeyCode::Char('s') => {
             if let Some(entry) = selected {
                 open_talk(m, entry.name());
             }
         }
+        KeyCode::Char('t') => m.info(SEND_MOVED),
         KeyCode::Char('v') => open_peek(m),
         KeyCode::Char('e') => {
             let path = m.selected().and_then(|(repo, e)| {
@@ -1404,9 +1409,56 @@ pub fn picker_matches(m: &Model, query: &str) -> Picks {
     }
 }
 
+/// Whether the list stays open.
+fn on_help_key(m: &Model, help: &mut HelpState, key: &KeyEvent) -> bool {
+    let rows =
+        crate::keymap::help(&Situation::of(m), &m.keys.nav().to_string(), &help.filter).len();
+    let last = rows.saturating_sub(1);
+    let control = key.modifiers.contains(KeyModifiers::CONTROL);
+    let step = |help: &mut HelpState, by: isize| {
+        help.selected = help.selected.saturating_add_signed(by).min(last);
+    };
+    match key.code {
+        KeyCode::Esc if help.filter.is_empty() && !help.typing => return false,
+        KeyCode::Esc => {
+            help.filter.clear();
+            help.typing = false;
+            help.selected = 0;
+        }
+        KeyCode::Down | KeyCode::Tab => step(help, 1),
+        KeyCode::Up | KeyCode::BackTab => step(help, -1),
+        KeyCode::Char('n') if control => step(help, 1),
+        KeyCode::Char('p') if control => step(help, -1),
+        KeyCode::PageDown => step(help, 8),
+        KeyCode::PageUp => step(help, -8),
+        KeyCode::Home => help.selected = 0,
+        KeyCode::End => help.selected = last,
+        KeyCode::Char('j') if !help.typing => step(help, 1),
+        KeyCode::Char('k') if !help.typing => step(help, -1),
+        KeyCode::Char('/') if !help.typing => help.typing = true,
+        KeyCode::Backspace => {
+            help.filter.pop();
+            help.selected = 0;
+        }
+        KeyCode::Char(c) if !control => {
+            help.typing = true;
+            help.filter.push(c);
+            help.selected = 0;
+        }
+        _ => {}
+    }
+    true
+}
+
 fn on_overlay_key(m: &mut Model, key: KeyEvent) -> Vec<Effect> {
     match std::mem::replace(&mut m.overlay, Overlay::None) {
-        Overlay::None | Overlay::Help => Vec::new(),
+        Overlay::None => Vec::new(),
+        Overlay::Help(mut help) => {
+            if on_help_key(m, &mut help, &key) {
+                m.overlay = Overlay::Help(help);
+            }
+            Vec::new()
+        }
         Overlay::New(form) => {
             m.overlay = Overlay::New(form);
             on_new_key(m, &key)
@@ -2359,6 +2411,38 @@ mod tests {
         assert_eq!(m.panel, Panel::Changes { file: 0 });
         update(&mut m, key(KeyCode::BackTab));
         assert_eq!(m.panel, Panel::Agent { offset: 0 });
+    }
+
+    #[test]
+    fn h_and_l_move_between_the_left_panels_like_shift_tab_and_tab() {
+        let mut m = model(&[]);
+        with_changes(&mut m, 3);
+        with_turn(&mut m);
+        update(&mut m, key(KeyCode::Char('l')));
+        assert_eq!(m.panel, Panel::Agent { offset: 0 });
+        update(&mut m, key(KeyCode::Char('l')));
+        assert_eq!(m.panel, Panel::Changes { file: 0 });
+        update(&mut m, key(KeyCode::Char('l')));
+        assert_eq!(m.panel, Panel::Agents);
+        update(&mut m, key(KeyCode::Char('h')));
+        assert_eq!(m.panel, Panel::Changes { file: 0 });
+        update(&mut m, key(KeyCode::Char('h')));
+        assert_eq!(m.panel, Panel::Agent { offset: 0 });
+        m.panel = Panel::Main(crate::model::Origin::Turn { offset: 0 });
+        update(&mut m, key(KeyCode::Char('l')));
+        assert_eq!(m.panel, Panel::Changes { file: 0 });
+    }
+
+    #[test]
+    fn l_no_longer_attaches_and_t_says_send_moved() {
+        let mut m = model(&[]);
+        let effects = update(&mut m, key(KeyCode::Char('l')));
+        assert!(effects.is_empty());
+        update(&mut m, key(KeyCode::Char('t')));
+        assert_eq!(
+            m.status.as_ref().map(|s| s.text.as_str()),
+            Some("send is s now")
+        );
     }
 
     #[test]
@@ -4144,7 +4228,7 @@ mod tests {
 
     fn talk_to(m: &mut Model, agent: &str, text: &str) -> Vec<Effect> {
         m.set_cursor(Cursor::Entry(name(agent)));
-        update(m, key(KeyCode::Char('t')));
+        update(m, key(KeyCode::Char('s')));
         assert!(matches!(m.overlay, Overlay::Talk { .. }), "the box opens");
         type_text(m, text);
         update(m, key(KeyCode::Enter))
@@ -4169,7 +4253,7 @@ mod tests {
             if let Some(panel) = panel {
                 update(&mut m, key(KeyCode::Char(panel)));
             }
-            update(&mut m, key(KeyCode::Char('t')));
+            update(&mut m, key(KeyCode::Char('s')));
             assert!(
                 matches!(&m.overlay, Overlay::Talk { to, .. } if to.as_str() == "auth-refresh-2"),
                 "{:?}",
@@ -4185,7 +4269,7 @@ mod tests {
     fn t_refuses_agents_that_report_nothing_or_are_not_running() {
         let mut m = two_live();
         m.set_cursor(Cursor::Entry(name("fix")));
-        update(&mut m, key(KeyCode::Char('t')));
+        update(&mut m, key(KeyCode::Char('s')));
         assert!(matches!(m.overlay, Overlay::None));
         assert!(
             m.status
@@ -4195,7 +4279,7 @@ mod tests {
         );
         let mut m = model(&[]);
         m.set_cursor(Cursor::Entry(name("api")));
-        update(&mut m, key(KeyCode::Char('t')));
+        update(&mut m, key(KeyCode::Char('s')));
         assert!(matches!(m.overlay, Overlay::None), "exited");
     }
 
@@ -4495,7 +4579,7 @@ mod tests {
         assert_eq!(m.outboxes[&name(agent)].queue.len(), 2);
 
         m.set_cursor(Cursor::Entry(name(agent)));
-        update(&mut m, key(KeyCode::Char('t')));
+        update(&mut m, key(KeyCode::Char('s')));
         update(
             &mut m,
             Msg::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL)),
@@ -4547,7 +4631,7 @@ mod tests {
         set_state(&mut m, "obs-layout-4", done(), 1);
         m.set_cursor(Cursor::Entry(name("obs-layout-4")));
         update(&mut m, key(KeyCode::Char('v')));
-        update(&mut m, key(KeyCode::Char('t')));
+        update(&mut m, key(KeyCode::Char('s')));
         assert!(matches!(m.overlay, Overlay::Talk { .. }));
         type_text(&mut m, "hi");
         let effects = update(&mut m, key(KeyCode::Enter));

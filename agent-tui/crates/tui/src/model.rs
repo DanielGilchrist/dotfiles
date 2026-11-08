@@ -169,15 +169,6 @@ impl View {
     pub fn previous(self) -> Self {
         Self::ALL[(self.index() + Self::ALL.len() - 1) % Self::ALL.len()]
     }
-
-    /// The tab's name in the footer hint, where no repo is to hand.
-    pub fn hint(self) -> &'static str {
-        match self {
-            Self::Focus => "repo",
-            Self::Overview => "agents",
-            Self::Pinned => "pinned",
-        }
-    }
 }
 
 /// What the sidebar selection points at, by identity so it survives refreshes.
@@ -844,13 +835,24 @@ impl Outbox {
     }
 }
 
+/// The keybindings list: what's typed to narrow it, the row under the
+/// cursor and, as view state, the first visible line.
+#[derive(Debug, Default, Clone)]
+pub struct HelpState {
+    pub filter: String,
+    /// `j` and `k` move until typing has started, then they are letters.
+    pub typing: bool,
+    pub selected: usize,
+    pub offset: std::cell::Cell<usize>,
+}
+
 pub enum Overlay {
     None,
     New(Box<NewAgent>),
     Switcher(Query),
     Picker(Query),
     Confirm(Confirm),
-    Help,
+    Help(HelpState),
     /// The configured actions, to run on this agent.
     Actions(SessionName),
     /// A message being typed for an agent.

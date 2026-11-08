@@ -2027,7 +2027,10 @@ mod tests {
             for (panel, overlay) in [
                 (Focused::Agents, Overlay::None),
                 (Focused::Agent { offset: 0 }, Overlay::None),
-                (Focused::Agents, Overlay::Help),
+                (
+                    Focused::Agents,
+                    Overlay::Help(crate::model::HelpState::default()),
+                ),
             ] {
                 let mut m = fleet(8);
                 m.palette = palette;
@@ -2655,13 +2658,13 @@ mod tests {
         let rows = screen(&terminal);
         let title = rows.iter().find(|r| r.contains("╔")).expect("a float");
         assert!(title.contains("obs-layout-4"), "{title}");
-        assert!(title.contains("t talk · i type · Esc close"), "{title}");
+        assert!(title.contains("⏎ attach · s send · Esc close"), "{title}");
         assert_eq!(m.areas.terminal, area, "the pty keeps its size");
         let behind = terminal.backend().buffer()[(0, 5)].modifier;
         assert!(behind.contains(Modifier::DIM), "what's behind is dimmed");
         let footer = rows.last().expect("a footer");
         assert!(
-            footer.contains("t talk") && footer.contains("i type"),
+            footer.contains("PEEK") && footer.contains("s send") && footer.contains("⏎ attach"),
             "{footer}"
         );
     }
@@ -2729,19 +2732,155 @@ mod tests {
         );
     }
 
+    fn footer_of(m: &mut Model, size: (u16, u16)) -> String {
+        screen(&render(m, size)).pop().expect("a footer")
+    }
+
+    fn hint_words(footer: &str) -> Vec<String> {
+        footer
+            .split("  ")
+            .map(|h| h.trim().to_string())
+            .filter(|h| !h.is_empty())
+            .collect()
+    }
+
     #[test]
-    fn the_help_shows_every_key_at_80_by_24() {
-        let mut m = fleet(10);
-        m.overlay = Overlay::Help;
-        let text = screen(&render(&mut m, (80, 24))).join("\n");
-        for expected in [
-            "attach or start",
-            "message, queued",
-            "peek at terminal",
-            "quit",
-            "no session",
-            "pick / close",
+    fn the_footer_ranks_hints_fits_what_it_can_and_never_repeats() {
+        for panel in [
+            Focused::Agents,
+            Focused::Agent { offset: 0 },
+            Focused::Changes { file: 0 },
         ] {
+            let mut counts = Vec::new();
+            for size in [(80, 24), (100, 30), (200, 50)] {
+                let mut m = fleet(10);
+                m.set_cursor(Cursor::Entry(name("obs-layout-4")));
+                m.panel = panel;
+                let footer = footer_of(&mut m, size);
+                let words = hint_words(&footer);
+                let mut sorted = words.clone();
+                sorted.sort();
+                sorted.dedup();
+                assert_eq!(sorted.len(), words.len(), "{size:?} {footer}");
+                assert!(footer.contains("? keys"), "{size:?} {footer}");
+                assert!(footer.contains("NAV"), "{footer}");
+                counts.push(words.len());
+            }
+            assert!(
+                counts[0] <= counts[1] && counts[1] <= counts[2],
+                "{counts:?}"
+            );
+        }
+        let mut m = fleet(10);
+        m.set_cursor(Cursor::Entry(name("obs-layout-4")));
+        let narrow = footer_of(&mut m, (80, 24));
+        let wide = footer_of(&mut m, (200, 50));
+        assert!(wide.contains("m pin") || wide.contains("m unpin"), "{wide}");
+        assert!(wide.contains("s send"), "{wide}");
+        if narrow.contains("m pin") {
+            assert!(narrow.contains("s send"), "lower ranks go first\n{narrow}");
+        }
+    }
+
+    #[test]
+    fn the_send_box_says_queue_when_it_will_queue() {
+        let mut m = fleet(10);
+        m.overlay = Overlay::Talk {
+            to: name("obs-layout-4"),
+            text: String::new(),
+        };
+        let text = screen(&render(&mut m, (100, 30))).join("\n");
+        assert!(text.contains("Send to obs-layout-4"), "{text}");
+        let queues = text.contains("queues until it's at rest");
+        assert_eq!(text.contains("⏎ queue"), queues, "{text}");
+    }
+
+    fn open_help(panel: Focused) -> Model {
+        let mut m = fleet(10);
+        m.set_cursor(Cursor::Entry(name("obs-layout-4")));
+        m.panel = panel;
+        m.overlay = Overlay::Help(crate::model::HelpState::default());
+        m
+    }
+
+    #[test]
+    fn the_help_lists_local_keys_before_global_ones_for_each_panel() {
+        for (panel, title) in [
+            (Focused::Agents, "[1] Agents"),
+            (Focused::Agent { offset: 0 }, "[2] Turn"),
+            (Focused::Changes { file: 0 }, "[3] Changes"),
+        ] {
+            let mut m = open_help(panel);
+            let text = screen(&render(&mut m, (100, 30))).join("\n");
+            let local = text.find("Local").expect("a Local section");
+            let global = text.find("Global").expect("a Global section");
+            assert!(local < global, "{text}");
+            assert!(text.contains(title), "{title}\n{text}");
+            assert!(text.contains("Keybindings") && text.contains("(type to filter)"));
+            assert!(text.contains("1 of "), "{text}");
+        }
+    }
+
+    #[test]
+    fn typing_filters_the_help_and_escape_clears_then_closes() {
+        use crate::update::update;
+        use crate::worker::Msg;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let press = |m: &mut Model, code| {
+            update(m, Msg::Key(KeyEvent::new(code, KeyModifiers::NONE)));
+        };
+        let mut m = open_help(Focused::Agents);
+        for c in "PEEK".chars() {
+            press(&mut m, KeyCode::Char(c));
+        }
+        let text = screen(&render(&mut m, (100, 30))).join("\n");
+        assert!(text.contains("filter: PEEK"), "{text}");
+        assert!(text.contains("1 of 1"), "{text}");
+        assert!(!text.contains("quit"), "{text}");
+        press(&mut m, KeyCode::Backspace);
+        press(&mut m, KeyCode::Esc);
+        assert!(matches!(&m.overlay, Overlay::Help(h) if h.filter.is_empty()));
+        press(&mut m, KeyCode::Esc);
+        assert!(matches!(m.overlay, Overlay::None));
+        let mut m = open_help(Focused::Agents);
+        press(&mut m, KeyCode::Char('/'));
+        press(&mut m, KeyCode::Char('k'));
+        assert!(matches!(&m.overlay, Overlay::Help(h) if h.filter == "k"));
+    }
+
+    #[test]
+    fn the_help_scrolls_at_80_by_24_and_follows_the_selection() {
+        use crate::update::update;
+        use crate::worker::Msg;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut m = open_help(Focused::Agents);
+        let first = screen(&render(&mut m, (80, 24)));
+        assert!(first.iter().any(|r| r.contains("Local")), "{first:?}");
+        assert!(
+            !first.join("\n").contains("quit"),
+            "overflow scrolls out of view"
+        );
+        update(
+            &mut m,
+            Msg::Key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE)),
+        );
+        let last = screen(&render(&mut m, (80, 24)));
+        assert_eq!(last.len(), 24);
+        let text = last.join("\n");
+        assert!(
+            text.contains("PgDn") || text.contains("Description"),
+            "{text}"
+        );
+        assert!(text.contains("attach next needing you"), "{text}");
+        assert!(!text.contains("Local"), "the top scrolled away\n{text}");
+        assert!(text.contains("Description"), "{text}");
+    }
+
+    #[test]
+    fn the_help_shows_every_key_when_filtered_by_each_word() {
+        let mut m = open_help(Focused::Agents);
+        let text = screen(&render(&mut m, (100, 40))).join("\n");
+        for expected in ["attach", "edit checkout", "send", "peek", "switch", "new"] {
             assert!(text.contains(expected), "{expected}\n{text}");
         }
     }
