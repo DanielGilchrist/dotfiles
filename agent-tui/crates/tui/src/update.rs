@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::Duration;
 
 use agent_core::actions::{Action, CommandLine, Context, EventName, Invocation};
 use agent_core::activity::{Activity, AgentId, State as ActivityState};
@@ -16,14 +16,14 @@ use agent_term::{CellPos, encode_key, encode_mouse};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind};
 use ratatui::layout::Position;
 
-use crate::document::Key;
+use crate::document::{Documents, Key};
 use crate::keymap::Situation;
 use crate::model::{
-    Answer, Chord, Confirm, Cursor, Direction, Edge, Enter, Field, Focus, Follow, FormKind,
-    HelpState, INFO_TTL, Inspection, Intent, Listed, Mode, Model, NamingState, NewAgent, Outbox,
-    Overlay, Pane, Panel, Phase, Query, Reach, Screen, StatusKind, SubagentRead, Submission,
-    TerminalFocus, Ticket, TurnRow, Unreachable, View, WorkRoom, fuzzy_match, match_rank,
-    repo_matches, unlisted,
+    Answer, Areas, Chord, Confirm, Cursor, DirCheck, Direction, Drawn, Edge, Enter, Field, Focus,
+    Follow, FormKind, HelpState, INFO_TTL, Inspection, Intent, Listed, Mode, Model, Moment,
+    NamingState, NewAgent, Outbox, Overlay, Pane, Panel, Phase, Query, Reach, RepoInput, Screen,
+    StatusKind, SubagentKey, SubagentRead, Submission, TerminalFocus, Ticket, TurnRow, Unreachable,
+    View, WorkRoom, fuzzy_match, match_rank, repo_matches, unlisted,
 };
 use crate::track::{LiveSince, Release, Seen};
 use crate::tree::ChangesView;
@@ -73,6 +73,16 @@ pub enum Open {
     },
 }
 
+impl Open {
+    /// The directory the editor runs in.
+    pub fn dir(&self) -> &Path {
+        match self {
+            Self::Checkout(dir) => dir,
+            Self::File { root, .. } | Self::At { root, .. } | Self::Transcript { root, .. } => root,
+        }
+    }
+}
+
 pub enum Effect {
     Job(Job),
     /// Read git facts about an agent's worktree.
@@ -103,6 +113,12 @@ pub enum Effect {
         launch: Launch,
         intent: Intent,
         ticket: Ticket,
+    },
+    /// Ask the harness's model to name the form's prompt.
+    SuggestName {
+        prompt: Prompt,
+        harness: agent_core::ports::HarnessId,
+        generation: u64,
     },
     /// Suspend the TUI and open `$EDITOR`.
     Edit(Open),
@@ -145,6 +161,7 @@ fn own_client(m: &Model) -> Option<ClientId> {
 pub fn update(m: &mut Model, msg: Msg) -> Vec<Effect> {
     let effects = step(m, msg);
     forget_subagents(m);
+    settle(m);
     effects
 }
 
@@ -226,6 +243,14 @@ fn step(m: &mut Model, msg: Msg) -> Vec<Effect> {
             report(m, outcome);
             Vec::new()
         }
+        Msg::DirChecked { path, found } => {
+            if let Overlay::New(form) = &mut m.overlay
+                && form.dir.awaits(&path)
+            {
+                form.dir = DirCheck::Answered { path, found };
+            }
+            Vec::new()
+        }
         Msg::NameSuggested { generation, name } => {
             if let Overlay::New(form) = &mut m.overlay {
                 form.model_named(generation, name);
@@ -264,7 +289,7 @@ fn step(m: &mut Model, msg: Msg) -> Vec<Effect> {
             Vec::new()
         }
         Msg::Document { key, result } => {
-            m.docs.loaded(&key, result);
+            m.docs.loaded(&key, result, m.clock.mono);
             Vec::new()
         }
         Msg::Subagent { name, id, detail } => {
@@ -302,29 +327,134 @@ fn ask_for_name(m: &mut Model) -> Option<Effect> {
     let NamingState::Due(at) = form.naming.state else {
         return None;
     };
-    if Instant::now() < at {
+    if m.clock.mono < at {
         return None;
     }
     form.naming.state = NamingState::Idle;
     let prompt = form.task.parse::<agent_core::names::Prompt>().ok()?;
     form.naming.state = NamingState::Asking;
     let generation = form.naming.generation;
-    Some(Effect::Job(Job::SuggestName {
+    Some(Effect::SuggestName {
         prompt,
         harness: m.harness.clone(),
         generation,
-    }))
+    })
 }
 
-/// Periodic work: debounced preview attach, naming, and status expiry.
+/// Asks the worker whether the repo field's typed path is a directory, once
+/// per path, since the form can't look at the filesystem itself.
+fn check_dir(m: &mut Model) -> Option<Effect> {
+    let Overlay::New(form) = &m.overlay else {
+        return None;
+    };
+    let RepoInput::Checking(path) = m.derive(form).repo_input else {
+        return None;
+    };
+    if form.dir.awaits(&path) {
+        return None;
+    }
+    let Overlay::New(form) = &mut m.overlay else {
+        return None;
+    };
+    form.dir = DirCheck::Asked(path.clone());
+    Some(Effect::Job(Job::CheckDir(path)))
+}
+
+/// [`tick_at`] at the real time.
 pub fn tick(m: &mut Model) -> Vec<Effect> {
-    if m.status
-        .as_ref()
-        .is_some_and(|s| s.kind == StatusKind::Info && s.at.elapsed() > INFO_TTL)
-    {
+    tick_at(m, Moment::now())
+}
+
+/// Brings everything a draw would otherwise have to decide up to date: the
+/// sidebar's room, what [0] points at and [3]'s tree. Runs after each
+/// message and tick, so a draw only reads.
+fn settle(m: &mut Model) {
+    let geometry = crate::view::geometry(m.size, m.screen);
+    m.fit_sidebar(geometry.sidebar, geometry.sidebar_shown);
+    m.settle();
+}
+
+/// The terminal is `size` big now.
+pub fn resized(m: &mut Model, size: ratatui::layout::Rect) {
+    m.size = size;
+    settle(m);
+}
+
+/// Takes in what a draw laid out, the only thing drawing leaves behind.
+/// Scroll and following are placed here, from the room the draw measured,
+/// so the keys that move over a document can rely on them.
+pub fn drawn(m: &mut Model, drawn: Drawn) {
+    let Drawn {
+        areas,
+        work_room,
+        scroll,
+        overlay_offset,
+        rows,
+    } = drawn;
+    m.areas = areas;
+    if let Some(room) = work_room {
+        m.work_room = room;
+    }
+    if let Some(scroll) = scroll {
+        m.scroll = scroll;
+        clamp_panel(m);
+    }
+    match (&mut m.overlay, overlay_offset) {
+        (Overlay::Switcher(query) | Overlay::Picker(query), Some(offset)) => {
+            query.offset = offset;
+        }
+        (Overlay::Help(help), Some(offset)) => help.offset = offset,
+        _ => {}
+    }
+    if let Some(rows) = rows {
+        m.docs.keep(rows);
+    }
+    if let Some(main) = &m.areas.main {
+        if let Some(slot) = &main.diff {
+            m.diff_view = m.diff_view.settled(slot, m.docs.lines());
+        }
+        m.docs.place(main.total, main.height, main.tails);
+    }
+}
+
+/// Hands the focus back to [1] when the panel it was in wasn't laid out,
+/// and keeps what the layout scrolled and clamped in the panel that was.
+fn clamp_panel(m: &mut Model) {
+    let list = match m.panel.list() {
+        Listed::Agents => return,
+        Listed::Agent { row, .. } => match m.areas.agent_rows.first() {
+            Some(&(_, first)) => Panel::Agent {
+                offset: first,
+                row: row.clone(),
+            },
+            None => Panel::Agents,
+        },
+        Listed::Changes { file } if !m.areas.changes_panel.is_empty() => Panel::Changes {
+            file: file.min(m.change_rows().saturating_sub(1)),
+        },
+        Listed::Changes { .. } => Panel::Agents,
+    };
+    m.panel = std::mem::replace(&mut m.panel, Panel::Agents).with_list(list);
+}
+
+/// Periodic work: debounced preview attach, naming, and status expiry. The
+/// clock is read by the caller, so everything one tick decides agrees on it.
+pub fn tick_at(m: &mut Model, now: Moment) -> Vec<Effect> {
+    m.clock = now;
+    // What the cursor is on must be judged at this moment before deciding
+    // what to read.
+    settle(m);
+    let effects = tick_effects(m);
+    settle(m);
+    effects
+}
+
+fn tick_effects(m: &mut Model) -> Vec<Effect> {
+    if m.status.as_ref().is_some_and(|s| {
+        s.kind == StatusKind::Info && m.clock.mono.saturating_duration_since(s.at) > INFO_TTL
+    }) {
         m.status = None;
     }
-    m.now = SystemTime::now();
     let mut effects: Vec<Effect> = ask_for_name(m).into_iter().collect();
     effects.extend(bell(m));
     effects.extend(flush(m));
@@ -333,12 +463,13 @@ pub fn tick(m: &mut Model) -> Vec<Effect> {
     effects.extend(inspect(m));
     effects.extend(read_subagent(m));
     effects.extend(read_document(m));
+    effects.extend(check_dir(m));
     effects
 }
 
 /// Attaches the selected live agent once the cursor has rested on it.
 fn preview(m: &mut Model) -> Option<Effect> {
-    let due = m.preview_at.is_some_and(|t| Instant::now() >= t);
+    let due = m.preview_at.is_some_and(|t| m.clock.mono >= t);
     if !due || matches!(m.focus(), Focus::Agent(_)) {
         return None;
     }
@@ -377,7 +508,8 @@ fn on_launched(m: &mut Model, ticket: Ticket, result: Result<Launch, String>) ->
     m.launching.retain(|(t, _)| *t != ticket);
     match result {
         Ok(launch) => {
-            m.track(&launch.session).launched(SystemTime::now());
+            let now = m.clock.wall;
+            m.track(&launch.session).launched(now);
             if matches!(&m.overlay, Overlay::New(form) if matches!(form.phase, Phase::Submitting { ticket: t, .. } if t == ticket))
             {
                 m.overlay = Overlay::None;
@@ -455,7 +587,7 @@ fn report(m: &mut Model, outcome: Outcome) {
 /// and move the cursor off a Needs you row that's gone.
 fn on_activities(m: &mut Model, activities: HashMap<SessionName, Activity>) -> Vec<Effect> {
     if newly_waiting(m, &activities) {
-        let allowed = m.last_bell.map_or_else(Instant::now, |at| at + BELL_EVERY);
+        let allowed = m.last_bell.map_or(m.clock.mono, |at| at + BELL_EVERY);
         m.bell_due = Some(m.bell_due.map_or(allowed, |due| due.min(allowed)));
     }
     m.activities = Some(activities);
@@ -486,9 +618,8 @@ fn forget_subagents(m: &mut Model) {
 
 /// Asks for what [3]'s cursor is on once it has rested there.
 fn read_document(m: &mut Model) -> Option<Effect> {
-    m.settle_main();
     let (key, worktree) = m.hovered_document()?;
-    let due = m.docs.due(Instant::now())?;
+    let due = m.docs.due(m.clock.mono)?;
     debug_assert_eq!(due, key);
     let reuse = match &due {
         Key::Folder(folder) => {
@@ -511,7 +642,7 @@ fn read_subagent(m: &mut Model) -> Option<Effect> {
     let (name, id) = m.subagent_selected()?;
     let workdir = m.selected_entry()?.path().map(Path::to_path_buf)?;
     let events = m.activity(&name)?.events;
-    let now = Instant::now();
+    let now = m.clock.mono;
     let key = (name.clone(), id.clone());
     let watched = m.watched(&key);
     if matches!(watched.and_then(|w| w.log.as_ref()), Some(Ok(Some(detail))) if matches!(detail.outcome, agent_core::ports::Outcome::Finished { .. }))
@@ -536,7 +667,7 @@ fn acknowledge(m: &mut Model, after: Duration) -> Option<Job> {
     let c = m
         .pane
         .connection()
-        .filter(|c| c.opened.elapsed() >= after)
+        .filter(|c| m.clock.mono.saturating_duration_since(c.opened) >= after)
         .filter(|_| m.terminal_visible())?;
     if m.terminal == TerminalFocus::Unfocused {
         return None;
@@ -559,7 +690,7 @@ fn forget_gone(m: &mut Model) {
         return;
     };
     let known: HashSet<SessionName> = snapshot.entries().map(|(_, e)| e.name().clone()).collect();
-    let now = SystemTime::now();
+    let now = m.clock.wall;
     for (name, tracked) in &mut m.agents {
         if known.contains(name) {
             tracked.listed();
@@ -597,7 +728,7 @@ fn inspect(m: &mut Model) -> Vec<Effect> {
     let Some(snapshot) = m.snapshot() else {
         return Vec::new();
     };
-    let now = Instant::now();
+    let now = m.clock.mono;
     let due: Vec<_> = snapshot
         .entries()
         .filter(|(_, e)| e.head().is_some())
@@ -627,9 +758,9 @@ fn inspect(m: &mut Model) -> Vec<Effect> {
 
 /// Rings the queued bell once the rate limit allows.
 fn bell(m: &mut Model) -> Option<Effect> {
-    m.bell_due.filter(|due| Instant::now() >= *due)?;
+    m.bell_due.filter(|due| m.clock.mono >= *due)?;
     m.bell_due = None;
-    m.last_bell = Some(Instant::now());
+    m.last_bell = Some(m.clock.mono);
     Some(Effect::Bell)
 }
 
@@ -716,7 +847,8 @@ fn activate(m: &mut Model, name: &SessionName) -> Vec<Effect> {
         ticket,
     };
     if !matches!(enter, Enter::Attach) {
-        m.track(name).launched(SystemTime::now());
+        let now = m.clock.wall;
+        m.track(name).launched(now);
     }
     match enter {
         Enter::Attach | Enter::Resurrect => vec![Effect::Attach {
@@ -970,20 +1102,20 @@ fn branch_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
             return Some(effects);
         }
         KeyCode::PageDown | KeyCode::PageUp => {
-            let half = m.docs.half_page() * 2;
+            let half = m.doc_half_page() * 2;
             m.docs.scroll_by(if code == KeyCode::PageDown {
                 half
             } else {
                 -half
             });
-            m.diff_view.follow_page = true;
+            m.follow_page();
             return Some(effects);
         }
         _ => return None,
     };
     if let Some(to) = to {
         m.diff_view.cursor = to;
-        m.diff_view.reveal = true;
+        m.reveal_line();
     }
     Some(effects)
 }
@@ -1030,13 +1162,13 @@ fn diff_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
         KeyCode::Char(']') => crate::review::hunk(lines, at, true),
         KeyCode::Char('[') => crate::review::hunk(lines, at, false),
         KeyCode::PageDown | KeyCode::PageUp => {
-            let half = m.docs.half_page() * 2;
+            let half = m.doc_half_page() * 2;
             m.docs.scroll_by(if code == KeyCode::PageDown {
                 half
             } else {
                 -half
             });
-            m.diff_view.follow_page = true;
+            m.follow_page();
             return Some(Vec::new());
         }
         KeyCode::Char('c') => {
@@ -1083,7 +1215,7 @@ fn diff_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
                 Some(to) => {
                     m.diff_view.cursor = to;
                     m.diff_view.anchor = None;
-                    m.diff_view.reveal = true;
+                    m.reveal_line();
                 }
                 None => m.info(if forward { "last file" } else { "first file" }),
             }
@@ -1094,9 +1226,17 @@ fn diff_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
     };
     if let Some(to) = to {
         m.diff_view.cursor = to;
-        m.diff_view.reveal = true;
+        m.reveal_line();
     }
     Some(Vec::new())
+}
+
+/// Scrolls [0] so the log entry `at` of subagent `key` shows, as the last
+/// draw laid it out.
+fn reveal_entry(areas: &Areas, docs: &mut Documents, key: &SubagentKey, at: usize) {
+    if let Some(main) = areas.main.as_ref().filter(|a| a.nav.as_ref() == Some(key)) {
+        main.reveal_entry(docs, at);
+    }
 }
 
 /// Keys for [0] while it reads a subagent's log: the entry cursor, folds and
@@ -1131,15 +1271,17 @@ fn log_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
     let mut effects = Vec::new();
     match code {
         KeyCode::Char('j') | KeyCode::Down => {
-            nav.cursor = Some((at + 1).min(last));
-            m.log_view.reveal = true;
+            let to = (at + 1).min(last);
+            nav.cursor = Some(to);
             if running && at + 1 >= last {
                 m.docs.scroll_to_end();
             }
+            reveal_entry(&m.areas, &mut m.docs, &key, to);
         }
         KeyCode::Char('k') | KeyCode::Up => {
-            nav.cursor = Some(at.saturating_sub(1));
-            m.log_view.reveal = true;
+            let to = at.saturating_sub(1);
+            nav.cursor = Some(to);
+            reveal_entry(&m.areas, &mut m.docs, &key, to);
             m.docs.pause();
         }
         KeyCode::Char('g') | KeyCode::Home => {
@@ -1151,13 +1293,13 @@ fn log_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
             m.docs.scroll_to_end();
         }
         KeyCode::PageDown | KeyCode::PageUp => {
-            let half = m.docs.half_page() * 2;
+            let half = m.doc_half_page() * 2;
             m.docs.scroll_by(if code == KeyCode::PageDown {
                 half
             } else {
                 -half
             });
-            m.log_view.follow_page = true;
+            m.follow_page();
         }
         KeyCode::Enter => {
             nav.cursor = Some(at);
@@ -1244,8 +1386,8 @@ fn on_panel_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
             KeyCode::Char('k') | KeyCode::Up => m.docs.scroll_by(-1),
             KeyCode::Char('g') | KeyCode::Home => m.docs.scroll_to_start(),
             KeyCode::Char('G') | KeyCode::End => m.docs.scroll_to_end(),
-            KeyCode::PageDown => m.docs.scroll_by(m.docs.half_page() * 2),
-            KeyCode::PageUp => m.docs.scroll_by(-m.docs.half_page() * 2),
+            KeyCode::PageDown => m.docs.scroll_by(m.doc_half_page() * 2),
+            KeyCode::PageUp => m.docs.scroll_by(-m.doc_half_page() * 2),
             KeyCode::Enter | KeyCode::Char('0') => {}
             _ => return None,
         }
@@ -1309,13 +1451,11 @@ fn on_panel_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
                 .and_then(|e| e.path())
                 .map(Path::to_path_buf);
             let folder = m.folder_under_cursor().map(|r| r.path);
-            match root.zip(folder).map(|(root, folder)| root.join(folder)) {
-                Some(dir) if dir.is_dir() => Some(vec![Effect::Edit(Open::Checkout(dir))]),
-                _ => {
-                    m.info("that folder is gone from the checkout");
-                    Some(Vec::new())
-                }
-            }
+            let Some(dir) = root.zip(folder).map(|(root, folder)| root.join(folder)) else {
+                m.info("that folder is gone from the checkout");
+                return Some(Vec::new());
+            };
+            Some(vec![Effect::Edit(Open::Checkout(dir))])
         }
         (KeyCode::Enter | KeyCode::Char('0'), Listed::Changes { .. } | Listed::Agent { .. })
             if m.hover().is_some() =>
@@ -1423,17 +1563,19 @@ fn on_nav_key(m: &mut Model, key: KeyEvent) -> Vec<Effect> {
         },
         KeyCode::Char('d') if ctrl(&key, 'd') => match m.panel {
             Panel::Changes { .. } | Panel::Agent { .. } | Panel::Main(_) => {
-                m.docs.scroll_by(m.docs.half_page());
-                m.log_view.follow_page = m.main_focused();
-                m.diff_view.follow_page = m.main_focused();
+                m.docs.scroll_by(m.doc_half_page());
+                if m.main_focused() {
+                    m.follow_page();
+                }
             }
             Panel::Agents => m.page_in_panel(m.half_page()),
         },
         KeyCode::Char('u') if ctrl(&key, 'u') => match m.panel {
             Panel::Changes { .. } | Panel::Agent { .. } | Panel::Main(_) => {
-                m.docs.scroll_by(-m.docs.half_page());
-                m.log_view.follow_page = m.main_focused();
-                m.diff_view.follow_page = m.main_focused();
+                m.docs.scroll_by(-m.doc_half_page());
+                if m.main_focused() {
+                    m.follow_page();
+                }
             }
             Panel::Agents => m.page_in_panel(-m.half_page()),
         },
@@ -1542,9 +1684,12 @@ fn run_action(m: &mut Model, target: &SessionName, action: &Action) -> Vec<Effec
         m.error(format!("{target} is gone"));
         return Vec::new();
     };
+    // A checkout git can't read is as good as gone, which only the worker
+    // may check for.
+    let readable = !matches!(m.facts(entry.name()), Some(Err(_)));
     let ctx = Context {
         name: entry.name(),
-        path: entry.path().filter(|p| p.is_dir()),
+        path: entry.path().filter(|_| readable),
         repo: repo.key().root().map(agent_core::paths::RepoRoot::path),
     };
     match action.invoke(ctx) {
@@ -1720,7 +1865,7 @@ fn flush(m: &mut Model) -> Vec<Effect> {
         .agents
         .iter()
         .filter_map(|(name, t)| Some((name, t.outbox.as_ref()?)))
-        .filter(|(_, o)| o.unheld())
+        .filter(|(_, o)| o.unheld(m.clock.mono))
         .filter(|(name, o)| {
             m.ready_for_text(name)
                 && !m.typing_into(name)
@@ -1751,6 +1896,7 @@ fn flush(m: &mut Model) -> Vec<Effect> {
 /// record couldn't be read, and dropped with the reason otherwise.
 fn on_sent(m: &mut Model, to: &SessionName, result: Result<(), SendError>) -> Vec<Effect> {
     let events = m.activity(to).map(|a| a.events);
+    let now = m.clock.mono;
     let Some(tracked) = m.agents.get_mut(to) else {
         return Vec::new();
     };
@@ -1759,10 +1905,7 @@ fn on_sent(m: &mut Model, to: &SessionName, result: Result<(), SendError>) -> Ve
     };
     match result {
         Ok(()) => {
-            let typed = events.map(|events| crate::track::Typed {
-                events,
-                at: Instant::now(),
-            });
+            let typed = events.map(|events| crate::track::Typed { events, at: now });
             tracked.outbox = outbox.delivered(typed);
             match tracked.outbox.as_ref().map(Outbox::len) {
                 None => m.info(format!("sent to {to}")),
@@ -1771,11 +1914,11 @@ fn on_sent(m: &mut Model, to: &SessionName, result: Result<(), SendError>) -> Ve
         }
         Err(SendError::Busy) => {
             let release = events.map_or(Release::NextRead, Release::NewEvents);
-            outbox.refused(release, Instant::now());
+            outbox.refused(release, now);
             tracked.outbox = Some(outbox);
         }
         Err(SendError::Unreadable(e)) => {
-            outbox.refused(Release::NextRead, Instant::now());
+            outbox.refused(Release::NextRead, now);
             tracked.outbox = Some(outbox);
             m.error(format!("couldn't read {to}'s activity: {e} · will retry"));
         }
@@ -1823,19 +1966,18 @@ fn track_live(m: &mut Model) {
         .map(|(_, e)| e.name().clone())
         .collect();
     let first = m.snapshots <= 1;
+    let appeared = if first {
+        LiveSince::Unknown
+    } else {
+        LiveSince::Since(m.clock.wall)
+    };
     for (name, tracked) in &mut m.agents {
         if !live.contains(name) {
             tracked.live_since = None;
         }
     }
     for name in live {
-        m.track(&name).live_since.get_or_insert_with(|| {
-            if first {
-                LiveSince::Unknown
-            } else {
-                LiveSince::Since(SystemTime::now())
-            }
-        });
+        m.track(&name).live_since.get_or_insert(appeared);
     }
 }
 
@@ -2190,6 +2332,7 @@ fn delete_word(text: &mut String) {
 /// Applies `edit` to the open form (unless it's creating), then refreshes
 /// its checks.
 fn edit_form(m: &mut Model, edit: impl FnOnce(&mut NewAgent)) {
+    let now = m.clock.mono;
     if let Overlay::New(form) = &mut m.overlay {
         if let Phase::Submitting { .. } = form.phase {
             return;
@@ -2198,7 +2341,7 @@ fn edit_form(m: &mut Model, edit: impl FnOnce(&mut NewAgent)) {
         edit(form);
         form.error = None;
         if form.task != before {
-            form.prompt_changed();
+            form.prompt_changed(now);
         }
     }
 }
@@ -2490,6 +2633,10 @@ fn on_mouse(m: &mut Model, mouse: MouseEvent) -> Vec<Effect> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Instant, SystemTime};
+
+    use crate::model::Found;
+
     use agent_core::discover::{Observation, assemble};
     use agent_core::paths::{Layout, RepoRoot};
     use agent_core::ports::{RepoWorktrees, SessionInfo, SessionStatus};
@@ -2562,6 +2709,14 @@ mod tests {
         assemble(&obs, &Layout::new("/w".into()).expect("absolute"), &[]).0
     }
 
+    /// [0] as drawn with `rows` showing.
+    fn paged(m: &mut Model, rows: usize) {
+        m.areas.main = Some(crate::model::MainLayout {
+            height: rows,
+            ..Default::default()
+        });
+    }
+
     #[test]
     fn ctrl_d_and_ctrl_u_move_half_a_page_in_the_focused_panel() {
         let mut m = model(&[]);
@@ -2578,7 +2733,7 @@ mod tests {
             "stops at the end rather than wrapping"
         );
         m.panel = Panel::turn();
-        m.docs.page = 6;
+        paged(&mut m, 6);
         update(
             &mut m,
             Msg::Key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL)),
@@ -2589,7 +2744,7 @@ mod tests {
             Msg::Key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL)),
         );
         assert_eq!(m.docs.scroll, 0);
-        m.docs.page = 1;
+        paged(&mut m, 1);
         update(
             &mut m,
             Msg::Key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL)),
@@ -2916,6 +3071,7 @@ mod tests {
                 ..crate::fixtures::unchanged()
             }),
         );
+        m.settle();
     }
 
     fn with_paths(m: &mut Model, paths: &[&str]) {
@@ -2940,6 +3096,7 @@ mod tests {
                 ..crate::fixtures::unchanged()
             }),
         );
+        m.settle();
     }
 
     fn tree_labels(m: &Model) -> Vec<String> {
@@ -3305,6 +3462,7 @@ mod tests {
         assert!(std::sync::Arc::ptr_eq(&first, &m.change_list()));
         m.panel = Panel::Changes { file: 0 };
         m.toggle_folder();
+        m.settle();
         let folded = m.change_list();
         assert!(
             !std::sync::Arc::ptr_eq(&first, &folded),
@@ -3312,8 +3470,10 @@ mod tests {
         );
         assert!(std::sync::Arc::ptr_eq(&folded, &m.change_list()));
         m.toggle_changes_view();
+        m.settle();
         assert!(!std::sync::Arc::ptr_eq(&folded, &m.change_list()), "view");
         m.toggle_changes_view();
+        m.settle();
         let before = m.change_list();
         with_paths(&mut m, &PATHS);
         assert!(!std::sync::Arc::ptr_eq(&before, &m.change_list()), "facts");
@@ -3342,8 +3502,11 @@ mod tests {
         assert!(
             matches!(m.hover(), Some(crate::document::Hover::Folder(k)) if k.path == std::path::Path::new("a"))
         );
-        update(&mut m, key(KeyCode::Char('e')));
-        assert!(m.status.is_some(), "a folder missing from disk says so");
+        let effects = update(&mut m, key(KeyCode::Char('e')));
+        assert!(
+            matches!(effects.as_slice(), [Effect::Edit(Open::Checkout(dir))] if dir.ends_with("a")),
+            "the runner reports a folder missing from disk"
+        );
         m.panel = Panel::Changes { file: 2 };
         assert!(m.file_under_cursor().is_some());
     }
@@ -3950,6 +4113,173 @@ mod tests {
         );
     }
 
+    /// The moment `after` past the model's clock.
+    fn later(m: &Model, after: Duration) -> Moment {
+        Moment {
+            wall: m.clock.wall + after,
+            mono: m.clock.mono + after,
+        }
+    }
+
+    #[test]
+    fn a_pause_in_typing_is_measured_on_the_clock_the_tick_is_given() {
+        let mut m = model(&[]);
+        open_form(&mut m);
+        type_text(&mut m, "why is the export slow");
+        let asks = |effects: Vec<Effect>| {
+            effects
+                .iter()
+                .filter(|e| matches!(e, Effect::SuggestName { .. }))
+                .count()
+        };
+        let almost = later(
+            &m,
+            crate::model::NAMING_DEBOUNCE.saturating_sub(Duration::from_millis(1)),
+        );
+        assert_eq!(asks(tick_at(&mut m, almost)), 0, "typing hasn't paused");
+        let paused = later(&m, Duration::from_millis(1));
+        assert_eq!(asks(tick_at(&mut m, paused)), 1);
+        let after = later(&m, crate::model::NAMING_DEBOUNCE);
+        assert_eq!(asks(tick_at(&mut m, after)), 0, "asked once");
+    }
+
+    #[test]
+    fn typing_again_before_the_pause_ends_asks_for_the_newer_prompt_only() {
+        let mut m = model(&[]);
+        open_form(&mut m);
+        type_text(&mut m, "why is the export slow");
+        let half = later(&m, crate::model::NAMING_DEBOUNCE / 2);
+        m.clock = half;
+        type_text(&mut m, "?");
+        let first_due = later(&m, crate::model::NAMING_DEBOUNCE / 2);
+        let effects = tick_at(&mut m, first_due);
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::SuggestName { .. })),
+            "the earlier pause was pushed back"
+        );
+        let due = later(&m, crate::model::NAMING_DEBOUNCE);
+        let asked: Vec<_> = tick_at(&mut m, due)
+            .into_iter()
+            .filter_map(|e| match e {
+                Effect::SuggestName { generation, .. } => Some(generation),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(asked, [form(&m).naming.generation]);
+    }
+
+    #[test]
+    fn an_info_message_expires_on_the_clock_the_tick_is_given() {
+        let mut m = model(&[]);
+        m.info("took a moment");
+        let almost = later(&m, INFO_TTL);
+        tick_at(&mut m, almost);
+        assert!(m.status.is_some(), "kept for exactly its time to live");
+        let over = later(&m, Duration::from_millis(1));
+        tick_at(&mut m, over);
+        assert!(m.status.is_none());
+        m.error("kept");
+        let long = later(&m, INFO_TTL * 10);
+        tick_at(&mut m, long);
+        assert!(m.status.is_some(), "errors stay until a key");
+    }
+
+    #[test]
+    fn the_preview_waits_out_its_debounce_on_the_models_clock() {
+        let mut m = model(&[]);
+        m.schedule_preview();
+        let almost = later(
+            &m,
+            crate::model::PREVIEW_DEBOUNCE.saturating_sub(Duration::from_millis(1)),
+        );
+        tick_at(&mut m, almost);
+        assert!(m.preview_at.is_some(), "still waiting");
+        let due = later(&m, Duration::from_millis(1));
+        tick_at(&mut m, due);
+        assert!(m.preview_at.is_none(), "taken once it is due");
+    }
+
+    fn type_repo(m: &mut Model, text: &str) {
+        update(m, key(KeyCode::BackTab));
+        type_text(m, text);
+    }
+
+    #[test]
+    fn a_typed_repo_path_is_looked_at_by_the_worker_once_and_never_by_the_form() {
+        let mut m = model(&[]);
+        open_form(&mut m);
+        type_text(&mut m, "add dark mode");
+        type_repo(&mut m, "/no/such/place");
+        let dir = std::path::PathBuf::from("/no/such/place");
+        assert_eq!(derived(&m).repo_input, RepoInput::Checking(dir.clone()));
+        assert!(
+            matches!(
+                derived(&m).submission,
+                Submission::Blocked(Blocked::Checking)
+            ),
+            "nothing is submitted on a guess"
+        );
+        let checks = |effects: &[Effect]| {
+            effects
+                .iter()
+                .filter(|e| matches!(e, Effect::Job(Job::CheckDir(_))))
+                .count()
+        };
+        assert_eq!(checks(&tick(&mut m)), 1);
+        assert_eq!(checks(&tick(&mut m)), 0, "asked once per path");
+
+        update(
+            &mut m,
+            Msg::DirChecked {
+                path: "/another".into(),
+                found: Found::Dir,
+            },
+        );
+        assert_eq!(
+            derived(&m).repo_input,
+            RepoInput::Checking(dir.clone()),
+            "an answer about another path counts for nothing"
+        );
+        update(
+            &mut m,
+            Msg::DirChecked {
+                path: dir.clone(),
+                found: Found::Nothing,
+            },
+        );
+        assert_eq!(derived(&m).repo_input, RepoInput::Missing(dir.clone()));
+        assert_eq!(checks(&tick(&mut m)), 0, "answered");
+
+        type_text(&mut m, "x");
+        assert!(matches!(derived(&m).repo_input, RepoInput::Checking(_)));
+        assert_eq!(checks(&tick(&mut m)), 1, "a new path is asked about");
+    }
+
+    #[test]
+    fn a_directory_the_worker_found_is_a_path_to_launch_in() {
+        let mut m = model(&[]);
+        open_form(&mut m);
+        type_text(&mut m, "add dark mode");
+        type_repo(&mut m, "/src/new");
+        tick(&mut m);
+        update(
+            &mut m,
+            Msg::DirChecked {
+                path: "/src/new".into(),
+                found: Found::Dir,
+            },
+        );
+        assert!(matches!(
+            derived(&m).submission,
+            Submission::Ready(Launchable::Create {
+                repo: crate::model::RepoChoice::Path(_),
+                ..
+            })
+        ));
+    }
+
     #[test]
     fn the_model_is_asked_once_typing_pauses_and_only_its_latest_answer_counts() {
         let mut m = model(&[]);
@@ -3961,7 +4291,7 @@ mod tests {
         f.naming.state = NamingState::Due(Instant::now());
         let effects = tick(&mut m);
         let Some(generation) = effects.iter().find_map(|e| match e {
-            Effect::Job(Job::SuggestName { generation, .. }) => Some(*generation),
+            Effect::SuggestName { generation, .. } => Some(*generation),
             _ => None,
         }) else {
             panic!("no ask")
@@ -4193,9 +4523,20 @@ mod tests {
     }
 
     #[test]
-    fn actions_needing_a_missing_checkout_are_refused() {
+    fn actions_needing_a_checkout_git_cannot_read_are_refused() {
         let mut m = model(&[]);
         with_actions(&mut m);
+        m.track(&name("fix")).inspection = Some(Inspection {
+            events: None,
+            at: m.clock.mono,
+        });
+        update(
+            &mut m,
+            Msg::Inspected {
+                name: name("fix"),
+                facts: Err("not a git repository".into()),
+            },
+        );
         update(&mut m, key(KeyCode::Char('x')));
         assert!(update(&mut m, key(KeyCode::Char('s'))).is_empty());
         assert!(
@@ -5138,7 +5479,7 @@ mod tests {
         );
         assert_eq!(diff_reads(tick(&mut m)), [""; 0], "asked once");
 
-        m.docs.page = 10;
+        paged(&mut m, 10);
         update(&mut m, key(KeyCode::Char('J')));
         assert_eq!(m.docs.scroll, 2);
         update(&mut m, key(KeyCode::Char('K')));
@@ -5157,14 +5498,14 @@ mod tests {
         assert_eq!(m.docs.scroll, 0);
 
         update(&mut m, key(KeyCode::Char('j')));
-        m.settle_main();
+        m.settle();
         assert_eq!(m.docs.scroll, 0, "another file starts at the top");
     }
 
     #[test]
     fn j_and_k_keep_moving_the_list_and_scroll_nothing_from_the_list() {
         let mut m = crate::fixtures::fleet(10);
-        m.docs.page = 10;
+        paged(&mut m, 10);
         update(&mut m, key(KeyCode::Char('J')));
         assert_eq!(m.docs.scroll, 0, "the terminal doesn't scroll from NAV");
     }
@@ -5173,7 +5514,7 @@ mod tests {
         let mut m = crate::fixtures::fleet(10);
         m.set_cursor(Cursor::Entry(name(name_of)));
         update(&mut m, key(KeyCode::Char('3')));
-        m.docs.page = 10;
+        paged(&mut m, 10);
         m
     }
 
@@ -5982,16 +6323,15 @@ mod tests {
         talk_to(&mut m, AGENT, "next");
         sent(&mut m, AGENT);
         let outbox = &m.outbox(&name(AGENT)).expect("queued");
-        assert!(!outbox.stalled(Some(1)), "just sent");
+        assert!(!outbox.stalled(Some(1), m.clock.mono), "just sent");
         let mut outbox = crate::track::queued("next");
         outbox.last_typed = Some(crate::track::Typed {
             events: 1,
-            at: Instant::now()
-                .checked_sub(crate::track::STALL_AFTER * 2)
-                .expect("the clock has run that long"),
+            at: m.clock.mono,
         });
-        assert!(outbox.stalled(Some(1)));
-        assert!(!outbox.stalled(Some(2)), "it reported");
+        let later = m.clock.mono + crate::track::STALL_AFTER * 2;
+        assert!(outbox.stalled(Some(1), later));
+        assert!(!outbox.stalled(Some(2), later), "it reported");
         assert!(replies(&tick(&mut m)).is_empty(), "never sent blindly");
     }
 

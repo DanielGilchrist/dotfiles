@@ -6,19 +6,20 @@ use agent_core::actions::Kind;
 use agent_core::model::{Entry, EntryKind, Head};
 use agent_core::names::{Checkout, SessionName};
 use agent_core::ops::Deletes;
-use ratatui::Frame;
+use ratatui::backend::Backend;
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Clear, Padding, Paragraph, Wrap};
+use ratatui::{Frame, Terminal};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::keymap::{self, Situation};
 use crate::model::{
-    AgentStatus, Blocked, Confirm, Derived, Enter, Field, Focus, FormKind, HelpState, Launchable,
-    Load, Model, NameCheck, NameSource, NamingState, NewAgent, OfferEffect, Overlay, Pane, Phase,
-    Proposal, Pulse, Query, Reach, RepoInput, Row, Screen, StatusKind, Submission, View, Waiting,
-    WorkRoom, fuzzy_match, invalid_chars, repo_matches,
+    AgentStatus, Areas, Blocked, Confirm, Derived, Drawn, Enter, Field, Focus, FormKind, HelpState,
+    Launchable, Load, Model, NameCheck, NameSource, NamingState, NewAgent, OfferEffect, Overlay,
+    Pane, Phase, Proposal, Pulse, Query, Reach, RepoInput, Row, Screen, StatusKind, Submission,
+    View, Waiting, WorkRoom, fuzzy_match, invalid_chars, repo_matches,
 };
 use crate::palette::Palette;
 use crate::update::{Pick, Picks, Unusable, picker_matches, switcher_matches};
@@ -159,7 +160,7 @@ fn justify<'a>(left: Vec<Span<'a>>, right: Vec<Span<'a>>, width: usize) -> Line<
 
 /// One glyph per state: a spinner that stops when the agent goes quiet, and
 /// attention glyphs that read without colour.
-fn glyph(status: &AgentStatus) -> Span<'static> {
+fn glyph(status: &AgentStatus, now: SystemTime) -> Span<'static> {
     match status {
         AgentStatus::NoSession => Span::styled("·", dim()),
         AgentStatus::Exited => Span::styled("○", dim()),
@@ -167,7 +168,7 @@ fn glyph(status: &AgentStatus) -> Span<'static> {
         AgentStatus::Working {
             pulse: Pulse::Steady,
             ..
-        } => Span::raw(spinner()),
+        } => Span::raw(spinner(now)),
         AgentStatus::Working {
             pulse: Pulse::Stale,
             ..
@@ -252,16 +253,26 @@ fn display_path(path: &Path) -> String {
     }
 }
 
-/// lazygit-style: two titled, rounded panels (the agents, and the selected
-/// agent's terminal) with the focused one's border in Cyan, over a one-line
-/// status bar carrying the mode badge and context hints.
-pub fn draw(frame: &mut Frame<'_>, m: &mut Model) {
-    PALETTE.set(m.palette);
-    m.settle_main();
-    let [body, footer] =
-        Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(frame.area());
+/// Where the screen's regions go, a function of its size alone.
+pub struct Geometry {
+    footer: Rect,
+    left: Rect,
+    right: Rect,
+    /// Inside the main view's border and padding.
+    terminal: Rect,
+    /// The list's room inside the sidebar's border. As if the sidebar were
+    /// there while it's hidden, so moving in the list still works.
+    pub sidebar: Rect,
+    pub sidebar_shown: bool,
+}
+
+/// The panel padding keeps the agent's own full-width rules off our border.
+const PANE_PADDING: Padding = Padding::horizontal(1);
+
+pub fn geometry(area: Rect, screen: Screen) -> Geometry {
+    let [body, footer] = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(area);
     let borders = 2;
-    let sidebar_width = if body.width < NARROW || m.screen == Screen::Full {
+    let sidebar_width = if body.width < NARROW || screen == Screen::Full {
         0
     } else {
         let share = u32::from(body.width) * SIDEBAR_SHARE / 100;
@@ -272,53 +283,98 @@ pub fn draw(frame: &mut Frame<'_>, m: &mut Model) {
     };
     let [left, right] =
         Layout::horizontal([Constraint::Length(sidebar_width), Constraint::Min(0)]).areas(body);
-    let (sidebar_style, pane_style) = focus_styles(m);
-
-    if sidebar_width > 0 {
-        sidebar::draw(frame, m, left, sidebar_style);
+    let sidebar = if sidebar_width > 0 {
+        Rect::new(
+            left.x + 1,
+            left.y + 1,
+            left.width.saturating_sub(2),
+            sidebar::list_room(left.height),
+        )
     } else {
-        // The panels keep the keys while the sidebar is out of sight, and
-        // the list is laid out as if it were there, so moving still works.
-        m.areas.sidebar = Rect::new(0, 0, SIDEBAR_MIN, sidebar::list_room(body.height));
-        m.areas.rows.clear();
-        m.areas.agent_rows.clear();
-        m.areas.change_rows.clear();
-        m.areas.agent_panel = Rect::default();
-        m.areas.changes_panel = Rect::default();
-        m.work_room = WorkRoom::Fits;
+        Rect::new(0, 0, SIDEBAR_MIN, sidebar::list_room(body.height))
+    };
+    Geometry {
+        footer,
+        left,
+        right,
+        terminal: Block::bordered().padding(PANE_PADDING).inner(right),
+        sidebar,
+        sidebar_shown: sidebar_width > 0,
     }
-    m.sidebar_shown = sidebar_width > 0;
+}
+
+/// Draws one frame from the model and hands back what the draw laid out.
+pub fn paint<B: Backend>(terminal: &mut Terminal<B>, m: &mut Model) -> Result<(), B::Error> {
+    let mut laid = None;
+    terminal.draw(|frame| laid = Some(draw(frame, m)))?;
+    if let Some(drawn) = laid {
+        crate::update::drawn(m, drawn);
+    }
+    Ok(())
+}
+
+/// lazygit-style: two titled, rounded panels (the agents, and the selected
+/// agent's terminal) with the focused one's border in Cyan, over a one-line
+/// status bar carrying the mode badge and context hints.
+///
+/// The model is only read. What the draw learned about the screen comes
+/// back as [`Drawn`], the one write-back, which [`crate::update::drawn`]
+/// applies.
+pub fn draw(frame: &mut Frame<'_>, m: &Model) -> Drawn {
+    PALETTE.set(m.palette);
+    let Geometry {
+        footer,
+        left,
+        right,
+        terminal,
+        sidebar: list,
+        sidebar_shown,
+    } = geometry(frame.area(), m.screen);
+    let (sidebar_style, pane_style) = focus_styles(m);
+    let mut drawn = Drawn {
+        areas: Areas {
+            sidebar: list,
+            terminal,
+            ..Areas::default()
+        },
+        ..Drawn::default()
+    };
+
+    if sidebar_shown {
+        sidebar::draw(frame, m, left, sidebar_style, &mut drawn);
+    } else {
+        // The panels keep the keys while the sidebar is out of sight.
+        drawn.work_room = Some(WorkRoom::Fits);
+    }
 
     let pane_focused = matches!(m.focus(), Focus::Agent(_)) || m.main_focused();
-    // Padding keeps the agent's own full-width rules off our border. The
-    // terminal's rect never depends on what [0] shows, so switching between
-    // it and a document never resizes the agent's pty.
-    let padding = Padding::horizontal(1);
-    let terminal = Block::bordered().padding(padding).inner(right);
-    m.areas.terminal = terminal;
+    // The terminal's rect never depends on what [0] shows, so switching
+    // between it and a document never resizes the agent's pty.
     if let Some(page) = page::page(m, terminal, usize::from(right.width), pane_style) {
         let block = panel(page.title, page.corner, pane_style, pane_focused)
-            .padding(padding)
+            .padding(PANE_PADDING)
             .title_top(Line::from(sidebar::pad_title(page.right)).right_aligned());
         frame.render_widget(Paragraph::new(page.lines).block(block), right);
+        drawn.areas.main = Some(page.laid);
+        drawn.rows = page.built;
     } else {
         let (title, path) = pane_title(m, usize::from(right.width));
-        let block = panel(title, path, pane_style, pane_focused).padding(padding);
+        let block = panel(title, path, pane_style, pane_focused).padding(PANE_PADDING);
         frame.render_widget(block, right);
         draw_terminal(frame, m, terminal);
     }
 
     draw_status_bar(frame, m, footer);
 
-    draw_peek(frame, m);
+    draw_peek(frame, m, terminal);
 
     match &m.overlay {
         Overlay::None => {}
         Overlay::New(form) => draw_new(frame, m, form),
-        Overlay::Switcher(query) => draw_switcher(frame, m, query),
-        Overlay::Picker(query) => draw_picker(frame, m, query),
+        Overlay::Switcher(query) => drawn.overlay_offset = draw_switcher(frame, m, query),
+        Overlay::Picker(query) => drawn.overlay_offset = Some(draw_picker(frame, m, query)),
         Overlay::Confirm(confirm) => draw_confirm(frame, confirm),
-        Overlay::Help(help) => draw_help(frame, m, help),
+        Overlay::Help(help) => drawn.overlay_offset = Some(draw_help(frame, m, help)),
         Overlay::Actions(target) => draw_actions(frame, m, target),
         Overlay::Talk { to, text } => draw_talk(frame, m, to, text),
         Overlay::Comment {
@@ -327,8 +383,9 @@ pub fn draw(frame: &mut Frame<'_>, m: &mut Model) {
             text,
             rev,
         } => draw_comment(frame, to, lines, text, rev.as_deref()),
-        Overlay::Planning { name, .. } => draw_planning(frame, name),
+        Overlay::Planning { name, .. } => draw_planning(frame, m.clock.wall, name),
     }
+    drawn
 }
 
 fn sidebar_focused(m: &Model) -> bool {
@@ -778,14 +835,14 @@ const QUERY_ROW_INSET: usize = 6;
 
 /// A query overlay: the input, then `items` with the one under the cursor
 /// marked. `verb` is what `⏎` does with it, left out when nothing is under
-/// it. A long query keeps its end in view.
+/// it. A long query keeps its end in view. Returns the first row shown.
 fn draw_query_list(
     frame: &mut Frame<'_>,
     title: &str,
     verb: Option<&str>,
     query: &Query,
     items: Vec<Item<'_>>,
-) {
+) -> usize {
     let len = items.len();
     let area = overlay_area(
         frame,
@@ -815,8 +872,7 @@ fn draw_query_list(
     let marked = verb.map(|_| index);
     let height = usize::from(list.height);
     let width = usize::from(list.width).saturating_sub(2);
-    let offset = scroll(query.offset.get(), index, height, len);
-    query.offset.set(offset);
+    let offset = scroll(query.offset, index, height, len);
     let lines: Vec<Line> = items
         .into_iter()
         .enumerate()
@@ -834,16 +890,17 @@ fn draw_query_list(
         })
         .collect();
     frame.render_widget(Paragraph::new(lines), list);
+    offset
 }
 
-fn draw_switcher(frame: &mut Frame<'_>, m: &Model, query: &Query) {
-    let Some(snapshot) = m.snapshot() else { return };
+fn draw_switcher(frame: &mut Frame<'_>, m: &Model, query: &Query) -> Option<usize> {
+    let snapshot = m.snapshot()?;
     let items: Vec<Item<'_>> = switcher_matches(m, &query.text)
         .into_iter()
         .filter_map(|name| snapshot.entry(&name))
         .map(|(repo, entry)| {
             let status = m.status(entry);
-            let mut left = vec![glyph(&status), Span::raw(" ")];
+            let mut left = vec![glyph(&status, m.clock.wall), Span::raw(" ")];
             left.extend(highlighted(
                 entry.name().as_str(),
                 &query.text,
@@ -861,13 +918,13 @@ fn draw_switcher(frame: &mut Frame<'_>, m: &Model, query: &Query) {
         })
         .collect();
     let verb = (!items.is_empty()).then_some("switch");
-    draw_query_list(frame, "Switch", verb, query, items);
+    Some(draw_query_list(frame, "Switch", verb, query, items))
 }
 
 /// Every row says where its repo is (DIM), since a name alone can't tell
 /// two clones apart, and a listed row its live count before that. A typed
 /// path keeps its end. With no rows, the one row says why.
-fn draw_picker(frame: &mut Frame<'_>, m: &Model, query: &Query) {
+fn draw_picker(frame: &mut Frame<'_>, m: &Model, query: &Query) -> usize {
     let matches = picker_matches(m, &query.text);
     let rows = matches.rows();
     let verb = query.pick(rows).map(Pick::verb);
@@ -925,7 +982,7 @@ fn draw_picker(frame: &mut Frame<'_>, m: &Model, query: &Query) {
             items.push((vec![Span::styled(text, error())], Vec::new()));
         }
     }
-    draw_query_list(frame, "Repos", verb, query, items);
+    draw_query_list(frame, "Repos", verb, query, items)
 }
 
 fn highlighted_owned(text: &str, query: &str) -> Vec<Span<'static>> {
@@ -961,8 +1018,8 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
     rows
 }
 
-fn spinner() -> &'static str {
-    let tick = std::time::SystemTime::now()
+fn spinner(now: SystemTime) -> &'static str {
+    let tick = now
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() / 100);
     SPINNER[usize::try_from(tick).unwrap_or(0) % SPINNER.len()]
@@ -995,7 +1052,7 @@ fn draw_new(frame: &mut Frame<'_>, m: &Model, form: &NewAgent) {
     // and after ⏎ for anything else, since a branch is invalid mid-word.
     let target_problem = match (form.kind, &derived.submission) {
         (FormKind::Checkout, Submission::Blocked(Blocked::Target(why)))
-            if form.task.contains("github.com") || form.error.is_some() =>
+            if derived.link_pasted || form.error.is_some() =>
         {
             Some(why.clone())
         }
@@ -1026,7 +1083,7 @@ fn draw_new(frame: &mut Frame<'_>, m: &Model, form: &NewAgent) {
                 let from = match suggestion.source {
                     NameSource::Link
                         if form.kind == FormKind::New
-                            && matches!(form.task.trim().parse(), Ok(Checkout::PullRequest(_))) =>
+                            && matches!(derived.target, Some(Checkout::PullRequest(_))) =>
                     {
                         "from the link · Esc then c checks it out".to_string()
                     }
@@ -1047,7 +1104,7 @@ fn draw_new(frame: &mut Frame<'_>, m: &Model, form: &NewAgent) {
         }
         if let NamingState::Asking = form.naming.state {
             source = vec![Span::styled(
-                format!("{} asking {}", spinner(), m.harness_label),
+                format!("{} asking {}", spinner(m.clock.wall), m.harness_label),
                 dim(),
             )];
         }
@@ -1109,7 +1166,7 @@ fn draw_new(frame: &mut Frame<'_>, m: &Model, form: &NewAgent) {
                     ));
                     lines.push(Line::raw(""));
                     lines.push(repo_line(m, form, &derived, &fields, inner));
-                    return finish_form(frame, form, &derived, lines, width);
+                    return finish_form(frame, form, &derived, m.clock.wall, lines, width);
                 }
                 Submission::Ready(Launchable::Attach { task: Some(_), .. }) => {
                     ("already running: the prompt will be typed into it", yellow)
@@ -1151,7 +1208,7 @@ fn draw_new(frame: &mut Frame<'_>, m: &Model, form: &NewAgent) {
     lines.push(Line::raw(""));
 
     lines.push(repo_line(m, form, &derived, &fields, inner));
-    finish_form(frame, form, &derived, lines, width);
+    finish_form(frame, form, &derived, m.clock.wall, lines, width);
 }
 
 /// Draws the assembled form, sized to its lines.
@@ -1159,10 +1216,11 @@ fn finish_form(
     frame: &mut Frame<'_>,
     form: &NewAgent,
     derived: &Derived,
+    now: SystemTime,
     lines: Vec<Line<'static>>,
     width: u16,
 ) {
-    let keys = form_keys(form, derived, usize::from(width).saturating_sub(4));
+    let keys = form_keys(form, derived, now, usize::from(width).saturating_sub(4));
     let height = u16::try_from(lines.len())
         .unwrap_or(u16::MAX)
         .saturating_add(2);
@@ -1285,8 +1343,8 @@ fn repo_line(
                 Some(root) => repo.push(Span::styled(root.name().into_owned(), dim())),
                 None => repo.push(Span::styled("none selected", dim())),
             }
-            let linked = match form.task.trim().parse() {
-                Ok(Checkout::PullRequest(pr)) if form.kind == FormKind::Checkout => Some(pr),
+            let linked = match &derived.target {
+                Some(Checkout::PullRequest(pr)) if form.kind == FormKind::Checkout => Some(pr),
                 _ => None,
             };
             match linked {
@@ -1326,7 +1384,7 @@ fn repo_line(
                 ));
             }
         }
-        RepoInput::Path(_) => {
+        RepoInput::Checking(_) | RepoInput::Path(_) => {
             repo.push(Span::raw(form.repo.text.clone()));
             repo.push(fields.cursor(Field::Repo));
         }
@@ -1346,11 +1404,21 @@ fn repo_line(
 
 /// The form's bottom-border hints, dropped least important first to fit
 /// `room` columns.
-fn form_keys<'a>(form: &'a NewAgent, derived: &Derived, room: usize) -> Vec<Span<'a>> {
+fn form_keys<'a>(
+    form: &'a NewAgent,
+    derived: &Derived,
+    now: SystemTime,
+    room: usize,
+) -> Vec<Span<'a>> {
     if let Phase::Submitting { launch, .. } = &form.phase {
         return vec![
             Span::styled(
-                format!("{} {} {}", spinner(), launch.progress(), launch.session()),
+                format!(
+                    "{} {} {}",
+                    spinner(now),
+                    launch.progress(),
+                    launch.session()
+                ),
                 dim(),
             ),
             Span::raw("  "),
@@ -1500,10 +1568,13 @@ fn draw_confirm(frame: &mut Frame<'_>, confirm: &Confirm) {
     frame.render_widget(paragraph.block(overlay_block(&title, keys, border)), area);
 }
 
-fn draw_planning(frame: &mut Frame<'_>, name: &SessionName) {
+fn draw_planning(frame: &mut Frame<'_>, now: SystemTime, name: &SessionName) {
     let line = Line::from(vec![
         Span::raw(" "),
-        Span::styled(format!("{} checking what would be lost…", spinner()), dim()),
+        Span::styled(
+            format!("{} checking what would be lost…", spinner(now)),
+            dim(),
+        ),
     ]);
     let width = u16::try_from(line.width() + 6).unwrap_or(u16::MAX);
     let area = centred(frame, width.max(30), 3);
@@ -1685,7 +1756,7 @@ fn draw_comment(
 
 /// The peek float: the agent's terminal at the pty's size, over everything
 /// else, which is dimmed. A pty bigger than the screen is cropped.
-fn draw_peek(frame: &mut Frame<'_>, m: &Model) {
+fn draw_peek(frame: &mut Frame<'_>, m: &Model, terminal: Rect) {
     let Some(name) = m.peek.as_ref().filter(|_| m.peeking()) else {
         return;
     };
@@ -1697,7 +1768,7 @@ fn draw_peek(frame: &mut Frame<'_>, m: &Model) {
         Pane::Connected(c) if &c.name == name => Some(c.term.size()),
         _ => None,
     };
-    let (cols, rows) = size.map_or((m.areas.terminal.width, m.areas.terminal.height), |s| {
+    let (cols, rows) = size.map_or((terminal.width, terminal.height), |s| {
         (s.cols.get(), s.rows.get())
     });
     let width = cols.saturating_add(2).min(screen.width);
@@ -1785,7 +1856,7 @@ fn pad(text: &str, width: usize) -> String {
 /// one row each with the one under the cursor highlighted, and below it
 /// a longer description of that row. Keys that do nothing here aren't
 /// listed.
-fn draw_help(frame: &mut Frame<'_>, m: &Model, state: &HelpState) {
+fn draw_help(frame: &mut Frame<'_>, m: &Model, state: &HelpState) -> usize {
     let nav = m.keys.nav().to_string();
     let situation = Situation::of(m);
     let help = keymap::help(&situation, &nav, &state.filter);
@@ -1869,8 +1940,7 @@ fn draw_help(frame: &mut Frame<'_>, m: &Model, state: &HelpState) {
         lines.push(Line::styled("  no key matches", dim()));
     }
     let visible = usize::from(inner.height);
-    let offset = scroll(state.offset.get(), selected_line, visible, lines.len());
-    state.offset.set(offset);
+    let offset = scroll(state.offset, selected_line, visible, lines.len());
     frame.render_widget(
         Paragraph::new(
             lines
@@ -1901,10 +1971,23 @@ fn draw_help(frame: &mut Frame<'_>, m: &Model, state: &HelpState) {
             inner,
         );
     }
+    offset
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_spinner_turns_with_the_clock_it_is_given() {
+        use std::time::{Duration, UNIX_EPOCH};
+
+        use super::*;
+        let at = |ms| UNIX_EPOCH + Duration::from_millis(ms);
+        assert_eq!(spinner(at(0)), SPINNER[0]);
+        assert_eq!(spinner(at(99)), SPINNER[0]);
+        assert_eq!(spinner(at(100)), SPINNER[1]);
+        assert_eq!(spinner(at(100 * SPINNER.len() as u64)), SPINNER[0]);
+    }
+
     #[test]
     fn justify_cuts_a_right_side_wider_than_the_line_instead_of_overflowing() {
         use super::*;

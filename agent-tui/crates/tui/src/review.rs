@@ -127,19 +127,29 @@ pub fn classify(lines: &[String]) -> Vec<(LineKind, Option<usize>, Option<usize>
 }
 
 /// The cursor over a diff document's lines.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct DiffView {
     /// What the cursor belongs to: another document starts afresh.
     pub owner: Option<crate::document::Slot>,
     pub cursor: usize,
     pub anchor: Option<usize>,
-    /// Scroll to show the cursor at the next draw.
-    pub reveal: bool,
-    /// Move the cursor onto the page at the next draw.
-    pub follow_page: bool,
 }
 
 impl DiffView {
+    /// This view once `slot`'s document with `lines` is under it: the
+    /// cursor starts afresh on another document and stays on a line.
+    pub fn settled(&self, slot: &crate::document::Slot, lines: &[LineInfo]) -> Self {
+        let first = first(lines).unwrap_or(0);
+        let last = last(lines).unwrap_or(0);
+        let fresh = self.owner.as_ref() != Some(slot);
+        let cursor = if fresh { first } else { self.cursor };
+        Self {
+            owner: Some(slot.clone()),
+            cursor: cursor.clamp(first, last),
+            anchor: if fresh { None } else { self.anchor }.map(|a| a.min(last)),
+        }
+    }
+
     /// The lines the cursor or its selection covers, first to last.
     pub fn span(&self) -> (usize, usize) {
         match self.anchor {

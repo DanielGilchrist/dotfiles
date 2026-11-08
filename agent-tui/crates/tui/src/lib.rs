@@ -38,7 +38,7 @@ use crossterm::terminal::{
 use ratatui::DefaultTerminal;
 use ratatui::layout::Rect;
 
-use model::{Connection, Intent, Mode, Model, Pane, TerminalFocus, Ticket};
+use model::{Connection, Intent, Mode, Model, Moment, Pane, StatusKind, TerminalFocus, Ticket};
 use palette::{Colours, Palette};
 use update::{Effect, Open};
 use worker::{Job, Msg, Workers};
@@ -251,7 +251,7 @@ impl Runtime {
             term,
             others: None,
             mode: Mode::Nav,
-            opened: Instant::now(),
+            opened: m.clock.mono,
         });
         m.touch_mru(&name);
         match intent {
@@ -346,6 +346,13 @@ impl Runtime {
         effects: Vec<Effect>,
     ) -> Result<Flow> {
         for effect in effects {
+            if let Some((kind, why)) = refusal(&effect) {
+                match kind {
+                    StatusKind::Info => m.info(why),
+                    StatusKind::Error => m.error(why),
+                }
+                continue;
+            }
             match effect {
                 Effect::Quit => return Ok(Flow::Quit),
                 Effect::Job(job) => self.send(job)?,
@@ -358,6 +365,11 @@ impl Runtime {
                 Effect::ReadSubagent { name, id, workdir } => {
                     self.workers.read_subagent(name, id, workdir);
                 }
+                Effect::SuggestName {
+                    prompt,
+                    harness,
+                    generation,
+                } => self.workers.suggest_name(prompt, harness, generation),
                 Effect::Attach {
                     name,
                     intent,
@@ -406,7 +418,9 @@ impl Runtime {
                             }
                         },
                     };
-                    if let Err(e) = self.edit(terminal, cwd, file, line).map(drop) {
+                    let edited = self.edit(terminal, cwd, file, line).map(drop);
+                    m.clock = Moment::now();
+                    if let Err(e) = edited {
                         m.error(format!("{e:#}"));
                     }
                     m.schedule_preview();
@@ -418,7 +432,9 @@ impl Runtime {
                     if let Some(cwd) = &launch.cwd {
                         command.current_dir(cwd);
                     }
-                    match self.suspended(terminal, &mut command) {
+                    let ran = self.suspended(terminal, &mut command);
+                    m.clock = Moment::now();
+                    match ran {
                         Ok(status) if status.success() => {}
                         Ok(status) => m.error(format!("{label} exited with {status}")),
                         Err(e) => m.error(format!("{label}: {e:#}")),
@@ -444,11 +460,14 @@ impl Runtime {
                 }
                 Effect::EditTask(task) => {
                     Self::fill_screen(m, terminal);
-                    match self.edit_task(terminal, &task) {
+                    let edited = self.edit_task(terminal, &task);
+                    m.clock = Moment::now();
+                    match edited {
                         Ok(Some(task)) => {
+                            let now = m.clock.mono;
                             if let model::Overlay::New(form) = &mut m.overlay {
                                 form.task = task;
-                                form.prompt_changed();
+                                form.prompt_changed(now);
                             }
                         }
                         Ok(None) => {}
@@ -563,7 +582,11 @@ fn event_loop(
         {
             m.error(format!("resizing the pane: {e}"));
         }
-        terminal.draw(|f| view::draw(f, &mut m))?;
+        let size = Rect::from(terminal.size()?);
+        if size != m.size {
+            update::resized(&mut m, size);
+        }
+        view::paint(terminal, &mut m)?;
         let title = m.attention().title();
         if title != last_title {
             set_title(terminal, &title);
@@ -573,6 +596,7 @@ fn event_loop(
         let mut effects = update::tick(&mut m);
         match inbox.recv_timeout(FRAME) {
             Ok(msg) => {
+                m.clock = Moment::now();
                 effects.extend(update::update(&mut m, msg));
                 for msg in inbox.try_iter() {
                     effects.extend(update::update(&mut m, msg));
@@ -608,6 +632,27 @@ fn event_loop(
         }
     }
     Ok(())
+}
+
+/// Why an effect that runs in a folder can't: the folder is gone, which only
+/// the runner may look for.
+fn refusal(effect: &Effect) -> Option<(StatusKind, String)> {
+    match effect {
+        Effect::Edit(open) => Some(open.dir())
+            .filter(|dir| !dir.is_dir())
+            .map(|dir| (StatusKind::Info, format!("{} is gone", dir.display()))),
+        Effect::Interactive { label, launch } => launch
+            .cwd
+            .as_deref()
+            .filter(|cwd| !cwd.is_dir())
+            .map(|cwd| {
+                (
+                    StatusKind::Error,
+                    format!("{label}: {} is gone", cwd.display()),
+                )
+            }),
+        _ => None,
+    }
 }
 
 const TRANSCRIPT_PREFIX: &str = "agent-transcript-";
@@ -659,6 +704,39 @@ fn write_transcript(name: &str, text: &str) -> Result<std::path::PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    use agent_core::actions::CommandLine;
+
+    use super::*;
+
+    #[test]
+    fn running_in_a_folder_that_is_gone_is_refused_with_its_name() {
+        let dir = tempfile::tempdir().expect("a dir");
+        let gone = dir.path().join("deleted");
+        let edit = Effect::Edit(Open::File {
+            root: gone.clone(),
+            file: "a.rs".into(),
+        });
+        let (kind, why) = refusal(&edit).expect("refused");
+        assert_eq!(kind, StatusKind::Info);
+        assert!(why.contains("deleted") && why.ends_with("is gone"), "{why}");
+        assert!(refusal(&Effect::Edit(Open::Checkout(gone.clone()))).is_some());
+        assert!(refusal(&Effect::Edit(Open::Checkout(dir.path().into()))).is_none());
+
+        let interactive = |cwd| Effect::Interactive {
+            label: "lazygit".into(),
+            launch: CommandLine {
+                program: "lazygit".into(),
+                args: Vec::new(),
+                cwd: Some(cwd),
+            },
+        };
+        let (kind, why) = refusal(&interactive(gone)).expect("refused");
+        assert_eq!(kind, StatusKind::Error);
+        assert!(why.starts_with("lazygit: "), "{why}");
+        assert!(refusal(&interactive(dir.path().into())).is_none());
+        assert!(refusal(&Effect::Quit).is_none());
+    }
+
     #[test]
     fn old_transcript_files_are_cleared_and_other_files_and_new_ones_stay() {
         let dir = tempfile::tempdir().expect("a dir");

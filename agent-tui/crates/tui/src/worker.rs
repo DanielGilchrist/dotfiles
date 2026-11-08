@@ -18,7 +18,7 @@ use agent_core::ports::{ClientId, FileDiff, HarnessId, HostError, SubagentDetail
 use crossterm::event::{KeyEvent, MouseEvent};
 
 use crate::document::{Doc, Key, assemble};
-use crate::model::{Launchable, RepoChoice, Ticket};
+use crate::model::{Found, Launchable, RepoChoice, Ticket};
 
 /// How much of a failed action's stderr is read for its last line.
 const STDERR_TAIL: u64 = 64 * 1024;
@@ -67,6 +67,11 @@ pub enum Msg {
     TookOver {
         name: SessionName,
         detached: Result<usize, String>,
+    },
+    /// What is at `path`.
+    DirChecked {
+        path: PathBuf,
+        found: Found,
     },
     /// The terminal gained or lost focus.
     Focus(crate::model::TerminalFocus),
@@ -166,12 +171,8 @@ pub enum Job {
     },
     /// Remember the selection for the next start.
     Select(SessionName),
-    /// Ask the harness's model for a name; runs on its own thread.
-    SuggestName {
-        prompt: Prompt,
-        harness: HarnessId,
-        generation: u64,
-    },
+    /// Look at the filesystem for a typed repo path.
+    CheckDir(PathBuf),
     TakeOver {
         name: SessionName,
         own: Option<ClientId>,
@@ -199,7 +200,7 @@ impl Job {
             Self::PlanRemoval { .. }
             | Self::CheckShared { .. }
             | Self::Select(_)
-            | Self::SuggestName { .. }
+            | Self::CheckDir(_)
             | Self::TakeOver { .. }
             | Self::Acknowledge(_)
             | Self::Reply { .. }
@@ -228,6 +229,7 @@ pub struct Workers {
     inspector: Arc<Inspector>,
     subagents: Arc<SubagentReader>,
     documents: Arc<DocumentReader>,
+    namer: Arc<Namer>,
     pub refresh: Sender<()>,
     worker: Option<JoinHandle<()>>,
 }
@@ -249,6 +251,12 @@ impl Workers {
     /// Asks for what subagent `id` of an agent working in `workdir` has done.
     pub fn read_subagent(&self, name: SessionName, id: AgentId, workdir: PathBuf) {
         self.subagents.request((name, id), workdir);
+    }
+
+    /// Asks the harness's model to name `prompt`. A request still waiting
+    /// when a newer one comes is dropped, so only the latest is answered.
+    pub fn suggest_name(&self, prompt: Prompt, harness: HarnessId, generation: u64) {
+        self.namer.request((), (prompt, harness, generation));
     }
 }
 
@@ -422,6 +430,30 @@ fn spawn_subagent_readers(backend: &Arc<Backend>, msgs: &Sender<Msg>) -> Arc<Sub
     reader
 }
 
+/// Asks the model to name prompts on one thread, one at a time. A model
+/// call takes seconds, so the form's typing pauses must not each start one.
+type Namer = Queue<(), (Prompt, HarnessId, u64)>;
+
+fn spawn_namer(
+    ask: impl Fn(&Prompt, &HarnessId) -> Option<AgentName> + Send + 'static,
+    msgs: &Sender<Msg>,
+) -> Arc<Namer> {
+    let namer = Arc::new(Namer::new());
+    let queue = Arc::clone(&namer);
+    let msgs = msgs.clone();
+    thread::spawn(move || {
+        loop {
+            let ((), (prompt, harness, generation)) = queue.next();
+            let name = ask(&prompt, &harness);
+            queue.done(&());
+            if msgs.send(Msg::NameSuggested { generation, name }).is_err() {
+                return;
+            }
+        }
+    });
+    namer
+}
+
 /// Two threads: one refreshes the snapshot, coalescing requests; the other
 /// runs user actions in order. A slow refresh never delays an action.
 pub fn spawn(backend: Arc<Backend>, sources: Sources, msgs: Sender<Msg>) -> Workers {
@@ -471,6 +503,21 @@ pub fn spawn(backend: Arc<Backend>, sources: Sources, msgs: Sender<Msg>) -> Work
     let inspector = spawn_inspectors(&backend, &msgs);
     let subagents = spawn_subagent_readers(&backend, &msgs);
     let documents = spawn_document_readers(&backend, &msgs);
+    let namer = {
+        let backend = Arc::clone(&backend);
+        spawn_namer(
+            move |prompt, harness| {
+                let question = agent_core::naming::question(prompt);
+                backend
+                    .harnesses
+                    .get(harness)
+                    .and_then(|h| h.ask(&question).ok().flatten())
+                    .as_deref()
+                    .and_then(agent_core::naming::from_model)
+            },
+            &msgs,
+        )
+    };
     let (jobs, rx) = mpsc::channel::<Job>();
     let after = refresh.clone();
     let worker = thread::spawn(move || {
@@ -491,6 +538,7 @@ pub fn spawn(backend: Arc<Backend>, sources: Sources, msgs: Sender<Msg>) -> Work
         inspector,
         subagents,
         documents,
+        namer,
         refresh,
         worker: Some(worker),
     }
@@ -506,6 +554,9 @@ fn run_action(label: &str, launch: &CommandLine, msgs: &Sender<Msg>) -> Result<O
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
     let failed = |e: std::io::Error| format!("{label}: {e}");
+    if let Some(cwd) = launch.cwd.as_deref().filter(|cwd| !cwd.is_dir()) {
+        return Err(format!("{label}: {} is gone", cwd.display()));
+    }
     let mut log = tempfile::tempfile().map_err(failed)?;
     let mut command = Command::new(&launch.program);
     command.args(&launch.args);
@@ -553,29 +604,19 @@ fn snapshot(backend: &Backend) -> Msg {
     )
 }
 
-/// Runs `job`, returning its reply; a model call for a name may take
-/// seconds, so it replies later from its own thread instead.
+/// Runs `job`, returning its reply; an action replies later from its own
+/// thread instead.
 fn run(backend: &Arc<Backend>, job: Job, msgs: &Sender<Msg>) -> Option<Msg> {
     let svc = backend.services();
     let err = |e: ops::Error| describe(&e);
     Some(match job {
-        Job::SuggestName {
-            prompt,
-            harness,
-            generation,
-        } => {
-            let backend = Arc::clone(backend);
-            let msgs = msgs.clone();
-            thread::spawn(move || {
-                let question = agent_core::naming::question(&prompt);
-                let reply = backend
-                    .harnesses
-                    .get(&harness)
-                    .and_then(|h| h.ask(&question).ok().flatten());
-                let name = reply.as_deref().and_then(agent_core::naming::from_model);
-                let _ = msgs.send(Msg::NameSuggested { generation, name });
-            });
-            return None;
+        Job::CheckDir(path) => {
+            let found = if path.is_dir() {
+                Found::Dir
+            } else {
+                Found::Nothing
+            };
+            Msg::DirChecked { path, found }
         }
         Job::Run { label, launch } => {
             let msgs = msgs.clone();
@@ -726,4 +767,74 @@ fn run(backend: &Arc<Backend>, job: Job, msgs: &Sender<Msg>) -> Option<Msg> {
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use super::*;
+
+    const PATIENCE: Duration = Duration::from_secs(5);
+
+    #[test]
+    fn at_most_one_name_is_asked_for_at_a_time_and_only_the_latest_waiting_prompt_is() {
+        let (msgs, replies) = mpsc::channel();
+        let (started, running) = mpsc::channel::<u64>();
+        let (release, gate) = mpsc::channel::<()>();
+        let gate = Mutex::new(gate);
+        let asking = Arc::new(AtomicUsize::new(0));
+        let most = Arc::new(AtomicUsize::new(0));
+        let namer = {
+            let (asking, most) = (Arc::clone(&asking), Arc::clone(&most));
+            spawn_namer(
+                move |prompt, _| {
+                    let now = asking.fetch_add(1, Ordering::SeqCst) + 1;
+                    most.fetch_max(now, Ordering::SeqCst);
+                    let _ = started.send(prompt.as_str().len() as u64);
+                    gate.lock()
+                        .expect("gate lock")
+                        .recv_timeout(PATIENCE)
+                        .expect("released");
+                    asking.fetch_sub(1, Ordering::SeqCst);
+                    None
+                },
+                &msgs,
+            )
+        };
+        let harness: HarnessId = "claude".parse().expect("parses");
+        let ask = |generation: u64, text: &str| {
+            namer.request(
+                (),
+                (text.parse().expect("a prompt"), harness.clone(), generation),
+            );
+        };
+
+        ask(1, "first");
+        running.recv_timeout(PATIENCE).expect("the first is asked");
+        ask(2, "second one");
+        ask(3, "third one here");
+        assert!(
+            running.recv_timeout(Duration::from_millis(100)).is_err(),
+            "nothing else is asked while one is in flight"
+        );
+
+        release.send(()).expect("open");
+        assert_eq!(
+            running.recv_timeout(PATIENCE).expect("the latest is asked"),
+            "third one here".len() as u64,
+            "the prompt that was replaced is never asked"
+        );
+        release.send(()).expect("open");
+
+        let generations: Vec<u64> = (0..2)
+            .map(|_| match replies.recv_timeout(PATIENCE).expect("replies") {
+                Msg::NameSuggested { generation, .. } => generation,
+                _ => panic!("a name was expected"),
+            })
+            .collect();
+        assert_eq!(generations, [1, 3]);
+        assert_eq!(most.load(Ordering::SeqCst), 1, "never two at once");
+    }
 }

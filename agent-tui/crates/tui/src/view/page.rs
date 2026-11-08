@@ -1,10 +1,6 @@
 //! The main view [0] when it reads a document instead of showing the
 //! terminal.
 
-use std::fmt::Write;
-use std::path::Path;
-use std::time::Instant;
-
 use agent_core::activity::AgentId;
 use agent_core::model::{Head, RepoKey};
 use agent_core::names::{CarriageReturn, SessionName, clean};
@@ -14,6 +10,8 @@ use agent_core::ports::{
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
+use std::fmt::Write;
+use std::path::Path;
 use unicode_width::UnicodeWidthChar;
 
 use super::log;
@@ -25,10 +23,10 @@ use super::{
     truncate_start, warning, wrap,
 };
 use crate::document::{
-    BranchKey, CommitKey, DiffKey, Doc, FolderDocs, FolderKey, Hover, Key, Resolved,
+    BranchKey, CommitKey, DiffKey, Doc, FolderDocs, FolderKey, Hover, Key, Laid, Resolved,
 };
-use crate::model::{AgentStatus, Model, SubagentKey};
-use crate::review::{self, LineInfo};
+use crate::model::{AgentStatus, MainLayout, Model, SubagentKey};
+use crate::review::{self, DiffView, LineInfo};
 
 /// [0]'s title, what its top border says on the right, its bottom-right
 /// corner and its rows.
@@ -37,13 +35,18 @@ pub(super) struct Page {
     pub right: Vec<Span<'static>>,
     pub corner: Vec<Span<'static>>,
     pub lines: Vec<Line<'static>>,
+    /// How the document sat in its room, for the keys that move over it.
+    pub laid: MainLayout,
+    /// The document's rows, if this frame built them.
+    pub built: Option<Laid>,
 }
 
-/// A document's rows: built for this frame, or the ones the document cache
+/// A document's rows: a few that are not from a document, or a document's
+/// rows, built for this frame or `None` for the ones the document cache
 /// kept from an earlier frame.
 enum Rows {
     Built(Vec<Line<'static>>),
-    Cached,
+    Doc(Option<Laid>),
 }
 
 /// What a document says before it's scrolled and framed.
@@ -81,8 +84,9 @@ impl Body {
 
 /// What [0] reads instead of the terminal, in `area`, scrolled as the model
 /// says, or `None` while the cursor is on nothing it reads. `border` is the
-/// corner's style and `width` the whole panel's.
-pub(super) fn page(m: &mut Model, area: Rect, width: usize, border: Style) -> Option<Page> {
+/// corner's style and `width` the whole panel's. Nothing is kept: what the
+/// model should remember comes back in the [`Page`].
+pub(super) fn page(m: &Model, area: Rect, width: usize, border: Style) -> Option<Page> {
     let hover = m.hover()?;
     let columns = usize::from(area.width);
     // An agent that asks takes the top row, since it needs an answer and
@@ -112,23 +116,22 @@ pub(super) fn page(m: &mut Model, area: Rect, width: usize, border: Style) -> Op
     let height = height - pinned;
     let total = match &body.rows {
         Rows::Built(rows) => rows.len(),
-        Rows::Cached => m.docs.cached().len(),
+        Rows::Doc(Some(laid)) => laid.rows.len(),
+        Rows::Doc(None) => m.docs.cached().len(),
     };
-    if let Some(key) = &body.nav {
-        reveal(m, key, &body.entries, height);
-    }
-    let diff = body.diff && matches!(body.rows, Rows::Cached);
-    if diff {
-        settle_diff(m, hover.key().map(|k| k.slot()));
-        reveal_line(m, height);
-    }
-    let top = m.docs.place(total, height, body.tails);
-    if let Some(key) = &body.nav {
-        follow_page(m, key, &body.entries, top);
-    }
-    if diff {
-        follow_page_line(m, top);
-    }
+    let doc_lines: &[LineInfo] = match &body.rows {
+        Rows::Built(_) => &[],
+        Rows::Doc(Some(laid)) => &laid.lines,
+        Rows::Doc(None) => m.docs.lines(),
+    };
+    let diff = (body.diff && matches!(body.rows, Rows::Doc(_)))
+        .then(|| hover.key().map(|k| k.slot()))
+        .flatten();
+    let cursor = diff
+        .as_ref()
+        .map(|slot| m.diff_view.settled(slot, doc_lines));
+    let placed = m.docs.placed(total, height, body.tails);
+    let top = placed.top;
     let mut lines: Vec<Line<'static>> = Vec::new();
     if let Some(question) = question {
         let ask = "i answer";
@@ -148,10 +151,11 @@ pub(super) fn page(m: &mut Model, area: Rect, width: usize, border: Style) -> Op
     let from = lines.len();
     match &body.rows {
         Rows::Built(rows) => lines.extend(rows.iter().skip(top).take(height).cloned()),
-        Rows::Cached => lines.extend(m.docs.cached().iter().skip(top).take(height).cloned()),
+        Rows::Doc(Some(laid)) => lines.extend(laid.rows.iter().skip(top).take(height).cloned()),
+        Rows::Doc(None) => lines.extend(m.docs.cached().iter().skip(top).take(height).cloned()),
     }
-    if diff {
-        mark_lines(m, &mut lines, from, top, height);
+    if let Some(cursor) = &cursor {
+        mark_lines(m, &mut lines, doc_lines, cursor, (from, top, height));
     }
     if let Some(key) = &body.nav
         && m.main_focused()
@@ -187,11 +191,11 @@ pub(super) fn page(m: &mut Model, area: Rect, width: usize, border: Style) -> Op
     };
 
     let shown = format!("{}-{} of {total}", top + 1, (top + height).min(total));
-    let corner = if body.loading || m.docs.loading(Instant::now()) {
+    let corner = if body.loading || m.docs.loading(m.clock.mono) {
         vec![Span::styled("loading", dim())]
-    } else if m.docs.following() {
+    } else if placed.following() {
         vec![Span::styled("following", border)]
-    } else if m.docs.paused() {
+    } else if placed.paused() {
         vec![Span::styled(format!("paused {shown}"), border)]
     } else if total > height {
         vec![Span::styled(shown, border)]
@@ -203,65 +207,34 @@ pub(super) fn page(m: &mut Model, area: Rect, width: usize, border: Style) -> Op
         right,
         corner,
         lines,
+        laid: MainLayout {
+            total,
+            height,
+            tails: body.tails,
+            entries: body.entries,
+            nav: body.nav,
+            diff,
+        },
+        built: match body.rows {
+            Rows::Doc(laid) => laid,
+            Rows::Built(_) => None,
+        },
     })
-}
-
-/// Starts the diff cursor afresh on another document and keeps it on a line.
-fn settle_diff(m: &mut Model, slot: Option<crate::document::Slot>) {
-    let first = review::first(m.docs.lines()).unwrap_or(0);
-    let last = review::last(m.docs.lines()).unwrap_or(0);
-    let view = &mut m.diff_view;
-    if view.owner != slot {
-        view.owner = slot;
-        view.cursor = first;
-        view.anchor = None;
-    }
-    view.cursor = view.cursor.clamp(first, last);
-    view.anchor = view.anchor.map(|a| a.min(last));
-}
-
-/// Scrolls so the cursor's lines show, once, after a key moved it.
-fn reveal_line(m: &mut Model, height: usize) {
-    if !std::mem::take(&mut m.diff_view.reveal) {
-        return;
-    }
-    let (from, to) = m.diff_view.span();
-    let lines = m.docs.lines();
-    let (Some(first), Some(last)) = (lines.get(from), lines.get(to)) else {
-        return;
-    };
-    let (start, end) = (first.row, last.row + last.height);
-    let top = m.docs.scroll;
-    if start < top {
-        m.docs.scroll = start;
-    } else if end > top + height {
-        m.docs.scroll = end.saturating_sub(height).min(start);
-    }
-}
-
-/// Moves the cursor onto the first line on screen after a page scroll.
-fn follow_page_line(m: &mut Model, top: usize) {
-    if !std::mem::take(&mut m.diff_view.follow_page) {
-        return;
-    }
-    let lines = m.docs.lines();
-    let at = lines
-        .iter()
-        .position(|l| l.selectable() && l.row + l.height > top)
-        .or_else(|| review::last(lines));
-    if let Some(at) = at {
-        m.diff_view.cursor = at;
-        m.diff_view.anchor = None;
-    }
 }
 
 /// `▌` in the gutter of the cursor's lines while [0] has the keys, and `✎`
 /// on lines the agent's draft comments on.
-fn mark_lines(m: &Model, out: &mut [Line<'static>], from: usize, top: usize, height: usize) {
+fn mark_lines(
+    m: &Model,
+    out: &mut [Line<'static>],
+    infos: &[LineInfo],
+    cursor: &DiffView,
+    (from, top, height): (usize, usize, usize),
+) {
     let drafts = m.selected_entry().map_or(&[][..], |e| m.draft(e.name()));
     let rev = crate::update::commit_rev(m);
-    let (lo, hi) = m.diff_view.span();
-    for (at, line) in m.docs.lines().iter().enumerate() {
+    let (lo, hi) = cursor.span();
+    for (at, line) in infos.iter().enumerate() {
         let selected = m.main_focused() && (lo..=hi).contains(&at);
         let commented = drafts.iter().any(|c| c.covers(line, rev.as_deref()));
         if !selected && !commented {
@@ -280,44 +253,6 @@ fn mark_lines(m: &Model, out: &mut [Line<'static>], from: usize, top: usize, hei
                 *first = mark.clone();
             }
         }
-    }
-}
-
-/// Scrolls so the cursor's entry shows, once, after a key moved it.
-fn reveal(m: &mut Model, key: &SubagentKey, entries: &[(usize, usize)], height: usize) {
-    if !std::mem::take(&mut m.log_view.reveal) {
-        return;
-    }
-    let Some(&(start, len)) = m
-        .watched(key)
-        .and_then(|w| w.nav.cursor)
-        .and_then(|at| entries.get(at))
-    else {
-        return;
-    };
-    let top = m.docs.scroll;
-    if start < top {
-        m.docs.scroll = start;
-    } else if start + len > top + height {
-        m.docs.scroll = (start + len).saturating_sub(height).min(start);
-    }
-}
-
-/// Moves the cursor onto the first entry on screen after a page scroll.
-fn follow_page(m: &mut Model, key: &SubagentKey, entries: &[(usize, usize)], top: usize) {
-    if !std::mem::take(&mut m.log_view.follow_page) {
-        return;
-    }
-    let at = entries
-        .iter()
-        .position(|&(start, len)| start + len > top)
-        .unwrap_or(entries.len().saturating_sub(1));
-    if let Some(watched) = m
-        .agents
-        .get_mut(&key.0)
-        .and_then(|t| t.subagents.get_mut(&key.1))
-    {
-        watched.nav.cursor = Some(at);
     }
 }
 
@@ -353,17 +288,15 @@ fn names_in(names: &[String], room: usize) -> String {
 /// The hovered file's diff, or the last read of the same file while the new
 /// one loads, under the file's name, counts and who else changed it. Another
 /// file's diff is never shown under this one's title.
-fn diff_body(m: &mut Model, hover: &DiffKey, columns: usize, budget: usize) -> Body {
+fn diff_body(m: &Model, hover: &DiffKey, columns: usize, budget: usize) -> Body {
     let rows = match m.docs.resolve() {
         Resolved::Current(key, loaded) | Resolved::Stale(key, loaded) => {
             let (key, loaded) = (key.clone(), loaded.clone());
-            m.docs
-                .rows_with_lines(&key, columns, || match loaded.as_ref() {
-                    Ok(Doc::Diff(diff)) => diff_rows_info(&hover.change.path, Ok(diff), columns, 0),
-                    Ok(Doc::Branch(_) | Doc::Folder(_)) => (Vec::new(), Vec::new()),
-                    Err(e) => diff_rows_info(&hover.change.path, Err(e), columns, 0),
-                });
-            Rows::Cached
+            Rows::Doc(m.docs.laid(&key, columns, || match loaded.as_ref() {
+                Ok(Doc::Diff(diff)) => diff_rows_info(&hover.change.path, Ok(diff), columns, 0),
+                Ok(Doc::Branch(_) | Doc::Folder(_)) => (Vec::new(), Vec::new()),
+                Err(e) => diff_rows_info(&hover.change.path, Err(e), columns, 0),
+            }))
         }
         Resolved::Missing => Rows::Built(Vec::new()),
     };
@@ -420,19 +353,20 @@ fn diff_body(m: &mut Model, hover: &DiffKey, columns: usize, budget: usize) -> B
 /// markers and counts, then each file's diff under its own header, in the
 /// tree's order. The list comes from the git facts already read, so it shows
 /// at once. The diffs follow when they have been read.
-fn folder_body(m: &mut Model, hover: &FolderKey, columns: usize, budget: usize) -> Body {
+fn folder_body(m: &Model, hover: &FolderKey, columns: usize, budget: usize) -> Body {
     let rows = match m.docs.resolve() {
         Resolved::Current(key, loaded) | Resolved::Stale(key, loaded) => {
             let (key, loaded) = (key.clone(), loaded.clone());
-            m.docs
-                .rows_with_lines(&key, columns, || match (&key, loaded.as_ref()) {
-                    (Key::Folder(folder), Ok(Doc::Folder(docs))) => {
-                        folder_rows(folder, Some(Ok(docs)), columns)
-                    }
-                    (Key::Folder(folder), Err(e)) => folder_rows(folder, Some(Err(e)), columns),
-                    _ => (Vec::new(), Vec::new()),
-                });
-            Rows::Cached
+            Rows::Doc(
+                m.docs
+                    .laid(&key, columns, || match (&key, loaded.as_ref()) {
+                        (Key::Folder(folder), Ok(Doc::Folder(docs))) => {
+                            folder_rows(folder, Some(Ok(docs)), columns)
+                        }
+                        (Key::Folder(folder), Err(e)) => folder_rows(folder, Some(Err(e)), columns),
+                        _ => (Vec::new(), Vec::new()),
+                    }),
+            )
         }
         Resolved::Missing => Rows::Built(folder_rows(hover, None, columns).0),
     };
@@ -581,21 +515,18 @@ fn section_rows(
 
 /// A commit opened from the branch view: the files it changed, then each
 /// file's diff against its parent.
-fn commit_body(m: &mut Model, hover: &CommitKey, columns: usize) -> Body {
+fn commit_body(m: &Model, hover: &CommitKey, columns: usize) -> Body {
     let rows = match m.docs.resolve() {
         Resolved::Current(key, loaded) | Resolved::Stale(key, loaded) => {
             let (key, loaded) = (key.clone(), loaded.clone());
-            m.docs
-                .rows_with_lines(&key, columns, || match loaded.as_ref() {
-                    Ok(Doc::Folder(docs)) => {
-                        let files: Vec<Change> =
-                            docs.files.iter().map(|f| f.change.clone()).collect();
-                        section_rows(&files, Path::new(""), Some(Ok(docs)), columns)
-                    }
-                    Err(e) => section_rows(&[], Path::new(""), Some(Err(e)), columns),
-                    Ok(_) => (Vec::new(), Vec::new()),
-                });
-            Rows::Cached
+            Rows::Doc(m.docs.laid(&key, columns, || match loaded.as_ref() {
+                Ok(Doc::Folder(docs)) => {
+                    let files: Vec<Change> = docs.files.iter().map(|f| f.change.clone()).collect();
+                    section_rows(&files, Path::new(""), Some(Ok(docs)), columns)
+                }
+                Err(e) => section_rows(&[], Path::new(""), Some(Err(e)), columns),
+                Ok(_) => (Vec::new(), Vec::new()),
+            }))
         }
         Resolved::Missing => Rows::Built(Vec::new()),
     };
@@ -614,7 +545,7 @@ fn commit_body(m: &mut Model, hover: &CommitKey, columns: usize) -> Body {
 
 /// The branch: how far it is from shipping, its commits and the files not
 /// yet committed.
-fn branch_body(m: &mut Model, key: &BranchKey, columns: usize) -> Body {
+fn branch_body(m: &Model, key: &BranchKey, columns: usize) -> Body {
     let title = vec![
         Span::raw("[0] "),
         Span::styled(second_tab(&key.compared), bold()),
@@ -625,19 +556,17 @@ fn branch_body(m: &mut Model, key: &BranchKey, columns: usize) -> Body {
     let rows = match m.docs.resolve() {
         Resolved::Current(key, loaded) | Resolved::Stale(key, loaded) => {
             let (key, loaded) = (key.clone(), loaded.clone());
-            m.docs
-                .rows_with_lines(&key, columns, || match loaded.as_ref() {
-                    Ok(Doc::Branch(log)) => branch_rows(log, &compared, behind, columns),
-                    Ok(Doc::Diff(_) | Doc::Folder(_)) => (Vec::new(), Vec::new()),
-                    Err(e) => (
-                        vec![Line::styled(
-                            e.lines().next().unwrap_or_default().to_string(),
-                            error(),
-                        )],
-                        Vec::new(),
-                    ),
-                });
-            Rows::Cached
+            Rows::Doc(m.docs.laid(&key, columns, || match loaded.as_ref() {
+                Ok(Doc::Branch(log)) => branch_rows(log, &compared, behind, columns),
+                Ok(Doc::Diff(_) | Doc::Folder(_)) => (Vec::new(), Vec::new()),
+                Err(e) => (
+                    vec![Line::styled(
+                        e.lines().next().unwrap_or_default().to_string(),
+                        error(),
+                    )],
+                    Vec::new(),
+                ),
+            }))
         }
         Resolved::Missing => Rows::Built(Vec::new()),
     };
@@ -827,7 +756,7 @@ fn turn_body(m: &Model, name: &SessionName, columns: usize) -> Option<Body> {
                 dim(),
             )
         }));
-        if queue.stalled(m.activity(name).map(|a| a.events)) {
+        if queue.stalled(m.activity(name).map(|a| a.events), m.clock.mono) {
             rows.push(Line::styled(
                 truncate_end(&format!("queued · waiting for {name} to report"), columns),
                 dim(),
@@ -902,8 +831,8 @@ fn log_body(m: &Model, name: &SessionName, id: &AgentId, columns: usize, budget:
         &nav,
         &log::Context {
             columns,
-            now: m.now,
-            spinner: spinner(),
+            now: m.clock.wall,
+            spinner: spinner(m.clock.wall),
             checkout: checkout.as_deref(),
             home: home.as_deref(),
         },

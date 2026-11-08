@@ -182,15 +182,6 @@ impl Nav {
     }
 }
 
-/// What the view and the keys share about [0]'s subagent log.
-#[derive(Debug, Default)]
-pub struct LogView {
-    /// Scroll to show the cursor's entry at the next draw.
-    pub reveal: bool,
-    /// Move the cursor onto the page at the next draw.
-    pub follow_page: bool,
-}
-
 /// `text` in a code fence long enough that no run of backticks inside it
 /// ends the fence early.
 fn fenced(text: &str) -> String {

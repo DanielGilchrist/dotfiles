@@ -289,12 +289,36 @@ enum Tail {
     Suspended,
 }
 
+/// A document's rows at a width, with the diff lines behind them.
+pub struct Laid {
+    key: Key,
+    width: usize,
+    pub rows: Vec<Line<'static>>,
+    pub lines: Vec<LineInfo>,
+}
+
+/// Where a document sits in its room, and whether its log follows its end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Placed {
+    pub top: usize,
+    tail: Tail,
+}
+
+impl Placed {
+    pub fn following(self) -> bool {
+        self.tail == Tail::Following
+    }
+
+    /// Whether the log was scrolled away from its end.
+    pub fn paused(self) -> bool {
+        self.tail == Tail::Paused
+    }
+}
+
 #[derive(Default)]
 pub struct Documents {
     /// Rows scrolled past, clamped when drawn.
     pub scroll: usize,
-    /// Rows of [0] as last drawn, for paging.
-    pub page: usize,
     /// Whether the document on screen is a log that follows its end:
     /// scrolling up pauses it and reaching the end resumes.
     tail: Tail,
@@ -320,7 +344,6 @@ impl Documents {
                 requested: std::mem::take(&mut self.requested),
                 cache: std::mem::take(&mut self.cache),
                 scroll: self.scroll,
-                page: self.page,
                 ..Self::default()
             };
             return;
@@ -384,7 +407,7 @@ impl Documents {
     /// A read finished. Whatever it was for is cached, shown or not, unless
     /// it failed, which is shown for a few seconds and then asked again.
     /// Older requests for the same slot were replaced and won't answer.
-    pub fn loaded(&mut self, key: &Key, result: Result<Doc, String>) {
+    pub fn loaded(&mut self, key: &Key, result: Result<Doc, String>, now: Instant) {
         let Some(at) = self.requested.iter().position(|k| k == key) else {
             return;
         };
@@ -400,7 +423,7 @@ impl Documents {
         self.cache.push(Entry {
             key: key.clone(),
             loaded: Arc::new(result),
-            at: Instant::now(),
+            at: now,
             bytes,
         });
         self.rows = None;
@@ -462,23 +485,33 @@ impl Documents {
     }
 
     /// Rows and the diff lines behind them for the document under `key` at
-    /// `width`, built once.
-    pub fn rows_with_lines(
-        &mut self,
+    /// `width`, unless they are already kept. A frame that builds them hands
+    /// them back to be kept with [`Self::keep`], so the next one needn't.
+    pub fn laid(
+        &self,
         key: &Key,
         width: usize,
         build: impl FnOnce() -> (Vec<Line<'static>>, Vec<LineInfo>),
-    ) -> &[Line<'static>] {
-        if !self
+    ) -> Option<Laid> {
+        if self
             .rows
             .as_ref()
             .is_some_and(|(k, w, _)| k == key && *w == width)
         {
-            let (rows, lines) = build();
-            self.rows = Some((key.clone(), width, rows));
-            self.lines = lines;
+            return None;
         }
-        self.rows.as_ref().map_or(&[], |(_, _, rows)| rows)
+        let (rows, lines) = build();
+        Some(Laid {
+            key: key.clone(),
+            width,
+            rows,
+            lines,
+        })
+    }
+
+    pub fn keep(&mut self, laid: Laid) {
+        self.rows = Some((laid.key, laid.width, laid.rows));
+        self.lines = laid.lines;
     }
 
     /// Whether what's shown is for an earlier cursor position and the read
@@ -521,32 +554,43 @@ impl Documents {
         };
     }
 
-    /// The first row shown of `total` rows in `height`, and the scroll kept
-    /// at it. A log that follows its end stays on it as rows are added until
-    /// scrolled up, and following resumes on reaching the end again.
-    pub fn place(&mut self, total: usize, height: usize, tails: bool) -> usize {
+    /// The first row shown of `total` rows in `height`, and whether the
+    /// log on screen then follows its end. A log that follows its end stays
+    /// on it as rows are added until scrolled up, and following resumes on
+    /// reaching the end again. Drawing shows this without keeping it.
+    pub fn placed(&self, total: usize, height: usize, tails: bool) -> Placed {
         let last = total.saturating_sub(height);
-        if self.tail == Tail::Following && !tails {
-            self.scroll = 0;
-        }
-        self.page = height;
+        let scroll = if self.tail == Tail::Following && !tails {
+            0
+        } else {
+            self.scroll
+        };
         let top = if tails && matches!(self.tail, Tail::Off | Tail::Following) {
             last
         } else {
-            self.scroll.min(last)
+            scroll.min(last)
         };
-        self.tail = match (tails, self.tail) {
+        let tail = match (tails, self.tail) {
             (false, Tail::Off | Tail::Following) => Tail::Off,
             (false, Tail::Paused | Tail::Suspended) => Tail::Suspended,
             (true, Tail::Off | Tail::Following) => Tail::Following,
             (true, Tail::Paused | Tail::Suspended) if top >= last => Tail::Following,
             (true, Tail::Paused | Tail::Suspended) => Tail::Paused,
         };
-        self.scroll = top;
-        top
+        Placed { top, tail }
+    }
+
+    /// Keeps the scroll and following [`Self::placed`] settled on, once a
+    /// draw has shown them.
+    pub fn place(&mut self, total: usize, height: usize, tails: bool) -> usize {
+        let placed = self.placed(total, height, tails);
+        self.tail = placed.tail;
+        self.scroll = placed.top;
+        placed.top
     }
 
     /// Whether the log on screen follows its end.
+    #[cfg(test)]
     pub fn following(&self) -> bool {
         self.tail == Tail::Following
     }
@@ -556,9 +600,14 @@ impl Documents {
         self.tail == Tail::Paused
     }
 
-    /// Half the rows of [0], at least one.
-    pub fn half_page(&self) -> isize {
-        isize::try_from(self.page / 2).unwrap_or(isize::MAX).max(1)
+    /// Scrolls just far enough that rows `start..end` show in `height`.
+    pub fn reveal(&mut self, start: usize, end: usize, height: usize) {
+        let top = self.scroll;
+        if start < top {
+            self.scroll = start;
+        } else if end > top + height {
+            self.scroll = end.saturating_sub(height).min(start);
+        }
     }
 
     /// Drops everything about an agent that's gone.
@@ -608,7 +657,7 @@ mod tests {
         assert_eq!(docs.due(t0), None, "not at once");
         let a = docs.due(t0 + REST).expect("after the rest");
         assert_eq!(docs.due(t0 + REST), None, "once");
-        docs.loaded(&a, Ok(diff("a")));
+        docs.loaded(&a, Ok(diff("a")), t0);
         docs.settle(Some(&Hover::Diff(key("a", 1))), t0 + REST);
         assert_eq!(path_of(&docs), Some("a".into()));
 
@@ -618,7 +667,7 @@ mod tests {
         assert!(!docs.loading(t1 + Duration::from_millis(100)));
         assert!(docs.loading(t1 + LOADING_AFTER));
         let b = docs.due(t1 + REST).expect("b is read");
-        docs.loaded(&b, Ok(diff("b")));
+        docs.loaded(&b, Ok(diff("b")), t0);
         docs.settle(Some(&Hover::Diff(key("b", 2))), t1 + REST);
         assert_eq!(path_of(&docs), Some("b".into()));
         assert!(!docs.loading(t1 + Duration::from_secs(9)));
@@ -654,14 +703,14 @@ mod tests {
     fn the_cache_keeps_the_last_few_and_an_answer_nobody_asked_for_is_dropped() {
         let mut docs = Documents::default();
         let t0 = Instant::now();
-        docs.loaded(&Key::Diff(key("x", 1)), Ok(diff("x")));
+        docs.loaded(&Key::Diff(key("x", 1)), Ok(diff("x")), t0);
         docs.settle(Some(&Hover::Diff(key("x", 1))), t0);
         assert!(docs.shown.is_none(), "never requested");
         for i in 0..CACHE + 5 {
             let k = key(&format!("f{i}"), i);
             docs.settle(Some(&Hover::Diff(k.clone())), t0);
             let due = docs.due(t0 + REST).expect("due");
-            docs.loaded(&due, Ok(diff("d")));
+            docs.loaded(&due, Ok(diff("d")), t0);
         }
         assert_eq!(docs.cache.len(), CACHE);
         assert!(docs.cache.iter().all(|e| {
@@ -675,7 +724,7 @@ mod tests {
         let t0 = Instant::now();
         docs.settle(Some(&Hover::Diff(key("a", 1))), t0);
         let a = docs.due(t0 + REST).expect("due");
-        docs.loaded(&a, Ok(diff("a")));
+        docs.loaded(&a, Ok(diff("a")), t0);
         docs.settle(Some(&Hover::Diff(key("a", 1))), t0 + REST);
         assert!(matches!(docs.resolve(), Resolved::Current(..)));
 
@@ -716,7 +765,7 @@ mod tests {
             .due(t0 + REST * 2)
             .expect("the newer one replaces the older in the queue");
         assert_ne!(first, second);
-        docs.loaded(&second, Ok(diff("two")));
+        docs.loaded(&second, Ok(diff("two")), t0);
         assert!(
             docs.requested.is_empty(),
             "the replaced request left nothing behind"
@@ -729,7 +778,7 @@ mod tests {
 
         docs.settle(Some(&Hover::Diff(key("c", 1))), t0);
         let c = docs.due(t0 + REST).expect("due");
-        docs.loaded(&c, Err("git failed".into()));
+        docs.loaded(&c, Err("git failed".into()), t0);
         docs.settle(Some(&Hover::Diff(key("c", 1))), t0 + REST);
         assert!(
             matches!(docs.resolve(), Resolved::Current(..)),
@@ -756,7 +805,7 @@ mod tests {
         for i in 0..5 {
             docs.settle(Some(&Hover::Diff(key(&format!("f{i}"), i))), t0);
             let due = docs.due(t0 + REST).expect("due");
-            docs.loaded(&due, Ok(big(i)));
+            docs.loaded(&due, Ok(big(i)), t0);
         }
         assert!(docs.cache.len() <= 3, "{}", docs.cache.len());
     }
@@ -894,7 +943,7 @@ mod tests {
         let t0 = Instant::now();
         docs.settle(Some(&Hover::Diff(k.clone())), t0);
         let due = docs.due(t0 + REST).expect("due");
-        docs.loaded(&due, Ok(diff("a")));
+        docs.loaded(&due, Ok(diff("a")), t0);
         let files = [change("d/a")];
         let name = k.name.clone();
         assert_eq!(docs.cached_diffs(&name, DiffBase::Fork, 0, &files).len(), 1);

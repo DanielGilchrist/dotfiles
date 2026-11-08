@@ -1,7 +1,6 @@
 //! What the model remembers per agent and per subagent, each kept in one
 //! record so pruning one drops everything known about it.
 
-use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -45,7 +44,7 @@ pub struct Tracked {
     /// The folders its [3] has closed. A folder that isn't named is open,
     /// so one that appears starts open.
     pub collapsed: HashSet<PathBuf>,
-    pub tree: RefCell<Option<CachedTree>>,
+    pub tree: Option<CachedTree>,
     /// When its facts were last asked for.
     pub inspection: Option<Inspection>,
     /// Comments drafted on diffs, until sent.
@@ -207,11 +206,11 @@ impl Outbox {
 
     /// Whether the worker may be asked to type the first message, as far as
     /// a hold goes.
-    pub fn unheld(&self) -> bool {
+    pub fn unheld(&self, now: Instant) -> bool {
         match self.phase {
             Phase::Waiting => true,
             Phase::InFlight => false,
-            Phase::Held { at, .. } => at.elapsed() > HOLD_FOR,
+            Phase::Held { at, .. } => now.saturating_duration_since(at) > HOLD_FOR,
         }
     }
 
@@ -290,10 +289,11 @@ impl Outbox {
 
     /// A message went in and the agent hasn't reported since, which a slash
     /// or `!` command never does.
-    pub fn stalled(&self, events: Option<u64>) -> bool {
+    pub fn stalled(&self, events: Option<u64>, now: Instant) -> bool {
         !self.in_flight()
             && self.last_typed.is_some_and(|typed| {
-                events == Some(typed.events) && typed.at.elapsed() > STALL_AFTER
+                events == Some(typed.events)
+                    && now.saturating_duration_since(typed.at) > STALL_AFTER
             })
     }
 }
@@ -316,66 +316,63 @@ mod tests {
         outbox
     }
 
-    fn ago(by: Duration) -> Instant {
-        Instant::now()
-            .checked_sub(by)
-            .expect("the clock has run that long")
-    }
-
-    fn typed(events: u64) -> Typed {
-        Typed {
-            events,
-            at: Instant::now(),
-        }
+    fn typed(events: u64, at: Instant) -> Typed {
+        Typed { events, at }
     }
 
     #[test]
     fn a_queue_starts_waiting_goes_in_flight_and_waits_again_once_the_first_is_typed() {
+        let now = Instant::now();
         let mut outbox = outbox(&["one", "two"]);
         assert!(matches!(outbox.phase(), Phase::Waiting));
-        assert!(outbox.unheld());
+        assert!(outbox.unheld(now));
         assert_eq!(outbox.start().as_str(), "one");
-        assert!(outbox.in_flight() && !outbox.unheld());
+        assert!(outbox.in_flight() && !outbox.unheld(now));
 
-        let outbox = outbox.delivered(Some(typed(3))).expect("one is left");
+        let outbox = outbox.delivered(Some(typed(3, now))).expect("one is left");
         assert!(matches!(outbox.phase(), Phase::Waiting));
         assert_eq!(outbox.front().as_str(), "two");
         assert_eq!(outbox.len(), 1);
         assert_eq!(outbox.last_typed.map(|t| t.events), Some(3));
-        assert!(outbox.delivered(Some(typed(4))).is_none(), "emptied");
+        assert!(outbox.delivered(Some(typed(4, now))).is_none(), "emptied");
     }
 
     #[test]
     fn a_refusal_holds_until_its_release_or_the_hold_runs_out() {
+        let now = Instant::now();
         let mut outbox = outbox(&["one"]);
         outbox.start();
-        outbox.refused(Release::NewEvents(5), Instant::now());
+        outbox.refused(Release::NewEvents(5), now);
         assert!(matches!(outbox.phase(), Phase::Held { .. }));
-        assert!(!outbox.unheld());
+        assert!(!outbox.unheld(now));
 
         outbox.read(Some(5));
         assert!(matches!(outbox.phase(), Phase::Held { .. }), "nothing new");
         outbox.read(None);
         assert!(matches!(outbox.phase(), Phase::Waiting), "it changed");
 
-        outbox.refused(Release::NextRead, Instant::now());
+        outbox.refused(Release::NextRead, now);
         outbox.read(Some(5));
         assert!(
             matches!(outbox.phase(), Phase::Waiting),
             "any read lifts it"
         );
 
-        outbox.refused(
-            Release::NewEvents(5),
-            ago(HOLD_FOR + Duration::from_secs(1)),
+        outbox.refused(Release::NewEvents(5), now);
+        assert!(
+            !outbox.unheld(now + HOLD_FOR),
+            "held for exactly the hold's time"
         );
-        assert!(outbox.unheld(), "asked again after the hold's time");
+        assert!(
+            outbox.unheld(now + HOLD_FOR + Duration::from_secs(1)),
+            "asked again after the hold's time"
+        );
     }
 
     #[test]
     fn a_dropped_message_leaves_the_rest_waiting_and_remembers_what_was_typed() {
         let mut outbox = outbox(&["one", "two"]);
-        outbox.last_typed = Some(typed(1));
+        outbox.last_typed = Some(typed(1, Instant::now()));
         outbox.start();
         let (dropped, rest) = outbox.dropped();
         assert_eq!(dropped.prompt.as_str(), "one");
@@ -388,23 +385,24 @@ mod tests {
 
     #[test]
     fn typing_waits_for_a_report_and_a_silent_agent_is_called_stalled() {
+        let now = Instant::now();
         let mut outbox = outbox(&["one"]);
         assert!(!outbox.awaits_report(Some(1)), "nothing typed yet");
-        outbox.last_typed = Some(typed(1));
+        outbox.last_typed = Some(typed(1, now));
         assert!(outbox.awaits_report(Some(1)));
         assert!(outbox.awaits_report(None), "nothing reported at all");
         assert!(!outbox.awaits_report(Some(2)));
-        assert!(!outbox.stalled(Some(1)), "just typed");
+        assert!(!outbox.stalled(Some(1), now), "just typed");
 
-        outbox.last_typed = Some(Typed {
-            events: 1,
-            at: ago(STALL_AFTER * 2),
-        });
-        assert!(outbox.stalled(Some(1)));
-        assert!(!outbox.stalled(Some(2)), "it reported");
+        let later = now + STALL_AFTER * 2;
+        assert!(outbox.stalled(Some(1), later));
+        assert!(!outbox.stalled(Some(2), later), "it reported");
 
         outbox.last_typed = None;
-        assert!(!outbox.stalled(Some(1)), "nothing typed since it reported");
+        assert!(
+            !outbox.stalled(Some(1), later),
+            "nothing typed since it reported"
+        );
         assert!(!outbox.awaits_report(None));
     }
 }

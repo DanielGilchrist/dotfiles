@@ -24,8 +24,8 @@ use super::{
     truncate_start, warning,
 };
 use crate::model::{
-    AgentStatus, Cursor, Doing, Extent, Failure, Fold, ListScroll, Listed, Model, Panel as Focused,
-    Place, Pulse, Row, Target, WorkRoom,
+    AgentStatus, Cursor, Doing, Drawn, Extent, Failure, Fold, ListScroll, Listed, Model,
+    Panel as Focused, Place, Pulse, Row, Target, WorkRoom,
 };
 use crate::tree::{ChangesScope, Counts, Node, TreeRow};
 
@@ -348,8 +348,8 @@ impl<'m> Deck<'m> {
     fn card(&self, entry: &Entry, title: Title, selected: bool) -> (Vec<Line<'static>>, Shown) {
         let m = self.m;
         let status = m.status(entry);
-        let heard = m.activity(entry.name()).map_or(m.now, |a| a.heard);
-        let gist = Gist::of(&status, heard, m.now)
+        let heard = m.activity(entry.name()).map_or(m.clock.wall, |a| a.heard);
+        let gist = Gist::of(&status, heard, m.clock.wall)
             .filter(|_| !matches!(title, Title::Elsewhere(_)) && self.has_line2(entry.name()));
         let subagents = match gist {
             Some(Gist::Delegating { .. }) => None,
@@ -403,7 +403,11 @@ impl<'m> Deck<'m> {
     ) -> Line<'static> {
         let m = self.m;
         let style = name_style(status, selected);
-        let mut left = vec![Span::raw(title.indent()), glyph(status), Span::raw(" ")];
+        let mut left = vec![
+            Span::raw(title.indent()),
+            glyph(status, m.clock.wall),
+            Span::raw(" "),
+        ];
         let fixed = line_width(&left);
         let mut repo = None;
         match title {
@@ -425,7 +429,7 @@ impl<'m> Deck<'m> {
             }
         }
         left.extend(subagents.map(|n| Span::styled(format!(" ↳{n}"), dim())));
-        let mut time = time_in_state(status, m.now);
+        let mut time = time_in_state(status, m.clock.wall);
         let mut markers = Vec::new();
         if m.pane
             .connection()
@@ -526,7 +530,7 @@ impl<'m> Deck<'m> {
             activity.subagents.values().collect(),
             self.form,
             self.content,
-            m.now,
+            m.clock.wall,
             cursor.and_then(|row| row.checked_sub(1)),
         ));
         (rows, cursor)
@@ -615,7 +619,9 @@ fn tree(
                     Span::styled("✓", success().add_modifier(Modifier::BOLD)),
                     ago(subagent.since, at),
                 ),
-                SubagentStatus::Running { .. } => (Span::raw(spinner()), ago(subagent.since, now)),
+                SubagentStatus::Running { .. } => {
+                    (Span::raw(spinner(now)), ago(subagent.since, now))
+                }
             };
             let described = subagent.description.as_deref().filter(|d| !d.is_empty());
             let (label, kind_only, right) = match (described, form) {
@@ -1024,10 +1030,9 @@ const AGENT_ROWS: usize = 6;
 /// allows), [2] with its rows up to a cap, and [3] in the rest. Without
 /// [3], [2] takes the rest, and without an agent selected, [1] does. A
 /// list with the keys scrolls to keep its cursor in view.
-fn lay_out(m: &Model, area: Rect) -> Option<Laid> {
+fn lay_out(m: &Model, area: Rect, room: usize) -> Option<Laid> {
     let snapshot = m.snapshot()?;
     let height = usize::from(area.height);
-    let room = usize::from(m.areas.sidebar.height);
     let deck = Deck::new(m, snapshot, usize::from(area.width).saturating_sub(2), room);
     let cursor = m.cursor();
     let list = list(&deck, snapshot, &m.rows(), cursor);
@@ -1391,8 +1396,8 @@ pub(super) fn others_on(m: &Model, name: &SessionName, path: &Path) -> Vec<Strin
 /// What the selected agent says about what it's doing, in full.
 pub(crate) fn turn_message(m: &Model, entry: &Entry) -> Option<String> {
     let status = m.status(entry);
-    let heard = m.activity(entry.name()).map_or(m.now, |a| a.heard);
-    Gist::of(&status, heard, m.now)?.message()
+    let heard = m.activity(entry.name()).map_or(m.clock.wall, |a| a.heard);
+    Gist::of(&status, heard, m.clock.wall)?.message()
 }
 
 /// The agent's subagents as tree rows, for [0]'s turn document.
@@ -1402,7 +1407,7 @@ pub(super) fn subagent_rows(m: &Model, entry: &Entry, width: usize) -> Vec<Line<
             a.subagents.values().collect(),
             Form::Long,
             width,
-            m.now,
+            m.clock.wall,
             None,
         )
     })
@@ -1412,7 +1417,7 @@ pub(super) fn subagent_rows(m: &Model, entry: &Entry, width: usize) -> Vec<Line<
 /// `width`.
 pub(super) fn queued_line(m: &Model, name: &SessionName, width: usize) -> Option<String> {
     let outbox = m.tracked(name)?.outbox.as_ref()?;
-    if outbox.stalled(m.activity(name).map(|a| a.events)) {
+    if outbox.stalled(m.activity(name).map(|a| a.events), m.clock.mono) {
         return Some(truncate_end(
             &format!("queued · waiting for {name} to report"),
             width,
@@ -1434,15 +1439,15 @@ pub(super) fn queued_line(m: &Model, name: &SessionName, width: usize) -> Option
 /// and for how long, cut to `width` by dropping what it's doing first.
 pub(super) fn status_line(m: &Model, entry: &Entry, width: usize) -> Vec<Span<'static>> {
     let status = m.status(entry);
-    let heard = m.activity(entry.name()).map_or(m.now, |a| a.heard);
-    let gist = Gist::of(&status, heard, m.now);
+    let heard = m.activity(entry.name()).map_or(m.clock.wall, |a| a.heard);
+    let gist = Gist::of(&status, heard, m.clock.wall);
     // A delegating gist already ends in how long it's been quiet.
     let time = match gist {
         Some(Gist::Delegating { .. }) => Vec::new(),
-        _ => time_in_state(&status, m.now),
+        _ => time_in_state(&status, m.clock.wall),
     };
     let mut spans = vec![
-        glyph(&status),
+        glyph(&status, m.clock.wall),
         Span::raw(" "),
         Span::styled(entry.label().to_string(), bold()),
     ];
@@ -1466,43 +1471,24 @@ const GIST_MIN: usize = 14;
 
 /// The three panels in `area`, the one `j`/`k` act on with `border` (the
 /// accent while the sidebar has the keys) and the others DIM.
-pub(super) fn draw(frame: &mut Frame<'_>, m: &mut Model, area: Rect, border: Style) {
+pub(super) fn draw(frame: &mut Frame<'_>, m: &Model, area: Rect, border: Style, out: &mut Drawn) {
     let nav = sidebar_focused(m);
     let style_of = |focused: bool| if focused { border } else { dim() };
     let agents = matches!(m.panel, Focused::Agents);
     let agent = matches!(m.panel.list(), Listed::Agent { .. });
     let files = matches!(m.panel.list(), Listed::Changes { .. });
-    // Overview's folds and the tier depend on the list's room, so it's
-    // measured before anything asks for the rows.
-    m.areas.sidebar = Rect::new(
-        area.x + 1,
-        area.y + 1,
-        area.width.saturating_sub(2),
-        list_room(area.height),
-    );
     let title = sidebar_title(m, usize::from(area.width).saturating_sub(4));
     let corner = sidebar_count(
         m,
         style_of(agents),
         usize::from(area.width).saturating_sub(4),
     );
-    let Some(laid) = lay_out(m, area) else {
-        m.work_room = WorkRoom::TooShort;
+    let Some(laid) = lay_out(m, area, usize::from(out.areas.sidebar.height)) else {
+        out.work_room = Some(WorkRoom::TooShort);
         frame.render_widget(panel(title, corner, style_of(agents), nav && agents), area);
         return;
     };
-    // A focused panel that stopped existing hands the focus back.
-    let laid =
-        if std::mem::discriminant(&laid.focus.list()) == std::mem::discriminant(&m.panel.list()) {
-            laid
-        } else {
-            m.panel = laid.focus;
-            match lay_out(m, area) {
-                Some(laid) => laid,
-                None => return,
-            }
-        };
-    m.areas.page = match laid.focus {
+    out.areas.page = match laid.focus {
         Focused::Agents => usize::from(laid.list.area.height),
         Focused::Agent { .. } => laid
             .agent
@@ -1515,8 +1501,8 @@ pub(super) fn draw(frame: &mut Frame<'_>, m: &mut Model, area: Rect, border: Sty
         Focused::Main(_) => 0,
     }
     .saturating_sub(2);
-    let agent_area = laid.agent.as_ref().map_or(Rect::default(), |p| p.area);
-    let changes_area = laid
+    out.areas.agent_panel = laid.agent.as_ref().map_or(Rect::default(), |p| p.area);
+    out.areas.changes_panel = laid
         .changes
         .as_ref()
         .map_or(Rect::default(), |(p, _)| p.area);
@@ -1560,14 +1546,11 @@ pub(super) fn draw(frame: &mut Frame<'_>, m: &mut Model, area: Rect, border: Sty
         let block = panel(title, corner, style_of(files), nav && files);
         frame.render_widget(Paragraph::new(lines).block(block), area);
     }
-    m.panel = std::mem::replace(&mut m.panel, Focused::Agents).with_list(laid.focus);
-    m.work_room = laid.room;
-    m.scroll = laid.scroll;
-    m.areas.rows = laid.hits;
-    m.areas.agent_rows = laid.agent_rows;
-    m.areas.change_rows = laid.change_rows;
-    m.areas.agent_panel = agent_area;
-    m.areas.changes_panel = changes_area;
+    out.work_room = Some(laid.room);
+    out.scroll = Some(laid.scroll);
+    out.areas.rows = laid.hits;
+    out.areas.agent_rows = laid.agent_rows;
+    out.areas.change_rows = laid.change_rows;
 }
 
 /// Whether text `wide` columns wide fits beside `title` in a border
@@ -1625,12 +1608,20 @@ mod tests {
         lines.iter().map(text).collect()
     }
 
+    /// What [0] asks to read once the cursor has rested, by moving the
+    /// clock instead of waiting.
+    fn due_after_rest(m: &mut Model) -> crate::document::Key {
+        m.settle();
+        m.docs
+            .due(m.clock.mono + crate::document::REST)
+            .expect("due")
+    }
+
     /// Draws the whole screen, as the app does.
     fn render(m: &mut Model, (width, height): (u16, u16)) -> Terminal<TestBackend> {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("a backend");
-        terminal
-            .draw(|frame| super::super::draw(frame, m))
-            .expect("draws");
+        crate::update::resized(m, Rect::new(0, 0, width, height));
+        super::super::paint(&mut terminal, m).expect("draws");
         terminal
     }
 
@@ -1642,7 +1633,7 @@ mod tests {
 
     fn laid(m: &mut Model, size: (u16, u16)) -> Laid {
         render(m, size);
-        lay_out(m, column(m, size)).expect("succeeds")
+        lay_out(m, column(m, size), usize::from(m.areas.sidebar.height)).expect("succeeds")
     }
 
     fn agent_lines(laid: &Laid) -> Vec<String> {
@@ -2649,9 +2640,7 @@ mod tests {
             m.areas.terminal
         };
         m.panel = Focused::Changes { file: 0 };
-        m.settle_main();
-        std::thread::sleep(crate::document::REST + std::time::Duration::from_millis(20));
-        let key = m.docs.due(std::time::Instant::now()).expect("due");
+        let key = due_after_rest(&mut m);
         m.docs.loaded(
             &key,
             Ok(crate::document::Doc::Diff(
@@ -2665,6 +2654,7 @@ mod tests {
                     more: 4000,
                 },
             )),
+            std::time::Instant::now(),
         );
         let terminal = render(&mut m, (100, 30));
         assert_eq!(
@@ -2710,9 +2700,7 @@ mod tests {
         let mut m = fleet(10);
         m.set_cursor(Cursor::Entry(name("rate-limit-9")));
         m.panel = Focused::Changes { file: 1 };
-        m.settle_main();
-        std::thread::sleep(crate::document::REST + std::time::Duration::from_millis(20));
-        let key = m.docs.due(std::time::Instant::now()).expect("due");
+        let key = due_after_rest(&mut m);
         m.docs.loaded(
             &key,
             Ok(crate::document::Doc::Diff(
@@ -2721,6 +2709,7 @@ mod tests {
                     more: 0,
                 },
             )),
+            std::time::Instant::now(),
         );
         let terminal = render(&mut m, (100, 30));
         let rows = screen(&terminal);
@@ -2914,9 +2903,7 @@ mod tests {
         m.set_cursor(Cursor::Entry(name("obs-layout-4")));
         m.toggle_changes_scope();
         m.panel = Focused::Changes { file: 0 };
-        m.settle_main();
-        std::thread::sleep(crate::document::REST + std::time::Duration::from_millis(20));
-        let key = m.docs.due(std::time::Instant::now()).expect("due");
+        let key = due_after_rest(&mut m);
         m.docs.loaded(
             &key,
             Ok(crate::document::Doc::Branch(BranchLog {
@@ -2926,6 +2913,7 @@ mod tests {
                     state: FileState::Unstaged(Edit::Modified),
                 }],
             })),
+            std::time::Instant::now(),
         );
         let text = screen(&render(&mut m, (100, 30))).join("\n");
         assert!(
@@ -3408,7 +3396,7 @@ mod tests {
         use agent_core::ports::FileDiff;
         let mut m = tree_fleet();
         m.panel = Focused::Changes { file: 0 };
-        m.settle_main();
+        m.settle();
         let before = screen(&render(&mut m, (140, 40))).join("\n");
         assert!(
             before.contains("view/sidebar.rs"),
@@ -3443,8 +3431,9 @@ mod tests {
                 files,
                 more_files: 4,
             })),
+            std::time::Instant::now(),
         );
-        m.settle_main();
+        m.settle();
         let text = screen(&render(&mut m, (140, 80))).join("\n");
         assert_eq!(text.matches("@@ -1 +1 @@").count(), 3, "{text}");
         assert!(text.contains("+new"), "{text}");
@@ -3469,9 +3458,7 @@ mod tests {
         use agent_core::ports::FileDiff;
         let mut m = tree_fleet();
         m.panel = Focused::Changes { file: 2 };
-        m.settle_main();
-        std::thread::sleep(crate::document::REST + std::time::Duration::from_millis(20));
-        let key = m.docs.due(std::time::Instant::now()).expect("due");
+        let key = due_after_rest(&mut m);
         let lines = [
             "@@ -10,3 +20,4 @@",
             " ctx",
@@ -3487,8 +3474,9 @@ mod tests {
                 lines: lines.iter().map(|l| (*l).to_string()).collect(),
                 more: 0,
             })),
+            std::time::Instant::now(),
         );
-        m.settle_main();
+        m.settle();
         render(&mut m, (140, 40));
         m.panel.focus_document();
         m
@@ -3597,9 +3585,7 @@ mod tests {
         m.set_cursor(Cursor::Entry(name("obs-layout-4")));
         m.toggle_changes_scope();
         m.panel = Focused::Changes { file: 0 };
-        m.settle_main();
-        std::thread::sleep(crate::document::REST + std::time::Duration::from_millis(20));
-        let key = m.docs.due(std::time::Instant::now()).expect("due");
+        let key = due_after_rest(&mut m);
         m.docs.loaded(
             &key,
             Ok(Doc::Branch(BranchLog {
@@ -3612,6 +3598,7 @@ mod tests {
                     state: FileState::Unstaged(Edit::Modified),
                 }],
             })),
+            std::time::Instant::now(),
         );
         render(&mut m, (140, 40));
         m.panel.focus_document();
@@ -3628,7 +3615,7 @@ mod tests {
             panic!("a commit opens");
         };
         assert_eq!(commit.sha, "abc1234");
-        m.settle_main();
+        m.settle();
         std::thread::sleep(crate::document::REST + std::time::Duration::from_millis(20));
         let key = m
             .docs
@@ -3655,8 +3642,9 @@ mod tests {
                 }],
                 more_files: 0,
             })),
+            std::time::Instant::now(),
         );
-        m.settle_main();
+        m.settle();
         let text = screen(&render(&mut m, (140, 40))).join("\n");
         assert!(
             text.contains("[0] commit abc1234 Fix the rounding"),

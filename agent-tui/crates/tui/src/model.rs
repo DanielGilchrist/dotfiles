@@ -721,7 +721,7 @@ impl Enter {
 pub struct Query {
     pub text: String,
     index: usize,
-    pub offset: std::cell::Cell<usize>,
+    pub offset: usize,
 }
 
 impl Query {
@@ -869,7 +869,7 @@ pub struct HelpState {
     /// `j` and `k` move until typing has started, then they are letters.
     pub typing: bool,
     pub selected: usize,
-    pub offset: std::cell::Cell<usize>,
+    pub offset: usize,
 }
 
 pub enum Overlay {
@@ -932,6 +932,23 @@ pub struct Status {
     pub at: Instant,
 }
 
+/// The time as one read of both clocks, so a message's wall-clock and
+/// monotonic readings agree.
+#[derive(Debug, Clone, Copy)]
+pub struct Moment {
+    pub wall: SystemTime,
+    pub mono: Instant,
+}
+
+impl Moment {
+    pub fn now() -> Self {
+        Self {
+            wall: SystemTime::now(),
+            mono: Instant::now(),
+        }
+    }
+}
+
 /// Screen regions from the last draw, for mouse hit-testing, pty sizing
 /// and how many repos Overview can keep open.
 #[derive(Default)]
@@ -949,6 +966,65 @@ pub struct Areas {
     /// Rows inside the panel the keys go to, as last drawn, so a half-page
     /// move knows how far that is.
     pub page: usize,
+    /// How [0]'s document was laid out, while it shows one.
+    pub main: Option<MainLayout>,
+}
+
+/// How [0]'s document was laid out the last time it was drawn: what the keys
+/// that move over it need to know without drawing.
+#[derive(Debug, Default)]
+pub struct MainLayout {
+    /// Rows in the document, and how many show under the rows that stay put.
+    pub total: usize,
+    pub height: usize,
+    /// A log, which follows its end.
+    pub tails: bool,
+    /// A log's entries: each one's first row and row count, and the
+    /// subagent it belongs to.
+    pub entries: Vec<(usize, usize)>,
+    pub nav: Option<SubagentKey>,
+    /// The document, if it is a diff whose lines the cursor moves over.
+    pub diff: Option<crate::document::Slot>,
+}
+
+impl MainLayout {
+    /// The first row on screen once `docs` has been placed in this layout.
+    pub fn top(&self, docs: &Documents) -> usize {
+        docs.placed(self.total, self.height, self.tails).top
+    }
+
+    /// The entry on screen's first row, or the last one.
+    pub fn entry_at(&self, top: usize) -> usize {
+        self.entries
+            .iter()
+            .position(|&(start, len)| start + len > top)
+            .unwrap_or(self.entries.len().saturating_sub(1))
+    }
+
+    /// Scrolls `docs` so the log's entry `at` shows.
+    pub fn reveal_entry(&self, docs: &mut Documents, at: usize) {
+        let Some(&(start, len)) = self.entries.get(at) else {
+            return;
+        };
+        docs.reveal(start, start + len, self.height);
+    }
+}
+
+/// What a draw leaves for the model to keep: layout facts and the rows it
+/// built, never decisions. [`crate::update::drawn`] applies it, so the draw
+/// itself only reads the model.
+#[derive(Default)]
+pub struct Drawn {
+    pub areas: Areas,
+    /// Whether [3] fits, when the sidebar was laid out.
+    pub work_room: Option<WorkRoom>,
+    /// Where the list scrolled to, when it was laid out.
+    pub scroll: Option<ListScroll>,
+    /// The first row an overlay's list showed, kept so the list stays
+    /// stable while the selection moves.
+    pub overlay_offset: Option<usize>,
+    /// The document's rows, when they were built for this frame.
+    pub rows: Option<crate::document::Laid>,
 }
 
 /// Where the sidebar list was scrolled to, and where the selection sat on
@@ -1076,8 +1152,12 @@ pub struct Model {
     /// What each agent's harness last reported, once the first report of
     /// them has arrived.
     pub activities: Option<HashMap<SessionName, Activity>>,
-    /// The clock for this frame, so every row, count and title agrees.
-    pub now: SystemTime,
+    /// The time this message or tick arrived: wall for rows, counts and
+    /// titles, monotonic for debounces and timeouts, so everything one
+    /// message decides agrees. Set by whatever delivers the message.
+    pub clock: Moment,
+    /// The terminal's size, which the layout is a function of.
+    pub size: Rect,
     /// How [3] lists the changed files, for the whole session.
     pub changes_view: ChangesView,
     pub changes_scope: ChangesScope,
@@ -1094,8 +1174,6 @@ pub struct Model {
     /// How many times any agent's git facts have been read, so a read's
     /// generation never repeats across agents that come and go.
     facts_reads: u64,
-    /// [0]'s subagent log: layout flags.
-    pub log_view: crate::log::LogView,
     /// [0]'s diff: the cursor over its lines.
     pub diff_view: crate::review::DiffView,
     /// What the branch view opened in [0], until `Esc` goes back to it.
@@ -1146,7 +1224,8 @@ impl Model {
             catalogue_warnings: Vec::new(),
             snapshots: 0,
             activities: None,
-            now: SystemTime::now(),
+            clock: Moment::now(),
+            size: Rect::default(),
             agents: HashMap::new(),
             changes_view: ChangesView::default(),
             changes_scope: ChangesScope::default(),
@@ -1156,7 +1235,6 @@ impl Model {
             terminal: TerminalFocus::Focused,
             visibility: Visibility::Active,
             facts_reads: 0,
-            log_view: crate::log::LogView::default(),
             diff_view: crate::review::DiffView::default(),
             opened: None,
             peek: None,
@@ -1261,6 +1339,12 @@ impl Model {
         }
     }
 
+    /// Half the rows of [0], at least one.
+    pub fn doc_half_page(&self) -> isize {
+        let rows = self.areas.main.as_ref().map_or(0, |main| main.height);
+        isize::try_from(rows / 2).unwrap_or(isize::MAX).max(1)
+    }
+
     /// Half the focused panel's rows, at least one.
     pub fn half_page(&self) -> isize {
         isize::try_from(self.areas.page / 2)
@@ -1307,36 +1391,23 @@ impl Model {
         usize::from(self.branch_row()) + self.change_list().len()
     }
 
-    /// The folders and files [3] lists under the readiness row.
+    /// The folders and files [3] lists under the readiness row: the tree
+    /// built when the model last settled, or built now if it hasn't.
     pub fn change_list(&self) -> std::sync::Arc<Vec<TreeRow>> {
-        let Some(tracked) = self
-            .selected_entry()
-            .and_then(|e| self.agents.get(e.name()))
-        else {
+        let Some(name) = self.selected_entry().map(Entry::name) else {
             return std::sync::Arc::new(Vec::new());
         };
-        let mut cache = tracked.tree.borrow_mut();
-        if let Some(hit) = cache.as_ref().filter(|c| {
-            c.generation == tracked.generation
-                && c.view == self.changes_view
-                && c.scope == self.changes_scope
-                && c.collapsed == tracked.collapsed
-        }) {
-            return hit.rows.clone();
+        let Some(tracked) = self.agents.get(name) else {
+            return std::sync::Arc::new(Vec::new());
+        };
+        match &tracked.tree {
+            Some(cached) if self.tree_fresh(name) => cached.rows.clone(),
+            _ => std::sync::Arc::new(tree::build(
+                self.changes(),
+                self.changes_view,
+                &tracked.collapsed,
+            )),
         }
-        let rows = std::sync::Arc::new(tree::build(
-            self.changes(),
-            self.changes_view,
-            &tracked.collapsed,
-        ));
-        *cache = Some(CachedTree {
-            generation: tracked.generation,
-            view: self.changes_view,
-            scope: self.changes_scope,
-            collapsed: tracked.collapsed.clone(),
-            rows: rows.clone(),
-        });
-        rows
     }
 
     /// What is known about `name`, if anything is.
@@ -1702,13 +1773,106 @@ impl Model {
         self.pane.session().filter(|_| self.terminal_visible())
     }
 
-    /// Points the main view at what the cursor is on.
-    pub fn settle_main(&mut self) {
+    /// Scrolls so the diff cursor's lines show, as the last draw laid the
+    /// document out.
+    pub fn reveal_line(&mut self) {
+        let Some(main) = self.areas.main.as_ref().filter(|main| main.diff.is_some()) else {
+            return;
+        };
+        let (from, to) = self.diff_view.span();
+        let lines = self.docs.lines();
+        let (Some(first), Some(last)) = (lines.get(from), lines.get(to)) else {
+            return;
+        };
+        let height = main.height;
+        self.docs.reveal(first.row, last.row + last.height, height);
+    }
+
+    /// Moves the cursor onto the first line or entry on screen after a page
+    /// scroll, as the last draw laid the document out.
+    pub fn follow_page(&mut self) {
+        let Some(main) = &self.areas.main else {
+            return;
+        };
+        let top = main.top(&self.docs);
+        if main.diff.is_some() {
+            let lines = self.docs.lines();
+            let at = lines
+                .iter()
+                .position(|l| l.selectable() && l.row + l.height > top)
+                .or_else(|| crate::review::last(lines));
+            if let Some(at) = at {
+                self.diff_view.cursor = at;
+                self.diff_view.anchor = None;
+            }
+        }
+        if let Some(key) = &main.nav
+            && let Some(watched) = self
+                .agents
+                .get_mut(&key.0)
+                .and_then(|t| t.subagents.get_mut(&key.1))
+        {
+            watched.nav.cursor = Some(main.entry_at(top));
+        }
+    }
+
+    /// Keeps where the sidebar's list is and whether it shows, which only
+    /// the screen's size and mode decide.
+    pub fn fit_sidebar(&mut self, list: Rect, shown: bool) {
+        self.areas.sidebar = list;
+        self.sidebar_shown = shown;
+    }
+
+    /// Brings what follows the cursor and the facts up to date, so a draw
+    /// only reads: [0] points at what the cursor is on, and [3]'s tree is
+    /// built.
+    pub fn settle(&mut self) {
         let hover = self.hover();
         if hover.is_none() {
             self.panel.leave_document();
         }
-        self.docs.settle(hover.as_ref(), Instant::now());
+        self.docs.settle(hover.as_ref(), self.clock.mono);
+        self.refresh_tree();
+    }
+
+    /// Builds the selected agent's tree if its facts, the view, the scope
+    /// or its folds changed since it was.
+    fn refresh_tree(&mut self) {
+        let Some(name) = self.selected_entry().map(|e| e.name().clone()) else {
+            return;
+        };
+        if self.tree_fresh(&name) {
+            return;
+        }
+        let Some(tracked) = self.agents.get(&name) else {
+            return;
+        };
+        let cached = CachedTree {
+            generation: tracked.generation,
+            view: self.changes_view,
+            scope: self.changes_scope,
+            collapsed: tracked.collapsed.clone(),
+            rows: std::sync::Arc::new(tree::build(
+                self.changes(),
+                self.changes_view,
+                &tracked.collapsed,
+            )),
+        };
+        if let Some(tracked) = self.agents.get_mut(&name) {
+            tracked.tree = Some(cached);
+        }
+    }
+
+    fn tree_fresh(&self, name: &SessionName) -> bool {
+        self.agents
+            .get(name)
+            .and_then(|t| Some((t, t.tree.as_ref()?)))
+            .is_some_and(|(t, c)| {
+                c.generation == t.generation
+                    && c.view == self.changes_view
+                    && c.scope == self.changes_scope
+                    && c.collapsed == t.collapsed
+            })
     }
 
     /// The selected agent's checkout and the file under [3]'s cursor in it.
@@ -1745,7 +1909,7 @@ impl Model {
         match &activity.state {
             ActivityState::Idle | ActivityState::Exited => AgentStatus::Idle,
             ActivityState::Working { .. } | ActivityState::Delegating => {
-                let pulse = if activity.stale(self.now) {
+                let pulse = if activity.stale(self.clock.wall) {
                     Pulse::Stale
                 } else {
                     Pulse::Steady
@@ -1816,7 +1980,7 @@ impl Model {
     /// the record shows.
     pub fn ready_for_text(&self, name: &SessionName) -> bool {
         self.activity(name)
-            .is_some_and(|a| a.ready_for_text(self.not_before(name), SystemTime::now()))
+            .is_some_and(|a| a.ready_for_text(self.not_before(name), self.clock.wall))
     }
 
     /// Whether the user's keys are going to `name`'s terminal.
@@ -1866,7 +2030,7 @@ impl Model {
         let listed = live
             .then(|| self.activity(by).and_then(|a| a.subagents.get(id)).cloned())
             .flatten();
-        let now = self.now;
+        let now = self.clock.wall;
         let Some(watched) = self
             .agents
             .get_mut(by)
@@ -2454,7 +2618,7 @@ impl Model {
     }
 
     pub fn schedule_preview(&mut self) {
-        self.preview_at = Some(Instant::now() + PREVIEW_DEBOUNCE);
+        self.preview_at = Some(self.clock.mono + PREVIEW_DEBOUNCE);
     }
 
     /// Moves the selection `delta` rows, past the ends as `wrap` says.
@@ -2571,7 +2735,7 @@ impl Model {
         self.status = Some(Status {
             text: text.into(),
             kind: StatusKind::Info,
-            at: Instant::now(),
+            at: self.clock.mono,
         });
     }
 
@@ -2579,7 +2743,7 @@ impl Model {
         self.status = Some(Status {
             text: text.into(),
             kind: StatusKind::Error,
-            at: Instant::now(),
+            at: self.clock.mono,
         });
     }
 
@@ -2668,7 +2832,10 @@ pub enum RepoChoice {
 pub enum RepoInput {
     /// Nothing typed: the repo selected when the form opened.
     Default(Option<RepoRoot>),
-    /// A typed path (`/`, `~/`, `./`, `../`) to a directory, absolute.
+    /// A typed path (`/`, `~/`, `./`, `../`) whose directory the worker
+    /// hasn't been heard on yet.
+    Checking(PathBuf),
+    /// A typed path to a directory, absolute.
     Path(PathBuf),
     /// A typed path to nothing.
     Missing(PathBuf),
@@ -2679,11 +2846,28 @@ pub enum RepoInput {
 }
 
 impl RepoInput {
-    fn path(path: PathBuf) -> Self {
-        if path.is_dir() {
-            Self::Path(path)
-        } else {
-            Self::Missing(path)
+    /// A typed `path`, as far as `checked` says whether it is a directory.
+    fn typed(path: PathBuf, checked: &DirCheck) -> Self {
+        match checked {
+            DirCheck::Answered { path: of, found } if *of == path => match found {
+                Found::Dir => Self::Path(path),
+                Found::Nothing => Self::Missing(path),
+            },
+            DirCheck::Unasked | DirCheck::Asked(_) | DirCheck::Answered { .. } => {
+                Self::Checking(path)
+            }
+        }
+    }
+
+    /// Why this input names no repo: still being looked at, or nothing.
+    fn blocked(&self) -> Blocked {
+        match self {
+            Self::Checking(_) => Blocked::Checking,
+            Self::Default(_)
+            | Self::Path(_)
+            | Self::Missing(_)
+            | Self::Search(_)
+            | Self::Unsupported => Blocked::NoRepo,
         }
     }
 
@@ -2691,7 +2875,7 @@ impl RepoInput {
         match self {
             Self::Default(root) | Self::Search(root) => root.clone().map(RepoChoice::Known),
             Self::Path(path) => Some(RepoChoice::Path(path.clone())),
-            Self::Missing(_) | Self::Unsupported => None,
+            Self::Checking(_) | Self::Missing(_) | Self::Unsupported => None,
         }
     }
 }
@@ -2871,6 +3055,8 @@ pub enum Blocked {
     /// The name is an agent in another repo, whose branches are its own.
     InAnotherRepo(String),
     NoRepo,
+    /// The typed repo path is still being looked at.
+    Checking,
     /// Exited, with a prompt that couldn't be delivered.
     ExitedWithPrompt,
 }
@@ -2883,6 +3069,7 @@ impl Blocked {
             Self::Prompt(why) => Some(format!("prompt: {why}")),
             Self::Target(why) => Some(why.clone()),
             Self::NoRepo => Some("pick a repo: type its name, or a path".into()),
+            Self::Checking => Some("still looking for that directory".into()),
             Self::ExitedWithPrompt => Some(
                 "it exited, so the prompt can't be typed in. Clear it to resurrect, then send it"
                     .into(),
@@ -2946,7 +3133,7 @@ impl Submission {
                 repo,
                 target,
             }),
-            None => Self::Blocked(Blocked::NoRepo),
+            None => Self::Blocked(repo.blocked()),
         }
     }
 
@@ -2963,7 +3150,7 @@ impl Submission {
                     repo,
                     task,
                 }),
-                None => Self::Blocked(Blocked::NoRepo),
+                None => Self::Blocked(repo.blocked()),
             },
             (NameCheck::Live { name, .. }, Ok(task)) => Self::Ready(Launchable::Attach {
                 name: name.clone(),
@@ -3050,7 +3237,35 @@ pub struct NewAgent {
     pub focus: Field,
     pub error: Option<String>,
     pub naming: Naming,
+    pub dir: DirCheck,
     pub phase: Phase,
+}
+
+/// What the worker has said about the directory the repo field's typed path
+/// names, which only it may look at.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum DirCheck {
+    #[default]
+    Unasked,
+    Asked(PathBuf),
+    Answered {
+        path: PathBuf,
+        found: Found,
+    },
+}
+
+/// What the worker found at a typed path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Found {
+    Dir,
+    Nothing,
+}
+
+impl DirCheck {
+    /// Whether a reply for `path` is the one being waited for.
+    pub fn awaits(&self, path: &Path) -> bool {
+        matches!(self, Self::Asked(asked) if asked == path)
+    }
 }
 
 /// What the form's fields mean against the current snapshot, worked out
@@ -3064,6 +3279,11 @@ pub struct Derived {
     pub name: String,
     pub check: NameCheck,
     pub repo_input: RepoInput,
+    /// What the first field names to check out, if it parses as one.
+    pub target: Option<Checkout>,
+    /// The first field mentions a GitHub link, which is live feedback
+    /// worth giving even mid-word.
+    pub link_pasted: bool,
     /// The rest of the matched repo's name, when the typed text is a proper
     /// prefix of it, ignoring case.
     pub completion: Option<String>,
@@ -3081,13 +3301,14 @@ impl NewAgent {
             focus: Field::Task,
             error: None,
             naming: Naming::default(),
+            dir: DirCheck::default(),
             phase: Phase::Editing,
         }
     }
 
     /// The prompt changed: drop any model answer for the old one and, if
     /// the prompt is prose worth naming, ask again once typing pauses.
-    pub fn prompt_changed(&mut self) {
+    pub fn prompt_changed(&mut self, now: Instant) {
         self.naming.generation += 1;
         let source = agent_core::naming::suggest(&self.task).map(|s| s.source);
         let words = self.task.split_whitespace().count();
@@ -3096,7 +3317,7 @@ impl NewAgent {
                 NamingState::Idle
             }
             _ if words < NAMING_MIN_WORDS => NamingState::Idle,
-            _ => NamingState::Due(Instant::now() + NAMING_DEBOUNCE),
+            _ => NamingState::Due(now + NAMING_DEBOUNCE),
         };
     }
 
@@ -3123,22 +3344,18 @@ impl NewAgent {
         start_dir: &Path,
     ) -> Derived {
         use agent_core::naming::{Source, for_checkout, suggest};
+        let target = self.task.trim().parse::<Checkout>().ok();
         let suggestion = match self.kind {
-            FormKind::Checkout => self
-                .task
-                .trim()
-                .parse::<Checkout>()
-                .ok()
-                .and_then(|target| {
-                    let source = match target {
-                        Checkout::Branch(_) => NameSource::Branch,
-                        Checkout::PullRequest(_) => NameSource::Link,
-                    };
-                    for_checkout(&target).map(|name| NameSuggestion {
-                        name: name.to_string(),
-                        source,
-                    })
-                }),
+            FormKind::Checkout => target.as_ref().and_then(|target| {
+                let source = match target {
+                    Checkout::Branch(_) => NameSource::Branch,
+                    Checkout::PullRequest(_) => NameSource::Link,
+                };
+                for_checkout(target).map(|name| NameSuggestion {
+                    name: name.to_string(),
+                    source,
+                })
+            }),
             FormKind::New => {
                 let local = suggest(&self.task);
                 let answer = match &self.naming.state {
@@ -3168,7 +3385,7 @@ impl NewAgent {
         // A pull request link names its repo, which wins over the selected
         // one while nothing is typed and exactly one repo has that name.
         if let (FormKind::Checkout, RepoInput::Default(_)) = (self.kind, &repo_input)
-            && let Ok(Checkout::PullRequest(pr)) = self.task.trim().parse::<Checkout>()
+            && let Some(Checkout::PullRequest(pr)) = &target
             && let Some(root) = named_repo(snapshot, catalogue, &pr.repo)
         {
             repo_input = RepoInput::Default(Some(root));
@@ -3186,6 +3403,8 @@ impl NewAgent {
             name,
             check,
             repo_input,
+            target,
+            link_pasted: self.task.contains("github.com"),
             completion,
             submission,
         }
@@ -3202,7 +3421,7 @@ impl NewAgent {
             return RepoInput::Default(self.default_repo.clone());
         }
         match typed_path(text, start_dir) {
-            Some(Typed::Path(path)) => RepoInput::path(path),
+            Some(Typed::Path(path)) => RepoInput::typed(path, &self.dir),
             Some(Typed::Unsupported | Typed::NoHome) => RepoInput::Unsupported,
             None => {
                 let matches = repo_matches(snapshot, catalogue, text);
