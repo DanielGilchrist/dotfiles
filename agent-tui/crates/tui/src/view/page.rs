@@ -1,11 +1,13 @@
 //! The main view [0] when it reads a document instead of showing the
 //! terminal.
 
+use std::fmt::Write;
 use std::time::Instant;
 
 use agent_core::activity::AgentId;
+use agent_core::model::{Head, RepoKey};
 use agent_core::names::SessionName;
-use agent_core::ports::{FileDiff, Lines, LogEntry};
+use agent_core::ports::{BranchLog, FileDiff, Lines, LogEntry};
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -16,7 +18,7 @@ use super::{
     ago, bold, dim, error, fit, justify, line_width, spinner, success, truncate_end,
     truncate_start, warning, wrap,
 };
-use crate::document::{BranchKey, DiffKey, Doc, Hover, Key};
+use crate::document::{BranchKey, DiffKey, Doc, Hover, Resolved};
 use crate::model::{AgentStatus, Model};
 
 /// [0]'s title, what its top border says on the right, its bottom-right
@@ -28,14 +30,32 @@ pub(super) struct Page {
     pub lines: Vec<Line<'static>>,
 }
 
+/// A document's rows: built for this frame, or the ones the document cache
+/// kept from an earlier frame.
+enum Rows {
+    Built(Vec<Line<'static>>),
+    Cached,
+}
+
 /// What a document says before it's scrolled and framed.
 struct Body {
     title: Vec<Span<'static>>,
-    rows: Vec<Line<'static>>,
+    rows: Rows,
     /// A log, which follows its end.
     tails: bool,
     /// Still being read.
     loading: bool,
+}
+
+impl Body {
+    fn built(title: Vec<Span<'static>>, rows: Vec<Line<'static>>) -> Self {
+        Self {
+            title,
+            rows: Rows::Built(rows),
+            tails: false,
+            loading: false,
+        }
+    }
 }
 
 /// A result sits within this many columns of its call, so it stays near it
@@ -46,6 +66,9 @@ const RESULT_COLUMNS: usize = 100;
 /// says, or `None` while the cursor is on nothing it reads. `border` is the
 /// corner's style and `width` the whole panel's.
 pub(super) fn page(m: &mut Model, area: Rect, width: usize, border: Style) -> Option<Page> {
+    if m.previewing() {
+        return None;
+    }
     let hover = m.hover()?;
     let columns = usize::from(area.width);
     // An agent that asks takes the top row, since it needs an answer and
@@ -56,13 +79,24 @@ pub(super) fn page(m: &mut Model, area: Rect, width: usize, border: Style) -> Op
     });
     let reserved = if question.is_some() { 2 } else { 0 };
     let height = usize::from(area.height).saturating_sub(reserved);
+    // The agent's state keeps its glyph, name and time, so the title yields
+    // to them first.
+    let status_least = m
+        .selected_entry()
+        .map_or(0, |entry| line_width(&status_line(m, entry, 0)));
+    let budget = width.saturating_sub(7 + status_least);
     let body = match &hover {
-        Hover::Diff(key) => diff_body(m, key, columns, width),
+        Hover::Diff(key) => diff_body(m, key, columns, budget),
         Hover::Branch(key) => branch_body(m, key, columns),
         Hover::Turn(name) => turn_body(m, name, columns)?,
         Hover::Subagent(name, id) => log_body(m, name, id, columns),
+        Hover::Repo(key) => repo_body(m, key, columns)?,
     };
-    let top = m.docs.place(body.rows.len(), height, body.tails);
+    let total = match &body.rows {
+        Rows::Built(rows) => rows.len(),
+        Rows::Cached => m.docs.cached().len(),
+    };
+    let top = m.docs.place(total, height, body.tails);
     let mut lines: Vec<Line<'static>> = Vec::new();
     if let Some(question) = question {
         let ask = "i answer";
@@ -78,7 +112,10 @@ pub(super) fn page(m: &mut Model, area: Rect, width: usize, border: Style) -> Op
         ));
         lines.push(Line::raw(""));
     }
-    lines.extend(body.rows.iter().skip(top).take(height).cloned());
+    match &body.rows {
+        Rows::Built(rows) => lines.extend(rows.iter().skip(top).take(height).cloned()),
+        Rows::Cached => lines.extend(m.docs.cached().iter().skip(top).take(height).cloned()),
+    }
 
     let mut title = body.title;
     if !m.sidebar_shown
@@ -86,10 +123,10 @@ pub(super) fn page(m: &mut Model, area: Rect, width: usize, border: Style) -> Op
     {
         title.insert(1, Span::styled(format!("{at} of {of} · "), dim()));
     }
-    let title = fit(title, width.saturating_sub(6));
+    let title = fit(title, width.saturating_sub(6 + status_least).max(8));
     let status = m
         .selected_entry()
-        .map(|entry| status_line(m, entry, width.saturating_sub(line_width(&title) + 9)))
+        .map(|entry| status_line(m, entry, width.saturating_sub(line_width(&title) + 7)))
         .unwrap_or_default();
     let right = if fits_beside(&title, line_width(&status), width) {
         status
@@ -97,19 +134,14 @@ pub(super) fn page(m: &mut Model, area: Rect, width: usize, border: Style) -> Op
         Vec::new()
     };
 
-    let shown = format!(
-        "{}-{} of {}",
-        top + 1,
-        (top + height).min(body.rows.len()),
-        body.rows.len()
-    );
+    let shown = format!("{}-{} of {total}", top + 1, (top + height).min(total));
     let corner = if body.loading || m.docs.loading(Instant::now()) {
         vec![Span::styled("loading", dim())]
     } else if m.docs.following() {
         vec![Span::styled("following", border)]
     } else if m.docs.paused() {
         vec![Span::styled(format!("paused {shown}"), border)]
-    } else if body.rows.len() > height {
+    } else if total > height {
         vec![Span::styled(shown, border)]
     } else {
         Vec::new()
@@ -122,47 +154,77 @@ pub(super) fn page(m: &mut Model, area: Rect, width: usize, border: Style) -> Op
     })
 }
 
-/// The hovered file's diff: what's loaded, or the last one shown while the
-/// new one loads, under the hovered file's name and counts.
-fn diff_body(m: &Model, hover: &DiffKey, columns: usize, width: usize) -> Body {
-    let rows = match m.docs.shown() {
-        Some((Key::Diff(_), loaded)) => match loaded.as_ref() {
-            Ok(Doc::Diff(diff)) => diff_rows(Ok(diff), columns),
-            Ok(Doc::Branch(_)) => Vec::new(),
-            Err(e) => diff_rows(Err(e), columns),
-        },
-        _ => Vec::new(),
+/// `names` as far as `room` columns allow, the rest counted: `a, b +2`.
+fn names_in(names: &[String], room: usize) -> String {
+    let mut shown = String::new();
+    for (at, name) in names.iter().enumerate() {
+        let left = names.len() - at - 1;
+        let more = if left > 0 {
+            format!(" +{left}").len()
+        } else {
+            0
+        };
+        let sep = if shown.is_empty() { 0 } else { 2 };
+        if shown.len() + sep + name.len() + more > room {
+            break;
+        }
+        if sep > 0 {
+            shown.push_str(", ");
+        }
+        shown.push_str(name);
+    }
+    if shown.is_empty() {
+        return names.len().to_string();
+    }
+    let left = names.len() - shown.split(", ").count();
+    if left > 0 {
+        let _ = write!(shown, " +{left}");
+    }
+    shown
+}
+
+/// The hovered file's diff, or the last read of the same file while the new
+/// one loads, under the file's name, counts and who else changed it. Another
+/// file's diff is never shown under this one's title.
+fn diff_body(m: &mut Model, hover: &DiffKey, columns: usize, budget: usize) -> Body {
+    let rows = match m.docs.resolve() {
+        Resolved::Current(key, loaded) | Resolved::Stale(key, loaded) => {
+            let (key, loaded) = (key.clone(), loaded.clone());
+            m.docs.rows(&key, columns, || match loaded.as_ref() {
+                Ok(Doc::Diff(diff)) => diff_rows(Ok(diff), columns),
+                Ok(Doc::Branch(_)) => Vec::new(),
+                Err(e) => diff_rows(Err(e), columns),
+            });
+            Rows::Cached
+        }
+        Resolved::Missing => Rows::Built(Vec::new()),
     };
-    let mut title = vec![
-        Span::raw("[0] "),
-        Span::styled(
-            truncate_start(
-                &hover.path.to_string_lossy(),
-                width.saturating_sub(16).max(8),
-            ),
-            bold(),
-        ),
-    ];
+    let mut counts = Vec::new();
     match hover.lines {
         Lines::Counted { added, removed } => {
             for (count, text, style) in [
-                (added, format!("+{added}"), success()),
-                (removed, format!("−{removed}"), error()),
+                (added, format!(" +{added}"), success()),
+                (removed, format!(" −{removed}"), error()),
             ] {
                 if count > 0 {
-                    title.push(Span::raw(" "));
-                    title.push(Span::styled(text, style));
+                    counts.push(Span::styled(text, style));
                 }
             }
         }
-        Lines::Binary => title.push(Span::styled(" bin", dim())),
-        Lines::Untracked => title.push(Span::styled(" new", dim())),
+        Lines::Binary => counts.push(Span::styled(" bin", dim())),
+        Lines::Untracked => counts.push(Span::styled(" new", dim())),
     }
     let others = others_on(m, &hover.name, &hover.path);
-    if !others.is_empty() {
+    let fixed = 4 + line_width(&counts);
+    let path_room = budget.saturating_sub(fixed).max(12);
+    let path = truncate_start(&hover.path.to_string_lossy(), path_room);
+    let mut title = vec![Span::raw("[0] "), Span::styled(path, bold())];
+    title.extend(counts);
+    let left = budget.saturating_sub(line_width(&title) + 4);
+    if !others.is_empty() && left >= 8 {
         title.push(Span::raw("  "));
         title.push(Span::styled("∩ ", warning()));
-        title.push(Span::styled(others.join(", "), dim()));
+        title.push(Span::styled(names_in(&others, left), dim()));
     }
     Body {
         title,
@@ -174,7 +236,7 @@ fn diff_body(m: &Model, hover: &DiffKey, columns: usize, width: usize) -> Body {
 
 /// The branch: how far it is from shipping, its commits and the files not
 /// yet committed.
-fn branch_body(m: &Model, key: &BranchKey, columns: usize) -> Body {
+fn branch_body(m: &mut Model, key: &BranchKey, columns: usize) -> Body {
     let mut facts = Vec::new();
     if key.ahead > 0 {
         facts.push(format!("↑{}", key.ahead));
@@ -189,75 +251,116 @@ fn branch_body(m: &Model, key: &BranchKey, columns: usize) -> Body {
     if !facts.is_empty() {
         title.push(Span::styled(format!(" {}", facts.join(" · ")), dim()));
     }
-    let mut rows: Vec<Line<'static>> = Vec::new();
-    if let Some((Key::Branch(_), loaded)) = m.docs.shown() {
-        match loaded.as_ref() {
-            Ok(Doc::Branch(log)) => {
-                if log.commits.is_empty() && log.uncommitted.is_empty() {
-                    rows.push(Line::styled("nothing ahead of the default branch", dim()));
-                }
-                if !log.commits.is_empty() {
-                    rows.push(Line::styled(
-                        format!("Commits ({})", log.commits.len()),
-                        dim(),
-                    ));
-                    for commit in &log.commits {
-                        let (hash, subject) = commit.split_once(' ').unwrap_or((commit, ""));
-                        rows.extend(
-                            hard_wrap(subject, columns.saturating_sub(hash.len() + 1))
-                                .into_iter()
-                                .enumerate()
-                                .map(|(i, row)| {
-                                    let lead = if i == 0 {
-                                        hash.to_string()
-                                    } else {
-                                        " ".repeat(hash.len())
-                                    };
-                                    Line::from(vec![
-                                        Span::styled(lead, dim()),
-                                        Span::raw(format!(" {row}")),
-                                    ])
-                                }),
-                        );
-                    }
-                    rows.push(Line::raw(""));
-                }
-                if !log.uncommitted.is_empty() {
-                    rows.push(Line::styled(
-                        format!("Uncommitted ({})", log.uncommitted.len()),
-                        dim(),
-                    ));
-                    for (code, path) in &log.uncommitted {
-                        rows.push(Line::from(vec![
-                            Span::styled(format!("{code} "), dim()),
-                            Span::raw(truncate_start(
-                                &path.to_string_lossy(),
-                                columns.saturating_sub(code.len() + 1),
-                            )),
-                        ]));
-                    }
-                }
-                if key.behind > 0 {
-                    rows.push(Line::raw(""));
-                    rows.push(Line::styled(
-                        format!("The default branch has {} newer commits.", key.behind),
-                        dim(),
-                    ));
-                }
-            }
-            Ok(Doc::Diff(_)) => {}
-            Err(e) => rows.push(Line::styled(
-                e.lines().next().unwrap_or_default().to_string(),
-                error(),
-            )),
+    let behind = key.behind;
+    let rows = match m.docs.resolve() {
+        Resolved::Current(key, loaded) | Resolved::Stale(key, loaded) => {
+            let (key, loaded) = (key.clone(), loaded.clone());
+            m.docs.rows(&key, columns, || match loaded.as_ref() {
+                Ok(Doc::Branch(log)) => branch_rows(log, behind, columns),
+                Ok(Doc::Diff(_)) => Vec::new(),
+                Err(e) => vec![Line::styled(
+                    e.lines().next().unwrap_or_default().to_string(),
+                    error(),
+                )],
+            });
+            Rows::Cached
         }
-    }
+        Resolved::Missing => Rows::Built(Vec::new()),
+    };
     Body {
         title,
         rows,
         tails: false,
         loading: false,
     }
+}
+
+/// A branch log as rows: its commits, then the files not committed.
+fn branch_rows(log: &BranchLog, behind: usize, columns: usize) -> Vec<Line<'static>> {
+    let mut rows: Vec<Line<'static>> = Vec::new();
+    if log.commits.is_empty() && log.uncommitted.is_empty() {
+        rows.push(Line::styled("nothing ahead of the default branch", dim()));
+    }
+    if !log.commits.is_empty() {
+        rows.push(Line::styled(
+            format!("Commits ({})", log.commits.len()),
+            dim(),
+        ));
+        for commit in &log.commits {
+            let (hash, subject) = commit.split_once(' ').unwrap_or((commit, ""));
+            let room = columns.saturating_sub(hash.len() + 1);
+            for (i, row) in hard_wrap(subject, room).into_iter().enumerate() {
+                let lead = if i == 0 {
+                    hash.to_string()
+                } else {
+                    " ".repeat(hash.len())
+                };
+                rows.push(Line::from(vec![
+                    Span::styled(lead, dim()),
+                    Span::raw(format!(" {row}")),
+                ]));
+            }
+        }
+        rows.push(Line::raw(""));
+    }
+    if !log.uncommitted.is_empty() {
+        rows.push(Line::styled(
+            format!("Uncommitted ({})", log.uncommitted.len()),
+            dim(),
+        ));
+        for (code, path) in &log.uncommitted {
+            rows.push(Line::from(vec![
+                Span::styled(format!("{code} "), dim()),
+                Span::raw(truncate_start(
+                    &path.to_string_lossy(),
+                    columns.saturating_sub(code.len() + 1),
+                )),
+            ]));
+        }
+    }
+    if behind > 0 {
+        rows.push(Line::raw(""));
+        rows.push(Line::styled(
+            format!("The default branch has {behind} newer commits."),
+            dim(),
+        ));
+    }
+    rows
+}
+
+/// A repo row's summary: its checkouts as the cards say them.
+fn repo_body(m: &Model, key: &RepoKey, columns: usize) -> Option<Body> {
+    let repo = m.snapshot()?.repo(key)?;
+    let mut rows: Vec<Line<'static>> = Vec::new();
+    let branch = repo.entries().iter().find_map(|e| match e.head() {
+        Some(Head::Branch(branch)) if e.path().is_some() => Some(branch.to_string()),
+        _ => None,
+    });
+    for entry in repo.entries().iter().filter(|e| m.shown(e)) {
+        let mut line = status_line(m, entry, columns.saturating_sub(2));
+        let work = m.facts.get(entry.name());
+        if let Some(Ok(facts)) = work {
+            let d = facts.diff();
+            if d.files > 0 {
+                line.push(Span::styled(
+                    format!("  {} files +{} −{}", d.files, d.added, d.removed),
+                    dim(),
+                ));
+            }
+        }
+        rows.push(Line::from(line));
+    }
+    if rows.is_empty() {
+        rows.push(Line::styled("nothing running", dim()));
+    }
+    let mut title = vec![
+        Span::raw("[0] "),
+        Span::styled(repo.name().into_owned(), bold()),
+    ];
+    if let Some(branch) = branch {
+        title.push(Span::styled(format!(" {branch}"), dim()));
+    }
+    Some(Body::built(title, rows))
 }
 
 /// The turn: the whole prompt, the whole message or question, and the
@@ -291,12 +394,10 @@ fn turn_body(m: &Model, name: &SessionName, columns: usize) -> Option<Body> {
     {
         rows.pop();
     }
-    Some(Body {
-        title: vec![Span::raw("[0] "), Span::styled("Turn", bold())],
+    Some(Body::built(
+        vec![Span::raw("[0] "), Span::styled("Turn", bold())],
         rows,
-        tails: false,
-        loading: false,
-    })
+    ))
 }
 
 /// A subagent's transcript: what it was told, then a line per tool call
@@ -314,10 +415,8 @@ fn log_body(m: &Model, name: &SessionName, id: &AgentId, columns: usize) -> Body
         None => title.push(Span::styled("subagent", bold())),
     }
     let note = |text: String, style: Style| Body {
-        title: title.clone(),
-        rows: vec![Line::styled(text, style)],
         tails: true,
-        loading: false,
+        ..Body::built(title.clone(), vec![Line::styled(text, style)])
     };
     let key = (name.clone(), id.clone());
     let detail = match m.subagent_logs.get(&key) {
@@ -389,10 +488,8 @@ fn log_body(m: &Model, name: &SessionName, id: &AgentId, columns: usize) -> Body
         rows.extend(wrap(text, columns).into_iter().map(Line::raw));
     }
     Body {
-        title,
-        rows,
         tails: true,
-        loading: false,
+        ..Body::built(title, rows)
     }
 }
 
@@ -418,6 +515,10 @@ fn diff_rows(loaded: Result<&FileDiff, &String>, width: usize) -> Vec<Line<'stat
                     Some('@') => dim(),
                     _ => Style::new(),
                 };
+                if line.starts_with("@@") {
+                    rows.push(Line::styled(truncate_end(line, width), style));
+                    continue;
+                }
                 rows.extend(
                     hard_wrap(&line.replace('\t', "    "), width)
                         .into_iter()
@@ -490,6 +591,34 @@ mod tests {
             ["a", "漢", "b"],
             "wide characters stay whole"
         );
+    }
+
+    #[test]
+    fn hunk_headers_are_cut_with_an_ellipsis_while_code_wraps() {
+        let diff = FileDiff::Text {
+            lines: vec![
+                "@@ -38,9 +39,15 @@ export function grossPay(shifts: Shift[]): Money {".into(),
+                "+const a = something_long_enough_to_wrap;".into(),
+            ],
+            more: 0,
+        };
+        let rows = diff_rows(Ok(&diff), 30);
+        let text = |row: &Line<'_>| {
+            row.spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
+        };
+        assert!(text(&rows[0]).ends_with('…') && text(&rows[0]).chars().count() <= 30);
+        assert_eq!(rows.len(), 3, "the header is one row and the code wraps");
+    }
+
+    #[test]
+    fn names_are_listed_as_far_as_they_fit_and_the_rest_counted() {
+        let names: Vec<String> = ["alpha", "beta", "gamma"].map(String::from).to_vec();
+        assert_eq!(names_in(&names, 40), "alpha, beta, gamma");
+        assert_eq!(names_in(&names, 12), "alpha +2");
+        assert_eq!(names_in(&names, 3), "3", "nothing fits, so only the count");
     }
 
     #[test]

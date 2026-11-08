@@ -331,6 +331,10 @@ pub fn draw(frame: &mut Frame<'_>, m: &mut Model) {
         // the list is laid out as if it were there, so moving still works.
         m.areas.sidebar = Rect::new(0, 0, SIDEBAR_MIN, sidebar::list_room(body.height));
         m.areas.rows.clear();
+        m.areas.agent_rows.clear();
+        m.areas.change_rows.clear();
+        m.areas.agent_panel = Rect::default();
+        m.areas.changes_panel = Rect::default();
         m.work_room = WorkRoom::Fits;
     }
     m.sidebar_shown = sidebar_width > 0;
@@ -349,10 +353,38 @@ pub fn draw(frame: &mut Frame<'_>, m: &mut Model) {
         frame.render_widget(Paragraph::new(page.lines).block(block), right);
     } else {
         let (title, path) = pane_title(m, usize::from(right.width));
-        frame.render_widget(
-            panel(title, path, pane_style, pane_focused).padding(padding),
-            right,
-        );
+        let mut block = panel(title, path, pane_style, pane_focused).padding(padding);
+        if m.previewing() {
+            // Only reading: its own border and title say so, and the hints
+            // say where the keys go.
+            let name = m
+                .selected_entry()
+                .map(|entry| sidebar::status_line(m, entry, 0));
+            let mut title = vec![
+                Span::raw("[0] "),
+                Span::styled("preview", bold()),
+                Span::styled(" · ", dim()),
+            ];
+            title.extend(name.unwrap_or_default());
+            let mut hints = Vec::new();
+            for (key, what) in [("i", "type"), ("r", "reply"), ("t", "back")] {
+                if !hints.is_empty() {
+                    hints.push(Span::styled(" · ", dim()));
+                }
+                hints.push(Span::raw(key));
+                hints.push(Span::styled(format!(" {what}"), dim()));
+            }
+            let hints = if line_width(&title) + 7 + line_width(&hints) <= usize::from(right.width) {
+                hints
+            } else {
+                Vec::new()
+            };
+            block = panel(title, Vec::new(), Style::new(), false)
+                .border_type(BorderType::Double)
+                .padding(padding)
+                .title_top(Line::from(sidebar::pad_title(hints)).right_aligned());
+        }
+        frame.render_widget(block, right);
         draw_terminal(frame, m, terminal);
     }
 
@@ -642,6 +674,13 @@ fn draw_status_bar(frame: &mut Frame<'_>, m: &Model, area: Rect) {
         let selected = m.selected();
         let entry = selected.and_then(|(_, e)| e);
         match m.panel {
+            _ if m.previewing() => {
+                hints.extend([ranked("i", "type", 9), ranked("t", "back", 9)]);
+                if entry.is_some_and(|e| m.replyable(e).is_some()) {
+                    hints.push(ranked("r", "reply", 8));
+                }
+                hints.push(ranked("Esc", "back", 7));
+            }
             _ if m.main_focused() => hints.extend([
                 ranked("j/k", "scroll", 8),
                 if m.docs.paused() {
@@ -650,6 +689,7 @@ fn draw_status_bar(frame: &mut Frame<'_>, m: &Model, area: Rect) {
                     ranked("G", "end", 6)
                 },
                 ranked("i", "type", 8),
+                ranked("t", "preview", 6),
                 ranked("Esc", "back", 9),
             ]),
             Panel::Changes { .. } => hints.extend([
@@ -657,15 +697,17 @@ fn draw_status_bar(frame: &mut Frame<'_>, m: &Model, area: Rect) {
                 ranked("J/K", "scroll", 8),
                 ranked("e", "edit", 7),
                 ranked("i", "type", 8),
+                ranked("t", "preview", 6),
                 ranked("Esc", "back", 9),
             ]),
             Panel::Agent { .. } => hints.extend([
                 ranked("⏎", "open", 9),
                 ranked("J/K", "scroll", 8),
                 ranked("i", "type", 8),
+                ranked("t", "preview", 6),
                 ranked("Esc", "back", 9),
             ]),
-            Panel::Agents => {}
+            Panel::Agents | Panel::Main(_) | Panel::Preview { .. } => {}
         }
         match (selected, entry.map(|e| m.reach(e))) {
             _ if matches!(m.panel, Panel::Changes { .. } | Panel::Agent { .. })

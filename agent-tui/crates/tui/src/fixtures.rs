@@ -112,6 +112,7 @@ fn doing(k: usize) -> Option<Activity> {
                         launch: Launch::Background,
                         tools: Vec::new(),
                         since: SystemTime::now() - Duration::from_secs(30 + 10 * i as u64),
+                        finished: None,
                     },
                 );
             }

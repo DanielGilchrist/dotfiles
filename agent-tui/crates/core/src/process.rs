@@ -117,6 +117,83 @@ pub fn output(cmd: &mut Command) -> Result<Output, CommandError> {
     output_within(cmd, DEFAULT_TIMEOUT)
 }
 
+/// Like [`output_within`], but reads at most `max` bytes of stdout. A command
+/// that has more is killed, and the flag says output was cut, so a huge diff
+/// is never held whole in memory. The exit status of a killed command isn't
+/// meaningful.
+pub fn output_capped(
+    cmd: &mut Command,
+    timeout: Duration,
+    max: u64,
+) -> Result<(Output, bool), CommandError> {
+    let command = describe(cmd);
+    let mut child = cmd
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|source| CommandError::Spawn {
+            command: command.clone(),
+            source,
+        })?;
+    let mut pipe = child.stdout.take().expect("stdout is piped");
+    let (tx, stdout) = mpsc::channel();
+    thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = pipe.by_ref().take(max).read_to_end(&mut buf);
+        let mut probe = [0u8; 1];
+        let more = pipe.read(&mut probe).is_ok_and(|n| n > 0);
+        let _ = tx.send((buf, more));
+    });
+    let stderr = drain(child.stderr.take().expect("stderr is piped"));
+    let deadline = Instant::now() + timeout;
+    let mut read: Option<(Vec<u8>, bool)> = None;
+    let status: ExitStatus = loop {
+        if read.is_none() {
+            read = stdout.try_recv().ok();
+        }
+        if read.as_ref().is_some_and(|(_, more)| *more) {
+            let _ = child.kill();
+            break child.wait().map_err(|source| CommandError::Spawn {
+                command: command.clone(),
+                source,
+            })?;
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(5)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(CommandError::TimedOut {
+                    command,
+                    after: timeout,
+                });
+            }
+            Err(source) => return Err(CommandError::Spawn { command, source }),
+        }
+    };
+    let (stdout, more) = match read {
+        Some(read) => read,
+        None => {
+            stdout
+                .recv_timeout(Duration::from_secs(1))
+                .map_err(|_| CommandError::TimedOut {
+                    command: command.clone(),
+                    after: timeout,
+                })?
+        }
+    };
+    let stderr = collect(&stderr, deadline).unwrap_or_default();
+    Ok((
+        Output {
+            status,
+            stdout,
+            stderr,
+        },
+        more,
+    ))
+}
+
 /// Runs `cmd` and returns its stdout, failing on a non-zero exit.
 pub fn run(cmd: &mut Command) -> Result<String, CommandError> {
     let out = output(cmd)?;
@@ -284,5 +361,19 @@ mod tests {
             parallel_map(&items, |n| n * 2),
             items.iter().map(|n| n * 2).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn capped_output_stops_a_command_that_has_more() {
+        let mut cmd = quiet("sh");
+        cmd.args(["-c", "yes | head -c 1000000"]);
+        let (out, cut) = output_capped(&mut cmd, Duration::from_secs(10), 100).expect("runs");
+        assert!(cut);
+        assert_eq!(out.stdout.len(), 100);
+        let mut cmd = quiet("sh");
+        cmd.args(["-c", "printf abc"]);
+        let (out, cut) = output_capped(&mut cmd, Duration::from_secs(10), 100).expect("runs");
+        assert!(!cut && out.status.success());
+        assert_eq!(out.stdout, b"abc");
     }
 }

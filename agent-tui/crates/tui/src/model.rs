@@ -36,6 +36,89 @@ pub enum Panel {
     Agent { offset: usize },
     /// [3]: they move the cursor over the selected agent's changed files.
     Changes { file: usize },
+    /// The keys are in the document [0] shows for the list panel it came
+    /// from, whose cursor still says which document.
+    Main(Origin),
+    /// [0] shows the agent's live terminal for reading only, while the list
+    /// panel it came from keeps its cursor. `in_main` says whether the keys
+    /// were in the document, so `t` returns to where they were.
+    Preview { from: Origin, in_main: bool },
+}
+
+/// The list panel a focused document in [0] came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Origin {
+    Turn { offset: usize },
+    Changes { file: usize },
+}
+
+impl Origin {
+    fn panel(self) -> Panel {
+        match self {
+            Self::Turn { offset } => Panel::Agent { offset },
+            Self::Changes { file } => Panel::Changes { file },
+        }
+    }
+}
+
+impl Panel {
+    /// The list panel, with the focus on its document or its preview taken
+    /// away.
+    pub fn listed(self) -> Self {
+        match self {
+            Self::Main(from) | Self::Preview { from, .. } => from.panel(),
+            panel => panel,
+        }
+    }
+
+    fn origin(self) -> Option<Origin> {
+        match self.listed() {
+            Self::Agent { offset } => Some(Origin::Turn { offset }),
+            Self::Changes { file } => Some(Origin::Changes { file }),
+            Self::Agents | Self::Main(_) | Self::Preview { .. } => None,
+        }
+    }
+
+    /// `t`: the preview of the terminal, or back from it to where the keys
+    /// were. [1] has none.
+    pub fn toggled_preview(self) -> Self {
+        match self {
+            Self::Preview { from, in_main } if in_main => Self::Main(from),
+            Self::Preview { from, .. } => from.panel(),
+            Self::Main(from) => Self::Preview {
+                from,
+                in_main: true,
+            },
+            list => list.origin().map_or(list, |from| Self::Preview {
+                from,
+                in_main: false,
+            }),
+        }
+    }
+
+    /// This panel after a layout settled `list` as its list panel: the
+    /// focus on its document or preview survives when the list panel does.
+    pub fn with_list(self, list: Self) -> Self {
+        match (self, list.origin()) {
+            (Self::Main(_), Some(from)) => Self::Main(from),
+            (Self::Preview { in_main, .. }, Some(from)) => Self::Preview { from, in_main },
+            _ => list,
+        }
+    }
+
+    /// The same panel with the keys in its document. [1] has none.
+    pub fn into_main(self) -> Self {
+        match self {
+            Self::Agent { offset } => Self::Main(Origin::Turn { offset }),
+            Self::Changes { file } => Self::Main(Origin::Changes { file }),
+            Self::Preview { from, .. } => Self::Main(from),
+            panel => panel,
+        }
+    }
+
+    pub fn in_main(self) -> bool {
+        matches!(self, Self::Main(_))
+    }
 }
 
 /// Whether the column is tall enough for [3] at all. Until a draw says
@@ -780,6 +863,12 @@ pub struct Areas {
     /// Inside the sidebar's border, empty while it's hidden.
     pub sidebar: Rect,
     pub rows: Vec<(u16, Cursor)>,
+    /// [2]'s and [3]'s panels as drawn, and the screen row of each of their
+    /// list rows with its index, so a click lands on what it points at.
+    pub agent_panel: Rect,
+    pub agent_rows: Vec<(u16, usize)>,
+    pub changes_panel: Rect,
+    pub change_rows: Vec<(u16, usize)>,
     /// Rows inside the panel the keys go to, as last drawn, so a half-page
     /// move knows how far that is.
     pub page: usize,
@@ -904,6 +993,9 @@ pub struct Model {
     pub activities: Option<HashMap<SessionName, Activity>>,
     /// The clock for this frame, so every row, count and title agrees.
     pub now: SystemTime,
+    /// How many times each agent's git facts have been read, which tells a
+    /// document read from them that they may have changed.
+    pub facts_generation: HashMap<SessionName, u64>,
     /// Each agent's git facts, or why they couldn't be read, as last read.
     pub facts: HashMap<SessionName, Result<WorktreeFacts, String>>,
     /// When each agent's facts were last asked for.
@@ -925,9 +1017,6 @@ pub struct Model {
     pub subagent_reads: HashMap<SubagentKey, SubagentRead>,
     /// What the main view [0] reads when it isn't the terminal.
     pub docs: Documents,
-    /// Whether the keys go to the document in [0] rather than the panel
-    /// that picked it.
-    pub focus_main: bool,
     pub screen: Screen,
     /// Whether the sidebar was drawn last frame: not in the full screen
     /// mode, nor below the width it needs.
@@ -972,6 +1061,7 @@ impl Model {
             activities: None,
             now: SystemTime::now(),
             facts: HashMap::new(),
+            facts_generation: HashMap::new(),
             inspections: HashMap::new(),
             acknowledged: None,
             last_bell: None,
@@ -982,7 +1072,6 @@ impl Model {
             subagent_logs: HashMap::new(),
             subagent_reads: HashMap::new(),
             docs: Documents::default(),
-            focus_main: false,
             screen: Screen::Split,
             sidebar_shown: true,
         }
@@ -1050,6 +1139,7 @@ impl Model {
 
     fn move_in_panel_by(&mut self, delta: isize, wrap: Wrap) {
         self.panel = match self.panel {
+            Panel::Main(_) | Panel::Preview { .. } => self.panel,
             Panel::Agents => {
                 self.move_cursor_by(delta, wrap);
                 Panel::Agents
@@ -1075,6 +1165,7 @@ impl Model {
 
     pub fn panel_to_edge(&mut self, edge: Edge) {
         self.panel = match (self.panel, edge) {
+            (Panel::Main(_) | Panel::Preview { .. }, _) => self.panel,
             (Panel::Agents, _) => {
                 self.move_to_edge(edge);
                 Panel::Agents
@@ -1119,7 +1210,7 @@ impl Model {
     /// What [3]'s cursor is on and the checkout it's in, unless the keys are
     /// going to the agent.
     fn changes_hover(&self) -> Option<(Hover, PathBuf)> {
-        let Panel::Changes { file } = self.panel else {
+        let Panel::Changes { file } = self.panel.listed() else {
             return None;
         };
         if matches!(self.focus(), Focus::Agent(_)) {
@@ -1129,17 +1220,20 @@ impl Model {
         let row = file.min(self.change_rows().checked_sub(1)?);
         let root = entry.path()?.to_path_buf();
         let name = entry.name().clone();
+        let generation = self.facts_generation.get(&name).copied().unwrap_or(0);
         let hover = match (row, self.change_at(row), self.facts.get(&name)) {
             (_, Some(change), _) => Hover::Diff(DiffKey {
                 name,
                 path: change.path.clone(),
                 lines: change.lines,
+                generation,
             }),
             (_, None, Some(Ok(facts))) => Hover::Branch(BranchKey {
                 name,
                 ahead: facts.ahead,
                 behind: facts.behind,
                 dirty: facts.dirty,
+                generation,
             }),
             (_, None, _) => return None,
         };
@@ -1153,7 +1247,7 @@ impl Model {
         let key = match hover {
             Hover::Diff(key) => Key::Diff(key),
             Hover::Branch(key) => Key::Branch(key),
-            Hover::Turn(_) | Hover::Subagent(..) => return None,
+            Hover::Turn(_) | Hover::Subagent(..) | Hover::Repo(_) => return None,
         };
         Some((key, root))
     }
@@ -1161,8 +1255,8 @@ impl Model {
     /// Which item of its panel the cursor is on, of how many, for [0]'s
     /// title while the sidebar is out of sight.
     pub fn position(&self) -> Option<(usize, usize)> {
-        match self.panel {
-            Panel::Agents => None,
+        match self.panel.listed() {
+            Panel::Agents | Panel::Main(_) | Panel::Preview { .. } => None,
             Panel::Changes { file } => {
                 let rows = self.change_rows();
                 Some((file.min(rows.checked_sub(1)?) + 1, rows))
@@ -1173,12 +1267,24 @@ impl Model {
 
     /// Whether the keys go to the document in [0].
     pub fn main_focused(&self) -> bool {
-        self.focus_main && self.hover().is_some()
+        self.panel.in_main()
     }
 
-    /// Whether [0] shows the terminal rather than a document.
+    /// Whether [0] reads the live terminal as a preview.
+    pub fn previewing(&self) -> bool {
+        matches!(self.panel, Panel::Preview { .. }) && !matches!(self.focus(), Focus::Agent(_))
+    }
+
+    /// Whether [0] shows a document that scrolls, as opposed to the
+    /// terminal, a preview of it or a repo's summary.
+    pub fn shows_document(&self) -> bool {
+        !self.previewing() && !matches!(self.hover(), None | Some(Hover::Repo(_)))
+    }
+
+    /// Whether [0] shows the terminal, live or as a preview, rather than a
+    /// document. It's being looked at either way.
     pub fn terminal_visible(&self) -> bool {
-        self.hover().is_none()
+        self.previewing() || self.hover().is_none()
     }
 
     /// The agent whose terminal [0] shows, if it shows one.
@@ -1188,16 +1294,16 @@ impl Model {
 
     /// Points the main view at what the cursor is on.
     pub fn settle_main(&mut self) {
-        if !matches!(self.panel, Panel::Agent { .. } | Panel::Changes { .. }) {
-            self.focus_main = false;
-        }
         let hover = self.hover();
+        if hover.is_none() {
+            self.panel = self.panel.listed();
+        }
         self.docs.settle(hover.as_ref(), Instant::now());
     }
 
     /// The selected agent's checkout and the file under [3]'s cursor in it.
     pub fn file_under_cursor(&self) -> Option<(PathBuf, PathBuf)> {
-        let Panel::Changes { file } = self.panel else {
+        let Panel::Changes { file } = self.panel.listed() else {
             return None;
         };
         let root = self.selected_entry()?.path()?;
@@ -1235,7 +1341,7 @@ impl Model {
                     Pulse::Steady
                 };
                 let doing = match (&activity.state, activity.current_tool()) {
-                    (ActivityState::Delegating, _) => NonZeroUsize::new(activity.subagents.len())
+                    (ActivityState::Delegating, _) => NonZeroUsize::new(activity.running())
                         .map_or(Doing::HandingBack, Doing::Delegating),
                     (_, Some(tool)) => Doing::Tool {
                         name: tool.name.clone(),
@@ -1301,7 +1407,7 @@ impl Model {
 
     /// Moves [2]'s cursor to the row `to` picks from where it is and the
     /// last row's index.
-    fn point_at_row(&mut self, to: impl FnOnce(usize, usize) -> usize) {
+    pub fn point_at_row(&mut self, to: impl FnOnce(usize, usize) -> usize) {
         let rows = self.subagent_rows();
         let row = to(self.row_at(), rows.len()).min(rows.len());
         self.subagent = row.checked_sub(1).map(|at| rows[at].0.clone());
@@ -1309,7 +1415,7 @@ impl Model {
 
     /// The subagent [2]'s cursor is on, while [2] is focused.
     pub fn subagent_selected(&self) -> Option<(SessionName, AgentId)> {
-        let Panel::Agent { .. } = self.panel else {
+        let Panel::Agent { .. } = self.panel.listed() else {
             return None;
         };
         let name = self.selected_entry()?.name().clone();
@@ -1324,8 +1430,13 @@ impl Model {
         if matches!(self.focus(), Focus::Agent(_)) {
             return None;
         }
-        match self.panel {
-            Panel::Agents => None,
+        match self.panel.listed() {
+            Panel::Agents | Panel::Main(_) | Panel::Preview { .. } => match self.cursor() {
+                Some(Cursor::Repo(key)) if self.panel == Panel::Agents => {
+                    Some(Hover::Repo(key.clone()))
+                }
+                _ => None,
+            },
             Panel::Changes { .. } => self.changes_hover().map(|(hover, _)| hover),
             Panel::Agent { .. } => {
                 let entry = self.selected_entry()?;
@@ -1344,7 +1455,7 @@ impl Model {
         let EntryState::Live = entry.state() else {
             return None;
         };
-        NonZeroUsize::new(self.activity(entry.name())?.subagents.len())
+        NonZeroUsize::new(self.activity(entry.name())?.running())
     }
 
     /// Agents that need the user, in the order `a` visits them: blocked ones

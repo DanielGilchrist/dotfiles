@@ -13,7 +13,7 @@ use agent_core::names::SessionName;
 use agent_core::ports::{DiffStat, Lines, Readiness, WorktreeFacts};
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::Style;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use unicode_width::UnicodeWidthStr;
@@ -498,7 +498,7 @@ impl<'m> Deck<'m> {
         let Some(activity) = m.activity(entry.name()) else {
             return (Vec::new(), None);
         };
-        let cursor = matches!(m.panel, Focused::Agent { .. }).then(|| m.row_at());
+        let cursor = matches!(m.panel.listed(), Focused::Agent { .. }).then(|| m.row_at());
         let mut rows = vec![Line::raw(turn_row(
             activity.prompt.as_deref(),
             self.content,
@@ -592,24 +592,34 @@ fn tree(
             } else {
                 "├ "
             };
-            let since = ago(subagent.since, now);
+            let (glyph, since) = match subagent.finished {
+                Some(at) => (
+                    Span::styled("✓", success().add_modifier(Modifier::BOLD)),
+                    ago(subagent.since, at),
+                ),
+                None => (Span::raw(spinner()), ago(subagent.since, now)),
+            };
             let described = subagent.description.as_deref().filter(|d| !d.is_empty());
-            let (label, right) = match (described, form) {
+            let (label, kind_only, right) = match (described, form) {
                 (Some(description), Form::Long) => {
-                    (description, format!(" {}  {since}", subagent.kind))
+                    (description, false, format!(" {}  {since}", subagent.kind))
                 }
-                (None, Form::Long) => ("", format!(" {}  {since}", subagent.kind)),
-                (Some(description), Form::Short) => (description, format!(" {since}")),
-                (None, Form::Short) => (subagent.kind.as_str(), format!(" {since}")),
+                (Some(description), Form::Short) => (description, false, format!(" {since}")),
+                (None, _) => (subagent.kind.as_str(), true, format!(" {since}")),
             };
             let selected = cursor == Some(i);
             let mut line = justify(
                 vec![
                     Span::styled(branch, dim()),
-                    Span::raw(format!("{} ", spinner())),
+                    glyph,
+                    Span::raw(" "),
                     Span::styled(
                         label.to_string(),
-                        if selected { bold() } else { Style::new() },
+                        match (kind_only, selected) {
+                            (true, _) => dim(),
+                            (false, true) => bold(),
+                            (false, false) => Style::new(),
+                        },
                     ),
                 ],
                 vec![Span::styled(right, dim())],
@@ -743,17 +753,12 @@ fn changes(
         all.push(line);
     }
     let total = all.len();
+    let (first, listed) = window(total, rows, cursor);
     match cursor {
-        Some(at) => {
-            let first = at
-                .min(total.saturating_sub(1))
-                .saturating_sub(rows.saturating_sub(1));
-            all.into_iter().skip(first).take(rows).collect()
-        }
+        Some(_) => all.into_iter().skip(first).take(rows).collect(),
         None if total <= rows => all,
         None => {
-            let mut shown: Vec<Line<'static>> =
-                all.into_iter().take(rows.saturating_sub(1)).collect();
+            let mut shown: Vec<Line<'static>> = all.into_iter().take(listed).collect();
             if let Some(hidden) = NonZeroUsize::new(total - shown.len()) {
                 let mut more = more_row(hidden, width);
                 more.spans.insert(0, Span::raw(" "));
@@ -761,6 +766,22 @@ fn changes(
             }
             shown
         }
+    }
+}
+
+/// Which of `total` rows [3] shows in `rows` rows: the first, and how many
+/// of the shown rows are rows rather than a closing `+k more`. With a cursor
+/// the rows scroll to keep it in view.
+fn window(total: usize, rows: usize, cursor: Option<usize>) -> (usize, usize) {
+    match cursor {
+        Some(at) => {
+            let first = at
+                .min(total.saturating_sub(1))
+                .saturating_sub(rows.saturating_sub(1));
+            (first, rows.min(total - first))
+        }
+        None if total <= rows => (0, total),
+        None => (0, rows.saturating_sub(1)),
     }
 }
 
@@ -874,6 +895,8 @@ struct Laid {
     scroll: ListScroll,
     /// [2], while an agent with a turn is selected.
     agent: Option<Panel>,
+    agent_rows: Vec<(u16, usize)>,
+    change_rows: Vec<(u16, usize)>,
     /// The focused panel, its position clamped to what it shows.
     focus: Focused,
     /// Whether the column had room for [3].
@@ -935,9 +958,23 @@ fn lay_out(m: &Model, area: Rect) -> Option<Laid> {
         .cloned()
         .zip(list.selected.map(|r| r.start.saturating_sub(offset)));
     let list_height = if lower.is_some() { visible + 2 } else { height };
-    let (agent, changes, focus, room) = match lower {
-        Some(lower) => (lower.agent, lower.changes, lower.focus, lower.room),
-        None => (None, None, Focused::Agents, WorkRoom::TooShort),
+    let (agent, agent_rows, changes, change_rows, focus, room) = match lower {
+        Some(lower) => (
+            lower.agent,
+            lower.agent_rows,
+            lower.changes,
+            lower.change_rows,
+            lower.focus,
+            lower.room,
+        ),
+        None => (
+            None,
+            Vec::new(),
+            None,
+            Vec::new(),
+            Focused::Agents,
+            WorkRoom::TooShort,
+        ),
     };
     Some(Laid {
         list: Panel {
@@ -952,9 +989,11 @@ fn lay_out(m: &Model, area: Rect) -> Option<Laid> {
         hits,
         scroll: ListScroll { offset, anchor },
         agent,
+        agent_rows,
         focus,
         room,
         changes,
+        change_rows,
     })
 }
 
@@ -1010,7 +1049,10 @@ fn work_of<'m>(m: &'m Model, entry: &Entry) -> Option<Work<'m>> {
 /// [2] and [3] as laid out under the list, with the focus clamped to them.
 struct Lower {
     agent: Option<Panel>,
+    /// The screen row of each of [2]'s rows shown, with its index.
+    agent_rows: Vec<(u16, usize)>,
     changes: Option<(Panel, Changes)>,
+    change_rows: Vec<(u16, usize)>,
     focus: Focused,
     room: WorkRoom,
 }
@@ -1059,9 +1101,11 @@ fn lower_panels(deck: &Deck<'_>, repo: &Repo, entry: &Entry, area: Rect) -> Lowe
     };
 
     let mut focus = Focused::Agents;
+    let mut agent_rows = Vec::new();
+    let mut change_rows = Vec::new();
     let agent = (turn_height > 0).then(|| {
         let inside = turn_height - 2;
-        let first = match (m.panel, turn_cursor) {
+        let first = match (m.panel.listed(), turn_cursor) {
             (Focused::Agent { offset }, Some(row)) => {
                 let first = scroll(offset, row, inside, turn.len());
                 focus = Focused::Agent { offset: first };
@@ -1069,15 +1113,17 @@ fn lower_panels(deck: &Deck<'_>, repo: &Repo, entry: &Entry, area: Rect) -> Lowe
             }
             _ => 0,
         };
-        pad(
-            at(0, turn_height),
-            turn.into_iter().skip(first).take(inside).collect(),
-        )
+        let lines: Vec<Line<'static>> = turn.into_iter().skip(first).take(inside).collect();
+        let top = at(0, turn_height).y + 1;
+        agent_rows = (0..lines.len())
+            .map(|i| (top + u16::try_from(i).unwrap_or(0), first + i))
+            .collect();
+        pad(at(0, turn_height), lines)
     });
     let changes = work.filter(|_| work_height > 0).map(|work| {
         let area = at(turn_height, work_height);
         let inside = work_height - 2;
-        let cursor = match m.panel {
+        let cursor = match m.panel.listed() {
             Focused::Changes { file } => {
                 let row = file.min(work_rows - 1);
                 focus = Focused::Changes { file: row };
@@ -1085,6 +1131,11 @@ fn lower_panels(deck: &Deck<'_>, repo: &Repo, entry: &Entry, area: Rect) -> Lowe
             }
             _ => None,
         };
+        let top = area.y + 1;
+        let (first, listed) = window(work_rows, inside, cursor);
+        change_rows = (0..listed)
+            .map(|i| (top + u16::try_from(i).unwrap_or(0), first + i))
+            .collect();
         match work {
             Work::Facts { facts, head } => {
                 let shared = deck.overlaps(repo, entry);
@@ -1105,7 +1156,9 @@ fn lower_panels(deck: &Deck<'_>, repo: &Repo, entry: &Entry, area: Rect) -> Lowe
     });
     Lower {
         agent,
+        agent_rows,
         changes,
+        change_rows,
         focus,
         room: if work_height > 0 || work_rows == 0 {
             WorkRoom::Fits
@@ -1182,15 +1235,20 @@ pub(super) fn subagent_rows(m: &Model, entry: &Entry, width: usize) -> Vec<Line<
 pub(super) fn status_line(m: &Model, entry: &Entry, width: usize) -> Vec<Span<'static>> {
     let status = m.status(entry);
     let heard = m.activity(entry.name()).map_or(m.now, |a| a.heard);
-    let time = time_in_state(&status, m.now);
+    let gist = Gist::of(&status, heard, m.now);
+    // A delegating gist already ends in how long it's been quiet.
+    let time = match gist {
+        Some(Gist::Delegating { .. }) => Vec::new(),
+        _ => time_in_state(&status, m.now),
+    };
     let mut spans = vec![
         glyph(&status),
         Span::raw(" "),
         Span::styled(entry.label().to_string(), bold()),
     ];
     let room = width.saturating_sub(line_width(&spans) + line_width(&time) + 4);
-    if let Some(gist) = Gist::of(&status, heard, m.now)
-        && room >= 8
+    if let Some(gist) = gist
+        && room >= GIST_MIN
     {
         spans.push(Span::raw("  "));
         spans.push(Span::styled(gist.line(Form::Long, room).0, gist.style()));
@@ -1202,14 +1260,18 @@ pub(super) fn status_line(m: &Model, entry: &Entry, width: usize) -> Vec<Span<'s
     spans
 }
 
+/// The least room what an agent is doing gets beside its name, else only
+/// the name and time show.
+const GIST_MIN: usize = 14;
+
 /// The three panels in `area`, the one `j`/`k` act on with `border` (the
 /// accent while the sidebar has the keys) and the others DIM.
 pub(super) fn draw(frame: &mut Frame<'_>, m: &mut Model, area: Rect, border: Style) {
     let nav = sidebar_focused(m);
     let style_of = |focused: bool| if focused { border } else { dim() };
     let agents = matches!(m.panel, Focused::Agents);
-    let agent = matches!(m.panel, Focused::Agent { .. });
-    let files = matches!(m.panel, Focused::Changes { .. });
+    let agent = matches!(m.panel.listed(), Focused::Agent { .. });
+    let files = matches!(m.panel.listed(), Focused::Changes { .. });
     // Overview's folds and the tier depend on the list's room, so it's
     // measured before anything asks for the rows.
     m.areas.sidebar = Rect::new(
@@ -1230,7 +1292,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, m: &mut Model, area: Rect, border: Sty
         return;
     };
     // A focused panel that stopped existing hands the focus back.
-    let laid = if std::mem::discriminant(&laid.focus) == std::mem::discriminant(&m.panel) {
+    let laid = if std::mem::discriminant(&laid.focus) == std::mem::discriminant(&m.panel.listed()) {
         laid
     } else {
         m.panel = laid.focus;
@@ -1249,8 +1311,14 @@ pub(super) fn draw(frame: &mut Frame<'_>, m: &mut Model, area: Rect, border: Sty
             .changes
             .as_ref()
             .map_or(0, |(p, _)| usize::from(p.area.height)),
+        Focused::Main(_) | Focused::Preview { .. } => 0,
     }
     .saturating_sub(2);
+    let agent_area = laid.agent.as_ref().map_or(Rect::default(), |p| p.area);
+    let changes_area = laid
+        .changes
+        .as_ref()
+        .map_or(Rect::default(), |(p, _)| p.area);
     let list = panel(title, corner, style_of(agents), nav && agents);
     frame.render_widget(Paragraph::new(laid.list.lines).block(list), laid.list.area);
     if let Some(Panel { area, lines }) = laid.agent {
@@ -1275,10 +1343,14 @@ pub(super) fn draw(frame: &mut Frame<'_>, m: &mut Model, area: Rect, border: Sty
         let block = panel(title, Vec::new(), style_of(files), nav && files);
         frame.render_widget(Paragraph::new(lines).block(block), area);
     }
-    m.panel = laid.focus;
+    m.panel = m.panel.with_list(laid.focus);
     m.work_room = laid.room;
     m.scroll = laid.scroll;
     m.areas.rows = laid.hits;
+    m.areas.agent_rows = laid.agent_rows;
+    m.areas.change_rows = laid.change_rows;
+    m.areas.agent_panel = agent_area;
+    m.areas.changes_panel = changes_area;
 }
 
 /// Whether text `wide` columns wide fits beside `title` in a border
@@ -1564,7 +1636,7 @@ mod tests {
                     let laid = laid(&mut m, size);
                     let column = column(&m, size);
                     let focused_lower = match laid.focus {
-                        Focused::Agents => None,
+                        Focused::Agents | Focused::Main(_) | Focused::Preview { .. } => None,
                         Focused::Agent { .. } => Some(1),
                         Focused::Changes { .. } => Some(2),
                     };
@@ -1779,8 +1851,8 @@ mod tests {
         assert_eq!(tree.len(), 3, "{}", lines.join("\n"));
         assert!(tree[2].contains("Adversarial review:…  general-purpose  30s"));
         assert!(
-            tree[0].trim_end().ends_with("general-purpose  50s"),
-            "a subagent with no description keeps the kind column\n{}",
+            tree[0].contains("general-purpose") && tree[0].trim_end().ends_with("50s"),
+            "a subagent with no description shows its kind in the description column\n{}",
             tree[0]
         );
     }
@@ -2192,13 +2264,14 @@ mod tests {
         assert!(text.contains("+added") && text.contains("-gone"), "{text}");
         assert!(text.contains("4,000 more lines · e open"), "{text}");
         assert!(
-            rows[0].contains("∩ auth-refresh-2"),
-            "who else changed the file is in its title\n{}",
+            rows[0].contains("∩ auth-refresh-2 +2") && rows[0].contains(" obs-layout-4 ╮"),
+            "the title yields names to the agent's glyph, name and time\n{}",
             rows[0]
         );
         let wide = screen(&render(&mut m, (200, 30)));
         assert!(
-            wide[0].contains("obs-layout-4  ↳3"),
+            wide[0].contains("∩ auth-refresh-2, payroll-fix-3, rate-limit-1")
+                && wide[0].contains("obs-layout-4  ↳3"),
             "the agent's status sits top right when there's room\n{}",
             wide[0]
         );
@@ -2253,7 +2326,7 @@ mod tests {
             terminal.backend().buffer()[(area.x - 2, area.y - 1)].fg
         };
         assert_ne!(border(&terminal), Color::Cyan, "[3] has the keys");
-        m.focus_main = true;
+        m.panel = m.panel.into_main();
         let terminal = render(&mut m, (100, 30));
         assert_eq!(border(&terminal), Color::Cyan, "[0] has them now");
     }
@@ -2424,6 +2497,169 @@ mod tests {
         assert!(
             matches!(m.panel, Focused::Changes { file: 0 }),
             "the focus survives"
+        );
+    }
+
+    fn click(m: &mut Model, x: u16, y: u16, kind: crossterm::event::MouseEventKind) {
+        crate::update::update(
+            m,
+            crate::worker::Msg::Mouse(crossterm::event::MouseEvent {
+                kind,
+                column: x,
+                row: y,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            }),
+        );
+    }
+
+    fn left() -> crossterm::event::MouseEventKind {
+        crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left)
+    }
+
+    #[test]
+    fn clicks_and_the_wheel_land_on_the_rows_drawn_in_two_and_three_and_in_the_document() {
+        let mut m = fleet(10);
+        m.set_cursor(Cursor::Entry(name("obs-layout-4")));
+        render(&mut m, (100, 30));
+        let (y, row) = m.areas.change_rows[2];
+        assert_eq!(row, 2);
+        click(&mut m, 5, y, left());
+        assert_eq!(
+            m.panel,
+            Focused::Changes { file: 2 },
+            "[3] has the keys on that file"
+        );
+        assert!(matches!(m.hover(), Some(crate::document::Hover::Diff(_))));
+        let (y0, _) = m.areas.change_rows[0];
+        click(&mut m, 5, y0, left());
+        assert!(
+            matches!(m.hover(), Some(crate::document::Hover::Branch(_))),
+            "the readiness row reads the branch"
+        );
+        click(&mut m, 5, y, crossterm::event::MouseEventKind::ScrollDown);
+        assert_eq!(
+            m.panel,
+            Focused::Changes { file: 1 },
+            "the wheel moves the cursor a row"
+        );
+
+        render(&mut m, (100, 30));
+        let (y, row) = m.areas.agent_rows[2];
+        assert_eq!(row, 2);
+        click(&mut m, 5, y, left());
+        assert!(matches!(m.panel, Focused::Agent { .. }));
+        assert_eq!(m.row_at(), 2, "the second subagent row");
+        assert!(matches!(
+            m.hover(),
+            Some(crate::document::Hover::Subagent(..))
+        ));
+        let turn_y = m.areas.agent_rows[0].0;
+        click(&mut m, 5, turn_y, left());
+        assert!(matches!(m.hover(), Some(crate::document::Hover::Turn(_))));
+
+        render(&mut m, (100, 30));
+        let terminal = m.areas.terminal;
+        click(&mut m, terminal.x + 2, terminal.y + 2, left());
+        assert!(m.main_focused(), "a click in the document focuses it");
+        click(
+            &mut m,
+            terminal.x + 2,
+            terminal.y + 2,
+            crossterm::event::MouseEventKind::ScrollDown,
+        );
+        assert_eq!(m.docs.scroll, 2, "the wheel scrolls it");
+    }
+
+    #[test]
+    fn clicks_after_the_panel_scrolls_land_on_the_drawn_row() {
+        let mut m = fleet(10);
+        m.set_cursor(Cursor::Entry(name("obs-layout-4")));
+        m.panel = Focused::Changes { file: 4 };
+        render(&mut m, (100, 16));
+        let rows = m.areas.change_rows.clone();
+        assert!(
+            rows.first().is_some_and(|(_, first)| *first > 0),
+            "scrolled: {rows:?}"
+        );
+        let (y, row) = rows[1];
+        click(&mut m, 5, y, left());
+        assert_eq!(m.panel, Focused::Changes { file: row });
+    }
+
+    #[test]
+    fn a_preview_says_it_only_previews_and_its_border_is_its_own() {
+        let mut m = fleet(10);
+        m.set_cursor(Cursor::Entry(name("obs-layout-4")));
+        m.panel = Focused::Changes { file: 1 };
+        let plain = render(&mut m, (100, 30));
+        let area = m.areas.terminal;
+        let corner = |t: &Terminal<TestBackend>| {
+            t.backend().buffer()[(area.x - 2, area.y - 1)]
+                .symbol()
+                .to_string()
+        };
+        assert_eq!(corner(&plain), "╭");
+        m.panel = m.panel.toggled_preview();
+        let terminal = render(&mut m, (100, 30));
+        let rows = screen(&terminal);
+        assert!(rows[0].contains("[0] preview · "), "{}", rows[0]);
+        assert!(rows[0].contains("obs-layout-4"), "{}", rows[0]);
+        assert!(rows[0].contains("i type · r reply · t back"), "{}", rows[0]);
+        assert_eq!(corner(&terminal), "╔", "a border no other panel has");
+        assert_eq!(m.areas.terminal, area, "the pty keeps its size");
+        let footer = rows.last().expect("a footer");
+        assert!(
+            footer.contains("t back") && footer.contains("i type"),
+            "{footer}"
+        );
+    }
+
+    #[test]
+    fn a_repo_row_shows_its_checkouts_in_the_main_view() {
+        let mut m = fleet(10);
+        m.toggle_view();
+        let key = m
+            .snapshot()
+            .expect("loaded")
+            .repos()
+            .iter()
+            .find(|r| r.name() == "heucristic0")
+            .expect("a repo")
+            .key()
+            .clone();
+        m.set_cursor(Cursor::Repo(key));
+        let text = screen(&render(&mut m, (100, 30))).join("\n");
+        assert!(text.contains("[0] heucristic0"), "{text}");
+        assert!(text.contains("obs-layout-4"), "{text}");
+        assert!(text.contains("files +"), "what each has changed\n{text}");
+    }
+
+    #[test]
+    fn a_running_call_reads_how_long_it_has_run() {
+        let mut m = fleet(10);
+        m.set_cursor(Cursor::Entry(name("obs-layout-4")));
+        m.panel = Focused::Agent { offset: 0 };
+        m.subagent = Some(AgentId::new("s1"));
+        let mut all = m.activities.take().expect("reported");
+        let sub = all
+            .get_mut(&name("obs-layout-4"))
+            .and_then(|a| a.subagents.get_mut(&AgentId::new("s1")))
+            .expect("a subagent");
+        sub.tools.push(agent_core::activity::Tool {
+            id: agent_core::activity::ToolId::new("t"),
+            name: "Bash".into(),
+            target: Some("cargo test".into()),
+            since: SystemTime::now() - std::time::Duration::from_secs(12),
+        });
+        m.activities = Some(all);
+        m.subagent_logs.insert(
+            (name("obs-layout-4"), AgentId::new("s1")),
+            Ok(Some(log_of(2, false))),
+        );
+        let text = screen(&render(&mut m, (100, 30))).join("\n");
+        assert!(
+            text.contains("running 1"),
+            "about 12s, from the hooks\n{text}"
         );
     }
 }

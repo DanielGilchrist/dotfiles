@@ -7,8 +7,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use agent_core::activity::AgentId;
+use agent_core::model::RepoKey;
 use agent_core::names::SessionName;
 use agent_core::ports::{BranchLog, FileDiff, Lines};
+use ratatui::text::Line;
 
 /// The cursor must rest on a file this long before its diff is asked for, so
 /// holding `j` doesn't start a read per file.
@@ -17,6 +19,10 @@ pub const REST: Duration = Duration::from_millis(60);
 pub const LOADING_AFTER: Duration = Duration::from_millis(150);
 /// Documents kept, the least recently shown going first.
 const CACHE: usize = 32;
+/// And at most this much text, so a few huge diffs can't hold the memory.
+const BUDGET: usize = 8 * 1024 * 1024;
+/// A read that failed is asked again after this long.
+const ERROR_TTL: Duration = Duration::from_secs(5);
 
 /// A changed file's diff: whose it is, which file, and the numstat line it
 /// was read at, so a file that changed again is a different document.
@@ -25,6 +31,9 @@ pub struct DiffKey {
     pub name: SessionName,
     pub path: PathBuf,
     pub lines: Lines,
+    /// Counts the agent's git facts read, so a file edited without its
+    /// counts changing is a different document.
+    pub generation: u64,
 }
 
 /// A branch's log: whose it is and the counts it was read at, so a branch
@@ -35,6 +44,8 @@ pub struct BranchKey {
     pub ahead: usize,
     pub behind: usize,
     pub dirty: usize,
+    /// As in [`DiffKey`], so a swapped commit shows.
+    pub generation: u64,
 }
 
 /// A document read off the UI thread.
@@ -44,7 +55,18 @@ pub enum Key {
     Branch(BranchKey),
 }
 
+/// What one read answers: an agent's file, or its branch. A newer read for
+/// the same slot replaces an older one that hasn't started.
+pub type Slot = (SessionName, Option<PathBuf>);
+
 impl Key {
+    pub fn slot(&self) -> Slot {
+        match self {
+            Self::Diff(key) => (key.name.clone(), Some(key.path.clone())),
+            Self::Branch(key) => (key.name.clone(), None),
+        }
+    }
+
     pub fn name(&self) -> &SessionName {
         match self {
             Self::Diff(key) => &key.name,
@@ -60,6 +82,19 @@ pub enum Doc {
     Branch(BranchLog),
 }
 
+impl Doc {
+    /// Roughly how much memory it holds.
+    fn bytes(&self) -> usize {
+        match self {
+            Self::Diff(FileDiff::Text { lines, .. }) => lines.iter().map(String::len).sum(),
+            Self::Diff(FileDiff::Binary { .. }) => 0,
+            Self::Branch(log) => {
+                log.commits.iter().map(String::len).sum::<usize>() + log.uncommitted.len() * 64
+            }
+        }
+    }
+}
+
 /// What the cursor is on that [0] reads.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Hover {
@@ -71,6 +106,8 @@ pub enum Hover {
     Turn(SessionName),
     /// A subagent row in [2].
     Subagent(SessionName, AgentId),
+    /// A repo row in [1]: nothing to read, but a summary to show.
+    Repo(RepoKey),
 }
 
 /// What a scroll position belongs to, so another item starts afresh.
@@ -80,6 +117,7 @@ enum Item {
     Branch(SessionName),
     Turn(SessionName),
     Subagent(SessionName, AgentId),
+    Repo(RepoKey),
 }
 
 impl Hover {
@@ -89,6 +127,7 @@ impl Hover {
             Self::Branch(key) => Item::Branch(key.name.clone()),
             Self::Turn(name) => Item::Turn(name.clone()),
             Self::Subagent(name, id) => Item::Subagent(name.clone(), id.clone()),
+            Self::Repo(key) => Item::Repo(key.clone()),
         }
     }
 
@@ -97,12 +136,36 @@ impl Hover {
         match self {
             Self::Diff(key) => Some(Key::Diff(key.clone())),
             Self::Branch(key) => Some(Key::Branch(key.clone())),
-            Self::Turn(_) | Self::Subagent(..) => None,
+            Self::Turn(_) | Self::Subagent(..) | Self::Repo(_) => None,
         }
     }
 }
 
 pub type Loaded = Arc<Result<Doc, String>>;
+
+/// The document the cursor is on, since when, and since when [0] has had
+/// nothing current to show for it.
+struct Wanted {
+    key: Key,
+    since: Instant,
+    waiting: Option<Instant>,
+}
+
+struct Entry {
+    key: Key,
+    loaded: Loaded,
+    at: Instant,
+    bytes: usize,
+}
+
+/// What [0] has for the document the cursor is on.
+pub enum Resolved<'a> {
+    /// The document itself.
+    Current(&'a Key, &'a Loaded),
+    /// An earlier read of the same file or branch, until the new one lands.
+    Stale(&'a Key, &'a Loaded),
+    Missing,
+}
 
 #[derive(Default)]
 pub struct Documents {
@@ -116,25 +179,27 @@ pub struct Documents {
     following: bool,
     /// What the scroll belongs to: moving to another item starts afresh.
     item: Option<Item>,
-    /// The document the cursor is on and since when.
-    hover: Option<(Key, Instant)>,
+    wanted: Option<Wanted>,
     requested: Vec<Key>,
-    cache: Vec<(Key, Loaded)>,
-    /// What [0] shows: the hovered document once it's loaded, else the last
-    /// one shown, so moving the cursor never blanks the screen.
+    cache: Vec<Entry>,
+    /// The last document that was current, so a file read again keeps its
+    /// text on screen meanwhile.
     shown: Option<(Key, Loaded)>,
-    /// Since when [0] has shown something other than what's hovered.
-    waiting: Option<Instant>,
+    /// Rows built from a document at a width, so a frame doesn't rebuild them.
+    rows: Option<(Key, usize, Vec<Line<'static>>)>,
 }
 
 impl Documents {
     /// Follows the cursor: `hover` is what it's on, if [0] reads it.
     pub fn settle(&mut self, hover: Option<&Hover>, now: Instant) {
         let Some(hover) = hover else {
-            self.hover = None;
-            self.item = None;
-            self.shown = None;
-            self.waiting = None;
+            *self = Self {
+                requested: std::mem::take(&mut self.requested),
+                cache: std::mem::take(&mut self.cache),
+                scroll: self.scroll,
+                page: self.page,
+                ..Self::default()
+            };
             return;
         };
         let item = hover.item();
@@ -144,60 +209,125 @@ impl Documents {
             self.following = true;
         }
         let Some(key) = hover.key() else {
-            self.hover = None;
+            self.wanted = None;
             self.shown = None;
-            self.waiting = None;
             return;
         };
-        if self.hover.as_ref().map(|(k, _)| k) != Some(&key) {
-            self.hover = Some((key.clone(), now));
+        self.cache
+            .retain(|e| e.loaded.is_ok() || now < e.at + ERROR_TTL);
+        if self.wanted.as_ref().map(|w| &w.key) != Some(&key) {
+            self.wanted = Some(Wanted {
+                key: key.clone(),
+                since: now,
+                waiting: None,
+            });
         }
-        match self.cache.iter().position(|(k, _)| *k == key) {
-            Some(at) => {
-                let hit = self.cache.remove(at);
-                self.shown = Some(hit.clone());
-                self.cache.push(hit);
-                self.waiting = None;
-            }
-            None => {
-                self.waiting.get_or_insert(now);
-            }
+        if self
+            .shown
+            .as_ref()
+            .is_some_and(|(k, _)| k.slot() != key.slot())
+        {
+            self.shown = None;
+        }
+        let hit = self.cache.iter().position(|e| e.key == key);
+        if let Some(at) = hit {
+            let entry = self.cache.remove(at);
+            self.shown = Some((entry.key.clone(), entry.loaded.clone()));
+            self.cache.push(entry);
+        }
+        if let Some(wanted) = &mut self.wanted {
+            wanted.waiting = match hit {
+                Some(_) => None,
+                None => wanted.waiting.or(Some(now)),
+            };
         }
     }
 
-    /// The hovered diff, once the cursor has rested on it and nothing has
-    /// it or is already reading it.
+    /// The hovered document, once the cursor has rested on it and nothing
+    /// has it or is reading it.
     pub fn due(&mut self, now: Instant) -> Option<Key> {
-        let (key, since) = self.hover.as_ref()?;
-        let waiting = now >= *since + REST
-            && !self.cache.iter().any(|(k, _)| k == key)
-            && !self.requested.contains(key);
-        let key = waiting.then(|| key.clone())?;
+        let wanted = self.wanted.as_ref()?;
+        let due = now >= wanted.since + REST
+            && !self.cache.iter().any(|e| e.key == wanted.key)
+            && !self.requested.contains(&wanted.key);
+        let key = due.then(|| wanted.key.clone())?;
         self.requested.push(key.clone());
         Some(key)
     }
 
-    /// A read finished. Whatever it was for is cached, shown or not.
+    /// A read finished. Whatever it was for is cached, shown or not, unless
+    /// it failed, which is shown for a few seconds and then asked again.
+    /// Older requests for the same slot were replaced and won't answer.
     pub fn loaded(&mut self, key: &Key, result: Result<Doc, String>) {
         let Some(at) = self.requested.iter().position(|k| k == key) else {
             return;
         };
-        self.requested.remove(at);
-        self.cache.retain(|(k, _)| k != key);
-        self.cache.push((key.clone(), Arc::new(result)));
-        let excess = self.cache.len().saturating_sub(CACHE);
-        self.cache.drain(..excess);
+        let slot = key.slot();
+        let mut index = 0;
+        self.requested.retain(|k| {
+            let drop = index <= at && k.slot() == slot;
+            index += 1;
+            !drop
+        });
+        self.cache.retain(|e| e.key != *key);
+        let bytes = result.as_ref().map_or(0, Doc::bytes);
+        self.cache.push(Entry {
+            key: key.clone(),
+            loaded: Arc::new(result),
+            at: Instant::now(),
+            bytes,
+        });
+        self.rows = None;
+        while self.cache.len() > 1
+            && (self.cache.len() > CACHE
+                || self.cache.iter().map(|e| e.bytes).sum::<usize>() > BUDGET)
+        {
+            self.cache.remove(0);
+        }
     }
 
-    /// What [0] shows, and the file it's for.
-    pub fn shown(&self) -> Option<&(Key, Loaded)> {
-        self.shown.as_ref()
+    /// What [0] has for the hovered document.
+    pub fn resolve(&self) -> Resolved<'_> {
+        let (Some(wanted), Some((key, loaded))) = (&self.wanted, &self.shown) else {
+            return Resolved::Missing;
+        };
+        if *key == wanted.key {
+            Resolved::Current(key, loaded)
+        } else if key.slot() == wanted.key.slot() {
+            Resolved::Stale(key, loaded)
+        } else {
+            Resolved::Missing
+        }
+    }
+
+    /// The rows last built for a document.
+    pub fn cached(&self) -> &[Line<'static>] {
+        self.rows.as_ref().map_or(&[], |(_, _, rows)| rows)
+    }
+
+    /// Rows for the document under `key` at `width`, built once.
+    pub fn rows(
+        &mut self,
+        key: &Key,
+        width: usize,
+        build: impl FnOnce() -> Vec<Line<'static>>,
+    ) -> &[Line<'static>] {
+        if !self
+            .rows
+            .as_ref()
+            .is_some_and(|(k, w, _)| k == key && *w == width)
+        {
+            self.rows = Some((key.clone(), width, build()));
+        }
+        self.rows.as_ref().map_or(&[], |(_, _, rows)| rows)
     }
 
     /// Whether what's shown is for an earlier cursor position and the read
     /// is taking long enough to say so.
     pub fn loading(&self, now: Instant) -> bool {
-        self.waiting
+        self.wanted
+            .as_ref()
+            .and_then(|w| w.waiting)
             .is_some_and(|since| now >= since + LOADING_AFTER)
     }
 
@@ -255,7 +385,7 @@ impl Documents {
 
     /// Drops everything about an agent that's gone.
     pub fn forget(&mut self, known: impl Fn(&SessionName) -> bool) {
-        self.cache.retain(|(k, _)| known(k.name()));
+        self.cache.retain(|e| known(e.key.name()));
         self.requested.retain(|k| known(k.name()));
     }
 }
@@ -269,6 +399,7 @@ mod tests {
             name: "fix".parse().expect("parses"),
             path: path.into(),
             lines: Lines::Counted { added, removed: 0 },
+            generation: 0,
         }
     }
 
@@ -280,7 +411,7 @@ mod tests {
     }
 
     fn path_of(docs: &Documents) -> Option<PathBuf> {
-        match docs.shown().map(|(k, _)| k) {
+        match docs.shown.as_ref().map(|(k, _)| k) {
             Some(Key::Diff(key)) => Some(key.path.clone()),
             _ => None,
         }
@@ -300,11 +431,7 @@ mod tests {
 
         let t1 = t0 + REST * 2;
         docs.settle(Some(&Hover::Diff(key("b", 2))), t1);
-        assert_eq!(
-            path_of(&docs),
-            Some("a".into()),
-            "a still shows while b is read"
-        );
+        assert_eq!(path_of(&docs), None, "a never stands in for b");
         assert!(!docs.loading(t1 + Duration::from_millis(100)));
         assert!(docs.loading(t1 + LOADING_AFTER));
         let b = docs.due(t1 + REST).expect("b is read");
@@ -346,18 +473,106 @@ mod tests {
         let t0 = Instant::now();
         docs.loaded(&Key::Diff(key("x", 1)), Ok(diff("x")));
         docs.settle(Some(&Hover::Diff(key("x", 1))), t0);
-        assert!(docs.shown().is_none(), "never requested");
+        assert!(docs.shown.is_none(), "never requested");
         for i in 0..CACHE + 5 {
             let k = key(&format!("f{i}"), i);
             docs.settle(Some(&Hover::Diff(k.clone())), t0);
-            docs.hover = Some((Key::Diff(k.clone()), t0));
             let due = docs.due(t0 + REST).expect("due");
             docs.loaded(&due, Ok(diff("d")));
         }
         assert_eq!(docs.cache.len(), CACHE);
-        assert!(docs.cache.iter().all(
-            |(k, _)| !matches!(k, Key::Diff(d) if d.path.as_path() == std::path::Path::new("f0"))
-        ));
+        assert!(docs.cache.iter().all(|e| {
+            !matches!(&e.key, Key::Diff(d) if d.path.as_path() == std::path::Path::new("f0"))
+        }));
+    }
+
+    #[test]
+    fn another_files_text_never_stands_in_and_the_same_files_older_read_does() {
+        let mut docs = Documents::default();
+        let t0 = Instant::now();
+        docs.settle(Some(&Hover::Diff(key("a", 1))), t0);
+        let a = docs.due(t0 + REST).expect("due");
+        docs.loaded(&a, Ok(diff("a")));
+        docs.settle(Some(&Hover::Diff(key("a", 1))), t0 + REST);
+        assert!(matches!(docs.resolve(), Resolved::Current(..)));
+
+        docs.settle(Some(&Hover::Diff(key("a", 2))), t0 + REST * 2);
+        assert!(
+            matches!(docs.resolve(), Resolved::Stale(..)),
+            "the same file read again keeps its text meanwhile"
+        );
+        docs.settle(Some(&Hover::Diff(key("b", 1))), t0 + REST * 3);
+        assert!(
+            matches!(docs.resolve(), Resolved::Missing),
+            "b never shows a's hunks, however slow its read is"
+        );
+        docs.settle(
+            Some(&Hover::Branch(BranchKey {
+                name: "fix".parse().expect("parses"),
+                ahead: 1,
+                behind: 0,
+                dirty: 0,
+                generation: 0,
+            })),
+            t0 + REST * 3,
+        );
+        assert!(matches!(docs.resolve(), Resolved::Missing));
+    }
+
+    #[test]
+    fn a_request_replaced_before_it_started_is_asked_again_and_errors_are_asked_again_later() {
+        let mut docs = Documents::default();
+        let t0 = Instant::now();
+        docs.settle(Some(&Hover::Diff(key("a", 1))), t0);
+        let first = docs.due(t0 + REST).expect("due");
+        docs.settle(Some(&Hover::Diff(key("a", 2))), t0 + REST);
+        let second = docs
+            .due(t0 + REST * 2)
+            .expect("the newer one replaces the older in the queue");
+        assert_ne!(first, second);
+        docs.loaded(&second, Ok(diff("two")));
+        assert!(
+            docs.requested.is_empty(),
+            "the replaced request left nothing behind"
+        );
+        docs.settle(Some(&Hover::Diff(key("a", 1))), t0 + REST * 3);
+        assert!(
+            docs.due(t0 + REST * 5).is_some(),
+            "going back to the replaced one asks for it again"
+        );
+
+        docs.settle(Some(&Hover::Diff(key("c", 1))), t0);
+        let c = docs.due(t0 + REST).expect("due");
+        docs.loaded(&c, Err("git failed".into()));
+        docs.settle(Some(&Hover::Diff(key("c", 1))), t0 + REST);
+        assert!(
+            matches!(docs.resolve(), Resolved::Current(..)),
+            "the error shows"
+        );
+        assert_eq!(docs.due(t0 + REST * 2), None);
+        docs.settle(Some(&Hover::Diff(key("c", 1))), t0 + ERROR_TTL + REST);
+        assert!(
+            docs.due(t0 + ERROR_TTL + REST * 2).is_some(),
+            "and is asked again"
+        );
+    }
+
+    #[test]
+    fn the_cache_has_a_byte_budget() {
+        let mut docs = Documents::default();
+        let t0 = Instant::now();
+        let big = |n: usize| {
+            Doc::Diff(FileDiff::Text {
+                lines: vec!["x".repeat(BUDGET / 3)],
+                more: n,
+            })
+        };
+        for i in 0..5 {
+            docs.settle(Some(&Hover::Diff(key(&format!("f{i}"), i))), t0);
+            let due = docs.due(t0 + REST).expect("due");
+            docs.loaded(&due, Ok(big(i)));
+        }
+        assert!(docs.cache.len() <= 3, "{}", docs.cache.len());
     }
 
     fn log() -> Hover {

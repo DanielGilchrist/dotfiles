@@ -68,6 +68,7 @@ types into the embedded session. `?` shows every key.
 | `J K` | From [2] or [3], scroll [0] two rows without focusing it |
 | `⌃D ⌃U` | Half a page in the list, or in [0] from [2] or [3] |
 | `+` `_` | [0] full width / back. Keys keep going to the focused panel, so `j` flips to the next file |
+| `t` | From [2], [3] or a focused document, preview the agent's live terminal read-only (double border, `[0] preview · …`) and back to the same place. In the preview `r` replies, `i` or `⏎` types, `Esc` returns |
 | `.` | Show every checkout, or only those with a live session (the default). `+7 hidden` in [1]'s corner says how many are left out |
 | `Space` / `/` | Switcher (fuzzy), `⌃N ⌃P` to move |
 | `Tab` / `⇧Tab` | Cycle [1]'s tabs: the repo, all agents, pinned. The title names them where the width allows, the active one bold, and the footer's `Tab` hint names the next |
@@ -105,7 +106,7 @@ in the repo changed too, and `∩ n` in the title counting them. The right pane
 [0] shows what the cursor in the focused panel is on: the agent's terminal
 for [1], the turn document or a subagent's transcript for [2] (it follows
 the tail until you scroll up, and `G` resumes), and the branch or a file's
-diff from the fork point for [3], with who else changed the file in its title.
+diff from the fork point for [3], with who else changed the file in its title. Clicking a row of [2] or [3] puts the cursor there, and the wheel scrolls.
 When the selected agent asks while you read, a banner at the top of [0] says
 so and `i` answers it. An agent whose terminal isn't showing still counts for
 `a`, the bell and the status counts, and doesn't clear its `✓` while you

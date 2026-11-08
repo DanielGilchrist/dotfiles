@@ -15,6 +15,9 @@ use agent_core::process::{self, CommandError};
 
 /// A diff over this many lines keeps only the first of them.
 const DIFF_LINES: usize = 5000;
+/// How much of a diff's text is read, and how much of one line is kept.
+const DIFF_BYTES: u64 = 2 * 1024 * 1024;
+const DIFF_LINE_CHARS: usize = 2000;
 /// A diff that takes longer than this to produce is given up on.
 const DIFF_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -550,14 +553,17 @@ impl Vcs for Git {
                 cmd.arg(base).arg("--").arg(path);
             }
         }
-        let out = process::output_within(&mut cmd, DIFF_TIMEOUT)?;
-        // `--no-index` exits 1 when the files differ.
-        let ok =
-            out.status.success() || (lines == Lines::Untracked && out.status.code() == Some(1));
+        let (out, cut) = process::output_capped(&mut cmd, DIFF_TIMEOUT, DIFF_BYTES)?;
+        // `--no-index` exits 1 when the files differ, and a diff cut short
+        // has its command killed.
+        let ok = cut
+            || out.status.success()
+            || (lines == Lines::Untracked && out.status.code() == Some(1));
         if !ok {
             return Err(process::failed(&cmd, &out));
         }
-        Ok(parse_diff(&String::from_utf8_lossy(&out.stdout), DIFF_LINES).unwrap_or_else(binary))
+        let text = String::from_utf8_lossy(&out.stdout);
+        Ok(parse_diff(&text, DIFF_LINES, cut).unwrap_or_else(binary))
     }
 
     fn delete_branch(&self, repo: &RepoRoot, branch: LocalBranch) -> Result<(), CommandError> {
@@ -567,16 +573,29 @@ impl Vcs for Git {
 
 /// The hunks of `git diff` output, from the first `@@`, at most `keep` lines
 /// of them. `None` when git says the file is binary.
-fn parse_diff(out: &str, keep: usize) -> Option<FileDiff> {
+/// A `cut` diff ended mid-line because it was too big to read whole.
+fn parse_diff(out: &str, keep: usize, cut: bool) -> Option<FileDiff> {
     let mut lines = out.lines().skip_while(|l| !l.starts_with("@@")).peekable();
     if lines.peek().is_none() && out.lines().any(|l| l.starts_with("Binary files")) {
         return None;
     }
-    let kept: Vec<String> = lines.by_ref().take(keep).map(str::to_string).collect();
-    Some(FileDiff::Text {
-        lines: kept,
-        more: lines.count(),
-    })
+    let short = |line: &str| -> String {
+        if line.chars().count() > DIFF_LINE_CHARS {
+            line.chars()
+                .take(DIFF_LINE_CHARS)
+                .chain(std::iter::once('…'))
+                .collect()
+        } else {
+            line.to_string()
+        }
+    };
+    let mut kept: Vec<String> = lines.by_ref().take(keep).map(short).collect();
+    let more = lines.count();
+    if cut && more == 0 {
+        kept.pop();
+        kept.push("@@ … the rest of the diff is too big to show".to_string());
+    }
+    Some(FileDiff::Text { lines: kept, more })
 }
 
 #[cfg(test)]
@@ -770,7 +789,7 @@ mod tests {
         let out =
             "diff --git a/x b/x\nindex 1..2 100644\n--- a/x\n+++ b/x\n@@ -1 +1,2 @@\n a\n+b\n+c\n";
         assert_eq!(
-            parse_diff(out, 10),
+            parse_diff(out, 10, false),
             Some(FileDiff::Text {
                 lines: vec![
                     "@@ -1 +1,2 @@".into(),
@@ -782,15 +801,41 @@ mod tests {
             })
         );
         assert_eq!(
-            parse_diff(out, 2),
+            parse_diff(out, 2, false),
             Some(FileDiff::Text {
                 lines: vec!["@@ -1 +1,2 @@".into(), " a".into()],
                 more: 2
             })
         );
-        assert_eq!(parse_diff("Binary files a/x and b/x differ\n", 10), None);
+        let big = format!("@@ -1 +1 @@\n+{}\n+tail", "x".repeat(DIFF_LINE_CHARS + 50));
+        let Some(FileDiff::Text { lines, more }) = parse_diff(&big, 10, false) else {
+            panic!("text");
+        };
         assert_eq!(
-            parse_diff("", 10),
+            lines[1].chars().count(),
+            DIFF_LINE_CHARS + 1,
+            "a long line is cut"
+        );
+        assert!(lines[1].ends_with('…'));
+        assert_eq!((lines.len(), more), (3, 0));
+        assert_eq!(
+            parse_diff("@@ -1 +1 @@\n+a\n+par", 10, true),
+            Some(FileDiff::Text {
+                lines: vec![
+                    "@@ -1 +1 @@".into(),
+                    "+a".into(),
+                    "@@ … the rest of the diff is too big to show".into()
+                ],
+                more: 0
+            }),
+            "the partial last line goes and the cut is said"
+        );
+        assert_eq!(
+            parse_diff("Binary files a/x and b/x differ\n", 10, false),
+            None
+        );
+        assert_eq!(
+            parse_diff("", 10, false),
             Some(FileDiff::Text {
                 lines: Vec::new(),
                 more: 0

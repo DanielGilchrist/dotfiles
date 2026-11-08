@@ -221,6 +221,7 @@ pub fn update(m: &mut Model, msg: Msg) -> Vec<Effect> {
         }
         Msg::Inspected { name, facts } => {
             if m.inspections.contains_key(&name) {
+                *m.facts_generation.entry(name.clone()).or_default() += 1;
                 m.facts.insert(name, facts);
             }
             Vec::new()
@@ -685,9 +686,26 @@ fn sanitize_paste(text: &str) -> String {
 /// Keys that choose the panel `j`/`k` act on, and those a panel gives its
 /// own meaning. `None` leaves the key to NAV.
 fn on_panel_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
+    if m.panel.listed() != Panel::Agents && matches!(code, KeyCode::Char('t')) {
+        m.panel = m.panel.toggled_preview();
+        return Some(Vec::new());
+    }
+    if let Panel::Preview { .. } = m.panel {
+        match code {
+            KeyCode::Esc => {
+                m.panel = m.panel.toggled_preview();
+                return Some(Vec::new());
+            }
+            KeyCode::Enter | KeyCode::Char('l' | '0') => {
+                let name = m.selected_entry().map(|e| e.name().clone());
+                return Some(name.map_or_else(Vec::new, |name| activate(m, &name)));
+            }
+            _ => {}
+        }
+    }
     if m.main_focused() {
         match code {
-            KeyCode::Esc | KeyCode::Char('1' | '2' | '3') => m.focus_main = false,
+            KeyCode::Esc | KeyCode::Char('1' | '2' | '3') => m.panel = m.panel.listed(),
             KeyCode::Char('j') | KeyCode::Down => m.docs.scroll_by(1),
             KeyCode::Char('k') | KeyCode::Up => m.docs.scroll_by(-1),
             KeyCode::Char('g') | KeyCode::Home => m.docs.scroll_to_start(),
@@ -701,7 +719,7 @@ fn on_panel_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
             return Some(Vec::new());
         }
     }
-    match (code, m.panel) {
+    match (code, m.panel.listed()) {
         (KeyCode::Esc | KeyCode::Char('1'), Panel::Agent { .. } | Panel::Changes { .. }) => {
             m.panel = Panel::Agents;
             Some(Vec::new())
@@ -738,7 +756,7 @@ fn on_panel_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
             KeyCode::Enter | KeyCode::Char('l' | '0'),
             Panel::Changes { .. } | Panel::Agent { .. },
         ) if m.hover().is_some() => {
-            m.focus_main = true;
+            m.panel = m.panel.into_main();
             Some(Vec::new())
         }
         (KeyCode::Char('0'), Panel::Agents) => m
@@ -789,11 +807,21 @@ fn on_nav_key(m: &mut Model, key: KeyEvent) -> Vec<Effect> {
             _ => {}
         },
         KeyCode::Char('d') if ctrl(&key, 'd') => match m.panel {
-            Panel::Changes { .. } | Panel::Agent { .. } => m.docs.scroll_by(m.docs.half_page()),
+            Panel::Changes { .. }
+            | Panel::Agent { .. }
+            | Panel::Main(_)
+            | Panel::Preview { .. } => {
+                m.docs.scroll_by(m.docs.half_page());
+            }
             Panel::Agents => m.page_in_panel(m.half_page()),
         },
         KeyCode::Char('u') if ctrl(&key, 'u') => match m.panel {
-            Panel::Changes { .. } | Panel::Agent { .. } => m.docs.scroll_by(-m.docs.half_page()),
+            Panel::Changes { .. }
+            | Panel::Agent { .. }
+            | Panel::Main(_)
+            | Panel::Preview { .. } => {
+                m.docs.scroll_by(-m.docs.half_page());
+            }
             Panel::Agents => m.page_in_panel(-m.half_page()),
         },
         KeyCode::Char('J') if m.hover().is_some() => m.docs.scroll_by(SCROLL),
@@ -1415,6 +1443,51 @@ fn on_confirm_key(m: &mut Model, confirm: Confirm, key: &KeyEvent) -> Vec<Effect
     }
 }
 
+/// A click or the wheel over [2] or [3]: focus it and put the cursor on the
+/// row clicked, or move it a row. `None` when it's over neither.
+fn on_lower_panel(
+    m: &mut Model,
+    mouse: MouseEvent,
+    at: Position,
+    clicked: bool,
+) -> Option<Vec<Effect>> {
+    let step = if matches!(mouse.kind, MouseEventKind::ScrollUp) {
+        -1
+    } else {
+        1
+    };
+    let row_at = |rows: &[(u16, usize)]| rows.iter().find(|(y, _)| *y == mouse.row).map(|r| r.1);
+    if m.areas.agent_panel.contains(at) {
+        let row = row_at(&m.areas.agent_rows);
+        let offset = match m.panel.listed() {
+            Panel::Agent { offset } => offset,
+            _ => 0,
+        };
+        m.panel = Panel::Agent { offset };
+        match (clicked, row) {
+            (true, Some(row)) => m.point_at_row(|_, _| row),
+            (true, None) => {}
+            (false, _) => m.move_in_panel(step),
+        }
+        return Some(Vec::new());
+    }
+    if m.areas.changes_panel.contains(at) {
+        let row = row_at(&m.areas.change_rows);
+        let file = match m.panel.listed() {
+            Panel::Changes { file } => file,
+            _ => 0,
+        };
+        m.panel = Panel::Changes { file };
+        match (clicked, row) {
+            (true, Some(row)) => m.panel = Panel::Changes { file: row },
+            (true, None) => {}
+            (false, _) => m.move_in_panel(step),
+        }
+        return Some(Vec::new());
+    }
+    None
+}
+
 fn on_mouse(m: &mut Model, mouse: MouseEvent) -> Vec<Effect> {
     let at = Position::new(mouse.column, mouse.row);
     let clicked = matches!(mouse.kind, MouseEventKind::Down(_));
@@ -1426,11 +1499,11 @@ fn on_mouse(m: &mut Model, mouse: MouseEvent) -> Vec<Effect> {
             mouse.kind,
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
         );
-        if clicked && m.hover().is_some() {
-            m.focus_main = true;
+        if clicked && m.shows_document() {
+            m.panel = m.panel.into_main();
             return Vec::new();
         }
-        if scrolling && m.hover().is_some() {
+        if scrolling && m.shows_document() {
             let up = matches!(mouse.kind, MouseEventKind::ScrollUp);
             m.docs.scroll_by(if up { -SCROLL } else { SCROLL });
             return Vec::new();
@@ -1447,6 +1520,15 @@ fn on_mouse(m: &mut Model, mouse: MouseEvent) -> Vec<Effect> {
             c.term.send(bytes);
         }
         return Vec::new();
+    }
+    let scrolling = matches!(
+        mouse.kind,
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+    );
+    if (clicked || scrolling)
+        && let Some(effects) = on_lower_panel(m, mouse, at, clicked)
+    {
+        return effects;
     }
     if clicked {
         if let Some(c) = m.pane.connection_mut() {
@@ -3557,7 +3639,7 @@ mod tests {
             m.docs.scroll, 2,
             "j scrolls the document, not the file list"
         );
-        assert!(matches!(m.panel, Panel::Changes { file: 0 }));
+        assert_eq!(m.panel.listed(), Panel::Changes { file: 0 });
         update(&mut m, key(KeyCode::Char('G')));
         assert_eq!(m.docs.scroll, usize::MAX);
         update(&mut m, key(KeyCode::Char('g')));
@@ -3699,5 +3781,83 @@ mod tests {
         assert!(matches!(m.panel, Panel::Changes { file: 1 }));
         update(&mut m, key(KeyCode::Char('_')));
         assert_eq!(m.screen, Screen::Split);
+    }
+
+    #[test]
+    fn t_previews_the_terminal_read_only_and_returns_to_the_same_document_and_place() {
+        let mut m = on_changes("obs-layout-4");
+        update(&mut m, key(KeyCode::Char('j')));
+        update(&mut m, key(KeyCode::Enter));
+        update(&mut m, key(KeyCode::Char('j')));
+        update(&mut m, key(KeyCode::Char('j')));
+        assert_eq!(m.docs.scroll, 2);
+
+        update(&mut m, key(KeyCode::Char('t')));
+        assert!(m.previewing());
+        assert!(m.terminal_visible(), "it's being looked at");
+        assert!(matches!(m.focus(), Focus::Nav(_)), "keys stay in the TUI");
+        assert!(!m.main_focused());
+        assert_eq!(m.panel.listed(), Panel::Changes { file: 1 });
+
+        update(&mut m, key(KeyCode::Char('t')));
+        assert!(m.main_focused(), "back in the document");
+        assert_eq!(m.docs.scroll, 2, "at the same place");
+
+        update(&mut m, key(KeyCode::Esc));
+        update(&mut m, key(KeyCode::Char('t')));
+        assert!(m.previewing());
+        update(&mut m, key(KeyCode::Esc));
+        assert_eq!(
+            m.panel,
+            Panel::Changes { file: 1 },
+            "Esc returns from a preview first"
+        );
+        update(&mut m, key(KeyCode::Esc));
+        assert_eq!(m.panel, Panel::Agents, "and the next goes up a level");
+    }
+
+    #[test]
+    fn a_preview_replies_or_types_and_never_clears_its_origin() {
+        let mut m = crate::fixtures::fleet(10);
+        m.set_cursor(Cursor::Entry(name("auth-refresh-2")));
+        update(&mut m, key(KeyCode::Char('2')));
+        update(&mut m, key(KeyCode::Char('t')));
+        assert!(m.previewing());
+        update(&mut m, key(KeyCode::Char('r')));
+        assert!(
+            matches!(m.overlay, Overlay::Reply { .. }),
+            "r opens the reply box"
+        );
+        m.overlay = Overlay::None;
+
+        let effects = update(&mut m, key(KeyCode::Char('i')));
+        assert!(effects.iter().any(|e| matches!(
+            e,
+            Effect::Attach {
+                intent: Intent::Activate,
+                ..
+            }
+        )));
+        assert!(
+            matches!(m.panel, Panel::Preview { .. }),
+            "and ⌃\\ comes back to the preview"
+        );
+
+        let effects = update(&mut m, key(KeyCode::Enter));
+        assert!(
+            effects.iter().any(|e| matches!(e, Effect::Attach { .. })),
+            "⏎ types too"
+        );
+
+        update(&mut m, key(KeyCode::Esc));
+        assert!(!m.previewing());
+        assert!(matches!(m.panel, Panel::Agent { .. }));
+        let mut m = crate::fixtures::fleet(10);
+        update(&mut m, key(KeyCode::Char('t')));
+        assert_eq!(
+            m.panel,
+            Panel::Agents,
+            "[1] has no preview, it is the terminal"
+        );
     }
 }

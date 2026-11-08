@@ -212,6 +212,10 @@ pub struct Subagent {
     /// The tools it's running.
     pub tools: Vec<Tool>,
     pub since: SystemTime,
+    /// When it stopped. It's kept until the next prompt so its row and
+    /// transcript stay to be read.
+    #[serde(default)]
+    pub finished: Option<SystemTime>,
 }
 
 /// Whether the agent waits on a subagent's tool call or carries on.
@@ -311,7 +315,8 @@ impl Activity {
             (Origin::Main, Event::Prompted(input)) => {
                 if let Input::User(text) = input {
                     self.prompt = Some(text);
-                    self.subagents.retain(|_, s| s.launch == Launch::Background);
+                    self.subagents
+                        .retain(|_, s| s.launch == Launch::Background && s.finished.is_none());
                     let subagents = &self.subagents;
                     self.asks.retain(|ask| match &ask.asker {
                         Origin::Subagent(id) => subagents.contains_key(id),
@@ -367,6 +372,7 @@ impl Activity {
                     launch: Launch::Foreground,
                     tools: Vec::new(),
                     since: now,
+                    finished: None,
                 });
                 state
             }
@@ -384,13 +390,17 @@ impl Activity {
                     launch: Launch::Background,
                     tools: Vec::new(),
                     since: now,
+                    finished: None,
                 });
                 subagent.launch = Launch::Background;
                 subagent.description = Some(description);
                 finish(state, &tool)
             }
             (Origin::Subagent(id), Event::SubagentStopped) => {
-                self.subagents.remove(&id);
+                if let Some(subagent) = self.subagents.get_mut(&id) {
+                    subagent.finished = Some(now);
+                    subagent.tools.clear();
+                }
                 state
             }
             (
@@ -437,7 +447,7 @@ impl Activity {
     /// The finished turn's background subagents replace the ones tracked.
     fn track_background(&mut self, running: &[Background], now: SystemTime) {
         self.subagents
-            .retain(|id, _| running.iter().any(|b| &b.id == id));
+            .retain(|id, s| s.finished.is_some() || running.iter().any(|b| &b.id == id));
         for b in running {
             let subagent = self
                 .subagents
@@ -448,6 +458,7 @@ impl Activity {
                     launch: Launch::Background,
                     tools: Vec::new(),
                     since: now,
+                    finished: None,
                 });
             subagent.launch = Launch::Background;
             if b.description.is_some() {
@@ -486,7 +497,15 @@ impl Activity {
     pub fn at_rest(&self) -> bool {
         matches!(self.state, State::Idle | State::Done { .. })
             && self.asks.is_empty()
-            && self.subagents.is_empty()
+            && self.running() == 0
+    }
+
+    /// How many subagents are still running.
+    pub fn running(&self) -> usize {
+        self.subagents
+            .values()
+            .filter(|s| s.finished.is_none())
+            .count()
     }
 
     /// The question that's waited longest, if any.
@@ -920,7 +939,11 @@ mod tests {
             Some("review it"),
             "a notification isn't the user's prompt"
         );
-        assert_eq!(handed_back.subagents, BTreeMap::new());
+        assert_eq!(handed_back.running(), 0);
+        assert!(
+            handed_back.subagents[&AgentId::new("a")].finished.is_some(),
+            "the finished one stays until the next prompt"
+        );
         let done = Activity::next(Some(handed_back), main(finished(&[])), at(95));
         assert_eq!(done.state, State::Done { summary: None });
     }
@@ -969,7 +992,17 @@ mod tests {
             (5, sub("a", Event::SubagentStopped)),
             (6, main(end("t"))),
         ]);
-        assert_eq!(back.subagents, BTreeMap::new());
+        assert_eq!(back.running(), 0);
+        let next = Activity::next(
+            Some(back),
+            Reported::main(Event::Prompted(Input::User("again".into()))),
+            at(6),
+        );
+        assert_eq!(
+            next.subagents,
+            BTreeMap::new(),
+            "the next prompt clears them"
+        );
     }
 
     #[test]
