@@ -1011,6 +1011,10 @@ pub struct Model {
     /// The subagent row [2]'s cursor is on while it's focused. The turn row
     /// while it's unset or gone.
     pub subagent: Option<AgentId>,
+    /// The row under [2]'s cursor as it last was listed, kept so a new
+    /// prompt clearing finished subagents doesn't take it from under the
+    /// cursor. Dropped once the cursor leaves it.
+    pub held_subagent: Option<(SessionName, AgentId, Subagent)>,
     /// What each subagent being watched was told and has done, as last read.
     pub subagent_logs: HashMap<SubagentKey, Result<Option<SubagentDetail>, String>>,
     /// When each subagent's transcript was last asked for.
@@ -1069,6 +1073,7 @@ impl Model {
             terminal: TerminalFocus::Focused,
             visibility: Visibility::Active,
             subagent: None,
+            held_subagent: None,
             subagent_logs: HashMap::new(),
             subagent_reads: HashMap::new(),
             docs: Documents::default(),
@@ -1392,8 +1397,40 @@ impl Model {
             return Vec::new();
         };
         let mut rows: Vec<_> = activity.subagents.iter().collect();
+        if let Some((held_by, id, subagent)) = &self.held_subagent
+            && held_by == entry.name()
+            && !activity.subagents.contains_key(id)
+        {
+            rows.push((id, subagent));
+        }
         rows.sort_by_key(|(_, s)| s.since);
         rows
+    }
+
+    /// Remembers the row [2]'s cursor is on while it's listed, and keeps
+    /// the memory only while the cursor stays on that row.
+    pub fn hold_hovered_subagent(&mut self) {
+        let hovered = match (self.panel.listed(), self.selected_entry(), &self.subagent) {
+            (Panel::Agent { .. }, Some(entry), Some(id)) => {
+                Some((entry.name().clone(), id.clone()))
+            }
+            _ => None,
+        };
+        let Some((name, id)) = hovered else {
+            self.held_subagent = None;
+            return;
+        };
+        let listed = self
+            .activity(&name)
+            .and_then(|a| a.subagents.get(&id))
+            .cloned();
+        self.held_subagent = match (listed, self.held_subagent.take()) {
+            (Some(subagent), _) => Some((name, id, subagent)),
+            (None, Some((held_by, held, subagent))) if held_by == name && held == id => {
+                Some((held_by, held, subagent))
+            }
+            (None, _) => None,
+        };
     }
 
     /// Where [2]'s cursor is among its rows: 0 is the turn, then the

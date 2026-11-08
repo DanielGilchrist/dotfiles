@@ -122,6 +122,13 @@ fn own_client(m: &Model) -> Option<ClientId> {
 }
 
 pub fn update(m: &mut Model, msg: Msg) -> Vec<Effect> {
+    let effects = step(m, msg);
+    m.hold_hovered_subagent();
+    forget_subagents(m);
+    effects
+}
+
+fn step(m: &mut Model, msg: Msg) -> Vec<Effect> {
     match msg {
         Msg::Key(key) if key.kind == KeyEventKind::Release => Vec::new(),
         Msg::Key(key) => {
@@ -428,10 +435,12 @@ fn forget_subagents(m: &mut Model) {
     let Some(activities) = &m.activities else {
         return;
     };
+    let held = m.held_subagent.as_ref().map(|(n, id, _)| (n, id));
     let listed = |(name, id): &(SessionName, AgentId)| {
-        activities
-            .get(name)
-            .is_some_and(|a| a.subagents.contains_key(id))
+        held == Some((name, id))
+            || activities
+                .get(name)
+                .is_some_and(|a| a.subagents.contains_key(id))
     };
     m.subagent_reads.retain(|key, _| listed(key));
     m.subagent_logs.retain(|key, _| listed(key));
@@ -3458,6 +3467,35 @@ mod tests {
     }
 
     #[test]
+    fn a_subagent_under_the_cursor_stays_listed_after_a_prompt_clears_it_until_the_cursor_leaves() {
+        let mut m = delegating();
+        update(&mut m, key(KeyCode::Char('2')));
+        update(&mut m, key(KeyCode::Char('j')));
+        let (agent, id) = m.subagent_selected().expect("a subagent is selected");
+        assert_eq!(reads(tick(&mut m)).len(), 1);
+
+        let mut cleared = m.activities.clone().expect("reported");
+        cleared
+            .get_mut(&agent)
+            .expect("has activity")
+            .subagents
+            .remove(&id);
+        update(&mut m, Msg::Activities(cleared));
+        assert_eq!(m.subagent_rows().len(), 3, "the hovered row stays");
+        assert_eq!(m.subagent_selected(), Some((agent.clone(), id.clone())));
+        assert!(m.subagent_reads.contains_key(&(agent.clone(), id.clone())));
+        assert!(matches!(
+            m.hover(),
+            Some(crate::document::Hover::Subagent(_, ref held)) if *held == id
+        ));
+
+        update(&mut m, key(KeyCode::Char('j')));
+        assert_eq!(m.subagent_rows().len(), 2, "gone once the cursor moved on");
+        assert!(m.held_subagent.is_some_and(|(_, held, _)| held != id));
+        assert!(!m.subagent_reads.contains_key(&(agent, id)));
+    }
+
+    #[test]
     fn a_subagent_is_read_again_soon_after_its_agent_reports_but_not_every_tick() {
         let mut m = delegating();
         update(&mut m, key(KeyCode::Char('2')));
@@ -3497,6 +3535,7 @@ mod tests {
         let mut gone = m.activities.clone().expect("reported");
         gone.get_mut(&name).expect("has activity").subagents.clear();
         update(&mut m, Msg::Activities(gone));
+        update(&mut m, key(KeyCode::Char('g')));
         assert!(m.subagent_logs.is_empty() && m.subagent_reads.is_empty());
         update(
             &mut m,
