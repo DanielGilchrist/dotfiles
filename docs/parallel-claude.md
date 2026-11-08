@@ -58,19 +58,24 @@ types into the embedded session. `?` shows every key.
 
 | Key | Action |
 |---|---|
-| `⏎` / `l` | Attach the selected agent (resurrect or start it if needed) |
+| `⏎` / `l` | In [1], attach the selected agent (resurrect or start it if needed). In [2] and [3], focus the document in [0] |
+| `0` | The same as `⏎` in every focus |
+| `i` | Type to the selected agent from anywhere, and `⌃\` comes back to where you were |
+| `Esc` | Back one level: a focused document to its panel, [2] or [3] to [1], then to the agent you left |
 | `⌃\` | Back to NAV from an agent. Twice goes to the previous agent |
-| `1` `2` `3` | Focus the list [1], the turn and Changes panels. Focusing [2] or [3] expands it only as far as its content needs: from the other lower panel's spare rows first, then the list, and only then does the other panel collapse to its title line (at the smallest sizes the collapse can leave it a few blank rows). From [2] or [3], `Esc` goes back to the list |
-| `j k g G`, `[ ]` | Move in the focused panel, previous / next repo. In [2] with subagents they move a cursor over them |
+| `1` `2` `3` | Focus the list [1] (and the terminal in [0], without typing), the turn [2] and the changes [3]. Each is a plain list whose cursor decides what [0] shows |
+| `j k g G`, `[ ]` | Move in the focused panel, previous / next repo. With [0] focused they scroll it and jump to its top and bottom |
+| `J K` | From [2] or [3], scroll [0] two rows without focusing it |
+| `⌃D ⌃U` | Half a page in the list, or in [0] from [2] or [3] |
+| `+` `_` | [0] full width / back. Keys keep going to the focused panel, so `j` flips to the next file |
 | `.` | Show every checkout, or only those with a live session (the default). `+7 hidden` in [1]'s corner says how many are left out |
-| `⌃D ⌃U` | Half a page in the focused panel, handy in Changes |
 | `Space` / `/` | Switcher (fuzzy), `⌃N ⌃P` to move |
 | `Tab` / `⇧Tab` | Cycle [1]'s tabs: the repo, all agents, pinned. The title names them where the width allows, the active one bold, and the footer's `Tab` hint names the next |
 | `m` | Pin / unpin (pinned agents get their own tab) |
 | `n` | New agent form: prompt (`⌃E` edits it in $EDITOR), name (suggested from the prompt or a Linear/GitHub link), repo (listed, from the catalogue, or a path) |
 | `c` | Check out for review: a branch name or a GitHub PR link, name (suggested from it), repo (a PR link picks the repo it names). Fetches the branch if git doesn't know it, asks `gh` for a PR's branch (a fork's PR lands on a `pr/N` branch), and attaches instead if an agent already has the branch checked out |
 | `p` | Repo picker: `⏎` focuses a listed repo, or adds one from the catalogue or by a typed path (`~/code/foo`) |
-| `e` | Open the agent's worktree in $EDITOR, or in Changes the file under the cursor |
+| `e` | Open the agent's worktree in $EDITOR, or in Changes the file under the cursor (`⏎` there reads its diff instead) |
 | `r` | Reply without attaching, once its turn is over and nothing is asking |
 | `d` / `D` | Kill the session / remove session, worktree and branch (confirms, lists anything that would be lost) |
 | `x` | Run a configured action on the selected agent (see below) |
@@ -93,14 +98,18 @@ The Agents tab opens with a **Needs you** group, the status bar and terminal
 title show `◆ ! ✓` counts, and a bell rings when an agent you're not
 typing into starts waiting. Each agent's card has a second line saying
 what it's doing or what it said (the question, the tool, the last
-message), when there's room. Under the list, panel [2] is the turn: your
-last prompt, the agent's message or question in full, and the subagents
-it's waiting on. When it doesn't fit the last row says `+k more` and `2`
-focuses the panel to read it all. Panel [3] is the work: whether it's
-ready to merge (`2 uncommitted · ↑2`), the files it changed, a `∩` on any
-file another agent in the repo changed too, and `∩ n` in the title
-counting them. Focus [3] and put the cursor on one and the border says
-who.
+message), when there's room. Under the list, panel [2] lists the turn and
+its subagents and panel [3] lists the work: whether it's ready to merge
+(`2 uncommitted · ↑2`), the files it changed, a `∩` on any file another agent
+in the repo changed too, and `∩ n` in the title counting them. The right pane
+[0] shows what the cursor in the focused panel is on: the agent's terminal
+for [1], the turn document or a subagent's transcript for [2] (it follows
+the tail until you scroll up, and `G` resumes), and the branch or a file's
+diff from the fork point for [3], with who else changed the file in its title.
+When the selected agent asks while you read, a banner at the top of [0] says
+so and `i` answers it. An agent whose terminal isn't showing still counts for
+`a`, the bell and the status counts, and doesn't clear its `✓` while you
+read its diff.
 Agents started before this existed report nothing until restarted: `d`
 then `⏎` in the TUI restarts one through `agent`, resuming its conversation.
 

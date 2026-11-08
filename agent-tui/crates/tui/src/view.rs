@@ -17,8 +17,8 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::model::{
     AgentStatus, Blocked, Confirm, Derived, Enter, Field, Focus, FormKind, Launchable, Load, Model,
     NameCheck, NameSource, NamingState, NewAgent, OfferEffect, Overlay, Pane, Panel, Phase,
-    Proposal, Pulse, Query, Reach, RepoInput, Row, StatusKind, Submission, Turn, View, Visibility,
-    Waiting, WorkRoom, fuzzy_match, invalid_chars, repo_matches,
+    Proposal, Pulse, Query, Reach, RepoInput, Row, Screen, StatusKind, Submission, View,
+    Visibility, Waiting, WorkRoom, fuzzy_match, invalid_chars, repo_matches,
 };
 use crate::palette::Palette;
 use crate::update::{Pick, Picks, Unusable, picker_matches, switcher_matches};
@@ -53,6 +53,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
             ("J K", "scroll [0] from [3]"),
             ("g G", "first / last"),
             ("[ ]", "previous / next repo"),
+            ("+ _", "[0] full width / back"),
             (".", "show every checkout, or only those running"),
             ("Space /", "switch agent"),
             (
@@ -310,7 +311,7 @@ pub fn draw(frame: &mut Frame<'_>, m: &mut Model) {
     let [body, footer] =
         Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(frame.area());
     let borders = 2;
-    let sidebar_width = if body.width < NARROW {
+    let sidebar_width = if body.width < NARROW || m.screen == Screen::Full {
         0
     } else {
         let share = u32::from(body.width) * SIDEBAR_SHARE / 100;
@@ -326,11 +327,13 @@ pub fn draw(frame: &mut Frame<'_>, m: &mut Model) {
     if sidebar_width > 0 {
         sidebar::draw(frame, m, left, sidebar_style);
     } else {
-        m.areas.sidebar = Rect::default();
-        m.turn = Turn::Whole;
-        m.work_room = WorkRoom::Hidden;
-        m.panel = Panel::Agents;
+        // The panels keep the keys while the sidebar is out of sight, and
+        // the list is laid out as if it were there, so moving still works.
+        m.areas.sidebar = Rect::new(0, 0, SIDEBAR_MIN, sidebar::list_room(body.height));
+        m.areas.rows.clear();
+        m.work_room = WorkRoom::Fits;
     }
+    m.sidebar_shown = sidebar_width > 0;
 
     let pane_focused = matches!(m.focus(), Focus::Agent(_)) || m.main_focused();
     // Padding keeps the agent's own full-width rules off our border. The
@@ -683,9 +686,6 @@ fn draw_status_bar(frame: &mut Frame<'_>, m: &Model, area: Rect) {
             (_, Some(Reach::Own) | None) => {}
         }
         hints.push(ranked("Space", "switch", 5));
-        if let (Panel::Agents | Panel::Changes { .. }, Turn::Hidden(_)) = (m.panel, m.turn) {
-            hints.push(ranked("2", "read", 5));
-        }
         if let Some(entry) = entry {
             let pin = match entry.pin() {
                 Some(_) => "unpin",

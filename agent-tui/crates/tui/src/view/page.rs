@@ -11,12 +11,12 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthChar;
 
-use super::sidebar::{fits_beside, status_line, subagent_rows, turn_message};
+use super::sidebar::{fits_beside, others_on, status_line, subagent_rows, turn_message};
 use super::{
-    ago, bold, dim, error, justify, line_width, spinner, success, truncate_end, truncate_start,
-    warning, wrap,
+    ago, bold, dim, error, fit, justify, line_width, spinner, success, truncate_end,
+    truncate_start, warning, wrap,
 };
-use crate::document::{DiffKey, Hover};
+use crate::document::{BranchKey, DiffKey, Doc, Hover, Key};
 use crate::model::{AgentStatus, Model};
 
 /// [0]'s title, what its top border says on the right, its bottom-right
@@ -58,6 +58,7 @@ pub(super) fn page(m: &mut Model, area: Rect, width: usize, border: Style) -> Op
     let height = usize::from(area.height).saturating_sub(reserved);
     let body = match &hover {
         Hover::Diff(key) => diff_body(m, key, columns, width),
+        Hover::Branch(key) => branch_body(m, key, columns),
         Hover::Turn(name) => turn_body(m, name, columns)?,
         Hover::Subagent(name, id) => log_body(m, name, id, columns),
     };
@@ -79,7 +80,13 @@ pub(super) fn page(m: &mut Model, area: Rect, width: usize, border: Style) -> Op
     }
     lines.extend(body.rows.iter().skip(top).take(height).cloned());
 
-    let title = body.title;
+    let mut title = body.title;
+    if !m.sidebar_shown
+        && let Some((at, of)) = m.position()
+    {
+        title.insert(1, Span::styled(format!("{at} of {of} · "), dim()));
+    }
+    let title = fit(title, width.saturating_sub(6));
     let status = m
         .selected_entry()
         .map(|entry| status_line(m, entry, width.saturating_sub(line_width(&title) + 9)))
@@ -118,11 +125,14 @@ pub(super) fn page(m: &mut Model, area: Rect, width: usize, border: Style) -> Op
 /// The hovered file's diff: what's loaded, or the last one shown while the
 /// new one loads, under the hovered file's name and counts.
 fn diff_body(m: &Model, hover: &DiffKey, columns: usize, width: usize) -> Body {
-    let rows = m
-        .docs
-        .shown()
-        .map(|(_, loaded)| diff_rows(loaded, columns))
-        .unwrap_or_default();
+    let rows = match m.docs.shown() {
+        Some((Key::Diff(_), loaded)) => match loaded.as_ref() {
+            Ok(Doc::Diff(diff)) => diff_rows(Ok(diff), columns),
+            Ok(Doc::Branch(_)) => Vec::new(),
+            Err(e) => diff_rows(Err(e), columns),
+        },
+        _ => Vec::new(),
+    };
     let mut title = vec![
         Span::raw("[0] "),
         Span::styled(
@@ -147,6 +157,100 @@ fn diff_body(m: &Model, hover: &DiffKey, columns: usize, width: usize) -> Body {
         }
         Lines::Binary => title.push(Span::styled(" bin", dim())),
         Lines::Untracked => title.push(Span::styled(" new", dim())),
+    }
+    let others = others_on(m, &hover.name, &hover.path);
+    if !others.is_empty() {
+        title.push(Span::raw("  "));
+        title.push(Span::styled("∩ ", warning()));
+        title.push(Span::styled(others.join(", "), dim()));
+    }
+    Body {
+        title,
+        rows,
+        tails: false,
+        loading: false,
+    }
+}
+
+/// The branch: how far it is from shipping, its commits and the files not
+/// yet committed.
+fn branch_body(m: &Model, key: &BranchKey, columns: usize) -> Body {
+    let mut facts = Vec::new();
+    if key.ahead > 0 {
+        facts.push(format!("↑{}", key.ahead));
+    }
+    if key.behind > 0 {
+        facts.push(format!("behind {}", key.behind));
+    }
+    if key.dirty > 0 {
+        facts.push(format!("{} uncommitted", key.dirty));
+    }
+    let mut title = vec![Span::raw("[0] "), Span::styled("Branch", bold())];
+    if !facts.is_empty() {
+        title.push(Span::styled(format!(" {}", facts.join(" · ")), dim()));
+    }
+    let mut rows: Vec<Line<'static>> = Vec::new();
+    if let Some((Key::Branch(_), loaded)) = m.docs.shown() {
+        match loaded.as_ref() {
+            Ok(Doc::Branch(log)) => {
+                if log.commits.is_empty() && log.uncommitted.is_empty() {
+                    rows.push(Line::styled("nothing ahead of the default branch", dim()));
+                }
+                if !log.commits.is_empty() {
+                    rows.push(Line::styled(
+                        format!("Commits ({})", log.commits.len()),
+                        dim(),
+                    ));
+                    for commit in &log.commits {
+                        let (hash, subject) = commit.split_once(' ').unwrap_or((commit, ""));
+                        rows.extend(
+                            hard_wrap(subject, columns.saturating_sub(hash.len() + 1))
+                                .into_iter()
+                                .enumerate()
+                                .map(|(i, row)| {
+                                    let lead = if i == 0 {
+                                        hash.to_string()
+                                    } else {
+                                        " ".repeat(hash.len())
+                                    };
+                                    Line::from(vec![
+                                        Span::styled(lead, dim()),
+                                        Span::raw(format!(" {row}")),
+                                    ])
+                                }),
+                        );
+                    }
+                    rows.push(Line::raw(""));
+                }
+                if !log.uncommitted.is_empty() {
+                    rows.push(Line::styled(
+                        format!("Uncommitted ({})", log.uncommitted.len()),
+                        dim(),
+                    ));
+                    for (code, path) in &log.uncommitted {
+                        rows.push(Line::from(vec![
+                            Span::styled(format!("{code} "), dim()),
+                            Span::raw(truncate_start(
+                                &path.to_string_lossy(),
+                                columns.saturating_sub(code.len() + 1),
+                            )),
+                        ]));
+                    }
+                }
+                if key.behind > 0 {
+                    rows.push(Line::raw(""));
+                    rows.push(Line::styled(
+                        format!("The default branch has {} newer commits.", key.behind),
+                        dim(),
+                    ));
+                }
+            }
+            Ok(Doc::Diff(_)) => {}
+            Err(e) => rows.push(Line::styled(
+                e.lines().next().unwrap_or_default().to_string(),
+                error(),
+            )),
+        }
     }
     Body {
         title,
@@ -292,7 +396,7 @@ fn log_body(m: &Model, name: &SessionName, id: &AgentId, columns: usize) -> Body
     }
 }
 
-fn diff_rows(loaded: &Result<FileDiff, String>, width: usize) -> Vec<Line<'static>> {
+fn diff_rows(loaded: Result<&FileDiff, &String>, width: usize) -> Vec<Line<'static>> {
     match loaded {
         Err(e) => vec![Line::styled(
             e.lines().next().unwrap_or_default().to_string(),

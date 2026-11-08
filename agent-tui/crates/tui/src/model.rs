@@ -7,16 +7,16 @@ use agent_core::actions::Actions;
 use agent_core::activity::{Activity, AgentId, State as ActivityState, Subagent};
 use agent_core::config::Keys;
 use agent_core::model::{
-    Entry, EntryState, Removable, Repo, RepoKey, Revival, Running, Snapshot, Startable,
+    Entry, EntryKind, EntryState, Removable, Repo, RepoKey, Revival, Running, Snapshot, Startable,
 };
 use agent_core::names::{AgentName, BranchName, Checkout, Prompt, SessionName};
 use agent_core::ops::{Approved, Hazardous, RemovalPlan};
 use agent_core::paths::{RepoRoot, Typed, typed_path};
-use agent_core::ports::{Change, HarnessId, SubagentDetail, WorktreeFacts};
+use agent_core::ports::{Change, HarnessId, Readiness, SubagentDetail, WorktreeFacts};
 use agent_term::{Emulator, Terminal};
 use ratatui::layout::Rect;
 
-use crate::document::{DiffKey, Documents, Hover};
+use crate::document::{BranchKey, DiffKey, Documents, Hover, Key};
 use crate::palette::Palette;
 
 pub const PREVIEW_DEBOUNCE: Duration = Duration::from_millis(150);
@@ -44,8 +44,30 @@ pub enum Panel {
 pub enum WorkRoom {
     Fits,
     TooShort,
-    /// The sidebar isn't drawn at this width.
-    Hidden,
+}
+
+/// How the screen is shared between the sidebar and the main view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Screen {
+    /// The sidebar beside [0].
+    #[default]
+    Split,
+    /// [0] takes the width. Keys still go to the focused panel.
+    Full,
+}
+
+/// Only an agent worktree's commits are its own work, so any other
+/// checkout shows readiness only while it has uncommitted files. `nothing
+/// ahead` is news only once the agent says it's done.
+pub fn shows_readiness(entry: &Entry, status: &AgentStatus, readiness: Readiness) -> bool {
+    match (readiness, entry.kind()) {
+        (Readiness::NothingAhead, EntryKind::Agent { .. }) => {
+            matches!(status, AgentStatus::Done { .. })
+        }
+        (Readiness::Dirty { .. }, _)
+        | (Readiness::Behind { .. } | Readiness::Ready { .. }, EntryKind::Agent { .. }) => true,
+        (_, EntryKind::Main { .. } | EntryKind::Adopted { .. } | EntryKind::Orphan { .. }) => false,
+    }
 }
 
 /// What a move past the end of a list does.
@@ -62,21 +84,6 @@ pub enum Wrap {
 pub enum Direction {
     Forward,
     Back,
-}
-
-/// What [2] has beyond its rows, as last drawn.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Turn {
-    /// Everything fits.
-    Whole,
-    /// Unfocused, with this many rows left out.
-    Hidden(NonZeroUsize),
-    /// Focused and scrolled: the rows shown, of all of them.
-    Scrolled {
-        top: usize,
-        bottom: usize,
-        total: usize,
-    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -869,8 +876,6 @@ pub struct Model {
     pub chord: Chord,
     pub scroll: ListScroll,
     pub panel: Panel,
-    /// What [2] had beyond its rows when last drawn, for the footer.
-    pub turn: Turn,
     /// Whether the column had room for [3] when last drawn, so `3` can
     /// say why it did nothing.
     pub work_room: WorkRoom,
@@ -923,6 +928,10 @@ pub struct Model {
     /// Whether the keys go to the document in [0] rather than the panel
     /// that picked it.
     pub focus_main: bool,
+    pub screen: Screen,
+    /// Whether the sidebar was drawn last frame: not in the full screen
+    /// mode, nor below the width it needs.
+    pub sidebar_shown: bool,
 }
 
 impl Model {
@@ -949,7 +958,6 @@ impl Model {
             chord: Chord::Idle,
             scroll: ListScroll::default(),
             panel: Panel::Agents,
-            turn: Turn::Whole,
             work_room: WorkRoom::Fits,
             follow: None,
             launching: Vec::new(),
@@ -975,6 +983,8 @@ impl Model {
             subagent_reads: HashMap::new(),
             docs: Documents::default(),
             focus_main: false,
+            screen: Screen::Split,
+            sidebar_shown: true,
         }
     }
 
@@ -1051,7 +1061,7 @@ impl Model {
             Panel::Changes { file } => Panel::Changes {
                 file: file
                     .saturating_add_signed(delta)
-                    .min(self.changes().len().saturating_sub(1)),
+                    .min(self.change_rows().saturating_sub(1)),
             },
         };
     }
@@ -1078,14 +1088,37 @@ impl Model {
             }
             (Panel::Changes { .. }, Edge::First) => Panel::Changes { file: 0 },
             (Panel::Changes { .. }, Edge::Last) => Panel::Changes {
-                file: self.changes().len().saturating_sub(1),
+                file: self.change_rows().saturating_sub(1),
             },
         };
     }
 
-    /// The file under [3]'s cursor and its checkout, unless the keys are
+    /// Whether [3] leads with the readiness row, which is a row the cursor
+    /// can be on, for the branch.
+    pub fn branch_row(&self) -> bool {
+        let Some(entry) = self.selected_entry() else {
+            return false;
+        };
+        let Some(Ok(facts)) = self.facts.get(entry.name()) else {
+            return false;
+        };
+        shows_readiness(entry, &self.status(entry), facts.readiness())
+    }
+
+    /// The rows [3]'s cursor moves over: the branch, then the files.
+    pub fn change_rows(&self) -> usize {
+        usize::from(self.branch_row()) + self.changes().len()
+    }
+
+    /// The file on [3]'s row `row`, none for the branch row.
+    pub fn change_at(&self, row: usize) -> Option<&Change> {
+        self.changes()
+            .get(row.checked_sub(usize::from(self.branch_row()))?)
+    }
+
+    /// What [3]'s cursor is on and the checkout it's in, unless the keys are
     /// going to the agent.
-    pub fn hovered_diff(&self) -> Option<(DiffKey, PathBuf)> {
+    fn changes_hover(&self) -> Option<(Hover, PathBuf)> {
         let Panel::Changes { file } = self.panel else {
             return None;
         };
@@ -1093,14 +1126,49 @@ impl Model {
             return None;
         }
         let entry = self.selected_entry()?;
-        let changes = self.changes();
-        let change = changes.get(file.min(changes.len().checked_sub(1)?))?;
-        let key = DiffKey {
-            name: entry.name().clone(),
-            path: change.path.clone(),
-            lines: change.lines,
+        let row = file.min(self.change_rows().checked_sub(1)?);
+        let root = entry.path()?.to_path_buf();
+        let name = entry.name().clone();
+        let hover = match (row, self.change_at(row), self.facts.get(&name)) {
+            (_, Some(change), _) => Hover::Diff(DiffKey {
+                name,
+                path: change.path.clone(),
+                lines: change.lines,
+            }),
+            (_, None, Some(Ok(facts))) => Hover::Branch(BranchKey {
+                name,
+                ahead: facts.ahead,
+                behind: facts.behind,
+                dirty: facts.dirty,
+            }),
+            (_, None, _) => return None,
         };
-        Some((key, entry.path()?.to_path_buf()))
+        Some((hover, root))
+    }
+
+    /// The document a read has to produce for what the cursor is on, and
+    /// the checkout to read it in.
+    pub fn hovered_document(&self) -> Option<(Key, PathBuf)> {
+        let (hover, root) = self.changes_hover()?;
+        let key = match hover {
+            Hover::Diff(key) => Key::Diff(key),
+            Hover::Branch(key) => Key::Branch(key),
+            Hover::Turn(_) | Hover::Subagent(..) => return None,
+        };
+        Some((key, root))
+    }
+
+    /// Which item of its panel the cursor is on, of how many, for [0]'s
+    /// title while the sidebar is out of sight.
+    pub fn position(&self) -> Option<(usize, usize)> {
+        match self.panel {
+            Panel::Agents => None,
+            Panel::Changes { file } => {
+                let rows = self.change_rows();
+                Some((file.min(rows.checked_sub(1)?) + 1, rows))
+            }
+            Panel::Agent { .. } => Some((self.row_at() + 1, self.subagent_rows().len() + 1)),
+        }
     }
 
     /// Whether the keys go to the document in [0].
@@ -1133,9 +1201,8 @@ impl Model {
             return None;
         };
         let root = self.selected_entry()?.path()?;
-        let changes = self.changes();
-        changes
-            .get(file.min(changes.len().saturating_sub(1)))
+        let row = file.min(self.change_rows().checked_sub(1)?);
+        self.change_at(row)
             .map(|c| (root.to_path_buf(), c.path.clone()))
     }
 
@@ -1259,7 +1326,7 @@ impl Model {
         }
         match self.panel {
             Panel::Agents => None,
-            Panel::Changes { .. } => self.hovered_diff().map(|(key, _)| Hover::Diff(key)),
+            Panel::Changes { .. } => self.changes_hover().map(|(hover, _)| hover),
             Panel::Agent { .. } => {
                 let entry = self.selected_entry()?;
                 self.activity(entry.name())?;

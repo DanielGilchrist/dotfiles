@@ -11,10 +11,10 @@ use crate::model::{Head, Running, Worktree};
 use crate::names::{BranchName, Prompt, PullRequest, SessionName};
 use crate::paths::{AgentWorktree, RepoRoot};
 use crate::ports::{
-    AgentRecord, BranchState, ClientControl, Fetch, FileDiff, Forge, Harness, HarnessError,
-    HarnessId, Harnesses, HostError, LaunchCtx, Lines, Listing, LocalBranch, PaneCommand,
-    PendingPrompt, PullRequestHead, RemoteBranch, RepoWorktrees, Seen, SessionHost, SessionInfo,
-    SessionStatus, Store, StoreError, Unlisting, Vcs, WorktreeFacts, WorktreeStart,
+    AgentRecord, BranchLog, BranchState, ClientControl, Fetch, FileDiff, Forge, Harness,
+    HarnessError, HarnessId, Harnesses, HostError, LaunchCtx, Lines, Listing, LocalBranch,
+    PaneCommand, PendingPrompt, PullRequestHead, RemoteBranch, RepoWorktrees, Seen, SessionHost,
+    SessionInfo, SessionStatus, Store, StoreError, Unlisting, Vcs, WorktreeFacts, WorktreeStart,
 };
 use crate::process::{CommandError, LaunchSpec};
 
@@ -222,6 +222,10 @@ impl Vcs for FakeVcs {
 
     fn facts(&self, _: &Path) -> Result<WorktreeFacts, CommandError> {
         Ok(WorktreeFacts::default())
+    }
+
+    fn branch_log(&self, _: &Path) -> Result<BranchLog, CommandError> {
+        Ok(BranchLog::default())
     }
 
     fn file_diff(&self, _: &Path, _: &Path, _: Lines) -> Result<FileDiff, CommandError> {

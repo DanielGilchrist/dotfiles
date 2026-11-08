@@ -16,12 +16,12 @@ use agent_term::{CellPos, encode_key, encode_mouse};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind};
 use ratatui::layout::Position;
 
-use crate::document::DiffKey;
+use crate::document::Key;
 use crate::model::{
     Answer, Chord, Confirm, Cursor, Direction, Edge, Enter, Field, Focus, Follow, FormKind,
     INFO_TTL, Inspection, Intent, Mode, Model, NamingState, NewAgent, Overlay, Pane, Panel, Phase,
-    Query, Reach, StatusKind, SubagentRead, Submission, TerminalFocus, Ticket, View, WorkRoom,
-    fuzzy_match, match_rank, repo_matches, unlisted,
+    Query, Reach, Screen, StatusKind, SubagentRead, Submission, TerminalFocus, Ticket, View,
+    WorkRoom, fuzzy_match, match_rank, repo_matches, unlisted,
 };
 use crate::worker::{Job, Msg, Outcome};
 
@@ -63,9 +63,9 @@ pub enum Effect {
         name: SessionName,
         worktree: PathBuf,
     },
-    /// Read a file's diff in a worktree.
-    ReadDiff {
-        key: DiffKey,
+    /// Read a diff or a branch log in a worktree.
+    ReadDocument {
+        key: Key,
         worktree: PathBuf,
     },
     /// Read what a subagent of an agent working in `workdir` has done.
@@ -225,7 +225,7 @@ pub fn update(m: &mut Model, msg: Msg) -> Vec<Effect> {
             }
             Vec::new()
         }
-        Msg::Diff { key, result } => {
+        Msg::Document { key, result } => {
             m.docs.loaded(&key, result);
             Vec::new()
         }
@@ -290,7 +290,7 @@ pub fn tick(m: &mut Model) -> Vec<Effect> {
     effects.extend(preview(m));
     effects.extend(inspect(m));
     effects.extend(read_subagent(m));
-    effects.extend(read_diff(m));
+    effects.extend(read_document(m));
     effects
 }
 
@@ -436,14 +436,13 @@ fn forget_subagents(m: &mut Model) {
     m.subagent_logs.retain(|key, _| listed(key));
 }
 
-/// Asks for the diff of the file under [3]'s cursor once the cursor has
-/// rested on it.
-fn read_diff(m: &mut Model) -> Option<Effect> {
+/// Asks for what [3]'s cursor is on once it has rested there.
+fn read_document(m: &mut Model) -> Option<Effect> {
     m.settle_main();
-    let (key, worktree) = m.hovered_diff()?;
+    let (key, worktree) = m.hovered_document()?;
     let due = m.docs.due(Instant::now())?;
     debug_assert_eq!(due, key);
-    Some(Effect::ReadDiff { key: due, worktree })
+    Some(Effect::ReadDocument { key: due, worktree })
 }
 
 /// Asks for what the subagent under [2]'s cursor has done: when it's first
@@ -707,10 +706,6 @@ fn on_panel_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
             m.panel = Panel::Agents;
             Some(Vec::new())
         }
-        (KeyCode::Char('2' | '3'), _) if m.work_room == WorkRoom::Hidden => {
-            m.info("the sidebar is hidden at this width");
-            Some(Vec::new())
-        }
         (KeyCode::Char('2'), _) if m.selected_entry().is_none() => {
             m.info("select an agent to see it");
             Some(Vec::new())
@@ -727,7 +722,7 @@ fn on_panel_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
             m.subagent = None;
             Some(Vec::new())
         }
-        (KeyCode::Char('3'), _) if m.changes().is_empty() => {
+        (KeyCode::Char('3'), _) if m.change_rows() == 0 => {
             m.info("no files to move to");
             Some(Vec::new())
         }
@@ -813,6 +808,8 @@ fn on_nav_key(m: &mut Model, key: KeyEvent) -> Vec<Effect> {
         KeyCode::Char('[') => m.jump_repo(-1),
         KeyCode::Tab => m.cycle_view(Direction::Forward),
         KeyCode::BackTab => m.cycle_view(Direction::Back),
+        KeyCode::Char('+') => m.screen = Screen::Full,
+        KeyCode::Char('_') => m.screen = Screen::Split,
         KeyCode::Char('.') if m.view == View::Pinned => {
             m.info("pinned lists every pin · . filters the repo and agents tabs");
         }
@@ -3467,9 +3464,10 @@ mod tests {
         effects
             .into_iter()
             .filter_map(|e| match e {
-                Effect::ReadDiff { key, worktree } => {
-                    Some(format!("{} {}", key.path.display(), worktree.display()))
-                }
+                Effect::ReadDocument {
+                    key: Key::Diff(key),
+                    worktree,
+                } => Some(format!("{} {}", key.path.display(), worktree.display())),
                 _ => None,
             })
             .collect()
@@ -3482,7 +3480,11 @@ mod tests {
         m.set_cursor(Cursor::Entry(name("obs-layout-4")));
         assert_eq!(diff_reads(tick(&mut m)), [""; 0], "[3] isn't focused");
         update(&mut m, key(KeyCode::Char('3')));
-        assert!(matches!(m.panel, Panel::Changes { file: 0 }));
+        update(&mut m, key(KeyCode::Char('j')));
+        assert!(
+            matches!(m.panel, Panel::Changes { file: 1 }),
+            "row 0 is the branch"
+        );
         assert_eq!(
             diff_reads(tick(&mut m)),
             [""; 0],
@@ -3506,7 +3508,7 @@ mod tests {
             Msg::Key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL)),
         );
         assert_eq!(m.docs.scroll, 5, "half a page of [0], not of the list");
-        assert!(matches!(m.panel, Panel::Changes { file: 0 }));
+        assert!(matches!(m.panel, Panel::Changes { file: 1 }));
         update(
             &mut m,
             Msg::Key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL)),
@@ -3642,5 +3644,60 @@ mod tests {
         assert_eq!(m.visible_session(), Some(&name("obs-layout-4")));
         update(&mut m, key(KeyCode::Char('3')));
         assert_eq!(m.visible_session(), None, "its diff is on screen instead");
+    }
+
+    #[test]
+    fn the_readiness_row_is_the_first_row_of_changes_and_reads_the_branch() {
+        let mut m = crate::fixtures::fleet(10);
+        m.set_cursor(Cursor::Entry(name("obs-layout-4")));
+        assert!(m.branch_row(), "obs-layout-4 is ahead in the fixture");
+        update(&mut m, key(KeyCode::Char('3')));
+        assert!(matches!(m.hover(), Some(crate::document::Hover::Branch(_))));
+        assert_eq!(m.change_rows(), m.changes().len() + 1);
+        assert_eq!(
+            tick(&mut m)
+                .iter()
+                .filter(|e| matches!(e, Effect::ReadDocument { .. }))
+                .count(),
+            0
+        );
+        std::thread::sleep(crate::document::REST + Duration::from_millis(20));
+        let asked: Vec<_> = tick(&mut m)
+            .into_iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    Effect::ReadDocument {
+                        key: Key::Branch(_),
+                        ..
+                    }
+                )
+            })
+            .collect();
+        assert_eq!(asked.len(), 1, "the branch log is read like a diff");
+
+        let effects = update(&mut m, key(KeyCode::Char('e')));
+        assert!(
+            matches!(effects.as_slice(), [Effect::Edit(Open::Checkout(_))]),
+            "with no file under the cursor e opens the worktree"
+        );
+        update(&mut m, key(KeyCode::Char('j')));
+        assert!(matches!(m.hover(), Some(crate::document::Hover::Diff(_))));
+        update(&mut m, key(KeyCode::Char('G')));
+        assert!(matches!(m.panel, Panel::Changes { file } if file == m.change_rows() - 1));
+    }
+
+    #[test]
+    fn plus_and_underscore_switch_the_screen_mode_and_the_panels_keep_the_keys() {
+        let mut m = crate::fixtures::fleet(10);
+        m.set_cursor(Cursor::Entry(name("obs-layout-4")));
+        update(&mut m, key(KeyCode::Char('3')));
+        update(&mut m, key(KeyCode::Char('+')));
+        assert_eq!(m.screen, Screen::Full);
+        assert!(matches!(m.panel, Panel::Changes { .. }), "the focus stays");
+        update(&mut m, key(KeyCode::Char('j')));
+        assert!(matches!(m.panel, Panel::Changes { file: 1 }));
+        update(&mut m, key(KeyCode::Char('_')));
+        assert_eq!(m.screen, Screen::Split);
     }
 }

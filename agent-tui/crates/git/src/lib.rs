@@ -8,8 +8,8 @@ use agent_core::model::{Head, Worktree};
 use agent_core::names::{BranchName, NameError, PullRequest};
 use agent_core::paths::{AgentWorktree, RepoRoot};
 use agent_core::ports::{
-    BranchState, Change, Fetch, FileDiff, Forge, Lines, LocalBranch, PullRequestHead, RemoteBranch,
-    RepoWorktrees, Vcs, WorktreeFacts, WorktreeStart,
+    BranchLog, BranchState, Change, Fetch, FileDiff, Forge, Lines, LocalBranch, PullRequestHead,
+    RemoteBranch, RepoWorktrees, Vcs, WorktreeFacts, WorktreeStart,
 };
 use agent_core::process::{self, CommandError};
 
@@ -499,6 +499,27 @@ impl Vcs for Git {
         })
     }
 
+    fn branch_log(&self, worktree: &Path) -> Result<BranchLog, CommandError> {
+        let uncommitted = Self::status(worktree)?;
+        let Some(base) = Self::default_base(worktree)? else {
+            return Ok(BranchLog {
+                commits: Vec::new(),
+                uncommitted,
+            });
+        };
+        let mut cmd = git(worktree);
+        cmd.args(["log", "--oneline", "--no-decorate", "--max-count=500"])
+            .arg(format!("{base}..HEAD"));
+        let commits = process::run(&mut cmd)?
+            .lines()
+            .map(str::to_string)
+            .collect();
+        Ok(BranchLog {
+            commits,
+            uncommitted,
+        })
+    }
+
     fn file_diff(
         &self,
         worktree: &Path,
@@ -833,6 +854,11 @@ mod tests {
             panic!("a text diff");
         };
         assert_eq!(lines[1..], ["+x", "+y"]);
+        let log = Git.branch_log(&work).expect("succeeds");
+        assert_eq!(log.commits.len(), 1);
+        assert!(log.commits[0].ends_with(" two"), "{:?}", log.commits);
+        let files: Vec<&Path> = log.uncommitted.iter().map(|(_, p)| p.as_path()).collect();
+        assert_eq!(files, [Path::new("a.txt"), Path::new("new.txt")]);
         assert_eq!(
             Git.file_diff(&work, Path::new("new.txt"), Lines::Binary)
                 .expect("succeeds"),

@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use agent_core::activity::AgentId;
 use agent_core::names::SessionName;
-use agent_core::ports::{FileDiff, Lines};
+use agent_core::ports::{BranchLog, FileDiff, Lines};
 
 /// The cursor must rest on a file this long before its diff is asked for, so
 /// holding `j` doesn't start a read per file.
@@ -27,11 +27,46 @@ pub struct DiffKey {
     pub lines: Lines,
 }
 
+/// A branch's log: whose it is and the counts it was read at, so a branch
+/// that gained a commit or a dirty file is a different document.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchKey {
+    pub name: SessionName,
+    pub ahead: usize,
+    pub behind: usize,
+    pub dirty: usize,
+}
+
+/// A document read off the UI thread.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Key {
+    Diff(DiffKey),
+    Branch(BranchKey),
+}
+
+impl Key {
+    pub fn name(&self) -> &SessionName {
+        match self {
+            Self::Diff(key) => &key.name,
+            Self::Branch(key) => &key.name,
+        }
+    }
+}
+
+/// What a read found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Doc {
+    Diff(FileDiff),
+    Branch(BranchLog),
+}
+
 /// What the cursor is on that [0] reads.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Hover {
     /// A changed file in [3].
     Diff(DiffKey),
+    /// [3]'s readiness row.
+    Branch(BranchKey),
     /// [2]'s turn row.
     Turn(SessionName),
     /// A subagent row in [2].
@@ -42,6 +77,7 @@ pub enum Hover {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Item {
     File(SessionName, PathBuf),
+    Branch(SessionName),
     Turn(SessionName),
     Subagent(SessionName, AgentId),
 }
@@ -50,13 +86,23 @@ impl Hover {
     fn item(&self) -> Item {
         match self {
             Self::Diff(key) => Item::File(key.name.clone(), key.path.clone()),
+            Self::Branch(key) => Item::Branch(key.name.clone()),
             Self::Turn(name) => Item::Turn(name.clone()),
             Self::Subagent(name, id) => Item::Subagent(name.clone(), id.clone()),
         }
     }
+
+    /// The document a read has to produce for this, if it needs one.
+    fn key(&self) -> Option<Key> {
+        match self {
+            Self::Diff(key) => Some(Key::Diff(key.clone())),
+            Self::Branch(key) => Some(Key::Branch(key.clone())),
+            Self::Turn(_) | Self::Subagent(..) => None,
+        }
+    }
 }
 
-pub type Loaded = Arc<Result<FileDiff, String>>;
+pub type Loaded = Arc<Result<Doc, String>>;
 
 #[derive(Default)]
 pub struct Documents {
@@ -70,13 +116,13 @@ pub struct Documents {
     following: bool,
     /// What the scroll belongs to: moving to another item starts afresh.
     item: Option<Item>,
-    /// The diff the cursor is on and since when.
-    hover: Option<(DiffKey, Instant)>,
-    requested: Vec<DiffKey>,
-    cache: Vec<(DiffKey, Loaded)>,
-    /// What [0] shows: the hovered diff once it's loaded, else the last one
-    /// shown, so moving the cursor never blanks the screen.
-    shown: Option<(DiffKey, Loaded)>,
+    /// The document the cursor is on and since when.
+    hover: Option<(Key, Instant)>,
+    requested: Vec<Key>,
+    cache: Vec<(Key, Loaded)>,
+    /// What [0] shows: the hovered document once it's loaded, else the last
+    /// one shown, so moving the cursor never blanks the screen.
+    shown: Option<(Key, Loaded)>,
     /// Since when [0] has shown something other than what's hovered.
     waiting: Option<Instant>,
 }
@@ -97,16 +143,16 @@ impl Documents {
             self.scroll = 0;
             self.following = true;
         }
-        let Hover::Diff(key) = hover else {
+        let Some(key) = hover.key() else {
             self.hover = None;
             self.shown = None;
             self.waiting = None;
             return;
         };
-        if self.hover.as_ref().map(|(k, _)| k) != Some(key) {
+        if self.hover.as_ref().map(|(k, _)| k) != Some(&key) {
             self.hover = Some((key.clone(), now));
         }
-        match self.cache.iter().position(|(k, _)| k == key) {
+        match self.cache.iter().position(|(k, _)| *k == key) {
             Some(at) => {
                 let hit = self.cache.remove(at);
                 self.shown = Some(hit.clone());
@@ -121,7 +167,7 @@ impl Documents {
 
     /// The hovered diff, once the cursor has rested on it and nothing has
     /// it or is already reading it.
-    pub fn due(&mut self, now: Instant) -> Option<DiffKey> {
+    pub fn due(&mut self, now: Instant) -> Option<Key> {
         let (key, since) = self.hover.as_ref()?;
         let waiting = now >= *since + REST
             && !self.cache.iter().any(|(k, _)| k == key)
@@ -132,7 +178,7 @@ impl Documents {
     }
 
     /// A read finished. Whatever it was for is cached, shown or not.
-    pub fn loaded(&mut self, key: &DiffKey, result: Result<FileDiff, String>) {
+    pub fn loaded(&mut self, key: &Key, result: Result<Doc, String>) {
         let Some(at) = self.requested.iter().position(|k| k == key) else {
             return;
         };
@@ -144,7 +190,7 @@ impl Documents {
     }
 
     /// What [0] shows, and the file it's for.
-    pub fn shown(&self) -> Option<&(DiffKey, Loaded)> {
+    pub fn shown(&self) -> Option<&(Key, Loaded)> {
         self.shown.as_ref()
     }
 
@@ -209,8 +255,8 @@ impl Documents {
 
     /// Drops everything about an agent that's gone.
     pub fn forget(&mut self, known: impl Fn(&SessionName) -> bool) {
-        self.cache.retain(|(k, _)| known(&k.name));
-        self.requested.retain(|k| known(&k.name));
+        self.cache.retain(|(k, _)| known(k.name()));
+        self.requested.retain(|k| known(k.name()));
     }
 }
 
@@ -226,10 +272,17 @@ mod tests {
         }
     }
 
-    fn diff(text: &str) -> FileDiff {
-        FileDiff::Text {
+    fn diff(text: &str) -> Doc {
+        Doc::Diff(FileDiff::Text {
             lines: vec![text.into()],
             more: 0,
+        })
+    }
+
+    fn path_of(docs: &Documents) -> Option<PathBuf> {
+        match docs.shown().map(|(k, _)| k) {
+            Some(Key::Diff(key)) => Some(key.path.clone()),
+            _ => None,
         }
     }
 
@@ -243,12 +296,12 @@ mod tests {
         assert_eq!(docs.due(t0 + REST), None, "once");
         docs.loaded(&a, Ok(diff("a")));
         docs.settle(Some(&Hover::Diff(key("a", 1))), t0 + REST);
-        assert_eq!(docs.shown().map(|(k, _)| k.path.clone()), Some("a".into()));
+        assert_eq!(path_of(&docs), Some("a".into()));
 
         let t1 = t0 + REST * 2;
         docs.settle(Some(&Hover::Diff(key("b", 2))), t1);
         assert_eq!(
-            docs.shown().map(|(k, _)| k.path.clone()),
+            path_of(&docs),
             Some("a".into()),
             "a still shows while b is read"
         );
@@ -257,12 +310,12 @@ mod tests {
         let b = docs.due(t1 + REST).expect("b is read");
         docs.loaded(&b, Ok(diff("b")));
         docs.settle(Some(&Hover::Diff(key("b", 2))), t1 + REST);
-        assert_eq!(docs.shown().map(|(k, _)| k.path.clone()), Some("b".into()));
+        assert_eq!(path_of(&docs), Some("b".into()));
         assert!(!docs.loading(t1 + Duration::from_secs(9)));
 
         docs.settle(Some(&Hover::Diff(key("a", 1))), t1 + REST * 2);
         assert_eq!(
-            docs.shown().map(|(k, _)| k.path.clone()),
+            path_of(&docs),
             Some("a".into()),
             "a cache hit shows at once"
         );
@@ -291,22 +344,20 @@ mod tests {
     fn the_cache_keeps_the_last_few_and_an_answer_nobody_asked_for_is_dropped() {
         let mut docs = Documents::default();
         let t0 = Instant::now();
-        docs.loaded(&key("x", 1), Ok(diff("x")));
+        docs.loaded(&Key::Diff(key("x", 1)), Ok(diff("x")));
         docs.settle(Some(&Hover::Diff(key("x", 1))), t0);
         assert!(docs.shown().is_none(), "never requested");
         for i in 0..CACHE + 5 {
             let k = key(&format!("f{i}"), i);
             docs.settle(Some(&Hover::Diff(k.clone())), t0);
-            docs.hover = Some((k.clone(), t0));
+            docs.hover = Some((Key::Diff(k.clone()), t0));
             let due = docs.due(t0 + REST).expect("due");
             docs.loaded(&due, Ok(diff("d")));
         }
         assert_eq!(docs.cache.len(), CACHE);
-        assert!(
-            docs.cache
-                .iter()
-                .all(|(k, _)| k.path.as_path() != std::path::Path::new("f0"))
-        );
+        assert!(docs.cache.iter().all(
+            |(k, _)| !matches!(k, Key::Diff(d) if d.path.as_path() == std::path::Path::new("f0"))
+        ));
     }
 
     fn log() -> Hover {

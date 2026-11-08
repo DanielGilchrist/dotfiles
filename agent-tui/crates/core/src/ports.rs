@@ -52,6 +52,16 @@ pub enum FileDiff {
     Binary { bytes: Option<u64> },
 }
 
+/// What a worktree has done since it forked from the default branch, for
+/// reading: its commits and its uncommitted files.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BranchLog {
+    /// One line per commit on top of the fork point, newest first.
+    pub commits: Vec<String>,
+    /// Modified, staged and untracked files with their two-letter status.
+    pub uncommitted: Vec<(String, PathBuf)>,
+}
+
 /// How a changed file's lines changed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Lines {
@@ -223,6 +233,9 @@ pub trait Vcs: Send + Sync {
     /// What a worktree has done since it forked from the default branch,
     /// without taking locks the agent working in it might need.
     fn facts(&self, worktree: &Path) -> Result<WorktreeFacts, CommandError>;
+    /// The worktree's commits since it forked, and its uncommitted files.
+    /// Slow on a big repo: call it off the UI thread.
+    fn branch_log(&self, worktree: &Path) -> Result<BranchLog, CommandError>;
     /// `path`'s change since the worktree forked from the default branch,
     /// committed and uncommitted together. `lines` says what kind of change
     /// facts found, so a new untracked file is shown whole. Slow on big
