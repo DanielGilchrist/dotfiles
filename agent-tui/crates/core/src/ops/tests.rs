@@ -779,3 +779,37 @@ fn attaching_here_starts_the_worktrees_agent_and_never_creates_one() {
         Err(Error::WorktreeGone { .. })
     ));
 }
+
+#[test]
+fn launching_marks_a_previously_finished_agent_as_booting() {
+    use crate::activity::{Activity, Event, Reported};
+    let w = World::new();
+    let repo = w.vcs.root.clone();
+    attach(w.svc(), &agent("fix"), None, Some(&repo), w.harness()).expect("succeeds");
+    let long_ago = std::time::SystemTime::UNIX_EPOCH;
+    let done = Activity::next(
+        None,
+        Reported::main(Event::Finished {
+            summary: None,
+            running: Vec::new(),
+        }),
+        long_ago,
+    );
+    assert!(done.at_rest());
+    w.store
+        .activities
+        .lock()
+        .expect("lock")
+        .insert(session("fix"), done);
+
+    exec_spec(w.svc(), &session("fix"), Path::new("/x")).expect("succeeds");
+    let activity = w
+        .store
+        .activities
+        .lock()
+        .expect("lock")
+        .get(&session("fix"))
+        .cloned()
+        .expect("recorded");
+    assert!(!activity.at_rest() && activity.booting);
+}

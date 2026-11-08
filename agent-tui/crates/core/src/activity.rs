@@ -75,6 +75,9 @@ impl Reported {
 /// Something a harness reported about an agent or one of its subagents.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
+    /// `agent exec` is about to start the harness: a new session, not yet
+    /// reporting.
+    Launched,
     /// A session began (fresh, resumed or cleared).
     Started,
     /// The context was compacted.
@@ -242,8 +245,8 @@ pub struct Activity {
     /// Open questions, at most one per asker, oldest first.
     pub asks: Vec<Ask>,
     pub subagents: BTreeMap<AgentId, Subagent>,
-    /// The last thing reported was a session starting, which a dialog may
-    /// still be covering.
+    /// The last thing reported was a session launching or starting, which a
+    /// dialog may still be covering.
     pub booting: bool,
 }
 
@@ -270,7 +273,7 @@ impl Activity {
             reported,
             Reported {
                 origin: Origin::Main,
-                event: Event::Started
+                event: Event::Started | Event::Launched
             }
         );
         let before = activity.state.clone();
@@ -320,6 +323,10 @@ impl Activity {
         };
         let state = std::mem::replace(&mut self.state, State::Idle);
         self.state = match (origin, event) {
+            (Origin::Main, Event::Launched) => {
+                self.forget_subagents();
+                State::Working { tools: Vec::new() }
+            }
             (Origin::Main, Event::Started) => {
                 self.forget_subagents();
                 State::Idle
@@ -1195,6 +1202,23 @@ mod tests {
         ]);
         assert!(!a.booting);
         assert!(a.ready_for_text(Some(at(15)), at(23)));
+    }
+
+    #[test]
+    fn a_launched_agent_is_busy_until_its_session_has_been_quiet() {
+        let a = run(vec![(10, main(finished(&[]))), (20, main(Event::Launched))]);
+        assert!(!a.at_rest() && a.booting);
+        assert!(!a.ready_for_text(Some(at(15)), at(100)));
+        let a = run(vec![
+            (10, main(finished(&[]))),
+            (20, main(Event::Launched)),
+            (21, main(Event::Started)),
+        ]);
+        assert!(a.at_rest() && a.booting);
+        assert!(!a.ready_for_text(Some(at(15)), at(22)));
+        assert!(a.ready_for_text(Some(at(15)), at(21 + BOOT_QUIET.as_secs())));
+        let a = run(vec![(10, main(finished(&[]))), (20, main(Event::Launched))]);
+        assert!(a.asks.is_empty() && a.subagents.is_empty());
     }
 
     #[test]
