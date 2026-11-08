@@ -659,16 +659,50 @@ pub enum HostError {
     Detach { client: ClientId, reason: String },
 }
 
+/// A terminal application, by the short name it goes by (`wezterm`, `iTerm`).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct TerminalApp(String);
+
+impl TerminalApp {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self(name.into())
+    }
+}
+
+impl fmt::Display for TerminalApp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Where another window showing a session lives, as far as its process
+/// ancestry tells.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Place {
+    Nvim,
+    Ssh,
+    Tmux,
+    Terminal(TerminalApp),
+    /// A client with no shell or terminal above it, left behind by one that
+    /// went away.
+    Detached,
+    Unknown,
+}
+
+/// One client showing a session in a window of someone's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Window {
+    pub client: ClientId,
+    pub session: SessionName,
+    pub place: Place,
+}
+
 /// Hosts whose sessions accept several clients can report and detach them.
 pub trait ClientControl: Send + Sync {
-    /// Windows showing `name`, excluding `own` and anything it spawned and
-    /// the previews of any TUI, which are not a window of someone else's.
-    /// Closing them (`detach`) is what moving the session here does.
-    fn other_clients(
-        &self,
-        name: &SessionName,
-        own: Option<ClientId>,
-    ) -> Result<Vec<ClientId>, HostError>;
+    /// Every window showing a session. Clients of `own` and of anything it
+    /// spawned are not windows, nor are the previews of any TUI. Closing
+    /// them (`detach`) is what moving the session here does.
+    fn windows(&self, own: Option<ClientId>) -> Result<Vec<Window>, HostError>;
     fn detach(&self, clients: &[ClientId]) -> Result<(), HostError>;
 }
 

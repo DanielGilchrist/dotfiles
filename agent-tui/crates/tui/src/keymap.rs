@@ -179,8 +179,9 @@ impl Situation {
         };
         let selected = m.selected();
         let entry = selected.and_then(|(_, e)| e);
-        let elsewhere = entry.is_some_and(|e| m.pane.elsewhere(e.name()));
-        let moves_here = entry.is_some_and(|e| m.moves_here().as_ref() == Some(e.name()));
+        let elsewhere = entry.is_some_and(|e| m.elsewhere(e.name()));
+        let moves_here =
+            entry.is_some_and(|e| m.moves_here().is_some_and(|(name, _)| name == e.name()));
         let reach = entry.map(|e| m.reach(e));
         let ReachKeys {
             enter,

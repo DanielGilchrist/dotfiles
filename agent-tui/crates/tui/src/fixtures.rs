@@ -12,16 +12,38 @@ use agent_core::model::{Head, Worktree};
 use agent_core::names::SessionName;
 use agent_core::paths::{Layout, RepoRoot};
 use agent_core::ports::{
-    Change, Checkout, Compared, Lines, RepoWorktrees, SessionInfo, SessionStatus, TrackedState,
-    WorktreeFacts,
+    Change, Checkout, Compared, Lines, Place, RepoWorktrees, SessionInfo, SessionStatus,
+    TrackedState, WorktreeFacts,
 };
 
 use crate::model::{Company, Connection, Cursor, Mode, Model, Pane};
-use crate::update::update;
+use crate::update::{Effect, update};
 use crate::worker::Msg;
 
+/// The company of an agent whose other window is an nvim tab.
+pub fn in_nvim() -> Company {
+    Company::of(vec![Place::Nvim])
+}
+
+/// Answers the newest look as finding `windows` (sessions by company), and
+/// every other agent alone.
+pub fn sighted(m: &mut Model, windows: &[(&str, Company)]) -> Vec<Effect> {
+    let ticket = m.current_look().expect("a look was asked for");
+    let found = windows
+        .iter()
+        .map(|(agent, company)| (name(agent), company.clone()))
+        .collect();
+    update(
+        m,
+        Msg::Elsewhere {
+            ticket,
+            found: Ok(found),
+        },
+    )
+}
+
 /// A pty running `cat` as the pane's client for `agent`.
-pub fn connect(m: &mut Model, agent: &str, mode: Mode, company: Company) {
+pub fn connect(m: &mut Model, agent: &str, mode: Mode) {
     let size = agent_term::TermSize::of(ratatui::layout::Rect::new(0, 0, 80, 24)).expect("size");
     let term = agent_term::Terminal::spawn(
         &agent_core::process::LaunchSpec::new("cat"),
@@ -32,7 +54,6 @@ pub fn connect(m: &mut Model, agent: &str, mode: Mode, company: Company) {
     m.pane = Pane::Connected(Connection {
         name: name(agent),
         term,
-        company,
         mode,
         opened: std::time::Instant::now(),
     });
@@ -43,6 +64,7 @@ pub fn elsewhere_on(agent: &str) -> Model {
     let mut m = fleet(10);
     m.set_cursor(Cursor::Entry(name(agent)));
     m.pane = Pane::Elsewhere { name: name(agent) };
+    m.record_company(&name(agent), in_nvim());
     m
 }
 

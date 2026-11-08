@@ -14,11 +14,13 @@ use agent_core::model::{Removable, Running, Snapshot, Startable};
 use agent_core::names::{AgentName, Prompt, SessionName};
 use agent_core::ops::{self, Approved, Backend, Launch, RemovalPlan, Removed};
 use agent_core::paths::RepoRoot;
-use agent_core::ports::{ActivityDetail, ClientId, FileDiff, HarnessId, HostError, Log};
+use agent_core::ports::{
+    ActivityDetail, ClientId, FileDiff, HarnessId, HostError, Log, Place, Window,
+};
 use crossterm::event::{KeyEvent, MouseEvent};
 
 use crate::document::{Doc, Key, assemble};
-use crate::model::{Company, Found, Inspected, Launchable, Look, RepoChoice, Ticket};
+use crate::model::{Company, Found, Inspected, Launchable, Look, Need, RepoChoice, Ticket};
 
 /// How much of a failed action's stderr is read for its last line.
 const STDERR_TAIL: u64 = 64 * 1024;
@@ -55,12 +57,11 @@ pub enum Msg {
         to: SessionName,
         result: Result<(), SendError>,
     },
-    /// Whether another window shows `name`, for the look `ticket` asked
-    /// for, or why that couldn't be told.
+    /// The windows besides this TUI's showing each session that has any,
+    /// for the look `ticket` asked for, or why that couldn't be told.
     Elsewhere {
-        name: SessionName,
         ticket: Ticket,
-        company: Result<Company, String>,
+        found: Sightings,
     },
     /// The harness's model named the prompt of `generation` (or couldn't).
     NameSuggested {
@@ -237,7 +238,7 @@ pub struct Workers {
     activities: Arc<ActivityReader>,
     documents: Arc<DocumentReader>,
     namer: Arc<Namer>,
-    lookout: Arc<Lookout>,
+    lookouts: Lookouts,
     pub refresh: Sender<()>,
     worker: Option<JoinHandle<()>>,
 }
@@ -268,10 +269,12 @@ impl Workers {
         self.activities.request(name, (workdir, at));
     }
 
-    /// Asks whether another window shows `name`, on a thread of its own so
-    /// no slow job delays the answer. Only the latest ask is answered.
+    /// Asks which windows besides this TUI's show any session, on threads of
+    /// their own so no slow job delays the answer. A decision's ask has a thread
+    /// to itself, so a refresh scan still running can't make it late. Only
+    /// the latest ask of each kind is answered.
     pub fn look_elsewhere(&self, look: Look) {
-        self.lookout.request((), look);
+        self.lookouts.request(look);
     }
 
     /// Asks the harness's model to name `prompt`. A request still waiting
@@ -535,38 +538,76 @@ fn spawn_namer(
     namer
 }
 
-/// Looks for other windows on one thread, the newest ask replacing a waiting one.
 type Lookout = Queue<(), Look>;
 
-fn spawn_lookout(backend: &Arc<Backend>, msgs: &Sender<Msg>) -> Arc<Lookout> {
+/// What a scan for windows found, by session, or why it couldn't.
+type Sightings = Result<HashMap<SessionName, Company>, String>;
+type Scan = Arc<dyn Fn(Option<ClientId>) -> Sightings + Send + Sync>;
+
+/// Looks for other windows on a thread each for the refresh's looks and for
+/// the ones a decision waits on, the newest ask replacing
+/// a waiting one.
+struct Lookouts {
+    refresh: Arc<Lookout>,
+    decision: Arc<Lookout>,
+}
+
+impl Lookouts {
+    fn request(&self, look: Look) {
+        let queue = match look.need {
+            Need::Refresh => &self.refresh,
+            Need::Decision => &self.decision,
+        };
+        queue.request((), look);
+    }
+}
+
+/// The company of every session with a window, from the host's windows.
+fn companies(windows: Vec<Window>) -> HashMap<SessionName, Company> {
+    let mut places: HashMap<SessionName, Vec<Place>> = HashMap::new();
+    for window in windows {
+        places.entry(window.session).or_default().push(window.place);
+    }
+    places
+        .into_iter()
+        .map(|(name, mut places)| {
+            places.sort();
+            (name, Company::of(places))
+        })
+        .collect()
+}
+
+fn host_scan(backend: &Arc<Backend>) -> Scan {
+    let backend = Arc::clone(backend);
+    Arc::new(move |own| {
+        backend
+            .services()
+            .host
+            .clients()
+            .map_or(Ok(Vec::new()), |c| c.windows(own))
+            .map(companies)
+            .map_err(|e| describe(&e))
+    })
+}
+
+fn spawn_lookouts(scan: &Scan, msgs: &Sender<Msg>) -> Lookouts {
+    Lookouts {
+        refresh: spawn_lookout(scan, msgs),
+        decision: spawn_lookout(scan, msgs),
+    }
+}
+
+fn spawn_lookout(scan: &Scan, msgs: &Sender<Msg>) -> Arc<Lookout> {
     let lookout = Arc::new(Lookout::new());
     let queue = Arc::clone(&lookout);
-    let backend = Arc::clone(backend);
+    let scan = Arc::clone(scan);
     let msgs = msgs.clone();
     thread::spawn(move || {
         loop {
-            let ((), Look { name, own, ticket }) = queue.next();
-            let company = backend
-                .services()
-                .host
-                .clients()
-                .map_or(Ok(Company::Alone), |c| {
-                    c.other_clients(&name, own).map(|others| {
-                        if others.is_empty() {
-                            Company::Alone
-                        } else {
-                            Company::Elsewhere
-                        }
-                    })
-                })
-                .map_err(|e| describe(&e));
+            let ((), Look { own, ticket, .. }) = queue.next();
+            let found = scan(own);
             queue.done(&());
-            let msg = Msg::Elsewhere {
-                name,
-                ticket,
-                company,
-            };
-            if msgs.send(msg).is_err() {
+            if msgs.send(Msg::Elsewhere { ticket, found }).is_err() {
                 return;
             }
         }
@@ -624,7 +665,7 @@ pub fn spawn(backend: Arc<Backend>, sources: Sources, msgs: Sender<Msg>) -> Work
     let subagents = spawn_subagent_readers(&backend, &msgs);
     let activities = spawn_activity_readers(&backend, &msgs);
     let documents = spawn_document_readers(&backend, &msgs);
-    let lookout = spawn_lookout(&backend, &msgs);
+    let lookouts = spawn_lookouts(&host_scan(&backend), &msgs);
     let namer = {
         let backend = Arc::clone(&backend);
         spawn_namer(
@@ -662,7 +703,7 @@ pub fn spawn(backend: Arc<Backend>, sources: Sources, msgs: Sender<Msg>) -> Work
         activities,
         documents,
         namer,
-        lookout,
+        lookouts,
         refresh,
         worker: Some(worker),
     }
@@ -900,7 +941,12 @@ fn close_elsewhere(
     let Some(clients) = svc.host.clients() else {
         return Ok(0);
     };
-    let others = clients.other_clients(name, own)?;
+    let others: Vec<ClientId> = clients
+        .windows(own)?
+        .into_iter()
+        .filter(|w| w.session == *name)
+        .map(|w| w.client)
+        .collect();
     clients.detach(&others)?;
     Ok(others.len())
 }
@@ -908,11 +954,77 @@ fn close_elsewhere(
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use super::*;
 
     const PATIENCE: Duration = Duration::from_secs(5);
+
+    fn ticket_of(reply: &Msg) -> Ticket {
+        match reply {
+            Msg::Elsewhere { ticket, .. } => *ticket,
+            _ => panic!("a look's answer"),
+        }
+    }
+
+    #[test]
+    fn a_prompt_look_is_answered_while_a_refresh_scan_is_still_running() {
+        let (msgs, replies) = mpsc::channel();
+        let (release, gate) = mpsc::channel::<()>();
+        let gate = Mutex::new(gate);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let scan: Scan = {
+            let calls = Arc::clone(&calls);
+            Arc::new(move |_| {
+                if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    let _ = gate.lock().expect("gate").recv_timeout(PATIENCE);
+                }
+                Ok(HashMap::new())
+            })
+        };
+        let lookouts = spawn_lookouts(&scan, &msgs);
+        let mut m = crate::fixtures::fleet(1);
+        let (slow, quick) = (m.start_look(), m.start_look());
+        let look = |ticket, need| Look {
+            own: None,
+            ticket,
+            need,
+        };
+        lookouts.request(look(slow, Need::Refresh));
+        let started = Instant::now();
+        while calls.load(Ordering::SeqCst) == 0 {
+            assert!(started.elapsed() < PATIENCE, "the refresh scan never began");
+            thread::sleep(Duration::from_millis(1));
+        }
+        lookouts.request(look(quick, Need::Decision));
+        let first = replies.recv_timeout(PATIENCE).expect("an answer");
+        assert_eq!(
+            ticket_of(&first),
+            quick,
+            "the refresh scan is still blocked"
+        );
+        release.send(()).expect("released");
+        let second = replies.recv_timeout(PATIENCE).expect("the refresh answer");
+        assert_eq!(ticket_of(&second), slow);
+    }
+
+    #[test]
+    fn windows_are_grouped_by_session_with_their_places_sorted() {
+        let window = |client, session: &str, place| Window {
+            client: ClientId::new(client),
+            session: session.parse().expect("a name"),
+            place,
+        };
+        let found = companies(vec![
+            window(3, "fix", Place::Ssh),
+            window(1, "fix", Place::Nvim),
+            window(2, "other", Place::Tmux),
+        ]);
+        let of = |name: &str| found.get(&name.parse::<SessionName>().expect("a name"));
+        assert_eq!(of("fix"), Some(&Company::of(vec![Place::Nvim, Place::Ssh])));
+        assert_eq!(of("other"), Some(&Company::of(vec![Place::Tmux])));
+        assert_eq!(of("idle"), None);
+    }
 
     #[test]
     fn at_most_one_name_is_asked_for_at_a_time_and_only_the_latest_waiting_prompt_is() {

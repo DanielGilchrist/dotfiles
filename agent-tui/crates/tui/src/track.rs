@@ -11,7 +11,7 @@ use agent_core::names::Prompt;
 use agent_core::ports::{ActivityDetail, Log, WorktreeFacts};
 
 use crate::log::Nav;
-use crate::model::Inspection;
+use crate::model::{Company, Inspection};
 use crate::touched::Baseline;
 use crate::tree::{ChangesScope, ChangesView, TreeRow};
 
@@ -58,6 +58,8 @@ pub struct Tracked {
     pub seen: Seen,
     /// The subagents being watched, dropped with the agent.
     pub subagents: HashMap<AgentId, Watched>,
+    /// The other windows showing its session, as the newest look found them.
+    pub company: Company,
     /// Its current activity, as [0] last read it.
     pub activity_view: ActivityWatch,
     /// Its changed files when that activity began.

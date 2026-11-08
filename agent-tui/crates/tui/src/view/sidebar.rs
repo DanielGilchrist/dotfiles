@@ -25,7 +25,7 @@ use super::{
 };
 use crate::model::{
     AgentStatus, Cursor, Doing, Drawn, Extent, Failure, Fold, ListScroll, Listed, Model,
-    Panel as Focused, Place, Pulse, Row, Target, WorkRoom,
+    Panel as Focused, Placement, Pulse, Row, Target, WorkRoom,
 };
 use crate::tree::{ChangesScope, Counts, Node, TreeRow};
 
@@ -940,17 +940,18 @@ fn list(deck: &Deck<'_>, snapshot: &Snapshot, rows: &[Row], cursor: Option<&Curs
                 let repo_name = repo.name().into_owned();
                 let title = match row {
                     Row::Entry {
-                        place: Place::Solo, ..
+                        place: Placement::Solo,
+                        ..
                     } => Title::Repo(repo_name),
                     Row::Elsewhere(_) => Title::Elsewhere(repo_name),
                     Row::Entry {
-                        place: Place::Pinned,
+                        place: Placement::Pinned,
                         ..
                     } if repo_name != entry.label() => Title::Pinned(repo_name),
                     Row::Grouped(..) if repo_name != entry.label() => Title::Grouped(repo_name),
                     Row::Grouped(..)
                     | Row::Entry {
-                        place: Place::Nested,
+                        place: Placement::Nested,
                         ..
                     } => Title::Child,
                     _ => Title::Label,
@@ -1381,10 +1382,12 @@ fn pad(area: Rect, lines: Vec<Line<'static>>) -> Panel {
 /// `⇄` when another window shows the agent: DIM while the TUI leaves it
 /// alone, Yellow while the TUI is typing into it and it squishes that.
 fn elsewhere_marker(m: &Model, name: &SessionName) -> Option<Span<'static>> {
-    if m.pane.squished(name) {
+    if m.squished(name).is_some() {
         Some(Span::styled("⇄", warning()))
     } else {
-        m.pane.elsewhere(name).then(|| Span::styled("⇄", dim()))
+        m.company(name)
+            .is_elsewhere()
+            .then(|| Span::styled("⇄", dim()))
     }
 }
 
@@ -2636,7 +2639,7 @@ mod tests {
         let rows = screen(&render(&mut m, (200, 50)));
         let banner = rows
             .iter()
-            .filter(|r| r.contains("⇄ elsewhere · ⏎ move here"))
+            .filter(|r| r.contains("⇄ in nvim · ⏎ move here"))
             .count();
         assert_eq!(banner, 1);
         assert!(rows.iter().any(|r| r.contains("[0] Activity")));
@@ -2648,11 +2651,12 @@ mod tests {
         let mut m = crate::fixtures::elsewhere_on("obs-layout-4");
         m.activities.get_or_insert_default().clear();
         let rows = screen(&render(&mut m, (200, 50)));
-        assert!(rows.iter().any(|r| r.contains("⇄ elsewhere · ⏎ move here")));
+        assert!(rows.iter().any(|r| r.contains("⇄ in nvim · ⏎ move here")));
     }
 
     fn typing_into(m: &mut Model, who: &str, company: Company) {
-        crate::fixtures::connect(m, who, Mode::Agent, company);
+        m.record_company(&name(who), company);
+        crate::fixtures::connect(m, who, Mode::Agent);
     }
 
     #[test]
@@ -2660,19 +2664,33 @@ mod tests {
         let marker = |m: &Model| elsewhere_marker(m, &name("obs-layout-4")).map(|s| s.style);
         let mut m = crate::fixtures::elsewhere_on("obs-layout-4");
         assert_eq!(marker(&m), Some(dim()));
-        typing_into(&mut m, "obs-layout-4", Company::Elsewhere);
+        typing_into(&mut m, "obs-layout-4", crate::fixtures::in_nvim());
         assert_eq!(marker(&m), Some(warning()));
         typing_into(&mut m, "obs-layout-4", Company::Alone);
         assert_eq!(marker(&m), None);
     }
 
     #[test]
-    fn typing_into_a_shared_agent_says_it_is_also_open_elsewhere_in_the_corner() {
+    fn every_card_of_an_agent_open_elsewhere_is_marked_not_only_the_hovered_one() {
         let mut m = fleet(10);
         m.set_cursor(Cursor::Entry(name("obs-layout-4")));
-        typing_into(&mut m, "obs-layout-4", Company::Elsewhere);
+        m.record_company(&name("rate-limit-1"), crate::fixtures::in_nvim());
+        let marker = |m: &Model, who: &str| elsewhere_marker(m, &name(who)).map(|s| s.style);
+        assert_eq!(marker(&m, "rate-limit-1"), Some(dim()));
+        assert_eq!(marker(&m, "obs-layout-4"), None);
         let rows = screen(&render(&mut m, (200, 50)));
-        assert!(rows.iter().any(|r| r.contains("⇄ also open elsewhere")));
+        let card = |who: &str| rows.iter().find(|r| r.contains(who)).expect("a card");
+        assert!(card("rate-limit-1").contains("⇄"));
+        assert!(!card("obs-layout-4").contains("⇄"));
+    }
+
+    #[test]
+    fn typing_into_a_shared_agent_names_where_else_it_is_open_in_the_corner() {
+        let mut m = fleet(10);
+        m.set_cursor(Cursor::Entry(name("obs-layout-4")));
+        typing_into(&mut m, "obs-layout-4", crate::fixtures::in_nvim());
+        let rows = screen(&render(&mut m, (200, 50)));
+        assert!(rows.iter().any(|r| r.contains("⇄ in nvim")));
         typing_into(&mut m, "obs-layout-4", Company::Alone);
         let rows = screen(&render(&mut m, (200, 50)));
         assert!(rows.iter().all(|r| !r.contains("⇄")));
@@ -3172,6 +3190,17 @@ mod tests {
             footer.contains("PEEK") && footer.contains("s send") && footer.contains("⏎ attach"),
             "{footer}"
         );
+    }
+
+    #[test]
+    fn the_peek_of_an_agent_open_elsewhere_names_where() {
+        let mut m = fleet(10);
+        m.set_cursor(Cursor::Entry(name("obs-layout-4")));
+        m.record_company(&name("obs-layout-4"), crate::fixtures::in_nvim());
+        m.peek = Some(name("obs-layout-4"));
+        let rows = screen(&render(&mut m, (100, 30)));
+        let title = rows.iter().find(|r| r.contains("╔")).expect("a float");
+        assert!(title.contains("⇄ in nvim"), "{title}");
     }
 
     #[test]

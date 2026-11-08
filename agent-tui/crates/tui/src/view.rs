@@ -16,10 +16,10 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::keymap::{self, Situation};
 use crate::model::{
-    ALSO_ELSEWHERE, AgentStatus, Areas, Blocked, Confirm, Derived, Drawn, Enter, Field, Focus,
-    FormKind, HelpState, Launchable, Load, Model, NameCheck, NameSource, NamingState, NewAgent,
-    OfferEffect, Overlay, Pane, Phase, Proposal, Pulse, Query, Reach, RepoInput, Row, Screen,
-    StatusKind, Submission, View, Waiting, WorkRoom, elsewhere_banner, fuzzy_match, invalid_chars,
+    AgentStatus, Areas, Blocked, Confirm, Derived, Drawn, Enter, Field, Focus, FormKind, HelpState,
+    Launchable, Load, Model, NameCheck, NameSource, NamingState, NewAgent, OfferEffect, Overlay,
+    Pane, Phase, Proposal, Pulse, Query, Reach, RepoInput, Row, Screen, StatusKind, Submission,
+    View, Waiting, Windows, WorkRoom, elsewhere_banner, elsewhere_note, fuzzy_match, invalid_chars,
     repo_matches,
 };
 use crate::palette::Palette;
@@ -516,8 +516,8 @@ const HIDDEN_MIN: usize = 26;
 
 /// What [0] says while another window has the agent, over its activity or
 /// alone.
-pub(crate) fn banner() -> Line<'static> {
-    Line::styled(elsewhere_banner(), dim())
+pub(crate) fn banner(windows: &Windows) -> Line<'static> {
+    Line::styled(elsewhere_banner(windows), dim())
 }
 
 /// The pane's title (the selected agent) and its corner (the path, or a
@@ -552,8 +552,10 @@ fn pane_title(m: &Model, width: usize) -> (Vec<Span<'static>>, Vec<Span<'static>
         }
         None => title.push(Span::styled(repo_name, identifier)),
     }
-    let corner = if matches!(m.focus(), Focus::Agent(c) if m.pane.squished(&c.name)) {
-        vec![Span::styled(ALSO_ELSEWHERE, warning())]
+    let corner = if let Focus::Agent(c) = m.focus()
+        && let Some(windows) = m.squished(&c.name)
+    {
+        vec![Span::styled(elsewhere_note(windows), warning())]
     } else {
         let path = entry
             .and_then(Entry::path)
@@ -598,7 +600,10 @@ fn draw_terminal(frame: &mut Frame<'_>, m: &Model, area: Rect) {
         (_, Pane::Connecting { name, .. } | Pane::Checking { name, .. }, _) => {
             Line::styled(format!("attaching to {name}…"), dim())
         }
-        (_, Pane::Elsewhere { .. }, _) => banner(),
+        (_, Pane::Elsewhere { name }, _) => m
+            .company(name)
+            .windows()
+            .map_or_else(|| banner(&Windows::unknown()), banner),
         (Load::Pending, ..) => Line::styled("Loading…", dim()),
         (_, _, None) if m.view == View::Pinned => Line::styled("Nothing pinned", dim()),
         (_, _, None) => action("n", "new agent".into()),
@@ -1855,6 +1860,12 @@ fn draw_peek(frame: &mut Frame<'_>, m: &Model, terminal: Rect) {
     }
     let mut title_spans = vec![Span::raw(" ")];
     title_spans.extend(title);
+    if let Some(windows) = m.company(name).windows() {
+        title_spans.push(Span::styled(
+            format!("  {}", elsewhere_note(windows)),
+            dim(),
+        ));
+    }
     title_spans.push(Span::raw(" "));
     let fits = line_width(&title_spans) + line_width(&keys) + 4 <= usize::from(area.width);
     let cropped = cols > area.width.saturating_sub(2) || rows > area.height.saturating_sub(2);

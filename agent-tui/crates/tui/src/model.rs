@@ -15,7 +15,7 @@ use agent_core::names::{AgentName, BranchName, Checkout, Prompt, SessionName};
 use agent_core::ops::{Approved, Hazardous, RemovalPlan};
 use agent_core::paths::{RepoRoot, Typed, typed_path};
 use agent_core::ports::{
-    ActivityDetail, CallKind, Change, ClientId, FileState, HarnessId, Progress, Readiness,
+    ActivityDetail, CallKind, Change, ClientId, FileState, HarnessId, Place, Progress, Readiness,
     Uncommitted, WorktreeFacts,
 };
 use agent_term::{Emulator, Terminal};
@@ -371,7 +371,7 @@ pub enum Row {
     Elsewhere(SessionName),
     Entry {
         name: SessionName,
-        place: Place,
+        place: Placement,
     },
 }
 
@@ -383,7 +383,7 @@ pub enum Fold {
 
 /// How an entry row sits in the list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Place {
+pub enum Placement {
     /// Focus: the whole list is its repo.
     Alone,
     /// Under its open repo row.
@@ -470,28 +470,99 @@ pub enum Intent {
 pub const MOVE_HERE: &str = "move here";
 pub const LEAVE_PAUSED: &str = "leave paused";
 
-/// What [0] and the status bar say of an agent another window shows.
-pub fn elsewhere_banner() -> String {
-    format!("⇄ elsewhere · ⏎ {MOVE_HERE}")
-}
-
-/// What the corner says while the keys are in such an agent.
-pub const ALSO_ELSEWHERE: &str = "⇄ also open elsewhere";
-
-/// Whether a session is also shown in a window that is neither this TUI's
+/// Whether a session is also shown in windows that are neither this TUI's
 /// nor another TUI's: a terminal tab, an editor, an SSH shell.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum Company {
+    #[default]
     Alone,
-    Elsewhere,
+    Elsewhere(Windows),
 }
 
-/// A look for windows besides this TUI's and other TUIs' showing `name`,
-/// answered with its ticket.
+/// The windows besides this TUI's showing a session: at least one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Windows {
+    first: Place,
+    rest: Vec<Place>,
+}
+
+impl Company {
+    /// The company of a session whose windows are in `places`, one each.
+    pub fn of(places: Vec<Place>) -> Self {
+        let mut places = places.into_iter();
+        match places.next() {
+            Some(first) => Self::Elsewhere(Windows {
+                first,
+                rest: places.collect(),
+            }),
+            None => Self::Alone,
+        }
+    }
+
+    pub fn windows(&self) -> Option<&Windows> {
+        match self {
+            Self::Alone => None,
+            Self::Elsewhere(windows) => Some(windows),
+        }
+    }
+
+    pub fn is_elsewhere(&self) -> bool {
+        self.windows().is_some()
+    }
+}
+
+impl Windows {
+    /// Windows nothing is known of, for a banner with no look behind it.
+    pub fn unknown() -> Self {
+        Self {
+            first: Place::Unknown,
+            rest: Vec::new(),
+        }
+    }
+
+    /// Where the windows are, in words: `in nvim`, `over SSH`, or `in 3
+    /// windows` when they aren't all in one place.
+    fn phrase(&self) -> String {
+        if self.rest.iter().any(|place| *place != self.first) {
+            return format!("in {} windows", self.rest.len() + 1);
+        }
+        match &self.first {
+            Place::Nvim => "in nvim".into(),
+            Place::Ssh => "over SSH".into(),
+            Place::Tmux => "in tmux".into(),
+            Place::Terminal(app) => format!("in {app}"),
+            Place::Detached => "detached window".into(),
+            Place::Unknown => "elsewhere".into(),
+        }
+    }
+}
+
+/// What [0] and the status bar say of an agent another window shows.
+pub fn elsewhere_banner(windows: &Windows) -> String {
+    format!("⇄ {} · ⏎ {MOVE_HERE}", windows.phrase())
+}
+
+/// What the corner says while the keys are in such an agent, and what the
+/// peek says of one.
+pub fn elsewhere_note(windows: &Windows) -> String {
+    format!("⇄ {}", windows.phrase())
+}
+
+/// What a look is for, which says how soon its answer is wanted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Need {
+    /// Keeping the cards and the pane current: nothing waits on it.
+    Refresh,
+    /// A pane or a choice waits on it, so it isn't queued behind a refresh.
+    Decision,
+}
+
+/// A look for the windows besides this TUI's and other TUIs' showing any
+/// session, answered with its ticket.
 pub struct Look {
-    pub name: SessionName,
     pub own: Option<ClientId>,
     pub ticket: Ticket,
+    pub need: Need,
 }
 
 /// What the TUI does with a session once its check for other windows is back.
@@ -521,7 +592,6 @@ pub enum CheckHealth {
 pub struct Connection {
     pub name: SessionName,
     pub term: Terminal<Box<dyn Emulator>>,
-    pub company: Company,
     pub mode: Mode,
     pub opened: Instant,
 }
@@ -580,25 +650,6 @@ impl Pane {
             Self::Elsewhere { name } => Some(name),
             _ => None,
         }
-    }
-
-    /// Whether `name` is known to be shown in another window.
-    pub fn elsewhere(&self, name: &SessionName) -> bool {
-        match self {
-            Self::Elsewhere { name: held } => held == name,
-            Self::Connected(c) => &c.name == name && c.company == Company::Elsewhere,
-            Self::Empty | Self::Checking { .. } | Self::Connecting { .. } => false,
-        }
-    }
-
-    /// Whether the TUI is typing into `name` while another window shows it,
-    /// which squishes what it types into.
-    pub fn squished(&self, name: &SessionName) -> bool {
-        matches!(
-            self,
-            Self::Connected(c)
-                if &c.name == name && c.mode == Mode::Agent && c.company == Company::Elsewhere
-        )
     }
 
     /// The session the pane is still waiting to connect to for `ticket`.
@@ -1658,6 +1709,39 @@ impl Model {
         }
     }
 
+    /// The windows besides this TUI's showing `name`, as the newest look
+    /// found them.
+    pub fn company(&self, name: &SessionName) -> &Company {
+        static ALONE: Company = Company::Alone;
+        self.agents.get(name).map_or(&ALONE, |t| &t.company)
+    }
+
+    /// Notes what a look found of `name`. An agent nothing is known of
+    /// isn't tracked just to be alone.
+    pub fn record_company(&mut self, name: &SessionName, company: Company) {
+        if company == Company::Alone && !self.agents.contains_key(name) {
+            return;
+        }
+        self.track(name).company = company;
+    }
+
+    /// Whether `name` is known to be shown in another window, which the pane
+    /// leaves alone or squishes.
+    pub fn elsewhere(&self, name: &SessionName) -> bool {
+        let held = self.pane.held_elsewhere() == Some(name);
+        let connected = self.pane.connection().is_some_and(|c| &c.name == name);
+        (held || connected) && self.company(name).is_elsewhere()
+    }
+
+    /// The windows that squish what the TUI types into, while it is typing
+    /// into `name` and another window shows it.
+    pub fn squished(&self, name: &SessionName) -> Option<&Windows> {
+        self.pane
+            .connection()
+            .filter(|c| &c.name == name && c.mode == Mode::Agent)
+            .and_then(|_| self.company(name).windows())
+    }
+
     /// What is known about `name`, if anything is.
     pub fn tracked(&self, name: &SessionName) -> Option<&Tracked> {
         self.agents.get(name)
@@ -2628,12 +2712,14 @@ impl Model {
         Some(Hover::Activity(name.clone()))
     }
 
-    /// The agent whose row shows `⇄ elsewhere · ⏎ move here`: selected in [1]
-    /// with [0] paused on it.
-    pub fn moves_here(&self) -> Option<SessionName> {
+    /// The agent whose row shows the `⇄ … · ⏎ move here` banner: selected in
+    /// [1] with [0] paused on it.
+    pub fn moves_here(&self) -> Option<(&SessionName, &Windows)> {
         let selected = self.selected_entry()?.name();
-        (matches!(self.panel, Panel::Agents) && self.pane.held_elsewhere() == Some(selected))
-            .then(|| selected.clone())
+        let held =
+            matches!(self.panel, Panel::Agents) && self.pane.held_elsewhere() == Some(selected);
+        held.then(|| self.company(selected).windows().map(|w| (selected, w)))
+            .flatten()
     }
 
     /// How many subagents a live agent has running, if any.
@@ -2762,7 +2848,7 @@ impl Model {
                     .into_iter()
                     .map(|(_, e)| Row::Entry {
                         name: e.name().clone(),
-                        place: Place::Pinned,
+                        place: Placement::Pinned,
                     })
                     .collect();
                 let waiting: Vec<SessionName> = self
@@ -2803,7 +2889,7 @@ impl Model {
                         if listed(&only) {
                             rows.push(Row::Entry {
                                 name: only.name().clone(),
-                                place: Place::Solo,
+                                place: Placement::Solo,
                             });
                         }
                         continue;
@@ -2819,7 +2905,7 @@ impl Model {
                     if let Fold::Open = fold {
                         rows.extend(repo.entries().iter().filter(listed).map(|e| Row::Entry {
                             name: e.name().clone(),
-                            place: Place::Nested,
+                            place: Placement::Nested,
                         }));
                     }
                 }
@@ -2851,7 +2937,7 @@ impl Model {
             .filter(|e| self.shown(e))
             .map(|e| Row::Entry {
                 name: e.name().clone(),
-                place: Place::Alone,
+                place: Placement::Alone,
             })
             .collect();
         let elsewhere: Vec<Row> = self

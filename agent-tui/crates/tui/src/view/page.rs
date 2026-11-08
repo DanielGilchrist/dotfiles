@@ -110,7 +110,7 @@ pub(super) fn page(m: &Model, area: Rect, width: usize, border: Style) -> Option
             _ => None,
         })
         .filter(|_| !pins_own);
-    let banner = m.moves_here().map(|_| super::banner());
+    let banner = m.moves_here().map(|(_, windows)| super::banner(windows));
     let reserved = usize::from(banner.is_some()) + if question.is_some() { 2 } else { 0 };
     let height = usize::from(area.height).saturating_sub(reserved);
     // The agent's state keeps its glyph, name and time, so the title yields

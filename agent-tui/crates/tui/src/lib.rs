@@ -39,9 +39,7 @@ use crossterm::terminal::{
 use ratatui::DefaultTerminal;
 use ratatui::layout::Rect;
 
-use model::{
-    Company, Connection, Intent, Mode, Model, Moment, Pane, StatusKind, TerminalFocus, Ticket,
-};
+use model::{Connection, Intent, Mode, Model, Moment, Pane, StatusKind, TerminalFocus, Ticket};
 use palette::{Colours, Palette};
 use update::{Background, Effect, Open};
 use worker::{Job, Msg, Workers};
@@ -239,7 +237,6 @@ impl Runtime {
         name: &SessionName,
         spec: LaunchSpec,
         intent: Intent,
-        company: Company,
         ticket: Ticket,
     ) -> Result<()> {
         let Some(_) = m.pane.awaiting(ticket) else {
@@ -252,7 +249,6 @@ impl Runtime {
         m.pane = Pane::Connected(Connection {
             name: name.clone(),
             term,
-            company,
             mode: Mode::Nav,
             opened: m.clock.mono,
         });
@@ -388,11 +384,10 @@ impl Runtime {
                 Effect::Attach {
                     name,
                     intent,
-                    company,
                     ticket,
                 } => {
                     let spec = self.backend.host.attach(&name);
-                    let result = self.connect(m, &name, spec, intent, company, ticket);
+                    let result = self.connect(m, &name, spec, intent, ticket);
                     Self::connect_failed(m, ticket, result);
                 }
                 Effect::Connect {
@@ -400,14 +395,7 @@ impl Runtime {
                     intent,
                     ticket,
                 } => {
-                    let result = self.connect(
-                        m,
-                        &launch.session,
-                        launch.spec,
-                        intent,
-                        Company::Alone,
-                        ticket,
-                    );
+                    let result = self.connect(m, &launch.session, launch.spec, intent, ticket);
                     Self::connect_failed(m, ticket, result);
                 }
                 Effect::Edit(open) => self.open(m, terminal, &open),

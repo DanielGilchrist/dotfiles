@@ -9,9 +9,11 @@ use std::time::{Duration, SystemTime};
 use agent_core::model::Running;
 use agent_core::names::SessionName;
 use agent_core::ports::{
-    ClientControl, ClientId, HostError, PaneCommand, SessionHost, SessionInfo, SessionStatus,
+    ClientControl, ClientId, HostError, PaneCommand, Place, SessionHost, SessionInfo,
+    SessionStatus, TerminalApp, Window,
 };
 use agent_core::process::{self, CommandError, LaunchSpec, parallel_map};
+use nix::errno::Errno;
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
@@ -295,10 +297,10 @@ fn attach_target<'a>(rest: &[&'a str]) -> Option<&'a str> {
     None
 }
 
-/// A zellij process that shows `name` in a terminal: `attach` (or `a`) of it,
-/// or no subcommand with `-s <name>`, which creates it. Background creation
-/// and `--session <name> action …` show nothing.
-fn is_client_of(args: &[&str], name: &str) -> bool {
+/// The session a zellij process shows in a terminal: `attach` (or `a`) of
+/// it, or no subcommand with `-s <name>`, which creates it. Background
+/// creation and `--session <name> action …` show nothing.
+fn attached_session<'a>(args: &'a [&'a str]) -> Option<&'a str> {
     let invocation = Invocation::parse(args);
     match invocation.subcommand {
         Some("attach" | "a") => {
@@ -306,10 +308,14 @@ fn is_client_of(args: &[&str], name: &str) -> bool {
                 .rest
                 .iter()
                 .any(|a| matches!(*a, "-b" | "--create-background"));
-            !background && attach_target(invocation.rest) == Some(name)
+            if background {
+                None
+            } else {
+                attach_target(invocation.rest)
+            }
         }
-        Some(_) => false,
-        None => invocation.session == Some(name),
+        Some(_) => None,
+        None => invocation.session,
     }
 }
 
@@ -319,11 +325,24 @@ fn program_is(argv: &[String], program: &str) -> bool {
         .is_some_and(|n| n == program)
 }
 
-/// What the scan keeps of a process: its parent, and the argv of the
+/// What the scan keeps of a process: its parent, the program it was started
+/// as, the kernel's name for it (cut short on Linux), and the argv of the
 /// programs that matter to it.
 struct Process {
     parent: Option<u32>,
+    program: String,
+    comm: String,
     argv: Vec<String>,
+}
+
+/// The program an argv[0] names: its basename, cut at the `:` some daemons
+/// retitle themselves with (`sshd: user@pts/0`).
+fn program_name(argv0: &str) -> &str {
+    let head = argv0.split(':').next().unwrap_or(argv0);
+    head.rsplit('/')
+        .next()
+        .unwrap_or(head)
+        .trim_start_matches('-')
 }
 
 /// Every process, for walking up from a client.
@@ -349,8 +368,13 @@ impl Processes {
                     .map(|a| a.to_string_lossy().into_owned())
                     .collect();
                 let keeps = program_is(&argv, "zellij") || program_is(&argv, "agent");
+                let comm = program_name(&p.name().to_string_lossy()).to_string();
                 let process = Process {
                     parent: p.parent().map(sysinfo::Pid::as_u32),
+                    program: argv
+                        .first()
+                        .map_or_else(|| comm.clone(), |a| program_name(a).to_string()),
+                    comm,
                     argv: if keeps { argv } else { Vec::new() },
                 };
                 (pid.as_u32(), process)
@@ -378,37 +402,101 @@ impl Processes {
         self.all.get(&pid).map_or(&[], |p| &p.argv)
     }
 
-    /// Windows showing `name`: clients that are neither `own`'s nor under a
-    /// process `is_tui` recognises, whose previews are not a window of
-    /// someone else's.
-    fn windows_of(
-        &self,
-        name: &str,
-        own: Option<ClientId>,
-        is_tui: fn(&[String]) -> bool,
-    ) -> Vec<ClientId> {
+    /// Every window showing a session: zellij clients that are neither
+    /// `own`'s nor under a process `is_tui` recognises, whose previews are
+    /// not a window of someone else's.
+    fn windows(&self, own: Option<ClientId>, is_tui: fn(&[String]) -> bool) -> Vec<Window> {
         let runs_tui = |pid: u32| {
             let argv = self.argv(pid);
             program_is(argv, "agent") && is_tui(&argv[1..])
         };
-        let mut clients: Vec<ClientId> = self
+        let mut windows: Vec<Window> = self
             .all
-            .keys()
-            .copied()
-            .filter(|pid| {
-                let argv = self.argv(*pid);
-                let rest: Vec<&str> = argv.iter().skip(1).map(String::as_str).collect();
-                program_is(argv, "zellij") && is_client_of(&rest, name)
-            })
-            .filter(|pid| {
+            .iter()
+            .filter_map(|(pid, process)| {
+                if !program_is(&process.argv, "zellij") {
+                    return None;
+                }
+                let rest: Vec<&str> = process.argv.iter().skip(1).map(String::as_str).collect();
+                let session = attached_session(&rest)?.parse().ok()?;
                 let lineage = self.lineage(*pid);
-                !own.is_some_and(|own| lineage.contains(&own.get()))
-                    && !lineage.iter().any(|p| runs_tui(*p))
+                let ours = own.is_some_and(|own| lineage.contains(&own.get()));
+                (!ours && !lineage.iter().any(|p| runs_tui(*p))).then(|| Window {
+                    client: ClientId::new(*pid),
+                    session,
+                    place: self.place_of(*pid),
+                })
             })
-            .map(ClientId::new)
             .collect();
-        clients.sort_by_key(|c| c.get());
-        clients
+        windows.sort_by_key(|w| w.client.get());
+        windows
+    }
+
+    /// The nearest ancestor of `client` that names a place. With none, a
+    /// client that has no shell above it either was left behind by a window
+    /// that went away.
+    fn place_of(&self, client: u32) -> Place {
+        let above: Vec<&Process> = self
+            .lineage(client)
+            .into_iter()
+            .skip(1)
+            .filter_map(|pid| self.all.get(&pid))
+            .collect();
+        above
+            .iter()
+            .find_map(|p| place_named(&p.program).or_else(|| place_named(&p.comm)))
+            .unwrap_or_else(|| {
+                if above.iter().any(|p| SHELLS.contains(&p.program.as_str())) {
+                    Place::Unknown
+                } else {
+                    Place::Detached
+                }
+            })
+    }
+}
+
+const SHELLS: &[&str] = &[
+    "fish", "bash", "zsh", "sh", "dash", "ksh", "tcsh", "csh", "nu", "pwsh", "elvish", "xonsh",
+    "login",
+];
+
+/// How a program name has to match a terminal's.
+enum Matching {
+    Exactly,
+    Prefix,
+}
+
+/// Terminal programs by program name, and what to call them.
+const TERMINALS: &[(&str, Matching, &str)] = &[
+    ("wezterm-gui", Matching::Exactly, "wezterm"),
+    ("wezterm-mux-server", Matching::Exactly, "wezterm"),
+    ("ghostty", Matching::Exactly, "ghostty"),
+    ("iTerm2", Matching::Exactly, "iTerm"),
+    ("iTermServer", Matching::Prefix, "iTerm"),
+    ("Terminal", Matching::Exactly, "Terminal"),
+    ("alacritty", Matching::Exactly, "alacritty"),
+    ("kitty", Matching::Exactly, "kitty"),
+    ("Hyper", Matching::Exactly, "Hyper"),
+    ("konsole", Matching::Exactly, "konsole"),
+    ("xterm", Matching::Exactly, "xterm"),
+    ("foot", Matching::Exactly, "foot"),
+];
+
+/// The place a program of this name is, if it is one. Shells, `agent` and
+/// `zellij` name none, so the walk goes on past them.
+fn place_named(program: &str) -> Option<Place> {
+    match program {
+        "nvim" | "vim" => Some(Place::Nvim),
+        "mosh-server" => Some(Place::Ssh),
+        "tmux" => Some(Place::Tmux),
+        _ if program.starts_with("sshd") => Some(Place::Ssh),
+        _ => TERMINALS
+            .iter()
+            .find(|(name, matching, _)| match matching {
+                Matching::Exactly => program == *name,
+                Matching::Prefix => program.starts_with(name),
+            })
+            .map(|(_, _, app)| Place::Terminal(TerminalApp::new(*app))),
     }
 }
 
@@ -545,27 +633,30 @@ impl SessionHost for Zellij {
 }
 
 impl ClientControl for Zellij {
-    fn other_clients(
-        &self,
-        name: &SessionName,
-        own: Option<ClientId>,
-    ) -> Result<Vec<ClientId>, HostError> {
+    fn windows(&self, own: Option<ClientId>) -> Result<Vec<Window>, HostError> {
         // `own` is the one client the caller is sure of whatever its binary
         // is called, which the TUI predicate can't promise.
-        Ok(Processes::scan().windows_of(name.as_str(), own, self.is_tui))
+        Ok(Processes::scan().windows(own, self.is_tui))
     }
 
-    /// SIGHUP is what a closing terminal sends, so the session just loses a viewer.
+    /// SIGHUP is what a closing terminal sends, so the session just loses a
+    /// viewer. A stopped client acts on no signal until continued, so it is
+    /// continued first.
     fn detach(&self, clients: &[ClientId]) -> Result<(), HostError> {
         for &client in clients {
             let pid = i32::try_from(client.get()).map_err(|e| HostError::Detach {
                 client,
                 reason: e.to_string(),
             })?;
-            kill(Pid::from_raw(pid), Signal::SIGHUP).map_err(|e| HostError::Detach {
-                client,
-                reason: e.to_string(),
-            })?;
+            let signal = |signal| match kill(Pid::from_raw(pid), signal) {
+                Ok(()) | Err(Errno::ESRCH) => Ok(()),
+                Err(e) => Err(HostError::Detach {
+                    client,
+                    reason: e.to_string(),
+                }),
+            };
+            signal(Signal::SIGCONT)?;
+            signal(Signal::SIGHUP)?;
         }
         Ok(())
     }
@@ -630,7 +721,7 @@ mod tests {
     }
 
     fn client(args: &str, name: &str) -> bool {
-        is_client_of(&args.split_whitespace().collect::<Vec<_>>(), name)
+        attached_session(&args.split_whitespace().collect::<Vec<_>>()) == Some(name)
     }
 
     #[test]
@@ -688,23 +779,34 @@ mod tests {
             all: rows
                 .iter()
                 .map(|(pid, parent, line)| {
-                    (
-                        *pid,
+                    (*pid, {
+                        let argv = argv(line);
+                        let program = argv.first().map_or("", |a| program_name(a)).to_string();
                         Process {
                             parent: Some(*parent),
-                            argv: argv(line),
-                        },
-                    )
+                            comm: program.clone(),
+                            program,
+                            argv,
+                        }
+                    })
                 })
                 .collect(),
         }
     }
 
-    fn windows(procs: &Processes, own: Option<ClientId>) -> Vec<u32> {
+    fn windows_of_fix(procs: &Processes, own: Option<ClientId>) -> Vec<Window> {
+        let fix: SessionName = "fix".parse().expect("a name");
         procs
-            .windows_of("fix", own, agent_runs_a_tui)
+            .windows(own, agent_runs_a_tui)
             .into_iter()
-            .map(ClientId::get)
+            .filter(|w| w.session == fix)
+            .collect()
+    }
+
+    fn windows(procs: &Processes, own: Option<ClientId>) -> Vec<u32> {
+        windows_of_fix(procs, own)
+            .into_iter()
+            .map(|w| w.client.get())
             .collect()
     }
 
@@ -742,5 +844,291 @@ mod tests {
             (12, 11, "zellij attach fix"),
         ]);
         assert_eq!(windows(&procs, None), Vec::<u32>::new());
+    }
+
+    fn places_of(procs: &Processes) -> Vec<Place> {
+        windows_of_fix(procs, None)
+            .into_iter()
+            .map(|w| w.place)
+            .collect()
+    }
+
+    fn terminal(app: &str) -> Place {
+        Place::Terminal(TerminalApp::new(app))
+    }
+
+    #[test]
+    fn a_client_under_nvim_is_in_nvim() {
+        let procs = table(&[
+            (1, 0, "launchd"),
+            (10, 1, "wezterm-gui"),
+            (20, 10, "nvim"),
+            (21, 20, "fish"),
+            (22, 21, "zellij attach fix"),
+        ]);
+        assert_eq!(places_of(&procs), [Place::Nvim]);
+    }
+
+    #[test]
+    fn a_client_under_sshd_is_over_ssh_whatever_the_sshd_is_called() {
+        for sshd in ["sshd", "sshd-session", "/usr/sbin/sshd"] {
+            let procs = table(&[
+                (1, 0, "launchd"),
+                (10, 1, sshd),
+                (11, 10, "fish"),
+                (12, 11, "zellij a fix"),
+            ]);
+            assert_eq!(places_of(&procs), [Place::Ssh], "{sshd}");
+        }
+    }
+
+    #[test]
+    fn a_client_under_the_tmux_server_is_in_tmux_even_when_the_server_is_ppid_1() {
+        let procs = table(&[
+            (1, 0, "launchd"),
+            (10, 1, "tmux"),
+            (11, 10, "fish"),
+            (12, 11, "zellij attach fix"),
+        ]);
+        assert_eq!(places_of(&procs), [Place::Tmux]);
+    }
+
+    #[test]
+    fn a_client_whose_chain_is_cut_at_a_tmux_is_in_tmux() {
+        let procs = table(&[(10, 1, "tmux: server"), (11, 10, "zellij attach fix")]);
+        assert_eq!(places_of(&procs), [Place::Tmux]);
+    }
+
+    #[test]
+    fn a_client_in_a_wezterm_tab_or_its_mux_is_in_wezterm() {
+        for gui in ["wezterm-gui", "wezterm-mux-server"] {
+            let procs = table(&[
+                (1, 0, "launchd"),
+                (10, 1, gui),
+                (11, 10, "fish"),
+                (12, 11, "/bin/agent attach fix"),
+                (13, 12, "zellij -s fix -n /l.kdl"),
+            ]);
+            assert_eq!(places_of(&procs), [terminal("wezterm")], "{gui}");
+        }
+    }
+
+    #[test]
+    fn known_terminal_apps_are_named_short() {
+        for (process, app) in [
+            ("ghostty", "ghostty"),
+            ("iTerm2", "iTerm"),
+            ("Terminal", "Terminal"),
+        ] {
+            let procs = table(&[
+                (1, 0, "launchd"),
+                (10, 1, process),
+                (11, 10, "login"),
+                (12, 11, "fish"),
+                (13, 12, "zellij attach fix"),
+            ]);
+            assert_eq!(places_of(&procs), [terminal(app)], "{process}");
+        }
+    }
+
+    #[test]
+    fn agent_attach_and_shells_are_skipped_on_the_way_up() {
+        let procs = table(&[
+            (1, 0, "launchd"),
+            (10, 1, "nvim"),
+            (11, 10, "fish"),
+            (12, 11, "/bin/agent attach fix"),
+            (13, 12, "bash"),
+            (14, 13, "zellij attach fix"),
+        ]);
+        assert_eq!(places_of(&procs), [Place::Nvim]);
+    }
+
+    #[test]
+    fn the_nearest_place_wins() {
+        let procs = table(&[
+            (1, 0, "launchd"),
+            (10, 1, "wezterm-gui"),
+            (11, 10, "nvim"),
+            (12, 11, "zellij attach fix"),
+        ]);
+        assert_eq!(places_of(&procs), [Place::Nvim]);
+    }
+
+    #[test]
+    fn a_client_with_a_shell_but_no_known_place_above_it_is_unknown() {
+        let procs = table(&[
+            (1, 0, "launchd"),
+            (10, 1, "fish"),
+            (11, 10, "zellij attach fix"),
+        ]);
+        assert_eq!(places_of(&procs), [Place::Unknown]);
+    }
+
+    #[test]
+    fn a_tuis_clients_are_never_a_place() {
+        let procs = table(&[
+            (10, 1, "/bin/agent"),
+            (11, 10, "zellij attach fix"),
+            (20, 1, "sshd"),
+            (21, 20, "/bin/agent attach fix"),
+            (22, 21, "zellij attach fix"),
+        ]);
+        assert_eq!(places_of(&procs), [Place::Ssh]);
+    }
+
+    #[test]
+    fn several_windows_are_listed_one_each_with_their_session() {
+        let procs = table(&[
+            (10, 1, "sshd"),
+            (11, 10, "zellij attach fix"),
+            (20, 1, "nvim"),
+            (21, 20, "zellij attach fix"),
+            (30, 1, "nvim"),
+            (31, 30, "zellij attach fix"),
+            (40, 1, "tmux"),
+            (41, 40, "zellij attach other"),
+        ]);
+        assert_eq!(places_of(&procs), [Place::Ssh, Place::Nvim, Place::Nvim]);
+        let other = procs
+            .windows(None, agent_runs_a_tui)
+            .into_iter()
+            .filter(|w| w.session.as_str() == "other")
+            .map(|w| w.place)
+            .collect::<Vec<_>>();
+        assert_eq!(other, [Place::Tmux]);
+    }
+
+    #[test]
+    fn a_program_cut_short_by_the_kernel_is_still_named_by_its_argv() {
+        let mut procs = table(&[
+            (1, 0, "launchd"),
+            (
+                10,
+                1,
+                "/Applications/WezTerm.app/Contents/MacOS/wezterm-mux-server",
+            ),
+            (11, 10, "fish"),
+            (12, 11, "zellij attach fix"),
+        ]);
+        procs.all.get_mut(&10).expect("a process").comm = "wezterm-mux-ser".into();
+        assert_eq!(places_of(&procs), [terminal("wezterm")]);
+    }
+
+    #[test]
+    fn a_retitled_daemon_is_named_by_its_program_and_the_comm_covers_the_rest() {
+        let mut procs = table(&[
+            (1, 0, "launchd"),
+            (10, 1, "sshd: daniel@pts/0"),
+            (11, 10, "zellij attach fix"),
+        ]);
+        assert_eq!(places_of(&procs), [Place::Ssh]);
+        procs.all.get_mut(&10).expect("a process").program = "unrelated".into();
+        procs.all.get_mut(&10).expect("a process").comm = "sshd-session".into();
+        assert_eq!(places_of(&procs), [Place::Ssh]);
+    }
+
+    #[test]
+    fn iterm_shells_sit_under_its_server() {
+        let procs = table(&[
+            (1, 0, "launchd"),
+            (10, 1, "iTermServer-main"),
+            (11, 10, "login"),
+            (12, 11, "fish"),
+            (13, 12, "zellij attach fix"),
+        ]);
+        assert_eq!(places_of(&procs), [terminal("iTerm")]);
+    }
+
+    #[test]
+    fn the_client_the_tui_spawned_is_no_window() {
+        let procs = table(&[(10, 1, "nvim"), (11, 10, "zellij attach fix")]);
+        assert_eq!(procs.windows(Some(ClientId::new(11)), agent_runs_a_tui), []);
+    }
+
+    #[test]
+    fn a_real_scan_names_processes_by_program_and_links_them_to_their_parents() {
+        let procs = Processes::scan();
+        let me = procs.all.get(&std::process::id()).expect("this process");
+        assert_ne!(me.program, "");
+        assert!(procs.lineage(std::process::id()).len() > 1);
+    }
+
+    #[test]
+    fn a_client_left_with_only_init_above_it_is_detached() {
+        let procs = table(&[(1, 0, "launchd"), (11, 1, "zellij attach fix")]);
+        assert_eq!(places_of(&procs), [Place::Detached]);
+    }
+
+    #[test]
+    fn a_client_whose_agent_attach_wrapper_was_orphaned_is_detached() {
+        let procs = table(&[
+            (1, 0, "launchd"),
+            (10, 1, "/bin/agent attach fix"),
+            (11, 10, "zellij attach fix"),
+        ]);
+        assert_eq!(places_of(&procs), [Place::Detached]);
+    }
+
+    #[test]
+    fn a_login_shell_with_a_dash_counts_as_a_shell_above_the_client() {
+        let procs = table(&[
+            (1, 0, "launchd"),
+            (10, 1, "-fish"),
+            (11, 10, "zellij attach fix"),
+        ]);
+        assert_eq!(places_of(&procs), [Place::Unknown]);
+    }
+
+    #[test]
+    fn a_known_place_beats_detached() {
+        let procs = table(&[
+            (1, 0, "launchd"),
+            (10, 1, "tmux"),
+            (11, 10, "zellij attach fix"),
+        ]);
+        assert_eq!(places_of(&procs), [Place::Tmux]);
+    }
+
+    #[test]
+    fn detaching_a_stopped_client_still_closes_it() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("sleep starts");
+        let client = ClientId::new(child.id());
+        kill(
+            Pid::from_raw(i32::try_from(client.get()).expect("a pid")),
+            Signal::SIGSTOP,
+        )
+        .expect("stops");
+        let zellij = Zellij::new(PathBuf::new(), |_| false);
+        zellij.detach(&[client]).expect("signals");
+        let status = child.wait().expect("exits");
+        assert_eq!(
+            std::os::unix::process::ExitStatusExt::signal(&status),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn a_client_that_already_left_does_not_stop_the_others_closing() {
+        let mut gone = std::process::Command::new("true")
+            .spawn()
+            .expect("true starts");
+        let left = ClientId::new(gone.id());
+        gone.wait().expect("exits");
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("sleep starts");
+        let staying = ClientId::new(child.id());
+        let zellij = Zellij::new(PathBuf::new(), |_| false);
+        zellij.detach(&[left, staying]).expect("signals");
+        let status = child.wait().expect("exits");
+        assert_eq!(
+            std::os::unix::process::ExitStatusExt::signal(&status),
+            Some(1)
+        );
     }
 }

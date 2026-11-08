@@ -23,9 +23,9 @@ use crate::model::{
     ActivityFiles, ActivityRow, AfterCheck, Answer, Areas, CheckHealth, Chord, CommentDraft,
     Company, Confirm, Cursor, DirCheck, Direction, Drawn, Edge, Enter, Field, Focus, Follow,
     FormKind, HelpState, INFO_TTL, Inspected, Inspection, Intent, Listed, LogKey, Look, Missing,
-    Mode, Model, Moment, NamingState, NewAgent, Outbox, Overlay, Pane, Panel, Phase, Query, Reach,
-    RepoInput, Screen, StatusKind, Submission, TerminalFocus, Ticket, Unreachable, View, WorkRoom,
-    elsewhere_banner, fuzzy_match, match_rank, repo_matches, unlisted,
+    Mode, Model, Moment, NamingState, Need, NewAgent, Outbox, Overlay, Pane, Panel, Phase, Query,
+    Reach, RepoInput, Screen, StatusKind, Submission, TerminalFocus, Ticket, Unreachable, View,
+    WorkRoom, elsewhere_banner, fuzzy_match, match_rank, repo_matches, unlisted,
 };
 use crate::touched::{Baseline, TouchedFile};
 use crate::track::{LiveSince, Release, Seen};
@@ -118,11 +118,9 @@ pub enum Effect {
     Attach {
         name: SessionName,
         intent: Intent,
-        /// What the checks found when this was decided.
-        company: Company,
         ticket: Ticket,
     },
-    /// Look for other windows showing `name`, off the UI thread.
+    /// Look for the windows showing any session, off the UI thread.
     CheckElsewhere(Look),
     Connect {
         launch: Launch,
@@ -250,11 +248,7 @@ fn step(m: &mut Model, msg: Msg) -> Vec<Effect> {
             }
             Vec::new()
         }
-        Msg::Elsewhere {
-            name,
-            ticket,
-            company,
-        } => on_elsewhere(m, name, ticket, company),
+        Msg::Elsewhere { ticket, found } => on_elsewhere(m, ticket, found),
         Msg::Focus(focus) => {
             m.terminal = focus;
             Vec::new()
@@ -363,30 +357,25 @@ fn on_catalogue(m: &mut Model, repos: Vec<RepoRoot>, warnings: Vec<String>) {
     m.catalogue_warnings = warnings;
 }
 
-/// What closing the other windows came to. Either way the connection is
-/// looked at again, which also drops any answer from before the close.
+/// What closing the other windows came to. A close that worked leaves the
+/// session alone, and a close that failed leaves what was known. Either way
+/// a new look follows at once, which drops any answer from before the close,
+/// and a pane waiting on an older look takes this one's answer instead.
 fn on_closed_elsewhere(
     m: &mut Model,
     name: &SessionName,
     closed: Result<usize, String>,
 ) -> Vec<Effect> {
-    let company = if closed.is_ok() {
-        Company::Alone
-    } else {
-        Company::Elsewhere
-    };
-    if let Some(c) = m.pane.connection_mut().filter(|c| c.name == *name) {
-        c.company = company;
-    }
     match closed {
-        Ok(0) => {}
-        Ok(n) => m.info(format!("closed {n} other window(s) on {name}")),
+        Ok(n) => {
+            m.record_company(name, Company::Alone);
+            if n > 0 {
+                m.info(format!("closed {n} other window(s) on {name}"));
+            }
+        }
         Err(e) => m.error(e),
     }
-    recheck_elsewhere(m)
-        .map(Effect::CheckElsewhere)
-        .into_iter()
-        .collect()
+    vec![Effect::CheckElsewhere(looking(m, Need::Decision))]
 }
 
 /// Asks the harness to name the form's prompt once typing has paused.
@@ -546,18 +535,13 @@ fn tick_effects(m: &mut Model) -> Vec<Effect> {
 const CHECK_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Asks whether another window shows `name` before attaching to it.
-fn check_first(m: &mut Model, name: SessionName, then: AfterCheck) -> Effect {
-    let ticket = m.start_look();
+fn check_first(m: &mut Model, name: &SessionName, then: AfterCheck) -> Effect {
     m.pane = Pane::Checking {
         name: name.clone(),
         then,
         until: m.clock.mono + CHECK_TIMEOUT,
     };
-    Effect::CheckElsewhere(Look {
-        name,
-        own: None,
-        ticket,
-    })
+    Effect::CheckElsewhere(looking(m, Need::Decision))
 }
 
 /// The one place the pane starts waiting on a client.
@@ -578,12 +562,11 @@ fn starting(m: &mut Model, name: &SessionName) -> Ticket {
     ticket
 }
 
-fn attach(m: &mut Model, name: SessionName, intent: Intent, company: Company) -> Vec<Effect> {
+fn attach(m: &mut Model, name: SessionName, intent: Intent) -> Vec<Effect> {
     let ticket = connecting(m, &name);
     vec![Effect::Attach {
         name,
         intent,
-        company,
         ticket,
     }]
 }
@@ -602,45 +585,45 @@ fn reattach_preview(m: &mut Model, name: SessionName) -> Vec<Effect> {
     if empty_if_exited(m, &name) {
         Vec::new()
     } else {
-        attach(m, name, Intent::Preview, Company::Alone)
+        attach(m, name, Intent::Preview)
     }
 }
 
-/// Another window's arrival or departure, as the newest look found it.
+/// Notes what the newest look found of every agent, then lets the pane
+/// act on what that says of the session it is on.
 fn on_elsewhere(
     m: &mut Model,
-    name: SessionName,
     ticket: Ticket,
-    company: Result<Company, String>,
+    found: Result<HashMap<SessionName, Company>, String>,
 ) -> Vec<Effect> {
     if !m.is_latest_look(ticket) {
         return Vec::new();
     }
-    let company = match company {
-        Ok(company) => {
+    let sightings = match found {
+        Ok(sightings) => {
             m.check_health = CheckHealth::Working;
-            company
+            sightings
         }
-        Err(why) => return check_failed(m, &name, &why),
+        Err(why) => return check_failed(m, &why),
     };
-    match (&mut m.pane, company) {
-        (
-            Pane::Checking {
-                name: waiting,
-                then,
-                ..
-            },
-            _,
-        ) if *waiting == name => {
-            let then = *then;
-            checked(m, name, then, company)
+    let listed: Vec<SessionName> = m
+        .snapshot()
+        .into_iter()
+        .flat_map(|s| s.entries().map(|(_, e)| e.name().clone()))
+        .chain(m.pane.session().cloned())
+        .collect();
+    for name in listed {
+        let company = sightings.get(&name).cloned().unwrap_or_default();
+        m.record_company(&name, company);
+    }
+    match &m.pane {
+        Pane::Checking { name, then, .. } => {
+            let (name, then) = (name.clone(), *then);
+            checked(m, name, then)
         }
-        (Pane::Elsewhere { name: held }, Company::Alone) if *held == name => {
+        Pane::Elsewhere { name } if !m.company(name).is_elsewhere() => {
+            let name = name.clone();
             reattach_preview(m, name)
-        }
-        (Pane::Connected(c), _) if c.name == name => {
-            c.company = company;
-            Vec::new()
         }
         _ => Vec::new(),
     }
@@ -648,19 +631,19 @@ fn on_elsewhere(
 
 /// Keeps the pane as it is, says so once, and lets a pane still waiting on
 /// the answer attach without it.
-fn check_failed(m: &mut Model, name: &SessionName, why: &str) -> Vec<Effect> {
+fn check_failed(m: &mut Model, why: &str) -> Vec<Effect> {
     if m.check_health == CheckHealth::Working {
         m.error(format!("couldn't look for other windows: {why}"));
     }
     m.check_health = CheckHealth::Failing;
     match &m.pane {
-        Pane::Checking {
-            name: waiting,
-            then,
-            ..
-        } if waiting == name => {
-            let then = *then;
-            checked(m, name.clone(), then, Company::Alone)
+        Pane::Checking { name, then, .. } => {
+            let (name, then) = (name.clone(), *then);
+            checked(m, name, then)
+        }
+        Pane::Elsewhere { name } if !m.company(name).is_elsewhere() => {
+            let name = name.clone();
+            reattach_preview(m, name)
         }
         _ => Vec::new(),
     }
@@ -675,25 +658,24 @@ fn check_timed_out(m: &mut Model) -> Vec<Effect> {
         } if m.clock.mono >= *until => Some((name.clone(), *then)),
         _ => None,
     };
-    late.map_or_else(Vec::new, |(name, then)| {
-        checked(m, name, then, Company::Alone)
-    })
+    late.map_or_else(Vec::new, |(name, then)| checked(m, name, then))
 }
 
-fn checked(m: &mut Model, name: SessionName, then: AfterCheck, company: Company) -> Vec<Effect> {
+/// Acts on what the newest look, or the lack of one, left known of `name`.
+fn checked(m: &mut Model, name: SessionName, then: AfterCheck) -> Vec<Effect> {
     if empty_if_exited(m, &name) {
         return Vec::new();
     }
-    match (company, then) {
-        (Company::Alone, _) => attach(m, name, then.intent(), Company::Alone),
-        (Company::Elsewhere, AfterCheck::Preview) if m.peek.as_ref() == Some(&name) => {
-            attach(m, name, Intent::Preview, Company::Elsewhere)
+    match (m.company(&name).clone(), then) {
+        (Company::Alone, _) => attach(m, name, then.intent()),
+        (Company::Elsewhere(_), AfterCheck::Preview) if m.peek.as_ref() == Some(&name) => {
+            attach(m, name, Intent::Preview)
         }
-        (Company::Elsewhere, AfterCheck::Preview) => {
+        (Company::Elsewhere(_), AfterCheck::Preview) => {
             m.pane = Pane::Elsewhere { name };
             Vec::new()
         }
-        (Company::Elsewhere, AfterCheck::Activate) => stay_elsewhere(m, &name),
+        (Company::Elsewhere(_), AfterCheck::Activate) => stay_elsewhere(m, &name),
     }
 }
 
@@ -703,7 +685,7 @@ fn pause_if_elsewhere(m: &mut Model) {
     let leaving = match &m.pane {
         Pane::Connected(c)
             if c.mode == Mode::Nav
-                && c.company == Company::Elsewhere
+                && m.company(&c.name).is_elsewhere()
                 && m.peek.as_ref() != Some(&c.name) =>
         {
             Some(c.name.clone())
@@ -723,30 +705,39 @@ fn stay_elsewhere(m: &mut Model, name: &SessionName) -> Vec<Effect> {
     }
     m.preview_at = None;
     m.peek = None;
-    m.info(format!("{name}: {}", elsewhere_banner()));
+    if let Some(windows) = m.company(name).windows() {
+        let said = format!("{name}: {}", elsewhere_banner(windows));
+        m.info(said);
+    }
     Vec::new()
 }
 
-/// The look the periodic refresh repeats: while connected, so a newcomer
-/// shows, and while left alone, so the pane comes back when the other window
-/// goes.
+/// The look the periodic refresh repeats, for every agent's card, for a
+/// newcomer beside a connection, and for the other window going while the
+/// pane is left alone. A pane waiting on its own look or a client doesn't
+/// ask again, which would drop that look's answer.
 pub fn recheck_elsewhere(m: &mut Model) -> Option<Look> {
-    let (name, own) = match &m.pane {
-        Pane::Connected(c) => (c.name.clone(), own_client(m)),
-        Pane::Elsewhere { name } => (name.clone(), None),
-        Pane::Empty | Pane::Checking { .. } | Pane::Connecting { .. } => return None,
-    };
-    Some(Look {
+    match &m.pane {
+        Pane::Checking { .. } | Pane::Connecting { .. } => None,
+        Pane::Empty | Pane::Connected(_) | Pane::Elsewhere { .. } => {
+            Some(looking(m, Need::Refresh))
+        }
+    }
+}
+
+/// A new look, which makes every look before it stale.
+fn looking(m: &mut Model, need: Need) -> Look {
+    Look {
         ticket: m.start_look(),
-        name,
-        own,
-    })
+        own: own_client(m),
+        need,
+    }
 }
 
 /// What `⏎`, `0` and `i` do on `name`: move here only from the row whose
 /// banner says so.
 fn enter_intent(m: &Model, name: &SessionName) -> Intent {
-    if m.moves_here().as_ref() == Some(name) {
+    if m.moves_here().is_some_and(|(held, _)| held == name) {
         Intent::MoveHere
     } else {
         Intent::Activate
@@ -766,7 +757,7 @@ fn preview(m: &mut Model) -> Option<Effect> {
         .map(|e| e.name().clone());
     match target {
         Some(name) if m.pane.session() == Some(&name) => None,
-        Some(name) => Some(check_first(m, name, AfterCheck::Preview)),
+        Some(name) => Some(check_first(m, &name, AfterCheck::Preview)),
         None => {
             m.pane = Pane::Empty;
             None
@@ -1083,6 +1074,12 @@ fn forget_gone(m: &mut Model) {
     if m.peek.as_ref().is_some_and(|name| !known.contains(name)) {
         m.peek = None;
     }
+    if m.pane
+        .held_elsewhere()
+        .is_some_and(|name| !known.contains(name))
+    {
+        m.pane = Pane::Empty;
+    }
     m.docs.forget(|name| known.contains(name));
 }
 
@@ -1208,13 +1205,26 @@ pub fn connected(m: &mut Model, intent: Intent) -> Vec<Background> {
     let (jobs, looks) = match intent {
         Intent::Preview => (Vec::new(), true),
         Intent::Activate => (enter(m, Others::Keep), true),
-        Intent::MoveHere => (enter(m, Others::Close), false),
+        Intent::MoveHere => {
+            let jobs = enter(m, Others::Close);
+            moved_here(m);
+            (jobs, false)
+        }
     };
     let look = looks.then(|| recheck_elsewhere(m)).flatten();
     jobs.into_iter()
         .map(Background::Job)
         .chain(look.map(Background::Look))
         .collect()
+}
+
+/// The other windows are being closed, so the session is alone now. Looks
+/// asked before this may still see them, and are dropped.
+fn moved_here(m: &mut Model) {
+    if let Some(name) = m.pane.connection().map(|c| c.name.clone()) {
+        m.record_company(&name, Company::Alone);
+        m.start_look();
+    }
 }
 
 /// Types into `name`, or moves here when `intent` is `MoveHere`.
@@ -1242,10 +1252,10 @@ fn activate(m: &mut Model, name: &SessionName, intent: Intent) -> Vec<Effect> {
         m.error(format!("this TUI is running inside {name}"));
         return Vec::new();
     };
-    if m.pane.elsewhere(name) {
+    if m.elsewhere(name) {
         if matches!(enter, Enter::Attach) {
             return match intent {
-                Intent::MoveHere => attach(m, name.clone(), Intent::MoveHere, Company::Alone),
+                Intent::MoveHere => attach(m, name.clone(), Intent::MoveHere),
                 Intent::Activate | Intent::Preview => stay_elsewhere(m, name),
             };
         }
@@ -1255,13 +1265,12 @@ fn activate(m: &mut Model, name: &SessionName, intent: Intent) -> Vec<Effect> {
         return enter_agent(m);
     }
     match enter {
-        Enter::Attach => vec![check_first(m, name.clone(), AfterCheck::Activate)],
+        Enter::Attach => vec![check_first(m, name, AfterCheck::Activate)],
         Enter::Resurrect => {
             let ticket = starting(m, name);
             vec![Effect::Attach {
                 name: name.clone(),
                 intent: Intent::Activate,
-                company: Company::Alone,
                 ticket,
             }]
         }
@@ -2440,7 +2449,7 @@ fn open_peek(m: &mut Model) -> Vec<Effect> {
         reach if reach.is_attach() => {
             m.peek = Some(name.clone());
             if m.pane.held_elsewhere() == Some(&name) {
-                return attach(m, name, Intent::Preview, Company::Elsewhere);
+                return attach(m, name, Intent::Preview);
             }
             if m.pane.session() != Some(&name) {
                 m.schedule_preview();
@@ -3637,7 +3646,7 @@ mod tests {
         let rows = m.rows();
         assert_eq!(rows.len(), 5, "{rows:?}");
         assert!(
-            matches!(rows.last(), Some(Row::Entry { name, place: crate::model::Place::Solo }) if name.as_str() == "web")
+            matches!(rows.last(), Some(Row::Entry { name, place: crate::model::Placement::Solo }) if name.as_str() == "web")
         );
     }
 
@@ -5286,8 +5295,8 @@ mod tests {
         assert_eq!(selected(&m).as_deref(), Some("web"));
         m.preview_at = m.preview_at.map(|_| Instant::now());
         let effects = tick(&mut m);
-        assert_eq!(checked_sessions(&effects), ["web"]);
-        let effects = answer(&mut m, "web", Company::Alone);
+        assert_eq!(checked_sessions(&m, &effects), ["web"]);
+        let effects = crate::fixtures::sighted(&mut m, &[]);
         assert!(effects.iter().any(|e| matches!(e, Effect::Attach { name, intent: Intent::Preview, .. } if name.as_str() == "web")));
     }
 
@@ -5488,7 +5497,7 @@ mod tests {
         update(&mut m, key(KeyCode::Char(']')));
         let pin = Row::Entry {
             name: name("api"),
-            place: crate::model::Place::Pinned,
+            place: crate::model::Placement::Pinned,
         };
         assert_eq!(m.rows(), vec![pin.clone()]);
         assert_eq!(
@@ -5527,7 +5536,7 @@ mod tests {
             m.rows(),
             vec![Row::Entry {
                 name: name("fix"),
-                place: crate::model::Place::Pinned,
+                place: crate::model::Placement::Pinned,
             }]
         );
         assert_eq!(m.cursor(), Some(&Cursor::Entry(name("fix"))));
@@ -5715,8 +5724,8 @@ mod tests {
             ),
         );
         let effects = update(&mut m, key(KeyCode::Char('a')));
-        assert_eq!(checked_sessions(&effects), ["web"]);
-        let effects = answer(&mut m, "web", Company::Alone);
+        assert_eq!(checked_sessions(&m, &effects), ["web"]);
+        let effects = crate::fixtures::sighted(&mut m, &[]);
         assert!(
             matches!(effects.as_slice(), [Effect::Attach { name, intent: Intent::Activate, .. }] if name.as_str() == "web")
         );
@@ -6289,8 +6298,8 @@ mod tests {
         let mut m = on_changes("obs-layout-4");
         update(&mut m, key(KeyCode::Enter));
         let effects = update(&mut m, key(KeyCode::Char('i')));
-        assert_eq!(checked_sessions(&effects), ["obs-layout-4"]);
-        let effects = answer(&mut m, "obs-layout-4", Company::Alone);
+        assert_eq!(checked_sessions(&m, &effects), ["obs-layout-4"]);
+        let effects = crate::fixtures::sighted(&mut m, &[]);
         assert!(
             effects.iter().any(|e| matches!(
                 e,
@@ -6309,8 +6318,8 @@ mod tests {
         let mut m = crate::fixtures::fleet(10);
         m.set_cursor(Cursor::Entry(name("obs-layout-4")));
         let effects = update(&mut m, key(KeyCode::Char('0')));
-        assert_eq!(checked_sessions(&effects), ["obs-layout-4"]);
-        let effects = answer(&mut m, "obs-layout-4", Company::Alone);
+        assert_eq!(checked_sessions(&m, &effects), ["obs-layout-4"]);
+        let effects = crate::fixtures::sighted(&mut m, &[]);
         assert!(
             effects.iter().any(|e| matches!(e, Effect::Attach { .. })),
             "0 in [1] is AGENT"
@@ -6766,6 +6775,7 @@ mod tests {
                 at: Instant::now(),
             });
             tracked.outbox = Some(crate::track::queued("rebase"));
+            tracked.company = crate::fixtures::in_nvim();
             tracked.live_since = Some(LiveSince::Unknown);
             tracked.launched(SystemTime::now());
             tracked.listed();
@@ -6776,9 +6786,11 @@ mod tests {
         }
         forget_gone(&mut m);
         assert!(m.tracked(&kept).is_some());
-        assert!(m.watched(&(kept, AgentId::new("s1"))).is_some());
+        assert!(m.watched(&(kept.clone(), AgentId::new("s1"))).is_some());
         assert!(m.tracked(&gone).is_none(), "nothing about it is kept");
         assert!(m.agents.keys().all(|name| *name != gone));
+        assert_eq!(*m.company(&gone), Company::Alone, "its windows go too");
+        assert_eq!(*m.company(&kept), crate::fixtures::in_nvim());
     }
 
     #[test]
@@ -7003,7 +7015,6 @@ mod tests {
         m.pane = Pane::Connected(crate::model::Connection {
             name: name(AGENT),
             term,
-            company: Company::Alone,
             mode: Mode::Agent,
             opened: Instant::now(),
         });
@@ -7131,8 +7142,8 @@ mod tests {
             m.set_cursor(Cursor::Entry(name("obs-layout-4")));
             update(&mut m, key(KeyCode::Char('v')));
             let effects = update(&mut m, key(code));
-            assert_eq!(checked_sessions(&effects), ["obs-layout-4"], "{code:?}");
-            let effects = answer(&mut m, "obs-layout-4", Company::Alone);
+            assert_eq!(checked_sessions(&m, &effects), ["obs-layout-4"], "{code:?}");
+            let effects = crate::fixtures::sighted(&mut m, &[]);
             assert!(
                 effects.iter().any(|e| matches!(
                     e,
@@ -7642,31 +7653,15 @@ mod tests {
         assert!(!acknowledged(tick_at(&mut m, at(6))), "once per report");
     }
 
-    fn checked_sessions(effects: &[Effect]) -> Vec<String> {
-        effects
+    /// The session the pane waits on when `effects` asked for a look.
+    fn checked_sessions(m: &Model, effects: &[Effect]) -> Vec<String> {
+        let asked = effects
             .iter()
-            .filter_map(|e| match e {
-                Effect::CheckElsewhere(look) => Some(look.name.to_string()),
-                _ => None,
-            })
-            .collect()
-    }
-
-    /// The newest look's answer for `agent`.
-    fn answer(m: &mut Model, agent: &str, company: Company) -> Vec<Effect> {
-        let ticket = m.current_look().expect("a look was asked for");
-        update(
-            m,
-            Msg::Elsewhere {
-                name: name(agent),
-                ticket,
-                company: Ok(company),
-            },
-        )
-    }
-
-    fn connect(m: &mut Model, agent: &str) {
-        crate::fixtures::connect(m, agent, Mode::Nav, Company::Alone);
+            .any(|e| matches!(e, Effect::CheckElsewhere(_)));
+        match &m.pane {
+            Pane::Checking { name, .. } if asked => vec![name.to_string()],
+            _ => Vec::new(),
+        }
     }
 
     #[test]
@@ -7675,7 +7670,7 @@ mod tests {
             let mut m = crate::fixtures::fleet(10);
             m.set_cursor(Cursor::Entry(name("auth-refresh-2")));
             update(&mut m, key(KeyCode::Char('2')));
-            connect(&mut m, "obs-layout-4");
+            crate::fixtures::connect(&mut m, "obs-layout-4", Mode::Nav);
             m.peek = Some(name("obs-layout-4"));
             let base = m.clock;
             let at = |secs| Moment {
