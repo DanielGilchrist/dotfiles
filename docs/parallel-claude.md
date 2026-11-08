@@ -70,7 +70,7 @@ types into the embedded session. `?` shows every key.
 | `j k g G`, `↓ ↑ Home End` | Move in the focused panel, or scroll [0] when it has the keys |
 | `J` `K` | Scroll [0] from [2] or [3] without focusing it |
 | `⌃D ⌃U`, `PgDn PgUp` | Half a page / a page in the focused panel |
-| `[` `]` | Previous / next tab of [1] (repo, agents, pinned) |
+| `[` `]` | Previous / next tab of [1] (agents, repo, pinned). Opens on agents |
 | `{` `}` | Previous / next repo |
 | `+` `_` | [0] full width / back |
 | `.` | In [1], show every checkout / only those with a session |
@@ -85,7 +85,7 @@ types into the embedded session. `?` shows every key.
 | `d` / `D` | Kill the session / remove session, worktree and branch (confirms, lists anything that would be lost) |
 | `x` | Run a configured action on the selected agent (see below) |
 | `a` | Attach the agent that needs you most (asking, failed, then finished) |
-| `?` | Keybindings: the focused panel's keys first, then the global ones. Type to filter, `Esc` clears then closes |
+| `?` | Keybindings: the focused panel's keys first, then the global ones. Type to filter, `⏎` keeps the filter, `Esc` clears it while typing, and `?`, `q` or `Esc` close |
 | `q` | Quit (agents keep running) |
 
 The footer shows as many hints as fit, most important for the focused panel first.
