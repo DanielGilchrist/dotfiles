@@ -152,6 +152,12 @@ fn step(m: &mut Model, msg: Msg) -> Vec<Effect> {
             });
             Vec::new()
         }
+        Msg::Paste(text) if matches!(m.overlay, Overlay::Talk { .. }) => {
+            if let Overlay::Talk { text: typed, .. } = &mut m.overlay {
+                typed.push_str(&sanitize_paste(&text).replace('\r', ""));
+            }
+            Vec::new()
+        }
         Msg::Paste(text) => {
             if let Some(c) = m.pane.connection().filter(|c| c.mode == Mode::Agent) {
                 let text = sanitize_paste(&text);
@@ -1166,6 +1172,7 @@ fn open_peek(m: &mut Model) {
 /// Queues a message for its agent and sends the first one that can go.
 fn talk(m: &mut Model, to: SessionName, text: String) -> Vec<Effect> {
     let Ok(prompt) = text.parse::<Prompt>() else {
+        m.info("type a message first · Esc closes");
         m.overlay = Overlay::Talk { to, text };
         return Vec::new();
     };
@@ -1175,8 +1182,10 @@ fn talk(m: &mut Model, to: SessionName, text: String) -> Vec<Effect> {
         .queue
         .push_back(prompt);
     let effects = flush(m);
-    if m.outboxes.get(&to).is_some_and(|o| !o.in_flight) {
-        m.info(format!("queued for {to} · sent when it's at rest"));
+    if m.outboxes.get(&to).is_some_and(|o| o.in_flight) {
+        m.info(format!("sent to {to}"));
+    } else {
+        m.info(format!("queued for {to} · sends when it's at rest"));
     }
     effects
 }
@@ -4566,6 +4575,57 @@ mod tests {
         assert_eq!(replies(&update(&mut m, Msg::Activities(all))), ["second"]);
         sent(&mut m, agent);
         assert!(m.outboxes.is_empty());
+    }
+
+    fn status(m: &Model) -> String {
+        m.status
+            .as_ref()
+            .map(|s| s.text.clone())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn enter_in_the_box_always_says_what_happened() {
+        let mut m = crate::fixtures::fleet(10);
+        set_state(&mut m, AGENT, done(), 1);
+        talk_to(&mut m, AGENT, "rebase");
+        assert_eq!(status(&m), format!("sent to {AGENT}"));
+
+        let mut m = crate::fixtures::fleet(10);
+        set_state(&mut m, AGENT, working(), 1);
+        talk_to(&mut m, AGENT, "rebase");
+        assert_eq!(
+            status(&m),
+            format!("queued for {AGENT} · sends when it's at rest")
+        );
+
+        let mut m = crate::fixtures::fleet(10);
+        set_state(&mut m, AGENT, done(), 1);
+        let effects = talk_to(&mut m, AGENT, "");
+        assert!(effects.is_empty());
+        assert!(matches!(m.overlay, Overlay::Talk { .. }), "the box stays");
+        assert!(status(&m).contains("type a message"));
+    }
+
+    #[test]
+    fn pasted_text_lands_in_the_message_box() {
+        let mut m = crate::fixtures::fleet(10);
+        set_state(&mut m, AGENT, done(), 1);
+        m.set_cursor(Cursor::Entry(name(AGENT)));
+        update(&mut m, key(KeyCode::Char('s')));
+        update(&mut m, Msg::Paste("rebase\r\nonto main".into()));
+        let effects = update(&mut m, key(KeyCode::Enter));
+        assert_eq!(replies(&effects), ["rebase\nonto main"]);
+    }
+
+    #[test]
+    fn a_resting_agent_that_stays_quiet_gets_the_message_once_the_bound_lapses() {
+        let mut m = crate::fixtures::fleet(10);
+        set_state(&mut m, AGENT, done(), 1);
+        live_since(&mut m, 2);
+        assert!(replies(&talk_to(&mut m, AGENT, "rebase")).is_empty());
+        live_since(&mut m, 90);
+        assert_eq!(replies(&tick(&mut m)), ["rebase"]);
     }
 
     #[test]
