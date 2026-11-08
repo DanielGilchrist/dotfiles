@@ -4,6 +4,7 @@ use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use crate::activity::{MainEvent, Reported};
 use crate::discover::{self, Warning};
 use crate::model::{Presence, Removable, Running, Snapshot, Startable};
 use crate::names::{
@@ -661,11 +662,9 @@ pub fn exec_spec(svc: Services<'_>, name: &SessionName, workdir: &Path) -> Resul
     })?;
     // The harness replaces this process, keeping its pid. A failed write
     // must not stop the launch.
-    let pid = (!spec.reattaches()).then(std::process::id);
-    let _ = svc.store.report(
-        name,
-        crate::activity::Reported::main(crate::activity::Event::Launched { pid }),
-    );
+    let _ = svc
+        .store
+        .report(name, Reported::main(MainEvent::Launched(spec.join())));
     Ok(spec)
 }
 

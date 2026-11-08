@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
+use agent_core::activity::Pid;
 use agent_core::config::Config;
 use agent_core::model::Presence;
 use agent_core::names::{AgentName, BranchName, Prompt, SessionName};
@@ -590,7 +591,8 @@ fn event(svc: Services<'_>, name: &SessionName) {
     }
     .unwrap_or_else(|| svc.harnesses.default_harness());
     if let Some(event) = harness.event(&payload) {
-        let lineage = lineage::of(std::process::id(), lineage::parent_of);
+        let lineage = lineage::of(std::process::id(), lineage::parent_of)
+            .map(|chain| chain.into_iter().filter_map(Pid::new).collect());
         let _ = svc.store.report(name, event.from_lineage(lineage));
     }
 }

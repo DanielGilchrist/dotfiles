@@ -1868,7 +1868,7 @@ impl Model {
                 subagent,
             }),
             (None, Some(mut held)) if held.by == name && held.id == id => {
-                held.subagent.finished.get_or_insert(now);
+                held.subagent.finish(now);
                 Some(held)
             }
             (None, _) => None,

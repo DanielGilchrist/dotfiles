@@ -5416,7 +5416,7 @@ mod tests {
     fn a_quiet_agent_launched_before_the_tui_saw_it_live_sends_at_rest() {
         let mut m = crate::fixtures::fleet(10);
         let mut a = reported(done(), 20);
-        a.launched = Some(SystemTime::now() - Duration::from_secs(25));
+        a.session = crate::fixtures::launch_reported(Duration::from_secs(25));
         report(&mut m, a);
         live_since(&mut m, 20);
         assert_eq!(replies(&talk_to(&mut m, AGENT, "rebase")), ["rebase"]);
@@ -5426,8 +5426,7 @@ mod tests {
     fn a_booting_record_never_sends_within_the_quiet_time() {
         let mut m = crate::fixtures::fleet(10);
         let mut a = reported(done(), 1);
-        a.launched = Some(SystemTime::now() - Duration::from_secs(1));
-        a.booting = true;
+        a.session = crate::fixtures::launched(Duration::from_secs(1));
         report(&mut m, a);
         live_since(&mut m, 30);
         assert_eq!(
@@ -5514,13 +5513,13 @@ mod tests {
         live_since(&mut m, 30);
         talk_to(&mut m, AGENT, "rebase");
         let mut booted = reported(done(), 1);
-        booted.booting = true;
+        booted.session = crate::fixtures::booting();
         assert!(
             replies(&report(&mut m, booted)).is_empty(),
             "1s after SessionStart"
         );
         let mut quiet = reported(done(), 6);
-        quiet.booting = true;
+        quiet.session = crate::fixtures::booting();
         assert_eq!(replies(&report(&mut m, quiet)), ["rebase"]);
     }
 

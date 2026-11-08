@@ -6,6 +6,8 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::activity::{Join, Pid};
+
 /// Long enough for a slow `git fetch`-free query or `ls-remote` over ssh.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_THREADS: usize = 8;
@@ -240,7 +242,7 @@ pub struct LaunchSpec {
     cwd: Option<PathBuf>,
     env: Vec<(OsString, OsString)>,
     env_remove: Vec<OsString>,
-    reattaches: bool,
+    join: Join,
 }
 
 impl LaunchSpec {
@@ -251,20 +253,20 @@ impl LaunchSpec {
             cwd: None,
             env: Vec::new(),
             env_remove: Vec::new(),
-            reattaches: false,
+            join: Pid::current().map_or(Join::Untraced, Join::Fresh),
         }
     }
 
-    /// Joins a session that is already running, so its hooks come from a
-    /// process other than the one this spec starts.
+    /// Its hooks come from a process other than the one this spec starts,
+    /// as when it joins a session that is already running.
     #[must_use]
-    pub fn reattaching(mut self) -> Self {
-        self.reattaches = true;
+    pub fn untraced(mut self) -> Self {
+        self.join = Join::Untraced;
         self
     }
 
-    pub fn reattaches(&self) -> bool {
-        self.reattaches
+    pub fn join(&self) -> Join {
+        self.join
     }
 
     #[must_use]

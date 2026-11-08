@@ -3,7 +3,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use agent_core::activity::{About, AgentId, Background, Event, Input, Origin, Reported, ToolId};
+use agent_core::activity::{
+    About, AgentId, Background, Common, Input, MainEvent, Reported, SubagentEvent, ToolId,
+};
 use agent_core::names::Prompt;
 use agent_core::ports::{
     Harness, HarnessError, HarnessId, Harnesses, LaunchCtx, PendingPrompt, Seen, SubagentDetail,
@@ -256,14 +258,14 @@ impl Harness for Claude {
             })?
         {
             match ctx.bootstrap {
-                // Reattaching keeps everything the session had, hooks
+                // Joining keeps everything the session had, hooks
                 // included, since this harness launched it.
                 None => {
                     return Ok(LaunchSpec::new(&self.program)
                         .cwd(&workdir)
                         .env_remove(INHERITED_SESSION_ENV.iter().copied())
                         .args(["attach".to_string(), id.clone()])
-                        .reattaching());
+                        .untraced());
                 }
                 Some(_) => self.stop(id)?,
             }
@@ -576,6 +578,11 @@ fn target(input: &serde_json::Value) -> Option<String> {
 const NOTIFICATION_PREFIXES: &[&str] = &["<agent-message", "<task-notification"];
 
 /// A hook payload as a [`Reported`] event.
+///
+/// Claude Code fires no hook while a trust or resume dialog is up or when
+/// the user interrupts with Esc, so the core leans on silence for both.
+/// Hooks only the agent itself fires, like `Stop`, are dropped when they
+/// name a subagent, and the other way round.
 fn claude_event(payload: &serde_json::Value) -> Option<Reported> {
     let text = |key: &str| payload.get(key).and_then(serde_json::Value::as_str);
     let at = |pointer: &str| payload.pointer(pointer).and_then(serde_json::Value::as_str);
@@ -586,16 +593,13 @@ fn claude_event(payload: &serde_json::Value) -> Option<Reported> {
     let name = text("hook_event_name")?;
     let launched = at("/tool_response/agentId")
         .filter(|_| at("/tool_response/status") == Some("async_launched"));
-    let origin = match launched.or_else(|| text("agent_id")) {
-        Some(id) => Origin::Subagent(AgentId::new(id)),
-        None => Origin::Main,
-    };
-    let event = match name {
-        "SessionStart" if text("source") == Some("compact") => Event::Compacted,
-        "SessionStart" => Event::Started,
+    let agent = launched.or_else(|| text("agent_id")).map(AgentId::new);
+    let hook = match name {
+        "SessionStart" if text("source") == Some("compact") => Hook::Main(MainEvent::Compacted),
+        "SessionStart" => Hook::Main(MainEvent::Started),
         "UserPromptSubmit" => {
             let prompt = text("prompt").unwrap_or_default();
-            Event::Prompted(
+            Hook::Main(MainEvent::Prompted(
                 if NOTIFICATION_PREFIXES
                     .iter()
                     .any(|p| prompt.trim_start().starts_with(p))
@@ -604,23 +608,23 @@ fn claude_event(payload: &serde_json::Value) -> Option<Reported> {
                 } else {
                     Input::User(long(prompt))
                 },
-            )
+            ))
         }
         "PreToolUse" if text("tool_name") == Some("AskUserQuestion") => {
             let question = input
                 .pointer("/questions/0/question")
                 .and_then(serde_json::Value::as_str);
-            Event::Asked {
+            Hook::Common(Common::Asked {
                 question: snippet(question.unwrap_or("has a question")),
                 about: About::Tool(id()),
-            }
+            })
         }
-        "PreToolUse" => Event::ToolStarted {
+        "PreToolUse" => Hook::Common(Common::ToolStarted {
             id: id(),
             tool: tool(),
             target: target(&input),
-        },
-        "PostToolUse" if launched.is_some() => Event::SubagentLaunched {
+        }),
+        "PostToolUse" if launched.is_some() => Hook::Subagent(SubagentEvent::Launched {
             tool: id(),
             kind: kind(
                 input
@@ -632,15 +636,17 @@ fn claude_event(payload: &serde_json::Value) -> Option<Reported> {
                     .or_else(|| input.get("description").and_then(serde_json::Value::as_str))
                     .unwrap_or_default(),
             ),
-        },
-        "PostToolUse" | "PostToolUseFailure" => Event::ToolFinished { id: id() },
-        "PermissionDenied" if text("tool_use_id").is_some() => Event::ToolFinished { id: id() },
-        "PermissionDenied" => Event::Declined,
+        }),
+        "PostToolUse" | "PostToolUseFailure" => Hook::Common(Common::ToolFinished { id: id() }),
+        "PermissionDenied" if text("tool_use_id").is_some() => {
+            Hook::Common(Common::ToolFinished { id: id() })
+        }
+        "PermissionDenied" => Hook::Common(Common::Declined),
         // Its question already arrived with its PreToolUse.
         "PermissionRequest" if text("tool_name") == Some("AskUserQuestion") => return None,
         "PermissionRequest" => {
             let target = target(&input);
-            Event::Asked {
+            Hook::Common(Common::Asked {
                 question: match &target {
                     Some(target) => format!("{}: {target}", tool()),
                     None => tool(),
@@ -649,29 +655,40 @@ fn claude_event(payload: &serde_json::Value) -> Option<Reported> {
                     tool: tool(),
                     target,
                 },
-            }
+            })
         }
-        "Notification" => Event::Asked {
+        "Notification" => Hook::Common(Common::Asked {
             question: snippet(text("message").unwrap_or("has a question")),
             about: About::Unknown,
-        },
-        "SubagentStart" => Event::SubagentStarted {
+        }),
+        "SubagentStart" => Hook::Subagent(SubagentEvent::Started {
             kind: kind(text("agent_type")),
-        },
-        "SubagentStop" => Event::SubagentStopped,
-        "Stop" => Event::Finished {
+        }),
+        "SubagentStop" => Hook::Subagent(SubagentEvent::Stopped),
+        "Stop" => Hook::Main(MainEvent::Finished {
             summary: text("last_assistant_message").map(long),
             running: background_subagents(payload),
-        },
-        "StopFailure" => Event::Failed(text("error").unwrap_or("error").replace('_', " ")),
-        "SessionEnd" => Event::Ended,
+        }),
+        "StopFailure" => Hook::Main(MainEvent::Failed(
+            text("error").unwrap_or("error").replace('_', " "),
+        )),
+        "SessionEnd" => Hook::Main(MainEvent::Ended),
         _ => return None,
     };
-    Some(Reported {
-        origin,
-        event,
-        lineage: None,
-    })
+    match (hook, agent) {
+        (Hook::Common(event), Some(id)) => Some(Reported::subagent(id, event)),
+        (Hook::Common(event), None) => Some(Reported::main(event)),
+        (Hook::Main(event), None) => Some(Reported::main(event)),
+        (Hook::Subagent(event), Some(id)) => Some(Reported::subagent(id, event)),
+        (Hook::Main(_), Some(_)) | (Hook::Subagent(_), None) => None,
+    }
+}
+
+/// Who fires a hook: the agent, one of its subagents, or either.
+enum Hook {
+    Main(MainEvent),
+    Subagent(SubagentEvent),
+    Common(Common),
 }
 
 /// The subagents a finished turn left running. Other background work
@@ -822,12 +839,13 @@ mod tests {
     #[test]
     fn hook_payloads_become_events() {
         let event = |json: &str| claude_event(&serde_json::from_str(json).expect("json"));
-        let main = |e: Event| Some(Reported::main(e));
+        let main = |e: MainEvent| Some(Reported::main(e));
+        let common = |c: Common| Some(Reported::main(c));
         assert_eq!(
             event(
                 r#"{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_use_id":"t1","tool_input":{"command":"cargo test\n--all"}}"#
             ),
-            main(Event::ToolStarted {
+            common(Common::ToolStarted {
                 id: ToolId::new("t1"),
                 tool: "Bash".into(),
                 target: Some("cargo test".into())
@@ -837,7 +855,7 @@ mod tests {
             event(
                 r#"{"hook_event_name":"PermissionRequest","tool_name":"Bash","tool_input":{"command":"rm -rf tmp"}}"#
             ),
-            main(Event::Asked {
+            common(Common::Asked {
                 question: "Bash: rm -rf tmp".into(),
                 about: About::Call {
                     tool: "Bash".into(),
@@ -849,40 +867,41 @@ mod tests {
             event(
                 r#"{"hook_event_name":"PreToolUse","tool_name":"AskUserQuestion","tool_use_id":"q1","tool_input":{"questions":[{"question":"Which DB?"}]}}"#
             ),
-            main(Event::Asked {
+            common(Common::Asked {
                 question: "Which DB?".into(),
                 about: About::Tool(ToolId::new("q1"))
             })
         );
         assert_eq!(
             event(r#"{"hook_event_name":"SessionStart","source":"compact"}"#),
-            main(Event::Compacted)
+            main(MainEvent::Compacted)
         );
         assert_eq!(
             event(r#"{"hook_event_name":"SessionStart","source":"resume"}"#),
-            main(Event::Started)
+            main(MainEvent::Started)
         );
         assert_eq!(
             event(r#"{"hook_event_name":"StopFailure","error":"rate_limit"}"#),
-            main(Event::Failed("rate limit".into()))
+            main(MainEvent::Failed("rate limit".into()))
         );
         assert_eq!(
             event(
                 r#"{"hook_event_name":"UserPromptSubmit","prompt":"<agent-message from=\"a1\">done</agent-message>"}"#
             ),
-            main(Event::Prompted(Input::Notification))
+            main(MainEvent::Prompted(Input::Notification))
         );
     }
 
     #[test]
     fn subagent_payloads_say_which_subagent_they_came_from() {
         let event = |json: &str| claude_event(&serde_json::from_str(json).expect("json"));
-        let a1 = |e: Event| Some(Reported::subagent(AgentId::new("a1"), e));
+        let a1 = |e: SubagentEvent| Some(Reported::subagent(AgentId::new("a1"), e));
+        let a1_common = |c: Common| Some(Reported::subagent(AgentId::new("a1"), c));
         assert_eq!(
             event(
                 r#"{"hook_event_name":"PermissionRequest","tool_name":"Bash","agent_id":"a1","tool_input":{"command":"ls"}}"#
             ),
-            a1(Event::Asked {
+            a1_common(Common::Asked {
                 question: "Bash: ls".into(),
                 about: About::Call {
                     tool: "Bash".into(),
@@ -892,19 +911,19 @@ mod tests {
         );
         assert_eq!(
             event(r#"{"hook_event_name":"SubagentStart","agent_id":"a1","agent_type":"Explore"}"#),
-            a1(Event::SubagentStarted {
+            a1(SubagentEvent::Started {
                 kind: "Explore".into()
             })
         );
         assert_eq!(
             event(r#"{"hook_event_name":"SubagentStop","agent_id":"a1"}"#),
-            a1(Event::SubagentStopped)
+            a1(SubagentEvent::Stopped)
         );
         assert_eq!(
             event(
                 r#"{"hook_event_name":"PostToolUse","tool_name":"Agent","agent_id":null,"tool_use_id":"t9","tool_input":{"subagent_type":"general-purpose","description":"review"},"tool_response":{"status":"async_launched","agentId":"a1","description":"Adversarial review"}}"#
             ),
-            a1(Event::SubagentLaunched {
+            a1(SubagentEvent::Launched {
                 tool: ToolId::new("t9"),
                 kind: "general-purpose".into(),
                 description: "Adversarial review".into()
@@ -914,7 +933,7 @@ mod tests {
             event(
                 r#"{"hook_event_name":"Stop","agent_id":null,"last_assistant_message":"Waiting.","background_tasks":[{"id":"a1","type":"subagent","status":"running","agent_type":"Explore","description":"look"},{"id":"s1","type":"shell","status":"running"},{"id":"a2","type":"subagent","status":"completed"}]}"#
             ),
-            Some(Reported::main(Event::Finished {
+            Some(Reported::main(MainEvent::Finished {
                 summary: Some("Waiting.".into()),
                 running: vec![Background {
                     id: AgentId::new("a1"),
@@ -923,6 +942,13 @@ mod tests {
                 }]
             }))
         );
+    }
+
+    #[test]
+    fn hooks_only_one_side_fires_are_dropped_from_the_other() {
+        let event = |json: &str| claude_event(&serde_json::from_str(json).expect("json"));
+        assert_eq!(event(r#"{"hook_event_name":"Stop","agent_id":"a1"}"#), None);
+        assert_eq!(event(r#"{"hook_event_name":"SubagentStop"}"#), None);
     }
 
     const PROMPT_LINE: &str = r#"{"type":"user","isSidechain":true,"message":{"role":"user","content":"Review the diff.\nBe harsh."}}"#;

@@ -2,6 +2,7 @@
 //! (`agent event`), so the TUI can show it and say which agents need you.
 
 use std::collections::BTreeMap;
+use std::num::NonZeroU32;
 use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
@@ -41,6 +42,38 @@ impl ToolId {
     }
 }
 
+/// A process id. Zero is never a process, so it can't be one here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Pid(NonZeroU32);
+
+impl Pid {
+    pub fn new(raw: u32) -> Option<Self> {
+        NonZeroU32::new(raw).map(Self)
+    }
+
+    pub fn current() -> Option<Self> {
+        Self::new(std::process::id())
+    }
+
+    pub fn get(self) -> u32 {
+        self.0.get()
+    }
+}
+
+/// How a session's hooks can be traced back to its launch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Join {
+    /// The harness was just started by this process, which every hook of
+    /// the new session descends from.
+    Fresh(Pid),
+    /// Its hooks come from some other process, as when it joined a session
+    /// that was already running, so a report can't be told from a replaced
+    /// session's.
+    Untraced,
+}
+
 /// Who an event came from: the agent itself or one of its subagents.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -52,52 +85,44 @@ pub enum Origin {
 /// An event and who it came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reported {
-    pub origin: Origin,
     pub event: Event,
     /// The reporting process and its ancestors, when they could be read.
-    pub lineage: Option<Vec<u32>>,
+    pub lineage: Option<Vec<Pid>>,
 }
 
 impl Reported {
-    pub fn main(event: Event) -> Self {
+    pub fn main(event: impl Into<MainEvent>) -> Self {
         Self {
-            origin: Origin::Main,
-            event,
+            event: Event::Main(event.into()),
             lineage: None,
         }
     }
 
-    pub fn subagent(id: AgentId, event: Event) -> Self {
+    pub fn subagent(id: AgentId, event: impl Into<SubagentEvent>) -> Self {
         Self {
-            origin: Origin::Subagent(id),
-            event,
+            event: Event::Subagent(id, event.into()),
             lineage: None,
         }
     }
 
     #[must_use]
-    pub fn from_lineage(mut self, lineage: Option<Vec<u32>>) -> Self {
+    pub fn from_lineage(mut self, lineage: Option<Vec<Pid>>) -> Self {
         self.lineage = lineage;
         self
     }
 }
 
-/// Something a harness reported about an agent or one of its subagents.
+/// Something a harness reported, from the agent or from one of its
+/// subagents.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
-    /// `agent exec` is about to start the harness: a new session, not yet
-    /// reporting.
-    /// The harness was just started by process `pid`, which every hook of
-    /// the new session descends from. None when it joined a session that
-    /// was already running.
-    Launched {
-        pid: Option<u32>,
-    },
-    /// A session began (fresh, resumed or cleared).
-    Started,
-    /// The context was compacted.
-    Compacted,
-    Prompted(Input),
+    Main(MainEvent),
+    Subagent(AgentId, SubagentEvent),
+}
+
+/// What either the agent or a subagent can report about its own tools.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Common {
     /// A tool began: its id, its name, and what it's acting on when that's
     /// short.
     ToolStarted {
@@ -106,29 +131,24 @@ pub enum Event {
         target: Option<String>,
     },
     /// A tool finished, failed, or was denied permission.
-    ToolFinished {
-        id: ToolId,
-    },
+    ToolFinished { id: ToolId },
     /// Waiting on the user: a permission prompt or a question.
-    Asked {
-        question: String,
-        about: About,
-    },
+    Asked { question: String, about: About },
     /// The user turned down the asker's permission prompt.
     Declined,
-    /// The subagent the event came from started.
-    SubagentStarted {
-        kind: String,
-    },
-    /// Tool call `tool` handed the subagent the event is about off to run in
-    /// the background.
-    SubagentLaunched {
-        tool: ToolId,
-        kind: String,
-        description: String,
-    },
-    /// The subagent the event came from finished.
-    SubagentStopped,
+}
+
+/// Something the agent itself reported.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MainEvent {
+    /// `agent exec` is about to start the harness: a new session, not yet
+    /// reporting.
+    Launched(Join),
+    /// A session began (fresh, resumed or cleared).
+    Started,
+    /// The context was compacted.
+    Compacted,
+    Prompted(Input),
     /// The turn ended. `summary` is the agent's last message, and `running`
     /// the background subagents it's still waiting on.
     Finished {
@@ -139,6 +159,77 @@ pub enum Event {
     Failed(String),
     /// The session ended.
     Ended,
+    Common(Common),
+}
+
+/// Something a subagent reported.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubagentEvent {
+    /// The subagent began running, in the foreground until a launch says
+    /// otherwise.
+    Started {
+        kind: String,
+    },
+    /// Tool call `tool` handed this subagent off to run in the background.
+    Launched {
+        tool: ToolId,
+        kind: String,
+        description: String,
+    },
+    Stopped,
+    Common(Common),
+}
+
+impl From<Common> for MainEvent {
+    fn from(common: Common) -> Self {
+        Self::Common(common)
+    }
+}
+
+impl From<Common> for SubagentEvent {
+    fn from(common: Common) -> Self {
+        Self::Common(common)
+    }
+}
+
+impl Common {
+    fn answers(&self, by: &Answer) -> bool {
+        match (self, by) {
+            (Self::ToolFinished { id }, Answer::ToolEnding(tool)) => id == tool,
+            (Self::ToolStarted { .. } | Self::ToolFinished { .. }, Answer::AnyTool)
+            | (Self::Declined, _) => true,
+            (Self::ToolStarted { .. } | Self::Asked { .. }, _) => false,
+        }
+    }
+}
+
+impl Event {
+    fn is_from(&self, asker: &Origin) -> bool {
+        match (self, asker) {
+            (Self::Main(_), Origin::Main) => true,
+            (Self::Subagent(id, _), Origin::Subagent(asker)) => id == asker,
+            (Self::Main(_), Origin::Subagent(_)) | (Self::Subagent(..), Origin::Main) => false,
+        }
+    }
+
+    fn answers(&self, by: &Answer) -> bool {
+        match self {
+            Self::Main(MainEvent::Common(common))
+            | Self::Subagent(_, SubagentEvent::Common(common)) => common.answers(by),
+            Self::Main(MainEvent::Prompted(_) | MainEvent::Failed(_))
+            | Self::Subagent(_, SubagentEvent::Stopped) => true,
+            Self::Main(
+                MainEvent::Launched(_)
+                | MainEvent::Started
+                | MainEvent::Compacted
+                | MainEvent::Finished { .. }
+                | MainEvent::Ended,
+            )
+            | Self::Subagent(_, SubagentEvent::Started { .. } | SubagentEvent::Launched { .. }) => {
+                false
+            }
+        }
+    }
 }
 
 /// What a question is about, as far as the harness can tell.
@@ -223,17 +314,70 @@ pub enum Answer {
 
 /// A subagent the agent started.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "StoredSubagent", into = "WrittenSubagent")]
 pub struct Subagent {
     pub kind: String,
     pub description: Option<String>,
     pub launch: Launch,
-    /// The tools it's running.
-    pub tools: Vec<Tool>,
     pub since: SystemTime,
-    /// When it stopped. It's kept until the next prompt so its row and
-    /// transcript stay to be read.
-    #[serde(default)]
-    pub finished: Option<SystemTime>,
+    pub status: SubagentStatus,
+}
+
+/// Whether a subagent is still going. A finished one is kept until the next
+/// prompt so its row and transcript stay to be read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SubagentStatus {
+    /// The tools it's running.
+    Running {
+        tools: Vec<Tool>,
+    },
+    Finished {
+        at: SystemTime,
+    },
+}
+
+impl Subagent {
+    fn new(kind: String, launch: Launch, now: SystemTime) -> Self {
+        Self {
+            kind,
+            description: None,
+            launch,
+            since: now,
+            status: SubagentStatus::Running { tools: Vec::new() },
+        }
+    }
+
+    pub fn is_running(&self) -> bool {
+        matches!(self.status, SubagentStatus::Running { .. })
+    }
+
+    /// The tools it's running, none once it has finished.
+    pub fn tools(&self) -> &[Tool] {
+        match &self.status {
+            SubagentStatus::Running { tools } => tools,
+            SubagentStatus::Finished { .. } => &[],
+        }
+    }
+
+    /// Marks it finished at `at`, unless it already was.
+    pub fn finish(&mut self, at: SystemTime) {
+        if self.is_running() {
+            self.status = SubagentStatus::Finished { at };
+        }
+    }
+
+    pub fn start(&mut self, tool: Tool) {
+        if let SubagentStatus::Running { tools } = &mut self.status {
+            tools.push(tool);
+        }
+    }
+
+    fn end(&mut self, id: &ToolId) {
+        if let SubagentStatus::Running { tools } = &mut self.status {
+            tools.retain(|t| &t.id != id);
+        }
+    }
 }
 
 /// Whether the agent waits on a subagent's tool call or carries on.
@@ -244,10 +388,82 @@ pub enum Launch {
     Background,
 }
 
+/// Where the current session is in its life, which decides whose reports to
+/// believe and when typed text is safe. Each carries how the session was
+/// launched: reports from processes that don't descend from a fresh launch
+/// are from a session it replaced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Session {
+    /// Launched through `agent`, which records it before the harness
+    /// starts, and nothing has been reported since: still inside the boot
+    /// window.
+    Launched {
+        join: Join,
+        at: SystemTime,
+    },
+    /// Launched, and the harness has reported something other than
+    /// starting.
+    LaunchReported {
+        join: Join,
+        at: SystemTime,
+    },
+    /// The last report was a session starting, which a dialog may still be
+    /// covering.
+    Booting {
+        join: Join,
+    },
+    Live {
+        join: Join,
+    },
+}
+
+impl Session {
+    fn join(self) -> Join {
+        match self {
+            Self::Launched { join, .. }
+            | Self::LaunchReported { join, .. }
+            | Self::Booting { join }
+            | Self::Live { join } => join,
+        }
+    }
+
+    /// When the session was launched through `agent`, until it reports
+    /// starting or ending. Absent for sessions an older binary started.
+    fn launched_at(self) -> Option<SystemTime> {
+        match self {
+            Self::Launched { at, .. } | Self::LaunchReported { at, .. } => Some(at),
+            Self::Booting { .. } | Self::Live { .. } => None,
+        }
+    }
+
+    pub fn is_booting(self) -> bool {
+        matches!(self, Self::Launched { .. } | Self::Booting { .. })
+    }
+
+    fn after(self, event: &Event, now: SystemTime) -> Self {
+        match (event, self) {
+            (Event::Main(MainEvent::Launched(join)), _) => Self::Launched {
+                join: *join,
+                at: now,
+            },
+            (Event::Main(MainEvent::Started), session) => Self::Booting {
+                join: session.join(),
+            },
+            (Event::Main(MainEvent::Ended), session) => Self::Live {
+                join: session.join(),
+            },
+            (_, Self::Launched { join, at }) => Self::LaunchReported { join, at },
+            (_, Self::Booting { join }) => Self::Live { join },
+            (_, session @ (Self::LaunchReported { .. } | Self::Live { .. })) => session,
+        }
+    }
+}
+
 /// An agent's state, since when, what it was last asked, and what it's
 /// waiting on.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(from = "Stored")]
+#[serde(from = "Stored", into = "Written")]
 pub struct Activity {
     pub state: State,
     pub since: SystemTime,
@@ -260,18 +476,7 @@ pub struct Activity {
     /// Open questions, at most one per asker, oldest first.
     pub asks: Vec<Ask>,
     pub subagents: BTreeMap<AgentId, Subagent>,
-    /// The last thing reported was a session launching or starting, which a
-    /// dialog may still be covering.
-    pub booting: bool,
-    /// The process the current session was launched as. Reports from
-    /// processes that don't descend from it are from a session it replaced.
-    #[serde(default)]
-    pub launcher: Option<u32>,
-    /// When the current session was launched through `agent`, which records
-    /// it before the harness starts. Absent for sessions an older binary
-    /// started.
-    #[serde(default)]
-    pub launched: Option<SystemTime>,
+    pub session: Session,
 }
 
 /// How much earlier than a bound a launch may be recorded and still count
@@ -280,18 +485,13 @@ pub struct Activity {
 pub const LAUNCH_SLACK: Duration = Duration::from_secs(15);
 
 /// How long a session that just reported starting must stay quiet before
-/// typed text is safe: a startup dialog (trust, resume) fires no hook.
+/// typed text is safe: a startup dialog may be open without any report.
 pub const BOOT_QUIET: Duration = Duration::from_secs(5);
 
 impl Activity {
-    /// The activity after `reported` happened at `now`. The time in state
-    /// only restarts when the state itself changes, not when a working agent
-    /// moves to its next tool or answers a question.
-    pub fn next(previous: Option<Self>, reported: Reported, now: SystemTime) -> Self {
-        if let Some(previous) = previous.as_ref().filter(|p| p.is_stale_report(&reported)) {
-            return previous.clone();
-        }
-        let mut activity = previous.unwrap_or(Self {
+    /// What an agent that has reported nothing yet is taken to be doing.
+    pub fn fresh(now: SystemTime) -> Self {
+        Self {
             state: State::Working { tools: Vec::new() },
             since: now,
             prompt: None,
@@ -299,35 +499,29 @@ impl Activity {
             events: 0,
             asks: Vec::new(),
             subagents: BTreeMap::new(),
-            booting: false,
-            launcher: None,
-            launched: None,
-        });
-        let booting = matches!(
-            reported,
-            Reported {
-                origin: Origin::Main,
-                event: Event::Started | Event::Launched { .. },
-                ..
-            }
-        );
-        match (&reported.origin, &reported.event) {
-            (_, Event::Launched { pid }) => {
-                activity.launcher = *pid;
-                activity.launched = Some(now);
-            }
-            (Origin::Main, Event::Started | Event::Ended) => activity.launched = None,
-            _ => {}
+            session: Session::Live {
+                join: Join::Untraced,
+            },
         }
+    }
+
+    /// The activity after `reported` happened at `now`. The time in state
+    /// only restarts when the state itself changes, not when a working agent
+    /// moves to its next tool or answers a question.
+    pub fn next(previous: Option<Self>, reported: Reported, now: SystemTime) -> Self {
+        if let Some(previous) = previous.as_ref().filter(|p| p.is_stale_report(&reported)) {
+            return previous.clone();
+        }
+        let mut activity = previous.unwrap_or_else(|| Self::fresh(now));
+        activity.session = activity.session.after(&reported.event, now);
         let before = activity.state.clone();
-        let answered = activity.answer(&reported);
-        activity.apply(reported, answered, now);
+        let answered = activity.answer(&reported.event);
+        activity.apply(reported.event, answered, now);
         if !same_kind(&before, &activity.state) {
             activity.since = now;
         }
         activity.heard = now;
         activity.events += 1;
-        activity.booting = booting;
         activity
     }
 
@@ -335,64 +529,57 @@ impl Activity {
     /// launched last, such as a background session it replaced. Reports
     /// whose process couldn't be traced are given the benefit of the doubt.
     fn is_stale_report(&self, reported: &Reported) -> bool {
-        match (self.launcher, &reported.lineage, &reported.event) {
-            (_, _, Event::Launched { .. }) | (None, _, _) | (_, None, _) => false,
-            (Some(pid), Some(lineage), _) => !lineage.contains(&pid),
+        match (self.session.join(), &reported.lineage, &reported.event) {
+            (_, _, Event::Main(MainEvent::Launched(_))) | (Join::Untraced, _, _) | (_, None, _) => {
+                false
+            }
+            (Join::Fresh(pid), Some(lineage), _) => !lineage.contains(&pid),
         }
     }
 
-    /// Takes out the question `reported` shows was answered.
-    fn answer(&mut self, reported: &Reported) -> Option<Ask> {
-        let at = self.asks.iter().position(|ask| {
-            ask.asker == reported.origin
-                && match (&reported.event, &ask.answered_by) {
-                    (Event::ToolFinished { id }, Answer::ToolEnding(tool)) => id == tool,
-                    (Event::ToolStarted { .. } | Event::ToolFinished { .. }, Answer::AnyTool)
-                    | (
-                        Event::Declined
-                        | Event::Prompted(_)
-                        | Event::Failed(_)
-                        | Event::SubagentStopped,
-                        _,
-                    ) => true,
-                    _ => false,
-                }
-        })?;
+    /// Takes out the question `event` shows was answered.
+    fn answer(&mut self, event: &Event) -> Option<Ask> {
+        let at = self
+            .asks
+            .iter()
+            .position(|ask| event.is_from(&ask.asker) && event.answers(&ask.answered_by))?;
         Some(self.asks.remove(at))
     }
 
-    fn apply(
+    fn apply(&mut self, event: Event, answered: Option<Ask>, now: SystemTime) {
+        let state = std::mem::replace(&mut self.state, State::Idle);
+        self.state = match event {
+            Event::Main(event) => self.apply_main(event, state, answered, now),
+            Event::Subagent(id, event) => self.apply_subagent(id, event, state, answered, now),
+        };
+    }
+
+    fn apply_main(
         &mut self,
-        Reported { origin, event, .. }: Reported,
+        event: MainEvent,
+        state: State,
         answered: Option<Ask>,
         now: SystemTime,
-    ) {
-        let declined = match answered {
-            Some(Ask {
-                answered_by: Answer::ToolEnding(id),
-                ..
-            }) => Some(id),
-            _ => None,
-        };
-        let state = std::mem::replace(&mut self.state, State::Idle);
-        self.state = match (origin, event) {
-            (Origin::Main, Event::Launched { .. }) => {
+    ) -> State {
+        match event {
+            MainEvent::Launched(_) => {
                 self.forget_subagents();
                 State::Working { tools: Vec::new() }
             }
-            (Origin::Main, Event::Started) => {
+            MainEvent::Started => {
                 self.forget_subagents();
                 State::Idle
             }
-            (Origin::Main, Event::Ended) => {
+            MainEvent::Ended => {
                 self.forget_subagents();
                 State::Exited
             }
-            (Origin::Main, Event::Prompted(input)) => {
+            MainEvent::Compacted => state,
+            MainEvent::Prompted(input) => {
                 if let Input::User(text) = input {
                     self.prompt = Some(text);
                     self.subagents
-                        .retain(|_, s| s.launch == Launch::Background && s.finished.is_none());
+                        .retain(|_, s| s.launch == Launch::Background && s.is_running());
                     let subagents = &self.subagents;
                     self.asks.retain(|ask| match &ask.asker {
                         Origin::Subagent(id) => subagents.contains_key(id),
@@ -401,23 +588,7 @@ impl Activity {
                 }
                 State::Working { tools: Vec::new() }
             }
-            (Origin::Main, Event::ToolStarted { id, tool, target }) => {
-                let mut tools = running(state);
-                tools.retain(|t| t.id != id);
-                tools.push(Tool {
-                    id,
-                    name: tool,
-                    target,
-                    since: now,
-                });
-                State::Working { tools }
-            }
-            (Origin::Main, Event::Declined) => match declined {
-                Some(id) => finish(state, &id),
-                None => state,
-            },
-            (Origin::Main, Event::ToolFinished { id }) => finish(state, &id),
-            (Origin::Main, Event::Finished { summary, running }) => {
+            MainEvent::Finished { summary, running } => {
                 self.asks.retain(|ask| match &ask.asker {
                     Origin::Subagent(id) => running.iter().any(|b| &b.id == id),
                     Origin::Main => false,
@@ -429,66 +600,71 @@ impl Activity {
                     State::Delegating
                 }
             }
-            (Origin::Main, Event::Failed(reason)) => State::Failed { reason },
-            (asker, Event::Asked { question, about }) => {
-                let answered_by = self.answered_by(&asker, about, &state);
-                self.asks.retain(|ask| ask.asker != asker);
-                self.asks.push(Ask {
-                    asker,
-                    question,
-                    answered_by,
+            MainEvent::Failed(reason) => State::Failed { reason },
+            MainEvent::Common(Common::ToolStarted { id, tool, target }) => {
+                let mut tools = running(state);
+                tools.retain(|t| t.id != id);
+                tools.push(Tool {
+                    id,
+                    name: tool,
+                    target,
                     since: now,
                 });
+                State::Working { tools }
+            }
+            MainEvent::Common(Common::ToolFinished { id }) => finish(state, &id),
+            MainEvent::Common(Common::Declined) => match declined(answered) {
+                Some(id) => finish(state, &id),
+                None => state,
+            },
+            MainEvent::Common(Common::Asked { question, about }) => {
+                self.ask(Origin::Main, question, about, &state, now);
                 state
             }
-            (Origin::Subagent(id), Event::SubagentStarted { kind }) => {
-                self.subagents.entry(id).or_insert(Subagent {
-                    kind,
-                    description: None,
-                    launch: Launch::Foreground,
-                    tools: Vec::new(),
-                    since: now,
-                    finished: None,
-                });
+        }
+    }
+
+    fn apply_subagent(
+        &mut self,
+        id: AgentId,
+        event: SubagentEvent,
+        state: State,
+        answered: Option<Ask>,
+        now: SystemTime,
+    ) -> State {
+        match event {
+            SubagentEvent::Started { kind } => {
+                self.subagents
+                    .entry(id)
+                    .or_insert_with(|| Subagent::new(kind, Launch::Foreground, now));
                 state
             }
-            (
-                Origin::Subagent(id),
-                Event::SubagentLaunched {
-                    tool,
-                    kind,
-                    description,
-                },
-            ) => {
-                let subagent = self.subagents.entry(id).or_insert(Subagent {
-                    kind,
-                    description: None,
-                    launch: Launch::Background,
-                    tools: Vec::new(),
-                    since: now,
-                    finished: None,
-                });
+            SubagentEvent::Launched {
+                tool,
+                kind,
+                description,
+            } => {
+                let subagent = self
+                    .subagents
+                    .entry(id)
+                    .or_insert_with(|| Subagent::new(kind, Launch::Background, now));
                 subagent.launch = Launch::Background;
                 subagent.description = Some(description);
                 finish(state, &tool)
             }
-            (Origin::Subagent(id), Event::SubagentStopped) => {
+            SubagentEvent::Stopped => {
                 if let Some(subagent) = self.subagents.get_mut(&id) {
-                    subagent.finished = Some(now);
-                    subagent.tools.clear();
+                    subagent.finish(now);
                 }
                 state
             }
-            (
-                Origin::Subagent(id),
-                Event::ToolStarted {
-                    id: tool,
-                    tool: name,
-                    target,
-                },
-            ) => {
+            SubagentEvent::Common(Common::ToolStarted {
+                id: tool,
+                tool: name,
+                target,
+            }) => {
                 if let Some(subagent) = self.subagents.get_mut(&id) {
-                    subagent.tools.push(Tool {
+                    subagent.start(Tool {
                         id: tool,
                         name,
                         target,
@@ -497,45 +673,54 @@ impl Activity {
                 }
                 state
             }
-            (Origin::Subagent(id), Event::ToolFinished { id: tool }) => {
+            SubagentEvent::Common(Common::ToolFinished { id: tool }) => {
                 if let Some(subagent) = self.subagents.get_mut(&id) {
-                    subagent.tools.retain(|t| t.id != tool);
+                    subagent.end(&tool);
                 }
                 state
             }
-            (Origin::Subagent(id), Event::Declined) => {
-                if let (Some(subagent), Some(tool)) = (self.subagents.get_mut(&id), declined) {
-                    subagent.tools.retain(|t| t.id != tool);
+            SubagentEvent::Common(Common::Declined) => {
+                if let (Some(subagent), Some(tool)) =
+                    (self.subagents.get_mut(&id), declined(answered))
+                {
+                    subagent.end(&tool);
                 }
                 state
             }
-            (
-                Origin::Main,
-                Event::Compacted
-                | Event::SubagentStarted { .. }
-                | Event::SubagentLaunched { .. }
-                | Event::SubagentStopped,
-            )
-            | (Origin::Subagent(_), _) => state,
-        };
+            SubagentEvent::Common(Common::Asked { question, about }) => {
+                self.ask(Origin::Subagent(id), question, about, &state, now);
+                state
+            }
+        }
+    }
+
+    fn ask(
+        &mut self,
+        asker: Origin,
+        question: String,
+        about: About,
+        state: &State,
+        now: SystemTime,
+    ) {
+        let answered_by = self.answered_by(&asker, about, state);
+        self.asks.retain(|ask| ask.asker != asker);
+        self.asks.push(Ask {
+            asker,
+            question,
+            answered_by,
+            since: now,
+        });
     }
 
     /// The finished turn's background subagents replace the ones tracked.
     fn track_background(&mut self, running: &[Background], now: SystemTime) {
         self.subagents
-            .retain(|id, s| s.finished.is_some() || running.iter().any(|b| &b.id == id));
+            .retain(|id, s| !s.is_running() || running.iter().any(|b| &b.id == id));
         for b in running {
             let subagent = self
                 .subagents
                 .entry(b.id.clone())
-                .or_insert_with(|| Subagent {
-                    kind: b.kind.clone(),
-                    description: None,
-                    launch: Launch::Background,
-                    tools: Vec::new(),
-                    since: now,
-                    finished: None,
-                });
+                .or_insert_with(|| Subagent::new(b.kind.clone(), Launch::Background, now));
             subagent.launch = Launch::Background;
             if b.description.is_some() {
                 subagent.description.clone_from(&b.description);
@@ -554,7 +739,7 @@ impl Activity {
         let running: &[Tool] = match (asker, state) {
             (Origin::Main, State::Working { tools }) => tools,
             (Origin::Main, _) => &[],
-            (Origin::Subagent(id), _) => self.subagents.get(id).map_or(&[], |s| &s.tools),
+            (Origin::Subagent(id), _) => self.subagents.get(id).map_or(&[], Subagent::tools),
         };
         running
             .iter()
@@ -581,7 +766,7 @@ impl Activity {
     pub fn ready_for_text(&self, not_before: Option<SystemTime>, now: SystemTime) -> bool {
         self.at_rest()
             && self.bound_met(not_before)
-            && !(self.booting
+            && !(self.session.is_booting()
                 && now
                     .duration_since(self.heard)
                     .is_ok_and(|quiet| quiet < BOOT_QUIET))
@@ -591,16 +776,18 @@ impl Activity {
     /// has launched since (so its own boot state is authoritative), or the
     /// harness has reported after it.
     pub fn bound_met(&self, not_before: Option<SystemTime>) -> bool {
-        not_before
-            .is_none_or(|t| self.heard > t || self.launched.is_some_and(|l| l + LAUNCH_SLACK >= t))
+        not_before.is_none_or(|t| {
+            self.heard > t
+                || self
+                    .session
+                    .launched_at()
+                    .is_some_and(|l| l + LAUNCH_SLACK >= t)
+        })
     }
 
     /// How many subagents are still running.
     pub fn running(&self) -> usize {
-        self.subagents
-            .values()
-            .filter(|s| s.finished.is_none())
-            .count()
+        self.subagents.values().filter(|s| s.is_running()).count()
     }
 
     /// The question that's waited longest, if any.
@@ -631,11 +818,11 @@ impl Activity {
     }
 
     /// Working or delegating with no tool running, its own or a subagent's,
-    /// and nothing heard for [`STALE_AFTER`]: probably interrupted (Esc fires
-    /// no hook), stuck, or its subagents died with the session.
+    /// and nothing heard for [`STALE_AFTER`]: probably interrupted without
+    /// the harness saying so, stuck, or its subagents died with the session.
     pub fn stale(&self, now: SystemTime) -> bool {
         let quiet = now.duration_since(self.heard).unwrap_or_default() > STALE_AFTER;
-        let subagent_busy = self.subagents.values().any(|s| !s.tools.is_empty());
+        let subagent_busy = self.subagents.values().any(|s| !s.tools().is_empty());
         match &self.state {
             State::Working { tools } => tools.is_empty() && !subagent_busy && quiet,
             State::Delegating => !subagent_busy && quiet,
@@ -645,7 +832,8 @@ impl Activity {
 }
 
 /// An activity file as written by any version, including ones that kept a
-/// single question in the state.
+/// single question in the state and ones that spread the session over
+/// `booting`, `launcher` and `launched`.
 #[derive(Deserialize)]
 struct Stored {
     state: StoredState,
@@ -658,11 +846,130 @@ struct Stored {
     #[serde(default)]
     subagents: BTreeMap<AgentId, Subagent>,
     #[serde(default)]
+    session: Option<Session>,
+    #[serde(default)]
     booting: bool,
     #[serde(default)]
     launcher: Option<u32>,
     #[serde(default)]
     launched: Option<SystemTime>,
+}
+
+/// What an activity file holds. The fields `session` replaced are written
+/// too, derived from it, so a binary from before it still reads a booting
+/// agent as booting.
+#[derive(Serialize)]
+struct Written {
+    state: State,
+    since: SystemTime,
+    prompt: Option<String>,
+    heard: SystemTime,
+    events: u64,
+    asks: Vec<Ask>,
+    subagents: BTreeMap<AgentId, Subagent>,
+    session: Session,
+    booting: bool,
+    launcher: Option<u32>,
+    launched: Option<SystemTime>,
+}
+
+impl From<Activity> for Written {
+    fn from(activity: Activity) -> Self {
+        let launcher = match activity.session.join() {
+            Join::Fresh(pid) => Some(pid.get()),
+            Join::Untraced => None,
+        };
+        Self {
+            state: activity.state,
+            since: activity.since,
+            prompt: activity.prompt,
+            heard: activity.heard,
+            events: activity.events,
+            asks: activity.asks,
+            subagents: activity.subagents,
+            session: activity.session,
+            booting: activity.session.is_booting(),
+            launcher,
+            launched: activity.session.launched_at(),
+        }
+    }
+}
+
+/// A subagent with `tools` and `finished` written beside `status`, for the
+/// same reason.
+#[derive(Serialize)]
+struct WrittenSubagent {
+    kind: String,
+    description: Option<String>,
+    launch: Launch,
+    since: SystemTime,
+    tools: Vec<Tool>,
+    finished: Option<SystemTime>,
+    status: SubagentStatus,
+}
+
+impl From<Subagent> for WrittenSubagent {
+    fn from(subagent: Subagent) -> Self {
+        let finished = match subagent.status {
+            SubagentStatus::Running { .. } => None,
+            SubagentStatus::Finished { at } => Some(at),
+        };
+        Self {
+            tools: subagent.tools().to_vec(),
+            finished,
+            kind: subagent.kind,
+            description: subagent.description,
+            launch: subagent.launch,
+            since: subagent.since,
+            status: subagent.status,
+        }
+    }
+}
+
+/// A subagent as written by any version, including ones that kept `tools`
+/// and `finished` apart.
+#[derive(Deserialize)]
+struct StoredSubagent {
+    kind: String,
+    description: Option<String>,
+    launch: Launch,
+    #[serde(default)]
+    tools: Vec<Tool>,
+    since: SystemTime,
+    #[serde(default)]
+    finished: Option<SystemTime>,
+    #[serde(default)]
+    status: Option<SubagentStatus>,
+}
+
+impl From<StoredSubagent> for Subagent {
+    fn from(stored: StoredSubagent) -> Self {
+        let status = stored.status.unwrap_or(match stored.finished {
+            Some(at) => SubagentStatus::Finished { at },
+            None => SubagentStatus::Running {
+                tools: stored.tools,
+            },
+        });
+        Self {
+            kind: stored.kind,
+            description: stored.description,
+            launch: stored.launch,
+            since: stored.since,
+            status,
+        }
+    }
+}
+
+fn legacy_session(booting: bool, launcher: Option<u32>, launched: Option<SystemTime>) -> Session {
+    let join = launcher
+        .and_then(Pid::new)
+        .map_or(Join::Untraced, Join::Fresh);
+    match (launched, booting) {
+        (Some(at), true) => Session::Launched { join, at },
+        (Some(at), false) => Session::LaunchReported { join, at },
+        (None, true) => Session::Booting { join },
+        (None, false) => Session::Live { join },
+    }
 }
 
 #[derive(Deserialize)]
@@ -688,6 +995,7 @@ impl From<Stored> for Activity {
             events,
             mut asks,
             subagents,
+            session,
             booting,
             launcher,
             launched,
@@ -712,9 +1020,7 @@ impl From<Stored> for Activity {
             events,
             asks,
             subagents,
-            booting,
-            launcher,
-            launched,
+            session: session.unwrap_or_else(|| legacy_session(booting, launcher, launched)),
         }
     }
 }
@@ -724,6 +1030,17 @@ fn running(state: State) -> Vec<Tool> {
     match state {
         State::Working { tools } => tools,
         _ => Vec::new(),
+    }
+}
+
+/// The call a declined question was about, when it named one.
+fn declined(answered: Option<Ask>) -> Option<ToolId> {
+    match answered {
+        Some(Ask {
+            answered_by: Answer::ToolEnding(id),
+            ..
+        }) => Some(id),
+        _ => None,
     }
 }
 
@@ -760,41 +1077,53 @@ mod tests {
         activity.expect("succeeds")
     }
 
-    fn main(event: Event) -> Reported {
+    fn main(event: impl Into<MainEvent>) -> Reported {
         Reported::main(event)
     }
 
-    fn sub(id: &str, event: Event) -> Reported {
+    fn sub(id: &str, event: impl Into<SubagentEvent>) -> Reported {
         Reported::subagent(AgentId::new(id), event)
     }
 
-    fn start(id: &str, tool: &str) -> Event {
-        Event::ToolStarted {
+    fn pid(raw: u32) -> Pid {
+        Pid::new(raw).expect("nonzero")
+    }
+
+    fn fresh(raw: u32) -> MainEvent {
+        MainEvent::Launched(Join::Fresh(pid(raw)))
+    }
+
+    fn untraced() -> MainEvent {
+        MainEvent::Launched(Join::Untraced)
+    }
+
+    fn start(id: &str, tool: &str) -> Common {
+        Common::ToolStarted {
             id: ToolId::new(id),
             tool: tool.into(),
             target: None,
         }
     }
 
-    fn end(id: &str) -> Event {
-        Event::ToolFinished {
+    fn end(id: &str) -> Common {
+        Common::ToolFinished {
             id: ToolId::new(id),
         }
     }
 
-    fn user(text: &str) -> Event {
-        Event::Prompted(Input::User(text.into()))
+    fn user(text: &str) -> MainEvent {
+        MainEvent::Prompted(Input::User(text.into()))
     }
 
-    fn asked(question: &str) -> Event {
-        Event::Asked {
+    fn asked(question: &str) -> Common {
+        Common::Asked {
             question: question.into(),
             about: About::Unknown,
         }
     }
 
-    fn finished(running: &[&str]) -> Event {
-        Event::Finished {
+    fn finished(running: &[&str]) -> MainEvent {
+        MainEvent::Finished {
             summary: None,
             running: running
                 .iter()
@@ -807,14 +1136,14 @@ mod tests {
         }
     }
 
-    fn started() -> Event {
-        Event::SubagentStarted {
+    fn started() -> SubagentEvent {
+        SubagentEvent::Started {
             kind: "general-purpose".into(),
         }
     }
 
-    fn launched(tool: &str) -> Event {
-        Event::SubagentLaunched {
+    fn launched(tool: &str) -> SubagentEvent {
+        SubagentEvent::Launched {
             tool: ToolId::new(tool),
             kind: "general-purpose".into(),
             description: "review".into(),
@@ -828,7 +1157,7 @@ mod tests {
     #[test]
     fn a_turn_works_through_tools_and_finishes_unseen() {
         let activity = run(vec![
-            (0, main(Event::Started)),
+            (0, main(MainEvent::Started)),
             (10, main(user("fix it"))),
             (12, main(start("t1", "Bash"))),
             (40, main(end("t1"))),
@@ -842,7 +1171,7 @@ mod tests {
         assert_eq!(activity.prompt.as_deref(), Some("fix it"));
         let done = Activity::next(
             Some(activity),
-            main(Event::Finished {
+            main(MainEvent::Finished {
                 summary: Some("Fixed.".into()),
                 running: Vec::new(),
             }),
@@ -883,7 +1212,7 @@ mod tests {
             (1, main(start("t", "Bash"))),
             (
                 2,
-                main(Event::Asked {
+                main(Common::Asked {
                     question: "Bash: cargo build".into(),
                     about: About::Call {
                         tool: "Bash".into(),
@@ -926,8 +1255,8 @@ mod tests {
             (2, sub("a", start("x", "Bash"))),
             (3, sub("a", asked("Bash: rm -rf target"))),
             (4, sub("b", start("y", "Read"))),
-            (5, sub("b", Event::SubagentStopped)),
-            (6, main(Event::Compacted)),
+            (5, sub("b", SubagentEvent::Stopped)),
+            (6, main(MainEvent::Compacted)),
         ]);
         assert_eq!(questions(&asking), ["Bash: rm -rf target"]);
         let answered = Activity::next(Some(asking), sub("a", end("x")), at(7));
@@ -972,7 +1301,7 @@ mod tests {
             (1, main(start("read", "Read"))),
             (
                 2,
-                main(Event::Asked {
+                main(Common::Asked {
                     question: "Bash: rm -rf target".into(),
                     about: About::Call {
                         tool: "Bash".into(),
@@ -987,7 +1316,7 @@ mod tests {
             ["Bash: rm -rf target"],
             "the parallel Read ending isn't an answer"
         );
-        let declined = Activity::next(Some(asking), main(Event::Declined), at(4));
+        let declined = Activity::next(Some(asking), main(Common::Declined), at(4));
         assert_eq!(questions(&declined), [""; 0]);
         assert_eq!(
             declined.current_tool(),
@@ -1038,8 +1367,8 @@ mod tests {
             (0, main(user("review it"))),
             (1, sub("a", launched("t"))),
             (3, main(finished(&["a"]))),
-            (90, main(Event::Prompted(Input::Notification))),
-            (91, sub("a", Event::SubagentStopped)),
+            (90, main(MainEvent::Prompted(Input::Notification))),
+            (91, sub("a", SubagentEvent::Stopped)),
         ]);
         assert_eq!(
             handed_back.prompt.as_deref(),
@@ -1048,7 +1377,7 @@ mod tests {
         );
         assert_eq!(handed_back.running(), 0);
         assert!(
-            handed_back.subagents[&AgentId::new("a")].finished.is_some(),
+            !handed_back.subagents[&AgentId::new("a")].is_running(),
             "the finished one stays until the next prompt"
         );
         let done = Activity::next(Some(handed_back), main(finished(&[])), at(95));
@@ -1076,7 +1405,7 @@ mod tests {
         let gone = run(vec![
             (0, sub("a", started())),
             (1, sub("a", asked("Bash: ls"))),
-            (2, sub("a", Event::SubagentStopped)),
+            (2, sub("a", SubagentEvent::Stopped)),
         ]);
         assert_eq!(questions(&gone), [""; 0]);
     }
@@ -1096,13 +1425,13 @@ mod tests {
         let back = run(vec![
             (0, main(start("t", "Agent"))),
             (1, sub("a", started())),
-            (5, sub("a", Event::SubagentStopped)),
+            (5, sub("a", SubagentEvent::Stopped)),
             (6, main(end("t"))),
         ]);
         assert_eq!(back.running(), 0);
         let next = Activity::next(
             Some(back),
-            Reported::main(Event::Prompted(Input::User("again".into()))),
+            Reported::main(MainEvent::Prompted(Input::User("again".into()))),
             at(6),
         );
         assert_eq!(
@@ -1154,7 +1483,7 @@ mod tests {
             (0, sub("a", launched("t"))),
             (1, main(finished(&["a"]))),
             (2, sub("a", asked("Bash: ls"))),
-            (9, main(Event::Started)),
+            (9, main(MainEvent::Started)),
         ]);
         assert!(resumed.subagents.is_empty() && resumed.asks.is_empty());
         let stopped = run(vec![(0, sub("a", launched("t"))), (9, main(finished(&[])))]);
@@ -1168,7 +1497,7 @@ mod tests {
     fn compacting_keeps_what_it_was_doing() {
         let compacting = run(vec![
             (0, main(start("t", "Read"))),
-            (5, main(Event::Compacted)),
+            (5, main(MainEvent::Compacted)),
         ]);
         assert_eq!(
             compacting.current_tool().map(|t| t.name.as_str()),
@@ -1258,11 +1587,8 @@ mod tests {
 
     #[test]
     fn a_launch_at_or_after_the_bound_makes_the_record_its_own_authority() {
-        let a = run(vec![
-            (20, main(Event::Launched { pid: Some(7) })),
-            (30, main(finished(&[]))),
-        ]);
-        assert!(a.launched.is_some());
+        let a = run(vec![(20, main(fresh(7))), (30, main(finished(&[])))]);
+        assert!(a.session.launched_at().is_some());
         assert!(a.ready_for_text(Some(at(25)), at(100)));
         assert!(a.ready_for_text(Some(at(20 + LAUNCH_SLACK.as_secs())), at(100)));
         assert!(
@@ -1270,81 +1596,80 @@ mod tests {
             "a launch far before the bound doesn't count"
         );
         let a = run(vec![(10, main(finished(&[])))]);
-        assert!(a.launched.is_none());
+        assert!(a.session.launched_at().is_none());
         assert!(!a.ready_for_text(Some(at(20)), at(1000)), "no lapse");
         assert!(!a.bound_met(Some(at(20))));
     }
 
     #[test]
     fn a_session_that_only_just_started_gets_time_to_show_a_dialog() {
-        let a = run(vec![(10, main(finished(&[]))), (20, main(Event::Started))]);
-        assert!(a.at_rest() && a.booting);
+        let a = run(vec![
+            (10, main(finished(&[]))),
+            (20, main(MainEvent::Started)),
+        ]);
+        assert!(a.at_rest() && a.session.is_booting());
         assert!(!a.ready_for_text(Some(at(15)), at(21)));
         assert!(a.ready_for_text(Some(at(15)), at(20 + BOOT_QUIET.as_secs())));
         let a = run(vec![
-            (20, main(Event::Started)),
+            (20, main(MainEvent::Started)),
             (21, main(user("go"))),
             (22, main(finished(&[]))),
         ]);
-        assert!(!a.booting);
+        assert!(!a.session.is_booting());
         assert!(a.ready_for_text(Some(at(15)), at(23)));
     }
 
     #[test]
     fn a_launched_agent_is_busy_until_its_session_has_been_quiet() {
-        let a = run(vec![
-            (10, main(finished(&[]))),
-            (20, main(Event::Launched { pid: Some(7) })),
-        ]);
-        assert!(!a.at_rest() && a.booting);
+        let a = run(vec![(10, main(finished(&[]))), (20, main(fresh(7)))]);
+        assert!(!a.at_rest() && a.session.is_booting());
         assert!(!a.ready_for_text(Some(at(15)), at(100)));
         let a = run(vec![
             (10, main(finished(&[]))),
-            (20, main(Event::Launched { pid: Some(7) })),
-            (21, main(Event::Started)),
+            (20, main(fresh(7))),
+            (21, main(MainEvent::Started)),
         ]);
-        assert!(a.at_rest() && a.booting);
+        assert!(a.at_rest() && a.session.is_booting());
         assert!(!a.ready_for_text(Some(at(15)), at(22)));
         assert!(a.ready_for_text(Some(at(15)), at(21 + BOOT_QUIET.as_secs())));
-        let a = run(vec![
-            (10, main(finished(&[]))),
-            (20, main(Event::Launched { pid: Some(7) })),
-        ]);
+        let a = run(vec![(10, main(finished(&[]))), (20, main(fresh(7)))]);
         assert!(a.asks.is_empty() && a.subagents.is_empty());
     }
 
     #[test]
     fn reports_from_a_replaced_process_are_ignored_after_a_launch() {
-        let from = |pids: &[u32], event| main(event).from_lineage(Some(pids.to_vec()));
+        let from = |pids: &[u32], event| {
+            main(event).from_lineage(Some(pids.iter().filter_map(|p| Pid::new(*p)).collect()))
+        };
         let a = run(vec![
             (10, main(finished(&[]))),
-            (20, main(Event::Launched { pid: Some(7) })),
+            (20, main(fresh(7))),
             (21, from(&[99, 98], finished(&[]))),
         ]);
-        assert!(!a.at_rest() && a.booting);
+        assert!(!a.at_rest() && a.session.is_booting());
         assert_eq!(a.heard, at(20));
         let a = run(vec![
-            (20, main(Event::Launched { pid: Some(7) })),
-            (21, from(&[50, 7, 3], Event::Started)),
+            (20, main(fresh(7))),
+            (21, from(&[50, 7, 3], MainEvent::Started)),
         ]);
         assert!(a.at_rest());
     }
 
     #[test]
     fn untraceable_or_unrecorded_reports_are_accepted() {
-        let a = run(vec![
-            (20, main(Event::Launched { pid: Some(7) })),
-            (21, main(Event::Started)),
-        ]);
+        let a = run(vec![(20, main(fresh(7))), (21, main(MainEvent::Started))]);
         assert!(a.at_rest(), "no lineage");
         let a = run(vec![
-            (20, main(Event::Launched { pid: None })),
-            (21, main(Event::Started).from_lineage(Some(vec![99]))),
+            (20, main(untraced())),
+            (
+                21,
+                main(MainEvent::Started).from_lineage(Some(vec![pid(99)])),
+            ),
         ]);
         assert!(a.at_rest(), "reattached session");
         let a = run(vec![(
             21,
-            main(Event::Started).from_lineage(Some(vec![99])),
+            main(MainEvent::Started).from_lineage(Some(vec![pid(99)])),
         )]);
         assert!(a.at_rest(), "old record");
     }
@@ -1373,17 +1698,164 @@ mod tests {
 
     #[test]
     fn a_launch_vouches_only_for_its_own_boot() {
-        let launched = run(vec![(0, main(Event::Launched { pid: None }))]);
-        assert_eq!(launched.launched, Some(at(0)));
-        let started = Activity::next(Some(launched.clone()), main(Event::Started), at(1));
+        let launched = run(vec![(0, main(untraced()))]);
+        assert_eq!(launched.session.launched_at(), Some(at(0)));
+        let started = Activity::next(Some(launched.clone()), main(MainEvent::Started), at(1));
         assert_eq!(
-            started.launched, None,
+            started.session.launched_at(),
+            None,
             "its session has reported, so heard takes over"
         );
-        let ended = Activity::next(Some(launched), main(Event::Ended), at(2));
+        let ended = Activity::next(Some(launched), main(MainEvent::Ended), at(2));
         assert_eq!(
-            ended.launched, None,
+            ended.session.launched_at(),
+            None,
             "a gone session can't vouch for the next"
         );
+    }
+
+    #[test]
+    fn a_tool_starting_after_its_subagent_stopped_isnt_running() {
+        let a = run(vec![
+            (0, sub("a", started())),
+            (1, sub("a", SubagentEvent::Stopped)),
+            (2, sub("a", start("x", "Bash"))),
+        ]);
+        let subagent = &a.subagents[&AgentId::new("a")];
+        assert_eq!(
+            (subagent.status.clone(), subagent.tools().len()),
+            (SubagentStatus::Finished { at: at(1) }, 0)
+        );
+        assert!(!a.stale(at(3)) && a.running() == 0);
+        let working = run(vec![(0, main(user("go")))]);
+        assert!(working.stale(at(400)), "no subagent keeps it busy");
+        let a = run(vec![
+            (0, main(user("go"))),
+            (1, sub("a", launched("t"))),
+            (2, sub("a", SubagentEvent::Stopped)),
+            (3, sub("a", start("x", "Bash"))),
+        ]);
+        assert!(a.stale(at(400)), "a stopped subagent's tool can't hold it");
+    }
+
+    fn old_file(extra: &str) -> Activity {
+        let time = r#"{"secs_since_epoch":20,"nanos_since_epoch":0}"#;
+        let json = format!(
+            r#"{{"state":{{"kind":"idle"}},"since":{time},"prompt":null,"heard":{time},"events":1{extra}}}"#
+        );
+        serde_json::from_str(&json).expect("json")
+    }
+
+    #[test]
+    fn sessions_from_the_separate_fields_still_load() {
+        let time = r#"{"secs_since_epoch":20,"nanos_since_epoch":0}"#;
+        assert_eq!(
+            old_file("").session,
+            Session::Live {
+                join: Join::Untraced
+            }
+        );
+        assert_eq!(
+            old_file(r#","launcher":7"#).session,
+            Session::Live {
+                join: Join::Fresh(pid(7))
+            }
+        );
+        assert_eq!(
+            old_file(r#","booting":true,"launcher":7"#).session,
+            Session::Booting {
+                join: Join::Fresh(pid(7))
+            }
+        );
+        assert_eq!(
+            old_file(&format!(
+                r#","booting":true,"launcher":7,"launched":{time}"#
+            ))
+            .session,
+            Session::Launched {
+                join: Join::Fresh(pid(7)),
+                at: at(20)
+            }
+        );
+        assert_eq!(
+            old_file(&format!(r#","booting":false,"launched":{time}"#)).session,
+            Session::LaunchReported {
+                join: Join::Untraced,
+                at: at(20)
+            }
+        );
+        assert_eq!(
+            old_file(r#","launcher":0"#).session,
+            Session::Live {
+                join: Join::Untraced
+            },
+            "zero was never a process"
+        );
+    }
+
+    #[test]
+    fn subagents_from_the_separate_fields_still_load() {
+        let time = r#"{"secs_since_epoch":20,"nanos_since_epoch":0}"#;
+        let tool = format!(r#"{{"id":"x","name":"Bash","target":null,"since":{time}}}"#);
+        let subagent = |extra: &str| {
+            let a = old_file(&format!(
+                r#","subagents":{{"a":{{"kind":"Explore","description":null,"launch":"background","since":{time}{extra}}}}}"#
+            ));
+            a.subagents[&AgentId::new("a")].clone()
+        };
+        let running = subagent(&format!(r#","tools":[{tool}]"#));
+        assert_eq!((running.is_running(), running.tools().len()), (true, 1));
+        let finished = subagent(&format!(r#","tools":[],"finished":{time}"#));
+        assert_eq!(finished.status, SubagentStatus::Finished { at: at(20) });
+        let bare = subagent("");
+        assert!(bare.is_running() && bare.tools().is_empty());
+    }
+
+    #[test]
+    fn the_session_survives_a_round_trip() {
+        let a = run(vec![
+            (0, main(fresh(7))),
+            (1, sub("a", launched("t"))),
+            (2, sub("a", SubagentEvent::Stopped)),
+        ]);
+        let json = serde_json::to_string(&a).expect("json");
+        assert_eq!(serde_json::from_str::<Activity>(&json).expect("json"), a);
+    }
+
+    #[test]
+    fn an_older_reader_sees_a_booting_session_as_booting() {
+        #[derive(Deserialize)]
+        struct Before {
+            #[serde(default)]
+            booting: bool,
+            #[serde(default)]
+            launcher: Option<u32>,
+            #[serde(default)]
+            launched: Option<SystemTime>,
+        }
+        let read = |a: &Activity| {
+            let before: Before =
+                serde_json::from_str(&serde_json::to_string(a).expect("json")).expect("json");
+            (before.booting, before.launcher, before.launched)
+        };
+        let launched = run(vec![(20, main(fresh(7)))]);
+        assert_eq!(read(&launched), (true, Some(7), Some(at(20))));
+        let started = Activity::next(Some(launched), main(MainEvent::Started), at(21));
+        assert_eq!(read(&started), (true, Some(7), None));
+        let live = Activity::next(Some(started), main(user("go")), at(22));
+        assert_eq!(read(&live), (false, Some(7), None));
+    }
+
+    #[test]
+    fn a_report_other_than_starting_ends_the_boot_but_not_the_launch() {
+        let a = run(vec![(20, main(untraced())), (21, main(user("go")))]);
+        assert_eq!(
+            a.session,
+            Session::LaunchReported {
+                join: Join::Untraced,
+                at: at(20)
+            }
+        );
+        assert!(a.bound_met(Some(at(25))) && !a.session.is_booting());
     }
 }

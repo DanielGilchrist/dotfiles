@@ -3,7 +3,7 @@
 
 use std::time::{Duration, SystemTime};
 
-use agent_core::activity::Subagent;
+use agent_core::activity::{Subagent, SubagentStatus};
 use agent_core::ports::{Call, CallState, Excerpt, SubagentDetail, Summary, Target};
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
@@ -531,7 +531,10 @@ fn status_row(
         .filter(|_| !narrow)
         .map(|m| Span::styled(m, dim()));
     let began = subagent.map(|s| s.since).or(detail.started);
-    let ended = subagent.and_then(|s| s.finished).or(detail.last_heard);
+    let ended = match subagent.map(|s| &s.status) {
+        Some(SubagentStatus::Finished { at }) => Some(*at),
+        Some(SubagentStatus::Running { .. }) | None => detail.last_heard,
+    };
     let working = began
         .and_then(|from| ctx.now.duration_since(from).ok())
         .map(span);
@@ -625,9 +628,9 @@ pub(super) fn render(
     nav: &Nav,
     ctx: &Context<'_>,
 ) -> Rendered {
-    let finished = detail.finished || subagent.is_some_and(|s| s.finished.is_some());
+    let finished = detail.finished || subagent.is_some_and(|s| !s.is_running());
     let live = !finished;
-    let idle = subagent.is_none_or(|s| s.tools.is_empty())
+    let idle = subagent.is_none_or(|s| s.tools().is_empty())
         && !detail
             .log
             .iter()
@@ -657,7 +660,7 @@ pub(super) fn render(
         narrow,
         live,
         stale,
-        running_since: subagent.and_then(|s| s.tools.last()).map(|t| t.since),
+        running_since: subagent.and_then(|s| s.tools().last()).map(|t| t.since),
         out: Vec::new(),
         after_rule: false,
     };

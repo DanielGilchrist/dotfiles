@@ -7,7 +7,7 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use agent_core::activity::Subagent;
+use agent_core::activity::{Subagent, SubagentStatus};
 use agent_core::model::{Entry, Head, Repo, RepoKey, Snapshot};
 use agent_core::names::SessionName;
 use agent_core::ports::{Compared, DiffStat, Edit, FileState, WorktreeFacts};
@@ -610,12 +610,12 @@ fn tree(
             } else {
                 "├ "
             };
-            let (glyph, since) = match subagent.finished {
-                Some(at) => (
+            let (glyph, since) = match subagent.status {
+                SubagentStatus::Finished { at } => (
                     Span::styled("✓", success().add_modifier(Modifier::BOLD)),
                     ago(subagent.since, at),
                 ),
-                None => (Span::raw(spinner()), ago(subagent.since, now)),
+                SubagentStatus::Running { .. } => (Span::raw(spinner()), ago(subagent.since, now)),
             };
             let described = subagent.description.as_deref().filter(|d| !d.is_empty());
             let (label, kind_only, right) = match (described, form) {
@@ -3065,7 +3065,7 @@ mod tests {
             .get_mut(&name("obs-layout-4"))
             .and_then(|a| a.subagents.get_mut(&AgentId::new("s1")))
             .expect("a subagent");
-        sub.tools.push(agent_core::activity::Tool {
+        sub.start(agent_core::activity::Tool {
             id: agent_core::activity::ToolId::new("t"),
             name: "Bash".into(),
             target: Some("cargo test".into()),

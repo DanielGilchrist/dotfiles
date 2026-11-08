@@ -1,10 +1,11 @@
 //! Models for tests, built the way discovery builds them.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
 use agent_core::activity::{
-    Activity, AgentId, Answer, Ask, Launch, Origin, State, Subagent, Tool, ToolId,
+    Activity, AgentId, Answer, Ask, Join, Launch, Origin, Session, State, Subagent, SubagentStatus,
+    Tool, ToolId,
 };
 use agent_core::discover::{Observation, assemble};
 use agent_core::model::{Head, Worktree};
@@ -35,11 +36,7 @@ pub fn reported(state: State, secs_ago: u64) -> Activity {
         prompt: Some("go".into()),
         heard: since,
         events: 1,
-        asks: Vec::new(),
-        subagents: BTreeMap::new(),
-        booting: false,
-        launcher: None,
-        launched: None,
+        ..Activity::fresh(since)
     }
 }
 
@@ -113,9 +110,8 @@ fn doing(k: usize) -> Option<Activity> {
                         kind: "general-purpose".into(),
                         description: Some(description.into()),
                         launch: Launch::Background,
-                        tools: Vec::new(),
                         since: SystemTime::now() - Duration::from_secs(30 + 10 * i as u64),
-                        finished: None,
+                        status: SubagentStatus::Running { tools: Vec::new() },
                     },
                 );
             }
@@ -265,4 +261,26 @@ pub fn fleet(n: usize) -> Model {
     m.revalidate();
     m.changes_view = crate::tree::ChangesView::Flat;
     m
+}
+
+/// A session launched `ago` ago, with nothing reported since.
+pub fn launched(ago: Duration) -> Session {
+    Session::Launched {
+        join: Join::Untraced,
+        at: SystemTime::now() - ago,
+    }
+}
+
+/// A session launched `ago` ago that has reported since, but not starting.
+pub fn launch_reported(ago: Duration) -> Session {
+    Session::LaunchReported {
+        join: Join::Untraced,
+        at: SystemTime::now() - ago,
+    }
+}
+
+pub fn booting() -> Session {
+    Session::Booting {
+        join: Join::Untraced,
+    }
 }
