@@ -141,9 +141,43 @@ local function build_attach_cmd(name)
   return { "zellij", "attach", name }
 end
 
+---Tab pages opened by `attach_in_terminal` just for an agent, as opposed to
+---the user's own tab that a repo session was split into.
+---@type table<integer, true>
+M.agent_tabs = {}
+
+---Forget a terminal whose zellij client exited (session ended, detached, or
+---moved to another window by the `agent` TUI) and close what was opened for
+---it, so the next attach starts fresh instead of reusing a dead buffer. A
+---failed attach keeps its buffer so the error stays readable.
+---@param name string
+---@param buf integer
+---@param status integer
+local function forget_terminal(name, buf, status)
+  local term = M.agent_terminals[name]
+  if not (term and term.buf == buf) then return end
+  M.agent_terminals[name] = nil
+  for tabid, agent in pairs(M.tab_agents) do
+    if agent == name then
+      M.tab_agents[tabid] = nil
+      if status == 0 and M.agent_tabs[tabid] and vim.api.nvim_tabpage_is_valid(tabid) and #vim.api.nvim_list_tabpages() > 1 then
+        pcall(vim.api.nvim_command, "tabclose " .. vim.api.nvim_tabpage_get_number(tabid))
+      end
+      M.agent_tabs[tabid] = nil
+    end
+  end
+  if M.last_attached == name then M.last_attached = nil end
+  if status ~= 0 then
+    notify.warn(("zellij attach %s exited with %d"):format(name, status))
+    return
+  end
+  if vim.api.nvim_buf_is_valid(buf) then pcall(vim.api.nvim_buf_delete, buf, { force = true }) end
+end
+
 ---Open the agent terminal. Terminal-mode <C-h/j/k/l> window-nav maps are
 ---buffer-local here — globally they'd shadow TUI apps' own bindings
----(e.g. lazygit's move-commit keys).
+---(e.g. lazygit's move-commit keys). Snacks calls `on_buf` on every show,
+---so the exit hook is registered once per buffer.
 ---@param cmd string[]
 local function open_agent_terminal(name, cmd)
   return Snacks.terminal.open(cmd, {
@@ -158,6 +192,17 @@ local function open_agent_terminal(name, cmd)
             { buffer = self.buf, desc = "agent: go to window " .. direction }
           )
         end
+        local buf = self.buf
+        if vim.b[buf].agent_exit_hook then return end
+        vim.b[buf].agent_exit_hook = true
+        vim.api.nvim_create_autocmd("TermClose", {
+          buffer = buf,
+          once = true,
+          callback = function()
+            local status = vim.v.event.status
+            vim.schedule(function() forget_terminal(name, buf, status) end)
+          end,
+        })
       end,
     },
     auto_close = false,
@@ -213,6 +258,7 @@ function M.attach_in_terminal(name, opts)
   vim.cmd("tcd " .. vim.fn.fnameescape(cwd))
   vim.t.tabname = name
   M.tab_agents[tabid] = name
+  M.agent_tabs[tabid] = true
   M.last_attached = name
   require("config.tabs").refresh_title()
 
@@ -425,12 +471,12 @@ local agent_augroup = vim.api.nvim_create_augroup("agent_nvim_tabs", { clear = t
 
 vim.api.nvim_create_autocmd("TabClosed", {
   group = agent_augroup,
-  callback = function(args)
-    local tabid = tonumber(args.file) -- nvim 0.10+ passes the closed tab number
-    if tabid then M.tab_agents[tabid] = nil end
-    -- belt-and-suspenders: drop any entries for tabs that no longer exist
+  callback = function()
     for id in pairs(M.tab_agents) do
       if not vim.api.nvim_tabpage_is_valid(id) then M.tab_agents[id] = nil end
+    end
+    for id in pairs(M.agent_tabs) do
+      if not vim.api.nvim_tabpage_is_valid(id) then M.agent_tabs[id] = nil end
     end
   end,
 })
