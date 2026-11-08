@@ -18,7 +18,7 @@ use agent_core::ports::{ActivityDetail, ClientId, FileDiff, HarnessId, HostError
 use crossterm::event::{KeyEvent, MouseEvent};
 
 use crate::document::{Doc, Key, assemble};
-use crate::model::{Found, Inspected, Launchable, RepoChoice, Ticket};
+use crate::model::{Company, Found, Inspected, Launchable, Look, RepoChoice, Ticket};
 
 /// How much of a failed action's stderr is read for its last line.
 const STDERR_TAIL: u64 = 64 * 1024;
@@ -55,18 +55,22 @@ pub enum Msg {
         to: SessionName,
         result: Result<(), SendError>,
     },
-    Shared {
+    /// Whether another window shows `name`, for the look `ticket` asked
+    /// for, or why that couldn't be told.
+    Elsewhere {
         name: SessionName,
-        others: usize,
+        ticket: Ticket,
+        company: Result<Company, String>,
     },
     /// The harness's model named the prompt of `generation` (or couldn't).
     NameSuggested {
         generation: u64,
         name: Option<AgentName>,
     },
-    TookOver {
+    /// Other windows showing `name` were closed, or couldn't be.
+    ClosedElsewhere {
         name: SessionName,
-        detached: Result<usize, String>,
+        closed: Result<usize, String>,
     },
     /// What is at `path`.
     DirChecked {
@@ -171,15 +175,12 @@ pub enum Job {
     Unpin(SessionName),
     /// List the repo holding this directory.
     ListRepo(PathBuf),
-    CheckShared {
-        name: SessionName,
-        own: Option<ClientId>,
-    },
     /// Remember the selection for the next start.
     Select(SessionName),
     /// Look at the filesystem for a typed repo path.
     CheckDir(PathBuf),
-    TakeOver {
+    /// Close the other windows showing `name`, which moves it here.
+    CloseElsewhere {
         name: SessionName,
         own: Option<ClientId>,
     },
@@ -204,10 +205,9 @@ impl Job {
             | Self::Unpin(_)
             | Self::ListRepo(_) => true,
             Self::PlanRemoval { .. }
-            | Self::CheckShared { .. }
             | Self::Select(_)
             | Self::CheckDir(_)
-            | Self::TakeOver { .. }
+            | Self::CloseElsewhere { .. }
             | Self::Acknowledge(_)
             | Self::Reply { .. }
             | Self::Run { .. } => false,
@@ -237,6 +237,7 @@ pub struct Workers {
     activities: Arc<ActivityReader>,
     documents: Arc<DocumentReader>,
     namer: Arc<Namer>,
+    lookout: Arc<Lookout>,
     pub refresh: Sender<()>,
     worker: Option<JoinHandle<()>>,
 }
@@ -265,6 +266,12 @@ impl Workers {
     /// the transcript its hooks named.
     pub fn read_activity(&self, name: SessionName, workdir: PathBuf, at: Option<TranscriptRef>) {
         self.activities.request(name, (workdir, at));
+    }
+
+    /// Asks whether another window shows `name`, on a thread of its own so
+    /// no slow job delays the answer. Only the latest ask is answered.
+    pub fn look_elsewhere(&self, look: Look) {
+        self.lookout.request((), look);
     }
 
     /// Asks the harness's model to name `prompt`. A request still waiting
@@ -528,6 +535,45 @@ fn spawn_namer(
     namer
 }
 
+/// Looks for other windows on one thread, the newest ask replacing a waiting one.
+type Lookout = Queue<(), Look>;
+
+fn spawn_lookout(backend: &Arc<Backend>, msgs: &Sender<Msg>) -> Arc<Lookout> {
+    let lookout = Arc::new(Lookout::new());
+    let queue = Arc::clone(&lookout);
+    let backend = Arc::clone(backend);
+    let msgs = msgs.clone();
+    thread::spawn(move || {
+        loop {
+            let ((), Look { name, own, ticket }) = queue.next();
+            let company = backend
+                .services()
+                .host
+                .clients()
+                .map_or(Ok(Company::Alone), |c| {
+                    c.other_clients(&name, own).map(|others| {
+                        if others.is_empty() {
+                            Company::Alone
+                        } else {
+                            Company::Elsewhere
+                        }
+                    })
+                })
+                .map_err(|e| describe(&e));
+            queue.done(&());
+            let msg = Msg::Elsewhere {
+                name,
+                ticket,
+                company,
+            };
+            if msgs.send(msg).is_err() {
+                return;
+            }
+        }
+    });
+    lookout
+}
+
 /// Two threads: one refreshes the snapshot, coalescing requests; the other
 /// runs user actions in order. A slow refresh never delays an action.
 pub fn spawn(backend: Arc<Backend>, sources: Sources, msgs: Sender<Msg>) -> Workers {
@@ -578,6 +624,7 @@ pub fn spawn(backend: Arc<Backend>, sources: Sources, msgs: Sender<Msg>) -> Work
     let subagents = spawn_subagent_readers(&backend, &msgs);
     let activities = spawn_activity_readers(&backend, &msgs);
     let documents = spawn_document_readers(&backend, &msgs);
+    let lookout = spawn_lookout(&backend, &msgs);
     let namer = {
         let backend = Arc::clone(&backend);
         spawn_namer(
@@ -615,6 +662,7 @@ pub fn spawn(backend: Arc<Backend>, sources: Sources, msgs: Sender<Msg>) -> Work
         activities,
         documents,
         namer,
+        lookout,
         refresh,
         worker: Some(worker),
     }
@@ -742,18 +790,8 @@ fn run(backend: &Arc<Backend>, job: Job, msgs: &Sender<Msg>) -> Option<Msg> {
             result: ops::plan_removal(svc, target, own.as_ref()).map_err(err),
         },
         Job::Remove { approved, own } => Msg::Done(remove(svc, approved, own.as_ref())),
-        Job::CheckShared { name, own } => {
-            let others = svc
-                .host
-                .clients()
-                .map_or(Ok(0), |c| c.other_clients(&name, own).map(|v| v.len()));
-            Msg::Shared {
-                name,
-                others: others.unwrap_or(0),
-            }
-        }
-        Job::TakeOver { name, own } => Msg::TookOver {
-            detached: take_over(svc, &name, own).map_err(|e| describe(&e)),
+        Job::CloseElsewhere { name, own } => Msg::ClosedElsewhere {
+            closed: close_elsewhere(svc, &name, own).map_err(|e| describe(&e)),
             name,
         },
         Job::Acknowledge(name) => return report_failure(svc.store.acknowledge(&name)),
@@ -854,7 +892,7 @@ fn remove(
     }
 }
 
-fn take_over(
+fn close_elsewhere(
     svc: ops::Services<'_>,
     name: &SessionName,
     own: Option<ClientId>,

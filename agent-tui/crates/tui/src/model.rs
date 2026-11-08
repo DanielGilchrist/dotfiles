@@ -15,8 +15,8 @@ use agent_core::names::{AgentName, BranchName, Checkout, Prompt, SessionName};
 use agent_core::ops::{Approved, Hazardous, RemovalPlan};
 use agent_core::paths::{RepoRoot, Typed, typed_path};
 use agent_core::ports::{
-    ActivityDetail, CallKind, Change, FileState, HarnessId, Progress, Readiness, Uncommitted,
-    WorktreeFacts,
+    ActivityDetail, CallKind, Change, ClientId, FileState, HarnessId, Progress, Readiness,
+    Uncommitted, WorktreeFacts,
 };
 use agent_term::{Emulator, Terminal};
 use ratatui::layout::Rect;
@@ -460,36 +460,93 @@ pub struct Ticket(u64);
 pub enum Intent {
     /// Show it in the pane; keys stay in the sidebar.
     Preview,
-    /// Show it and type into it.
+    /// Show it and type into it, leaving any other window open.
     Activate,
+    /// Show it and type into it, closing the other windows once connected.
+    MoveHere,
+}
+
+/// What `⏎` says on an agent another window shows, and in the peek of one.
+pub const MOVE_HERE: &str = "move here";
+pub const LEAVE_PAUSED: &str = "leave paused";
+
+/// What [0] and the status bar say of an agent another window shows.
+pub fn elsewhere_banner() -> String {
+    format!("⇄ elsewhere · ⏎ {MOVE_HERE}")
+}
+
+/// What the corner says while the keys are in such an agent.
+pub const ALSO_ELSEWHERE: &str = "⇄ also open elsewhere";
+
+/// Whether a session is also shown in a window that is neither this TUI's
+/// nor another TUI's: a terminal tab, an editor, an SSH shell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Company {
+    Alone,
+    Elsewhere,
+}
+
+/// A look for windows besides this TUI's and other TUIs' showing `name`,
+/// answered with its ticket.
+pub struct Look {
+    pub name: SessionName,
+    pub own: Option<ClientId>,
+    pub ticket: Ticket,
+}
+
+/// What the TUI does with a session once its check for other windows is back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AfterCheck {
+    Preview,
+    Activate,
+}
+
+impl AfterCheck {
+    pub fn intent(self) -> Intent {
+        match self {
+            Self::Preview => Intent::Preview,
+            Self::Activate => Intent::Activate,
+        }
+    }
+}
+
+/// Whether the last look for other windows worked, so a failure is said once
+/// and not at every refresh.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckHealth {
+    Working,
+    Failing,
 }
 
 pub struct Connection {
     pub name: SessionName,
     pub term: Terminal<Box<dyn Emulator>>,
-    /// Other clients attached to the same session.
-    pub others: Option<NonZeroUsize>,
+    pub company: Company,
     pub mode: Mode,
     pub opened: Instant,
-}
-
-impl Connection {
-    /// Other clients attached, if this connection is to `name`.
-    pub fn sharing(&self, name: &SessionName) -> Option<NonZeroUsize> {
-        if &self.name == name {
-            self.others
-        } else {
-            None
-        }
-    }
 }
 
 /// The right-hand pane. Only a live connection takes keyboard input, so
 /// AGENT mode can't exist without one.
 pub enum Pane {
     Empty,
-    Connecting { name: SessionName, ticket: Ticket },
+    /// Asking whether another window shows the session before attaching,
+    /// attaching anyway when no answer comes by `until`.
+    Checking {
+        name: SessionName,
+        then: AfterCheck,
+        until: Instant,
+    },
+    Connecting {
+        name: SessionName,
+        ticket: Ticket,
+    },
     Connected(Connection),
+    /// Another window shows the session, so this TUI holds no client and
+    /// doesn't resize it.
+    Elsewhere {
+        name: SessionName,
+    },
 }
 
 impl Pane {
@@ -510,9 +567,38 @@ impl Pane {
     pub fn session(&self) -> Option<&SessionName> {
         match self {
             Self::Empty => None,
-            Self::Connecting { name, .. } => Some(name),
+            Self::Checking { name, .. }
+            | Self::Connecting { name, .. }
+            | Self::Elsewhere { name } => Some(name),
             Self::Connected(c) => Some(&c.name),
         }
+    }
+
+    /// The session left alone because another window shows it.
+    pub fn held_elsewhere(&self) -> Option<&SessionName> {
+        match self {
+            Self::Elsewhere { name } => Some(name),
+            _ => None,
+        }
+    }
+
+    /// Whether `name` is known to be shown in another window.
+    pub fn elsewhere(&self, name: &SessionName) -> bool {
+        match self {
+            Self::Elsewhere { name: held } => held == name,
+            Self::Connected(c) => &c.name == name && c.company == Company::Elsewhere,
+            Self::Empty | Self::Checking { .. } | Self::Connecting { .. } => false,
+        }
+    }
+
+    /// Whether the TUI is typing into `name` while another window shows it,
+    /// which squishes what it types into.
+    pub fn squished(&self, name: &SessionName) -> bool {
+        matches!(
+            self,
+            Self::Connected(c)
+                if &c.name == name && c.mode == Mode::Agent && c.company == Company::Elsewhere
+        )
     }
 
     /// The session the pane is still waiting to connect to for `ticket`.
@@ -738,6 +824,19 @@ pub enum Reach {
         kill: Option<Running>,
         remove: Option<Removable>,
     },
+}
+
+impl Reach {
+    /// Whether `⏎` would attach to a live session.
+    pub fn is_attach(&self) -> bool {
+        matches!(
+            self,
+            Self::Other {
+                enter: Enter::Attach,
+                ..
+            }
+        )
+    }
 }
 
 /// What ⏎ does to an entry.
@@ -1254,6 +1353,9 @@ pub struct Model {
     /// to, restored by the next tab that does unless you moved meanwhile.
     displaced: Option<Cursor>,
     next_ticket: u64,
+    /// The newest look for other windows, the only one whose answer counts.
+    latest_look: Option<Ticket>,
+    pub check_health: CheckHealth,
     pub actions: Actions,
     pub keys: Keys,
     pub palette: Palette,
@@ -1335,6 +1437,8 @@ impl Model {
             launching: Vec::new(),
             displaced: None,
             next_ticket: 0,
+            latest_look: None,
+            check_health: CheckHealth::Working,
             actions: Actions::default(),
             keys: Keys::default(),
             palette: Palette::DEFAULT,
@@ -1380,6 +1484,31 @@ impl Model {
     pub fn ticket(&mut self) -> Ticket {
         self.next_ticket += 1;
         Ticket(self.next_ticket)
+    }
+
+    /// A ticket for a new look for other windows. Only the newest look's
+    /// answer counts, so asking again drops the answers still on their way.
+    pub fn start_look(&mut self) -> Ticket {
+        let ticket = self.ticket();
+        self.latest_look = Some(ticket);
+        ticket
+    }
+
+    pub fn is_latest_look(&self, ticket: Ticket) -> bool {
+        self.latest_look == Some(ticket)
+    }
+
+    #[cfg(test)]
+    pub fn current_look(&self) -> Option<Ticket> {
+        self.latest_look
+    }
+
+    /// Whether `name` is a live agent a client may attach to, as opposed to
+    /// one that exited, which attaching would resurrect.
+    pub fn attachable(&self, name: &SessionName) -> bool {
+        self.snapshot()
+            .and_then(|s| s.entry(name))
+            .is_some_and(|(_, e)| self.reach(e).is_attach())
     }
 
     pub fn mru(&self) -> &[SessionName] {
@@ -2475,7 +2604,7 @@ impl Model {
         match self.panel.list() {
             Listed::Agents => match self.cursor() {
                 Some(Cursor::Repo(key)) => Some(Hover::Repo(key.clone())),
-                _ => None,
+                _ => self.elsewhere_activity(),
             },
             Listed::Changes { .. } => self.changes_hover().map(|(hover, _)| hover),
             Listed::Agent { .. } => {
@@ -2488,6 +2617,23 @@ impl Model {
                 })
             }
         }
+    }
+
+    /// The selected agent's activity, which [0] shows while its terminal is
+    /// left to another window.
+    fn elsewhere_activity(&self) -> Option<Hover> {
+        let name = self.selected_entry()?.name();
+        (self.pane.held_elsewhere() == Some(name)).then_some(())?;
+        self.activity(name)?;
+        Some(Hover::Activity(name.clone()))
+    }
+
+    /// The agent whose row shows `⇄ elsewhere · ⏎ move here`: selected in [1]
+    /// with [0] paused on it.
+    pub fn moves_here(&self) -> Option<SessionName> {
+        let selected = self.selected_entry()?.name();
+        (matches!(self.panel, Panel::Agents) && self.pane.held_elsewhere() == Some(selected))
+            .then(|| selected.clone())
     }
 
     /// How many subagents a live agent has running, if any.

@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -27,11 +26,14 @@ const WRITE_CHUNK: usize = 1024;
 /// kept in `layouts`, since zellij reads them after the create command starts.
 pub struct Zellij {
     layouts: PathBuf,
+    is_tui: fn(&[String]) -> bool,
 }
 
 impl Zellij {
-    pub fn new(layouts: PathBuf) -> Self {
-        Self { layouts }
+    /// `is_tui` says whether an `agent` process's argv (after the program)
+    /// runs a TUI, whose preview clients aren't someone else's window.
+    pub fn new(layouts: PathBuf, is_tui: fn(&[String]) -> bool) -> Self {
+        Self { layouts, is_tui }
     }
 
     fn layout(&self, name: &SessionName) -> PathBuf {
@@ -224,18 +226,189 @@ fn layout_kdl(pane: &PaneCommand) -> String {
     format!("layout {{\n    tab {{\n        {node}\n    }}\n}}\n")
 }
 
-/// `zellij attach <name>` or `zellij -s <name> -n <layout>`, as argv after the program.
-fn is_client_of(args: &[OsString], name: &str) -> bool {
-    let args: Vec<&str> = args.iter().filter_map(|a| a.to_str()).collect();
-    match args.as_slice() {
-        ["attach", rest @ ..] => rest.last() == Some(&name),
-        ["-s" | "--session", session, rest @ ..] => {
-            *session == name
-                && rest
-                    .iter()
-                    .any(|a| matches!(*a, "-n" | "--new-session-with-layout"))
+/// Flags before the subcommand that take a value.
+const VALUED_GLOBALS: &[&str] = &[
+    "-c",
+    "--config",
+    "--config-dir",
+    "--data-dir",
+    "-l",
+    "--layout",
+    "-n",
+    "--new-session-with-layout",
+    "-s",
+    "--session",
+    "--max-panes",
+];
+
+/// zellij's argv after the program: the session its flags name, and what
+/// follows the first positional word, which is the subcommand.
+struct Invocation<'a> {
+    session: Option<&'a str>,
+    subcommand: Option<&'a str>,
+    rest: &'a [&'a str],
+}
+
+impl<'a> Invocation<'a> {
+    fn parse(args: &'a [&'a str]) -> Self {
+        let mut session = None;
+        let mut i = 0;
+        while i < args.len() {
+            let arg = args[i];
+            if let Some(named) = arg.strip_prefix("--session=") {
+                session = Some(named);
+            } else if VALUED_GLOBALS.contains(&arg) {
+                i += 1;
+                if matches!(arg, "-s" | "--session") {
+                    session = args.get(i).copied();
+                }
+            } else if !arg.starts_with('-') {
+                return Self {
+                    session,
+                    subcommand: Some(arg),
+                    rest: &args[i + 1..],
+                };
+            }
+            i += 1;
         }
-        _ => false,
+        Self {
+            session,
+            subcommand: None,
+            rest: &[],
+        }
+    }
+}
+
+/// The session `zellij attach` names: the first word that isn't a flag or
+/// a flag's value.
+fn attach_target<'a>(rest: &[&'a str]) -> Option<&'a str> {
+    let mut words = rest.iter();
+    while let Some(&word) = words.next() {
+        match word {
+            "--index" | "-t" | "--token" => {
+                words.next();
+            }
+            flag if flag.starts_with('-') => {}
+            name => return Some(name),
+        }
+    }
+    None
+}
+
+/// A zellij process that shows `name` in a terminal: `attach` (or `a`) of it,
+/// or no subcommand with `-s <name>`, which creates it. Background creation
+/// and `--session <name> action …` show nothing.
+fn is_client_of(args: &[&str], name: &str) -> bool {
+    let invocation = Invocation::parse(args);
+    match invocation.subcommand {
+        Some("attach" | "a") => {
+            let background = invocation
+                .rest
+                .iter()
+                .any(|a| matches!(*a, "-b" | "--create-background"));
+            !background && attach_target(invocation.rest) == Some(name)
+        }
+        Some(_) => false,
+        None => invocation.session == Some(name),
+    }
+}
+
+fn program_is(argv: &[String], program: &str) -> bool {
+    argv.first()
+        .and_then(|exe| Path::new(exe).file_name())
+        .is_some_and(|n| n == program)
+}
+
+/// What the scan keeps of a process: its parent, and the argv of the
+/// programs that matter to it.
+struct Process {
+    parent: Option<u32>,
+    argv: Vec<String>,
+}
+
+/// Every process, for walking up from a client.
+struct Processes {
+    all: HashMap<u32, Process>,
+}
+
+impl Processes {
+    fn scan() -> Self {
+        let mut system = System::new();
+        system.refresh_processes_specifics(
+            ProcessesToUpdate::All,
+            true,
+            ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always),
+        );
+        let all = system
+            .processes()
+            .iter()
+            .map(|(pid, p)| {
+                let argv: Vec<String> = p
+                    .cmd()
+                    .iter()
+                    .map(|a| a.to_string_lossy().into_owned())
+                    .collect();
+                let keeps = program_is(&argv, "zellij") || program_is(&argv, "agent");
+                let process = Process {
+                    parent: p.parent().map(sysinfo::Pid::as_u32),
+                    argv: if keeps { argv } else { Vec::new() },
+                };
+                (pid.as_u32(), process)
+            })
+            .collect();
+        Self { all }
+    }
+
+    /// `pid` and its ancestors, nearest first.
+    fn lineage(&self, mut pid: u32) -> Vec<u32> {
+        let mut lineage = vec![pid];
+        for _ in 0..64 {
+            match self.all.get(&pid).and_then(|p| p.parent) {
+                Some(parent) if parent != pid => {
+                    lineage.push(parent);
+                    pid = parent;
+                }
+                _ => break,
+            }
+        }
+        lineage
+    }
+
+    fn argv(&self, pid: u32) -> &[String] {
+        self.all.get(&pid).map_or(&[], |p| &p.argv)
+    }
+
+    /// Windows showing `name`: clients that are neither `own`'s nor under a
+    /// process `is_tui` recognises, whose previews are not a window of
+    /// someone else's.
+    fn windows_of(
+        &self,
+        name: &str,
+        own: Option<ClientId>,
+        is_tui: fn(&[String]) -> bool,
+    ) -> Vec<ClientId> {
+        let runs_tui = |pid: u32| {
+            let argv = self.argv(pid);
+            program_is(argv, "agent") && is_tui(&argv[1..])
+        };
+        let mut clients: Vec<ClientId> = self
+            .all
+            .keys()
+            .copied()
+            .filter(|pid| {
+                let argv = self.argv(*pid);
+                let rest: Vec<&str> = argv.iter().skip(1).map(String::as_str).collect();
+                program_is(argv, "zellij") && is_client_of(&rest, name)
+            })
+            .filter(|pid| {
+                let lineage = self.lineage(*pid);
+                !own.is_some_and(|own| lineage.contains(&own.get()))
+                    && !lineage.iter().any(|p| runs_tui(*p))
+            })
+            .map(ClientId::new)
+            .collect();
+        clients.sort_by_key(|c| c.get());
+        clients
     }
 }
 
@@ -377,46 +550,9 @@ impl ClientControl for Zellij {
         name: &SessionName,
         own: Option<ClientId>,
     ) -> Result<Vec<ClientId>, HostError> {
-        let mut system = System::new();
-        system.refresh_processes_specifics(
-            ProcessesToUpdate::All,
-            true,
-            ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always),
-        );
-        let parents: HashMap<u32, u32> = system
-            .processes()
-            .iter()
-            .filter_map(|(pid, p)| Some((pid.as_u32(), p.parent()?.as_u32())))
-            .collect();
-        let descends_from_own = |mut pid: u32| {
-            let Some(own) = own else { return false };
-            for _ in 0..64 {
-                if pid == own.get() {
-                    return true;
-                }
-                match parents.get(&pid) {
-                    Some(&parent) if parent != pid => pid = parent,
-                    _ => return false,
-                }
-            }
-            false
-        };
-        let mut clients: Vec<ClientId> = system
-            .processes()
-            .iter()
-            .filter(|(_, p)| {
-                let cmd = p.cmd();
-                cmd.first()
-                    .and_then(|exe| Path::new(exe).file_name())
-                    .is_some_and(|n| n == "zellij")
-                    && is_client_of(&cmd[1..], name.as_str())
-            })
-            .map(|(pid, _)| pid.as_u32())
-            .filter(|pid| !descends_from_own(*pid))
-            .map(ClientId::new)
-            .collect();
-        clients.sort_by_key(|c| c.get());
-        Ok(clients)
+        // `own` is the one client the caller is sure of whatever its binary
+        // is called, which the TUI predicate can't promise.
+        Ok(Processes::scan().windows_of(name.as_str(), own, self.is_tui))
     }
 
     /// SIGHUP is what a closing terminal sends, so the session just loses a viewer.
@@ -438,10 +574,6 @@ impl ClientControl for Zellij {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn os(args: &[&str]) -> Vec<OsString> {
-        args.iter().map(OsString::from).collect()
-    }
 
     #[test]
     fn session_listing_parses_names_and_presence_and_skips_invalid() {
@@ -493,15 +625,122 @@ mod tests {
         assert!(kdl.contains("args \"exec\" \"fix\""));
     }
 
+    fn argv(line: &str) -> Vec<String> {
+        line.split_whitespace().map(String::from).collect()
+    }
+
+    fn client(args: &str, name: &str) -> bool {
+        is_client_of(&args.split_whitespace().collect::<Vec<_>>(), name)
+    }
+
     #[test]
-    fn client_detection_matches_attach_and_create_but_not_actions() {
-        assert!(is_client_of(&os(&["attach", "fix"]), "fix"));
-        assert!(is_client_of(&os(&["attach", "--create", "fix"]), "fix"));
-        assert!(is_client_of(&os(&["-s", "fix", "-n", "/l.kdl"]), "fix"));
-        assert!(!is_client_of(
-            &os(&["--session", "fix", "action", "list-panes"]),
+    fn typed_attaches_with_the_alias_or_flags_are_clients_of_the_session_they_name() {
+        assert!(client("attach fix", "fix"));
+        assert!(client("a fix", "fix"));
+        assert!(client("attach --create fix", "fix"));
+        assert!(client("attach -c fix", "fix"));
+        assert!(client("attach fix options --default-shell fish", "fix"));
+        assert!(client("attach --index 1 fix", "fix"));
+        assert!(client("--config /c.kdl attach fix", "fix"));
+        assert!(!client("attach fixer", "fix"));
+        assert!(!client("a fixer", "fix"));
+    }
+
+    #[test]
+    fn a_name_that_is_only_somewhere_in_the_arguments_is_not_the_one_attached() {
+        assert!(!client("attach other options --default-cwd fix", "fix"));
+        assert!(!client("attach other fix", "fix"));
+        assert!(!client("attach --index 3", "3"));
+    }
+
+    #[test]
+    fn a_session_made_with_s_is_a_client_but_subcommands_and_background_creation_are_not() {
+        assert!(client("-s fix -n /l.kdl", "fix"));
+        assert!(client("-n /l.kdl -s fix", "fix"));
+        assert!(client(
+            "--session fix --new-session-with-layout /l.kdl",
             "fix"
         ));
-        assert!(!is_client_of(&os(&["attach", "fixer"]), "fix"));
+        assert!(client("--session=fix", "fix"));
+        assert!(client("-s fix", "fix"));
+        assert!(!client("--session fix action list-panes", "fix"));
+        assert!(!client(
+            "--session fix action new-tab --layout x.kdl",
+            "fix"
+        ));
+        assert!(!client("--session=fix run -- ls", "fix"));
+        assert!(!client("-s fix kill-session", "fix"));
+        assert!(!client("-s fix pipe", "fix"));
+        assert!(!client("-s fixer -n /l.kdl", "fix"));
+        assert!(!client(
+            "attach --create-background fix options --default-layout /l.kdl",
+            "fix"
+        ));
+    }
+
+    fn agent_runs_a_tui(args: &[String]) -> bool {
+        args.iter()
+            .all(|a| a == "tui" || a == "--harness" || a == "claude")
+    }
+
+    fn table(rows: &[(u32, u32, &str)]) -> Processes {
+        Processes {
+            all: rows
+                .iter()
+                .map(|(pid, parent, line)| {
+                    (
+                        *pid,
+                        Process {
+                            parent: Some(*parent),
+                            argv: argv(line),
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    fn windows(procs: &Processes, own: Option<ClientId>) -> Vec<u32> {
+        procs
+            .windows_of("fix", own, agent_runs_a_tui)
+            .into_iter()
+            .map(ClientId::get)
+            .collect()
+    }
+
+    #[test]
+    fn a_window_is_a_client_but_the_tui_and_other_tuis_previews_are_not() {
+        let procs = table(&[
+            (10, 1, "/bin/agent"),
+            (11, 10, "zellij attach fix"),
+            (20, 1, "/bin/agent --harness claude tui"),
+            (21, 20, "zellij attach fix"),
+            (30, 1, "nvim"),
+            (31, 30, "zellij attach fix"),
+            (40, 1, "fish"),
+            (41, 40, "/bin/agent attach fix"),
+            (42, 41, "zellij -s fix -n /l.kdl"),
+            (50, 1, "sshd"),
+            (51, 50, "zellij a fix"),
+        ]);
+        assert_eq!(windows(&procs, None), [31, 42, 51]);
+    }
+
+    #[test]
+    fn the_client_the_tui_spawned_is_excluded_by_pid_even_when_no_tui_is_recognised() {
+        let procs = table(&[(10, 1, "fish"), (11, 10, "zellij attach fix")]);
+        assert_eq!(windows(&procs, Some(ClientId::new(11))), Vec::<u32>::new());
+        assert_eq!(windows(&procs, Some(ClientId::new(10))), Vec::<u32>::new());
+        assert_eq!(windows(&procs, None), [11]);
+    }
+
+    #[test]
+    fn a_window_run_by_a_tui_action_is_still_under_that_tui() {
+        let procs = table(&[
+            (10, 1, "/bin/agent"),
+            (11, 10, "/bin/agent attach fix"),
+            (12, 11, "zellij attach fix"),
+        ]);
+        assert_eq!(windows(&procs, None), Vec::<u32>::new());
     }
 }

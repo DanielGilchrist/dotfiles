@@ -431,13 +431,7 @@ impl<'m> Deck<'m> {
         left.extend(subagents.map(|n| Span::styled(format!(" ↳{n}"), dim())));
         let mut time = time_in_state(status, m.clock.wall);
         let mut markers = Vec::new();
-        if m.pane
-            .connection()
-            .and_then(|c| c.sharing(entry.name()))
-            .is_some()
-        {
-            markers.push(Span::styled("⇄", warning()));
-        }
+        markers.extend(elsewhere_marker(m, entry.name()));
         let right = |repo: &Option<String>, time: &[Span<'static>]| {
             let mut right: Vec<Span<'static>> = repo
                 .iter()
@@ -1384,6 +1378,16 @@ fn pad(area: Rect, lines: Vec<Line<'static>>) -> Panel {
     Panel { area, lines }
 }
 
+/// `⇄` when another window shows the agent: DIM while the TUI leaves it
+/// alone, Yellow while the TUI is typing into it and it squishes that.
+fn elsewhere_marker(m: &Model, name: &SessionName) -> Option<Span<'static>> {
+    if m.pane.squished(name) {
+        Some(Span::styled("⇄", warning()))
+    } else {
+        m.pane.elsewhere(name).then(|| Span::styled("⇄", dim()))
+    }
+}
+
 /// The other agents in the repo that changed `path` too, by label.
 pub(super) fn others_on(m: &Model, name: &SessionName, path: &Path) -> Vec<String> {
     let Some((repo, _)) = m.snapshot().and_then(|s| s.entry(name)) else {
@@ -1579,6 +1583,7 @@ pub(super) fn pad_title(mut spans: Vec<Span<'static>>) -> Vec<Span<'static>> {
 #[cfg(test)]
 mod tests {
     use crate::keymap::Ctx;
+    use crate::model::{Company, Mode};
     use agent_core::ports::Lines;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -2619,6 +2624,58 @@ mod tests {
             .chunks(width)
             .map(|row| row.iter().map(Cell::symbol).collect::<String>())
             .collect()
+    }
+
+    #[test]
+    fn a_paused_agents_activity_is_shown_under_one_elsewhere_banner() {
+        let mut m = crate::fixtures::elsewhere_on("obs-layout-4");
+        assert!(
+            m.activity(&name("obs-layout-4")).is_some(),
+            "has an activity"
+        );
+        let rows = screen(&render(&mut m, (200, 50)));
+        let banner = rows
+            .iter()
+            .filter(|r| r.contains("⇄ elsewhere · ⏎ move here"))
+            .count();
+        assert_eq!(banner, 1);
+        assert!(rows.iter().any(|r| r.contains("[0] Activity")));
+        assert!(rows.iter().all(|r| !r.contains("attaching to")));
+    }
+
+    #[test]
+    fn a_paused_agent_without_an_activity_says_so_in_the_middle() {
+        let mut m = crate::fixtures::elsewhere_on("obs-layout-4");
+        m.activities.get_or_insert_default().clear();
+        let rows = screen(&render(&mut m, (200, 50)));
+        assert!(rows.iter().any(|r| r.contains("⇄ elsewhere · ⏎ move here")));
+    }
+
+    fn typing_into(m: &mut Model, who: &str, company: Company) {
+        crate::fixtures::connect(m, who, Mode::Agent, company);
+    }
+
+    #[test]
+    fn the_card_of_an_agent_open_elsewhere_is_marked_dim_and_a_squished_one_yellow() {
+        let marker = |m: &Model| elsewhere_marker(m, &name("obs-layout-4")).map(|s| s.style);
+        let mut m = crate::fixtures::elsewhere_on("obs-layout-4");
+        assert_eq!(marker(&m), Some(dim()));
+        typing_into(&mut m, "obs-layout-4", Company::Elsewhere);
+        assert_eq!(marker(&m), Some(warning()));
+        typing_into(&mut m, "obs-layout-4", Company::Alone);
+        assert_eq!(marker(&m), None);
+    }
+
+    #[test]
+    fn typing_into_a_shared_agent_says_it_is_also_open_elsewhere_in_the_corner() {
+        let mut m = fleet(10);
+        m.set_cursor(Cursor::Entry(name("obs-layout-4")));
+        typing_into(&mut m, "obs-layout-4", Company::Elsewhere);
+        let rows = screen(&render(&mut m, (200, 50)));
+        assert!(rows.iter().any(|r| r.contains("⇄ also open elsewhere")));
+        typing_into(&mut m, "obs-layout-4", Company::Alone);
+        let rows = screen(&render(&mut m, (200, 50)));
+        assert!(rows.iter().all(|r| !r.contains("⇄")));
     }
 
     #[test]

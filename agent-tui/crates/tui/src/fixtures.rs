@@ -16,9 +16,35 @@ use agent_core::ports::{
     WorktreeFacts,
 };
 
-use crate::model::Model;
+use crate::model::{Company, Connection, Cursor, Mode, Model, Pane};
 use crate::update::update;
 use crate::worker::Msg;
+
+/// A pty running `cat` as the pane's client for `agent`.
+pub fn connect(m: &mut Model, agent: &str, mode: Mode, company: Company) {
+    let size = agent_term::TermSize::of(ratatui::layout::Rect::new(0, 0, 80, 24)).expect("size");
+    let term = agent_term::Terminal::spawn(
+        &agent_core::process::LaunchSpec::new("cat"),
+        size,
+        Box::new(agent_term::Vt100::new(size)) as Box<dyn agent_term::Emulator>,
+    )
+    .expect("a pty");
+    m.pane = Pane::Connected(Connection {
+        name: name(agent),
+        term,
+        company,
+        mode,
+        opened: std::time::Instant::now(),
+    });
+}
+
+/// A fleet with the cursor on `agent`, whose other window has the pane paused.
+pub fn elsewhere_on(agent: &str) -> Model {
+    let mut m = fleet(10);
+    m.set_cursor(Cursor::Entry(name(agent)));
+    m.pane = Pane::Elsewhere { name: name(agent) };
+    m
+}
 
 pub fn nz(n: usize) -> std::num::NonZeroUsize {
     std::num::NonZeroUsize::new(n).expect("a line number")

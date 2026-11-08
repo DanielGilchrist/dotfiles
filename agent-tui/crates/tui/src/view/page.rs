@@ -110,7 +110,8 @@ pub(super) fn page(m: &Model, area: Rect, width: usize, border: Style) -> Option
             _ => None,
         })
         .filter(|_| !pins_own);
-    let reserved = if question.is_some() { 2 } else { 0 };
+    let banner = m.moves_here().map(|_| super::banner());
+    let reserved = usize::from(banner.is_some()) + if question.is_some() { 2 } else { 0 };
     let height = usize::from(area.height).saturating_sub(reserved);
     // The agent's state keeps its glyph, name and time, so the title yields
     // to them first.
@@ -148,6 +149,7 @@ pub(super) fn page(m: &Model, area: Rect, width: usize, border: Style) -> Option
     let placed = m.docs.placed(total, height, body.tails);
     let top = placed.top;
     let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.extend(banner);
     if let Some(question) = question {
         lines.extend(question_lines(&question, columns));
     }

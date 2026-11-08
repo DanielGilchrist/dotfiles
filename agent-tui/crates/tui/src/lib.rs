@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 use agent_core::config::Config;
 use agent_core::names::{CarriageReturn, SessionName, clean};
 use agent_core::ops::Backend;
-use agent_core::ports::{ClientId, HarnessId};
+use agent_core::ports::HarnessId;
 use agent_core::process::LaunchSpec;
 use agent_term::{EmulatorFactory, Liveness, TermSize, Terminal};
 use anyhow::{Context, Result};
@@ -39,9 +39,11 @@ use crossterm::terminal::{
 use ratatui::DefaultTerminal;
 use ratatui::layout::Rect;
 
-use model::{Connection, Intent, Mode, Model, Moment, Pane, StatusKind, TerminalFocus, Ticket};
+use model::{
+    Company, Connection, Intent, Mode, Model, Moment, Pane, StatusKind, TerminalFocus, Ticket,
+};
 use palette::{Colours, Palette};
-use update::{Effect, Open};
+use update::{Background, Effect, Open};
 use worker::{Job, Msg, Workers};
 
 const FRAME: Duration = Duration::from_millis(16);
@@ -234,9 +236,10 @@ impl Runtime {
     fn connect(
         &self,
         m: &mut Model,
-        name: SessionName,
+        name: &SessionName,
         spec: LaunchSpec,
         intent: Intent,
+        company: Company,
         ticket: Ticket,
     ) -> Result<()> {
         let Some(_) = m.pane.awaiting(ticket) else {
@@ -246,26 +249,29 @@ impl Runtime {
         let size = TermSize::of(m.areas.terminal).context("the terminal pane has no size")?;
         let term = Terminal::spawn(&spec, size, (self.emulator)(size))
             .with_context(|| format!("attaching to {name}"))?;
-        let own = term.pid().map(ClientId::new);
         m.pane = Pane::Connected(Connection {
             name: name.clone(),
             term,
-            others: None,
+            company,
             mode: Mode::Nav,
             opened: m.clock.mono,
         });
-        m.touch_mru(&name);
-        match intent {
-            Intent::Activate => {
-                for effect in update::enter_agent(m) {
-                    if let Effect::Job(job) = effect {
-                        self.send(job)?;
-                    }
-                }
-            }
-            Intent::Preview => self.send(Job::CheckShared { name, own })?,
+        m.touch_mru(name);
+        for work in update::connected(m, intent) {
+            self.dispatch(work)?;
         }
         Ok(())
+    }
+
+    /// Sends what a connection starts in the background.
+    fn dispatch(&self, work: Background) -> Result<()> {
+        match work {
+            Background::Job(job) => self.send(job),
+            Background::Look(look) => {
+                self.workers.look_elsewhere(look);
+                Ok(())
+            }
+        }
     }
 
     fn send(&self, job: Job) -> Result<()> {
@@ -357,6 +363,7 @@ impl Runtime {
             match effect {
                 Effect::Quit => return Ok(Flow::Quit),
                 Effect::Job(job) => self.send(job)?,
+                Effect::CheckElsewhere(look) => self.workers.look_elsewhere(look),
                 Effect::Inspect {
                     name,
                     worktree,
@@ -381,10 +388,11 @@ impl Runtime {
                 Effect::Attach {
                     name,
                     intent,
+                    company,
                     ticket,
                 } => {
                     let spec = self.backend.host.attach(&name);
-                    let result = self.connect(m, name, spec, intent, ticket);
+                    let result = self.connect(m, &name, spec, intent, company, ticket);
                     Self::connect_failed(m, ticket, result);
                 }
                 Effect::Connect {
@@ -392,7 +400,14 @@ impl Runtime {
                     intent,
                     ticket,
                 } => {
-                    let result = self.connect(m, launch.session, launch.spec, intent, ticket);
+                    let result = self.connect(
+                        m,
+                        &launch.session,
+                        launch.spec,
+                        intent,
+                        Company::Alone,
+                        ticket,
+                    );
                     Self::connect_failed(m, ticket, result);
                 }
                 Effect::Edit(open) => self.open(m, terminal, &open),
@@ -649,12 +664,8 @@ fn event_loop(
                 .send(())
                 .ok()
                 .context("the refresh worker stopped")?;
-            if let Some(c) = m.pane.connection().filter(|c| c.mode != Mode::Agent) {
-                let own = c.term.pid().map(ClientId::new);
-                rt.send(Job::CheckShared {
-                    name: c.name.clone(),
-                    own,
-                })?;
+            if let Some(look) = update::recheck_elsewhere(&mut m) {
+                rt.workers.look_elsewhere(look);
             }
         }
     }

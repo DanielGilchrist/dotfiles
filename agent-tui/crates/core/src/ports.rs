@@ -661,7 +661,9 @@ pub enum HostError {
 
 /// Hosts whose sessions accept several clients can report and detach them.
 pub trait ClientControl: Send + Sync {
-    /// Clients attached to `name`, excluding `own` and anything it spawned.
+    /// Windows showing `name`, excluding `own` and anything it spawned and
+    /// the previews of any TUI, which are not a window of someone else's.
+    /// Closing them (`detach`) is what moving the session here does.
     fn other_clients(
         &self,
         name: &SessionName,

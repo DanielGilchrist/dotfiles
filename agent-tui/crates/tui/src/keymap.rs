@@ -3,7 +3,7 @@
 //! `update` still do the dispatching; a test there presses every key in
 //! every context and checks the ones that do something are in this table.
 
-use crate::model::{Model, Panel, Reach, View, Visibility};
+use crate::model::{LEAVE_PAUSED, MOVE_HERE, Model, Panel, Reach, View, Visibility};
 use crate::tree::{ChangesScope, ChangesView, Node};
 use agent_core::ports::Compared;
 
@@ -92,6 +92,10 @@ pub struct Situation {
     pub can_remove: bool,
     pub can_send: bool,
     pub can_peek: bool,
+    /// Another window shows the selected agent.
+    pub elsewhere: bool,
+    /// `⏎` on the selected agent moves here: its row shows the banner.
+    pub moves_here: bool,
     pub pinned: bool,
     pub paused: bool,
     pub hover: bool,
@@ -124,6 +128,37 @@ pub struct Situation {
     pub next_changes_tab: &'static str,
 }
 
+/// What `⏎` says, and whether kill, remove and peek apply, from what an
+/// entry's `reach` allows.
+struct ReachKeys {
+    enter: Option<&'static str>,
+    can_kill: bool,
+    can_remove: bool,
+    can_peek: bool,
+}
+
+fn reach_keys(reach: Option<&Reach>, moves_here: bool) -> ReachKeys {
+    let can_peek = reach.is_some_and(Reach::is_attach);
+    match reach {
+        Some(Reach::Other {
+            enter,
+            kill,
+            remove,
+        }) => ReachKeys {
+            enter: Some(if moves_here { MOVE_HERE } else { enter.verb() }),
+            can_kill: kill.is_some(),
+            can_remove: remove.is_some(),
+            can_peek,
+        },
+        Some(Reach::Own) | None => ReachKeys {
+            enter: None,
+            can_kill: false,
+            can_remove: false,
+            can_peek,
+        },
+    }
+}
+
 impl Situation {
     /// [0] has the keys on an activity that has a log.
     fn reads_activity(&self) -> bool {
@@ -144,20 +179,15 @@ impl Situation {
         };
         let selected = m.selected();
         let entry = selected.and_then(|(_, e)| e);
+        let elsewhere = entry.is_some_and(|e| m.pane.elsewhere(e.name()));
+        let moves_here = entry.is_some_and(|e| m.moves_here().as_ref() == Some(e.name()));
         let reach = entry.map(|e| m.reach(e));
-        let (enter, can_kill, can_remove, can_peek) = match &reach {
-            Some(Reach::Other {
-                enter,
-                kill,
-                remove,
-            }) => (
-                Some(enter.verb()),
-                kill.is_some(),
-                remove.is_some(),
-                matches!(enter, crate::model::Enter::Attach),
-            ),
-            Some(Reach::Own) | None => (None, false, false, false),
-        };
+        let ReachKeys {
+            enter,
+            can_kill,
+            can_remove,
+            can_peek,
+        } = reach_keys(reach.as_ref(), moves_here);
         let left_agent = m
             .pane
             .connection()
@@ -171,6 +201,8 @@ impl Situation {
             can_remove,
             can_send: entry.is_some_and(|e| m.talkable(e).is_ok()),
             can_peek,
+            elsewhere,
+            moves_here,
             pinned: entry.is_some_and(|e| e.pin().is_some()),
             paused: m.docs.paused(),
             hover: m.hover().is_some(),
@@ -328,7 +360,7 @@ pub const BINDINGS: &[Binding] = &[
             (true, _) => Some("focus repo"),
             (_, verb) => verb,
         }),
-        "On an agent: attach, so your keys go to its terminal (starts or resurrects the session first if needed). On a repo: show that repo's agents.",
+        "On an agent: attach, so your keys go to its terminal (starts or resurrects the session first if needed). On an agent open in another window: move here, which attaches and then closes that window, from [1] on the banner row only. On a repo: show that repo's agents.",
     )
     .with(&["0"]),
     Binding::new(
@@ -347,8 +379,12 @@ pub const BINDINGS: &[Binding] = &[
         &["⏎"],
         Ctxs::of(&[Ctx::Peek]),
         At(9),
-        By(|s| s.on_agent.then_some("attach")),
-        "Close the peek and attach, so your keys go to the agent's terminal.",
+        By(|s| match (s.on_agent, s.elsewhere) {
+            (false, _) => None,
+            (_, false) => Some("attach"),
+            (_, true) => Some(LEAVE_PAUSED),
+        }),
+        "Close the peek and attach, so your keys go to the agent's terminal. On an agent open in another window the peek closes and the agent stays paused, with ⏎ on its row in [1] to move here.",
     ),
     Binding::new(
         &["J", "K"],
@@ -516,8 +552,12 @@ pub const BINDINGS: &[Binding] = &[
             (s.on_agent && matches!(s.ctx, Ctx::Activity | Ctx::Changes | Ctx::Main))
                 .then_some(if s.diff { 4 } else { 8 })
         }),
-        By(|s| s.on_agent.then_some("attach")),
-        "Attach the selected agent from any panel, so the nav key returns to where you were.",
+        By(|s| match (s.on_agent, s.elsewhere, s.moves_here) {
+            (true, false, _) => Some("attach"),
+            (true, true, true) => Some(MOVE_HERE),
+            _ => None,
+        }),
+        "Attach the selected agent from any panel, so the nav key returns to where you were. On an agent open in another window it moves here from [1] only, where its row says so.",
     ),
     Binding::new(
         &["s"],
@@ -832,6 +872,8 @@ mod tests {
             can_remove: true,
             can_send: true,
             can_peek: true,
+            elsewhere: false,
+            moves_here: false,
             pinned: false,
             paused: false,
             hover: true,
@@ -910,6 +952,32 @@ mod tests {
                 .any(|r| r.keys == "e" && r.label == "edit transcript")
         );
         assert!(labels.iter().all(|r| r.label != "edit checkout"));
+    }
+
+    #[test]
+    fn enter_reads_move_here_on_an_agent_open_elsewhere_and_only_in_the_list() {
+        let label = |s: &Situation, key: &str| {
+            footer(s, "⌃\\")
+                .into_iter()
+                .find(|h| h.keys == key)
+                .map(|h| h.label)
+        };
+        let elsewhere = |ctx| Situation {
+            elsewhere: true,
+            moves_here: ctx == Ctx::Agents,
+            enter: Some("move here"),
+            ..situation(ctx)
+        };
+        assert_eq!(label(&elsewhere(Ctx::Agents), "⏎"), Some("move here"));
+        assert_eq!(label(&elsewhere(Ctx::Peek), "⏎"), Some("leave paused"));
+        assert_eq!(label(&elsewhere(Ctx::Main), "i"), None);
+        let help = help(&elsewhere(Ctx::Agents), "⌃\\", "");
+        assert!(
+            help.local
+                .iter()
+                .chain(&help.global)
+                .any(|r| r.keys == "i" && r.label == "move here")
+        );
     }
 
     #[test]

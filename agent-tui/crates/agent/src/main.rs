@@ -135,6 +135,19 @@ enum Cmd {
     Sweep { worktrees: Vec<PathBuf> },
 }
 
+/// Whether `agent <args>` opens the TUI, by the grammar above, so a new
+/// global flag can't make the TUI look like a window.
+fn runs_tui(args: &[String]) -> bool {
+    let argv = std::iter::once("agent").chain(args.iter().map(String::as_str));
+    matches!(
+        Cli::try_parse_from(argv),
+        Ok(Cli {
+            command: None | Some(Cmd::Tui),
+            ..
+        })
+    )
+}
+
 /// Where a new agent's first prompt comes from.
 enum Seed {
     Text(Prompt),
@@ -158,7 +171,7 @@ impl Seed {
 fn backend() -> Result<Backend> {
     let layout = Layout::from_env()?;
     let store = FsStore::from_env()?;
-    let host = Zellij::new(store.dir().join("layouts"));
+    let host = Zellij::new(store.dir().join("layouts"), runs_tui);
     let exe = std::env::current_exe().context("locating the agent binary")?;
     Ok(Backend {
         vcs: Box::new(Git),
@@ -751,6 +764,54 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn args(line: &str) -> Vec<String> {
+        line.split_whitespace().map(String::from).collect()
+    }
+
+    #[test]
+    fn only_no_subcommand_or_tui_runs_the_tui_whatever_the_global_flags() {
+        assert!(runs_tui(&args("")));
+        assert!(runs_tui(&args("tui")));
+        assert!(runs_tui(&args("--harness claude")));
+        assert!(runs_tui(&args("--harness=claude tui")));
+        assert!(!runs_tui(&args("attach fix")));
+        assert!(!runs_tui(&args("--harness claude attach fix")));
+        assert!(!runs_tui(&args("repo")));
+        assert!(!runs_tui(&args("--help")));
+    }
+
+    #[test]
+    fn every_global_flag_the_cli_defines_leaves_the_tui_a_tui() {
+        let command = Cli::command();
+        let globals: Vec<_> = command
+            .get_arguments()
+            .filter(|a| a.is_global_set() && !matches!(a.get_id().as_str(), "help" | "version"))
+            .collect();
+        assert_ne!(globals.len(), 0);
+        for arg in globals {
+            let long = arg.get_long().expect("a long flag");
+            let mut argv = vec![format!("--{long}")];
+            if arg.get_action().takes_values() {
+                argv.push("claude".into());
+            }
+            assert!(runs_tui(&argv), "{argv:?}");
+        }
+    }
+
+    #[test]
+    fn every_subcommand_but_tui_is_a_window_not_a_tui() {
+        for sub in Cli::command()
+            .get_subcommands()
+            .filter(|c| c.get_name() != "tui")
+        {
+            assert!(
+                !runs_tui(&[sub.get_name().to_string()]),
+                "{}",
+                sub.get_name()
+            );
+        }
+    }
 
     #[test]
     fn a_hook_payload_is_read_up_to_the_cap() {

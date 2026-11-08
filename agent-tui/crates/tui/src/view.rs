@@ -16,10 +16,11 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::keymap::{self, Situation};
 use crate::model::{
-    AgentStatus, Areas, Blocked, Confirm, Derived, Drawn, Enter, Field, Focus, FormKind, HelpState,
-    Launchable, Load, Model, NameCheck, NameSource, NamingState, NewAgent, OfferEffect, Overlay,
-    Pane, Phase, Proposal, Pulse, Query, Reach, RepoInput, Row, Screen, StatusKind, Submission,
-    View, Waiting, WorkRoom, fuzzy_match, invalid_chars, repo_matches,
+    ALSO_ELSEWHERE, AgentStatus, Areas, Blocked, Confirm, Derived, Drawn, Enter, Field, Focus,
+    FormKind, HelpState, Launchable, Load, Model, NameCheck, NameSource, NamingState, NewAgent,
+    OfferEffect, Overlay, Pane, Phase, Proposal, Pulse, Query, Reach, RepoInput, Row, Screen,
+    StatusKind, Submission, View, Waiting, WorkRoom, elsewhere_banner, fuzzy_match, invalid_chars,
+    repo_matches,
 };
 use crate::palette::Palette;
 use crate::update::{Pick, Picks, Unusable, picker_matches, switcher_matches};
@@ -513,6 +514,12 @@ fn sidebar_count(m: &Model, border: Style, width: usize) -> Vec<Span<'static>> {
 /// The narrowest list that shows `+n hidden` beside `i of n`.
 const HIDDEN_MIN: usize = 26;
 
+/// What [0] says while another window has the agent, over its activity or
+/// alone.
+pub(crate) fn banner() -> Line<'static> {
+    Line::styled(elsewhere_banner(), dim())
+}
+
 /// The pane's title (the selected agent) and its corner (the path, or a
 /// shared-session warning), cut to fit `width`.
 /// The title names what the pane shows: the session it's connected or
@@ -545,17 +552,8 @@ fn pane_title(m: &Model, width: usize) -> (Vec<Span<'static>>, Vec<Span<'static>
         }
         None => title.push(Span::styled(repo_name, identifier)),
     }
-    let sharing = entry.and_then(|e| m.pane.connection().and_then(|c| c.sharing(e.name())));
-    let corner = if let Some(others) = sharing {
-        let clients = if others.get() == 1 {
-            "client"
-        } else {
-            "clients"
-        };
-        vec![Span::styled(
-            format!("⇄ {others} other {clients} · ⏎ take over"),
-            warning(),
-        )]
+    let corner = if matches!(m.focus(), Focus::Agent(c) if m.pane.squished(&c.name)) {
+        vec![Span::styled(ALSO_ELSEWHERE, warning())]
     } else {
         let path = entry
             .and_then(Entry::path)
@@ -597,9 +595,10 @@ fn draw_terminal(frame: &mut Frame<'_>, m: &Model, area: Rect) {
         ])
     };
     let line = match (&m.load, &m.pane, m.selected()) {
-        (_, Pane::Connecting { name, .. }, _) => {
+        (_, Pane::Connecting { name, .. } | Pane::Checking { name, .. }, _) => {
             Line::styled(format!("attaching to {name}…"), dim())
         }
+        (_, Pane::Elsewhere { .. }, _) => banner(),
         (Load::Pending, ..) => Line::styled("Loading…", dim()),
         (_, _, None) if m.view == View::Pinned => Line::styled("Nothing pinned", dim()),
         (_, _, None) => action("n", "new agent".into()),
