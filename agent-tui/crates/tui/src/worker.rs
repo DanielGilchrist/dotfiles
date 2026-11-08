@@ -5,14 +5,14 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 
 use agent_core::actions::CommandLine;
-use agent_core::activity::Activity;
+use agent_core::activity::{Activity, AgentId};
 use agent_core::config::Sources;
 use agent_core::discover;
 use agent_core::model::{Removable, Running, Snapshot, Startable};
 use agent_core::names::{AgentName, Prompt, SessionName};
 use agent_core::ops::{self, Approved, Backend, Launch, RemovalPlan, Removed};
 use agent_core::paths::RepoRoot;
-use agent_core::ports::{ClientId, HarnessId, HostError, WorktreeFacts};
+use agent_core::ports::{ClientId, HarnessId, HostError, SubagentDetail, WorktreeFacts};
 use crossterm::event::{KeyEvent, MouseEvent};
 
 use crate::model::{Launchable, RepoChoice, Ticket};
@@ -22,6 +22,9 @@ const STDERR_TAIL: u64 = 64 * 1024;
 
 /// Threads reading git facts, so a slow repo holds up only its own agents.
 const INSPECTORS: usize = 2;
+
+/// Threads reading subagent transcripts.
+const SUBAGENT_READERS: usize = 1;
 
 /// How often the refresh thread checks what agents reported through hooks.
 const ACTIVITY_POLL: std::time::Duration = std::time::Duration::from_millis(500);
@@ -68,6 +71,13 @@ pub enum Msg {
     Inspected {
         name: SessionName,
         facts: Result<WorktreeFacts, String>,
+    },
+    /// What a subagent was told and has done, or `None` when its harness
+    /// has no record of it yet.
+    Subagent {
+        name: SessionName,
+        id: AgentId,
+        detail: Result<Option<SubagentDetail>, String>,
     },
 }
 
@@ -187,6 +197,7 @@ pub fn describe(e: &(dyn std::error::Error + 'static)) -> String {
 pub struct Workers {
     pub jobs: Sender<Job>,
     inspector: Arc<Inspector>,
+    subagents: Arc<SubagentReader>,
     pub refresh: Sender<()>,
     worker: Option<JoinHandle<()>>,
 }
@@ -195,6 +206,11 @@ impl Workers {
     /// Asks for git facts about an agent's worktree.
     pub fn inspect(&self, name: SessionName, worktree: PathBuf) {
         self.inspector.request(name, worktree);
+    }
+
+    /// Asks for what subagent `id` of an agent working in `workdir` has done.
+    pub fn read_subagent(&self, name: SessionName, id: AgentId, workdir: PathBuf) {
+        self.subagents.request((name, id), workdir);
     }
 }
 
@@ -210,78 +226,113 @@ impl Drop for Workers {
     }
 }
 
-/// Reads git facts on [`INSPECTORS`] threads, one request per agent at a
-/// time. A request for an agent already being read waits its turn, so the
-/// answer reflects its latest state.
-struct Inspector {
-    queue: Mutex<Inspections>,
+/// Requests keyed by `K`, served by several threads, one request per key at
+/// a time. A request for a key already being served waits its turn, and one
+/// waiting is replaced by a newer one, so the answer reflects the latest.
+struct Queue<K, V> {
+    queue: Mutex<Requests<K, V>>,
     ready: Condvar,
 }
 
-#[derive(Default)]
-struct Inspections {
-    waiting: Vec<(SessionName, PathBuf)>,
-    reading: HashSet<SessionName>,
+struct Requests<K, V> {
+    waiting: Vec<(K, V)>,
+    serving: HashSet<K>,
 }
 
-impl Inspector {
-    fn spawn(backend: &Arc<Backend>, msgs: &Sender<Msg>) -> Arc<Self> {
-        let inspector = Arc::new(Self {
-            queue: Mutex::new(Inspections::default()),
+impl<K: Clone + Eq + std::hash::Hash, V> Queue<K, V> {
+    fn new() -> Self {
+        Self {
+            queue: Mutex::new(Requests {
+                waiting: Vec::new(),
+                serving: HashSet::new(),
+            }),
             ready: Condvar::new(),
-        });
-        for _ in 0..INSPECTORS {
-            let inspector = Arc::clone(&inspector);
-            let backend = Arc::clone(backend);
-            let msgs = msgs.clone();
-            thread::spawn(move || {
-                loop {
-                    let (name, worktree) = inspector.next();
-                    let facts = backend.vcs.facts(&worktree).map_err(|e| describe(&e));
-                    inspector.done(&name);
-                    if msgs.send(Msg::Inspected { name, facts }).is_err() {
-                        return;
-                    }
-                }
-            });
         }
-        inspector
     }
 
-    fn request(&self, name: SessionName, worktree: PathBuf) {
-        let mut queue = self.queue.lock().expect("inspections lock");
-        match queue.waiting.iter_mut().find(|(n, _)| *n == name) {
-            Some(waiting) => waiting.1 = worktree,
-            None => queue.waiting.push((name, worktree)),
+    fn request(&self, key: K, value: V) {
+        let mut queue = self.queue.lock().expect("queue lock");
+        match queue.waiting.iter_mut().find(|(k, _)| *k == key) {
+            Some(waiting) => waiting.1 = value,
+            None => queue.waiting.push((key, value)),
         }
         self.ready.notify_one();
     }
 
-    /// The oldest request for an agent that isn't being read.
-    fn next(&self) -> (SessionName, PathBuf) {
-        let mut queue = self.queue.lock().expect("inspections lock");
+    /// The oldest request for a key that isn't being served.
+    fn next(&self) -> (K, V) {
+        let mut queue = self.queue.lock().expect("queue lock");
         loop {
             let free = queue
                 .waiting
                 .iter()
-                .position(|(name, _)| !queue.reading.contains(name));
+                .position(|(key, _)| !queue.serving.contains(key));
             if let Some(at) = free {
-                let (name, worktree) = queue.waiting.remove(at);
-                queue.reading.insert(name.clone());
-                return (name, worktree);
+                let (key, value) = queue.waiting.remove(at);
+                queue.serving.insert(key.clone());
+                return (key, value);
             }
-            queue = self.ready.wait(queue).expect("inspections lock");
+            queue = self.ready.wait(queue).expect("queue lock");
         }
     }
 
-    fn done(&self, name: &SessionName) {
-        self.queue
-            .lock()
-            .expect("inspections lock")
-            .reading
-            .remove(name);
+    fn done(&self, key: &K) {
+        self.queue.lock().expect("queue lock").serving.remove(key);
         self.ready.notify_all();
     }
+}
+
+/// Reads git facts on [`INSPECTORS`] threads.
+type Inspector = Queue<SessionName, PathBuf>;
+
+fn spawn_inspectors(backend: &Arc<Backend>, msgs: &Sender<Msg>) -> Arc<Inspector> {
+    let inspector = Arc::new(Inspector::new());
+    for _ in 0..INSPECTORS {
+        let inspector = Arc::clone(&inspector);
+        let backend = Arc::clone(backend);
+        let msgs = msgs.clone();
+        thread::spawn(move || {
+            loop {
+                let (name, worktree) = inspector.next();
+                let facts = backend.vcs.facts(&worktree).map_err(|e| describe(&e));
+                inspector.done(&name);
+                if msgs.send(Msg::Inspected { name, facts }).is_err() {
+                    return;
+                }
+            }
+        });
+    }
+    inspector
+}
+
+/// Reads subagent transcripts on [`SUBAGENT_READERS`] threads.
+type SubagentReader = Queue<(SessionName, AgentId), PathBuf>;
+
+fn spawn_subagent_readers(backend: &Arc<Backend>, msgs: &Sender<Msg>) -> Arc<SubagentReader> {
+    let reader = Arc::new(SubagentReader::new());
+    for _ in 0..SUBAGENT_READERS {
+        let reader = Arc::clone(&reader);
+        let backend = Arc::clone(backend);
+        let msgs = msgs.clone();
+        thread::spawn(move || {
+            loop {
+                let ((name, id), workdir) = reader.next();
+                let harness = backend
+                    .store
+                    .record(&name)
+                    .ok()
+                    .flatten()
+                    .and_then(|record| backend.harnesses.get(&record.harness))
+                    .unwrap_or_else(|| backend.harnesses.default_harness());
+                let detail = harness.subagent(&workdir, &id).map_err(|e| describe(&e));
+                reader.done(&(name.clone(), id.clone()));
+                if msgs.send(Msg::Subagent { name, id, detail }).is_err() {
+                    return;
+                }
+            }
+        });
+    }
+    reader
 }
 
 /// Two threads: one refreshes the snapshot, coalescing requests; the other
@@ -330,7 +381,8 @@ pub fn spawn(backend: Arc<Backend>, sources: Sources, msgs: Sender<Msg>) -> Work
         });
     }
 
-    let inspector = Inspector::spawn(&backend, &msgs);
+    let inspector = spawn_inspectors(&backend, &msgs);
+    let subagents = spawn_subagent_readers(&backend, &msgs);
     let (jobs, rx) = mpsc::channel::<Job>();
     let after = refresh.clone();
     let worker = thread::spawn(move || {
@@ -349,6 +401,7 @@ pub fn spawn(backend: Arc<Backend>, sources: Sources, msgs: Sender<Msg>) -> Work
     Workers {
         jobs,
         inspector,
+        subagents,
         refresh,
         worker: Some(worker),
     }

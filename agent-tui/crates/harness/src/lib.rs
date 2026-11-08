@@ -6,7 +6,8 @@ use std::time::SystemTime;
 use agent_core::activity::{About, AgentId, Background, Event, Input, Origin, Reported, ToolId};
 use agent_core::names::Prompt;
 use agent_core::ports::{
-    Harness, HarnessError, HarnessId, Harnesses, LaunchCtx, PendingPrompt, Seen,
+    Harness, HarnessError, HarnessId, Harnesses, LaunchCtx, LogEntry, PendingPrompt, Seen,
+    SubagentDetail,
 };
 use agent_core::process::LaunchSpec;
 
@@ -32,6 +33,16 @@ const HOOKS: &[(&str, Option<&str>)] = &[
 ];
 /// How much of a tool's target or a message the TUI keeps.
 const SNIPPET: usize = 160;
+/// How much of what a subagent said a log entry keeps.
+const SAID: usize = 600;
+/// Log entries kept per subagent, the newest.
+const LOG_ENTRIES: usize = 60;
+/// How much of the end of a subagent's transcript is read for its log, and
+/// the most it widens to when that holds no whole record.
+const TAIL_BYTES: u64 = 512 * 1024;
+const TAIL_BYTES_MAX: u64 = 8 * 1024 * 1024;
+/// How much of its start is read for the prompt.
+const HEAD_BYTES: u64 = 256 * 1024;
 
 /// Variables an agent inherits when spawned from inside another Claude Code
 /// session; they make Claude treat it as a child and stop writing its
@@ -157,6 +168,37 @@ impl Claude {
             }
         }
         Ok(found)
+    }
+
+    /// The transcript of subagent `id` in any of `workdir`'s sessions.
+    fn subagent_file(&self, workdir: &Path, id: &AgentId) -> io::Result<Option<PathBuf>> {
+        let id = id.as_str();
+        if id.is_empty()
+            || !id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            return Ok(None);
+        }
+        let entries = match std::fs::read_dir(self.project_dir(workdir)) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let mut newest: Option<(SystemTime, PathBuf)> = None;
+        for entry in entries {
+            let candidate = entry?
+                .path()
+                .join("subagents")
+                .join(format!("agent-{id}.jsonl"));
+            let Ok(modified) = std::fs::metadata(&candidate).and_then(|m| m.modified()) else {
+                continue;
+            };
+            if newest.as_ref().is_none_or(|(at, _)| modified > *at) {
+                newest = Some((modified, candidate));
+            }
+        }
+        Ok(newest.map(|(_, path)| path))
     }
 
     /// The conversation to resume: the newest transcript written since the
@@ -292,6 +334,35 @@ impl Harness for Claude {
             .then(|| String::from_utf8_lossy(&out.stdout).into_owned()))
     }
 
+    /// Claude Code writes each subagent's transcript beside the session's,
+    /// in `<session>/subagents/agent-<id>.jsonl`. The hooks name the
+    /// subagent but not the session, so the project's sessions are searched.
+    fn subagent(
+        &self,
+        workdir: &Path,
+        id: &AgentId,
+    ) -> Result<Option<SubagentDetail>, HarnessError> {
+        let workdir = workdir
+            .canonicalize()
+            .unwrap_or_else(|_| workdir.to_path_buf());
+        let context = || format!("reading the transcript of subagent {}", id.as_str());
+        let Some(file) = self
+            .subagent_file(&workdir, id)
+            .map_err(|source| HarnessError {
+                context: context(),
+                source,
+            })?
+        else {
+            return Ok(None);
+        };
+        read_subagent(&file)
+            .map(Some)
+            .map_err(|source| HarnessError {
+                context: context(),
+                source,
+            })
+    }
+
     /// Bracketed paste keeps a multi-line prompt as one message; Enter submits it.
     fn submit(&self, prompt: &Prompt) -> Vec<u8> {
         format!("\x1b[200~{prompt}\x1b[201~\r").into_bytes()
@@ -339,6 +410,144 @@ fn has_user_turn(path: &Path) -> io::Result<bool> {
         }
     }
     Ok(false)
+}
+
+/// A subagent's prompt, log and whether it finished, from its transcript
+/// and the `meta.json` beside it. A transcript still being written is read
+/// as far as it goes.
+fn read_subagent(transcript: &Path) -> io::Result<SubagentDetail> {
+    use std::io::{BufRead, Read};
+    let mut file = std::fs::File::open(transcript)?;
+    let len = file.metadata()?.len();
+    let mut head = Vec::new();
+    std::io::BufReader::new((&file).take(HEAD_BYTES)).read_until(b'\n', &mut head)?;
+    let tail = read_tail(&mut file, len, TAIL_BYTES, TAIL_BYTES_MAX)?;
+    let finished = std::fs::read_to_string(transcript.with_extension("meta.json"))
+        .is_ok_and(|meta| parse_finished(&meta));
+    Ok(SubagentDetail {
+        prompt: parse_prompt(&String::from_utf8_lossy(&head)).unwrap_or_default(),
+        finished,
+        log: parse_log(&tail),
+    })
+}
+
+/// The whole records in the last `window` bytes of a `len` byte file, widening
+/// the window fourfold up to `max` while it holds none (one huge record).
+/// The window reaches one byte back so a record starting exactly at its edge
+/// is kept, and the partial one before it is dropped.
+fn read_tail(file: &mut std::fs::File, len: u64, mut window: u64, max: u64) -> io::Result<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    loop {
+        let start = len.saturating_sub(window);
+        let back = start.min(1);
+        file.seek(SeekFrom::Start(start - back))?;
+        let mut bytes = Vec::new();
+        file.by_ref().take(window + back).read_to_end(&mut bytes)?;
+        let text = String::from_utf8_lossy(&bytes);
+        let whole = match (start, text.find('\n')) {
+            (0, _) => Some(&text[..]),
+            (_, Some(newline)) => Some(&text[newline + 1..]),
+            (_, None) => None,
+        };
+        match whole {
+            Some(whole) if whole.contains('\n') || start == 0 || window >= max => {
+                return Ok(whole.to_string());
+            }
+            None if window >= max => return Ok(String::new()),
+            _ => window = (window * 4).min(max),
+        }
+    }
+}
+
+/// The prompt in a subagent transcript's first line.
+fn parse_prompt(line: &str) -> Option<String> {
+    let record: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+    let text = text_of(record.pointer("/message/content")?);
+    (!text.is_empty()).then_some(text)
+}
+
+/// Message content as text: a string, or the text parts of a list.
+fn text_of(content: &serde_json::Value) -> String {
+    match content {
+        serde_json::Value::String(text) => text.trim().to_string(),
+        serde_json::Value::Array(parts) => parts
+            .iter()
+            .filter_map(|part| part.get("text").and_then(serde_json::Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .trim()
+            .to_string(),
+        _ => String::new(),
+    }
+}
+
+/// Whether a `meta.json` says the subagent is done.
+fn parse_finished(meta: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(meta)
+        .ok()
+        .and_then(|meta| meta.get("finished").and_then(serde_json::Value::as_bool))
+        .unwrap_or(false)
+}
+
+/// The steps in transcript lines, oldest first and at most
+/// [`LOG_ENTRIES`] of them: what the subagent said and the tools it
+/// called, each with the first line of its result once that's recorded.
+/// Lines that aren't whole records are skipped.
+fn parse_log(text: &str) -> Vec<LogEntry> {
+    let mut log: Vec<LogEntry> = Vec::new();
+    let mut calls: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for record in text
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+    {
+        let Some(parts) = record
+            .pointer("/message/content")
+            .and_then(serde_json::Value::as_array)
+        else {
+            continue;
+        };
+        for part in parts {
+            let field = |key: &str| part.get(key).and_then(serde_json::Value::as_str);
+            match (
+                record.get("type").and_then(serde_json::Value::as_str),
+                field("type"),
+            ) {
+                (Some("assistant"), Some("text")) => {
+                    let said: String = field("text")
+                        .unwrap_or_default()
+                        .trim()
+                        .chars()
+                        .take(SAID)
+                        .collect();
+                    if !said.is_empty() {
+                        log.push(LogEntry::Said(said));
+                    }
+                }
+                (Some("assistant"), Some("tool_use")) => {
+                    if let Some(id) = field("id") {
+                        calls.insert(id.to_string(), log.len());
+                    }
+                    log.push(LogEntry::Called {
+                        tool: field("name").unwrap_or("a tool").to_string(),
+                        target: part.get("input").and_then(target),
+                        result: None,
+                    });
+                }
+                (Some("user"), Some("tool_result")) => {
+                    let first = part.get("content").map(text_of).map(|t| snippet(&t));
+                    let at = field("tool_use_id").and_then(|id| calls.get(id));
+                    if let (Some(first), Some(&at)) = (first, at)
+                        && let Some(LogEntry::Called { result, .. }) = log.get_mut(at)
+                    {
+                        *result = Some(first).filter(|r| !r.is_empty());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    log.drain(..log.len().saturating_sub(LOG_ENTRIES));
+    log
 }
 
 /// `--settings` JSON adding hooks that report each event to the TUI with
@@ -726,5 +935,156 @@ mod tests {
                 }]
             }))
         );
+    }
+
+    const PROMPT_LINE: &str = r#"{"type":"user","isSidechain":true,"message":{"role":"user","content":"Review the diff.\nBe harsh."}}"#;
+    const CALL_LINE: &str = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Looking."},{"type":"tool_use","id":"tu1","name":"Read","input":{"file_path":"/a/b.rs"}}]}}"#;
+    const RESULT_LINE: &str = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu1","content":"fn main() {}\nmore"}]}}"#;
+    const LATER_LINE: &str = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"tu2","name":"Bash","input":{"command":"cargo test"}}]}}"#;
+
+    #[test]
+    fn a_subagent_transcript_reads_as_a_log_with_results_paired_to_calls() {
+        assert_eq!(
+            parse_prompt(PROMPT_LINE).as_deref(),
+            Some("Review the diff.\nBe harsh.")
+        );
+        let text =
+            format!("{PROMPT_LINE}\n{CALL_LINE}\n{RESULT_LINE}\n{LATER_LINE}\n{{\"type\":\"assi");
+        assert_eq!(
+            parse_log(&text),
+            [
+                LogEntry::Said("Looking.".into()),
+                LogEntry::Called {
+                    tool: "Read".into(),
+                    target: Some("/a/b.rs".into()),
+                    result: Some("fn main() {}".into()),
+                },
+                LogEntry::Called {
+                    tool: "Bash".into(),
+                    target: Some("cargo test".into()),
+                    result: None,
+                },
+            ],
+            "a record cut off mid-write is skipped"
+        );
+        assert!(parse_finished(r#"{"agentType":"Explore","finished":true}"#));
+        assert!(!parse_finished(r#"{"agentType":"Explore"}"#));
+        assert!(!parse_finished("not json"));
+        assert_eq!(parse_prompt("{\"type\":"), None);
+    }
+
+    #[test]
+    fn the_log_keeps_only_the_newest_entries() {
+        let text: String = (0..LOG_ENTRIES + 5)
+            .map(|i| {
+                format!(
+                    r#"{{"type":"assistant","message":{{"content":[{{"type":"text","text":"t{i}"}}]}}}}"#
+                ) + "\n"
+            })
+            .collect();
+        let log = parse_log(&text);
+        assert_eq!(log.len(), LOG_ENTRIES);
+        assert_eq!(log[0], LogEntry::Said("t5".into()));
+    }
+
+    #[test]
+    fn subagents_are_found_by_id_in_any_session_and_missing_or_partial_files_dont_fail() {
+        let home = tempfile::tempdir().expect("a temp dir");
+        let work = tempfile::tempdir().expect("a temp dir");
+        let claude = Claude::with_program(home.path(), "/usr/bin/true".into());
+        let work_path = work.path().canonicalize().expect("exists");
+        let id = AgentId::new("a1");
+        assert_eq!(claude.subagent(&work_path, &id).expect("no project"), None);
+
+        let dir = claude.project_dir(&work_path).join("sess1/subagents");
+        std::fs::create_dir_all(&dir).expect("creates");
+        assert_eq!(claude.subagent(&work_path, &id).expect("no file"), None);
+
+        let transcript = dir.join("agent-a1.jsonl");
+        std::fs::write(&transcript, format!("{PROMPT_LINE}\n{CALL_LINE}\n{{\"type"))
+            .expect("writes");
+        std::fs::write(dir.join("agent-a1.meta.json"), r#"{"finished":true}"#).expect("writes");
+        let detail = claude
+            .subagent(&work_path, &id)
+            .expect("reads")
+            .expect("found");
+        assert_eq!(detail.prompt, "Review the diff.\nBe harsh.");
+        assert!(detail.finished);
+        assert_eq!(detail.log.len(), 2);
+
+        std::fs::write(&transcript, "").expect("writes");
+        let empty = claude
+            .subagent(&work_path, &id)
+            .expect("reads")
+            .expect("found");
+        assert_eq!(empty.prompt, "");
+        assert_eq!(empty.log, []);
+
+        let hostile = AgentId::new("../x");
+        assert_eq!(
+            claude.subagent(&work_path, &hostile).expect("refused"),
+            None
+        );
+    }
+
+    #[test]
+    fn the_tail_keeps_whole_records_widens_for_a_huge_one_and_keeps_one_on_the_edge() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let tail = |body: &str, window: u64, max: u64| {
+            let path = dir.path().join("t.jsonl");
+            std::fs::write(&path, body).expect("writes");
+            let mut file = std::fs::File::open(&path).expect("opens");
+            read_tail(&mut file, body.len() as u64, window, max).expect("reads")
+        };
+        let body = "aaaa\nbbbb\ncccc\n";
+        assert_eq!(tail(body, 100, 100), body, "the whole file");
+        assert_eq!(
+            tail(body, 7, 7),
+            "cccc\n",
+            "the partial record before is dropped"
+        );
+        assert_eq!(
+            tail(body, 5, 5),
+            "cccc\n",
+            "a record starting on the edge is kept"
+        );
+        let huge = format!("{}\n{}\n", "x".repeat(40), "y".repeat(40));
+        assert_eq!(
+            tail(&huge, 10, 10),
+            "",
+            "one record bigger than the limit is skipped"
+        );
+        assert_eq!(
+            tail(&huge, 10, 60),
+            format!("{}\n", "y".repeat(40)),
+            "the window widens until it holds one"
+        );
+    }
+
+    #[test]
+    fn the_newest_transcript_with_the_subagent_wins() {
+        let home = tempfile::tempdir().expect("a temp dir");
+        let work = tempfile::tempdir().expect("a temp dir");
+        let claude = Claude::with_program(home.path(), "/usr/bin/true".into());
+        let work_path = work.path().canonicalize().expect("exists");
+        let project = claude.project_dir(&work_path);
+        let write = |session: &str, secs: u64| {
+            let dir = project.join(session).join("subagents");
+            std::fs::create_dir_all(&dir).expect("creates");
+            let path = dir.join("agent-a1.jsonl");
+            std::fs::write(&path, PROMPT_LINE).expect("writes");
+            std::fs::File::open(&path)
+                .expect("opens")
+                .set_modified(SystemTime::now() + std::time::Duration::from_secs(secs))
+                .expect("sets mtime");
+        };
+        write("zzz-old", 1);
+        write("aaa-new", 5);
+        write("mmm-older", 0);
+        let found = claude
+            .subagent_file(&work_path, &AgentId::new("a1"))
+            .expect("reads")
+            .expect("found");
+        assert!(found.to_string_lossy().contains("aaa-new"));
     }
 }

@@ -566,10 +566,17 @@ impl<'m> Deck<'m> {
             width,
         );
         let state = states.then(|| Item::fixed(Order::State, vec![state]));
+        let cursor = matches!(m.panel, Focused::Agent { .. }).then(|| m.subagent_at());
         let tree = activity.filter(|_| m.subagents(entry).is_some()).map(|a| {
             Item::fixed(
                 Order::Tree,
-                tree(a.subagents.values().collect(), self.form, width, m.now),
+                tree(
+                    a.subagents.values().collect(),
+                    self.form,
+                    width,
+                    m.now,
+                    cursor,
+                ),
             )
         });
         let prompt = activity.and_then(|a| a.prompt.as_deref()).map(|prompt| {
@@ -592,13 +599,21 @@ impl<'m> Deck<'m> {
         } else {
             Vec::new()
         };
+        let items: Vec<Item> = [state, lead, tree, prompt].into_iter().flatten().collect();
+        let cursor = cursor.filter(|_| items.iter().any(|i| i.order == Order::Tree));
+        let above: usize = items
+            .iter()
+            .filter(|i| i.order < Order::Tree)
+            .map(Item::len)
+            .sum();
         Detail {
             title: vec![
                 Span::raw("[2] "),
                 Span::styled(entry.label().to_string(), bold()),
             ],
             right,
-            items: [state, lead, tree, prompt].into_iter().flatten().collect(),
+            cursor: cursor.map(|row| above + row),
+            items,
         }
     }
 }
@@ -608,6 +623,8 @@ impl<'m> Deck<'m> {
 struct Detail {
     title: Vec<Span<'static>>,
     right: Vec<Span<'static>>,
+    /// The row of the subagent under the cursor, while [2] is focused.
+    cursor: Option<usize>,
     items: Vec<Item>,
 }
 
@@ -653,6 +670,7 @@ fn time_in_state(status: &AgentStatus, now: SystemTime) -> Vec<Span<'static>> {
 fn settled_counts(m: &Model, repo: &Repo) -> (usize, usize) {
     repo.entries()
         .iter()
+        .filter(|entry| m.active(entry))
         .fold((0, 0), |(live, exited), entry| match m.status(entry) {
             AgentStatus::Idle | AgentStatus::Working { .. } => (live + 1, exited),
             AgentStatus::Exited => (live, exited + 1),
@@ -674,13 +692,19 @@ fn others(agents: &[&Entry]) -> String {
     }
 }
 
+/// The mark in a row's first column for what the cursor is on. It takes the
+/// place of the panel's padding, so rows keep their alignment.
+const GUTTER: &str = "▌";
+
 /// `├ ⠹ description  kind  4m`, oldest first, the last child on `└`.
 fn tree(
     mut subagents: Vec<&Subagent>,
     form: Form,
     width: usize,
     now: SystemTime,
+    cursor: Option<usize>,
 ) -> Vec<Line<'static>> {
+    let cursor = cursor.map(|at| at.min(subagents.len().saturating_sub(1)));
     subagents.sort_by_key(|s| s.since);
     subagents
         .iter()
@@ -701,15 +725,23 @@ fn tree(
                 (Some(description), Form::Short) => (description, format!(" {since}")),
                 (None, Form::Short) => (subagent.kind.as_str(), format!(" {since}")),
             };
-            justify(
+            let selected = cursor == Some(i);
+            let mut line = justify(
                 vec![
                     Span::styled(branch, dim()),
                     Span::raw(format!("{} ", spinner())),
-                    Span::raw(label.to_string()),
+                    Span::styled(
+                        label.to_string(),
+                        if selected { bold() } else { Style::new() },
+                    ),
                 ],
                 vec![Span::styled(right, dim())],
                 width,
-            )
+            );
+            if selected {
+                line.spans.insert(0, Span::styled(GUTTER, accent()));
+            }
+            line
         })
         .collect()
 }
@@ -1657,6 +1689,11 @@ fn lower_panels(
             turn: inside,
             ..
         } => {
+            let offset = match detail.cursor {
+                Some(row) if row < offset => row,
+                Some(row) if row >= offset + inside => (row + 1).saturating_sub(inside),
+                _ => offset,
+            };
             let offset = offset.min(all.len().saturating_sub(inside));
             let shown: Vec<Line<'static>> = all.iter().skip(offset).take(inside).cloned().collect();
             let turn = if all.len() <= inside {
@@ -1771,7 +1808,9 @@ fn pad(area: Rect, lines: Vec<Line<'static>>) -> Panel {
     let lines = lines
         .into_iter()
         .map(|mut line| {
-            line.spans.insert(0, Span::raw(" "));
+            if line.spans.first().is_none_or(|s| s.content != GUTTER) {
+                line.spans.insert(0, Span::raw(" "));
+            }
             line
         })
         .collect();
@@ -1795,7 +1834,11 @@ pub(super) fn draw(frame: &mut Frame<'_>, m: &mut Model, area: Rect, border: Sty
         list_room(area.height),
     );
     let title = sidebar_title(m, usize::from(area.width).saturating_sub(4));
-    let corner = sidebar_count(m, style_of(agents));
+    let corner = sidebar_count(
+        m,
+        style_of(agents),
+        usize::from(area.width).saturating_sub(4),
+    );
     let Some(laid) = lay_out(m, area) else {
         m.turn = Turn::Whole;
         m.work_room = WorkRoom::TooShort;
@@ -1915,14 +1958,15 @@ fn pad_title(mut spans: Vec<Span<'static>>) -> Vec<Span<'static>> {
 mod tests {
     use std::collections::{HashMap, HashSet};
 
-    use agent_core::activity::State;
+    use agent_core::activity::{AgentId, State};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::buffer::Cell;
     use ratatui::style::{Color, Modifier};
 
     use super::*;
     use crate::fixtures::{fleet, name, reported};
-    use crate::model::{Group, Overlay, Pane, View};
+    use crate::model::{Group, Overlay, Pane, View, Visibility};
 
     const SIZES: [(u16, u16); 3] = [(200, 50), (100, 30), (80, 24)];
     const FLEETS: [usize; 5] = [0, 1, 2, 8, 20];
@@ -3129,5 +3173,73 @@ mod tests {
             .expect("a marked row");
         assert_eq!(marked, 3, "under the readiness row\n{}", lines.join("\n"));
         assert!(lines[marked].contains("types.ts"), "{}", lines.join("\n"));
+    }
+
+    /// The screen as rows of text.
+    fn screen(terminal: &Terminal<TestBackend>) -> Vec<String> {
+        let buffer = terminal.backend().buffer();
+        let width = usize::from(buffer.area.width);
+        buffer
+            .content()
+            .chunks(width)
+            .map(|row| row.iter().map(Cell::symbol).collect::<String>())
+            .collect()
+    }
+
+    #[test]
+    fn the_list_says_how_many_it_hides_and_stops_once_everything_shows() {
+        let mut m = fleet(10);
+        let hidden = m.hidden();
+        assert!(hidden > 0, "the fleet has exited and idle checkouts");
+        let rows = screen(&render(&mut m, (200, 50)));
+        let corner = format!("+{hidden} hidden · ");
+        assert!(
+            rows.iter().any(|r| r.contains(&corner)),
+            "{}",
+            rows.join("\n")
+        );
+        assert!(
+            !rows.iter().any(|r| r.contains("○")),
+            "no exited checkout is listed"
+        );
+
+        m.visibility = Visibility::All;
+        let rows = screen(&render(&mut m, (200, 50)));
+        assert!(!rows.iter().any(|r| r.contains(" hidden")));
+        assert!(rows.iter().any(|r| r.contains("○")));
+    }
+
+    #[test]
+    fn the_turn_cursor_marks_a_subagent_and_scrolls_to_keep_it_in_view() {
+        let mut m = fleet(8);
+        m.set_cursor(Cursor::Entry(name("obs-layout-4")));
+        let rows = screen(&render(&mut m, (200, 50)));
+        assert!(
+            !rows
+                .iter()
+                .any(|r| r.contains('▌') && r.contains(['├', '└']))
+        );
+
+        m.panel = Focused::Agent { offset: 0 };
+        m.subagent = Some(AgentId::new("s1"));
+        let rows = screen(&render(&mut m, (200, 50)));
+        let marked: Vec<&String> = rows
+            .iter()
+            .filter(|r| r.contains('▌') && r.contains(['├', '└']))
+            .collect();
+        assert_eq!(marked.len(), 1, "{}", rows.join("\n"));
+        assert!(marked[0].contains("Reverting memo edit"), "{}", marked[0]);
+
+        // In a short column [2] scrolls, and the cursor's row stays on screen.
+        m.subagent = Some(AgentId::new("s0"));
+        for height in [14, 17, 20] {
+            let rows = screen(&render(&mut m, (100, height)));
+            assert!(
+                rows.iter()
+                    .any(|r| r.contains('▌') && r.contains(['├', '└'])),
+                "height {height}\n{}",
+                rows.join("\n")
+            );
+        }
     }
 }

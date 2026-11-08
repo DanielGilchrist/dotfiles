@@ -9,7 +9,7 @@ use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
-use crate::activity::{Activity, Reported};
+use crate::activity::{Activity, AgentId, Reported};
 use crate::model::{Head, Presence, Running, Worktree};
 use crate::names::{BranchName, Prompt, PullRequest, SessionName};
 use crate::paths::{AgentWorktree, RepoRoot};
@@ -464,6 +464,40 @@ pub trait Harness: Send + Sync {
         let _ = question;
         Ok(None)
     }
+    /// What subagent `id` of the agent working in `workdir` was told and has
+    /// done, or `None` when the harness keeps no record of it (yet). Reads
+    /// files: call it off the UI thread.
+    fn subagent(
+        &self,
+        workdir: &Path,
+        id: &AgentId,
+    ) -> Result<Option<SubagentDetail>, HarnessError> {
+        let _ = (workdir, id);
+        Ok(None)
+    }
+}
+
+/// What one subagent was told and what it has done since, for a log.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SubagentDetail {
+    /// What the agent told it to do.
+    pub prompt: String,
+    /// Whether the harness records it as done.
+    pub finished: bool,
+    /// The most recent entries, oldest first.
+    pub log: Vec<LogEntry>,
+}
+
+/// One step of a subagent's work.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LogEntry {
+    Said(String),
+    Called {
+        tool: String,
+        target: Option<String>,
+        /// The first line of what the tool returned, once it has.
+        result: Option<String>,
+    },
 }
 
 pub trait Harnesses: Send + Sync {

@@ -20,6 +20,10 @@ impl AgentId {
     pub fn new(id: impl Into<String>) -> Self {
         Self(id.into())
     }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 /// A tool call's id, as the harness names it.

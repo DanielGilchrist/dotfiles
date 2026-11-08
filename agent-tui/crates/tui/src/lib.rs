@@ -324,6 +324,9 @@ impl Runtime {
                 Effect::Quit => return Ok(Flow::Quit),
                 Effect::Job(job) => self.send(job)?,
                 Effect::Inspect { name, worktree } => self.workers.inspect(name, worktree),
+                Effect::ReadSubagent { name, id, workdir } => {
+                    self.workers.read_subagent(name, id, workdir);
+                }
                 Effect::Attach {
                     name,
                     intent,

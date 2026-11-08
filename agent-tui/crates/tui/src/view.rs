@@ -17,8 +17,8 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::model::{
     AgentStatus, Blocked, Confirm, Derived, Enter, Field, Focus, FormKind, Launchable, Load, Model,
     NameCheck, NameSource, NamingState, NewAgent, OfferEffect, Overlay, Pane, Panel, Phase,
-    Proposal, Pulse, Query, Reach, RepoInput, Row, StatusKind, Submission, Turn, View, Waiting,
-    WorkRoom, fuzzy_match, invalid_chars, repo_matches,
+    Proposal, Pulse, Query, Reach, RepoInput, Row, StatusKind, Submission, Turn, View, Visibility,
+    Waiting, WorkRoom, fuzzy_match, invalid_chars, repo_matches,
 };
 use crate::palette::Palette;
 use crate::update::{Pick, Picks, Unusable, picker_matches, switcher_matches};
@@ -49,6 +49,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
             ("⌃D ⌃U", "half a page"),
             ("g G", "first / last"),
             ("[ ]", "previous / next repo"),
+            (".", "show every checkout, or only those running"),
             ("Space /", "switch agent"),
             (
                 "p",
@@ -442,21 +443,34 @@ fn sidebar_title(m: &Model, width: usize) -> Vec<Span<'static>> {
 
 /// `3 of 7`: where the selection is in the list, in the border's colour.
 /// Agents listed from other repos count, though they can't be selected.
-fn sidebar_count(m: &Model, border: Style) -> Vec<Span<'static>> {
+/// While the filter hides entries, a DIM `+7 hidden` leads it when `width`
+/// has room.
+fn sidebar_count(m: &Model, border: Style, width: usize) -> Vec<Span<'static>> {
     let items = m.items();
     let elsewhere = m
         .rows()
         .iter()
         .filter(|r| matches!(r, Row::Elsewhere(_)))
         .count();
-    match m.cursor().and_then(|c| items.iter().position(|i| i == c)) {
-        Some(i) => vec![Span::styled(
+    let mut corner = Vec::new();
+    let hidden = m.hidden();
+    if hidden > 0 && width >= HIDDEN_MIN {
+        corner.push(Span::styled(format!("+{hidden} hidden"), dim()));
+    }
+    if let Some(i) = m.cursor().and_then(|c| items.iter().position(|i| i == c)) {
+        if !corner.is_empty() {
+            corner.push(Span::styled(" · ", dim()));
+        }
+        corner.push(Span::styled(
             format!("{} of {}", i + 1, items.len() + elsewhere),
             border,
-        )],
-        None => Vec::new(),
+        ));
     }
+    corner
 }
+
+/// The narrowest list that shows `+n hidden` beside `i of n`.
+const HIDDEN_MIN: usize = 26;
 
 /// The pane's title (the selected agent) and its corner (the path, or a
 /// shared-session warning), cut to fit `width`.
@@ -645,6 +659,17 @@ fn draw_status_bar(frame: &mut Frame<'_>, m: &Model, area: Rect) {
             }
         }
         hints.push(ranked("n", "new", 4));
+        if m.view != View::Pinned && (m.visibility == Visibility::All || m.hidden() > 0) {
+            hints.push(ranked(
+                ".",
+                if m.visibility == Visibility::All {
+                    "active only"
+                } else {
+                    "show all"
+                },
+                1,
+            ));
+        }
         hints.push(ranked("Tab", m.view.next().hint(), 6));
         if entry.is_some() && !m.actions.is_empty() {
             hints.push(ranked("x", "actions", 0));

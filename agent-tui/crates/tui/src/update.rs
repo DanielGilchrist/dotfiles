@@ -1,11 +1,11 @@
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::num::NonZeroUsize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
 use agent_core::actions::{Action, CommandLine, Context, EventName, Invocation};
-use agent_core::activity::{Activity, State as ActivityState};
+use agent_core::activity::{Activity, AgentId, State as ActivityState};
 use agent_core::config::ControlKey;
 use agent_core::model::RepoKey;
 use agent_core::names::{Prompt, SessionName};
@@ -19,8 +19,8 @@ use ratatui::layout::Position;
 use crate::model::{
     Answer, Chord, Confirm, Cursor, Direction, Edge, Enter, Field, Focus, Follow, FormKind,
     INFO_TTL, Inspection, Intent, Mode, Model, NamingState, NewAgent, Overlay, Pane, Panel, Phase,
-    Query, Reach, StatusKind, Submission, TerminalFocus, Ticket, View, WorkRoom, fuzzy_match,
-    match_rank, repo_matches, unlisted,
+    Query, Reach, StatusKind, SubagentRead, Submission, TerminalFocus, Ticket, View, WorkRoom,
+    fuzzy_match, match_rank, repo_matches, unlisted,
 };
 use crate::worker::{Job, Msg, Outcome};
 
@@ -36,6 +36,12 @@ const LONG_TURN: Duration = Duration::from_secs(30);
 const REINSPECT_AFTER: Duration = Duration::from_secs(3);
 /// And this often whatever it does.
 const SLOW_REFRESH: Duration = Duration::from_secs(30);
+/// The subagent under [2]'s cursor is read again on its agent's activity, at
+/// most this often.
+const SUBAGENT_REFRESH: Duration = Duration::from_secs(2);
+/// And this often whatever it does, since a transcript can be written
+/// without a hook firing.
+const SUBAGENT_SLOW_REFRESH: Duration = Duration::from_secs(10);
 
 /// What `$EDITOR` opens.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,6 +58,12 @@ pub enum Effect {
     Inspect {
         name: SessionName,
         worktree: PathBuf,
+    },
+    /// Read what a subagent of an agent working in `workdir` has done.
+    ReadSubagent {
+        name: SessionName,
+        id: AgentId,
+        workdir: PathBuf,
     },
     /// Attach to an existing session (resurrecting it if it exited).
     Attach {
@@ -204,6 +216,13 @@ pub fn update(m: &mut Model, msg: Msg) -> Vec<Effect> {
             }
             Vec::new()
         }
+        Msg::Subagent { name, id, detail } => {
+            let key = (name, id);
+            if m.subagent_reads.contains_key(&key) {
+                m.subagent_logs.insert(key, detail);
+            }
+            Vec::new()
+        }
         Msg::TookOver { name, detached } => {
             match detached {
                 Ok(n) => {
@@ -257,6 +276,7 @@ pub fn tick(m: &mut Model) -> Vec<Effect> {
     effects.extend(acknowledge(m, SEEN_AFTER).map(Effect::Job));
     effects.extend(preview(m));
     effects.extend(inspect(m));
+    effects.extend(read_subagent(m));
     effects
 }
 
@@ -383,8 +403,47 @@ fn on_activities(m: &mut Model, activities: HashMap<SessionName, Activity>) -> V
         m.bell_due = Some(m.bell_due.map_or(allowed, |due| due.min(allowed)));
     }
     m.activities = Some(activities);
+    forget_subagents(m);
     m.revalidate();
     Vec::new()
+}
+
+/// Drops what's known about subagents their agents no longer list.
+fn forget_subagents(m: &mut Model) {
+    let Some(activities) = &m.activities else {
+        return;
+    };
+    let listed = |(name, id): &(SessionName, AgentId)| {
+        activities
+            .get(name)
+            .is_some_and(|a| a.subagents.contains_key(id))
+    };
+    m.subagent_reads.retain(|key, _| listed(key));
+    m.subagent_logs.retain(|key, _| listed(key));
+}
+
+/// Asks for what the subagent under [2]'s cursor has done: when it's first
+/// shown, soon after its agent reports something, and every
+/// [`SUBAGENT_SLOW_REFRESH`] regardless.
+fn read_subagent(m: &mut Model) -> Option<Effect> {
+    let (name, id) = m.subagent_selected()?;
+    let workdir = m.selected_entry()?.path().map(Path::to_path_buf)?;
+    let events = m.activity(&name)?.events;
+    let now = Instant::now();
+    let key = (name.clone(), id.clone());
+    if matches!(m.subagent_logs.get(&key), Some(Ok(Some(detail))) if detail.finished) {
+        return None;
+    }
+    let due = m.subagent_reads.get(&key).is_none_or(|last| {
+        now >= last.at + SUBAGENT_SLOW_REFRESH
+            || (last.events != events && now >= last.at + SUBAGENT_REFRESH)
+    });
+    if !due {
+        return None;
+    }
+    m.subagent_reads
+        .insert(key, SubagentRead { events, at: now });
+    Some(Effect::ReadSubagent { name, id, workdir })
 }
 
 /// The agent in the pane has finished a turn and been in view for `after`
@@ -416,6 +475,8 @@ fn forget_gone(m: &mut Model) {
     };
     let known: HashSet<SessionName> = snapshot.entries().map(|(_, e)| e.name().clone()).collect();
     m.inspections.retain(|name, _| known.contains(name));
+    m.subagent_reads.retain(|(name, _), _| known.contains(name));
+    m.subagent_logs.retain(|(name, _), _| known.contains(name));
     m.facts.retain(|name, _| known.contains(name));
 }
 
@@ -614,6 +675,7 @@ fn on_panel_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
         }
         (KeyCode::Char('2'), _) => {
             m.panel = Panel::Agent { offset: 0 };
+            m.subagent = None;
             Some(Vec::new())
         }
         (KeyCode::Char('3'), _) if m.changes().is_empty() => {
@@ -678,6 +740,10 @@ fn on_nav_key(m: &mut Model, key: KeyEvent) -> Vec<Effect> {
         KeyCode::Char('[') => m.jump_repo(-1),
         KeyCode::Tab => m.cycle_view(Direction::Forward),
         KeyCode::BackTab => m.cycle_view(Direction::Back),
+        KeyCode::Char('.') if m.view == View::Pinned => {
+            m.info("pinned lists every pin · . filters the repo and agents tabs");
+        }
+        KeyCode::Char('.') => m.visibility = m.visibility.toggled(),
         KeyCode::Char('p') => m.overlay = Overlay::Picker(Query::default()),
         KeyCode::Char(' ' | '/') => m.overlay = Overlay::Switcher(Query::default()),
         KeyCode::Char('?') => m.overlay = Overlay::Help,
@@ -1330,7 +1396,7 @@ mod tests {
 
     use super::*;
     use crate::fixtures::{asking, name, reported, wt};
-    use crate::model::{Blocked, Launchable, NameCheck, Row};
+    use crate::model::{Blocked, Launchable, NameCheck, Row, Visibility};
 
     fn snapshot(sessions: Vec<SessionInfo>, pins: &[&str]) -> agent_core::model::Snapshot {
         let obs = Observation {
@@ -1632,6 +1698,7 @@ mod tests {
             "claude".parse().expect("parses"),
             "claude".into(),
         );
+        m.visibility = Visibility::All;
         update(
             &mut m,
             Msg::Snapshot(Ok((snapshot(sessions, pins), Vec::new()))),
@@ -2013,6 +2080,7 @@ mod tests {
             "claude".parse().expect("parses"),
             "claude".into(),
         );
+        m.visibility = Visibility::All;
         update(&mut m, Msg::Snapshot(Ok((snapshot, Vec::new()))));
         update(&mut m, key(KeyCode::Char('c')));
         type_text(&mut m, "feature/x");
@@ -2533,6 +2601,7 @@ mod tests {
             "claude".parse().expect("parses"),
             "claude".into(),
         );
+        m.visibility = Visibility::All;
         m.follow = Some(Follow::Restored(name("web")));
         update(
             &mut m,
@@ -2566,6 +2635,7 @@ mod tests {
             "claude".parse().expect("parses"),
             "claude".into(),
         );
+        m.visibility = Visibility::All;
         m.follow = Some(Follow::Restored(name("web")));
         update(
             &mut m,
@@ -2595,6 +2665,7 @@ mod tests {
             "claude".parse().expect("parses"),
             "claude".into(),
         );
+        m.visibility = Visibility::All;
         update(
             &mut m,
             Msg::Snapshot(Ok((snapshot(sessions, &[]), Vec::new()))),
@@ -2961,6 +3032,7 @@ mod tests {
             "claude".parse().expect("parses"),
             "claude".into(),
         );
+        m.visibility = Visibility::All;
         update(
             &mut m,
             Msg::Snapshot(Ok((snapshot_with_tools(true), Vec::new()))),
@@ -3030,5 +3102,290 @@ mod tests {
             !tick(&mut m).iter().any(|e| matches!(e, Effect::Bell)),
             "already done"
         );
+    }
+
+    fn filtered(pins: &[&str]) -> Model {
+        let mut m = model(pins);
+        m.visibility = Visibility::Active;
+        m.revalidate();
+        m
+    }
+
+    fn listed(m: &Model) -> Vec<String> {
+        m.rows()
+            .iter()
+            .filter_map(|row| match row {
+                Row::Entry { name, .. } => Some(name.to_string()),
+                Row::Repo { key, .. } => Some(format!(
+                    "repo {}",
+                    key.root()
+                        .map_or(String::new(), |r| r.path().display().to_string())
+                )),
+                Row::Grouped(..) | Row::Header(_) | Row::Elsewhere(_) => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn only_checkouts_with_a_session_are_listed_until_dot_shows_the_rest() {
+        let mut m = filtered(&[]);
+        assert_eq!(
+            listed(&m),
+            ["fix"],
+            "the exited main and the idle worktree are hidden"
+        );
+        assert_eq!(m.hidden(), 2, "api and idle: what `.` adds to this tab");
+        update(&mut m, key(KeyCode::Char('j')));
+        assert_eq!(
+            selected(&m).as_deref(),
+            Some("fix"),
+            "nothing else to move to"
+        );
+
+        update(&mut m, key(KeyCode::Char('.')));
+        assert_eq!(listed(&m), ["api", "fix", "idle"]);
+        assert_eq!(m.hidden(), 0);
+        update(&mut m, key(KeyCode::Char('.')));
+        assert_eq!(listed(&m), ["fix"]);
+    }
+
+    #[test]
+    fn the_selection_stays_listed_until_it_moves_on() {
+        let mut m = filtered(&[]);
+        m.set_cursor(Cursor::Entry(name("idle")));
+        assert_eq!(listed(&m), ["fix", "idle"]);
+        assert_eq!(m.hidden(), 1, "api; the selected idle is listed");
+        update(&mut m, key(KeyCode::Char('j')));
+        assert_eq!(selected(&m).as_deref(), Some("fix"));
+        assert_eq!(
+            listed(&m),
+            ["fix"],
+            "it goes once something else is selected"
+        );
+    }
+
+    #[test]
+    fn overview_drops_repos_with_nothing_listed_and_the_pinned_tab_keeps_every_pin() {
+        let mut m = filtered(&["web"]);
+        update(&mut m, key(KeyCode::Tab));
+        assert_eq!(m.view, View::Overview);
+        assert_eq!(listed(&m), ["repo /src/api", "fix"], "web has no session");
+        update(&mut m, key(KeyCode::Tab));
+        assert_eq!(m.view, View::Pinned);
+        assert_eq!(listed(&m), ["web"], "pins show whatever their state");
+        assert_eq!(m.hidden(), 0, "the filter doesn't apply here");
+    }
+
+    #[test]
+    fn repo_jumps_skip_repos_with_nothing_running() {
+        let mut m = filtered(&[]);
+        update(&mut m, key(KeyCode::Char(']')));
+        assert_eq!(selected(&m).as_deref(), Some("fix"));
+        update(&mut m, key(KeyCode::Char('.')));
+        update(&mut m, key(KeyCode::Char(']')));
+        assert_eq!(selected(&m).as_deref(), Some("web"));
+    }
+
+    #[test]
+    fn the_switcher_still_finds_hidden_checkouts_and_selecting_one_lists_it() {
+        let mut m = filtered(&[]);
+        let found = switcher_matches(&m, "web");
+        assert_eq!(found, [name("web")]);
+        assert!(switcher_matches(&m, "idle").contains(&name("idle")));
+        m.set_cursor(Cursor::Entry(name("web")));
+        assert_eq!(selected(&m).as_deref(), Some("web"));
+        assert_eq!(listed(&m), ["web"]);
+    }
+
+    fn delegating() -> Model {
+        let mut m = crate::fixtures::fleet(10);
+        m.set_cursor(Cursor::Entry(name("obs-layout-4")));
+        m
+    }
+
+    fn reads(effects: Vec<Effect>) -> Vec<String> {
+        effects
+            .into_iter()
+            .filter_map(|e| match e {
+                Effect::ReadSubagent { id, workdir, .. } => {
+                    Some(format!("{id:?} {}", workdir.display()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn focusing_the_turn_puts_a_cursor_on_the_subagents_and_reads_the_one_it_is_on() {
+        let mut m = delegating();
+        assert_eq!(m.subagent_count(), 3);
+        assert!(
+            reads(tick(&mut m)).is_empty(),
+            "nothing is read while [2] is unfocused"
+        );
+
+        update(&mut m, key(KeyCode::Char('2')));
+        assert_eq!(m.panel, Panel::Agent { offset: 0 });
+        assert_eq!(
+            reads(tick(&mut m)),
+            ["AgentId(\"s2\") /w/heucristic0/obs-layout-4"],
+            "the oldest first, as the tree lists them"
+        );
+        assert!(reads(tick(&mut m)).is_empty(), "once");
+
+        update(&mut m, key(KeyCode::Char('j')));
+        assert_eq!(
+            m.panel,
+            Panel::Agent { offset: 0 },
+            "j moves the cursor, not the scroll"
+        );
+        assert_eq!(m.subagent_at(), 1);
+        assert_eq!(
+            reads(tick(&mut m)).len(),
+            1,
+            "the newly selected one is read at once"
+        );
+        update(&mut m, key(KeyCode::Char('G')));
+        assert_eq!(m.subagent_at(), 2);
+        update(&mut m, key(KeyCode::Char('j')));
+        assert_eq!(m.subagent_at(), 2, "stops at the end");
+        update(&mut m, key(KeyCode::Char('g')));
+        assert_eq!(m.subagent_at(), 0);
+        update(&mut m, key(KeyCode::Char('k')));
+        assert_eq!(m.subagent_at(), 0);
+    }
+
+    #[test]
+    fn a_subagent_is_read_again_soon_after_its_agent_reports_but_not_every_tick() {
+        let mut m = delegating();
+        update(&mut m, key(KeyCode::Char('2')));
+        assert_eq!(reads(tick(&mut m)).len(), 1);
+        let (name, id) = m.subagent_selected().expect("a subagent is selected");
+
+        let mut more = m.activities.clone().expect("reported");
+        more.get_mut(&name).expect("has activity").events += 1;
+        update(&mut m, Msg::Activities(more));
+        assert!(
+            reads(tick(&mut m)).is_empty(),
+            "within the refresh interval"
+        );
+        for last in m.subagent_reads.values_mut() {
+            last.at -= SUBAGENT_REFRESH;
+        }
+        assert_eq!(reads(tick(&mut m)).len(), 1, "after it");
+
+        let detail = agent_core::ports::SubagentDetail {
+            prompt: "do it".into(),
+            ..Default::default()
+        };
+        update(
+            &mut m,
+            Msg::Subagent {
+                name: name.clone(),
+                id: id.clone(),
+                detail: Ok(Some(detail.clone())),
+            },
+        );
+        assert_eq!(
+            m.subagent_logs.get(&(name.clone(), id.clone())),
+            Some(&Ok(Some(detail.clone())))
+        );
+
+        let mut gone = m.activities.clone().expect("reported");
+        gone.get_mut(&name).expect("has activity").subagents.clear();
+        update(&mut m, Msg::Activities(gone));
+        assert!(m.subagent_logs.is_empty() && m.subagent_reads.is_empty());
+        update(
+            &mut m,
+            Msg::Subagent {
+                name,
+                id,
+                detail: Ok(Some(detail)),
+            },
+        );
+        assert!(
+            m.subagent_logs.is_empty(),
+            "a late answer for an unwatched subagent is dropped"
+        );
+    }
+
+    #[test]
+    fn without_subagents_j_and_k_still_scroll_the_turn() {
+        let mut m = crate::fixtures::fleet(10);
+        m.set_cursor(Cursor::Entry(name("rate-limit-1")));
+        update(&mut m, key(KeyCode::Char('2')));
+        update(&mut m, key(KeyCode::Char('j')));
+        assert_eq!(m.panel, Panel::Agent { offset: 1 });
+        assert_eq!(reads(tick(&mut m)), [""; 0]);
+    }
+
+    #[test]
+    fn dot_counts_what_it_adds_per_tab_and_does_nothing_on_the_pinned_tab() {
+        let mut m = filtered(&[]);
+        update(&mut m, key(KeyCode::Tab));
+        assert_eq!(
+            m.hidden(),
+            3,
+            "the agents tab spans every repo: api, idle, web"
+        );
+        update(&mut m, key(KeyCode::Tab));
+        assert_eq!(m.view, View::Pinned);
+        update(&mut m, key(KeyCode::Char('.')));
+        assert_eq!(
+            m.visibility,
+            Visibility::Active,
+            "no effect on the pinned tab"
+        );
+        assert!(
+            m.status
+                .as_ref()
+                .is_some_and(|s| s.text.contains("pinned lists every pin"))
+        );
+    }
+
+    #[test]
+    fn a_finished_subagent_is_not_read_again() {
+        let mut m = delegating();
+        update(&mut m, key(KeyCode::Char('2')));
+        assert_eq!(reads(tick(&mut m)).len(), 1);
+        let (name, id) = m.subagent_selected().expect("a subagent is selected");
+        let done = agent_core::ports::SubagentDetail {
+            finished: true,
+            ..Default::default()
+        };
+        update(
+            &mut m,
+            Msg::Subagent {
+                name,
+                id,
+                detail: Ok(Some(done)),
+            },
+        );
+        for last in m.subagent_reads.values_mut() {
+            last.at -= SUBAGENT_SLOW_REFRESH;
+        }
+        assert_eq!(reads(tick(&mut m)), [""; 0]);
+    }
+
+    #[test]
+    fn the_turn_cursor_follows_its_subagent_when_the_others_come_and_go() {
+        let mut m = delegating();
+        update(&mut m, key(KeyCode::Char('2')));
+        update(&mut m, key(KeyCode::Char('j')));
+        let (name, id) = m.subagent_selected().expect("a subagent is selected");
+        assert_eq!(id, AgentId::new("s1"));
+        let mut fewer = m.activities.clone().expect("reported");
+        fewer
+            .get_mut(&name)
+            .expect("has activity")
+            .subagents
+            .remove(&AgentId::new("s2"));
+        update(&mut m, Msg::Activities(fewer));
+        assert_eq!(
+            m.subagent_selected().map(|(_, id)| id),
+            Some(id),
+            "still s1, now first"
+        );
+        assert_eq!(m.subagent_at(), 0);
     }
 }

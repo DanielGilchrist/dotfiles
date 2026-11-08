@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
 use agent_core::actions::Actions;
-use agent_core::activity::{Activity, State as ActivityState};
+use agent_core::activity::{Activity, AgentId, State as ActivityState, Subagent};
 use agent_core::config::Keys;
 use agent_core::model::{
     Entry, EntryState, Removable, Repo, RepoKey, Revival, Running, Snapshot, Startable,
@@ -12,7 +12,7 @@ use agent_core::model::{
 use agent_core::names::{AgentName, BranchName, Checkout, Prompt, SessionName};
 use agent_core::ops::{Approved, Hazardous, RemovalPlan};
 use agent_core::paths::{RepoRoot, Typed, typed_path};
-use agent_core::ports::{Change, HarnessId, WorktreeFacts};
+use agent_core::ports::{Change, HarnessId, SubagentDetail, WorktreeFacts};
 use agent_term::{Emulator, Terminal};
 use ratatui::layout::Rect;
 
@@ -796,6 +796,52 @@ pub struct Extent {
     pub live: usize,
 }
 
+/// Which checkouts [1]'s repo and agents tabs list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Visibility {
+    /// Those with a live session, and the selected one.
+    #[default]
+    Active,
+    All,
+}
+
+impl Visibility {
+    /// Whether `entry` is listed on its own account.
+    pub fn lists(self, entry: &Entry) -> bool {
+        match self {
+            Self::All => true,
+            Self::Active => matches!(entry.state(), EntryState::Live),
+        }
+    }
+
+    pub fn toggled(self) -> Self {
+        match self {
+            Self::Active => Self::All,
+            Self::All => Self::Active,
+        }
+    }
+}
+
+/// The entry selecting `repo` lands on: its first listed one, else its main
+/// checkout.
+fn lead(visibility: Visibility, repo: &Repo) -> &Entry {
+    repo.entries()
+        .iter()
+        .find(|e| visibility.lists(e))
+        .unwrap_or_else(|| repo.first())
+}
+
+/// When a subagent's transcript was last asked for, and how many events its
+/// agent had reported then.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubagentRead {
+    pub events: u64,
+    pub at: Instant,
+}
+
+/// A subagent by its agent and its id.
+pub type SubagentKey = (SessionName, AgentId);
+
 pub enum Load {
     Pending,
     Ready {
@@ -862,6 +908,15 @@ pub struct Model {
     /// A bell held back by the rate limit, to ring when it allows.
     pub bell_due: Option<Instant>,
     pub terminal: TerminalFocus,
+    /// Which checkouts [1] lists.
+    pub visibility: Visibility,
+    /// The subagent [2]'s cursor is on while it's focused. The first one
+    /// while it's unset or gone.
+    pub subagent: Option<AgentId>,
+    /// What each subagent being watched was told and has done, as last read.
+    pub subagent_logs: HashMap<SubagentKey, Result<Option<SubagentDetail>, String>>,
+    /// When each subagent's transcript was last asked for.
+    pub subagent_reads: HashMap<SubagentKey, SubagentRead>,
 }
 
 impl Model {
@@ -908,6 +963,10 @@ impl Model {
             last_bell: None,
             bell_due: None,
             terminal: TerminalFocus::Focused,
+            visibility: Visibility::Active,
+            subagent: None,
+            subagent_logs: HashMap::new(),
+            subagent_reads: HashMap::new(),
         }
     }
 
@@ -977,6 +1036,10 @@ impl Model {
                 self.move_cursor_by(delta, wrap);
                 Panel::Agents
             }
+            Panel::Agent { .. } if self.subagent_count() > 0 => {
+                self.point_at_subagent(|at, last| at.saturating_add_signed(delta).min(last));
+                self.panel
+            }
             Panel::Agent { offset } => Panel::Agent {
                 offset: offset.saturating_add_signed(delta),
             },
@@ -1000,6 +1063,13 @@ impl Model {
             (Panel::Agents, _) => {
                 self.move_to_edge(edge);
                 Panel::Agents
+            }
+            (Panel::Agent { .. }, edge) if self.subagent_count() > 0 => {
+                self.point_at_subagent(|_, last| match edge {
+                    Edge::First => 0,
+                    Edge::Last => last,
+                });
+                self.panel
             }
             (Panel::Agent { .. }, Edge::First) => Panel::Agent { offset: 0 },
             (Panel::Agent { .. }, Edge::Last) => Panel::Agent { offset: usize::MAX },
@@ -1090,6 +1160,57 @@ impl Model {
         Some(entry.name())
     }
 
+    /// The selected agent's subagents, oldest first, as [2] lists them.
+    pub fn subagent_rows(&self) -> Vec<(&AgentId, &Subagent)> {
+        let Some(entry) = self.selected_entry() else {
+            return Vec::new();
+        };
+        let Some(activity) = self
+            .activity(entry.name())
+            .filter(|_| matches!(entry.state(), EntryState::Live))
+        else {
+            return Vec::new();
+        };
+        let mut rows: Vec<_> = activity.subagents.iter().collect();
+        rows.sort_by_key(|(_, s)| s.since);
+        rows
+    }
+
+    pub fn subagent_count(&self) -> usize {
+        self.subagent_rows().len()
+    }
+
+    /// Where [2]'s cursor is among the subagents: its own, or the first
+    /// while it points at none that exist.
+    pub fn subagent_at(&self) -> usize {
+        self.subagent
+            .as_ref()
+            .and_then(|id| self.subagent_rows().iter().position(|(row, _)| *row == id))
+            .unwrap_or(0)
+    }
+
+    /// Moves [2]'s cursor to the subagent `to` picks from where it is and
+    /// the last one's index.
+    fn point_at_subagent(&mut self, to: impl FnOnce(usize, usize) -> usize) {
+        let rows = self.subagent_rows();
+        let Some(last) = rows.len().checked_sub(1) else {
+            return;
+        };
+        let id = rows[to(self.subagent_at(), last).min(last)].0.clone();
+        self.subagent = Some(id);
+    }
+
+    /// The subagent [2]'s cursor is on, while [2] is focused.
+    pub fn subagent_selected(&self) -> Option<(SessionName, AgentId)> {
+        let Panel::Agent { .. } = self.panel else {
+            return None;
+        };
+        let name = self.selected_entry()?.name().clone();
+        let rows = self.subagent_rows();
+        let (id, _) = rows.get(self.subagent_at())?;
+        Some((name, (*id).clone()))
+    }
+
     /// How many subagents a live agent has running, if any.
     pub fn subagents(&self, entry: &Entry) -> Option<NonZeroUsize> {
         let EntryState::Live = entry.state() else {
@@ -1173,6 +1294,33 @@ impl Model {
         }
     }
 
+    /// Whether [1] lists `entry` on its own account.
+    pub fn active(&self, entry: &Entry) -> bool {
+        self.visibility.lists(entry)
+    }
+
+    /// Whether [1] lists `entry`: it's active, or it's what's selected, so
+    /// the cursor never vanishes.
+    pub fn shown(&self, entry: &Entry) -> bool {
+        self.active(entry) || self.cursor().and_then(Cursor::entry_name) == Some(entry.name())
+    }
+
+    /// How many entries the filter leaves out of the current tab: what `.`
+    /// would add to it.
+    pub fn hidden(&self) -> usize {
+        let Some(snapshot) = self.snapshot() else {
+            return 0;
+        };
+        let hidden = |entries: &[Entry]| entries.iter().filter(|e| !self.shown(e)).count();
+        match self.view {
+            View::Pinned => 0,
+            View::Focus => self
+                .selected()
+                .map_or(0, |(repo, _)| hidden(repo.entries())),
+            View::Overview => snapshot.repos().iter().map(|r| hidden(r.entries())).sum(),
+        }
+    }
+
     pub fn rows(&self) -> Vec<Row> {
         let Some(snapshot) = self.snapshot() else {
             return Vec::new();
@@ -1204,14 +1352,14 @@ impl Model {
                 let waiting = self.needs_you();
                 let mut rows = Self::needs_you_rows(&waiting);
                 let repos = snapshot.repos();
-                let listed = |e: &&Entry| !waiting.contains(e.name());
+                let listed = |e: &&Entry| !waiting.contains(e.name()) && self.shown(e);
                 // Folds are worked out from the extent's worst case, so
                 // agents changing state never open or close a repo.
                 let sizes: Vec<usize> = repos
                     .iter()
                     .map(|r| match sole(r) {
                         Some(_) => 0,
-                        None => r.entries().len(),
+                        None => r.entries().iter().filter(|e| self.shown(e)).count(),
                     })
                     .collect();
                 let room = usize::from(self.areas.sidebar.height);
@@ -1235,7 +1383,8 @@ impl Model {
                         }
                         continue;
                     }
-                    if !repo.entries().iter().any(|e| listed(&e)) {
+                    let selected = self.cursor() == Some(&Cursor::Repo(repo.key().clone()));
+                    if !selected && !repo.entries().iter().any(|e| listed(&e)) {
                         continue;
                     }
                     rows.push(Row::Repo {
@@ -1274,6 +1423,7 @@ impl Model {
         let mut rows: Vec<Row> = repo
             .entries()
             .iter()
+            .filter(|e| self.shown(e))
             .map(|e| Row::Entry {
                 name: e.name().clone(),
                 place: Place::Alone,
@@ -1305,9 +1455,10 @@ impl Model {
                 let Some((repo, _)) = self.selected() else {
                     return Extent::default();
                 };
-                let elsewhere = snapshot.entries().count() - repo.entries().len();
+                let here = repo.entries().iter().filter(|e| self.active(e)).count();
+                let elsewhere = snapshot.entries().filter(|(_, e)| self.active(e)).count() - here;
                 return Extent {
-                    rows: 1 + elsewhere + repo.entries().len(),
+                    rows: 1 + elsewhere + here,
                     live: repo
                         .entries()
                         .iter()
@@ -1316,10 +1467,18 @@ impl Model {
                 };
             }
             View::Overview => {
-                let repos = snapshot.repos().iter().filter(|r| sole(r).is_none());
+                let repos = snapshot
+                    .repos()
+                    .iter()
+                    .filter(|r| sole(r).is_none())
+                    .filter(|r| r.entries().iter().any(|e| self.active(e)));
                 (
                     1 + repos.count(),
-                    snapshot.entries().map(|(_, e)| e).collect(),
+                    snapshot
+                        .entries()
+                        .map(|(_, e)| e)
+                        .filter(|e| self.active(e))
+                        .collect(),
                 )
             }
             View::Pinned => (1, snapshot.entries().map(|(_, e)| e).collect()),
@@ -1406,6 +1565,7 @@ impl Model {
         let view = self.view;
         let start_dir = self.start_dir.clone();
         let waiting = self.needs_you();
+        let visibility = self.visibility;
         let Load::Ready { snapshot, cursor } = &mut self.load else {
             return;
         };
@@ -1447,7 +1607,9 @@ impl Model {
             Some(Cursor::Grouped(_, name) | Cursor::Entry(name)) => {
                 snapshot.entry(name).and_then(|(_, e)| entry_of(e))
             }
-            Some(Cursor::Repo(key)) => snapshot.repo(key).and_then(|r| entry_of(r.first())),
+            Some(Cursor::Repo(key)) => snapshot
+                .repo(key)
+                .and_then(|r| entry_of(lead(visibility, r))),
             None => None,
         };
         let fallback = fallback.or_else(|| match view {
@@ -1459,7 +1621,7 @@ impl Model {
                 .and_then(entry_of),
             View::Focus | View::Overview => previous_repo
                 .and_then(|k| snapshot.repo(k))
-                .and_then(|r| entry_of(r.first()))
+                .and_then(|r| entry_of(lead(visibility, r)))
                 .or_else(|| {
                     snapshot
                         .containing(&start_dir)
@@ -1514,7 +1676,7 @@ impl Model {
         let next = match (self.view, next) {
             (View::Focus, Cursor::Grouped(_, name)) => Cursor::Entry(name),
             (View::Focus, Cursor::Repo(key)) => match self.snapshot().and_then(|s| s.repo(&key)) {
-                Some(repo) => Cursor::Entry(repo.first().name().clone()),
+                Some(repo) => Cursor::Entry(lead(self.visibility, repo).name().clone()),
                 None => return,
             },
             (View::Pinned, Cursor::Entry(name) | Cursor::Grouped(_, name)) => {
@@ -1589,14 +1751,17 @@ impl Model {
         let Some(snapshot) = self.snapshot() else {
             return;
         };
-        let repos = snapshot.repos();
+        let here = self.cursor().and_then(|c| c.repo(snapshot)).map(Repo::key);
+        let repos: Vec<&Repo> = snapshot
+            .repos()
+            .iter()
+            .filter(|r| Some(r.key()) == here || r.entries().iter().any(|e| self.active(e)))
+            .collect();
         if repos.is_empty() {
             return;
         }
-        let current = self
-            .cursor()
-            .and_then(|c| c.repo(snapshot))
-            .and_then(|r| repos.iter().position(|x| x.key() == r.key()))
+        let current = here
+            .and_then(|key| repos.iter().position(|x| x.key() == key))
             .unwrap_or(0);
         let next = current
             .checked_add_signed(delta)
@@ -1613,7 +1778,7 @@ impl Model {
         let cursor = match (self.view, sole(repo)) {
             (View::Overview, None) => Cursor::Repo(key.clone()),
             (View::Overview, Some(_)) | (View::Focus | View::Pinned, _) => {
-                Cursor::Entry(repo.first().name().clone())
+                Cursor::Entry(lead(self.visibility, repo).name().clone())
             }
         };
         if self.view == View::Pinned {

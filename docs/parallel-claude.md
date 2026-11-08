@@ -61,7 +61,8 @@ types into the embedded session. `?` shows every key.
 | `⏎` / `l` | Attach the selected agent (resurrect or start it if needed) |
 | `⌃\` | Back to NAV from an agent. Twice goes to the previous agent |
 | `1` `2` `3` | Focus the list [1], the turn and Changes panels. Focusing [2] or [3] expands it only as far as its content needs: from the other lower panel's spare rows first, then the list, and only then does the other panel collapse to its title line (at the smallest sizes the collapse can leave it a few blank rows). From [2] or [3], `Esc` goes back to the list |
-| `j k g G`, `[ ]` | Move in the focused panel, previous / next repo |
+| `j k g G`, `[ ]` | Move in the focused panel, previous / next repo. In [2] with subagents they move a cursor over them |
+| `.` | Show every checkout, or only those with a live session (the default). `+7 hidden` in [1]'s corner says how many are left out |
 | `⌃D ⌃U` | Half a page in the focused panel, handy in Changes |
 | `Space` / `/` | Switcher (fuzzy), `⌃N ⌃P` to move |
 | `Tab` / `⇧Tab` | Cycle [1]'s tabs: the repo, all agents, pinned. The title names them where the width allows, the active one bold, and the footer's `Tab` hint names the next |
