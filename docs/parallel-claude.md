@@ -148,8 +148,8 @@ terminal_event = { name = "agent-spawn-dev", value = "{path}" }
 
 [[action]]
 key = "t"
-label = "open in tab"
-terminal_event = { name = "agent-open", value = "tab|{name}|{path}" }
+label = "nvim in tab"
+terminal_event = { name = "agent-edit", value = "tab|{path}" }
 
 [[action]]
 key = "g"
@@ -203,17 +203,14 @@ success = "green"    # finished activities, added lines
 | `CMD+Left` / `CMD+Right` | Cycle tabs, skipping the `agent` tab |
 | `Shift+Alt+{` / `}` | Move tabs (the `agent` tab stays put) |
 
-The `agent-open` event (`wezterm/agent_open.lua`) backs the `t` (open in tab)
-and `r` (open right) actions in `~/.config/agent/config.toml`, run with `x`
-then the key. The payload is `<tab|right>|<name>|<cwd>`. The handler asks
-`agent windows <name>` which clients show the agent. If a local pane runs one
-of them (unless it's inside the `agent` TUI), that pane's tab and window are
-focused. Otherwise `agent attach <name>` opens in a new tab or in a split
-right of the TUI, or `agent repo` for a repo session. The agent is then open
-elsewhere, so the TUI pauses its own view of it within a few seconds. The
-handler runs on the machine whose wezterm draws the TUI and refuses a `cwd`
-that isn't a directory there, so over SSH these actions only say so. Panes
-that aren't local can't be inspected, so they are never matched.
+The `agent-edit` event (`wezterm/agent_edit.lua`) backs the `t` (nvim in tab)
+and `r` (nvim right) actions in `~/.config/agent/config.toml`, run with `x`
+then the key. The payload is `<tab|right>|<cwd>`. If a local pane already runs
+`$EDITOR` in that checkout, its tab and window are focused. Otherwise `$EDITOR`
+opens there in a new tab or in a split right of the TUI. The handler runs on
+the machine whose wezterm draws the TUI and refuses a `cwd` that isn't a
+directory there, so over SSH these actions only say so. Panes that aren't
+local can't be inspected, so they are never matched.
 
 ## Commands
 

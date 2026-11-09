@@ -1,6 +1,6 @@
 require("commands").register_commands()
 require("agents_tab").register()
-require("agent_open").register()
+require("agent_edit").register()
 
 local wezterm = require("wezterm")
 local os_utils = require("utils.os")
