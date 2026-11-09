@@ -3,14 +3,6 @@ local M = {}
 local repo = vim.fn.expand("~/repos/DanielGilchrist/heucristic")
 local building = false
 
-local function head()
-  local result = vim.system({ "git", "-C", repo, "rev-parse", "HEAD" }, { text = true }):wait()
-  if result.code ~= 0 then
-    return nil
-  end
-  return vim.trim(result.stdout)
-end
-
 local function installed()
   local file = io.open(repo .. "/bin/.installed-commit", "r")
   if not file then
@@ -39,23 +31,34 @@ function M.ensure()
   if building or vim.fn.isdirectory(repo) == 0 then
     return
   end
-  local current = head()
-  if not current or (current == installed() and vim.fn.executable(repo .. "/bin/heucristic") == 1) then
-    return
-  end
 
   building = true
-  vim.notify("heucristic: building " .. current:sub(1, 7) .. " in the background")
-  vim.system({ "script/install" }, { cwd = repo, text = true }, function(result)
+  local before = installed()
+  local output = {}
+  local function collect(_, data)
+    if not data then
+      return
+    end
+    if #output == 0 then
+      vim.schedule(function()
+        vim.notify("heucristic: building in the background")
+      end)
+    end
+    table.insert(output, data)
+  end
+  vim.system({ "script/install", "--if-changed" }, { cwd = repo, text = true, stdout = collect }, function(result)
     vim.schedule(function()
       building = false
       if result.code ~= 0 then
-        local lines = vim.split(vim.trim(result.stderr ~= "" and result.stderr or result.stdout), "\n")
+        local lines = vim.split(vim.trim(result.stderr ~= "" and result.stderr or table.concat(output)), "\n")
         vim.notify("heucristic: build failed\n" .. table.concat(vim.list_slice(lines, math.max(1, #lines - 10)), "\n"), vim.log.levels.ERROR)
         return
       end
-      vim.notify("heucristic: built " .. current:sub(1, 7) .. ", restarting")
-      restart()
+      local after = installed()
+      if after and after ~= before then
+        vim.notify("heucristic: built " .. after:sub(1, 7) .. ", restarting")
+        restart()
+      end
     end)
   end)
 end
