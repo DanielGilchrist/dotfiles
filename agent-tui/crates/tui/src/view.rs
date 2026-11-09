@@ -4,7 +4,7 @@ use std::time::SystemTime;
 
 use agent_core::actions::Kind;
 use agent_core::model::{Entry, EntryKind, Head};
-use agent_core::names::{Checkout, SessionName};
+use agent_core::names::{Checkout, NameLimit, SessionName};
 use agent_core::ops::Deletes;
 use ratatui::backend::Backend;
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
@@ -14,6 +14,7 @@ use ratatui::widgets::{Block, BorderType, Clear, Padding, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::cause::Cause;
 use crate::keymap::{self, Situation};
 use crate::model::{
     AgentStatus, Areas, Blocked, Confirm, Derived, Drawn, Enter, Field, Focus, FormKind, HelpState,
@@ -37,7 +38,7 @@ const SIDEBAR_SHARE: u32 = 24;
 
 const TASK_ROWS: usize = 6;
 const SPINNER: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
-/// Below this width the agent needs every column; Space still switches agents.
+/// Below this width the agent needs every column. Space still switches agents.
 const NARROW: u16 = 60;
 /// A name keeps at least this many columns before row details give way.
 const NAME_MIN: usize = 8;
@@ -247,11 +248,8 @@ fn badge(text: &'static str) -> Span<'static> {
     )
 }
 
-fn display_path(path: &Path) -> String {
-    match agent_core::paths::home()
-        .ok()
-        .and_then(|h| path.strip_prefix(h).ok().map(Path::to_path_buf))
-    {
+fn display_path(path: &Path, home: Option<&Path>) -> String {
+    match home.and_then(|home| path.strip_prefix(home).ok()) {
         Some(rest) => format!("~/{}", rest.display()),
         None => path.display().to_string(),
     }
@@ -387,7 +385,7 @@ pub fn draw(frame: &mut Frame<'_>, m: &Model) -> Drawn {
                 &draft.to,
                 &draft.lines,
                 &draft.text,
-                draft.rev.as_deref(),
+                draft.rev.as_ref(),
             );
         }
         Overlay::Planning { name, .. } => draw_planning(frame, m.clock.wall, name),
@@ -565,7 +563,7 @@ fn pane_title(m: &Model, width: usize) -> (Vec<Span<'static>>, Vec<Span<'static>
             .or_else(|| repo.key().root().map(agent_core::paths::RepoRoot::path));
         path.map(|p| {
             vec![Span::styled(
-                truncate_start(&display_path(p), width.saturating_sub(7)),
+                truncate_start(&display_path(p, m.home.as_deref()), width.saturating_sub(7)),
                 dim(),
             )]
         })
@@ -625,12 +623,16 @@ fn draw_terminal(frame: &mut Frame<'_>, m: &Model, area: Rect) {
                 enter: Enter::Start(_),
                 ..
             } => action("⏎", format!("start {} here", m.harness_label)),
+            Reach::Other {
+                enter: Enter::Refused(why),
+                ..
+            } => Line::styled(why.to_string(), error()),
         },
     };
     centered(frame, area, vec![line]);
 }
 
-/// A status-bar hint; lower `rank` is dropped first when space runs out.
+/// A status-bar hint. Lower `rank` is dropped first when space runs out.
 struct Hint<'a> {
     spans: [Span<'a>; 3],
     rank: u8,
@@ -720,7 +722,7 @@ fn status_counts(m: &Model, focus: &Focus<'_>, nav: &str) -> Vec<Span<'static>> 
 
 /// The mode badge, then context hints, then the status message on the
 /// right. Hints that don't fit are dropped least important first (`? keys`
-/// always stays); the status never pushes hints out, which made the row
+/// always stays). The status never pushes hints out, which made the row
 /// jitter as messages came and went, it's cut to fit instead.
 fn draw_status_bar(frame: &mut Frame<'_>, m: &Model, area: Rect) {
     let focus = m.focus();
@@ -954,7 +956,9 @@ fn draw_picker(frame: &mut Frame<'_>, m: &Model, query: &Query) -> usize {
     // A place never takes more than half the row, so the name stays legible.
     let place = |path: &Path| {
         truncate_start(
-            &path.parent().map_or_else(String::new, display_path),
+            &path
+                .parent()
+                .map_or_else(String::new, |p| display_path(p, m.home.as_deref())),
             width / 2,
         )
     };
@@ -986,7 +990,10 @@ fn draw_picker(frame: &mut Frame<'_>, m: &Model, query: &Query) -> usize {
                     let right = Span::styled("add its repo", dim());
                     let room = width.saturating_sub(right.width() + 1);
                     (
-                        vec![Span::raw(truncate_start(&display_path(path), room))],
+                        vec![Span::raw(truncate_start(
+                            &display_path(path, m.home.as_deref()),
+                            room,
+                        ))],
                         vec![right],
                     )
                 }
@@ -1072,11 +1079,19 @@ fn draw_new(frame: &mut Frame<'_>, m: &Model, form: &NewAgent) {
         ),
         None => lines.push(Line::raw("")),
     }
-    let failure = form.error.as_ref().filter(|e| problem.as_ref() != Some(e));
+    let failure = form
+        .error
+        .as_ref()
+        .filter(|e| problem.as_deref() != Some(e.to_string().as_str()));
 
     lines.push(name_line(m, form, &derived, &fields, inner));
     let message = name_message(form, &derived, failure);
-    lines.extend(name_note(message.as_ref(), derived.name.len(), inner));
+    lines.extend(name_note(
+        message.as_ref(),
+        derived.name.len(),
+        m.name_limit,
+        inner,
+    ));
     lines.push(Line::raw(""));
 
     lines.push(repo_line(m, form, &derived, &fields, inner));
@@ -1101,7 +1116,7 @@ fn target_problem(form: &NewAgent, derived: &Derived) -> Option<String> {
 }
 
 /// The name row: the suggestion dim with where it came from until one is
-/// typed; typed characters that don't fit or aren't allowed are red.
+/// typed. Typed characters that don't fit or aren't allowed are red.
 fn name_line(
     m: &Model,
     form: &NewAgent,
@@ -1149,7 +1164,7 @@ fn name_line(
             .into_iter()
             .map(|(i, _)| i)
             .collect();
-        let max = agent_core::names::MAX_SESSION_LEN;
+        let max = m.name_limit.bytes();
         name.extend(form.name.char_indices().map(|(i, c)| {
             let wrong = i + c.len_utf8() > max || bad.contains(&i);
             Span::styled(c.to_string(), if wrong { error() } else { Style::new() })
@@ -1164,16 +1179,23 @@ fn name_line(
 fn name_message(
     form: &NewAgent,
     derived: &Derived,
-    failure: Option<&String>,
+    failure: Option<&Cause>,
 ) -> Option<(String, Style)> {
-    let max = agent_core::names::MAX_SESSION_LEN;
     let (red, yellow) = (error(), warning());
     match (&form.phase, failure, &derived.check) {
         (Phase::Submitting { .. }, ..) | (_, None, NameCheck::Empty | NameCheck::Free(_)) => None,
-        (_, Some(failure), _) => Some((failure.clone(), red)),
-        (_, None, NameCheck::TooLong { bytes }) => {
-            Some((format!("{} over zellij's limit", bytes - max), red))
-        }
+        (_, Some(failure), _) => Some((failure.to_string(), red)),
+        (_, None, NameCheck::TooLong { over, .. }) => Some((
+            format!(
+                "{over} {} over the session host's limit",
+                if over.get() == 1 {
+                    "character"
+                } else {
+                    "characters"
+                }
+            ),
+            red,
+        )),
         (_, None, NameCheck::Invalid(why)) => Some((why.clone(), red)),
         (_, None, NameCheck::Own) => Some(("this TUI runs in that session".into(), yellow)),
         (_, None, NameCheck::MainCheckout { repo }) => Some((
@@ -1235,8 +1257,13 @@ fn name_message(
 
 /// The message under the name with the name's length beside its first row.
 /// Worker errors can be long, so they wrap rather than being cut.
-fn name_note(message: Option<&(String, Style)>, length: usize, inner: usize) -> Vec<Line<'static>> {
-    let max = agent_core::names::MAX_SESSION_LEN;
+fn name_note(
+    message: Option<&(String, Style)>,
+    length: usize,
+    limit: NameLimit,
+    inner: usize,
+) -> Vec<Line<'static>> {
+    let max = limit.bytes();
     let counter_style = if length > max { error() } else { dim() };
     let counter = vec![Span::styled(format!("{length}/{max}"), counter_style)];
     let rows: Vec<String> = match &message {
@@ -1395,7 +1422,7 @@ fn repo_line(
                 Some(pr) if root.as_ref().is_none_or(|root| root.name() != pr.repo) => {
                     right.push(Span::styled(
                         format!("the link is {}", pr.slug()),
-                        Style::new().fg(Color::Yellow),
+                        warning(),
                     ));
                 }
                 _ if fields.focus == Some(Field::Repo) => {
@@ -1776,7 +1803,7 @@ fn draw_comment(
     to: &SessionName,
     selected: &[crate::review::LineInfo],
     text: &str,
-    rev: Option<&str>,
+    rev: Option<&crate::review::Rev>,
 ) {
     let shown = selected.len().min(3);
     let height = u16::try_from(3 + shown + usize::from(selected.len() > shown)).unwrap_or(3);

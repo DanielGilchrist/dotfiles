@@ -58,19 +58,25 @@ pub struct Rgb {
     pub b: u8,
 }
 
+/// How much of a colour goes into a mix, from 0 to 100 percent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Share(u8);
+
+impl Share {
+    /// Anything over 100 counts as 100.
+    pub fn percent(percent: u8) -> Self {
+        Self(percent.min(100))
+    }
+}
+
 impl Rgb {
-    /// `weight` of `self` and the rest of `other`, per channel.
+    /// `share` of `self` and the rest of `other`, per channel.
     #[must_use]
-    pub fn mix(self, other: Self, weight: f32) -> Self {
+    pub fn mix(self, other: Self, share: Share) -> Self {
+        let own = u16::from(share.0);
         let channel = |a: u8, b: u8| {
-            let mixed = f32::from(a) * weight + f32::from(b) * (1.0 - weight);
-            #[expect(
-                clippy::cast_possible_truncation,
-                clippy::cast_sign_loss,
-                reason = "clamped to 0-255 first"
-            )]
-            let byte = mixed.round().clamp(0.0, 255.0) as u8;
-            byte
+            let mixed = (u16::from(a) * own + u16::from(b) * (100 - own) + 50) / 100;
+            u8::try_from(mixed).unwrap_or(u8::MAX)
         };
         Self {
             r: channel(self.r, other.r),
@@ -282,10 +288,10 @@ mod tests {
             g: 0x25,
             b: 0x28,
         };
-        assert_eq!(fg.mix(bg, 1.0), fg);
-        assert_eq!(fg.mix(bg, 0.0), bg);
+        assert_eq!(fg.mix(bg, Share::percent(100)), fg);
+        assert_eq!(fg.mix(bg, Share::percent(0)), bg);
         assert_eq!(
-            fg.mix(bg, 0.5),
+            fg.mix(bg, Share::percent(50)),
             Rgb {
                 r: 0x8b,
                 g: 0x8f,

@@ -1,3 +1,4 @@
+mod cause;
 mod document;
 mod keymap;
 mod log;
@@ -29,6 +30,7 @@ use agent_core::ports::{ClientId, HarnessId, Observation};
 use agent_core::process::LaunchSpec;
 use agent_term::{Emulator, EmulatorFactory, Liveness, TermSize, Terminal};
 use anyhow::{Context, Result};
+use cause::Cause;
 use crossterm::event::{
     self, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
     EnableFocusChange, EnableMouseCapture, Event,
@@ -59,7 +61,7 @@ pub struct Options {
     pub config: Config,
     pub harness: HarnessId,
     pub start_dir: PathBuf,
-    pub own_session: Option<SessionName>,
+    pub home: Option<PathBuf>,
     pub emulator: EmulatorFactory,
 }
 
@@ -316,7 +318,7 @@ impl Runtime {
             .context("the background worker stopped")
     }
 
-    /// Runs `$EDITOR` with `arg` in `cwd`, handing it the terminal; reports
+    /// Runs `$EDITOR` with `arg` in `cwd`, handing it the terminal. Reports
     /// whether it exited successfully (`:cq` doesn't).
     fn edit(
         &self,
@@ -366,7 +368,7 @@ impl Runtime {
         Ok(status?)
     }
 
-    /// Zellij sizes a session to its smallest client, so while the editor
+    /// The session host sizes a session to its smallest client, so while the editor
     /// has the screen, the hidden pane's client takes the whole terminal and
     /// can't crop the session for clients the editor attaches. The event
     /// loop sizes it back to the pane on the next frame.
@@ -423,8 +425,8 @@ impl Runtime {
                 Effect::SuggestName {
                     prompt,
                     harness,
-                    generation,
-                } => self.workers.suggest_name(prompt, harness, generation),
+                    edit,
+                } => self.workers.suggest_name(prompt, harness, edit),
                 Effect::Attach {
                     name,
                     intent,
@@ -439,7 +441,7 @@ impl Runtime {
                     ticket,
                 } => {
                     if let Err(e) = self.observe(m, observation, ticket) {
-                        update::observe_failed(m, ticket, format!("{e:#}"));
+                        update::observe_failed(m, ticket, Cause::of(e.as_ref()));
                     }
                 }
                 Effect::Connect {
@@ -551,9 +553,10 @@ impl Runtime {
         match edited {
             Ok(Some(task)) => {
                 let now = m.clock.mono;
+                let limit = m.name_limit;
                 if let model::Overlay::New(form) = &mut m.overlay {
                     form.task = task;
-                    form.prompt_changed(now);
+                    form.prompt_changed(now, limit);
                 }
             }
             Ok(None) => {}
@@ -562,7 +565,7 @@ impl Runtime {
     }
 
     /// Edits `task` in `$EDITOR` through a temp file. `None` if the editor
-    /// was cancelled; the text is cleaned of carriage returns and control
+    /// was cancelled. The text is cleaned of carriage returns and control
     /// characters, as pasted text is.
     fn edit_task(&self, terminal: &mut DefaultTerminal, task: &str) -> Result<Option<String>> {
         let file = tempfile::Builder::new()
@@ -633,9 +636,11 @@ fn event_loop(
 
     let mut m = Model::new(
         options.start_dir,
-        options.own_session,
+        rt.backend.own.clone(),
         options.harness,
         label,
+        rt.backend.host.name_limit(),
+        options.home,
     );
     m.follow = rt
         .backend

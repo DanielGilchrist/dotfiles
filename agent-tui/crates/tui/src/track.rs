@@ -11,15 +11,38 @@ use agent_core::names::Prompt;
 use agent_core::ports::PromptKind;
 use agent_core::ports::{ActivityDetail, Log, TranscriptStamp, WorktreeFacts};
 
+use crate::cause::Cause;
 use crate::log::Nav;
 use crate::model::{Company, Held, Inspection};
 use crate::touched::Baseline;
 use crate::tree::{ChangesScope, ChangesView, TreeRow};
 
+/// Which read of an agent's git facts something was made from. Reads are
+/// counted across all agents, so an epoch never repeats for an agent that
+/// leaves and comes back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct FactsEpoch(u64);
+
+impl FactsEpoch {
+    /// Before any read.
+    pub const ORIGIN: Self = Self(0);
+
+    pub fn next(self) -> Self {
+        Self(self.0 + 1)
+    }
+}
+
+/// One read of an agent's git facts and what it found.
+pub struct FactsRead {
+    pub epoch: FactsEpoch,
+    pub result: Result<Inspected, Cause>,
+}
+
 /// The tree built for an agent, rebuilt only when its facts, the view or
 /// its closed folders change.
 pub struct CachedTree {
-    pub generation: u64,
+    /// The facts it was built from, none while there were none.
+    pub epoch: Option<FactsEpoch>,
     pub view: ChangesView,
     pub scope: ChangesScope,
     pub collapsed: HashSet<PathBuf>,
@@ -39,10 +62,7 @@ pub enum LiveSince {
 #[derive(Default)]
 pub struct Tracked {
     /// Its git facts, or why they couldn't be read, as last read.
-    pub facts: Option<Result<Inspected, String>>,
-    /// How many times its facts have been read, which tells a document read
-    /// from them that they may have changed.
-    pub generation: u64,
+    pub facts: Option<FactsRead>,
     /// The folders its [3] has closed. A folder that isn't named is open,
     /// so one that appears starts open.
     pub collapsed: HashSet<PathBuf>,
@@ -213,7 +233,7 @@ pub struct ReadAt {
 /// cursor over it.
 pub struct Watch<T> {
     pub read: Option<ReadAt>,
-    pub log: Option<Result<Option<T>, String>>,
+    pub log: Option<Result<Option<T>, Cause>>,
     pub nav: Nav,
 }
 

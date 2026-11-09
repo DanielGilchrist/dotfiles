@@ -1,4 +1,5 @@
 use super::*;
+use crate::cause::Cause;
 use crate::fixtures::sighted;
 use crate::fixtures::{elsewhere_on, watch};
 use crate::model::{
@@ -298,7 +299,7 @@ fn a_closed_other_window_leaves_the_session_alone_and_a_failed_close_leaves_what
         )
     };
     m.record_company(&name(SHARED), crate::fixtures::in_nvim());
-    let effects = closed(&mut m, Err("nope".into()));
+    let effects = closed(&mut m, Err(Cause::message("nope".into())));
     assert_eq!(company(&m), crate::fixtures::in_nvim());
     assert_eq!(looks_asked(&effects), 1);
     let in_flight = m.current_look();
@@ -441,7 +442,7 @@ fn a_failed_look_on_a_paused_pane_whose_company_is_alone_reattaches() {
         &mut m,
         Msg::Elsewhere {
             ticket,
-            found: Err("ps failed".into()),
+            found: Err(Cause::message("ps failed".into())),
         },
     );
     assert_eq!(attaches(&effects), [Intent::Preview]);
@@ -507,7 +508,7 @@ fn session_of(cols: u16, rows: u16) -> Observation {
     }
 }
 
-fn answered(m: &mut Model, ticket: Ticket, result: Result<Observation, String>) -> Vec<Effect> {
+fn answered(m: &mut Model, ticket: Ticket, result: Result<Observation, Cause>) -> Vec<Effect> {
     update(m, Msg::Observed { ticket, result })
 }
 
@@ -582,7 +583,7 @@ fn a_session_that_cannot_be_watched_closes_the_peek_and_leaves_the_agent_paused(
     let mut m = held_elsewhere_model();
     let peeked = update(&mut m, key(KeyCode::Char('v')));
     let (_, ticket) = observe_job(&peeked).expect("an observe job");
-    let effects = answered(&mut m, ticket, Err("no tab".into()));
+    let effects = answered(&mut m, ticket, Err(Cause::message("no tab".into())));
     stays_held_elsewhere(&m, &effects, SHARED);
     assert!(!m.peeking());
     assert!(
@@ -765,7 +766,7 @@ fn a_failed_size_look_keeps_the_watcher_it_has() {
     recheck_elsewhere(&mut m);
     let asked = crate::fixtures::sighted(&mut m, &[(SHARED, crate::fixtures::in_nvim())]);
     let (_, ticket) = observe_job(&asked).expect("asked");
-    answered(&mut m, ticket, Err("busy".into()));
+    answered(&mut m, ticket, Err(Cause::message("busy".into())));
     assert!(matches!(view(&m), Some(WatchView::Watched(_))));
     assert!(m.status.is_none());
 }
@@ -881,7 +882,7 @@ fn a_failed_look_keeps_the_pane_and_says_so_once() {
             m,
             Msg::Elsewhere {
                 ticket,
-                found: Err("ps failed".into()),
+                found: Err(Cause::message("ps failed".into())),
             },
         )
     };
@@ -910,7 +911,7 @@ fn a_first_look_that_fails_attaches_anyway_and_says_so() {
         &mut m,
         Msg::Elsewhere {
             ticket,
-            found: Err("ps failed".into()),
+            found: Err(Cause::message("ps failed".into())),
         },
     );
     assert_eq!(attaches(&effects), [Intent::Preview]);
@@ -1025,7 +1026,7 @@ fn a_failed_look_leaves_the_cards_as_they_were() {
         &mut m,
         Msg::Elsewhere {
             ticket,
-            found: Err("ps failed".into()),
+            found: Err(Cause::message("ps failed".into())),
         },
     );
     assert_eq!(*m.company(&name(SHARED)), one(Place::Nvim));

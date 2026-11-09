@@ -4,7 +4,7 @@ use std::io::{IsTerminal, Write};
 use std::os::fd::AsFd;
 use std::time::{Duration, Instant};
 
-use agent_core::theme::{Ansi, Colour, Dim, Rgb, Theme};
+use agent_core::theme::{Ansi, Colour, Dim, Rgb, Share, Theme};
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use ratatui::style::{Color, Modifier, Style};
 
@@ -112,7 +112,7 @@ pub enum Backdrop {
 
 fn dim_over(fg: Rgb, bg: Rgb) -> Rgb {
     (0u8..=10)
-        .map(|step| fg.mix(bg, 0.5 + f32::from(step) * 0.05))
+        .map(|step| fg.mix(bg, Share::percent(50 + step * 5)))
         .find(|dim| contrast(*dim, bg) >= DIM_CONTRAST)
         .unwrap_or(fg)
 }
@@ -380,7 +380,7 @@ mod tests {
         let (fg, bg) = (hex("#f8f9e8"), hex("#1e2528"));
         assert_eq!(
             dim_over(fg, bg),
-            fg.mix(bg, 0.5),
+            fg.mix(bg, Share::percent(50)),
             "dark themes keep the halfway mix"
         );
     }

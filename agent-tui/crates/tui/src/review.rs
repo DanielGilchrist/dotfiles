@@ -10,9 +10,9 @@ use std::path::{Path, PathBuf};
 pub enum LineKind {
     /// A hunk header or a `\ No newline` note: shown, never selected.
     Header,
-    /// A commit in the branch view; its `text` is the log line.
+    /// A commit in the branch view. Its `text` is the log line.
     Commit,
-    /// An uncommitted file in the branch view; its `text` is its status code.
+    /// An uncommitted file in the branch view. Its `text` is its status code.
     Entry(FileState),
     Added,
     Removed,
@@ -219,7 +219,7 @@ pub fn file(lines: &[LineInfo], from: usize, forward: bool) -> Option<usize> {
 
 /// `path:42`, `path:10-14`, or for removed lines `path:7 (removed)`. In a
 /// commit's diff the path says which commit: `path@abc1234:42`.
-pub fn label(path: &Path, rev: Option<&str>, selected: &[&LineInfo]) -> String {
+pub fn label(path: &Path, rev: Option<&Rev>, selected: &[&LineInfo]) -> String {
     let at = match rev {
         Some(rev) => format!("{}@{rev}", path.display()),
         None => path.display().to_string(),
@@ -245,12 +245,28 @@ fn outside_text(text: &str) -> String {
     clean(text, CarriageReturn::Newline, Some('?'))
 }
 
+/// A commit's id, which says what a comment's lines are from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rev(String);
+
+impl Rev {
+    pub fn new(sha: String) -> Self {
+        Self(sha)
+    }
+}
+
+impl std::fmt::Display for Rev {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// A comment on lines of a diff.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Comment {
     pub path: PathBuf,
     /// The commit the lines are from, when they aren't the checkout's.
-    pub rev: Option<String>,
+    pub rev: Option<Rev>,
     /// The first line's place, which names the comment.
     pub at: (Option<usize>, Option<usize>),
     pub label: String,
@@ -262,7 +278,7 @@ pub struct Comment {
 const QUOTED: usize = 6;
 
 impl Comment {
-    pub fn on(selected: &[&LineInfo], rev: Option<&str>, text: &str) -> Option<Self> {
+    pub fn on(selected: &[&LineInfo], rev: Option<&Rev>, text: &str) -> Option<Self> {
         let first = selected.first()?;
         let mut quoted: Vec<String> = selected
             .iter()
@@ -274,7 +290,7 @@ impl Comment {
         }
         Some(Self {
             path: first.path.clone(),
-            rev: rev.map(str::to_string),
+            rev: rev.cloned(),
             at: (first.old, first.new),
             label: outside_text(&label(&first.path, rev, selected)),
             quoted,
@@ -286,8 +302,8 @@ impl Comment {
         self.path == other.path && self.rev == other.rev && self.at == other.at
     }
 
-    pub fn covers(&self, line: &LineInfo, rev: Option<&str>) -> bool {
-        self.path == line.path && self.rev.as_deref() == rev && self.at == (line.old, line.new)
+    pub fn covers(&self, line: &LineInfo, rev: Option<&Rev>) -> bool {
+        self.path == line.path && self.rev.as_ref() == rev && self.at == (line.old, line.new)
     }
 }
 
@@ -415,7 +431,7 @@ mod tests {
         let lines = infos(&[("a.rs", &["@@ -1 +1 @@", "+let x = 3;"])]);
         let comment = Comment::on(&[&lines[1]], None, "Use the limit.").expect("a line");
         assert!(comment.covers(&lines[1], None));
-        assert!(!comment.covers(&lines[1], Some("abc1234")));
+        assert!(!comment.covers(&lines[1], Some(&Rev::new("abc1234".into()))));
         assert_eq!(
             review_message("", std::slice::from_ref(&comment)),
             "Review comments. Work through each one.\n\na.rs:1\n> +let x = 3;\nUse the limit."
@@ -468,9 +484,10 @@ mod tests {
     #[test]
     fn a_comment_in_a_commit_names_it_and_only_covers_lines_of_it() {
         let lines = infos(&[("a.rs", &["@@ -1 +1 @@", "+x"])]);
-        let comment = Comment::on(&[&lines[1]], Some("abc1234"), "No.").expect("a line");
+        let comment =
+            Comment::on(&[&lines[1]], Some(&Rev::new("abc1234".into())), "No.").expect("a line");
         assert_eq!(comment.label, "a.rs@abc1234:1");
-        assert!(comment.covers(&lines[1], Some("abc1234")));
+        assert!(comment.covers(&lines[1], Some(&Rev::new("abc1234".into()))));
         assert!(!comment.covers(&lines[1], None));
     }
 

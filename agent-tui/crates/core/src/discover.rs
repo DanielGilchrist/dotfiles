@@ -3,8 +3,10 @@ use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::model::{Checkout, Entry, EntryKind, Presence, Repo, RepoKey, Snapshot, Worktree};
-use crate::names::{NameError, SessionName};
+use crate::model::{
+    Checkout, Entry, EntryKind, HostedRepo, Hosting, Presence, Repo, RepoKey, Snapshot, Worktree,
+};
+use crate::names::{NameError, NameLimit, SessionName};
 use crate::paths::{Layout, RepoRoot};
 use crate::ports::{HostError, RepoWorktrees, SessionHost, SessionInfo, Vcs};
 use crate::process::{CommandError, parallel_map};
@@ -25,7 +27,7 @@ pub enum Warning {
         root: RepoRoot,
         error: NameError,
     },
-    /// Two checkouts want the same session name; the later one is hidden.
+    /// Two checkouts want the same session name. The later one is hidden.
     NameClash {
         name: SessionName,
         hidden: PathBuf,
@@ -222,6 +224,7 @@ pub fn assemble(
     obs: &Observation,
     layout: &Layout,
     pins: &[SessionName],
+    limit: NameLimit,
 ) -> (Snapshot, Vec<Warning>) {
     let sessions: HashMap<&SessionName, &SessionInfo> =
         obs.sessions.iter().map(|s| (&s.name, s)).collect();
@@ -231,7 +234,15 @@ pub fn assemble(
         .repos
         .iter()
         .map(|(root, worktrees)| {
-            let entries = repo_entries(obs, layout, root, worktrees, &mut claims, &session_of);
+            let entries = repo_entries(
+                obs,
+                layout,
+                root,
+                worktrees,
+                &mut claims,
+                &session_of,
+                limit,
+            );
             (RepoKey::Root(root.clone()), entries)
         })
         .collect();
@@ -290,14 +301,15 @@ fn repo_entries(
     worktrees: &RepoWorktrees,
     claims: &mut Claims,
     session_of: &impl Fn(&SessionName) -> Option<Presence>,
+    limit: NameLimit,
 ) -> Vec<Entry> {
     let mut entries = Vec::new();
 
-    match root.name().parse::<SessionName>() {
-        Ok(name) => {
-            if let Some(name) = claims.claim(name, &worktrees.main.path) {
+    match HostedRepo::admit(limit, root.clone()) {
+        Ok(repo) => {
+            if let Some(name) = claims.claim(repo.host().session().clone(), &worktrees.main.path) {
                 let kind = EntryKind::Main {
-                    root: root.clone(),
+                    repo,
                     head: worktrees.main.head.clone(),
                     session: session_of(&name),
                 };
@@ -320,7 +332,7 @@ fn repo_entries(
         let kind = EntryKind::Agent {
             session: session_of(&name),
             head: wt.head.clone(),
-            worktree,
+            worktree: Hosting::admit(limit, worktree),
         };
         entries.push(Entry::new(name, kind));
     }
@@ -377,6 +389,7 @@ mod tests {
     use super::*;
     use crate::model::{EntryState, Head, Presence};
     use crate::ports::SessionStatus;
+    use crate::testing::NAME_LIMIT;
 
     fn layout() -> Layout {
         Layout::new("/w".into()).expect("absolute")
@@ -424,7 +437,7 @@ mod tests {
     }
 
     fn snapshot(obs: &Observation, pins: &[SessionName]) -> Snapshot {
-        assemble(obs, &layout(), pins).0
+        assemble(obs, &layout(), pins, NAME_LIMIT).0
     }
 
     #[test]
@@ -457,6 +470,24 @@ mod tests {
             panic!("idle should be startable")
         };
         assert_eq!(at.cwd(), std::path::Path::new("/w/api/idle"));
+    }
+
+    #[test]
+    fn a_worktree_over_the_hosts_limit_is_listed_and_removable_but_not_startable() {
+        let obs = Observation {
+            sessions: Vec::new(),
+            repos: vec![repo("/src/api", &["/w/api/a-worktree-name-over-the-limit"])],
+            warnings: Vec::new(),
+        };
+        let snap = snapshot(&obs, &[]);
+        let long = snap.repos()[0]
+            .entry(&name("a-worktree-name-over-the-limit"))
+            .expect("listed");
+        assert!(matches!(
+            long.state(),
+            EntryState::Unhostable(NameError::TooLong { limit: 20, .. })
+        ));
+        assert!(long.removable().is_some());
     }
 
     #[test]
@@ -534,7 +565,7 @@ mod tests {
             repos: vec![repo("/a/api", &[]), repo("/b/api", &[])],
             warnings: Vec::new(),
         };
-        let (snap, warnings) = assemble(&obs, &layout(), &[]);
+        let (snap, warnings) = assemble(&obs, &layout(), &[], NAME_LIMIT);
         assert_eq!(
             snap.entries()
                 .filter(|(_, e)| e.name().as_str() == "api")
@@ -550,7 +581,7 @@ mod tests {
             repos: vec![repo("/src/a-very-long-repository-name", &[])],
             ..Observation::default()
         };
-        let (snap, warnings) = assemble(&obs, &layout(), &[]);
+        let (snap, warnings) = assemble(&obs, &layout(), &[], NAME_LIMIT);
         assert!(snap.is_empty());
         assert!(matches!(warnings.as_slice(), [Warning::Unnamed { .. }]));
     }

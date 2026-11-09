@@ -1,12 +1,11 @@
 use std::fmt;
+use std::num::NonZeroUsize;
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
-/// The name of the old meta-session; never a valid agent or session name.
+/// The name of the old meta-session. Never a valid agent or session name.
 pub const RESERVED: &str = "agents";
-/// Zellij's unix socket path budget on macOS caps session names at 20 bytes.
-pub const MAX_SESSION_LEN: usize = 20;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum NameError {
@@ -14,8 +13,12 @@ pub enum NameError {
     Empty,
     #[error("'{0}' is reserved")]
     Reserved(String),
-    #[error("'{name}' is {len} bytes, over the {MAX_SESSION_LEN} byte limit for session names")]
-    TooLong { name: String, len: usize },
+    #[error("'{name}' is {} over the session host's limit of {limit}", bytes(*.over))]
+    TooLong {
+        name: String,
+        over: NonZeroUsize,
+        limit: usize,
+    },
     #[error(
         "'{0}' must start with a letter or digit and contain only letters, digits, '.', '-' or '_'"
     )]
@@ -26,6 +29,13 @@ pub enum NameError {
     InvalidBranch(String),
     #[error("not a pull request link: github.com/<owner>/<repo>/pull/<number>")]
     InvalidPullRequest,
+}
+
+fn bytes(count: NonZeroUsize) -> String {
+    match count.get() {
+        1 => "1 byte".to_string(),
+        n => format!("{n} bytes"),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -89,17 +99,71 @@ fn check_session_rules(s: &str) -> Result<(), NameError> {
     if s == RESERVED {
         return Err(NameError::Reserved(s.into()));
     }
-    if s.len() > MAX_SESSION_LEN {
-        return Err(NameError::TooLong {
-            name: s.into(),
-            len: s.len(),
-        });
-    }
     Ok(())
 }
 
-/// A zellij session name as zellij reports it. Session names are global, so
-/// this is also the identity of an agent across the whole app.
+/// The longest session name a session host accepts, in bytes. Each
+/// `SessionHost` adapter declares its own, so names parse without one and
+/// are admitted against it where a session is made for the host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NameLimit(NonZeroUsize);
+
+/// A session name within the host's limit, which `SessionHost::create` needs.
+/// Only [`NameLimit::admit`] makes one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostName {
+    name: SessionName,
+    limit: NameLimit,
+}
+
+impl HostName {
+    pub fn session(&self) -> &SessionName {
+        &self.name
+    }
+
+    pub fn into_session(self) -> SessionName {
+        self.name
+    }
+
+    /// Whether a host with `limit` takes it, which a host checks because
+    /// the name may have been admitted under another host's limit.
+    pub fn within(&self, limit: NameLimit) -> Result<(), NameError> {
+        if self.limit.bytes() <= limit.bytes() {
+            return Ok(());
+        }
+        limit.admit(self.name.clone()).map(drop)
+    }
+}
+
+impl NameLimit {
+    pub const fn new(bytes: NonZeroUsize) -> Self {
+        Self(bytes)
+    }
+
+    pub fn bytes(self) -> usize {
+        self.0.get()
+    }
+
+    pub fn admit(self, name: SessionName) -> Result<HostName, NameError> {
+        match NonZeroUsize::new(name.as_str().len().saturating_sub(self.bytes())) {
+            Some(over) => Err(NameError::TooLong {
+                name: name.into(),
+                over,
+                limit: self.bytes(),
+            }),
+            None => Ok(HostName { name, limit: self }),
+        }
+    }
+
+    pub fn agent(self, text: &str) -> Result<AgentName, NameError> {
+        let name = text.parse::<AgentName>()?;
+        self.admit(name.session())?;
+        Ok(name)
+    }
+}
+
+/// A session name as the session host reports it. Session names are global,
+/// so this is also the identity of an agent across the whole app.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct SessionName(String);
@@ -142,9 +206,9 @@ impl FromStr for AgentName {
 
 impl AgentName {
     /// The branch's words, lowercased and joined with `-`, cut at the last
-    /// whole word that fits a session name.
-    pub fn from_branch(branch: &BranchName) -> Result<Self, NameError> {
-        crate::naming::fit(crate::naming::words(branch.as_str()))
+    /// whole word that fits `limit`.
+    pub fn from_branch(branch: &BranchName, limit: NameLimit) -> Result<Self, NameError> {
+        crate::naming::fit(crate::naming::words(branch.as_str()), limit)
             .ok_or_else(|| NameError::InvalidAgent(branch.to_string()))
     }
 
@@ -165,7 +229,6 @@ impl From<AgentName> for SessionName {
 pub struct BranchName(String);
 string_newtype!(BranchName);
 
-#[allow(clippy::case_sensitive_file_extension_comparisons)]
 impl FromStr for BranchName {
     type Err = NameError;
 
@@ -173,7 +236,12 @@ impl FromStr for BranchName {
         // git's own rules: only ASCII controls and the space are refused, so
         // names with other Unicode whitespace or C1 controls are real branches.
         let forbidden = |c: char| c < ' ' || c == '\x7f' || c == ' ' || "~^:?*[\\".contains(c);
-        let bad_component = |c: &str| c.is_empty() || c.starts_with('.') || c.ends_with(".lock");
+        let bad_component = |c: &str| {
+            c.is_empty()
+                || c.starts_with('.')
+                || c.rsplit_once('.')
+                    .is_some_and(|(_, extension)| extension == "lock")
+        };
         let invalid = s.is_empty()
             || s == "@"
             || s.starts_with('-')
@@ -295,7 +363,7 @@ impl FromStr for Checkout {
     type Err = NameError;
 
     /// A GitHub link is a pull request (anything else under github.com is
-    /// an error, not a branch); the rest is a branch name.
+    /// an error, not a branch). The rest is a branch name.
     fn from_str(s: &str) -> Result<Self, NameError> {
         let s = s.trim().trim_matches(|c: char| matches!(c, '<' | '>'));
         let Some(rest) = s.split("github.com/").nth(1) else {
@@ -324,6 +392,7 @@ impl FromStr for Checkout {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::NAME_LIMIT;
 
     #[test]
     fn agent_names_are_single_safe_components() {
@@ -336,9 +405,28 @@ mod tests {
             assert!(bad.parse::<AgentName>().is_err(), "{bad}");
         }
         assert!(matches!(
-            "123456789012345678901".parse::<AgentName>(),
-            Err(NameError::TooLong { len: 21, .. })
+            NAME_LIMIT.agent("123456789012345678901"),
+            Err(NameError::TooLong {
+                over,
+                limit: 20,
+                ..
+            }) if over.get() == 1
         ));
+        assert!("123456789012345678901".parse::<AgentName>().is_ok());
+    }
+
+    #[test]
+    fn a_name_at_the_limit_fits_and_one_byte_over_says_so_in_the_singular() {
+        assert!(NAME_LIMIT.agent("12345678901234567890").is_ok());
+        let over = NAME_LIMIT.agent("123456789012345678901").expect_err("over");
+        assert_eq!(
+            over.to_string(),
+            "'123456789012345678901' is 1 byte over the session host's limit of 20"
+        );
+        let more = NAME_LIMIT
+            .agent("12345678901234567890123")
+            .expect_err("over");
+        assert!(more.to_string().contains("is 3 bytes over"));
     }
 
     #[test]
@@ -354,7 +442,12 @@ mod tests {
     #[test]
     fn length_is_counted_in_bytes() {
         let name = "é".repeat(11);
-        assert!(name.parse::<SessionName>().is_err());
+        assert!(NAME_LIMIT.admit(name.parse().expect("parses")).is_err());
+        assert!(
+            NAME_LIMIT
+                .admit("é".repeat(10).parse().expect("parses"))
+                .is_ok()
+        );
     }
 
     #[test]
@@ -394,19 +487,25 @@ mod tests {
     fn agent_name_from_branch_flattens_slashes_and_fits() {
         let branch: BranchName = "user/fix-ci".parse().expect("parses");
         assert_eq!(
-            AgentName::from_branch(&branch).expect("succeeds").as_str(),
+            AgentName::from_branch(&branch, NAME_LIMIT)
+                .expect("succeeds")
+                .as_str(),
             "user-fix-ci"
         );
         let long: BranchName = "axel-chargebee-webhook-handler-classes"
             .parse()
             .expect("parses");
         assert_eq!(
-            AgentName::from_branch(&long).expect("succeeds").as_str(),
+            AgentName::from_branch(&long, NAME_LIMIT)
+                .expect("succeeds")
+                .as_str(),
             "axel-chargebee"
         );
         let cased: BranchName = "Feature/Add_Thing".parse().expect("parses");
         assert_eq!(
-            AgentName::from_branch(&cased).expect("succeeds").as_str(),
+            AgentName::from_branch(&cased, NAME_LIMIT)
+                .expect("succeeds")
+                .as_str(),
             "feature-add-thing"
         );
     }

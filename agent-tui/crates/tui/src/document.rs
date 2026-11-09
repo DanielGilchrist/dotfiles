@@ -12,7 +12,9 @@ use agent_core::names::SessionName;
 use agent_core::ports::{BranchLog, Change, Compared, DiffBase, FileDiff};
 use ratatui::text::Line;
 
+use crate::cause::Cause;
 use crate::review::LineInfo;
+use crate::track::FactsEpoch;
 
 /// The cursor must rest on a file this long before its diff is asked for, so
 /// holding `j` doesn't start a read per file.
@@ -35,13 +37,12 @@ pub struct DiffKey {
     /// What the diff is read against, so the same file in the other view
     /// of [3] is another document.
     pub base: DiffBase,
-    /// Counts the agent's git facts read, so a file edited without its
-    /// counts changing is a different document.
-    pub generation: u64,
+    /// A file edited without its counts changing is a different document.
+    pub epoch: FactsEpoch,
 }
 
 /// A folder in [3]: the files under it from the git facts, in the tree's
-/// order, and what their diffs are read against. A newer generation of the
+/// order, and what their diffs are read against. A newer epoch of the
 /// facts is another document.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FolderKey {
@@ -49,7 +50,7 @@ pub struct FolderKey {
     pub path: PathBuf,
     pub files: Vec<Change>,
     pub base: DiffBase,
-    pub generation: u64,
+    pub epoch: FactsEpoch,
 }
 
 /// Files of a folder whose diffs are read, at most.
@@ -61,7 +62,7 @@ pub const FOLDER_LINES: usize = 5000;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FolderFile {
     pub change: Change,
-    pub diff: Result<FileDiff, String>,
+    pub diff: Result<FileDiff, Cause>,
 }
 
 /// A folder's diffs: the first files that fit the budget, and how many
@@ -78,7 +79,7 @@ pub struct FolderDocs {
 pub fn assemble(
     files: &[Change],
     mut reuse: Vec<(PathBuf, FileDiff)>,
-    mut read: impl FnMut(&Change) -> Result<FileDiff, String>,
+    mut read: impl FnMut(&Change) -> Result<FileDiff, Cause>,
 ) -> FolderDocs {
     let mut out = FolderDocs::default();
     let mut used = 0;
@@ -117,7 +118,7 @@ pub struct BranchKey {
     pub dirty: usize,
     pub compared: Compared,
     /// As in [`DiffKey`], so a swapped commit shows.
-    pub generation: u64,
+    pub epoch: FactsEpoch,
 }
 
 /// A commit's diff: the files it changed, read when it is opened from the
@@ -251,7 +252,7 @@ impl Hover {
     }
 }
 
-pub type Loaded = Arc<Result<Doc, String>>;
+pub type Loaded = Arc<Result<Doc, Cause>>;
 
 /// The document the cursor is on, since when, and since when [0] has had
 /// nothing current to show for it.
@@ -407,7 +408,7 @@ impl Documents {
     /// A read finished. Whatever it was for is cached, shown or not, unless
     /// it failed, which is shown for a few seconds and then asked again.
     /// Older requests for the same slot were replaced and won't answer.
-    pub fn loaded(&mut self, key: &Key, result: Result<Doc, String>, now: Instant) {
+    pub fn loaded(&mut self, key: &Key, result: Result<Doc, Cause>, now: Instant) {
         let Some(at) = self.requested.iter().position(|k| k == key) else {
             return;
         };
@@ -435,20 +436,20 @@ impl Documents {
         }
     }
 
-    /// Diffs of `files` already read in this base and facts generation, to
+    /// Diffs of `files` already read in this base and facts epoch, to
     /// reuse in a folder's.
     pub fn cached_diffs(
         &self,
         name: &SessionName,
         base: DiffBase,
-        generation: u64,
+        epoch: FactsEpoch,
         files: &[Change],
     ) -> Vec<(PathBuf, FileDiff)> {
         self.cache
             .iter()
             .filter_map(|e| match (&e.key, e.loaded.as_ref()) {
                 (Key::Diff(key), Ok(Doc::Diff(diff)))
-                    if key.name == *name && key.base == base && key.generation == generation =>
+                    if key.name == *name && key.base == base && key.epoch == epoch =>
                 {
                     files
                         .iter()
@@ -631,7 +632,7 @@ mod tests {
                 TrackedState::Committed,
             ),
             base: DiffBase::Fork,
-            generation: 0,
+            epoch: FactsEpoch::ORIGIN,
         }
     }
 
@@ -747,7 +748,7 @@ mod tests {
                 compared: Compared::NoBase {
                     checkout: Checkout::Detached("abc1234".into()),
                 },
-                generation: 0,
+                epoch: FactsEpoch::ORIGIN,
             })),
             t0 + REST * 3,
         );
@@ -778,7 +779,7 @@ mod tests {
 
         docs.settle(Some(&Hover::Diff(key("c", 1))), t0);
         let c = docs.due(t0 + REST).expect("due");
-        docs.loaded(&c, Err("git failed".into()), t0);
+        docs.loaded(&c, Err(Cause::message("git failed".into())), t0);
         docs.settle(Some(&Hover::Diff(key("c", 1))), t0 + REST);
         assert!(
             matches!(docs.resolve(), Resolved::Current(..)),
@@ -932,12 +933,14 @@ mod tests {
             matches!(last, Ok(FileDiff::Text { lines, more }) if lines.len() == 1000 && *more == 1000),
             "the file that crosses the budget is cut and says how much"
         );
-        let failing = assemble(&files[..1], Vec::new(), |_| Err("boom".into()));
-        assert_eq!(failing.files[0].diff, Err("boom".into()));
+        let failing = assemble(&files[..1], Vec::new(), |_| {
+            Err(Cause::message("boom".into()))
+        });
+        assert_eq!(failing.files[0].diff, Err(Cause::message("boom".into())));
     }
 
     #[test]
-    fn cached_file_diffs_are_offered_only_for_the_same_base_generation_and_counts() {
+    fn cached_file_diffs_are_offered_only_for_the_same_base_epoch_and_counts() {
         let mut docs = Documents::default();
         let k = key("d/a", 1);
         let t0 = Instant::now();
@@ -946,9 +949,19 @@ mod tests {
         docs.loaded(&due, Ok(diff("a")), t0);
         let files = [change("d/a")];
         let name = k.name.clone();
-        assert_eq!(docs.cached_diffs(&name, DiffBase::Fork, 0, &files).len(), 1);
-        assert_eq!(docs.cached_diffs(&name, DiffBase::Head, 0, &files), []);
-        assert_eq!(docs.cached_diffs(&name, DiffBase::Fork, 1, &files), []);
+        assert_eq!(
+            docs.cached_diffs(&name, DiffBase::Fork, FactsEpoch::ORIGIN, &files)
+                .len(),
+            1
+        );
+        assert_eq!(
+            docs.cached_diffs(&name, DiffBase::Head, FactsEpoch::ORIGIN, &files),
+            []
+        );
+        assert_eq!(
+            docs.cached_diffs(&name, DiffBase::Fork, FactsEpoch::ORIGIN.next(), &files),
+            []
+        );
         let changed = [Change::tracked(
             "d/a",
             Lines::Counted {
@@ -957,6 +970,9 @@ mod tests {
             },
             TrackedState::Committed,
         )];
-        assert_eq!(docs.cached_diffs(&name, DiffBase::Fork, 0, &changed), []);
+        assert_eq!(
+            docs.cached_diffs(&name, DiffBase::Fork, FactsEpoch::ORIGIN, &changed),
+            []
+        );
     }
 }

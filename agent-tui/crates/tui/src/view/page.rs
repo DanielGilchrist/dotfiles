@@ -22,6 +22,7 @@ use super::{
     accent, bold, dim, error, fit, justify, line_width, spinner, success, truncate_end,
     truncate_start, warning, wrap,
 };
+use crate::cause::Cause;
 use crate::document::{
     BranchKey, CommitKey, DiffKey, Doc, FolderDocs, FolderKey, Hover, Key, Laid, Placed, Resolved,
 };
@@ -244,7 +245,7 @@ fn title_and_status(
     width: usize,
     status_least: usize,
 ) -> (Vec<Span<'static>>, Vec<Span<'static>>) {
-    if !m.sidebar_shown
+    if !crate::view::geometry(m.size, m.screen).sidebar_shown
         && let Some((at, of)) = m.position()
     {
         title.insert(1, Span::styled(format!("{at} of {of} · "), dim()));
@@ -305,7 +306,7 @@ fn mark_lines(
     let (lo, hi) = cursor.span();
     for (at, line) in infos.iter().enumerate() {
         let selected = m.main_focused() && (lo..=hi).contains(&at);
-        let commented = drafts.iter().any(|c| c.covers(line, rev.as_deref()));
+        let commented = drafts.iter().any(|c| c.covers(line, rev.as_ref()));
         if !selected && !commented {
             continue;
         }
@@ -513,7 +514,7 @@ pub(super) fn count_spans(kind: ChangeKind) -> Vec<Span<'static>> {
 /// The folder's file list, then a section per file read so far.
 fn folder_rows(
     folder: &FolderKey,
-    docs: Option<Result<&FolderDocs, &String>>,
+    docs: Option<Result<&FolderDocs, &Cause>>,
     columns: usize,
 ) -> (Vec<Line<'static>>, Vec<LineInfo>) {
     section_rows(&folder.files, &folder.path, docs, columns)
@@ -524,7 +525,7 @@ fn folder_rows(
 fn section_rows(
     files: &[Change],
     base: &Path,
-    docs: Option<Result<&FolderDocs, &String>>,
+    docs: Option<Result<&FolderDocs, &Cause>>,
     columns: usize,
 ) -> (Vec<Line<'static>>, Vec<LineInfo>) {
     let mut rows: Vec<Line<'static>> = Vec::new();
@@ -629,10 +630,7 @@ fn branch_body(m: &Model, key: &BranchKey, columns: usize) -> Body {
                 Ok(Doc::Branch(log)) => branch_rows(log, &compared, behind, columns),
                 Ok(Doc::Diff(_) | Doc::Folder(_)) => (Vec::new(), Vec::new()),
                 Err(e) => (
-                    vec![Line::styled(
-                        e.lines().next().unwrap_or_default().to_string(),
-                        error(),
-                    )],
+                    vec![Line::styled(e.first_line().to_string(), error())],
                     Vec::new(),
                 ),
             }))
@@ -804,7 +802,7 @@ fn activity_body(m: &Model, name: &SessionName, columns: usize, height: usize) -
     let watch = m.tracked(name).map(|t| &t.activity_view);
     let Some(detail) = m.activity_detail(name) else {
         let failed = match watch.and_then(|w| w.watch.log.as_ref()) {
-            Some(Err(e)) => e.lines().next().map(str::to_string),
+            Some(Err(e)) => Some(e.first_line().to_string()).filter(|line| !line.is_empty()),
             _ => None,
         };
         return Some(plain_activity_body(
@@ -823,7 +821,6 @@ fn activity_body(m: &Model, name: &SessionName, columns: usize, height: usize) -
         listed: files.map_or(&[], ActivityFiles::listed),
     };
     let roots = m.roots(name);
-    let home = std::env::var("HOME").ok();
     let nav = watch.map(|w| w.watch.nav.clone()).unwrap_or_default();
     let rendered = log::render_activity(
         detail,
@@ -834,7 +831,7 @@ fn activity_body(m: &Model, name: &SessionName, columns: usize, height: usize) -
             now: m.clock.wall,
             spinner: spinner(m.clock.wall),
             roots: roots.as_ref(),
-            home: home.as_deref(),
+            home: m.home.as_deref(),
         },
     );
     let mut rows = rendered.rows;
@@ -1022,12 +1019,11 @@ fn log_body(m: &Model, name: &SessionName, id: &AgentId, columns: usize, budget:
                 ..note(String::new(), dim())
             };
         }
-        Some(Err(e)) => return note(e.lines().next().unwrap_or_default().to_string(), error()),
+        Some(Err(e)) => return note(e.first_line().to_string(), error()),
         Some(Ok(None)) => return note("no transcript for this subagent".into(), dim()),
         Some(Ok(Some(detail))) => detail,
     };
     let roots = m.roots(name);
-    let home = std::env::var("HOME").ok();
     let nav = m
         .watched(&key)
         .map(|w| w.watch.nav.clone())
@@ -1042,7 +1038,7 @@ fn log_body(m: &Model, name: &SessionName, id: &AgentId, columns: usize, budget:
             now: m.clock.wall,
             spinner: spinner(m.clock.wall),
             roots: roots.as_ref(),
-            home: home.as_deref(),
+            home: m.home.as_deref(),
         },
     );
     Body {
@@ -1054,7 +1050,7 @@ fn log_body(m: &Model, name: &SessionName, id: &AgentId, columns: usize, budget:
     }
 }
 
-fn diff_rows(loaded: Result<&FileDiff, &String>, width: usize) -> Vec<Line<'static>> {
+fn diff_rows(loaded: Result<&FileDiff, &Cause>, width: usize) -> Vec<Line<'static>> {
     diff_rows_info(Path::new(""), loaded, width, 0).0
 }
 
@@ -1062,7 +1058,7 @@ fn diff_rows(loaded: Result<&FileDiff, &String>, width: usize) -> Vec<Line<'stat
 /// each of its lines is. `offset` is the document row the first one lands on.
 fn diff_rows_info(
     path: &Path,
-    loaded: Result<&FileDiff, &String>,
+    loaded: Result<&FileDiff, &Cause>,
     width: usize,
     offset: usize,
 ) -> (Vec<Line<'static>>, Vec<LineInfo>) {
@@ -1075,7 +1071,7 @@ fn diff_rows_info(
     };
     let width = width.saturating_sub(1).max(1);
     match loaded {
-        Err(e) => note(e.lines().next().unwrap_or_default().to_string(), error()),
+        Err(e) => note(e.first_line().to_string(), error()),
         Ok(FileDiff::Binary { bytes }) => note(
             match bytes {
                 Some(bytes) => format!("binary · {}", size(*bytes)),

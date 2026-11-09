@@ -1,7 +1,7 @@
 //! Suggested agent names from a prompt: a linked issue's identifier and
 //! title if there is one, otherwise the prompt's meaningful words.
 
-use crate::names::{AgentName, Checkout, MAX_SESSION_LEN};
+use crate::names::{AgentName, Checkout, NameLimit};
 
 /// Words that carry no meaning in a name: articles, pronouns, and the way
 /// people talk to an agent ("can you figure out what's going on here").
@@ -107,7 +107,7 @@ pub struct Suggestion {
 }
 
 /// Joins `words` with `-`, stopping at the last whole word that fits.
-pub(crate) fn fit<I: IntoIterator<Item = String>>(words: I) -> Option<AgentName> {
+pub(crate) fn fit<I: IntoIterator<Item = String>>(words: I, limit: NameLimit) -> Option<AgentName> {
     let mut name = String::new();
     for word in words {
         let joined = if name.is_empty() {
@@ -115,15 +115,15 @@ pub(crate) fn fit<I: IntoIterator<Item = String>>(words: I) -> Option<AgentName>
         } else {
             format!("{name}-{word}")
         };
-        if joined.len() > MAX_SESSION_LEN {
+        if joined.len() > limit.bytes() {
             if name.is_empty() {
-                name = word.chars().take(MAX_SESSION_LEN).collect();
+                name = word.chars().take(limit.bytes()).collect();
             }
             break;
         }
         name = joined;
     }
-    name.parse().ok()
+    limit.agent(&name).ok()
 }
 
 pub(crate) fn words(text: &str) -> impl Iterator<Item = String> + '_ {
@@ -157,18 +157,21 @@ fn tokens(prompt: &str) -> impl Iterator<Item = &str> {
 }
 
 /// `linear.app/<team>/issue/ENG-123/fix-the-thing` → `eng-123-fix-the-thing`.
-fn linear(prompt: &str) -> Option<AgentName> {
+fn linear(prompt: &str, limit: NameLimit) -> Option<AgentName> {
     tokens(prompt).find_map(|token| {
         let rest = token.split("linear.app/").nth(1)?;
         let mut parts = rest.split('/').skip_while(|p| *p != "issue").skip(1);
         let id = parts.next().filter(|id| is_ticket(id))?;
         let title = parts.next().unwrap_or_default();
-        fit(std::iter::once(id.to_ascii_lowercase()).chain(words(title)))
+        fit(
+            std::iter::once(id.to_ascii_lowercase()).chain(words(title)),
+            limit,
+        )
     })
 }
 
-/// `github.com/<owner>/<repo>/pull/482` → `pr-482`; issues → `issue-482`.
-fn github(prompt: &str) -> Option<AgentName> {
+/// `github.com/<owner>/<repo>/pull/482` → `pr-482`. Issues → `issue-482`.
+fn github(prompt: &str, limit: NameLimit) -> Option<AgentName> {
     tokens(prompt).find_map(|token| {
         let rest = token.split("github.com/").nth(1)?;
         let parts: Vec<&str> = rest.split('/').collect();
@@ -182,14 +185,17 @@ fn github(prompt: &str) -> Option<AgentName> {
             "issues" => "issue",
             _ => return None,
         };
-        format!("{kind}-{number}").parse().ok()
+        limit.agent(&format!("{kind}-{number}")).ok()
     })
 }
 
 /// A bare `ENG-123` in the prompt, followed by the prompt's words.
-fn ticket(prompt: &str) -> Option<AgentName> {
+fn ticket(prompt: &str, limit: NameLimit) -> Option<AgentName> {
     let id = tokens(prompt).find(|t| is_ticket(t))?;
-    fit(std::iter::once(id.to_ascii_lowercase()).chain(prose_words(&prompt.replace(id, ""))))
+    fit(
+        std::iter::once(id.to_ascii_lowercase()).chain(prose_words(&prompt.replace(id, ""))),
+        limit,
+    )
 }
 
 fn prose_words(prompt: &str) -> impl Iterator<Item = String> + '_ {
@@ -200,17 +206,17 @@ fn prose_words(prompt: &str) -> impl Iterator<Item = String> + '_ {
         .filter(|w| !FILLER.contains(&w.as_str()))
 }
 
-pub fn suggest(prompt: &str) -> Option<Suggestion> {
-    if let Some(name) = linear(prompt)
-        .or_else(|| github(prompt))
-        .or_else(|| ticket(prompt))
+pub fn suggest(prompt: &str, limit: NameLimit) -> Option<Suggestion> {
+    if let Some(name) = linear(prompt, limit)
+        .or_else(|| github(prompt, limit))
+        .or_else(|| ticket(prompt, limit))
     {
         return Some(Suggestion {
             name,
             source: Source::Link,
         });
     }
-    fit(prose_words(prompt)).map(|name| Suggestion {
+    fit(prose_words(prompt), limit).map(|name| Suggestion {
         name,
         source: Source::Words,
     })
@@ -218,36 +224,38 @@ pub fn suggest(prompt: &str) -> Option<Suggestion> {
 
 /// The name for an agent checking `target` out: `pr-482` for a pull
 /// request, else the branch cut to fit.
-pub fn for_checkout(target: &Checkout) -> Option<AgentName> {
+pub fn for_checkout(target: &Checkout, limit: NameLimit) -> Option<AgentName> {
     match target {
-        Checkout::Branch(branch) => AgentName::from_branch(branch).ok(),
-        Checkout::PullRequest(pr) => format!("pr-{}", pr.number).parse().ok(),
+        Checkout::Branch(branch) => AgentName::from_branch(branch, limit).ok(),
+        Checkout::PullRequest(pr) => limit.agent(&format!("pr-{}", pr.number)).ok(),
     }
 }
 
 /// The question to ask a harness's model for a name for `task`.
-pub fn question(task: &crate::names::Prompt) -> crate::names::Prompt {
+pub fn question(task: &crate::names::Prompt, limit: NameLimit) -> crate::names::Prompt {
     format!(
-        "Reply with only a short kebab-case name (at most {MAX_SESSION_LEN} characters: lowercase letters, digits \
-         and hyphens) for a git branch for the task below. No other text.\n\nTask:\n{task}"
+        "Reply with only a short kebab-case name (at most {} characters: lowercase letters, digits \
+         and hyphens) for a git branch for the task below. No other text.\n\nTask:\n{task}",
+        limit.bytes()
     )
     .parse()
     .expect("a non-empty task makes a valid question")
 }
 
 /// Turns free text from a model into a name, or `None` if it isn't one.
-pub fn from_model(reply: &str) -> Option<AgentName> {
+pub fn from_model(reply: &str, limit: NameLimit) -> Option<AgentName> {
     let line = reply.lines().map(str::trim).find(|l| !l.is_empty())?;
     let line = line.trim_matches(|c: char| matches!(c, '`' | '"' | '\'' | '*' | '.'));
-    fit(words(line))
+    fit(words(line), limit)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::NAME_LIMIT;
 
     fn name(prompt: &str) -> Option<(String, Source)> {
-        suggest(prompt).map(|s| (s.name.to_string(), s.source))
+        suggest(prompt, NAME_LIMIT).map(|s| (s.name.to_string(), s.source))
     }
 
     #[test]
@@ -271,14 +279,18 @@ mod tests {
             .parse()
             .expect("parses");
         assert_eq!(
-            for_checkout(&pr).map(|n| n.to_string()).as_deref(),
+            for_checkout(&pr, NAME_LIMIT)
+                .map(|n| n.to_string())
+                .as_deref(),
             Some("pr-482")
         );
         let branch: Checkout = "axel-chargebee-webhook-handler-classes"
             .parse()
             .expect("parses");
         assert_eq!(
-            for_checkout(&branch).map(|n| n.to_string()).as_deref(),
+            for_checkout(&branch, NAME_LIMIT)
+                .map(|n| n.to_string())
+                .as_deref(),
             Some("axel-chargebee")
         );
     }
@@ -332,17 +344,17 @@ mod tests {
     #[test]
     fn model_replies_are_cleaned_into_names() {
         assert_eq!(
-            from_model("`payroll-dst-export`\n")
+            from_model("`payroll-dst-export`\n", NAME_LIMIT)
                 .map(|n| n.to_string())
                 .as_deref(),
             Some("payroll-dst-export")
         );
         assert_eq!(
-            from_model("Sure! Fix Login Flake")
+            from_model("Sure! Fix Login Flake", NAME_LIMIT)
                 .map(|n| n.to_string())
                 .as_deref(),
             Some("sure-fix-login-flake")
         );
-        assert!(from_model("  \n").is_none());
+        assert!(from_model("  \n", NAME_LIMIT).is_none());
     }
 }

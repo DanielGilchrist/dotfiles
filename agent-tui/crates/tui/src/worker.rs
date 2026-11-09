@@ -21,8 +21,11 @@ use agent_core::ports::{
 };
 use crossterm::event::{KeyEvent, MouseEvent};
 
+use crate::cause::Cause;
 use crate::document::{Doc, Key, assemble};
-use crate::model::{Company, Found, Inspected, Launchable, Look, Need, RepoChoice, Ticket};
+use crate::model::{
+    Company, Found, Inspected, Launchable, Look, Need, PromptEdit, RepoChoice, Ticket,
+};
 
 /// How much of a failed action's stderr is read for its last line.
 const STDERR_TAIL: u64 = 64 * 1024;
@@ -47,21 +50,21 @@ pub enum Msg {
     Mouse(MouseEvent),
     Paste(String),
     Resize,
-    Snapshot(Result<(Snapshot, Vec<String>), String>),
+    Snapshot(Result<(Snapshot, Vec<String>), Cause>),
     Launched {
         ticket: Ticket,
-        result: Result<Launch, String>,
+        result: Result<Launch, Cause>,
     },
     /// A session can be observed at this size, or why it can't.
     Observed {
         ticket: Ticket,
-        result: Result<Observation, String>,
+        result: Result<Observation, Cause>,
     },
     RemovalPlanned {
         ticket: Ticket,
-        result: Result<RemovalPlan, String>,
+        result: Result<RemovalPlan, Cause>,
     },
-    Done(Result<Outcome, String>),
+    Done(Result<Outcome, Cause>),
     /// A message was typed into `to`, or wasn't.
     Sent {
         to: SessionName,
@@ -73,15 +76,15 @@ pub enum Msg {
         ticket: Ticket,
         found: Sightings,
     },
-    /// The harness's model named the prompt of `generation` (or couldn't).
+    /// The harness's model named the prompt as of `edit` (or couldn't).
     NameSuggested {
-        generation: u64,
+        edit: PromptEdit,
         name: Option<AgentName>,
     },
     /// Other windows showing `name` were closed, or couldn't be.
     ClosedElsewhere {
         name: SessionName,
-        closed: Result<usize, String>,
+        closed: Result<usize, Cause>,
     },
     /// What is at `path`.
     DirChecked {
@@ -101,32 +104,32 @@ pub enum Msg {
     /// Git facts about an agent's worktree.
     Inspected {
         name: SessionName,
-        read: Result<Inspected, String>,
+        read: Result<Inspected, Cause>,
     },
     /// A document, read for `key`.
     Document {
         key: Key,
-        result: Result<Doc, String>,
+        result: Result<Doc, Cause>,
     },
     /// What a subagent was told and has done, or `None` when its harness
     /// has no record of it yet.
     Subagent {
         name: SessionName,
         id: AgentId,
-        detail: Result<Option<Log>, String>,
+        detail: Result<Option<Log>, Cause>,
     },
     /// An agent's current activity, or `None` when its harness has no record of
     /// one.
     Activity {
         name: SessionName,
-        detail: Result<Option<ActivityDetail>, String>,
+        detail: Result<Option<ActivityDetail>, Cause>,
     },
     /// What reading an agent's transcript found, for the activity `standing`
     /// proves. What moved the activity is already recorded.
     Probed {
         name: SessionName,
         standing: Standing,
-        result: Result<Probe, String>,
+        result: Result<Probe, Cause>,
     },
 }
 
@@ -153,8 +156,8 @@ pub enum SendError {
     /// ready: try again when that changes.
     Held(Hold),
     /// The store couldn't be read, so nothing was typed: try again.
-    Unreadable(String),
-    Failed(String),
+    Unreadable(Cause),
+    Failed(Cause),
 }
 
 pub enum Job {
@@ -184,17 +187,11 @@ pub enum Job {
         ticket: Ticket,
     },
     Kill(Running),
-    /// `own` is the session the TUI runs in, never offered for killing.
     PlanRemoval {
         target: Removable,
         ticket: Ticket,
-        own: Option<SessionName>,
     },
-    /// `own` is the session the TUI runs in, which removal must refuse.
-    Remove {
-        approved: Approved,
-        own: Option<SessionName>,
-    },
+    Remove(Approved),
     Pin(SessionName),
     Unpin(SessionName),
     /// List the repo holding this directory.
@@ -210,7 +207,7 @@ pub enum Job {
     },
     /// The user saw an agent's finished activity.
     Acknowledge(SessionName),
-    /// Start a configured action's process; a failure is reported when it exits.
+    /// Start a configured action's process. A failure is reported when it exits.
     Run {
         label: String,
         launch: CommandLine,
@@ -224,7 +221,7 @@ impl Job {
             Self::Start { .. }
             | Self::Launch { .. }
             | Self::Kill(_)
-            | Self::Remove { .. }
+            | Self::Remove(_)
             | Self::Pin(_)
             | Self::Unpin(_)
             | Self::ListRepo(_) => true,
@@ -238,21 +235,6 @@ impl Job {
             | Self::Run { .. } => false,
         }
     }
-}
-
-/// The error and its sources, outermost first.
-pub fn describe(e: &(dyn std::error::Error + 'static)) -> String {
-    let mut out = e.to_string();
-    let mut source = e.source();
-    while let Some(s) = source {
-        let text = s.to_string();
-        if !out.contains(&text) {
-            out.push_str(": ");
-            out.push_str(&text);
-        }
-        source = s.source();
-    }
-    out
 }
 
 pub struct Workers {
@@ -317,8 +299,8 @@ impl Workers {
 
     /// Asks the harness's model to name `prompt`. A request still waiting
     /// when a newer one comes is dropped, so only the latest is answered.
-    pub fn suggest_name(&self, prompt: Prompt, harness: HarnessId, generation: u64) {
-        self.namer.request((), (prompt, harness, generation));
+    pub fn suggest_name(&self, prompt: Prompt, harness: HarnessId, edit: PromptEdit) {
+        self.namer.request((), (prompt, harness, edit));
     }
 }
 
@@ -414,7 +396,7 @@ fn spawn_inspectors(backend: &Arc<Backend>, msgs: &Sender<Msg>) -> Arc<Inspector
                         real_root: std::fs::canonicalize(&worktree).ok(),
                         asked_events,
                     })
-                    .map_err(|e| describe(&e));
+                    .map_err(|e| Cause::of(&e));
                 inspector.done(&name);
                 if msgs.send(Msg::Inspected { name, read }).is_err() {
                     return;
@@ -453,17 +435,19 @@ fn spawn_document_readers(backend: &Arc<Backend>, msgs: &Sender<Msg>) -> Arc<Doc
                                 let changes: Vec<_> =
                                     files.iter().map(|(c, _)| c.clone()).collect();
                                 let diffs = files.into_iter().map(|(c, d)| (c.path, d)).collect();
-                                Doc::Folder(assemble(&changes, diffs, |_| Err("not read".into())))
+                                Doc::Folder(assemble(&changes, diffs, |_| {
+                                    Err(Cause::message("not read".into()))
+                                }))
                             })
                     }
                     Key::Folder(folder) => Ok(Doc::Folder(assemble(&folder.files, reuse, |c| {
                         backend
                             .vcs
                             .file_diff(&worktree, c, folder.base)
-                            .map_err(|e| describe(&e))
+                            .map_err(|e| Cause::of(&e))
                     }))),
                 }
-                .map_err(|e| describe(&e));
+                .map_err(|e| Cause::of(&e));
                 reader.done(&at);
                 if msgs.send(Msg::Document { key, result }).is_err() {
                     return;
@@ -526,7 +510,7 @@ fn spawn_subagent_readers(backend: &Arc<Backend>, msgs: &Sender<Msg>) -> Arc<Sub
                 id: id.clone(),
                 detail: ops::harness_for(backend.services(), name)
                     .and_then(|harness| Ok(harness.subagent(&workdir, id)?))
-                    .map_err(|e| describe(&e)),
+                    .map_err(|e| Cause::of(&e)),
             }]
         },
     )
@@ -542,7 +526,7 @@ fn spawn_activity_readers(backend: &Arc<Backend>, msgs: &Sender<Msg>) -> Arc<Act
                 name: name.clone(),
                 detail: ops::harness_for(backend.services(), name)
                     .and_then(|harness| Ok(harness.activity_detail(&workdir, at.as_ref())?))
-                    .map_err(|e| describe(&e)),
+                    .map_err(|e| Cause::of(&e)),
             }]
         },
     )
@@ -571,12 +555,12 @@ fn probe(backend: &Backend, name: &SessionName, probing: &Probing) -> Vec<Msg> {
     let mut msgs = vec![Msg::Probed {
         name: name.clone(),
         standing: probing.standing,
-        result: result.map(|(probe, _)| probe).map_err(|e| describe(&e)),
+        result: result.map(|(probe, _)| probe).map_err(|e| Cause::of(&e)),
     }];
     if moved {
         match backend.store.activities() {
             Ok(activities) => msgs.push(Msg::Activities(activities)),
-            Err(e) => msgs.push(Msg::Done(Err(describe(&e)))),
+            Err(e) => msgs.push(Msg::Done(Err(Cause::of(&e)))),
         }
     }
     msgs
@@ -584,7 +568,7 @@ fn probe(backend: &Backend, name: &SessionName, probing: &Probing) -> Vec<Msg> {
 
 /// Asks the model to name prompts on one thread, one at a time. A model
 /// call takes seconds, so the form's typing pauses must not each start one.
-type Namer = Queue<(), (Prompt, HarnessId, u64)>;
+type Namer = Queue<(), (Prompt, HarnessId, PromptEdit)>;
 
 fn spawn_namer(
     ask: impl Fn(&Prompt, &HarnessId) -> Option<AgentName> + Send + 'static,
@@ -595,10 +579,10 @@ fn spawn_namer(
     let msgs = msgs.clone();
     thread::spawn(move || {
         loop {
-            let ((), (prompt, harness, generation)) = queue.next();
+            let ((), (prompt, harness, edit)) = queue.next();
             let name = ask(&prompt, &harness);
             queue.done(&());
-            if msgs.send(Msg::NameSuggested { generation, name }).is_err() {
+            if msgs.send(Msg::NameSuggested { edit, name }).is_err() {
                 return;
             }
         }
@@ -609,7 +593,7 @@ fn spawn_namer(
 type Lookout = Queue<(), Look>;
 
 /// What a scan for windows found, by session, or why it couldn't.
-type Sightings = Result<HashMap<SessionName, Company>, String>;
+type Sightings = Result<HashMap<SessionName, Company>, Cause>;
 type Scan = Arc<dyn Fn(Option<ClientId>) -> Sightings + Send + Sync>;
 
 /// Looks for other windows on a thread each for the refresh's looks and for
@@ -654,7 +638,7 @@ fn host_scan(backend: &Arc<Backend>) -> Scan {
             .clients()
             .map_or(Ok(Vec::new()), |c| c.windows(own))
             .map(companies)
-            .map_err(|e| describe(&e))
+            .map_err(|e| Cause::of(&e))
     })
 }
 
@@ -683,7 +667,7 @@ fn spawn_lookout(scan: &Scan, msgs: &Sender<Msg>) -> Arc<Lookout> {
     lookout
 }
 
-/// Two threads: one refreshes the snapshot, coalescing requests; the other
+/// Two threads: one refreshes the snapshot, coalescing requests. The other
 /// runs user actions in order. A slow refresh never delays an action.
 pub fn spawn(backend: Arc<Backend>, sources: Sources, msgs: Sender<Msg>) -> Workers {
     let (refresh, refresh_rx) = mpsc::channel::<()>();
@@ -718,7 +702,7 @@ pub fn spawn(backend: Arc<Backend>, sources: Sources, msgs: Sender<Msg>) -> Work
                             Msg::Activities(activities)
                         }
                         Ok(_) => continue,
-                        Err(e) => Msg::Done(Err(describe(&e))),
+                        Err(e) => Msg::Done(Err(Cause::of(&e))),
                     },
                     Err(mpsc::RecvTimeoutError::Disconnected) => return,
                 };
@@ -741,13 +725,14 @@ pub fn spawn(backend: Arc<Backend>, sources: Sources, msgs: Sender<Msg>) -> Work
         let backend = Arc::clone(&backend);
         spawn_namer(
             move |prompt, harness| {
-                let question = agent_core::naming::question(prompt);
+                let limit = backend.host.name_limit();
+                let question = agent_core::naming::question(prompt, limit);
                 backend
                     .harnesses
                     .get(harness)
                     .and_then(|h| h.ask(&question).ok().flatten())
                     .as_deref()
-                    .and_then(agent_core::naming::from_model)
+                    .and_then(|reply| agent_core::naming::from_model(reply, limit))
             },
             &msgs,
         )
@@ -782,17 +767,20 @@ pub fn spawn(backend: Arc<Backend>, sources: Sources, msgs: Sender<Msg>) -> Work
 }
 
 /// Starts the action detached from the TUI's terminal, reports that it
-/// started, then waits for it alone (not for anything it backgrounds); a
+/// started, then waits for it alone (not for anything it backgrounds). A
 /// failure comes back with its last line of stderr. Stderr goes to an
 /// unlinked file rather than a pipe so the action never depends on the TUI
 /// reading it, or dies writing to it after the TUI quits.
-fn run_action(label: &str, launch: &CommandLine, msgs: &Sender<Msg>) -> Result<Outcome, String> {
+fn run_action(label: &str, launch: &CommandLine, msgs: &Sender<Msg>) -> Result<Outcome, Cause> {
     use std::io::{Read, Seek};
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
-    let failed = |e: std::io::Error| format!("{label}: {e}");
+    let failed = |e: std::io::Error| Cause::message(format!("{label}: {e}"));
     if let Some(cwd) = launch.cwd.as_deref().filter(|cwd| !cwd.is_dir()) {
-        return Err(format!("{label}: {} is gone", cwd.display()));
+        return Err(Cause::message(format!(
+            "{label}: {} is gone",
+            cwd.display()
+        )));
     }
     let mut log = tempfile::tempfile().map_err(failed)?;
     let mut command = Command::new(&launch.program);
@@ -806,7 +794,12 @@ fn run_action(label: &str, launch: &CommandLine, msgs: &Sender<Msg>) -> Result<O
         .stderr(log.try_clone().map_err(failed)?)
         .process_group(0)
         .spawn()
-        .map_err(|e| format!("{label}: starting {}: {e}", launch.program.display()))?;
+        .map_err(|e| {
+            Cause::message(format!(
+                "{label}: starting {}: {e}",
+                launch.program.display()
+            ))
+        })?;
     let _ = msgs.send(Msg::Done(Ok(Outcome::Started(label.to_string()))));
     let status = child.wait().map_err(failed)?;
     if status.success() {
@@ -821,14 +814,14 @@ fn run_action(label: &str, launch: &CommandLine, msgs: &Sender<Msg>) -> Result<O
         .rev()
         .find(|l| !l.trim().is_empty())
         .unwrap_or_default();
-    Err(format!(
+    Err(Cause::message(format!(
         "{label} failed ({status}){}",
         if last.is_empty() {
             String::new()
         } else {
             format!(": {last}")
         }
-    ))
+    )))
 }
 
 fn snapshot(backend: &Backend) -> Msg {
@@ -837,15 +830,15 @@ fn snapshot(backend: &Backend) -> Msg {
             .map(|(snapshot, warnings)| {
                 (snapshot, warnings.iter().map(ToString::to_string).collect())
             })
-            .map_err(|e| describe(&e)),
+            .map_err(|e| Cause::of(&e)),
     )
 }
 
-/// Runs `job`, returning its reply; an action replies later from its own
+/// Runs `job`, returning its reply. An action replies later from its own
 /// thread instead.
 fn run(backend: &Arc<Backend>, job: Job, msgs: &Sender<Msg>) -> Option<Msg> {
     let svc = backend.services();
-    let err = |e: ops::Error| describe(&e);
+    let err = |e: ops::Error| Cause::of(&e);
     Some(match job {
         Job::CheckDir(path) => {
             let found = if path.is_dir() {
@@ -891,24 +884,22 @@ fn run(backend: &Arc<Backend>, job: Job, msgs: &Sender<Msg>) -> Option<Msg> {
         }
         Job::Observe { name, ticket } => Msg::Observed {
             ticket,
-            result: svc.host.observe(&name).map_err(|e| describe(&e)),
+            result: svc.host.observe(&name).map_err(|e| Cause::of(&e)),
         },
         Job::Kill(running) => Msg::Done(
             ops::kill(svc, &running)
                 .map(|()| Outcome::Killed(running.name().clone()))
                 .map_err(err),
         ),
-        Job::PlanRemoval {
-            target,
+        Job::PlanRemoval { target, ticket } => Msg::RemovalPlanned {
             ticket,
-            own,
-        } => Msg::RemovalPlanned {
-            ticket,
-            result: ops::plan_removal(svc, target, own.as_ref()).map_err(err),
+            result: ops::plan_removal(svc, target)
+                .and_then(ops::Planned::elsewhere)
+                .map_err(err),
         },
-        Job::Remove { approved, own } => Msg::Done(remove(svc, approved, own.as_ref())),
+        Job::Remove(approved) => Msg::Done(remove(svc, approved)),
         Job::CloseElsewhere { name, own } => Msg::ClosedElsewhere {
-            closed: close_elsewhere(svc, &name, own).map_err(|e| describe(&e)),
+            closed: close_elsewhere(svc, &name, own).map_err(|e| Cause::of(&e)),
             name,
         },
         Job::Acknowledge(name) => return report_failure(svc.store.acknowledge(&name)),
@@ -917,13 +908,13 @@ fn run(backend: &Arc<Backend>, job: Job, msgs: &Sender<Msg>) -> Option<Msg> {
             svc.store
                 .pin(&name)
                 .map(|()| Outcome::Pinned(name))
-                .map_err(|e| describe(&e)),
+                .map_err(|e| Cause::of(&e)),
         ),
         Job::Unpin(name) => Msg::Done(
             svc.store
                 .unpin(&name)
                 .map(|()| Outcome::Unpinned(name))
-                .map_err(|e| describe(&e)),
+                .map_err(|e| Cause::of(&e)),
         ),
         Job::ListRepo(dir) => {
             Msg::Done(ops::list_repo(svc, &dir).map(Outcome::Listed).map_err(err))
@@ -933,7 +924,7 @@ fn run(backend: &Arc<Backend>, job: Job, msgs: &Sender<Msg>) -> Option<Msg> {
 
 /// What a job with nothing to report unless it failed replies.
 fn report_failure<E: std::error::Error + 'static>(result: Result<(), E>) -> Option<Msg> {
-    result.err().map(|e| Msg::Done(Err(describe(&e))))
+    result.err().map(|e| Msg::Done(Err(Cause::of(&e))))
 }
 
 fn launch_session(
@@ -975,19 +966,15 @@ fn reply(
     let all = svc
         .store
         .activities()
-        .map_err(|e| SendError::Unreadable(describe(&e)))?;
+        .map_err(|e| SendError::Unreadable(Cause::of(&e)))?;
     match Hold::of(all.get(to), not_before, SystemTime::now()) {
-        None => ops::inject(svc, to, prompt).map_err(|e| SendError::Failed(describe(&e))),
+        None => ops::inject(svc, to, prompt).map_err(|e| SendError::Failed(Cause::of(&e))),
         Some(hold) => Err(SendError::Held(hold)),
     }
 }
 
-fn remove(
-    svc: ops::Services<'_>,
-    approved: Approved,
-    own: Option<&SessionName>,
-) -> Result<Outcome, String> {
-    match ops::remove(svc, approved, own).map_err(|e| describe(&e))? {
+fn remove(svc: ops::Services<'_>, approved: Approved) -> Result<Outcome, Cause> {
+    match ops::remove(svc, approved).map_err(|e| Cause::of(&e))? {
         Removed::Session(name) => Ok(Outcome::Removed {
             name,
             warnings: Vec::new(),
@@ -999,7 +986,7 @@ fn remove(
         } => {
             let name = worktree.name().session();
             if let Err(e) = ops::spawn_sweep(svc, &[worktree]) {
-                warnings.push(describe(&e));
+                warnings.push(Cause::of(&e).to_string());
             }
             Ok(Outcome::Removed { name, warnings })
         }
@@ -1125,17 +1112,18 @@ mod tests {
             )
         };
         let harness: HarnessId = "claude".parse().expect("parses");
-        let ask = |generation: u64, text: &str| {
-            namer.request(
-                (),
-                (text.parse().expect("a prompt"), harness.clone(), generation),
-            );
+        let ask = |edit: PromptEdit, text: &str| {
+            namer.request((), (text.parse().expect("a prompt"), harness.clone(), edit));
         };
 
-        ask(1, "first");
+        let (first, second, third) = {
+            let first = PromptEdit::default().next();
+            (first, first.next(), first.next().next())
+        };
+        ask(first, "first");
         running.recv_timeout(PATIENCE).expect("the first is asked");
-        ask(2, "second one");
-        ask(3, "third one here");
+        ask(second, "second one");
+        ask(third, "third one here");
         assert!(
             running.recv_timeout(Duration::from_millis(100)).is_err(),
             "nothing else is asked while one is in flight"
@@ -1149,13 +1137,13 @@ mod tests {
         );
         release.send(()).expect("open");
 
-        let generations: Vec<u64> = (0..2)
+        let edits: Vec<PromptEdit> = (0..2)
             .map(|_| match replies.recv_timeout(PATIENCE).expect("replies") {
-                Msg::NameSuggested { generation, .. } => generation,
+                Msg::NameSuggested { edit, .. } => edit,
                 _ => panic!("a name was expected"),
             })
             .collect();
-        assert_eq!(generations, [1, 3]);
+        assert_eq!(edits, [first, third]);
         assert_eq!(most.load(Ordering::SeqCst), 1, "never two at once");
     }
 }

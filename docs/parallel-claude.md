@@ -45,8 +45,10 @@ it into `~/.local/bin/agent`. Session layouts record that path, so keep it.
   [repos]
   dirs = ["~/repos", "~/.config"]
   ```
-- **Names** are ≤20 chars of `[A-Za-z0-9._-]` (the zellij socket path limit
-  on macOS). `agents` is reserved.
+- **Names** are ≤20 chars of `[A-Za-z0-9._-]` (the session host's limit:
+  zellij's socket path budget on macOS). `agents` is reserved. A worktree
+  already named longer than the limit is still listed and can be removed,
+  and `⏎` on it says why it can't start.
 - **State** lives in `~/.local/state/agent`: per-agent records (harness,
   undelivered first prompt), pins, zellij layouts and the TUI's last
   selection.

@@ -2,7 +2,7 @@ use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
 
-use crate::names::{BranchName, SessionName};
+use crate::names::{BranchName, HostName, NameError, NameLimit, SessionName};
 use crate::paths::{AgentWorktree, RepoRoot};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,13 +62,13 @@ impl Checkout {
 pub enum EntryKind {
     /// A repo's main checkout, named after the repo.
     Main {
-        root: RepoRoot,
+        repo: HostedRepo,
         head: Head,
         session: Option<Presence>,
     },
     /// An agent worktree, named after its directory.
     Agent {
-        worktree: AgentWorktree,
+        worktree: Hosting,
         head: Head,
         session: Option<Presence>,
     },
@@ -85,14 +85,78 @@ pub enum EntryKind {
     },
 }
 
+/// An agent worktree and the session name the host takes for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostedWorktree {
+    at: AgentWorktree,
+    host: HostName,
+}
+
+impl HostedWorktree {
+    pub fn admit(limit: NameLimit, at: AgentWorktree) -> Result<Self, NameError> {
+        let host = limit.admit(at.name().session())?;
+        Ok(Self { at, host })
+    }
+
+    pub fn at(&self) -> &AgentWorktree {
+        &self.at
+    }
+
+    pub fn host(&self) -> &HostName {
+        &self.host
+    }
+}
+
+/// A repo's main checkout and the session name the host takes for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostedRepo {
+    root: RepoRoot,
+    host: HostName,
+}
+
+impl HostedRepo {
+    pub fn admit(limit: NameLimit, root: RepoRoot) -> Result<Self, NameError> {
+        let host = limit.admit(root.name().parse()?)?;
+        Ok(Self { root, host })
+    }
+
+    pub fn root(&self) -> &RepoRoot {
+        &self.root
+    }
+
+    pub fn host(&self) -> &HostName {
+        &self.host
+    }
+}
+
+/// An agent worktree, hosted unless its name is over the host's limit. One
+/// that isn't can be removed but not started.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Hosting {
+    Hosted(HostedWorktree),
+    Unhosted { at: AgentWorktree, why: NameError },
+}
+
+impl Hosting {
+    pub fn admit(limit: NameLimit, at: AgentWorktree) -> Self {
+        match HostedWorktree::admit(limit, at.clone()) {
+            Ok(hosted) => Self::Hosted(hosted),
+            Err(why) => Self::Unhosted { at, why },
+        }
+    }
+
+    pub fn at(&self) -> &AgentWorktree {
+        match self {
+            Self::Hosted(hosted) => hosted.at(),
+            Self::Unhosted { at, .. } => at,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Start {
-    /// A repo's main checkout; the name is the repo's.
-    Main {
-        name: SessionName,
-        root: RepoRoot,
-    },
-    Agent(AgentWorktree),
+    Main(HostedRepo),
+    Agent(HostedWorktree),
 }
 
 /// Somewhere a new session can be started: an idle main checkout or agent
@@ -107,6 +171,8 @@ pub enum EntryState {
     /// Dead but resurrectable.
     Exited(Revival),
     Idle(Startable),
+    /// An agent worktree whose name the session host can't take.
+    Unhostable(NameError),
 }
 
 /// How an exited session comes back.
@@ -114,37 +180,38 @@ pub enum EntryState {
 pub enum Revival {
     /// One of our checkouts: start it again through `agent exec`, which
     /// resumes the conversation with today's launch (hooks included),
-    /// whatever command zellij cached for it.
+    /// whatever command the session host cached for it.
     Restart(Startable),
-    /// A session we don't own the checkout of: zellij replays its cached
-    /// command.
+    /// A session we don't own the checkout of: the session host replays its
+    /// cached command.
     Resurrect,
 }
 
 impl Startable {
-    pub(crate) fn worktree(worktree: &AgentWorktree) -> Self {
-        Self(Start::Agent(worktree.clone()))
+    pub fn worktree(worktree: HostedWorktree) -> Self {
+        Self(Start::Agent(worktree))
     }
 
     /// A repo's main checkout, in a session named after the repo.
-    pub(crate) fn main(root: &RepoRoot) -> Result<Self, crate::names::NameError> {
-        Ok(Self(Start::Main {
-            name: root.name().parse()?,
-            root: root.clone(),
-        }))
+    pub fn main(repo: HostedRepo) -> Self {
+        Self(Start::Main(repo))
+    }
+
+    pub fn host_name(&self) -> &HostName {
+        match &self.0 {
+            Start::Main(repo) => repo.host(),
+            Start::Agent(worktree) => worktree.host(),
+        }
     }
 
     pub fn name(&self) -> SessionName {
-        match &self.0 {
-            Start::Main { name, .. } => name.clone(),
-            Start::Agent(worktree) => worktree.name().session(),
-        }
+        self.host_name().session().clone()
     }
 
     pub fn cwd(&self) -> &Path {
         match &self.0 {
-            Start::Main { root, .. } => root.path(),
-            Start::Agent(worktree) => worktree.path(),
+            Start::Main(repo) => repo.root().path(),
+            Start::Agent(worktree) => worktree.at().path(),
         }
     }
 }
@@ -259,8 +326,8 @@ impl Entry {
 
     pub fn path(&self) -> Option<&Path> {
         match &self.kind {
-            EntryKind::Main { root, .. } => Some(root.path()),
-            EntryKind::Agent { worktree, .. } => Some(worktree.path()),
+            EntryKind::Main { repo, .. } => Some(repo.root().path()),
+            EntryKind::Agent { worktree, .. } => Some(worktree.at().path()),
             EntryKind::Adopted { checkout, .. } => Some(checkout.path()),
             EntryKind::Orphan { cwd, .. } => cwd.as_deref(),
         }
@@ -273,28 +340,28 @@ impl Entry {
     /// The agent worktree this entry owns (and removing it would delete).
     pub fn worktree(&self) -> Option<&AgentWorktree> {
         match &self.kind {
-            EntryKind::Agent { worktree, .. } => Some(worktree),
+            EntryKind::Agent { worktree, .. } => Some(worktree.at()),
             _ => None,
         }
     }
 
     pub fn removable(&self) -> Option<Removable> {
         match (&self.kind, self.state()) {
-            (EntryKind::Agent { worktree, .. }, _) => Some(Removable::Worktree(worktree.clone())),
+            (EntryKind::Agent { worktree, .. }, _) => {
+                Some(Removable::Worktree(worktree.at().clone()))
+            }
             (_, EntryState::Live | EntryState::Exited(_)) => {
                 Some(Removable::Session(self.name.clone()))
             }
-            (_, EntryState::Idle(_)) => None,
+            (_, EntryState::Idle(_) | EntryState::Unhostable(_)) => None,
         }
     }
 
     /// Its session, or where one can start when there's none.
     pub fn state(&self) -> EntryState {
-        let main = |root: &RepoRoot| {
-            Startable(Start::Main {
-                name: self.name.clone(),
-                root: root.clone(),
-            })
+        let agent = |worktree: &Hosting| match worktree {
+            Hosting::Hosted(hosted) => Ok(Startable::worktree(hosted.clone())),
+            Hosting::Unhosted { why, .. } => Err(why.clone()),
         };
         match &self.kind {
             EntryKind::Main {
@@ -314,15 +381,18 @@ impl Entry {
                 ..
             } => EntryState::Live,
             EntryKind::Main {
-                root,
+                repo,
                 session: Some(Presence::Exited),
                 ..
-            } => EntryState::Exited(Revival::Restart(main(root))),
+            } => EntryState::Exited(Revival::Restart(Startable::main(repo.clone()))),
             EntryKind::Agent {
                 worktree,
                 session: Some(Presence::Exited),
                 ..
-            } => EntryState::Exited(Revival::Restart(Startable::worktree(worktree))),
+            } => match agent(worktree) {
+                Ok(at) => EntryState::Exited(Revival::Restart(at)),
+                Err(why) => EntryState::Unhostable(why),
+            },
             EntryKind::Adopted {
                 presence: Presence::Exited,
                 ..
@@ -332,19 +402,22 @@ impl Entry {
                 ..
             } => EntryState::Exited(Revival::Resurrect),
             EntryKind::Main {
-                root,
+                repo,
                 session: None,
                 ..
-            } => EntryState::Idle(main(root)),
+            } => EntryState::Idle(Startable::main(repo.clone())),
             EntryKind::Agent {
                 worktree,
                 session: None,
                 ..
-            } => EntryState::Idle(Startable::worktree(worktree)),
+            } => match agent(worktree) {
+                Ok(at) => EntryState::Idle(at),
+                Err(why) => EntryState::Unhostable(why),
+            },
         }
     }
 
-    /// The main checkout reads best as its branch; everything else by name.
+    /// The main checkout reads best as its branch. Everything else by name.
     pub fn label(&self) -> &str {
         match &self.kind {
             EntryKind::Main {
@@ -427,7 +500,7 @@ pub struct Counts {
     pub idle: usize,
 }
 
-/// A repo and its entries; never empty.
+/// A repo and its entries. Never empty.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Repo {
     key: RepoKey,
@@ -475,7 +548,7 @@ impl Repo {
     }
 }
 
-/// Every repo and entry, sorted; repo keys and session names are unique.
+/// Every repo and entry, sorted. Repo keys and session names are unique.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Snapshot {
     repos: Vec<Repo>,

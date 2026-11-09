@@ -6,9 +6,9 @@ use std::process::{Command, Stdio};
 
 use crate::activity::{MainEvent, Move, Reported, Standing, TranscriptRef};
 use crate::discover::{self, Warning};
-use crate::model::{Presence, Removable, Running, Snapshot, Startable};
+use crate::model::{HostedRepo, HostedWorktree, Presence, Removable, Running, Snapshot, Startable};
 use crate::names::{
-    AgentName, BranchName, Checkout, InvalidPrompt, NameError, Prompt, SessionName,
+    AgentName, BranchName, Checkout, InvalidPrompt, NameError, NameLimit, Prompt, SessionName,
 };
 use crate::paths::{AgentWorktree, Layout, PathError, RepoRoot, TrashSlot, WorktreeState};
 use crate::ports::{
@@ -110,6 +110,8 @@ pub struct Backend {
     pub harnesses: Box<dyn Harnesses>,
     pub layout: Layout,
     pub exe: PathBuf,
+    /// The session this process runs in, read once at startup.
+    pub own: Option<SessionName>,
 }
 
 impl Backend {
@@ -122,6 +124,7 @@ impl Backend {
             harnesses: self.harnesses.as_ref(),
             layout: &self.layout,
             exe: &self.exe,
+            own: self.own.as_ref(),
         }
     }
 }
@@ -136,6 +139,7 @@ pub struct Services<'a> {
     pub harnesses: &'a dyn Harnesses,
     pub layout: &'a Layout,
     pub exe: &'a Path,
+    pub own: Option<&'a SessionName>,
 }
 
 impl Services<'_> {
@@ -165,7 +169,8 @@ pub fn snapshot(svc: Services<'_>) -> Result<(Snapshot, Vec<Warning>)> {
     let listed = svc.store.repos()?;
     let mut obs = discover::observe(svc.vcs, svc.host, svc.layout, &listed)?;
     let pins = svc.store.pinned()?;
-    let (snapshot, mut warnings) = discover::assemble(&obs, svc.layout, &pins);
+    let (snapshot, mut warnings) =
+        discover::assemble(&obs, svc.layout, &pins, svc.host.name_limit());
     warnings.append(&mut obs.warnings);
     Ok((snapshot, warnings))
 }
@@ -179,19 +184,19 @@ pub fn repo_for(svc: Services<'_>, dir: &Path) -> Result<Option<RepoRoot>> {
 /// could never show.
 pub fn list_repo(svc: Services<'_>, dir: &Path) -> Result<Listed> {
     let repo = repo_for(svc, dir)?.ok_or_else(|| Error::NotARepo(dir.to_path_buf()))?;
-    listable(&repo)?;
+    listable(svc, &repo)?;
     let listing = svc.store.list_repo(&repo)?;
     Ok(Listed { repo, listing })
 }
 
 /// Why `repo` couldn't be listed: its name can't be a session, or its
 /// path can't be stored.
-fn listable(repo: &RepoRoot) -> Result<()> {
-    repo.name().parse::<SessionName>()?;
+fn listable(svc: Services<'_>, repo: &RepoRoot) -> Result<HostedRepo> {
+    let hosted = HostedRepo::admit(svc.host.name_limit(), repo.clone())?;
     if repo.path().to_str().is_none_or(|p| p.contains('\n')) {
         return Err(Error::Unstorable(repo.path().to_path_buf()));
     }
-    Ok(())
+    Ok(hosted)
 }
 
 /// What [`list_repo`] did.
@@ -260,11 +265,12 @@ pub(crate) struct AttachFacts<'a> {
     pub session: Option<&'a SessionInfo>,
     pub repo: Option<&'a RepoRoot>,
     pub layout: &'a Layout,
+    pub limit: NameLimit,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Plan {
-    /// The session exists; attach, resurrecting it if it exited.
+    /// The session exists. Attach, resurrecting it if it exited.
     Attach {
         session: SessionName,
         presence: Presence,
@@ -273,21 +279,21 @@ enum Plan {
     Start(Start),
     /// The session is alive but its worktree is gone.
     Recreate {
-        worktree: AgentWorktree,
+        worktree: HostedWorktree,
         repo: RepoRoot,
     },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Start {
-    Existing(AgentWorktree),
+    Existing(Startable),
     New {
-        worktree: AgentWorktree,
+        worktree: HostedWorktree,
         repo: RepoRoot,
     },
 }
 
-/// How to reach an agent; only [`plan`] makes these.
+/// How to reach an agent. Only [`plan`] makes these.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttachPlan(Plan);
 
@@ -295,8 +301,10 @@ impl AttachPlan {
     pub fn session(&self) -> SessionName {
         match &self.0 {
             Plan::Attach { session, .. } => session.clone(),
-            Plan::Start(Start::Existing(wt) | Start::New { worktree: wt, .. })
-            | Plan::Recreate { worktree: wt, .. } => wt.name().session(),
+            Plan::Start(Start::Existing(at)) => at.name(),
+            Plan::Start(Start::New { worktree, .. }) | Plan::Recreate { worktree, .. } => {
+                worktree.host().session().clone()
+            }
         }
     }
 
@@ -304,7 +312,7 @@ impl AttachPlan {
     /// message.
     pub fn new_worktree(&self) -> Option<&AgentWorktree> {
         match &self.0 {
-            Plan::Start(Start::New { worktree, .. }) => Some(worktree),
+            Plan::Start(Start::New { worktree, .. }) => Some(worktree.at()),
             _ => None,
         }
     }
@@ -313,7 +321,7 @@ impl AttachPlan {
 pub(crate) fn plan_attach(facts: &AttachFacts<'_>) -> Result<AttachPlan> {
     let plan = match (facts.existing, facts.session) {
         // An exited agent starts again through `agent exec` rather than
-        // whatever command zellij cached, so it gets today's launch.
+        // whatever command the session host cached, so it gets today's launch.
         (
             Some(wt),
             None
@@ -321,7 +329,10 @@ pub(crate) fn plan_attach(facts: &AttachFacts<'_>) -> Result<AttachPlan> {
                 status: SessionStatus::Exited { .. },
                 ..
             }),
-        ) => Plan::Start(Start::Existing(wt.clone())),
+        ) => {
+            let hosted = HostedWorktree::admit(facts.limit, wt.clone())?;
+            Plan::Start(Start::Existing(Startable::worktree(hosted)))
+        }
         (Some(wt), Some(s)) => Plan::Attach {
             session: s.name.clone(),
             presence: s.status.presence(),
@@ -348,7 +359,7 @@ pub(crate) fn plan_attach(facts: &AttachFacts<'_>) -> Result<AttachPlan> {
                             path: gone.path().to_path_buf(),
                         })?;
                         Plan::Recreate {
-                            worktree: gone,
+                            worktree: HostedWorktree::admit(facts.limit, gone)?,
                             repo: repo.clone(),
                         }
                     }
@@ -368,7 +379,10 @@ pub(crate) fn plan_attach(facts: &AttachFacts<'_>) -> Result<AttachPlan> {
         (None, None) => {
             let repo = facts.repo.ok_or(Error::NoRepo)?;
             Plan::Start(Start::New {
-                worktree: facts.layout.worktree(repo, facts.name.clone()),
+                worktree: HostedWorktree::admit(
+                    facts.limit,
+                    facts.layout.worktree(repo, facts.name.clone()),
+                )?,
                 repo: repo.clone(),
             })
         }
@@ -404,6 +418,7 @@ pub fn plan(svc: Services<'_>, name: &AgentName, repo: Option<&RepoRoot>) -> Res
         session: session.as_ref(),
         repo,
         layout: svc.layout,
+        limit: svc.host.name_limit(),
     })
 }
 
@@ -411,9 +426,10 @@ pub fn plan(svc: Services<'_>, name: &AgentName, repo: Option<&RepoRoot>) -> Res
 fn create_worktree(
     svc: Services<'_>,
     repo: &RepoRoot,
-    at: &AgentWorktree,
+    new: &HostedWorktree,
     start: &WorktreeStart,
 ) -> Result<()> {
+    let at = new.at();
     if at.path().exists() {
         return Err(Error::Occupied(at.path().to_path_buf()));
     }
@@ -428,8 +444,8 @@ fn create_worktree(
     Ok(())
 }
 
-/// Type `prompt` into a running session using its harness's input encoding;
-/// sessions agent didn't start get the default harness's.
+/// Type `prompt` into a running session using its harness's input encoding.
+/// Sessions agent didn't start get the default harness's.
 pub fn inject(svc: Services<'_>, name: &SessionName, prompt: &Prompt) -> Result<PromptKind> {
     let harness = harness_for(svc, name)?;
     svc.host.write(name, &harness.submit(prompt))?;
@@ -503,7 +519,7 @@ pub fn create(
         Some(_) => {
             // The worktree makes the repo show either way, so one that can't
             // be listed just doesn't stay once the agent is gone.
-            if listable(repo).is_ok() {
+            if listable(svc, repo).is_ok() {
                 svc.store.list_repo(repo)?;
             }
             execute(svc, plan, task, harness)
@@ -513,7 +529,7 @@ pub fn create(
 }
 
 /// Carries out an [`AttachPlan`]. `task` is typed into a running agent or
-/// queued for a new one; it's an error if neither is possible. `harness`
+/// queued for a new one. It's an error if neither is possible. `harness`
 /// only applies to agents that don't already have one.
 pub fn execute(
     svc: Services<'_>,
@@ -546,23 +562,17 @@ pub fn execute(
             create_worktree(svc, &repo, &worktree, &WorktreeStart::DefaultBase)?;
             let delivery = deliver(svc, &session, task)?;
             Ok(Launch {
-                spec: svc.host.attach(&session).cwd(worktree.path()),
+                spec: svc.host.attach(&session).cwd(worktree.at().path()),
                 session,
                 delivery,
             })
         }
         Plan::Start(Start::New { worktree, repo }) => {
             create_worktree(svc, &repo, &worktree, &WorktreeStart::DefaultBase)?;
-            start(
-                svc,
-                &Startable::worktree(&worktree),
-                harness,
-                Some(bootstrap_prompt(task)),
-            )
+            let at = Startable::worktree(worktree);
+            start(svc, &at, harness, Some(bootstrap_prompt(task)))
         }
-        Plan::Start(Start::Existing(worktree)) => {
-            start(svc, &Startable::worktree(&worktree), harness, task.cloned())
-        }
+        Plan::Start(Start::Existing(at)) => start(svc, &at, harness, task.cloned()),
     }
 }
 
@@ -578,7 +588,7 @@ pub fn attach(
 
 /// Start a session whose pane runs `agent exec`, which asks the agent's
 /// harness to resume or launch. An agent that already has a record keeps
-/// its harness; `prompt` is queued for the next launch.
+/// its harness. `prompt` is queued for the next launch.
 pub fn start(
     svc: Services<'_>,
     at: &Startable,
@@ -601,7 +611,7 @@ pub fn start(
         args: vec!["exec".into(), name.to_string()],
         cwd: at.cwd().into(),
     };
-    let spec = svc.host.create(&name, &pane)?;
+    let spec = svc.host.create(at.host_name(), &pane)?;
     svc.store.put_record(
         &name,
         &AgentRecord {
@@ -620,9 +630,8 @@ pub fn start(
 /// isn't one (named after the repo, running `harness`). Either way the
 /// repo joins the list, so it stays shown once the session is gone.
 pub fn open_repo(svc: Services<'_>, repo: &RepoRoot, harness: &dyn Harness) -> Result<Launch> {
-    let at = Startable::main(repo)?;
+    let at = Startable::main(listable(svc, repo)?);
     let name = at.name();
-    listable(repo)?;
     let launch = match find_session(svc, &name)?.map(|s| s.status) {
         Some(SessionStatus::Live { .. }) => Launch {
             spec: svc.host.attach(&name).cwd(repo.path()),
@@ -660,6 +669,7 @@ pub fn attach_here(
         session: session.as_ref(),
         repo: None,
         layout: svc.layout,
+        limit: svc.host.name_limit(),
     })?;
     execute(svc, plan, None, harness)
 }
@@ -697,7 +707,7 @@ pub fn exec_spec(svc: Services<'_>, name: &SessionName, workdir: &Path) -> Resul
     Ok(spec)
 }
 
-/// Ensure an agent worktree exists for `branch`; returns its name.
+/// Ensure an agent worktree exists for `branch`. Returns its name.
 pub fn checkout(
     svc: Services<'_>,
     repo: &RepoRoot,
@@ -741,7 +751,7 @@ fn checkout_from(
     }
     let name = match name {
         Some(name) => name,
-        None => AgentName::from_branch(&branch)?,
+        None => AgentName::from_branch(&branch, svc.host.name_limit())?,
     };
     let at = svc.layout.worktree(repo, name.clone());
     if let Some(existing) = find_worktree(svc, &name)? {
@@ -769,6 +779,7 @@ fn checkout_from(
             on: head.branch().cloned(),
         });
     }
+    let new = HostedWorktree::admit(svc.host.name_limit(), at)?;
     let start = match fetch {
         Fetch::PullRequest(_) => {
             svc.vcs.fetch(repo, fetch)?;
@@ -793,8 +804,8 @@ fn checkout_from(
             }
         }
     };
-    create_worktree(svc, repo, &at, &start)?;
-    if listable(repo).is_ok() {
+    create_worktree(svc, repo, &new, &start)?;
+    if listable(svc, repo).is_ok() {
         svc.store.list_repo(repo)?;
     }
     Ok(name)
@@ -943,7 +954,7 @@ pub struct RemovalPlan {
 
 /// A plan that would lose something. Only this can be forced.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Hazardous(RemovalPlan);
+pub struct Hazardous(Box<RemovalPlan>);
 
 impl Hazardous {
     pub fn plan(&self) -> &RemovalPlan {
@@ -952,7 +963,7 @@ impl Hazardous {
 
     /// Go ahead despite the hazards the user saw.
     pub fn force(self) -> Approved {
-        Approved(Approval::Forced(self.0))
+        Approved(Box::new(Approval::Forced(*self.0)))
     }
 }
 
@@ -979,7 +990,7 @@ enum Recheck {
 /// A removal the user has agreed to. Only [`RemovalPlan::approve`] and
 /// [`Hazardous::force`] make one.
 #[derive(Debug)]
-pub struct Approved(Approval);
+pub struct Approved(Box<Approval>);
 
 #[derive(Debug)]
 enum Approval {
@@ -1001,15 +1012,8 @@ pub enum Consent {
 
 impl Approved {
     pub fn plan(&self) -> &RemovalPlan {
-        match &self.0 {
+        match &*self.0 {
             Approval::Clean(plan) | Approval::Forced(plan) => plan,
-        }
-    }
-
-    pub fn consent(&self) -> Consent {
-        match self.0 {
-            Approval::Clean(_) => Consent::Clean,
-            Approval::Forced(_) => Consent::Discard,
         }
     }
 
@@ -1048,12 +1052,11 @@ impl RemovalPlan {
     }
 
     /// Approval without forcing, refused when anything could be lost.
-    #[allow(clippy::result_large_err)]
     pub fn approve(self) -> Result<Approved, Hazardous> {
         if self.hazards.is_empty() {
-            Ok(Approved(Approval::Clean(self)))
+            Ok(Approved(Box::new(Approval::Clean(self))))
         } else {
-            Err(Hazardous(self))
+            Err(Hazardous(Box::new(self)))
         }
     }
 }
@@ -1072,8 +1075,51 @@ pub fn removable(svc: Services<'_>, name: &SessionName) -> Result<Removable> {
     }
 }
 
-/// `own` is the session this process runs in, never offered for killing.
-pub fn plan_removal(
+/// A removal planned for a session other than the caller's own, the only
+/// kind [`remove`] can be handed.
+#[derive(Debug)]
+pub enum Planned {
+    Elsewhere(RemovalPlan),
+    Own(OwnPlan),
+}
+
+impl Planned {
+    /// The plan, or [`Error::OwnSession`] when it targets the caller's own session.
+    pub fn elsewhere(self) -> Result<RemovalPlan> {
+        match self {
+            Self::Elsewhere(plan) => Ok(plan),
+            Self::Own(own) => Err(Error::OwnSession(own.name())),
+        }
+    }
+}
+
+/// A removal of the session the caller runs in. It can't be approved here
+/// because stopping the session would kill the removal halfway.
+#[derive(Debug)]
+pub struct OwnPlan(RemovalPlan);
+
+impl OwnPlan {
+    pub fn name(&self) -> SessionName {
+        self.0.name()
+    }
+
+    pub fn hazards(&self) -> &[Hazard] {
+        self.0.hazards()
+    }
+}
+
+/// The session this process runs in is never offered for killing, and
+/// removing it is a [`Planned::Own`].
+pub fn plan_removal(svc: Services<'_>, target: Removable) -> Result<Planned> {
+    let plan = plan_target(svc, target, svc.own)?;
+    Ok(if svc.own == Some(&plan.name()) {
+        Planned::Own(OwnPlan(plan))
+    } else {
+        Planned::Elsewhere(plan)
+    })
+}
+
+fn plan_target(
     svc: Services<'_>,
     target: Removable,
     own: Option<&SessionName>,
@@ -1118,7 +1164,7 @@ pub fn plan_removal(
 #[derive(Debug)]
 pub enum Removed {
     Session(SessionName),
-    /// The worktree was moved into the trash; [`sweep`] finishes deleting it.
+    /// The worktree was moved into the trash. [`sweep`] finishes deleting it.
     /// Later cleanup steps that failed are reported, not fatal.
     Agent {
         worktree: AgentWorktree,
@@ -1127,15 +1173,10 @@ pub enum Removed {
     },
 }
 
-/// `own` is the session this process runs in, which can't remove itself:
-/// stopping it would kill the removal halfway.
-pub fn remove(svc: Services<'_>, approved: Approved, own: Option<&SessionName>) -> Result<Removed> {
-    if own == Some(&approved.name()) {
-        return Err(Error::OwnSession(approved.name()));
-    }
-    let (plan, recheck) = match approved {
-        Approved(Approval::Clean(plan)) => (plan, Recheck::Hazards),
-        Approved(Approval::Forced(plan)) => (plan, Recheck::BranchOnly),
+pub fn remove(svc: Services<'_>, approved: Approved) -> Result<Removed> {
+    let (plan, recheck) = match *approved.0 {
+        Approval::Clean(plan) => (plan, Recheck::Hazards),
+        Approval::Forced(plan) => (plan, Recheck::BranchOnly),
     };
     let name = plan.name();
     let (worktree, repo, planned) = match plan.target {
@@ -1152,7 +1193,7 @@ pub fn remove(svc: Services<'_>, approved: Approved, own: Option<&SessionName>) 
     };
 
     // Stop the agent (resurrectably) so nothing changes under the final
-    // check; only once the worktree is safely in the trash is the session
+    // check. Only once the worktree is safely in the trash is the session
     // deleted for good. The session may have been started since the plan.
     let stopped = match find_session(svc, &name)?.map(|s| s.status) {
         Some(SessionStatus::Live { .. }) => {
@@ -1227,7 +1268,7 @@ pub fn remove(svc: Services<'_>, approved: Approved, own: Option<&SessionName>) 
     })
 }
 
-/// Stop a session; it can be resurrected later.
+/// Stop a session. It can be resurrected later.
 pub fn kill(svc: Services<'_>, session: &Running) -> Result<()> {
     svc.host.kill(session)?;
     Ok(())

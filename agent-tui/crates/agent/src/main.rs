@@ -8,7 +8,9 @@ use std::sync::Arc;
 use agent_core::config::Config;
 use agent_core::model::Presence;
 use agent_core::names::{AgentName, BranchName, Prompt, SessionName};
-use agent_core::ops::{self, Backend, Consent, Delivery, Launch, Removed, Services};
+use agent_core::ops::{
+    self, Backend, Consent, Delivery, Hazard, Launch, Planned, Removed, Services,
+};
 use agent_core::paths::{self, Layout, RepoRoot, WorktreeState};
 use agent_core::ports::{Harness, HarnessId, Listing, Unlisting, Window};
 use agent_git::{Git, GitHub};
@@ -183,6 +185,7 @@ fn backend() -> Result<Backend> {
         store: Box::new(store),
         layout,
         exe: exe.canonicalize().unwrap_or(exe),
+        own: own_session(),
     })
 }
 
@@ -434,29 +437,38 @@ fn consent(force: bool) -> Consent {
     }
 }
 
+fn refuse_unless_forced(name: &SessionName, hazards: &[Hazard], consent: Consent) -> Result<()> {
+    if hazards.is_empty() || consent == Consent::Discard {
+        return Ok(());
+    }
+    let why: Vec<String> = hazards.iter().map(ToString::to_string).collect();
+    bail!(
+        "refusing to remove {name}: {} (re-run with --force to discard)",
+        why.join(", ")
+    );
+}
+
 fn remove(svc: Services<'_>, name: &SessionName, consent: Consent) -> Result<String> {
-    let own = own_session();
-    let plan = ops::plan_removal(svc, ops::removable(svc, name)?, own.as_ref())?;
-    let approved = match (plan.approve(), consent) {
-        (Ok(approved), _) => approved,
-        (Err(hazardous), Consent::Discard) => hazardous.force(),
-        (Err(hazardous), Consent::Clean) => {
-            let why: Vec<String> = hazardous
-                .plan()
-                .hazards()
-                .iter()
-                .map(ToString::to_string)
-                .collect();
-            bail!(
-                "refusing to remove {name}: {} (re-run with --force to discard)",
-                why.join(", ")
-            );
+    let plan = match ops::plan_removal(svc, ops::removable(svc, name)?)? {
+        Planned::Own(own) => {
+            refuse_unless_forced(name, own.hazards(), consent)?;
+            let needed = if own.hazards().is_empty() {
+                Consent::Clean
+            } else {
+                Consent::Discard
+            };
+            return remove_own(name, needed);
+        }
+        Planned::Elsewhere(plan) => plan,
+    };
+    let approved = match plan.approve() {
+        Ok(approved) => approved,
+        Err(hazardous) => {
+            refuse_unless_forced(name, hazardous.plan().hazards(), consent)?;
+            hazardous.force()
         }
     };
-    if own.as_ref() == Some(name) {
-        return remove_own(&approved);
-    }
-    Ok(match ops::remove(svc, approved, None)? {
+    Ok(match ops::remove(svc, approved)? {
         Removed::Session(name) => format!("killed {name}. It has no worktree to remove"),
         Removed::Agent {
             worktree, warnings, ..
@@ -472,9 +484,8 @@ fn remove(svc: Services<'_>, name: &SessionName, consent: Consent) -> Result<Str
 
 /// Removing the session this runs in would kill the removal halfway, so
 /// hand it to a detached `agent rm` outside the session's process group.
-fn remove_own(approved: &ops::Approved) -> Result<String> {
-    let name = approved.name();
-    let force = match approved.consent() {
+fn remove_own(name: &SessionName, consent: Consent) -> Result<String> {
+    let force = match consent {
         Consent::Clean => None,
         Consent::Discard => Some("--force"),
     };
@@ -685,13 +696,14 @@ fn main() -> Result<()> {
         hook_event(args.next().as_ref());
     }
     let cli = Cli::parse();
+    let home = paths::home().ok();
     let backend = backend()?;
     let svc = backend.services();
     let harness = chosen_harness(svc, cli.harness.as_ref())?;
     match cli.command.unwrap_or(Cmd::Tui) {
         Cmd::Tui => agent_tui::run(agent_tui::Options {
             config: config()?,
-            own_session: own_session(),
+            home,
             start_dir: cwd()?,
             harness: harness.id().clone(),
             emulator: agent_term::vt100,

@@ -23,6 +23,7 @@ use super::{
     panel, scroll, sidebar_count, sidebar_focused, sidebar_title, spinner, success, truncate_end,
     truncate_start, warning,
 };
+use crate::cause::Cause;
 use crate::model::{
     ActivityRow, AgentStatus, Cursor, Doing, Drawn, Extent, Failure, Fold, ListScroll, Listed,
     Model, Panel as Focused, Placement, Pulse, Row, Target, WorkRoom, held,
@@ -1238,7 +1239,7 @@ enum Vacancy<'a> {
     NotRead,
     /// It has no checkout to read.
     NoCheckout,
-    Unreadable(String),
+    Unreadable(Cause),
 }
 
 impl Vacancy<'_> {
@@ -1248,7 +1249,7 @@ impl Vacancy<'_> {
             Self::Reading => "reading git…".to_string(),
             Self::NotRead => "git not read yet".to_string(),
             Self::NoCheckout => "no checkout".to_string(),
-            Self::Unreadable(why) => format!("git: {}", first_line(why).0),
+            Self::Unreadable(why) => format!("git: {}", first_line(&why.to_string()).0),
         }
     }
 }
@@ -2082,7 +2083,12 @@ mod tests {
         let mut m = fleet(10);
         m.set_cursor(Cursor::Entry(name("obs-layout-4")));
         m.changes_view = crate::tree::ChangesView::Flat;
-        let Some(Ok(read)) = m.track(&name("obs-layout-4")).facts.as_mut() else {
+        let Some(Ok(read)) = m
+            .track(&name("obs-layout-4"))
+            .facts
+            .as_mut()
+            .map(|f| &mut f.result)
+        else {
             panic!("facts")
         };
         let facts = &mut read.facts;
@@ -2576,6 +2582,25 @@ mod tests {
     }
 
     #[test]
+    fn the_keymap_reads_a_subagent_row_exactly_when_one_is_selected() {
+        let reads_subagent =
+            |m: &Model| crate::keymap::Situation::of(m).reading == crate::keymap::Reading::Subagent;
+        let mut m = fleet(8);
+        m.show_view(View::Overview);
+        m.set_cursor(Cursor::Entry(name("obs-layout-4")));
+        m.panel = Focused::activity();
+        m.point_at_subagent("s1");
+        assert!(m.subagent_selected().is_some());
+        assert!(reads_subagent(&m));
+        m.activities
+            .as_mut()
+            .expect("loaded")
+            .remove(&name("obs-layout-4"));
+        assert!(m.subagent_selected().is_none());
+        assert!(!reads_subagent(&m));
+    }
+
+    #[test]
     fn the_activity_panel_is_a_row_for_the_activity_then_one_per_subagent() {
         let mut m = fleet(8);
         m.show_view(View::Overview);
@@ -2618,30 +2643,89 @@ mod tests {
         }
     }
 
+    type Surface = (Focused, fn(&Model) -> Overlay);
+
+    fn checkout_of_a_link_to_another_repo(m: &Model) -> Overlay {
+        let mut form = crate::model::NewAgent::new(
+            crate::model::FormKind::Checkout,
+            m.selected()
+                .and_then(|(repo, _)| repo.key().root().cloned()),
+        );
+        form.task = "https://github.com/acme/elsewhere/pull/7".into();
+        Overlay::New(Box::new(form))
+    }
+
+    #[test]
+    fn a_name_over_the_session_hosts_limit_says_so_without_naming_the_host() {
+        let mut m = fleet(8);
+        let mut form = crate::model::NewAgent::new(
+            crate::model::FormKind::New,
+            m.selected()
+                .and_then(|(repo, _)| repo.key().root().cloned()),
+        );
+        form.name = "a".repeat(27);
+        m.overlay = Overlay::New(Box::new(form));
+        let terminal = render(&mut m, (120, 40));
+        let buffer = terminal.backend().buffer();
+        let screen: String = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            screen.contains("7 characters over the session host's limit"),
+            "{screen}"
+        );
+        assert!(screen.contains("27/20"));
+        assert!(!screen.to_lowercase().contains("zellij"));
+    }
+
+    const SENTINEL: crate::palette::Palette = crate::palette::Palette {
+        accent: Color::Rgb(1, 1, 1),
+        dim: crate::palette::Secondary::Colour(Color::Rgb(2, 2, 2)),
+        warning: Color::Rgb(3, 3, 3),
+        error: Color::Rgb(4, 4, 4),
+        success: Color::Rgb(5, 5, 5),
+    };
+
+    #[test]
+    fn the_checkout_form_warns_about_a_link_to_another_repo_in_the_warning_colour() {
+        let mut m = fleet(8);
+        m.palette = SENTINEL;
+        m.overlay = checkout_of_a_link_to_another_repo(&m);
+        let terminal = render(&mut m, (120, 40));
+        let buffer = terminal.backend().buffer();
+        let warned: Vec<_> = buffer
+            .content()
+            .windows(12)
+            .filter(|cells| cells.iter().map(Cell::symbol).collect::<String>() == "the link is ")
+            .collect();
+        assert_eq!(warned.len(), 1, "the form says where the link points");
+        assert!(warned[0].iter().all(|c| c.fg == Color::Rgb(3, 3, 3)));
+    }
+
     #[test]
     fn every_colour_comes_from_the_palette() {
-        let palette = crate::palette::Palette {
-            accent: Color::Rgb(1, 1, 1),
-            dim: crate::palette::Secondary::Colour(Color::Rgb(2, 2, 2)),
-            warning: Color::Rgb(3, 3, 3),
-            error: Color::Rgb(4, 4, 4),
-            success: Color::Rgb(5, 5, 5),
-        };
+        let palette = SENTINEL;
         let ours = [1, 2, 3, 4, 5].map(|n| Some(Color::Rgb(n, n, n)));
         for size in SIZES {
-            for (panel, overlay) in [
-                (Focused::Agents, Overlay::None),
-                (Focused::activity(), Overlay::None),
-                (
-                    Focused::Agents,
-                    Overlay::Help(crate::model::HelpState::default()),
-                ),
-            ] {
+            let cases: [Surface; 4] = [
+                (Focused::Agents, |_| Overlay::None),
+                (Focused::activity(), |_| Overlay::None),
+                (Focused::Agents, |_| {
+                    Overlay::Help(crate::model::HelpState::default())
+                }),
+                (Focused::Agents, checkout_of_a_link_to_another_repo),
+            ];
+            for (panel, overlay) in cases {
                 let mut m = fleet(8);
                 m.palette = palette;
                 m.panel = panel;
-                m.overlay = overlay;
-                m.error("failed".to_string());
+                m.overlay = overlay(&m);
+                m.error("failed");
                 let terminal = render(&mut m, size);
                 let buffer = terminal.backend().buffer();
                 let mut used = HashSet::new();
@@ -2741,7 +2825,7 @@ mod tests {
         let mut m = fleet(8);
         let who = name("auth-refresh-2");
         m.set_cursor(Cursor::Entry(who.clone()));
-        m.set_test_facts(&who, Err("fatal: not a repo".into()));
+        m.set_test_facts(&who, Err(Cause::message("fatal: not a repo".into())));
         assert_eq!(changes_rows(&mut m), [" git: fatal: not a repo"]);
     }
 
@@ -2825,7 +2909,10 @@ mod tests {
 
         let mut m = fleet(8);
         m.set_cursor(Cursor::Entry(name("rate-limit-1")));
-        m.track(&name("rate-limit-1")).facts = Some(Err("fatal: not a repo\nmore".into()));
+        m.set_facts(
+            &name("rate-limit-1"),
+            Err(Cause::message("fatal: not a repo\nmore".into())),
+        );
         let laid = laid(&mut m, (200, 50));
         let (panel, changes) = laid.changes.as_ref().expect("[3] shows");
         assert_eq!(texts(&panel.lines), [" git: fatal: not a repo"]);
@@ -3785,7 +3872,12 @@ mod tests {
         let mut m = fleet(10);
         m.set_cursor(Cursor::Entry(name("obs-layout-4")));
         m.changes_view = crate::tree::ChangesView::Tree;
-        let Some(Ok(read)) = m.track(&name("obs-layout-4")).facts.as_mut() else {
+        let Some(Ok(read)) = m
+            .track(&name("obs-layout-4"))
+            .facts
+            .as_mut()
+            .map(|f| &mut f.result)
+        else {
             panic!("facts")
         };
         let facts = &mut read.facts;
@@ -4475,6 +4567,28 @@ mod tests {
         }
 
         #[test]
+        fn a_path_under_home_reads_from_the_models_home_not_the_environment() {
+            let mut m = fleet(10);
+            let who = working(&mut m, "payroll-fix-3");
+            let now = m.clock.wall;
+            let read = call_at(
+                now,
+                "r9",
+                "Read",
+                crate::log::fixtures::path("/home/dev/notes/todo.md"),
+                done(Summary::Lines(3)),
+                20,
+            );
+            m.set_activity(&who, Ok(Some(activity_at(now, vec![read], None))));
+            m.home = Some("/home/dev".into());
+            let text = page(&mut m, (140, 40)).join("\n");
+            assert!(text.contains("~/notes/todo.md"), "{text}");
+            m.home = None;
+            let text = page(&mut m, (140, 40)).join("\n");
+            assert!(text.contains("/home/dev/notes/todo.md"), "{text}");
+        }
+
+        #[test]
         fn a_working_activity_shows_progress_older_phases_folded_and_the_current_one_whole() {
             let mut m = fleet(10);
             working(&mut m, "payroll-fix-3");
@@ -5114,7 +5228,10 @@ mod tests {
             assert!(at > 5 && at < rows.len() - 5, "in the middle, row {at}");
             assert!(rows[at].starts_with(' '), "centred across");
 
-            m.set_activity(&who, Err("reading the transcript: denied".into()));
+            m.set_activity(
+                &who,
+                Err(Cause::message("reading the transcript: denied".into())),
+            );
             let rows = page(&mut m, (100, 30));
             assert!(
                 rows.iter()

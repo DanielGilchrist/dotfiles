@@ -1,14 +1,14 @@
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io::Write;
-use std::num::NonZeroU16;
+use std::num::{NonZeroU16, NonZeroUsize};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime};
 
 use agent_core::model::Running;
-use agent_core::names::SessionName;
+use agent_core::names::{HostName, NameLimit, SessionName};
 use agent_core::ports::{
     ClientControl, ClientId, HostError, Observation, PaneCommand, Place, SessionHost, SessionInfo,
     SessionStatus, TerminalApp, Window,
@@ -20,8 +20,11 @@ use nix::unistd::Pid;
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
 const NESTING_ENV: &[&str] = &["ZELLIJ", "ZELLIJ_SESSION_NAME", "ZELLIJ_PANE_ID"];
-/// A pane query for one session; a hung session shouldn't stall a refresh.
+/// A pane query for one session. A hung session shouldn't stall a refresh.
 const PANE_QUERY_TIMEOUT: Duration = Duration::from_secs(2);
+/// Zellij names its session socket after the session, and a unix socket path
+/// is limited to 103 bytes on macOS, which leaves 20 bytes for the name.
+const NAME_LIMIT: NameLimit = NameLimit::new(NonZeroUsize::new(20).expect("nonzero"));
 /// Bytes per `zellij action write`, well under the argv limit.
 const WRITE_CHUNK: usize = 1024;
 
@@ -64,7 +67,10 @@ fn parse_sessions(listing: &str) -> Vec<(SessionName, Listed)> {
     listing
         .lines()
         .filter_map(|line| {
-            let name = line.split_whitespace().next()?.parse().ok()?;
+            let name = NAME_LIMIT
+                .admit(line.split_whitespace().next()?.parse().ok()?)
+                .ok()?
+                .into_session();
             let listed = if line.contains("(EXITED") {
                 Listed::Exited
             } else {
@@ -453,7 +459,10 @@ impl Processes {
                     return None;
                 }
                 let rest: Vec<&str> = process.argv.iter().skip(1).map(String::as_str).collect();
-                let session = attached_session(&rest)?.parse().ok()?;
+                let session = NAME_LIMIT
+                    .admit(attached_session(&rest)?.parse().ok()?)
+                    .ok()?
+                    .into_session();
                 let lineage = self.lineage(*pid);
                 let ours = own.is_some_and(|own| lineage.contains(&own.get()));
                 (!ours && !lineage.iter().any(|p| runs_tui(*p))).then(|| Window {
@@ -536,6 +545,10 @@ fn place_named(program: &str) -> Option<Place> {
 }
 
 impl SessionHost for Zellij {
+    fn name_limit(&self) -> NameLimit {
+        NAME_LIMIT
+    }
+
     fn sessions(&self) -> Result<Vec<SessionInfo>, HostError> {
         let listed = list()?;
         Ok(parallel_map(&listed, |(name, listed)| {
@@ -567,7 +580,11 @@ impl SessionHost for Zellij {
         })
     }
 
-    fn create(&self, name: &SessionName, pane: &PaneCommand) -> Result<LaunchSpec, HostError> {
+    fn create(&self, name: &HostName, pane: &PaneCommand) -> Result<LaunchSpec, HostError> {
+        // `NameLimit::new` is public, so a name admitted against a larger limit
+        // can reach here. Zellij would fail on its socket path.
+        name.within(NAME_LIMIT)?;
+        let name = name.session();
         if list()?
             .iter()
             .any(|(n, listed)| n == name && *listed == Listed::Exited)
@@ -717,6 +734,39 @@ mod tests {
         assert_eq!(sessions.len(), 2);
         assert!(sessions[0].1 == Listed::Live);
         assert!(sessions[1].1 == Listed::Exited);
+    }
+
+    #[test]
+    fn sessions_with_names_over_the_limit_are_not_listed() {
+        let long = "a".repeat(21);
+        let listing = format!(
+            "{long} [Created 1h ago]\n{} [Created 1h ago]\n",
+            "a".repeat(20)
+        );
+        let sessions = parse_sessions(&listing);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].0.as_str().len(), 20);
+    }
+
+    #[test]
+    fn a_name_admitted_against_a_larger_limit_is_refused_before_zellij_is_asked_anything() {
+        let host = Zellij::new(PathBuf::from("/nonexistent-layouts"), |_| false);
+        let larger = NameLimit::new(NonZeroUsize::new(40).expect("nonzero"));
+        let name = larger
+            .admit("a".repeat(21).parse().expect("parses"))
+            .expect("fits 40");
+        let pane = PaneCommand {
+            program: "agent".into(),
+            args: Vec::new(),
+            cwd: PathBuf::from("/"),
+        };
+        assert!(matches!(
+            host.create(&name, &pane),
+            Err(HostError::Name(agent_core::names::NameError::TooLong {
+                limit: 20,
+                ..
+            }))
+        ));
     }
 
     #[test]

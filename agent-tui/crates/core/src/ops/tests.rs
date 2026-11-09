@@ -20,6 +20,7 @@ struct World {
     harnesses: FakeHarnesses,
     layout: Layout,
     exe: PathBuf,
+    own: Option<SessionName>,
 }
 
 impl World {
@@ -35,6 +36,7 @@ impl World {
             store: MemStore::default(),
             harnesses: FakeHarnesses::default(),
             exe: "/bin/agent".into(),
+            own: None,
             _dir: dir,
         }
     }
@@ -48,6 +50,7 @@ impl World {
             harnesses: &self.harnesses,
             layout: &self.layout,
             exe: &self.exe,
+            own: self.own.as_ref(),
         }
     }
 
@@ -321,7 +324,14 @@ fn restarts_keep_the_agents_recorded_harness() {
     w.store
         .put_record(&session("fix"), &record)
         .expect("succeeds");
-    let result = start(w.svc(), &Startable::worktree(&wt), w.harness(), None);
+    let result = start(
+        w.svc(),
+        &Startable::worktree(
+            HostedWorktree::admit(crate::testing::NAME_LIMIT, wt.clone()).expect("admitted"),
+        ),
+        w.harness(),
+        None,
+    );
     assert!(matches!(result, Err(Error::UnknownHarness(id)) if id.to_string() == "codex"));
 }
 
@@ -416,12 +426,13 @@ fn removal_refuses_unmerged_work_unless_forced() {
     let plan = plan_removal(
         w.svc(),
         removable(w.svc(), &session("fix")).expect("succeeds"),
-        None,
     )
+    .expect("succeeds")
+    .elsewhere()
     .expect("succeeds");
     let plan = plan.approve().expect_err("fails");
     assert!(wt.path().exists());
-    let removed = remove(w.svc(), plan.force(), None).expect("succeeds");
+    let removed = remove(w.svc(), plan.force()).expect("succeeds");
     assert!(matches!(removed, Removed::Agent { ref warnings, .. } if warnings.is_empty()));
     assert!(!wt.path().exists());
     assert_eq!(*w.vcs.deleted.lock().expect("lock"), [branch("fix")]);
@@ -436,8 +447,9 @@ fn a_refused_removal_leaves_the_session_running() {
     let approved = plan_removal(
         w.svc(),
         removable(w.svc(), &session("fix")).expect("succeeds"),
-        None,
     )
+    .expect("succeeds")
+    .elsewhere()
     .expect("succeeds")
     .approve()
     .expect("succeeds");
@@ -447,10 +459,7 @@ fn a_refused_removal_leaves_the_session_running() {
             ahead: NonZeroUsize::new(1).expect("succeeds"),
         },
     );
-    assert!(matches!(
-        remove(w.svc(), approved, None),
-        Err(Error::Hazards(_))
-    ));
+    assert!(matches!(remove(w.svc(), approved), Err(Error::Hazards(_))));
     assert!(wt.path().exists());
     assert!(w.host.deleted.lock().expect("lock").is_empty());
 }
@@ -472,8 +481,9 @@ fn uncommitted_files_and_detached_commits_block_removal() {
     let plan = plan_removal(
         w.svc(),
         removable(w.svc(), &session("fix")).expect("succeeds"),
-        None,
     )
+    .expect("succeeds")
+    .elsewhere()
     .expect("succeeds");
     assert!(matches!(
         plan.hazards(),
@@ -496,36 +506,30 @@ fn forced_removal_still_refuses_after_a_branch_switch() {
     let forced = plan_removal(
         w.svc(),
         removable(w.svc(), &session("fix")).expect("succeeds"),
-        None,
     )
+    .expect("succeeds")
+    .elsewhere()
     .expect("succeeds")
     .approve()
     .expect_err("fails")
     .force();
     w.vcs.set_head(wt.path(), Head::Branch(branch("other")));
-    assert!(matches!(
-        remove(w.svc(), forced, None),
-        Err(Error::Changed(_))
-    ));
+    assert!(matches!(remove(w.svc(), forced), Err(Error::Changed(_))));
     assert!(w.vcs.deleted.lock().expect("lock").is_empty());
 }
 
 #[test]
-fn the_session_doing_the_removal_cant_remove_itself() {
-    let w = World::new();
+fn a_removal_of_the_callers_own_session_cant_be_approved() {
+    let mut w = World::new();
+    w.own = Some(session("fix"));
     w.existing_worktree("fix");
-    let approved = plan_removal(
+    let planned = plan_removal(
         w.svc(),
         removable(w.svc(), &session("fix")).expect("succeeds"),
-        None,
     )
-    .expect("succeeds")
-    .approve()
     .expect("succeeds");
-    assert!(matches!(
-        remove(w.svc(), approved, Some(&session("fix"))),
-        Err(Error::OwnSession(_))
-    ));
+    assert!(matches!(planned, Planned::Own(ref own) if own.name() == session("fix")));
+    assert!(matches!(planned.elsewhere(), Err(Error::OwnSession(_))));
 }
 
 #[test]
@@ -538,7 +542,10 @@ fn a_main_entry_never_removes_a_same_named_worktree() {
             cwd: Some(w.vcs.root.path().into()),
         },
     );
-    let plan = plan_removal(w.svc(), Removable::Session(session("api")), None).expect("succeeds");
+    let plan = plan_removal(w.svc(), Removable::Session(session("api")))
+        .expect("succeeds")
+        .elsewhere()
+        .expect("succeeds");
     assert_eq!(plan.deletes(), Deletes::Session);
 }
 
@@ -549,16 +556,14 @@ fn removal_notices_a_branch_switch() {
     let approved = plan_removal(
         w.svc(),
         removable(w.svc(), &session("fix")).expect("succeeds"),
-        None,
     )
+    .expect("succeeds")
+    .elsewhere()
     .expect("succeeds")
     .approve()
     .expect("succeeds");
     w.vcs.set_head(wt.path(), Head::Branch(branch("new-work")));
-    assert!(matches!(
-        remove(w.svc(), approved, None),
-        Err(Error::Changed(_))
-    ));
+    assert!(matches!(remove(w.svc(), approved), Err(Error::Changed(_))));
 }
 
 #[test]
@@ -568,13 +573,14 @@ fn removal_deletes_a_session_started_after_the_plan() {
     let approved = plan_removal(
         w.svc(),
         removable(w.svc(), &session("fix")).expect("succeeds"),
-        None,
     )
+    .expect("succeeds")
+    .elsewhere()
     .expect("succeeds")
     .approve()
     .expect("succeeds");
     w.add_session("fix", SessionStatus::Live { cwd: None });
-    remove(w.svc(), approved, None).expect("succeeds");
+    remove(w.svc(), approved).expect("succeeds");
     assert_eq!(*w.host.deleted.lock().expect("lock"), [session("fix")]);
 }
 
@@ -590,11 +596,12 @@ fn sessions_without_worktrees_are_only_deleted() {
     let plan = plan_removal(
         w.svc(),
         removable(w.svc(), &session("api")).expect("succeeds"),
-        None,
     )
+    .expect("succeeds")
+    .elsewhere()
     .expect("succeeds");
     assert_eq!(plan.deletes(), Deletes::Session);
-    remove(w.svc(), plan.approve().expect("succeeds"), None).expect("succeeds");
+    remove(w.svc(), plan.approve().expect("succeeds")).expect("succeeds");
     assert_eq!(w.host.deleted.lock().expect("lock").len(), 1);
     assert!(w.vcs.deleted.lock().expect("lock").is_empty());
 }
@@ -760,6 +767,22 @@ fn opening_a_repo_or_creating_an_agent_in_it_lists_it() {
         world.store.repos().expect("store"),
         vec![world.vcs.root.clone()]
     );
+}
+
+#[test]
+fn an_agent_name_over_the_hosts_limit_is_refused_before_any_worktree_is_made() {
+    let world = World::new();
+    let svc = world.svc();
+    let long: AgentName = "an-agent-name-over-the-limit".parse().expect("parses");
+    assert!(matches!(
+        create(svc, &long, &world.vcs.root, None, world.harness()),
+        Err(Error::Name(NameError::TooLong { limit: 20, .. }))
+    ));
+    assert!(matches!(
+        checkout(svc, &world.vcs.root, &branch("main-2"), Some(long.clone())),
+        Err(Error::Name(NameError::TooLong { .. }))
+    ));
+    assert!(!world.layout.worktree(&world.vcs.root, long).path().exists());
 }
 
 #[test]

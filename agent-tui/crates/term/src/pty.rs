@@ -37,7 +37,7 @@ fn to_io(e: impl std::fmt::Display) -> io::Error {
 
 /// A program running in a pty, rendered through an [`Emulator`]. Reading and
 /// writing happen on background threads so the owner never blocks on the
-/// program; output is fed to the emulator by [`Terminal::pump`].
+/// program. Output is fed to the emulator by [`Terminal::pump`].
 pub struct Terminal<E> {
     emulator: E,
     master: Box<dyn MasterPty + Send>,
@@ -104,7 +104,7 @@ impl<E: Emulator> Terminal<E> {
         })
     }
 
-    /// Feeds pending output to the emulator; reports whether the program is
+    /// Feeds pending output to the emulator. Reports whether the program is
     /// still running.
     pub fn pump(&mut self) -> Liveness {
         let mut fed = 0;
@@ -251,7 +251,7 @@ fn read_output(mut reader: Box<dyn Read + Send>, output: &SyncSender<Vec<u8>>) {
 }
 
 impl<E> Drop for Terminal<E> {
-    /// Killing is immediate; reaping happens off-thread so dropping a
+    /// Killing is immediate. Reaping happens off-thread so dropping a
     /// terminal never blocks.
     fn drop(&mut self) {
         if let Some(mut child) = self.child.take() {

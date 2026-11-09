@@ -18,6 +18,7 @@ use agent_term::{CellPos, encode_key, encode_mouse};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind};
 use ratatui::layout::Position;
 
+use crate::cause::Cause;
 use crate::document::{Documents, Key};
 use crate::keymap::Situation;
 use crate::log::{EntryKey, Nav};
@@ -26,9 +27,9 @@ use crate::model::{
     Company, Confirm, Cursor, DirCheck, Direction, Drawn, Edge, Enter, Field, Focus, Follow,
     FormKind, Held, HelpState, INFO_TTL, Inspected, Inspection, Intent, Listed, LogKey, Look,
     Missing, Mode, Model, Moment, NamingState, Need, NewAgent, Outbox, Overlay, Pane, Panel, Peek,
-    Phase, Query, Reach, Reply, RepoInput, Screen, StatusKind, Submission, TerminalFocus, Ticket,
-    Unreachable, View, Watch, WatchView, WorkRoom, elsewhere_banner, fuzzy_match, held, match_rank,
-    repo_matches, unlisted,
+    Phase, PromptEdit, Query, Reach, Reply, RepoInput, Screen, StatusKind, Submission,
+    TerminalFocus, Ticket, Unreachable, View, Watch, WatchView, WorkRoom, elsewhere_banner,
+    fuzzy_match, held, match_rank, repo_matches, unlisted,
 };
 use crate::touched::{Baseline, TouchedFile};
 use crate::track::{Found, Probed, Sent};
@@ -41,7 +42,7 @@ use crate::worker::{Job, Msg, Outcome, SendError};
 const SEEN_AFTER: Duration = Duration::from_secs(3);
 /// At most one bell this often.
 const BELL_EVERY: Duration = Duration::from_secs(10);
-/// An activity this long rings when it finishes; shorter ones you were probably
+/// An activity this long rings when it finishes. Shorter ones you were probably
 /// watching.
 const LONG_TURN: Duration = Duration::from_secs(30);
 /// An agent's git facts refresh on its activity, at most this often.
@@ -150,7 +151,7 @@ pub enum Effect {
     SuggestName {
         prompt: Prompt,
         harness: agent_core::ports::HarnessId,
-        generation: u64,
+        edit: PromptEdit,
     },
     /// Suspend the TUI and open `$EDITOR`.
     Edit(Open),
@@ -259,9 +260,9 @@ fn step(m: &mut Model, msg: Msg) -> Vec<Effect> {
             }
             Vec::new()
         }
-        Msg::NameSuggested { generation, name } => {
+        Msg::NameSuggested { edit, name } => {
             if let Overlay::New(form) = &mut m.overlay {
-                form.model_named(generation, name);
+                form.model_named(edit, name);
             }
             Vec::new()
         }
@@ -302,7 +303,7 @@ fn step(m: &mut Model, msg: Msg) -> Vec<Effect> {
 
 /// Git facts about an agent's worktree were read, unless it is no longer
 /// asked about.
-fn on_inspected(m: &mut Model, name: &SessionName, read: Result<Inspected, String>) -> Vec<Effect> {
+fn on_inspected(m: &mut Model, name: &SessionName, read: Result<Inspected, Cause>) -> Vec<Effect> {
     if m.tracked(name).is_some_and(|t| t.inspection.is_some()) {
         m.set_facts(name, read);
     }
@@ -310,7 +311,7 @@ fn on_inspected(m: &mut Model, name: &SessionName, read: Result<Inspected, Strin
 }
 
 /// An agent's activity was read. A new prompt starts the cursor over.
-fn on_activity(m: &mut Model, name: &SessionName, detail: Result<Option<ActivityDetail>, String>) {
+fn on_activity(m: &mut Model, name: &SessionName, detail: Result<Option<ActivityDetail>, Cause>) {
     let Some(tracked) = m.agents.get_mut(name) else {
         return;
     };
@@ -327,7 +328,7 @@ fn on_activity(m: &mut Model, name: &SessionName, detail: Result<Option<Activity
 /// recorded by the worker, and arrives as the activity changing. The file's
 /// stamp is kept for the proof it was read under, and a failure is told once
 /// and then read again whole.
-fn on_probed(m: &mut Model, name: &SessionName, standing: Standing, result: Result<Probe, String>) {
+fn on_probed(m: &mut Model, name: &SessionName, standing: Standing, result: Result<Probe, Cause>) {
     let Some(probed) = m
         .agents
         .get_mut(name)
@@ -408,7 +409,13 @@ fn on_paste(m: &mut Model, text: &str) -> Vec<Effect> {
         Overlay::Talk { text: typed, .. } | Overlay::Comment(CommentDraft { text: typed, .. }) => {
             typed.push_str(&clean(text, CarriageReturn::Newline, None));
         }
-        _ => {
+        Overlay::None
+        | Overlay::Switcher(_)
+        | Overlay::Picker(_)
+        | Overlay::Confirm(_)
+        | Overlay::Help(_)
+        | Overlay::Actions(_)
+        | Overlay::Planning { .. } => {
             if let Some(c) = m.pane.connection().filter(|c| c.mode == Mode::Agent) {
                 let text = sanitize_paste(text);
                 let bytes = if c.term.modes().bracketed_paste {
@@ -462,7 +469,7 @@ fn on_catalogue(m: &mut Model, repos: Vec<RepoRoot>, warnings: Vec<String>) {
 fn on_closed_elsewhere(
     m: &mut Model,
     name: &SessionName,
-    closed: Result<usize, String>,
+    closed: Result<usize, Cause>,
 ) -> Vec<Effect> {
     match closed {
         Ok(n) => {
@@ -490,11 +497,11 @@ fn ask_for_name(m: &mut Model) -> Option<Effect> {
     form.naming.state = NamingState::Idle;
     let prompt = form.task.parse::<agent_core::names::Prompt>().ok()?;
     form.naming.state = NamingState::Asking;
-    let generation = form.naming.generation;
+    let edit = form.naming.edit;
     Some(Effect::SuggestName {
         prompt,
         harness: m.harness.clone(),
-        generation,
+        edit,
     })
 }
 
@@ -531,7 +538,7 @@ fn settle(m: &mut Model) {
     pause_if_elsewhere(m);
     let geometry = crate::view::geometry(m.size, m.screen);
     m.areas.terminal = geometry.terminal;
-    m.fit_sidebar(geometry.sidebar, geometry.sidebar_shown);
+    m.fit_sidebar(geometry.sidebar);
     m.settle();
 }
 
@@ -706,7 +713,7 @@ fn watch_looked(m: &mut Model) -> Vec<Effect> {
 pub fn on_observed(
     m: &mut Model,
     ticket: Ticket,
-    result: Result<Observation, String>,
+    result: Result<Observation, Cause>,
 ) -> Vec<Effect> {
     let Some(watch) = m.watch_mut() else {
         return Vec::new();
@@ -728,7 +735,7 @@ pub fn on_observed(
 }
 
 /// The watcher couldn't be started: answers the size request with a failure.
-pub fn observe_failed(m: &mut Model, ticket: Ticket, why: String) {
+pub fn observe_failed(m: &mut Model, ticket: Ticket, why: Cause) {
     on_observed(m, ticket, Err(why));
 }
 
@@ -793,7 +800,7 @@ fn reattach_preview(m: &mut Model, name: SessionName) -> Vec<Effect> {
 fn on_elsewhere(
     m: &mut Model,
     ticket: Ticket,
-    found: Result<HashMap<SessionName, Company>, String>,
+    found: Result<HashMap<SessionName, Company>, Cause>,
 ) -> Vec<Effect> {
     if !m.is_latest_look(ticket) {
         return Vec::new();
@@ -835,13 +842,15 @@ fn pane_looked(m: &mut Model) -> Vec<Effect> {
             m.set_pane(Pane::Elsewhere { name });
             start_watching(m)
         }
-        _ => Vec::new(),
+        Pane::Empty | Pane::Connecting { .. } | Pane::Connected(_) | Pane::Elsewhere { .. } => {
+            Vec::new()
+        }
     }
 }
 
 /// Keeps the pane as it is, says so once, and lets a pane still waiting on
 /// the answer attach without it.
-fn check_failed(m: &mut Model, why: &str) -> Vec<Effect> {
+fn check_failed(m: &mut Model, why: &Cause) -> Vec<Effect> {
     if m.check_health == CheckHealth::Working {
         m.error(format!("couldn't look for other windows: {why}"));
     }
@@ -855,7 +864,9 @@ fn check_failed(m: &mut Model, why: &str) -> Vec<Effect> {
             let name = name.clone();
             reattach_preview(m, name)
         }
-        _ => Vec::new(),
+        Pane::Empty | Pane::Connecting { .. } | Pane::Connected(_) | Pane::Elsewhere { .. } => {
+            Vec::new()
+        }
     }
 }
 
@@ -973,7 +984,7 @@ fn preview(m: &mut Model) -> Option<Effect> {
 
 /// A start or create finished: connect, or say why it failed where the
 /// user is looking (the form that asked, or the status bar).
-fn on_launched(m: &mut Model, ticket: Ticket, result: Result<Launch, String>) -> Vec<Effect> {
+fn on_launched(m: &mut Model, ticket: Ticket, result: Result<Launch, Cause>) -> Vec<Effect> {
     m.launching.retain(|(t, _)| *t != ticket);
     match result {
         Ok(launch) => {
@@ -993,7 +1004,7 @@ fn on_launched(m: &mut Model, ticket: Ticket, result: Result<Launch, String>) ->
                 name.clone_from(&launch.session);
             }
             // A backgrounded launch no longer has the pane waiting on it, so
-            // this connects nothing; its follow previews it instead.
+            // this connects nothing. Its follow previews it instead.
             vec![Effect::Connect {
                 launch,
                 intent: Intent::Activate,
@@ -1103,7 +1114,7 @@ fn baseline_since(
     let read = m
         .tracked(name)
         .and_then(|t| t.facts.as_ref())
-        .and_then(|r| r.as_ref().ok());
+        .and_then(|r| r.result.as_ref().ok());
     let current = read.is_some_and(|r| {
         r.asked_events.is_some_and(|asked| {
             before.is_none_or(|before| asked >= before.events) && asked <= now.prompt_event
@@ -1139,7 +1150,7 @@ fn read_document(m: &mut Model) -> Option<Effect> {
     let reuse = match &due {
         Key::Folder(folder) => {
             m.docs
-                .cached_diffs(&folder.name, folder.base, folder.generation, &folder.files)
+                .cached_diffs(&folder.name, folder.base, folder.epoch, &folder.files)
         }
         Key::Diff(_) | Key::Branch(_) | Key::Commit(_) => Vec::new(),
     };
@@ -1228,7 +1239,14 @@ fn look(m: &mut Model, after: Duration) -> Option<Job> {
             name,
             view: WatchView::Watched(w),
         })) => Some((name, w.opened)),
-        _ => m.pane.connection().map(|c| (&c.name, c.opened)),
+        Some(
+            Peek::Pane
+            | Peek::Watch(Watch {
+                view: WatchView::Watching(_),
+                ..
+            }),
+        )
+        | None => m.pane.connection().map(|c| (&c.name, c.opened)),
     };
     let watching = shown
         .filter(|(_, opened)| now.saturating_duration_since(*opened) >= after)
@@ -1372,15 +1390,21 @@ fn newly_waiting(m: &Model, next: &HashMap<SessionName, Activity>) -> bool {
                 .iter()
                 .any(|ask| before.is_none_or(|b| !b.asks.contains(ask)));
             asks_anew
-                || match (&activity.state, before.map(|b| (&b.state, b.since))) {
-                    (State::Failed { .. }, Some((State::Failed { .. }, _)))
-                    | (State::Done { .. }, Some((State::Done { .. }, _))) => false,
-                    (State::Failed { .. }, _) => true,
-                    (
-                        State::Done { .. },
-                        Some((State::Working { .. } | State::Delegating, started)),
-                    ) => activity.since.duration_since(started).unwrap_or_default() >= LONG_TURN,
-                    _ => false,
+                || match &activity.state {
+                    State::Failed { .. } => {
+                        !matches!(before.map(|b| &b.state), Some(State::Failed { .. }))
+                    }
+                    State::Done { .. } => match before.map(|b| (&b.state, b.since)) {
+                        Some((State::Working { .. } | State::Delegating, started)) => {
+                            activity.since.duration_since(started).unwrap_or_default() >= LONG_TURN
+                        }
+                        _ => false,
+                    },
+                    State::Idle
+                    | State::Working { .. }
+                    | State::Delegating
+                    | State::Interrupted
+                    | State::Exited => false,
                 }
         })
 }
@@ -1504,6 +1528,10 @@ fn activate(m: &mut Model, name: &SessionName, intent: Intent) -> Vec<Effect> {
                 ticket,
             })]
         }
+        Enter::Refused(why) => {
+            m.error(why);
+            Vec::new()
+        }
         Enter::Restart(at) => {
             let ticket = starting(m, name);
             m.info(format!("resurrecting {name}…"));
@@ -1599,9 +1627,9 @@ fn copy(m: &mut Model, text: String) -> Vec<Effect> {
 }
 
 /// The commit the diff in [0] is of, when it is one.
-pub fn commit_rev(m: &Model) -> Option<String> {
+pub fn commit_rev(m: &Model) -> Option<crate::review::Rev> {
     match m.hover() {
-        Some(crate::document::Hover::Commit(key)) => Some(key.sha),
+        Some(crate::document::Hover::Commit(key)) => Some(crate::review::Rev::new(key.sha)),
         _ => None,
     }
 }
@@ -1613,10 +1641,10 @@ fn add_comment(
     to: &SessionName,
     lines: &[crate::review::LineInfo],
     text: &str,
-    rev: Option<String>,
+    rev: Option<crate::review::Rev>,
 ) {
     let refs: Vec<&crate::review::LineInfo> = lines.iter().collect();
-    let Some(comment) = crate::review::Comment::on(&refs, rev.as_deref(), text.trim()) else {
+    let Some(comment) = crate::review::Comment::on(&refs, rev.as_ref(), text.trim()) else {
         return;
     };
     if let Some(c) = agent_core::names::first_control(text) {
@@ -1680,7 +1708,7 @@ fn open_comment(m: &mut Model) {
     let existing = m
         .draft(&name)
         .iter()
-        .find(|c| c.covers(first, rev.as_deref()));
+        .find(|c| c.covers(first, rev.as_ref()));
     m.overlay = Overlay::Comment(CommentDraft {
         to: name,
         text: existing.map(|c| c.text.clone()).unwrap_or_default(),
@@ -1720,7 +1748,10 @@ fn branch_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
                     path: line.path.clone(),
                     state,
                 },
-                _ => return Some(effects),
+                crate::review::LineKind::Header
+                | crate::review::LineKind::Added
+                | crate::review::LineKind::Removed
+                | crate::review::LineKind::Context => return Some(effects),
             });
             m.diff_view.owner = None;
             return Some(effects);
@@ -1731,7 +1762,11 @@ fn branch_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
                 crate::review::LineKind::Commit => {
                     line.text.split(' ').next().unwrap_or_default().to_string()
                 }
-                _ => line.path.to_string_lossy().into_owned(),
+                crate::review::LineKind::Header
+                | crate::review::LineKind::Entry(_)
+                | crate::review::LineKind::Added
+                | crate::review::LineKind::Removed
+                | crate::review::LineKind::Context => line.path.to_string_lossy().into_owned(),
             };
             return Some(copy(m, text));
         }
@@ -1837,7 +1872,7 @@ fn diff_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
                     .join("\n")
             } else {
                 let line = lines.get(at)?;
-                crate::review::label(&line.path, commit_rev(m).as_deref(), &[line])
+                crate::review::label(&line.path, commit_rev(m).as_ref(), &[line])
             };
             m.diff_view.anchor = None;
             return Some(copy(m, text));
@@ -2026,6 +2061,13 @@ fn log_of(m: &Model) -> Option<LogKey> {
     }
 }
 
+enum Motion {
+    Down,
+    Up,
+    Start,
+    End,
+}
+
 /// Moves the cursor of an open log for a key that moves it, and the document
 /// with it. `None` for a key that doesn't.
 fn walk(
@@ -2035,28 +2077,28 @@ fn walk(
     (docs, areas, key): (&mut Documents, &Areas, &LogKey),
 ) -> Option<()> {
     let last = open.entries.len().checked_sub(1)?;
-    let to = match code {
-        KeyCode::Char('j') | KeyCode::Down => (at + 1).min(last),
-        KeyCode::Char('k') | KeyCode::Up => at.saturating_sub(1),
-        KeyCode::Char('g') | KeyCode::Home => 0,
-        KeyCode::Char('G') | KeyCode::End => last,
+    let (to, motion) = match code {
+        KeyCode::Char('j') | KeyCode::Down => ((at + 1).min(last), Motion::Down),
+        KeyCode::Char('k') | KeyCode::Up => (at.saturating_sub(1), Motion::Up),
+        KeyCode::Char('g') | KeyCode::Home => (0, Motion::Start),
+        KeyCode::Char('G') | KeyCode::End => (last, Motion::End),
         _ => return None,
     };
     let to_key = open.entries[to].1.clone();
     open.nav.cursor = Some(to_key.clone());
-    match code {
-        KeyCode::Char('j') | KeyCode::Down => {
+    match motion {
+        Motion::Down => {
             if open.running && at + 1 >= last {
                 docs.scroll_to_end();
             }
             reveal_entry(areas, docs, key, &to_key);
         }
-        KeyCode::Char('k') | KeyCode::Up => {
+        Motion::Up => {
             reveal_entry(areas, docs, key, &to_key);
             docs.pause();
         }
-        KeyCode::Char('g') | KeyCode::Home => docs.scroll_to_start(),
-        _ => docs.scroll_to_end(),
+        Motion::Start => docs.scroll_to_start(),
+        Motion::End => docs.scroll_to_end(),
     }
     Some(())
 }
@@ -2320,36 +2362,59 @@ fn cycle_tab(m: &mut Model, direction: Direction) {
     }
 }
 
-fn panel_focusable(m: &Model, number: usize) -> bool {
-    match number {
-        1 => true,
-        2 => m
+/// The left panels in the order `h` and `l` cycle them.
+#[derive(Clone, Copy)]
+enum Slot {
+    Agents,
+    Activity,
+    Changes,
+}
+
+impl Slot {
+    const ALL: [Self; 3] = [Self::Agents, Self::Activity, Self::Changes];
+
+    fn digit(self) -> char {
+        match self {
+            Self::Agents => '1',
+            Self::Activity => '2',
+            Self::Changes => '3',
+        }
+    }
+
+    fn index(self) -> usize {
+        match self {
+            Self::Agents => 0,
+            Self::Activity => 1,
+            Self::Changes => 2,
+        }
+    }
+}
+
+fn panel_focusable(m: &Model, slot: Slot) -> bool {
+    match slot {
+        Slot::Agents => true,
+        Slot::Activity => m
             .selected_entry()
             .is_some_and(|e| m.activity(e.name()).is_some()),
-        _ => m.change_rows() > 0 && m.work_room != WorkRoom::TooShort,
+        Slot::Changes => m.change_rows() > 0 && m.work_room != WorkRoom::TooShort,
     }
 }
 
 fn cycle_panel(m: &mut Model, direction: Direction) -> Vec<Effect> {
     let current = match m.panel.list() {
-        Listed::Agent { .. } => 2,
-        Listed::Changes { .. } => 3,
-        Listed::Agents => 1,
+        Listed::Agent { .. } => Slot::Activity,
+        Listed::Changes { .. } => Slot::Changes,
+        Listed::Agents => Slot::Agents,
     };
     let step = match direction {
         Direction::Forward => 1,
         Direction::Back => 2,
     };
-    let target = (1..=3)
-        .map(|k| (current - 1 + k * step) % 3 + 1)
-        .find(|n| panel_focusable(m, *n))
-        .unwrap_or(1);
-    let digit = match target {
-        2 => '2',
-        3 => '3',
-        _ => '1',
-    };
-    on_panel_key(m, KeyCode::Char(digit)).unwrap_or_default()
+    let target = (1..=Slot::ALL.len())
+        .map(|k| Slot::ALL[(current.index() + k * step) % Slot::ALL.len()])
+        .find(|slot| panel_focusable(m, *slot))
+        .unwrap_or(Slot::Agents);
+    on_panel_key(m, KeyCode::Char(target.digit())).unwrap_or_default()
 }
 
 /// What `key` does in the peek while one is open, else in NAV, or `None`
@@ -2496,7 +2561,7 @@ fn action_key(m: &mut Model, key: &KeyEvent, selected: Option<Entry>) -> Option<
                 let intent = enter_intent(m, entry.name());
                 return Some(activate(m, entry.name(), intent));
             }
-            _ => {}
+            (None | Some(Cursor::Entry(_) | Cursor::Grouped(..)), None) => {}
         },
         KeyCode::Char('m') => {
             if let Some(entry) = selected {
@@ -2609,7 +2674,7 @@ fn open_form(m: &mut Model, kind: FormKind) {
     m.overlay = Overlay::New(Box::new(NewAgent::new(kind, default_repo)));
 }
 
-/// Plans removing the selected agent; the confirmation opens when the plan
+/// Plans removing the selected agent. The confirmation opens when the plan
 /// arrives.
 fn request_removal(m: &mut Model) -> Vec<Effect> {
     let Some(entry) = m.selected_entry().cloned() else {
@@ -2629,11 +2694,7 @@ fn request_removal(m: &mut Model) -> Vec<Effect> {
                 ticket,
                 name: entry.name().clone(),
             };
-            return vec![Effect::Job(Job::PlanRemoval {
-                target,
-                ticket,
-                own: m.own_session.clone(),
-            })];
+            return vec![Effect::Job(Job::PlanRemoval { target, ticket })];
         }
         Reach::Other { remove: None, .. } => {
             m.info(format!("{} has nothing to remove", entry.name()));
@@ -2978,7 +3039,7 @@ impl Picks {
 /// `query`, then the catalogue's, each group with exact matches first,
 /// then prefixes.
 pub fn picker_matches(m: &Model, query: &str) -> Picks {
-    match typed_path(query, &m.start_dir) {
+    match typed_path(query, &m.start_dir, m.home.as_deref()) {
         Some(Typed::Path(path)) => return Picks::Rows(vec![Pick::Path(path)]),
         Some(Typed::Unsupported) => return Picks::Unusable(Unusable::UserHome),
         Some(Typed::NoHome) => return Picks::Unusable(Unusable::NoHome),
@@ -3192,7 +3253,7 @@ fn type_into(form: &mut NewAgent, c: char) {
         Field::Name if c.is_whitespace() => form.name.push('-'),
         Field::Name if !c.is_control() => form.name.push(c),
         Field::Repo if !c.is_control() => form.repo.push(c),
-        _ => {}
+        Field::Task | Field::Name | Field::Repo => {}
     }
 }
 
@@ -3209,6 +3270,7 @@ fn delete_word(text: &mut String) {
 /// its checks.
 fn edit_form(m: &mut Model, edit: impl FnOnce(&mut NewAgent)) {
     let now = m.clock.mono;
+    let limit = m.name_limit;
     if let Overlay::New(form) = &mut m.overlay {
         if let Phase::Submitting { .. } = form.phase {
             return;
@@ -3217,7 +3279,7 @@ fn edit_form(m: &mut Model, edit: impl FnOnce(&mut NewAgent)) {
         edit(form);
         form.error = None;
         if form.task != before {
-            form.prompt_changed(now);
+            form.prompt_changed(now, limit);
         }
     }
 }
@@ -3319,7 +3381,7 @@ fn submit(m: &mut Model) -> Vec<Effect> {
     let launch = match submission {
         Submission::Ready(launch) => launch,
         Submission::Blocked(blocked) => {
-            form.error = blocked.reason();
+            form.error = blocked.reason().map(Cause::message);
             return Vec::new();
         }
     };
@@ -3352,10 +3414,7 @@ fn drop_connection_to(m: &mut Model, name: &SessionName) {
 
 fn remove(m: &mut Model, approved: Approved) -> Vec<Effect> {
     drop_connection_to(m, &approved.name());
-    vec![Effect::Job(Job::Remove {
-        approved,
-        own: m.own_session.clone(),
-    })]
+    vec![Effect::Job(Job::Remove(approved))]
 }
 
 fn on_confirm_key(m: &mut Model, confirm: Confirm, key: &KeyEvent) -> Vec<Effect> {
@@ -3410,7 +3469,7 @@ fn on_lower_panel(
         let focused = match m.panel {
             Panel::Agent { .. } => over_agent,
             Panel::Changes { .. } => over_changes,
-            _ => false,
+            Panel::Agents | Panel::Main(..) => false,
         };
         if focused && !typing {
             m.move_in_panel(step);
@@ -3433,7 +3492,7 @@ fn on_lower_panel(
         let row = row_at(&m.areas.change_rows);
         let file = match m.panel.list() {
             Listed::Changes { file } => file,
-            _ => 0,
+            Listed::Agents | Listed::Agent { .. } => 0,
         };
         m.panel = Panel::Changes {
             file: row.unwrap_or(file),
@@ -3548,7 +3607,13 @@ mod tests {
             warnings: Vec::new(),
         };
         let pins: Vec<SessionName> = pins.iter().map(|p| name(p)).collect();
-        assemble(&obs, &Layout::new("/w".into()).expect("absolute"), &pins).0
+        assemble(
+            &obs,
+            &Layout::new("/w".into()).expect("absolute"),
+            &pins,
+            agent_core::testing::NAME_LIMIT,
+        )
+        .0
     }
 
     fn root(path: &str) -> RepoRoot {
@@ -3586,7 +3651,13 @@ mod tests {
                 },
             ));
         }
-        assemble(&obs, &Layout::new("/w".into()).expect("absolute"), &[]).0
+        assemble(
+            &obs,
+            &Layout::new("/w".into()).expect("absolute"),
+            &[],
+            agent_core::testing::NAME_LIMIT,
+        )
+        .0
     }
 
     /// [0] as drawn with `rows` showing.
@@ -3657,7 +3728,7 @@ mod tests {
             &mut m,
             Msg::Launched {
                 ticket,
-                result: Err("no".into()),
+                result: Err(Cause::message("no".into())),
             },
         );
         assert_eq!(m.launching.len(), 0);
@@ -3829,12 +3900,7 @@ mod tests {
                 status: SessionStatus::Exited { cwd: None },
             },
         ];
-        let mut m = Model::new(
-            "/w/api/fix/src".into(),
-            None,
-            "claude".parse().expect("parses"),
-            "claude".into(),
-        );
+        let mut m = crate::fixtures::model("/w/api/fix/src");
         m.view = crate::model::View::Focus;
         m.visibility = Visibility::All;
         update(
@@ -3843,6 +3909,52 @@ mod tests {
         );
         m.changes_view = ChangesView::Flat;
         m
+    }
+
+    #[test]
+    fn a_worktree_over_the_hosts_limit_says_why_it_cant_start_and_can_still_be_removed() {
+        let long = "an-over-the-limit-worktree";
+        let obs = Observation {
+            sessions: Vec::new(),
+            repos: vec![(
+                RepoRoot::new("/src/api".into()).expect("absolute"),
+                RepoWorktrees {
+                    main: wt("/src/api"),
+                    linked: vec![wt(&format!("/w/api/{long}"))],
+                },
+            )],
+            warnings: Vec::new(),
+        };
+        let snapshot = assemble(
+            &obs,
+            &Layout::new("/w".into()).expect("absolute"),
+            &[],
+            agent_core::testing::NAME_LIMIT,
+        )
+        .0;
+        let mut m = crate::fixtures::model("/elsewhere");
+        m.visibility = Visibility::All;
+        update(&mut m, Msg::Snapshot(Ok((snapshot, Vec::new()))));
+        m.set_cursor(Cursor::Entry(name(long)));
+
+        let effects = update(&mut m, key(KeyCode::Enter));
+        assert!(
+            effects
+                .iter()
+                .all(|e| !matches!(e, Effect::Job(Job::Start { .. }))),
+            "nothing starts"
+        );
+        let status = m.status.as_ref().expect("a status says why");
+        assert_eq!(status.kind, crate::model::StatusKind::Error);
+        assert!(
+            status.text.contains("session host's limit"),
+            "{}",
+            status.text
+        );
+
+        let hints = crate::keymap::footer(&crate::keymap::Situation::of(&m), "⌃\\");
+        assert!(hints.iter().all(|h| h.keys != "⏎"), "no ⏎ hint");
+        assert!(hints.iter().any(|h| h.keys == "D"), "D still offered");
     }
 
     fn key(code: KeyCode) -> Msg {
@@ -3907,7 +4019,13 @@ mod tests {
             )],
             ..Observation::default()
         };
-        let snap = assemble(&obs, &Layout::new("/w".into()).expect("absolute"), &[]).0;
+        let snap = assemble(
+            &obs,
+            &Layout::new("/w".into()).expect("absolute"),
+            &[],
+            agent_core::testing::NAME_LIMIT,
+        )
+        .0;
         update(&mut m, Msg::Snapshot(Ok((snap, Vec::new()))));
         assert_eq!(selected(&m).as_deref(), Some("api"));
     }
@@ -3993,16 +4111,7 @@ mod tests {
 
     #[test]
     fn the_tree_is_the_default_and_a_backtick_switches_to_the_flat_list_and_back() {
-        assert_eq!(
-            Model::new(
-                "/".into(),
-                None,
-                "claude".parse().expect("parses"),
-                "claude".into()
-            )
-            .changes_view,
-            ChangesView::Tree
-        );
+        assert_eq!(crate::fixtures::model("/").changes_view, ChangesView::Tree);
         let mut m = model(&[]);
         m.changes_view = ChangesView::Tree;
         with_paths(&mut m, &PATHS);
@@ -4334,7 +4443,7 @@ mod tests {
     }
 
     #[test]
-    fn the_tree_is_built_once_per_generation_view_and_fold_state() {
+    fn the_tree_is_built_once_per_epoch_view_and_fold_state() {
         let mut m = model(&[]);
         m.changes_view = ChangesView::Tree;
         with_paths(&mut m, &PATHS);
@@ -4689,7 +4798,7 @@ mod tests {
             &mut m,
             Msg::Launched {
                 ticket: stale,
-                result: Err("boom".into()),
+                result: Err(Cause::message("boom".into())),
             },
         );
         assert!(matches!(&m.pane, Pane::Connecting { name, .. } if name.as_str() == "api"));
@@ -4811,13 +4920,14 @@ mod tests {
             )],
             warnings: Vec::new(),
         };
-        let snapshot = assemble(&obs, &Layout::new("/w".into()).expect("absolute"), &[]).0;
-        let mut m = Model::new(
-            "/w/api/fix/src".into(),
-            None,
-            "claude".parse().expect("parses"),
-            "claude".into(),
-        );
+        let snapshot = assemble(
+            &obs,
+            &Layout::new("/w".into()).expect("absolute"),
+            &[],
+            agent_core::testing::NAME_LIMIT,
+        )
+        .0;
+        let mut m = crate::fixtures::model("/w/api/fix/src");
         m.view = crate::model::View::Focus;
         m.visibility = Visibility::All;
         update(&mut m, Msg::Snapshot(Ok((snapshot, Vec::new()))));
@@ -4929,12 +5039,14 @@ mod tests {
             &mut m,
             Msg::Launched {
                 ticket: *ticket,
-                result: Err("branch fix-ci not found locally or on origin".into()),
+                result: Err(Cause::message(
+                    "branch fix-ci not found locally or on origin".into(),
+                )),
             },
         );
         assert!(matches!(form(&m).phase, Phase::Editing));
         assert_eq!(
-            form(&m).error.as_deref(),
+            form(&m).error.as_ref().map(ToString::to_string).as_deref(),
             Some("branch fix-ci not found locally or on origin")
         );
     }
@@ -5006,7 +5118,7 @@ mod tests {
         type_text(&mut m, "a-name-that-is-far-too-long");
         assert!(matches!(
             &derived(&m).check,
-            NameCheck::TooLong { bytes: 27 }
+            NameCheck::TooLong { over, limit: 20 } if over.get() == 7
         ));
         assert!(update(&mut m, key(KeyCode::Enter)).is_empty());
         assert!(matches!(m.overlay, Overlay::New(_)));
@@ -5088,7 +5200,7 @@ mod tests {
                 .expect("going or stopped")
         }
 
-        fn answer(m: &mut Model, standing: Standing, result: Result<Probe, String>) {
+        fn answer(m: &mut Model, standing: Standing, result: Result<Probe, Cause>) {
             update(
                 m,
                 Msg::Probed {
@@ -5195,12 +5307,12 @@ mod tests {
             answer(&mut m, proof, Ok(Probe::Going(stamp(10))));
             let due = later(&m, PROBE_EVERY);
             tick_at(&mut m, due);
-            answer(&mut m, proof, Err("io".into()));
+            answer(&mut m, proof, Err(Cause::message("io".into())));
             assert!(status(&m).contains("couldn't read auth-refresh-2's transcript"));
             m.status = None;
             let due = later(&m, PROBE_EVERY * 2);
             assert_eq!(probes(&tick_at(&mut m, due)), [(WORKER.to_string(), None)]);
-            answer(&mut m, proof, Err("io".into()));
+            answer(&mut m, proof, Err(Cause::message("io".into())));
             assert_eq!(status(&m), "", "once is enough");
         }
 
@@ -5278,11 +5390,11 @@ mod tests {
         let asked: Vec<_> = tick_at(&mut m, due)
             .into_iter()
             .filter_map(|e| match e {
-                Effect::SuggestName { generation, .. } => Some(generation),
+                Effect::SuggestName { edit, .. } => Some(edit),
                 _ => None,
             })
             .collect();
-        assert_eq!(asked, [form(&m).naming.generation]);
+        assert_eq!(asked, [form(&m).naming.edit]);
     }
 
     #[test]
@@ -5405,8 +5517,8 @@ mod tests {
         };
         f.naming.state = NamingState::Due(Instant::now());
         let effects = tick(&mut m);
-        let Some(generation) = effects.iter().find_map(|e| match e {
-            Effect::SuggestName { generation, .. } => Some(*generation),
+        let Some(edit) = effects.iter().find_map(|e| match e {
+            Effect::SuggestName { edit, .. } => Some(*edit),
             _ => None,
         }) else {
             panic!("no ask")
@@ -5414,7 +5526,7 @@ mod tests {
         update(
             &mut m,
             Msg::NameSuggested {
-                generation: generation - 1,
+                edit: PromptEdit::default(),
                 name: "stale".parse().ok(),
             },
         );
@@ -5425,7 +5537,7 @@ mod tests {
         update(
             &mut m,
             Msg::NameSuggested {
-                generation,
+                edit,
                 name: "slow-export".parse().ok(),
             },
         );
@@ -5482,10 +5594,13 @@ mod tests {
             &mut m,
             Msg::Launched {
                 ticket,
-                result: Err("boom".into()),
+                result: Err(Cause::message("boom".into())),
             },
         );
-        assert_eq!(form(&m).error.as_deref(), Some("boom"));
+        assert_eq!(
+            form(&m).error.as_ref().map(ToString::to_string).as_deref(),
+            Some("boom")
+        );
         assert_eq!(
             form(&m).task,
             "add dark mode",
@@ -5587,7 +5702,7 @@ mod tests {
             &mut m,
             Msg::Launched {
                 ticket,
-                result: Err("boom".into()),
+                result: Err(Cause::message("boom".into())),
             },
         );
         assert_eq!(m.follow, Some(Follow::Restored(name("web"))));
@@ -5702,7 +5817,7 @@ mod tests {
             &mut m,
             Msg::Inspected {
                 name: name("fix"),
-                read: (Err("not a git repository".into())).map(Inspected::of),
+                read: (Err(Cause::message("not a git repository".into()))).map(Inspected::of),
             },
         );
         update(&mut m, key(KeyCode::Char('x')));
@@ -5762,12 +5877,7 @@ mod tests {
                 },
             },
         ];
-        let mut m = Model::new(
-            "/elsewhere".into(),
-            None,
-            "claude".parse().expect("parses"),
-            "claude".into(),
-        );
+        let mut m = crate::fixtures::model("/elsewhere");
         m.view = crate::model::View::Focus;
         m.visibility = Visibility::All;
         m.follow = Some(Follow::Restored(name("web")));
@@ -5799,12 +5909,7 @@ mod tests {
                 },
             },
         ];
-        let mut m = Model::new(
-            "/w/api/fix/src".into(),
-            None,
-            "claude".parse().expect("parses"),
-            "claude".into(),
-        );
+        let mut m = crate::fixtures::model("/w/api/fix/src");
         m.view = crate::model::View::Focus;
         m.visibility = Visibility::All;
         m.follow = Some(Follow::Restored(name("web")));
@@ -5830,12 +5935,7 @@ mod tests {
                 },
             },
         ];
-        let mut m = Model::new(
-            "/elsewhere".into(),
-            None,
-            "claude".parse().expect("parses"),
-            "claude".into(),
-        );
+        let mut m = crate::fixtures::model("/elsewhere");
         m.view = crate::model::View::Focus;
         m.visibility = Visibility::All;
         update(
@@ -5965,12 +6065,7 @@ mod tests {
 
     #[test]
     fn a_new_model_starts_on_the_agents_tab() {
-        let m = Model::new(
-            "/".into(),
-            None,
-            "claude".parse().expect("parses"),
-            "claude".into(),
-        );
+        let m = crate::fixtures::model("/");
         assert_eq!(m.view, View::Overview);
     }
 
@@ -6147,17 +6242,18 @@ mod tests {
             warnings: Vec::new(),
         };
         let pins = [name("api")];
-        assemble(&obs, &Layout::new("/w".into()).expect("absolute"), &pins).0
+        assemble(
+            &obs,
+            &Layout::new("/w".into()).expect("absolute"),
+            &pins,
+            agent_core::testing::NAME_LIMIT,
+        )
+        .0
     }
 
     #[test]
     fn a_displaced_agent_that_has_gone_does_not_drag_the_selection() {
-        let mut m = Model::new(
-            "/w/api/fix/src".into(),
-            None,
-            "claude".parse().expect("parses"),
-            "claude".into(),
-        );
+        let mut m = crate::fixtures::model("/w/api/fix/src");
         m.view = crate::model::View::Focus;
         m.visibility = Visibility::All;
         update(
@@ -7254,7 +7350,9 @@ mod tests {
             &mut m,
             Msg::Sent {
                 to: name(agent),
-                result: Err(crate::worker::SendError::Failed("no pty".into())),
+                result: Err(crate::worker::SendError::Failed(Cause::message(
+                    "no pty".into(),
+                ))),
             },
         );
         assert_eq!(m.queued(), 0);
@@ -7318,11 +7416,17 @@ mod tests {
         let mut m = crate::fixtures::fleet(10);
         let agent = name("auth-refresh-2");
         let line = crate::fixtures::line_info("a.rs", "+x", 1);
-        add_comment(&mut m, &agent, &[line], "a\x1bb", Some("abc1234".into()));
+        add_comment(
+            &mut m,
+            &agent,
+            &[line],
+            "a\x1bb",
+            Some(crate::review::Rev::new("abc1234".into())),
+        );
         assert_eq!(m.drafted(), 0);
         assert!(
             matches!(&m.overlay, Overlay::Comment(CommentDraft { text, rev, .. })
-                if text == "a\x1bb" && rev.as_deref() == Some("abc1234")),
+                if text == "a\x1bb" && rev.as_ref().map(ToString::to_string).as_deref() == Some("abc1234")),
             "the box stays with its commit"
         );
         assert!(
@@ -7427,7 +7531,7 @@ mod tests {
     }
 
     #[test]
-    fn generations_never_repeat_for_an_agent_removed_and_recreated() {
+    fn epochs_never_repeat_for_an_agent_removed_and_recreated() {
         let mut m = crate::fixtures::fleet(10);
         let facts = match m.facts(&name("obs-layout-4")) {
             Some(Ok(facts)) => facts.clone(),
@@ -7435,12 +7539,18 @@ mod tests {
         };
         let again = name("removed-agent");
         m.set_test_facts(&again, Ok(facts.clone()));
-        let first = m.tracked(&again).expect("tracked").generation;
+        let epoch = |m: &Model| {
+            m.tracked(&again)
+                .and_then(|t| t.facts.as_ref())
+                .expect("read")
+                .epoch
+        };
+        let first = epoch(&m);
         m.track(&again).listed();
         forget_gone(&mut m);
         assert!(m.tracked(&again).is_none());
         m.set_test_facts(&again, Ok(facts));
-        assert!(m.tracked(&again).expect("tracked").generation > first);
+        assert!(epoch(&m) > first);
     }
 
     #[test]
@@ -7456,7 +7566,9 @@ mod tests {
             &mut m,
             Msg::Sent {
                 to: name(agent),
-                result: Err(crate::worker::SendError::Failed("no pty".into())),
+                result: Err(crate::worker::SendError::Failed(Cause::message(
+                    "no pty".into(),
+                ))),
             },
         );
         let paths: Vec<_> = m
@@ -7578,7 +7690,7 @@ mod tests {
             &mut m,
             Msg::Sent {
                 to: name(AGENT),
-                result: Err(SendError::Unreadable("io".into())),
+                result: Err(SendError::Unreadable(Cause::message("io".into()))),
             },
         );
         assert_eq!(replies(&effects), Vec::<String>::new());
@@ -8063,7 +8175,7 @@ mod tests {
             &mut m,
             Msg::Activity {
                 name: who.clone(),
-                detail: Err("denied".into()),
+                detail: Err(Cause::message("denied".into())),
             },
         );
         assert!(m.activity_detail(&who).is_none());

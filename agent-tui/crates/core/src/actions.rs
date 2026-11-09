@@ -58,7 +58,7 @@ enum Piece {
     Field(Field),
 }
 
-/// Text with `{name}`, `{path}` and `{repo}` placeholders; `{{` and `}}`
+/// Text with `{name}`, `{path}` and `{repo}` placeholders. `{{` and `}}`
 /// are literal braces.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Template(Vec<Piece>);

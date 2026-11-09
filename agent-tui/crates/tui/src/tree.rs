@@ -150,7 +150,7 @@ pub struct TreeRow {
     /// `path`: a chain row stands for all of them. Empty for files.
     pub chain: Vec<PathBuf>,
     pub counts: Counts,
-    /// A file's state against the last commit; `Committed` for folders,
+    /// A file's state against the last commit. `Committed` for folders,
     /// whose `counts` say what's pending under them.
     pub state: FileState,
 }
@@ -224,7 +224,7 @@ fn emit(
 }
 
 /// The rows [3] lists. `collapsed` holds the paths of the real folders that
-/// are closed, however the rows chain them; a row is closed when any folder
+/// are closed, however the rows chain them. A row is closed when any folder
 /// of its chain is, and a folder it doesn't name is open, so one that
 /// appears starts open.
 pub fn build(changes: &[Change], view: ChangesView, collapsed: &HashSet<PathBuf>) -> Vec<TreeRow> {

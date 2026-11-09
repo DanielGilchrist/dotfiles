@@ -9,6 +9,9 @@ serde_json.workspace = true
 thiserror.workspace = true
 toml.workspace = true
 
+[features]
+testing = []
+
 [dev-dependencies]
 tempfile.workspace = true
 

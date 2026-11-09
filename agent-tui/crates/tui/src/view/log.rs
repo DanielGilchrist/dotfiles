@@ -27,6 +27,22 @@ use crate::touched::{Now, Roots, TouchedFile};
 
 /// Below this width the summary column and tool names shrink.
 const WIDE: usize = 100;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Width {
+    Narrow,
+    Wide,
+}
+
+impl Context<'_> {
+    fn width(&self) -> Width {
+        if self.columns < WIDE {
+            Width::Narrow
+        } else {
+            Width::Wide
+        }
+    }
+}
 const SUMMARY_WIDE: usize = 32;
 const SUMMARY_NARROW: usize = 10;
 const SAID_ROWS: usize = 4;
@@ -41,7 +57,7 @@ pub(super) struct Context<'a> {
     pub spinner: &'static str,
     /// The agent's checkout, to show paths inside it relative.
     pub roots: Option<&'a Roots>,
-    pub home: Option<&'a str>,
+    pub home: Option<&'a Path>,
 }
 
 pub(super) struct Rendered {
@@ -159,35 +175,66 @@ fn indented(indent: usize, spans: Vec<Span<'static>>) -> Line<'static> {
     Line::from(row)
 }
 
-#[allow(clippy::struct_excessive_bools)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Standing {
+    Over,
+    /// Still going, so its last call is live.
+    Going(Pace),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Pace {
+    Moving,
+    /// It has gone quiet, so spinners stand still.
+    Stalled,
+}
+
+impl Standing {
+    fn of(live: bool, stale: bool) -> Self {
+        match (live, stale) {
+            (false, _) => Self::Over,
+            (true, false) => Self::Going(Pace::Moving),
+            (true, true) => Self::Going(Pace::Stalled),
+        }
+    }
+}
+
+/// Which running calls are live.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Concurrency {
+    LastOnly,
+    /// An agent can run several calls at once.
+    Every,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LastRow {
+    Text,
+    /// A blank row never follows it.
+    Rule,
+}
+
 struct Rows<'a, 'b> {
     ctx: &'a Context<'b>,
-    narrow: bool,
-    /// Whether the subagent is still going, so its last call is live.
-    live: bool,
-    /// Whether it has gone quiet, so spinners stand still.
-    stale: bool,
-    /// Whether every running call is live, not just the last one: an agent
-    /// can run several at once.
-    parallel: bool,
+    standing: Standing,
+    concurrency: Concurrency,
     /// The call the user's answer is awaited for.
     waiting: Option<ToolId>,
     /// When the hooks say its running tool started, for a call whose
     /// request carried no time.
     running_since: Option<SystemTime>,
     out: Vec<Line<'static>>,
-    /// Whether the last row is a rule, which a blank row never follows.
-    after_rule: bool,
+    last_row: LastRow,
 }
 
 impl Rows<'_, '_> {
     fn push(&mut self, line: Line<'static>) {
-        self.after_rule = false;
+        self.last_row = LastRow::Text;
         self.out.push(line);
     }
 
     fn blank(&mut self) {
-        if !self.out.is_empty() && !self.after_rule {
+        if !self.out.is_empty() && self.last_row == LastRow::Text {
             self.out.push(Line::raw(""));
         }
     }
@@ -200,7 +247,7 @@ impl Rows<'_, '_> {
             gutter(),
             Span::styled(text + &rule, dim()),
         ]));
-        self.after_rule = true;
+        self.last_row = LastRow::Rule;
     }
 
     fn text_rows(&mut self, text: &str, indent: usize) {
@@ -277,7 +324,9 @@ impl Rows<'_, '_> {
     }
 
     fn is_live(&self, call: &Call, last: bool) -> bool {
-        self.live && (last || self.parallel) && matches!(call.state, CallState::Running)
+        let going = matches!(self.standing, Standing::Going(_));
+        let several = last || self.concurrency == Concurrency::Every;
+        going && several && matches!(call.state, CallState::Running)
     }
 
     fn asks(&self, call: &Call) -> bool {
@@ -289,7 +338,9 @@ impl Rows<'_, '_> {
             CallState::Running if self.asks(call) => {
                 Span::styled("◆", warning().add_modifier(Modifier::BOLD))
             }
-            CallState::Running if self.is_live(call, last) && self.stale => {
+            CallState::Running
+                if self.is_live(call, last) && self.standing == Standing::Going(Pace::Stalled) =>
+            {
                 Span::styled(SPINNER[0], dim())
             }
             CallState::Running if self.is_live(call, last) => Span::raw(self.ctx.spinner),
@@ -329,7 +380,7 @@ impl Rows<'_, '_> {
 
     /// The right side of a call row: how it came out, and how long it took.
     fn outcome_spans(&self, call: &Call, last: bool) -> Vec<Span<'static>> {
-        let column = if self.narrow {
+        let column = if self.ctx.width() == Width::Narrow {
             SUMMARY_NARROW
         } else {
             SUMMARY_WIDE
@@ -350,7 +401,7 @@ impl Rows<'_, '_> {
                     .and_then(|from| self.ctx.now.duration_since(from).ok());
                 let mut text = ran.map(span).unwrap_or_default();
                 let stuck = ran.is_some_and(|d| d >= STUCK);
-                if !self.narrow || text.is_empty() {
+                if self.ctx.width() == Width::Wide || text.is_empty() {
                     text = if text.is_empty() {
                         "running".into()
                     } else {
@@ -373,7 +424,7 @@ impl Rows<'_, '_> {
                 vec![Span::styled(failure_text(*code), error())]
             }
         };
-        if self.narrow
+        if self.ctx.width() == Width::Narrow
             && matches!(call.state, CallState::Done { .. })
             && let Some(took) = &took
         {
@@ -393,7 +444,11 @@ impl Rows<'_, '_> {
         suffix: Option<Span<'static>>,
         label: Option<Vec<Span<'static>>>,
     ) {
-        let name = if self.narrow { 5 } else { 6 };
+        let name = if self.ctx.width() == Width::Narrow {
+            5
+        } else {
+            6
+        };
         let right = self.outcome_spans(call, last);
         let mut left = vec![
             gutter(),
@@ -519,7 +574,11 @@ impl Rows<'_, '_> {
         } else {
             String::new()
         };
-        let name = if self.narrow { 5 } else { 6 };
+        let name = if self.ctx.width() == Width::Narrow {
+            5
+        } else {
+            6
+        };
         let head = format!("{:<name$} {} {noun}  ", tool, calls.len());
         let used = 3 + 2 + head.chars().count() + total.chars().count() + 2;
         let room = self.ctx.columns.saturating_sub(used);
@@ -579,23 +638,22 @@ fn status_row(
     detail: &Log,
     subagent: Option<&Subagent>,
     ctx: &Context<'_>,
-    live: bool,
-    stale: bool,
-    narrow: bool,
+    standing: Standing,
 ) -> Vec<Span<'static>> {
-    let figures = figures(detail, subagent, ctx, narrow);
+    let figures = figures(detail, subagent, ctx);
+    let over = standing == Standing::Over;
     match &detail.outcome {
-        Outcome::Finished { report: Some(_) } if !live => finished_row(figures),
+        Outcome::Finished { report: Some(_) } if over => finished_row(figures),
         Outcome::Stopped { reason } => stopped_row(reason),
-        _ if !live => ended_row(figures),
+        _ if over => ended_row(figures),
         _ => match failing(detail) {
-            Some(reason) => failing_row(&reason, figures, narrow),
-            None => working_row(detail, figures, ctx, stale),
+            Some(reason) => failing_row(&reason, figures, ctx),
+            None => working_row(detail, figures, ctx, standing),
         },
     }
 }
 
-fn figures(detail: &Log, subagent: Option<&Subagent>, ctx: &Context<'_>, narrow: bool) -> Figures {
+fn figures(detail: &Log, subagent: Option<&Subagent>, ctx: &Context<'_>) -> Figures {
     let calls = Span::styled(calls_label(detail), dim());
     let errors = error_count(detail);
     let began = subagent.map(|s| s.since).or(detail.started);
@@ -609,7 +667,7 @@ fn figures(detail: &Log, subagent: Option<&Subagent>, ctx: &Context<'_>, narrow:
         model: detail
             .model
             .clone()
-            .filter(|_| !narrow)
+            .filter(|_| ctx.width() == Width::Wide)
             .map(|m| Span::styled(m, dim())),
         working: began
             .and_then(|from| ctx.now.duration_since(from).ok())
@@ -673,14 +731,14 @@ fn ended_row(figures: Figures) -> Vec<Span<'static>> {
     )
 }
 
-fn failing_row(reason: &str, figures: Figures, narrow: bool) -> Vec<Span<'static>> {
+fn failing_row(reason: &str, figures: Figures, ctx: &Context<'_>) -> Vec<Span<'static>> {
     let spans = vec![
         Span::styled("!", error().add_modifier(Modifier::BOLD)),
         Span::styled(" failing", bold()),
         Span::styled(" · ", dim()),
         Span::raw(reason.to_string()),
     ];
-    if narrow {
+    if ctx.width() == Width::Narrow {
         return spans;
     }
     with_tail(
@@ -699,13 +757,10 @@ fn working_row(
     detail: &Log,
     figures: Figures,
     ctx: &Context<'_>,
-    stale: bool,
+    standing: Standing,
 ) -> Vec<Span<'static>> {
-    let glyph = if stale {
-        Span::styled(SPINNER[0], dim())
-    } else {
-        Span::raw(ctx.spinner)
-    };
+    let stalled = standing == Standing::Going(Pace::Stalled);
+    let glyph = spinner_span(standing, ctx);
     let spans = vec![
         glyph,
         Span::raw(format!(
@@ -713,7 +768,7 @@ fn working_row(
             figures.working.map(|w| format!(" {w}")).unwrap_or_default()
         )),
     ];
-    let quiet = stale
+    let quiet = stalled
         .then(|| {
             detail
                 .last_heard
@@ -989,20 +1044,18 @@ pub(super) fn render(
         .and_then(|at| ctx.now.duration_since(at).ok())
         .is_some_and(|d| d >= STUCK);
     let stale = live && idle && silent;
-    let narrow = ctx.columns < WIDE;
-    let status = status_row(detail, subagent, ctx, live, stale, narrow);
+    let standing = Standing::of(live, stale);
+    let status = status_row(detail, subagent, ctx, standing);
     let pinned = status_rows(status, ctx.columns);
 
     let mut rows = Rows {
         ctx,
-        narrow,
-        live,
-        stale,
-        parallel: false,
+        standing,
+        concurrency: Concurrency::LastOnly,
         waiting: None,
         running_since: subagent.and_then(|s| s.tools().last()).map(|t| t.since),
         out: Vec::new(),
-        after_rule: false,
+        last_row: LastRow::Text,
     };
     let mut layout = Vec::new();
     let all = entries(detail);
@@ -1063,20 +1116,21 @@ pub(super) fn render_activity(
     nav: &Nav,
     ctx: &Context<'_>,
 ) -> Rendered {
-    let narrow = ctx.columns < WIDE;
     let finished = view.state.finished();
-    let status = activity_status(detail, view, ctx, narrow);
-    let mut pinned = status_rows(status, ctx.columns);
-    let mut rows = Rows {
-        ctx,
-        narrow,
-        live: !finished,
-        stale: matches!(
+    let standing = Standing::of(
+        !finished,
+        matches!(
             view.state,
             ActivityStage::Working { stale: true, .. }
                 | ActivityStage::Delegating { stale: true, .. }
         ),
-        parallel: true,
+    );
+    let status = activity_status(detail, view, ctx, standing);
+    let mut pinned = status_rows(status, ctx.columns);
+    let mut rows = Rows {
+        ctx,
+        standing,
+        concurrency: Concurrency::Every,
         waiting: match &view.state {
             ActivityStage::Asking {
                 asking: Some(Asking::Choice { call, .. } | Asking::Permission { call }),
@@ -1086,7 +1140,7 @@ pub(super) fn render_activity(
         },
         running_since: None,
         out: Vec::new(),
-        after_rule: false,
+        last_row: LastRow::Text,
     };
     pin_question(&mut pinned, detail, view, &rows);
     let layout = activity_rows(&mut rows, detail, view, nav);
@@ -1221,7 +1275,6 @@ struct ActivityFigures<'a> {
     /// Since the prompt, or since the agent began when that's unknown.
     working: Option<String>,
     ctx: &'a Context<'a>,
-    narrow: bool,
 }
 
 impl ActivityFigures<'_> {
@@ -1244,7 +1297,7 @@ impl ActivityFigures<'_> {
     }
 
     fn files(&self) -> Option<Span<'static>> {
-        (self.files > 0 && !self.narrow)
+        (self.files > 0 && self.ctx.width() == Width::Wide)
             .then(|| Span::styled(plural(self.files, "file", "files"), dim()))
     }
 
@@ -1252,8 +1305,9 @@ impl ActivityFigures<'_> {
         (self.agents > 0).then(|| Span::styled(plural(self.agents, "subagent", "subagents"), dim()))
     }
 
-    fn quiet(&self, stale: bool) -> Option<Span<'static>> {
-        let heard = stale.then_some(self.log.last_heard).flatten()?;
+    fn quiet(&self, standing: Standing) -> Option<Span<'static>> {
+        let stalled = standing == Standing::Going(Pace::Stalled);
+        let heard = stalled.then_some(self.log.last_heard).flatten()?;
         let quiet = self.ctx.now.duration_since(heard).ok()?;
         Some(Span::styled(
             format!("quiet {} ?", ago(self.ctx.now - quiet, self.ctx.now)),
@@ -1262,11 +1316,10 @@ impl ActivityFigures<'_> {
     }
 }
 
-fn spinner_span(stale: bool, ctx: &Context<'_>) -> Span<'static> {
-    if stale {
-        Span::styled(SPINNER[0], dim())
-    } else {
-        Span::raw(ctx.spinner)
+fn spinner_span(standing: Standing, ctx: &Context<'_>) -> Span<'static> {
+    match standing {
+        Standing::Going(Pace::Stalled) => Span::styled(SPINNER[0], dim()),
+        Standing::Going(Pace::Moving) | Standing::Over => Span::raw(ctx.spinner),
     }
 }
 
@@ -1275,7 +1328,7 @@ fn activity_status(
     detail: &ActivityDetail,
     view: &ActivityView<'_>,
     ctx: &Context<'_>,
-    narrow: bool,
+    standing: Standing,
 ) -> Vec<Span<'static>> {
     let log = &detail.log;
     let since = match view.state {
@@ -1292,11 +1345,10 @@ fn activity_status(
             .and_then(|from| ctx.now.duration_since(from).ok())
             .map(span),
         ctx,
-        narrow,
     };
     match &view.state {
-        ActivityStage::Working { stale, running, .. } => {
-            working_activity_row(&figures, *stale, *running)
+        ActivityStage::Working { running, .. } => {
+            working_activity_row(&figures, standing, *running)
         }
         ActivityStage::Asking {
             since,
@@ -1304,11 +1356,9 @@ fn activity_status(
             asking,
             by,
         } => asking_activity_row(&figures, *since, question, *asking, by.as_deref()),
-        ActivityStage::Delegating {
-            running,
-            quiet,
-            stale,
-        } => delegating_activity_row(&figures, *running, *quiet, *stale),
+        ActivityStage::Delegating { running, quiet, .. } => {
+            delegating_activity_row(&figures, standing, *running, *quiet)
+        }
         ActivityStage::Done { seen } => done_activity_row(detail, &figures, *seen),
         ActivityStage::Failed { reason, since } => failed_activity_row(&figures, reason, *since),
         ActivityStage::Interrupted { since } => interrupted_activity_row(&figures, *since),
@@ -1317,10 +1367,10 @@ fn activity_status(
 
 fn working_activity_row(
     figures: &ActivityFigures<'_>,
-    stale: bool,
+    standing: Standing,
     running: usize,
 ) -> Vec<Span<'static>> {
-    let narrow = figures.narrow;
+    let narrow = figures.ctx.width() == Width::Narrow;
     if let Some(reason) = failing(figures.log) {
         let spans = vec![
             Span::styled("!", error().add_modifier(Modifier::BOLD)),
@@ -1338,7 +1388,7 @@ fn working_activity_row(
         return with_tail(spans, vec![working, Some(figures.calls.clone())]);
     }
     let spans = vec![
-        spinner_span(stale, figures.ctx),
+        spinner_span(standing, figures.ctx),
         Span::raw(format!(
             " working{}",
             figures
@@ -1351,7 +1401,7 @@ fn working_activity_row(
     with_tail(
         spans,
         vec![
-            figures.quiet(stale),
+            figures.quiet(standing),
             Some(figures.calls.clone()),
             figures.errors(None),
             figures.files(),
@@ -1385,7 +1435,7 @@ fn asking_activity_row(
     };
     let width = ctx.columns;
     let room = width.saturating_sub(line_width(&spans) + 1);
-    if !figures.narrow && room > about.chars().count() + ANSWER_HINT.len() + 3 {
+    if figures.ctx.width() == Width::Wide && room > about.chars().count() + ANSWER_HINT.len() + 3 {
         let used = line_width(&spans) + about.chars().count();
         let gap = " ".repeat(width.saturating_sub(used + ANSWER_HINT.len() + 1));
         spans.extend([
@@ -1403,18 +1453,22 @@ const ANSWER_HINT: &str = "i answer in the terminal";
 
 fn delegating_activity_row(
     figures: &ActivityFigures<'_>,
+    standing: Standing,
     running: usize,
     quiet: Duration,
-    stale: bool,
 ) -> Vec<Span<'static>> {
+    let stalled = standing == Standing::Going(Pace::Stalled);
     let quiet = (quiet >= QUIET_FROM).then(|| {
         Span::styled(
-            format!("quiet {}{}", span(quiet), if stale { " ?" } else { "" }),
+            format!("quiet {}{}", span(quiet), if stalled { " ?" } else { "" }),
             dim(),
         )
     });
     with_tail(
-        vec![spinner_span(stale, figures.ctx), Span::raw(" delegating")],
+        vec![
+            spinner_span(standing, figures.ctx),
+            Span::raw(" delegating"),
+        ],
         vec![Some(Span::styled(format!("↳{running}"), dim())), quiet],
     )
 }
@@ -1434,7 +1488,8 @@ fn done_activity_row(
     } else {
         Span::styled("✓", success().add_modifier(Modifier::BOLD))
     };
-    let (preposition, narrow) = (if figures.narrow { "" } else { " in" }, figures.narrow);
+    let narrow = figures.ctx.width() == Width::Narrow;
+    let preposition = if narrow { "" } else { " in" };
     let spans = vec![
         glyph,
         Span::raw(format!(
@@ -1469,7 +1524,7 @@ fn failed_activity_row(
         Span::raw(tame(reason)),
     ];
     let mut extras = vec![Some(Span::styled(ago(since, figures.ctx.now), dim()))];
-    if !figures.narrow {
+    if figures.ctx.width() == Width::Wide {
         extras.extend([Some(figures.calls.clone()), figures.errors(None)]);
     }
     with_tail(spans, extras)
@@ -1481,7 +1536,7 @@ fn interrupted_activity_row(
 ) -> Vec<Span<'static>> {
     let spans = vec![Span::styled("■", dim()), Span::raw(" interrupted")];
     let mut extras = vec![Some(Span::styled(ago(since, figures.ctx.now), dim()))];
-    if !figures.narrow {
+    if figures.ctx.width() == Width::Wide {
         extras.extend([Some(figures.calls.clone()), figures.errors(None)]);
     }
     with_tail(spans, extras)
@@ -1578,7 +1633,7 @@ impl Columns {
         Self {
             lead,
             label,
-            beside: (!rows.narrow && room >= OPTION_BESIDE).then_some(room),
+            beside: (rows.ctx.width() == Width::Wide && room >= OPTION_BESIDE).then_some(room),
             width: rows.ctx.columns,
         }
     }

@@ -80,7 +80,7 @@ impl<E: Emulator + ?Sized> Emulator for Box<E> {
     }
 }
 
-/// Builds an emulator for a new terminal; lets the TUI swap emulators.
+/// Builds an emulator for a new terminal. Lets the TUI swap emulators.
 pub type EmulatorFactory = fn(TermSize) -> Box<dyn Emulator>;
 
 pub fn vt100(size: TermSize) -> Box<dyn Emulator> {

@@ -173,11 +173,12 @@ impl RawRepos {
             path: path.to_string(),
             reason,
         };
+        let home = paths::home().ok();
         let mut dirs = Vec::new();
         for raw in &self.dirs {
             let typed = raw
                 .starts_with('~')
-                .then(|| paths::typed_path(raw, Path::new("/")))
+                .then(|| paths::typed_path(raw, Path::new("/"), home.as_deref()))
                 .flatten();
             match typed {
                 Some(Typed::Path(path)) => dirs.push(path),

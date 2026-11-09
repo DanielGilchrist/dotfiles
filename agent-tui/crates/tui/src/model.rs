@@ -11,7 +11,9 @@ use agent_core::config::Keys;
 use agent_core::model::{
     Entry, EntryKind, EntryState, Removable, Repo, RepoKey, Revival, Running, Snapshot, Startable,
 };
-use agent_core::names::{AgentName, BranchName, Checkout, Prompt, SessionName};
+use agent_core::names::{
+    AgentName, BranchName, Checkout, NameError, NameLimit, Prompt, SessionName,
+};
 use agent_core::ops::{Approved, Hazardous, RemovalPlan};
 use agent_core::paths::{RepoRoot, Typed, typed_path};
 use agent_core::ports::{
@@ -21,11 +23,12 @@ use agent_core::ports::{
 use agent_term::{Emulator, Terminal};
 use ratatui::layout::Rect;
 
+use crate::cause::Cause;
 use crate::document::{BranchKey, CommitKey, DiffKey, Documents, FolderKey, Hover, Key};
 use crate::log::Nav;
 use crate::palette::Palette;
 use crate::touched::{self, Roots, TouchedFile};
-use crate::track::{CachedTree, LiveSince};
+use crate::track::{CachedTree, FactsEpoch, FactsRead, LiveSince};
 pub use crate::track::{Inspected, Outbox, Tracked, Watched};
 use crate::tree::{self, ChangesScope, ChangesView, Node, TreeRow};
 
@@ -34,7 +37,7 @@ pub const INFO_TTL: Duration = Duration::from_secs(4);
 
 /// How long the prompt must be still before the model is asked.
 pub const NAMING_DEBOUNCE: Duration = Duration::from_millis(900);
-/// Prompts this short are named from their words; asking isn't worth it.
+/// Prompts this short are named from their words. Asking isn't worth it.
 const NAMING_MIN_WORDS: usize = 3;
 
 /// The sidebar panel `j`/`k` act on in NAV, and how far it has moved.
@@ -327,7 +330,7 @@ pub enum RowId {
 /// What the sidebar selection points at, by identity so it survives refreshes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Cursor {
-    /// A repo row; only exists in Overview.
+    /// A repo row. Only exists in Overview.
     Repo(RepoKey),
     /// An entry where its repo lists it, or a pin in the Pinned tab.
     Entry(SessionName),
@@ -421,7 +424,7 @@ pub enum Placement {
 }
 
 impl Row {
-    /// What selecting this row selects; group headers select nothing.
+    /// What selecting this row selects. Group headers select nothing.
     pub fn cursor(&self) -> Option<Cursor> {
         match self {
             Self::Header(_) | Self::Elsewhere(_) => None,
@@ -484,7 +487,7 @@ pub struct Ticket(u64);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Intent {
-    /// Show it in the pane; keys stay in the sidebar.
+    /// Show it in the pane. Keys stay in the sidebar.
     Preview,
     /// Show it and type into it, leaving any other window open.
     Activate,
@@ -664,7 +667,7 @@ pub enum Measure {
 /// What the answer to a size request means to a watch.
 pub enum Reply {
     Spawn(Observation),
-    Failed(String),
+    Failed(Cause),
     Ignore,
 }
 
@@ -696,7 +699,7 @@ impl Watch {
         }
     }
 
-    pub fn reply(&mut self, ticket: Ticket, result: Result<Observation, String>) -> Reply {
+    pub fn reply(&mut self, ticket: Ticket, result: Result<Observation, Cause>) -> Reply {
         match (&mut self.view, result) {
             (WatchView::Watching(t), Ok(found)) if *t == ticket => Reply::Spawn(found),
             (WatchView::Watching(t), Err(why)) if *t == ticket => Reply::Failed(why),
@@ -1049,17 +1052,21 @@ pub enum Enter {
     /// Start an exited agent again through `agent`, resuming its
     /// conversation.
     Restart(Startable),
-    /// Let zellij replay a session we don't own the checkout of.
+    /// Let the session host replay a session we don't own the checkout of.
     Resurrect,
     Start(Startable),
+    /// The session host can't take the agent's name.
+    Refused(NameError),
 }
 
 impl Enter {
-    pub fn verb(&self) -> &'static str {
+    /// What `⏎` says, or nothing when it can't do anything.
+    pub fn verb(&self) -> Option<&'static str> {
         match self {
-            Self::Attach => "attach",
-            Self::Restart(_) | Self::Resurrect => "resurrect",
-            Self::Start(_) => "start",
+            Self::Attach => Some("attach"),
+            Self::Restart(_) | Self::Resurrect => Some("resurrect"),
+            Self::Start(_) => Some("start"),
+            Self::Refused(_) => None,
         }
     }
 }
@@ -1186,7 +1193,6 @@ impl Proposal {
     }
 
     /// What `key` does, or the proposal back if it isn't on offer.
-    #[allow(clippy::result_large_err)]
     pub fn answer(self, key: char) -> Result<Answer, Self> {
         if key == self.primary().0 {
             return Ok(Answer::Remove(match self {
@@ -1239,7 +1245,7 @@ pub struct CommentDraft {
     pub lines: Vec<crate::review::LineInfo>,
     pub text: String,
     /// The commit the lines are from, when they aren't the checkout's.
-    pub rev: Option<String>,
+    pub rev: Option<crate::review::Rev>,
 }
 
 pub enum Overlay {
@@ -1258,7 +1264,7 @@ pub enum Overlay {
     },
     /// A comment being typed on lines of a diff, for an agent's draft review.
     Comment(CommentDraft),
-    /// Working out what removing `name` would lose; the confirmation
+    /// Working out what removing `name` would lose. The confirmation
     /// replaces this when the answer arrives.
     Planning {
         ticket: Ticket,
@@ -1569,7 +1575,7 @@ pub struct Model {
     pub view: View,
     pub pane: Pane,
     pub overlay: Overlay,
-    /// Most recently used first; no duplicates.
+    /// Most recently used first. No duplicates.
     mru: Vec<SessionName>,
     pub status: Option<Status>,
     pub preview_at: Option<Instant>,
@@ -1601,6 +1607,9 @@ pub struct Model {
     pub actions: Actions,
     pub keys: Keys,
     pub palette: Palette,
+    pub name_limit: NameLimit,
+    /// `$HOME`, read once at startup to abbreviate paths.
+    pub home: Option<PathBuf>,
     /// Repos found under `[repos] dirs`, by name, for the pickers to offer
     /// beyond the snapshot.
     pub catalogue: Vec<RepoRoot>,
@@ -1633,9 +1642,7 @@ pub struct Model {
     pub terminal: TerminalFocus,
     /// Which checkouts [1] lists.
     pub visibility: Visibility,
-    /// How many times any agent's git facts have been read, so a read's
-    /// generation never repeats across agents that come and go.
-    facts_reads: u64,
+    facts_reads: FactsEpoch,
     /// [0]'s diff: the cursor over its lines.
     pub diff_view: crate::review::DiffView,
     /// What the branch view opened in [0], until `Esc` goes back to it.
@@ -1648,9 +1655,6 @@ pub struct Model {
     /// What the main view [0] reads when it isn't the terminal.
     pub docs: Documents,
     pub screen: Screen,
-    /// Whether the sidebar was drawn last frame: not in the full screen
-    /// mode, nor below the width it needs.
-    pub sidebar_shown: bool,
 }
 
 impl Model {
@@ -1659,8 +1663,12 @@ impl Model {
         own_session: Option<SessionName>,
         harness: HarnessId,
         harness_label: String,
+        name_limit: NameLimit,
+        home: Option<PathBuf>,
     ) -> Self {
         Self {
+            name_limit,
+            home,
             load: Load::Pending,
             view: View::Overview,
             pane: Pane::Empty,
@@ -1702,14 +1710,13 @@ impl Model {
             elsewhere_due: None,
             terminal: TerminalFocus::Focused,
             visibility: Visibility::Active,
-            facts_reads: 0,
+            facts_reads: FactsEpoch::ORIGIN,
             diff_view: crate::review::DiffView::default(),
             opened: None,
             activity_files: None,
             peek: None,
             docs: Documents::default(),
             screen: Screen::Split,
-            sidebar_shown: true,
         }
     }
 
@@ -2119,9 +2126,9 @@ impl Model {
     }
 
     /// `name`'s git facts, or why they couldn't be read, as last read.
-    pub fn facts(&self, name: &SessionName) -> Option<Result<&WorktreeFacts, &String>> {
+    pub fn facts(&self, name: &SessionName) -> Option<Result<&WorktreeFacts, &Cause>> {
         let read = self.agents.get(name)?.facts.as_ref()?;
-        Some(read.as_ref().map(|i| &i.facts))
+        Some(read.result.as_ref().map(|i| &i.facts))
     }
 
     /// The comments drafted on diffs for `name`, until sent.
@@ -2143,16 +2150,15 @@ impl Model {
             .sum()
     }
 
-    /// Records `name`'s freshly read facts: the generation moves on, the
+    /// Records `name`'s freshly read facts: the epoch moves on, the
     /// closed folders that no longer exist are forgotten, and [3]'s cursor
     /// stays on the row it was on.
-    pub fn set_facts(&mut self, name: &SessionName, read: Result<Inspected, String>) {
+    pub fn set_facts(&mut self, name: &SessionName, read: Result<Inspected, Cause>) {
         let selected = self.selected_entry().is_some_and(|e| e.name() == name);
         let anchor = selected.then(|| self.changes_anchor()).flatten();
-        self.facts_reads += 1;
-        let generation = self.facts_reads;
+        self.facts_reads = self.facts_reads.next();
+        let epoch = self.facts_reads;
         let tracked = self.track(name);
-        tracked.generation = generation;
         match &read {
             Ok(read) => {
                 let mut existing = tree::folders(&read.facts.changed);
@@ -2161,7 +2167,10 @@ impl Model {
             }
             Err(_) => tracked.collapsed.clear(),
         }
-        tracked.facts = Some(read);
+        tracked.facts = Some(FactsRead {
+            epoch,
+            result: read,
+        });
         if let Some(anchor) = anchor {
             self.refresh_tree();
             self.restore_changes_anchor(&anchor);
@@ -2170,7 +2179,7 @@ impl Model {
 
     /// Facts as if they had been read, for tests that don't care how.
     #[cfg(test)]
-    pub fn set_test_facts(&mut self, name: &SessionName, facts: Result<WorktreeFacts, String>) {
+    pub fn set_test_facts(&mut self, name: &SessionName, facts: Result<WorktreeFacts, Cause>) {
         self.set_facts(name, facts.map(Inspected::of));
     }
 
@@ -2353,7 +2362,7 @@ impl Model {
     /// Where `name`'s checkout is, for telling paths in it from others.
     pub fn roots(&self, name: &SessionName) -> Option<Roots> {
         let (_, entry) = self.snapshot()?.entry(name)?;
-        let real = match self.tracked(name)?.facts.as_ref()? {
+        let real = match &self.tracked(name)?.facts.as_ref()?.result {
             Ok(read) => read.real_root.clone(),
             Err(_) => None,
         };
@@ -2369,7 +2378,7 @@ impl Model {
         let facts = tracked
             .facts
             .as_ref()
-            .and_then(|r| r.as_ref().ok())
+            .and_then(|r| r.result.as_ref().ok())
             .map(|i| &i.facts);
         let touched = touched::files(&detail.log, &roots, facts, &tracked.baseline);
         let running = self.activity_running(name);
@@ -2488,7 +2497,7 @@ impl Model {
         let row = file.min(self.change_rows().checked_sub(1)?);
         let root = entry.path()?.to_path_buf();
         let name = entry.name().clone();
-        let generation = self.tracked(&name).map_or(0, |t| t.generation);
+        let epoch = self.tracked(&name)?.facts.as_ref()?.epoch;
         if self.panel.in_main()
             && let Some(opened) = &self.opened
         {
@@ -2505,39 +2514,36 @@ impl Model {
                         state: *state,
                     }),
                     base: agent_core::ports::DiffBase::Head,
-                    generation,
+                    epoch,
                 }),
             };
             return Some((hover, root));
         }
         let folder = self.folder_under_cursor().map(|r| r.path);
-        let hover = match (row, self.change_at(row), self.facts(&name)) {
-            (_, None, _) if folder.is_none() && !self.branch_row() => return None,
-            (_, None, _) if folder.is_some() => {
-                let path = folder.unwrap_or_default();
-                Hover::Folder(FolderKey {
-                    files: self.folder_files(&path),
-                    base: self.changes_scope.diff_base(),
-                    name,
-                    path,
-                    generation,
-                })
-            }
-            (_, Some(change), _) => Hover::Diff(DiffKey {
+        let hover = match (self.change_at(row), folder, self.facts(&name)) {
+            (None, None, _) if !self.branch_row() => return None,
+            (None, Some(path), _) => Hover::Folder(FolderKey {
+                files: self.folder_files(&path),
+                base: self.changes_scope.diff_base(),
+                name,
+                path,
+                epoch,
+            }),
+            (Some(change), _, _) => Hover::Diff(DiffKey {
                 name,
                 change: change.clone(),
                 base: self.changes_scope.diff_base(),
-                generation,
+                epoch,
             }),
-            (_, None, Some(Ok(facts))) => Hover::Branch(BranchKey {
+            (None, None, Some(Ok(facts))) => Hover::Branch(BranchKey {
                 name,
                 ahead: facts.ahead,
                 behind: facts.behind,
                 dirty: facts.dirty(),
                 compared: facts.compared.clone(),
-                generation,
+                epoch,
             }),
-            (_, None, _) => return None,
+            (None, None, _) => return None,
         };
         Some((hover, root))
     }
@@ -2676,11 +2682,8 @@ impl Model {
         }
     }
 
-    /// Keeps where the sidebar's list is and whether it shows, which only
-    /// the screen's size and mode decide.
-    pub fn fit_sidebar(&mut self, list: Rect, shown: bool) {
+    pub fn fit_sidebar(&mut self, list: Rect) {
         self.areas.sidebar = list;
-        self.sidebar_shown = shown;
     }
 
     /// Brings what follows the cursor and the facts up to date, so a draw
@@ -2719,7 +2722,7 @@ impl Model {
             return;
         };
         let cached = CachedTree {
-            generation: tracked.generation,
+            epoch: tracked.facts.as_ref().map(|f| f.epoch),
             view: self.changes_view,
             scope: self.changes_scope,
             collapsed: tracked.collapsed.clone(),
@@ -2739,7 +2742,7 @@ impl Model {
             .get(name)
             .and_then(|t| Some((t, t.tree.as_ref()?)))
             .is_some_and(|(t, c)| {
-                c.generation == t.generation
+                c.epoch == t.facts.as_ref().map(|f| f.epoch)
                     && c.view == self.changes_view
                     && c.scope == self.changes_scope
                     && c.collapsed == t.collapsed
@@ -2763,7 +2766,7 @@ impl Model {
 
     pub fn status(&self, entry: &Entry) -> AgentStatus {
         match entry.state() {
-            EntryState::Idle(_) => return AgentStatus::NoSession,
+            EntryState::Idle(_) | EntryState::Unhostable(_) => return AgentStatus::NoSession,
             EntryState::Exited(_) => return AgentStatus::Exited,
             EntryState::Live => {}
         }
@@ -3114,6 +3117,7 @@ impl Model {
             EntryState::Exited(Revival::Restart(at)) => Enter::Restart(at),
             EntryState::Exited(Revival::Resurrect) => Enter::Resurrect,
             EntryState::Idle(at) => Enter::Start(at),
+            EntryState::Unhostable(why) => Enter::Refused(why),
         };
         Reach::Other {
             enter,
@@ -3473,6 +3477,8 @@ impl Model {
             &self.catalogue,
             self.own_session.as_ref(),
             &self.start_dir,
+            self.home.as_deref(),
+            self.name_limit,
         )
     }
 
@@ -3483,7 +3489,7 @@ impl Model {
             .is_some_and(|(_, e)| e.pin().is_some())
     }
 
-    /// Moves the cursor; repo rows only exist in Overview, so in Focus
+    /// Moves the cursor. Repo rows only exist in Overview, so in Focus
     /// those become the entry they stand for. In Overview an agent that
     /// needs you is listed only under Needs you, and a repo whose agents
     /// all need you has no row of its own. Pinned lists pins and the
@@ -3662,9 +3668,9 @@ impl Model {
         });
     }
 
-    pub fn error(&mut self, text: impl Into<String>) {
+    pub fn error(&mut self, text: impl std::fmt::Display) {
         self.status = Some(Status {
-            text: text.into(),
+            text: text.to_string(),
             kind: StatusKind::Error,
             at: self.clock.mono,
         });
@@ -3707,7 +3713,7 @@ impl Model {
     }
 }
 
-/// Case-insensitive subsequence match; returns matched byte offsets.
+/// Case-insensitive subsequence match. Returns matched byte offsets.
 pub fn fuzzy_match(query: &str, text: &str) -> Option<Vec<usize>> {
     let mut indices = Vec::new();
     let mut chars = text
@@ -3762,7 +3768,7 @@ pub enum RepoInput {
     Path(PathBuf),
     /// A typed path to nothing.
     Missing(PathBuf),
-    /// A search; the chosen match, if any.
+    /// A search. The chosen match, if any.
     Search(Option<RepoRoot>),
     /// `~user/...`, which isn't supported.
     Unsupported,
@@ -3809,12 +3815,13 @@ impl RepoInput {
 pub enum NameCheck {
     Empty,
     TooLong {
-        bytes: usize,
+        over: std::num::NonZeroUsize,
+        limit: usize,
     },
     Invalid(String),
     /// The session the TUI runs in.
     Own,
-    /// A repo's main checkout without a session; start it from the list.
+    /// A repo's main checkout without a session. Start it from the list.
     MainCheckout {
         repo: String,
     },
@@ -3838,15 +3845,18 @@ pub enum NameCheck {
 }
 
 impl NameCheck {
-    fn of(text: &str, snapshot: Option<&Snapshot>, own: Option<&SessionName>) -> Self {
+    fn of(
+        text: &str,
+        limit: NameLimit,
+        snapshot: Option<&Snapshot>,
+        own: Option<&SessionName>,
+    ) -> Self {
         use agent_core::model::EntryKind;
-        use agent_core::names::NameError;
         if text.is_empty() {
             return Self::Empty;
         }
         let name = match text.parse::<AgentName>() {
             Ok(name) => name,
-            Err(NameError::TooLong { len, .. }) => return Self::TooLong { bytes: len },
             Err(NameError::Reserved(_)) => return Self::Invalid(format!("'{text}' is reserved")),
             Err(_) => {
                 let bad = invalid_chars(text)
@@ -3856,11 +3866,18 @@ impl NameCheck {
                 return Self::Invalid(format!("'{bad}' not allowed: letters, digits, . - _"));
             }
         };
-        let session = name.session();
-        if own == Some(&session) {
+        let host = match limit.admit(name.session()) {
+            Ok(host) => host,
+            Err(NameError::TooLong { over, limit, .. }) => {
+                return Self::TooLong { over, limit };
+            }
+            Err(other) => return Self::Invalid(other.to_string()),
+        };
+        let session = host.session();
+        if own == Some(session) {
             return Self::Own;
         }
-        let Some((repo, entry)) = snapshot.and_then(|s| s.entry(&session)) else {
+        let Some((repo, entry)) = snapshot.and_then(|s| s.entry(session)) else {
             return Self::Free(name);
         };
         let repo = repo.name().into_owned();
@@ -3874,6 +3891,7 @@ impl NameCheck {
             (_, EntryState::Exited(Revival::Restart(_)) | EntryState::Idle(_)) => {
                 Self::MainCheckout { repo }
             }
+            (_, EntryState::Unhostable(why)) => Self::Invalid(why.to_string()),
         }
     }
 }
@@ -4115,11 +4133,22 @@ pub struct NameSuggestion {
     pub source: NameSource,
 }
 
+/// Which edit of the new-agent prompt a name suggestion answers, so a reply
+/// to an older edit is dropped.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PromptEdit(u64);
+
+impl PromptEdit {
+    pub fn next(self) -> Self {
+        Self(self.0 + 1)
+    }
+}
+
 /// Asking the harness's model for a name, debounced while the prompt is
-/// being typed. `generation` identifies the prompt edit a reply belongs to.
+/// being typed. `edit` identifies the prompt edit a reply belongs to.
 #[derive(Debug, Clone, Default)]
 pub struct Naming {
-    pub generation: u64,
+    pub edit: PromptEdit,
     pub state: NamingState,
 }
 
@@ -4146,7 +4175,7 @@ pub enum FormKind {
     Checkout,
 }
 
-/// The new-agent form. `name` is what the user typed; when it's empty the
+/// The new-agent form. `name` is what the user typed. When it's empty the
 /// suggestion is used. `suggestion`, `check` and `repo_input` are derived
 /// from the fields and the snapshot, and refreshed whenever either changes.
 /// For a checkout, `task` holds the branch or pull request link.
@@ -4158,7 +4187,7 @@ pub struct NewAgent {
     pub repo: Query,
     pub default_repo: Option<RepoRoot>,
     pub focus: Field,
-    pub error: Option<String>,
+    pub error: Option<Cause>,
     pub naming: Naming,
     pub dir: DirCheck,
     pub phase: Phase,
@@ -4231,9 +4260,9 @@ impl NewAgent {
 
     /// The prompt changed: drop any model answer for the old one and, if
     /// the prompt is prose worth naming, ask again once typing pauses.
-    pub fn prompt_changed(&mut self, now: Instant) {
-        self.naming.generation += 1;
-        let source = agent_core::naming::suggest(&self.task).map(|s| s.source);
+    pub fn prompt_changed(&mut self, now: Instant, limit: NameLimit) {
+        self.naming.edit = self.naming.edit.next();
+        let source = agent_core::naming::suggest(&self.task, limit).map(|s| s.source);
         let words = self.task.split_whitespace().count();
         self.naming.state = match (self.kind, source) {
             (FormKind::Checkout, _) | (_, Some(agent_core::naming::Source::Link)) => {
@@ -4244,10 +4273,10 @@ impl NewAgent {
         };
     }
 
-    /// The model replied for `generation`; kept only if the prompt hasn't
+    /// The model replied for `edit`. Kept only if the prompt hasn't
     /// changed since.
-    pub fn model_named(&mut self, generation: u64, name: Option<AgentName>) {
-        if generation != self.naming.generation {
+    pub fn model_named(&mut self, edit: PromptEdit, name: Option<AgentName>) {
+        if edit != self.naming.edit {
             return;
         }
         self.naming.state = match name {
@@ -4265,6 +4294,8 @@ impl NewAgent {
         catalogue: &[RepoRoot],
         own: Option<&SessionName>,
         start_dir: &Path,
+        home: Option<&Path>,
+        limit: NameLimit,
     ) -> Derived {
         use agent_core::naming::{Source, for_checkout, suggest};
         let target = self.task.trim().parse::<Checkout>().ok();
@@ -4274,13 +4305,13 @@ impl NewAgent {
                     Checkout::Branch(_) => NameSource::Branch,
                     Checkout::PullRequest(_) => NameSource::Link,
                 };
-                for_checkout(target).map(|name| NameSuggestion {
+                for_checkout(target, limit).map(|name| NameSuggestion {
                     name: name.to_string(),
                     source,
                 })
             }),
             FormKind::New => {
-                let local = suggest(&self.task);
+                let local = suggest(&self.task, limit);
                 let answer = match &self.naming.state {
                     NamingState::Answered { prompt, name } if *prompt == self.task => Some(name),
                     _ => None,
@@ -4294,7 +4325,7 @@ impl NewAgent {
                     (None, None) => None,
                 }
                 .map(|(name, source)| NameSuggestion {
-                    name: free_name(&name, snapshot, own),
+                    name: free_name(&name, limit, snapshot, own),
                     source,
                 })
             }
@@ -4303,8 +4334,8 @@ impl NewAgent {
             ("", Some(suggestion)) => suggestion.name.clone(),
             (typed, _) => typed.to_string(),
         };
-        let check = NameCheck::of(&name, snapshot, own);
-        let mut repo_input = self.parse_repo(snapshot, catalogue, start_dir);
+        let check = NameCheck::of(&name, limit, snapshot, own);
+        let mut repo_input = self.parse_repo(snapshot, catalogue, start_dir, home);
         // A pull request link names its repo, which wins over the selected
         // one while nothing is typed and exactly one repo has that name.
         if let (FormKind::Checkout, RepoInput::Default(_)) = (self.kind, &repo_input)
@@ -4338,12 +4369,13 @@ impl NewAgent {
         snapshot: Option<&Snapshot>,
         catalogue: &[RepoRoot],
         start_dir: &Path,
+        home: Option<&Path>,
     ) -> RepoInput {
         let text = self.repo.text.trim();
         if text.is_empty() {
             return RepoInput::Default(self.default_repo.clone());
         }
-        match typed_path(text, start_dir) {
+        match typed_path(text, start_dir, home) {
             Some(Typed::Path(path)) => RepoInput::typed(path, &self.dir),
             Some(Typed::Unsupported | Typed::NoHome) => RepoInput::Unsupported,
             None => {
@@ -4371,7 +4403,12 @@ pub fn completes(name: &str, typed: &str) -> Option<String> {
 }
 
 /// `base`, or `base-2`, `base-3`… (trimmed to fit) if `base` is taken.
-fn free_name(base: &AgentName, snapshot: Option<&Snapshot>, own: Option<&SessionName>) -> String {
+fn free_name(
+    base: &AgentName,
+    limit: NameLimit,
+    snapshot: Option<&Snapshot>,
+    own: Option<&SessionName>,
+) -> String {
     let taken = |name: &str| {
         name.parse::<SessionName>()
             .is_ok_and(|s| own == Some(&s) || snapshot.is_some_and(|snap| snap.entry(&s).is_some()))
@@ -4382,10 +4419,8 @@ fn free_name(base: &AgentName, snapshot: Option<&Snapshot>, own: Option<&Session
     (2..100)
         .map(|n| {
             let suffix = format!("-{n}");
-            let stem = &base.as_str()[..base
-                .as_str()
-                .len()
-                .min(agent_core::names::MAX_SESSION_LEN - suffix.len())];
+            let room = limit.bytes().saturating_sub(suffix.len());
+            let stem = &base.as_str()[..base.as_str().len().min(room)];
             format!("{}{suffix}", stem.trim_end_matches(['-', '.', '_']))
         })
         .find(|candidate| !taken(candidate))
@@ -4496,7 +4531,7 @@ impl Model {
     pub fn set_log(
         &mut self,
         key: SubagentKey,
-        log: Result<Option<agent_core::ports::Log>, String>,
+        log: Result<Option<agent_core::ports::Log>, Cause>,
     ) {
         self.track(&key.0)
             .subagents
@@ -4510,7 +4545,7 @@ impl Model {
     pub fn set_activity(
         &mut self,
         name: &SessionName,
-        detail: Result<Option<ActivityDetail>, String>,
+        detail: Result<Option<ActivityDetail>, Cause>,
     ) {
         self.track(name).activity_view.watch.log = Some(detail);
     }
@@ -4528,6 +4563,14 @@ impl Model {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_limit_shorter_than_the_numbered_suffix_gives_a_name_instead_of_panicking() {
+        let taken: SessionName = "ab".parse().expect("parses");
+        let limit = NameLimit::new(std::num::NonZeroUsize::new(1).expect("nonzero"));
+        let name = free_name(&"ab".parse().expect("parses"), limit, None, Some(&taken));
+        assert_eq!(name, "-2");
+    }
 
     #[test]
     fn repos_nearest_the_selection_stay_open_while_they_fit() {

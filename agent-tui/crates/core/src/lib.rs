@@ -9,6 +9,6 @@ pub mod ops;
 pub mod paths;
 pub mod ports;
 pub mod process;
-#[cfg(test)]
-mod testing;
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
 pub mod theme;

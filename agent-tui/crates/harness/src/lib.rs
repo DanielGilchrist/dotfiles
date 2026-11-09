@@ -53,7 +53,7 @@ const TAIL_BYTES_MAX: u64 = 8 * 1024 * 1024;
 const HEAD_BYTES: u64 = 256 * 1024;
 
 /// Variables an agent inherits when spawned from inside another Claude Code
-/// session; they make Claude treat it as a child and stop writing its
+/// session. They make Claude treat it as a child and stop writing its
 /// transcript, which breaks resuming.
 const INHERITED_SESSION_ENV: &[&str] = &[
     "CLAUDE_CODE_CHILD_SESSION",
@@ -452,7 +452,7 @@ impl Harness for Claude {
         }
     }
 
-    /// Bracketed paste keeps a multi-line prompt as one message; Enter submits it.
+    /// Bracketed paste keeps a multi-line prompt as one message. Enter submits it.
     fn submit(&self, prompt: &Prompt) -> Vec<u8> {
         format!("\x1b[200~{prompt}\x1b[201~\r").into_bytes()
     }

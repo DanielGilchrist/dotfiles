@@ -1,6 +1,7 @@
 //! In-memory ports for exercising use cases without git, zellij or a disk store.
 
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -8,7 +9,7 @@ use std::time::SystemTime;
 
 use crate::activity::{Activity, Going, Reported, Stopped, TranscriptRef};
 use crate::model::{Head, Running, Worktree};
-use crate::names::{BranchName, Prompt, PullRequest, SessionName};
+use crate::names::{BranchName, HostName, NameLimit, Prompt, PullRequest, SessionName};
 use crate::paths::{AgentWorktree, RepoRoot};
 use crate::ports::{
     AgentRecord, BranchLog, BranchState, Change, Checkout, ClientControl, Compared, DiffBase,
@@ -278,7 +279,13 @@ pub struct FakeHost {
     pub written: Mutex<Vec<(SessionName, Vec<u8>)>>,
 }
 
+pub const NAME_LIMIT: NameLimit = NameLimit::new(NonZeroUsize::new(20).expect("nonzero"));
+
 impl SessionHost for FakeHost {
+    fn name_limit(&self) -> NameLimit {
+        NAME_LIMIT
+    }
+
     fn sessions(&self) -> Result<Vec<SessionInfo>, HostError> {
         Ok(self.sessions.lock().expect("lock").clone())
     }
@@ -295,7 +302,9 @@ impl SessionHost for FakeHost {
         })
     }
 
-    fn create(&self, name: &SessionName, pane: &PaneCommand) -> Result<LaunchSpec, HostError> {
+    fn create(&self, name: &HostName, pane: &PaneCommand) -> Result<LaunchSpec, HostError> {
+        name.within(NAME_LIMIT)?;
+        let name = name.session();
         self.created
             .lock()
             .expect("succeeds")
@@ -472,8 +481,8 @@ impl Store for MemStore {
     }
 }
 
-/// Launches `fake [bootstrap]`; submits a prompt followed by a carriage
-/// return; reports activity when told to.
+/// Launches `fake [bootstrap]`. Submits a prompt followed by a carriage
+/// return. Reports activity when told to.
 pub struct FakeHarness {
     id: HarnessId,
     pub active: AtomicBool,

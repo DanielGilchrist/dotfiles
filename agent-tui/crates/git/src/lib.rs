@@ -65,7 +65,7 @@ fn parse_pull_request_head(line: &str) -> Result<PullRequestHead, String> {
     })
 }
 
-/// Whether the user has their own ssh command for git; if not, ours runs ssh
+/// Whether the user has their own ssh command for git. If not, ours runs ssh
 /// in batch mode so a passphrase prompt can't draw over the TUI.
 fn custom_ssh() -> bool {
     static CUSTOM: OnceLock<bool> = OnceLock::new();

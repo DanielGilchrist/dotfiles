@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::activity::{Activity, AgentId, Going, Reported, Stopped, ToolId, TranscriptRef};
 use crate::model::{Head, Presence, Running, Worktree};
-use crate::names::{BranchName, NameError, Prompt, PullRequest, SessionName};
+use crate::names::{BranchName, HostName, NameError, NameLimit, Prompt, PullRequest, SessionName};
 use crate::paths::{AgentWorktree, RepoRoot};
 use crate::process::{CommandError, LaunchSpec};
 
@@ -625,7 +625,7 @@ impl SessionStatus {
     }
 }
 
-/// A terminal client attached to a session (a process id for zellij).
+/// A terminal client attached to a session, by its process id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ClientId(u32);
 
@@ -657,6 +657,8 @@ pub enum HostError {
     },
     #[error("couldn't detach client {client}: {reason}")]
     Detach { client: ClientId, reason: String },
+    #[error(transparent)]
+    Name(#[from] NameError),
 }
 
 /// A terminal application, by the short name it goes by (`wezterm`, `iTerm`).
@@ -725,8 +727,9 @@ pub struct Observation {
     pub rows: NonZeroU16,
 }
 
-/// Where agent sessions persist (zellij today).
 pub trait SessionHost: Send + Sync {
+    /// What the host accepts as a session name.
+    fn name_limit(&self) -> NameLimit;
     fn sessions(&self) -> Result<Vec<SessionInfo>, HostError>;
     /// Attach to an existing (live or resurrectable) session in the foreground.
     fn attach(&self, name: &SessionName) -> LaunchSpec;
@@ -734,11 +737,11 @@ pub trait SessionHost: Send + Sync {
     fn observe(&self, name: &SessionName) -> Result<Observation, HostError>;
     /// Create `name` running `pane`, replacing a dead session of the same
     /// name, and attach in the foreground.
-    fn create(&self, name: &SessionName, pane: &PaneCommand) -> Result<LaunchSpec, HostError>;
-    /// Run `name` with no client attached. A live session is left alone;
-    /// otherwise it starts with the pane its last `create` set up.
+    fn create(&self, name: &HostName, pane: &PaneCommand) -> Result<LaunchSpec, HostError>;
+    /// Run `name` with no client attached. A live session is left alone.
+    /// Otherwise it starts with the pane its last `create` set up.
     fn start_detached(&self, name: &SessionName) -> Result<(), HostError>;
-    /// Stop a session; it can be resurrected later.
+    /// Stop a session. It can be resurrected later.
     fn kill(&self, session: &Running) -> Result<(), HostError>;
     /// Stop a session and forget it.
     fn delete(&self, name: &SessionName) -> Result<(), HostError>;
@@ -818,7 +821,7 @@ pub trait Harness: Send + Sync {
     /// A short human name, e.g. "claude".
     fn label(&self) -> &'static str;
     /// Resume the worktree's conversation if there is one, otherwise start
-    /// fresh; either way `bootstrap`, if any, is sent as the next prompt.
+    /// fresh. Either way `bootstrap`, if any, is sent as the next prompt.
     fn launch(&self, ctx: &LaunchCtx<'_>) -> Result<LaunchSpec, HarnessError>;
     /// What a hook payload reported through `agent event` means, if it's
     /// anything the TUI shows.
@@ -1228,7 +1231,7 @@ pub enum StoreError {
 pub trait Store: Send + Sync {
     /// Pinned sessions in pin order.
     fn pinned(&self) -> Result<Vec<SessionName>, StoreError>;
-    /// Pins `name` last; already pinned is fine.
+    /// Pins `name` last. Already pinned is fine.
     fn pin(&self, name: &SessionName) -> Result<(), StoreError>;
     /// Unpinned already is fine.
     fn unpin(&self, name: &SessionName) -> Result<(), StoreError>;

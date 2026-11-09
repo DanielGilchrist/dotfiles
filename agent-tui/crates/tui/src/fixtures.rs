@@ -290,6 +290,17 @@ fn fleet_facts(k: usize) -> WorktreeFacts {
 }
 
 /// A worktree with nothing changed, on a detached checkout with no base.
+pub fn model(start_dir: &str) -> Model {
+    Model::new(
+        start_dir.into(),
+        None,
+        "claude".parse().expect("parses"),
+        "claude".into(),
+        agent_core::testing::NAME_LIMIT,
+        None,
+    )
+}
+
 pub fn unchanged() -> WorktreeFacts {
     WorktreeFacts::unchanged(Compared::NoBase {
         checkout: Checkout::Detached("abc1234".into()),
@@ -376,19 +387,15 @@ pub fn fleet(n: usize) -> Model {
         &observation,
         &Layout::new("/w".into()).expect("absolute"),
         &pins,
+        agent_core::testing::NAME_LIMIT,
     )
     .0;
-    let mut m = Model::new(
-        "/elsewhere".into(),
-        None,
-        "claude".parse().expect("parses"),
-        "claude".into(),
-    );
+    let mut m = model("/elsewhere");
     m.view = crate::model::View::Focus;
     update(&mut m, Msg::Snapshot(Ok((snapshot, Vec::new()))));
     m.activities = Some(activities);
     for (name, facts) in facts_of {
-        m.track(&name).facts = Some(facts.map(crate::model::Inspected::of));
+        m.set_facts(&name, facts.map(crate::model::Inspected::of));
     }
     m.revalidate();
     m.changes_view = crate::tree::ChangesView::Flat;

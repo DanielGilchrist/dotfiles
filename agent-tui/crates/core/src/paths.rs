@@ -30,15 +30,15 @@ pub enum Typed {
 
 /// `text` as a path when it starts like one, with `~` as the home
 /// directory and `.` or `..` relative to `base`. Anything else is a name.
-pub fn typed_path(text: &str, base: &Path) -> Option<Typed> {
+pub fn typed_path(text: &str, base: &Path, home: Option<&Path>) -> Option<Typed> {
     let text = text.trim();
     if let Some(rest) = text.strip_prefix('~') {
         if !(rest.is_empty() || rest.starts_with('/')) {
             return Some(Typed::Unsupported);
         }
-        return Some(match home() {
-            Ok(home) => Typed::Path(home.join(rest.trim_start_matches('/'))),
-            Err(_) => Typed::NoHome,
+        return Some(match home {
+            Some(home) => Typed::Path(home.join(rest.trim_start_matches('/'))),
+            None => Typed::NoHome,
         });
     }
     if text.starts_with('/') {
@@ -310,7 +310,7 @@ impl Layout {
     }
 }
 
-/// A path inside [`Layout::trash`]; only the layout constructs these.
+/// A path inside [`Layout::trash`]. Only the layout constructs these.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrashSlot(PathBuf);
 
@@ -428,17 +428,26 @@ mod tests {
         let home = home().expect("HOME");
         let base = Path::new("/w/api/fix");
         assert_eq!(
-            typed_path("~/code", base),
+            typed_path("~/code", base, Some(&home)),
             Some(Typed::Path(home.join("code")))
         );
-        assert_eq!(typed_path("~", base), Some(Typed::Path(home.clone())));
-        assert_eq!(typed_path("~bob/x", base), Some(Typed::Unsupported));
         assert_eq!(
-            typed_path("../other", base),
+            typed_path("~", base, Some(&home)),
+            Some(Typed::Path(home.clone()))
+        );
+        assert_eq!(
+            typed_path("~bob/x", base, Some(&home)),
+            Some(Typed::Unsupported)
+        );
+        assert_eq!(
+            typed_path("../other", base, Some(&home)),
             Some(Typed::Path(base.join("../other")))
         );
-        assert_eq!(typed_path("/srv", base), Some(Typed::Path("/srv".into())));
-        assert_eq!(typed_path("api", base), None);
+        assert_eq!(
+            typed_path("/srv", base, Some(&home)),
+            Some(Typed::Path("/srv".into()))
+        );
+        assert_eq!(typed_path("api", base, Some(&home)), None);
     }
 
     #[test]
