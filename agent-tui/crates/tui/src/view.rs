@@ -378,7 +378,7 @@ pub fn draw(frame: &mut Frame<'_>, m: &Model) -> Drawn {
         Overlay::Confirm(confirm) => draw_confirm(frame, confirm),
         Overlay::Help(help) => drawn.overlay_offset = Some(draw_help(frame, m, help)),
         Overlay::Actions(target) => draw_actions(frame, m, target),
-        Overlay::Talk { to, text } => draw_talk(frame, m, to, text),
+        Overlay::Talk { to, quote, text } => draw_talk(frame, m, to, quote.as_ref(), text),
         Overlay::Comment(draft) => {
             draw_comment(
                 frame,
@@ -1715,7 +1715,13 @@ fn draw_actions(frame: &mut Frame<'_>, m: &Model, target: &SessionName) {
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
-fn draw_talk(frame: &mut Frame<'_>, m: &Model, to: &SessionName, text: &str) {
+fn draw_talk(
+    frame: &mut Frame<'_>,
+    m: &Model,
+    to: &SessionName,
+    quote: Option<&crate::log::Quote>,
+    text: &str,
+) {
     let draft = m.draft(to);
     let queued: Vec<&str> = m
         .tracked(to)
@@ -1728,15 +1734,16 @@ fn draw_talk(frame: &mut Frame<'_>, m: &Model, to: &SessionName, text: &str) {
         3 + shown
             + usize::from(queued.len() > shown)
             + drafted
-            + usize::from(draft.len() > drafted),
+            + usize::from(draft.len() > drafted)
+            + usize::from(quote.is_some()),
     )
     .unwrap_or(3);
     let area = centred(frame, 72, height);
     clear_around(frame, area);
-    let (what, verb) = if draft.is_empty() {
-        ("Send", "send")
-    } else {
-        ("Send review", "send review")
+    let (what, verb) = match (draft.is_empty(), quote) {
+        (false, _) => ("Send review", "send review"),
+        (true, Some(_)) => ("Reply", "send"),
+        (true, None) => ("Send", "send"),
     };
     let (title, verb) = match m.hold(to) {
         None => (format!("{what} to {to}"), verb),
@@ -1788,12 +1795,29 @@ fn draw_talk(frame: &mut Frame<'_>, m: &Model, to: &SessionName, text: &str) {
             dim(),
         ));
     }
-    lines.push(Line::from(vec![
-        Span::styled(" › ", accent()),
-        Span::raw(truncate_start(text, room)),
-        Span::styled("█", dim()),
-    ]));
-    frame.render_widget(Paragraph::new(lines), inner);
+    if let Some(quote) = quote {
+        lines.push(Line::styled(
+            format!(
+                " > {}",
+                truncate_end(quote.as_str(), room.saturating_sub(2))
+            ),
+            dim(),
+        ));
+    }
+    let [above, input] =
+        Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(inner);
+    let hidden = u16::try_from(lines.len())
+        .unwrap_or(u16::MAX)
+        .saturating_sub(above.height);
+    frame.render_widget(Paragraph::new(lines).scroll((hidden, 0)), above);
+    frame.render_widget(
+        Line::from(vec![
+            Span::styled(" › ", accent()),
+            Span::raw(truncate_start(text, room)),
+            Span::styled("█", dim()),
+        ]),
+        input,
+    );
 }
 
 /// The box that takes a comment on lines of a diff: the quoted lines DIM,

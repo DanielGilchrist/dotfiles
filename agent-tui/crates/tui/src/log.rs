@@ -14,6 +14,7 @@ use agent_core::ports::{
 };
 
 use agent_core::activity::{AgentId, TranscriptRef};
+use agent_core::names::{CarriageReturn, clean};
 
 use crate::touched::{Now, Roots, TouchedFile};
 
@@ -188,6 +189,53 @@ enum Piece<'a> {
     },
 }
 
+/// Splits `log` into its pieces. This is the one definition of a phase: a
+/// stretch starts at a message, or at the first call after the start of the
+/// log or after a queued message or a compaction.
+fn pieces(log: &[LogEntry]) -> Vec<Piece<'_>> {
+    let mut pieces: Vec<Piece<'_>> = Vec::new();
+    for (entry, at) in indexed(log) {
+        match &log[at] {
+            LogEntry::Queued { .. } | LogEntry::Compacted => pieces.push(Piece::Loose(entry, at)),
+            LogEntry::Said { .. } => pieces.push(Piece::Stretch {
+                entries: vec![(entry, at)],
+                from: at,
+                to: at + 1,
+            }),
+            LogEntry::Called(_) => match pieces.last_mut() {
+                Some(Piece::Stretch { entries, to, .. }) => {
+                    *to = at + entry.calls().len();
+                    entries.push((entry, at));
+                }
+                _ => pieces.push(Piece::Stretch {
+                    to: at + entry.calls().len(),
+                    from: at,
+                    entries: vec![(entry, at)],
+                }),
+            },
+        }
+    }
+    pieces
+}
+
+/// Where in `entries` each phase of `log` starts, in order: the entry that
+/// stands for the phase's first log entry, folded or not.
+pub fn phase_positions(log: &[LogEntry], entries: &[(Entry<'_>, EntryKey)]) -> Vec<usize> {
+    let starts: HashSet<usize> = pieces(log)
+        .iter()
+        .filter_map(|piece| match piece {
+            Piece::Stretch { from, .. } => Some(*from),
+            Piece::Loose(..) => None,
+        })
+        .collect();
+    entries
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, key))| matches!(key, EntryKey::Log(at) if starts.contains(at)))
+        .map(|(position, _)| position)
+        .collect()
+}
+
 pub fn time_of(entry: &LogEntry) -> Option<SystemTime> {
     match entry {
         LogEntry::Said { at, .. } | LogEntry::Queued { at, .. } => *at,
@@ -254,29 +302,8 @@ pub fn activity_entries<'a>(
         }
         _ => &detail.log[..],
     };
-    let mut pieces: Vec<Piece<'a>> = Vec::new();
+    let pieces = pieces(log);
     let mut out = Vec::new();
-    for (entry, at) in indexed(log) {
-        match &log[at] {
-            LogEntry::Queued { .. } | LogEntry::Compacted => pieces.push(Piece::Loose(entry, at)),
-            LogEntry::Said { .. } => pieces.push(Piece::Stretch {
-                entries: vec![(entry, at)],
-                from: at,
-                to: at + 1,
-            }),
-            LogEntry::Called(_) => match pieces.last_mut() {
-                Some(Piece::Stretch { entries, to, .. }) => {
-                    *to = at + entry.calls().len();
-                    entries.push((entry, at));
-                }
-                _ => pieces.push(Piece::Stretch {
-                    to: at + entry.calls().len(),
-                    from: at,
-                    entries: vec![(entry, at)],
-                }),
-            },
-        }
-    }
     let latest = pieces
         .iter()
         .rposition(|p| matches!(p, Piece::Stretch { .. }));
@@ -440,6 +467,135 @@ pub fn failing(detail: &Log) -> Option<String> {
         .then(|| format!("{failed} of the last {WINDOW} calls failed"))
 }
 
+/// The first line of `text` with something on it, trimmed.
+pub fn first_line(text: &str) -> Option<&str> {
+    text.split(['\n', '\r'])
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+}
+
+/// A call as one plain line: its tool and what it is aimed at.
+pub fn call_line(call: &Call) -> String {
+    format!("{} {}", call.tool, target_text(&call.target))
+        .trim_end()
+        .to_string()
+}
+
+impl Phase<'_> {
+    /// What the folded row starts with: the first thing the agent said in
+    /// it, else its first call.
+    pub fn heading(&self) -> Option<String> {
+        self.entries
+            .iter()
+            .find_map(|entry| match entry {
+                Entry::Said(text) => first_line(text).map(str::to_string),
+                _ => None,
+            })
+            .or_else(|| {
+                self.entries
+                    .iter()
+                    .flat_map(Entry::calls)
+                    .next()
+                    .map(call_line)
+            })
+    }
+}
+
+impl Entry<'_> {
+    /// The entry as one line, the way its row starts.
+    fn head(&self) -> Option<String> {
+        match self {
+            Self::Prompt(text) | Self::Said(text) | Self::Queued(text) => {
+                first_line(text).map(str::to_string)
+            }
+            Self::Compacted => Some("compacted".to_string()),
+            Self::Call(call) => Some(call_line(call)),
+            Self::Group { tool, calls } => Some(format!("{tool} ×{}", calls.len())),
+            Self::Repeat(calls) => calls.last().map(|call| call_line(call)),
+            Self::Phase(phase) => phase.heading(),
+            Self::Touched(file) => Some(file.path.to_string_lossy().into_owned()),
+        }
+    }
+}
+
+/// Who an entry was said or done by, so a quote can name a subagent.
+#[derive(Debug, Clone, Copy)]
+pub enum Whose<'a> {
+    Activity,
+    Subagent(Option<&'a str>),
+}
+
+/// What a reply answers: one line of a log entry. Only [`Quote::of`] makes
+/// one, so it holds a single line with no control characters.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Quote(String);
+
+impl Quote {
+    pub fn of(entry: &Entry<'_>, whose: Whose<'_>) -> Option<Self> {
+        let line = scrub(&entry.head()?);
+        if line.is_empty() {
+            return None;
+        }
+        Some(Self(match whose {
+            Whose::Activity => line,
+            Whose::Subagent(title) => match title.and_then(first_line).map(scrub) {
+                Some(title) => format!("(subagent {title}) {line}"),
+                None => format!("(subagent) {line}"),
+            },
+        }))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// `message` under the quote, which is marked as one.
+    pub fn before(&self, message: &str) -> String {
+        format!("> {}\n\n{message}", self.0)
+    }
+}
+
+/// `text` without terminal escape sequences: CSI up to its final byte, OSC
+/// up to a bell or a string terminator. A lone escape character is left to
+/// [`clean`].
+fn strip_escapes(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match (c, chars.peek()) {
+            ('\x1b', Some('[')) => {
+                chars.next();
+                for follower in chars.by_ref() {
+                    if ('@'..='~').contains(&follower) {
+                        break;
+                    }
+                }
+            }
+            ('\x1b', Some(']')) => {
+                chars.next();
+                while let Some(follower) = chars.next() {
+                    if follower == '\x07'
+                        || (follower == '\x1b' && chars.next_if_eq(&'\\').is_some())
+                    {
+                        break;
+                    }
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// `text` on one row: no escape sequences, no control characters, tabs as
+/// spaces.
+fn scrub(text: &str) -> String {
+    clean(&strip_escapes(text), CarriageReturn::Drop, None)
+        .replace('\t', " ")
+        .trim()
+        .to_string()
+}
+
 /// The cursor and what is expanded, for one log.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Nav {
@@ -511,7 +667,7 @@ fn fenced(text: &str) -> String {
 fn entry_markdown(entry: &Entry<'_>) -> String {
     let mut text = String::new();
     let single = |text: &mut String, call: &Call| {
-        let _ = write!(text, "### {} {}\n\n", call.tool, target_text(&call.target));
+        let _ = write!(text, "### {}\n\n", call_line(call));
         let _ = write!(text, "{}\n\n", fenced(&call.input));
         if !call.output.is_empty() {
             let _ = write!(text, "Result:\n\n{}\n\n", fenced(&call.output));
@@ -1338,6 +1494,177 @@ mod tests {
         assert_eq!(
             shapes(&activity_entries(&detail.log, None, &[])),
             ["prompt@0", "phase@0", "queued@2", "compacted@3", "call@4"]
+        );
+    }
+
+    fn at_positions(detail: &Log, closing: Option<&str>, touched: &[TouchedFile]) -> Vec<EntryKey> {
+        let entries = activity_entries(detail, closing, touched).flat();
+        phase_positions(&detail.log, &entries)
+            .into_iter()
+            .map(|p| entries[p].1.clone())
+            .collect()
+    }
+
+    #[test]
+    fn a_call_after_a_queued_message_starts_a_phase_and_the_queued_message_does_not() {
+        let detail = activity_of(vec![
+            said("one"),
+            bash("a", ok()),
+            LogEntry::Queued {
+                text: "also".into(),
+                at: None,
+            },
+            bash("b", ok()),
+            said("two"),
+            bash("c", ok()),
+        ])
+        .log;
+        assert_eq!(
+            at_positions(&detail, None, &[]),
+            [EntryKey::Log(0), EntryKey::Log(3), EntryKey::Log(4)]
+        );
+    }
+
+    #[test]
+    fn phase_starts_ignore_compactions_groups_touched_files_and_a_closing_report() {
+        let file = TouchedFile {
+            path: "a.rs".into(),
+            now: Now::Unknown,
+        };
+        let detail = activity_of(vec![
+            said("one"),
+            read("a"),
+            read("b"),
+            read("c"),
+            LogEntry::Compacted,
+            read("d"),
+            said("two"),
+            bash("e", ok()),
+            said("all done"),
+        ])
+        .log;
+        let touched = [file];
+        let at = at_positions(&detail, Some("all done"), &touched);
+        assert_eq!(
+            at,
+            [EntryKey::Log(0), EntryKey::Log(5), EntryKey::Log(6)],
+            "the group is one entry inside the first phase, the call after the compaction starts one, and the report is no phase"
+        );
+        let found = activity_entries(&detail, Some("all done"), &touched).flat();
+        let positions = phase_positions(&detail.log, &found);
+        assert!(
+            positions.iter().all(|&p| p >= 2),
+            "positions count the prompt and the touched file before the log: {positions:?}"
+        );
+    }
+
+    #[test]
+    fn a_folded_phase_always_starts_where_a_phase_does() {
+        let detail = activity_of(vec![
+            said("one"),
+            bash("a", ok()),
+            LogEntry::Compacted,
+            bash("b", ok()),
+            said("two"),
+            bash("c", ok()),
+            said("three"),
+        ])
+        .log;
+        let starts = at_positions(&detail, None, &[]);
+        let entries = activity_entries(&detail, None, &[]).flat();
+        for (entry, key) in &entries {
+            if matches!(entry, Entry::Phase(_)) {
+                assert!(starts.contains(key), "{key:?} in {starts:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_quote_is_the_entrys_first_line_without_csi_or_osc_sequences_or_control_characters() {
+        let said = Quote::of(
+            &Entry::Said(
+                "\n  First \u{1b}]0;title\u{7}line \u{1b}[31mred\u{1b}[0m\u{7}\u{1b}]8;;u\u{1b}\\!\nsecond",
+            ),
+            Whose::Activity,
+        );
+        assert_eq!(said.expect("a quote").as_str(), "First line red!");
+        let long = "x".repeat(200);
+        assert_eq!(
+            Quote::of(&Entry::Said(&long), Whose::Activity)
+                .expect("a quote")
+                .as_str()
+                .len(),
+            200,
+            "the view cuts it to the box, the data keeps it"
+        );
+        assert_eq!(Quote::of(&Entry::Said("  \n "), Whose::Activity), None);
+        assert_eq!(Quote::of(&Entry::Said("\u{7}"), Whose::Activity), None);
+    }
+
+    #[test]
+    fn a_quote_goes_above_the_message_as_a_blockquote() {
+        let quote = Quote::of(&Entry::Compacted, Whose::Activity).expect("a quote");
+        assert_eq!(quote.before("why?"), "> compacted\n\nwhy?");
+    }
+
+    #[test]
+    fn a_call_is_quoted_as_its_tool_and_target_and_a_phase_as_its_heading() {
+        let call = bash("cargo test", ok());
+        let LogEntry::Called(boxed) = &call else {
+            panic!("a call");
+        };
+        let line =
+            |entry: &Entry<'_>, whose| Quote::of(entry, whose).map(|q| q.as_str().to_string());
+        assert_eq!(
+            line(&Entry::Call(boxed), Whose::Activity).as_deref(),
+            Some("Bash cargo test")
+        );
+        let said_first = Entry::Phase(Phase {
+            entries: vec![
+                Entry::Call(boxed),
+                Entry::Said("\n\nChecking the lint\nmore"),
+            ],
+            took: None,
+        });
+        assert_eq!(
+            line(&said_first, Whose::Activity).as_deref(),
+            Some("Checking the lint"),
+            "leading blank lines are skipped"
+        );
+        let calls_only = Entry::Phase(Phase {
+            entries: vec![Entry::Call(boxed)],
+            took: None,
+        });
+        assert_eq!(
+            line(&calls_only, Whose::Activity).as_deref(),
+            Some("Bash cargo test")
+        );
+    }
+
+    #[test]
+    fn a_quote_from_a_subagent_names_it() {
+        let call = bash("ls", ok());
+        let LogEntry::Called(boxed) = &call else {
+            panic!("a call");
+        };
+        let entry = Entry::Call(boxed);
+        assert_eq!(
+            Quote::of(&entry, Whose::Subagent(Some("\n Find the\nbug")))
+                .map(|q| q.as_str().to_string())
+                .as_deref(),
+            Some("(subagent Find the) Bash ls")
+        );
+        assert_eq!(
+            Quote::of(&entry, Whose::Subagent(None))
+                .map(|q| q.as_str().to_string())
+                .as_deref(),
+            Some("(subagent) Bash ls")
+        );
+        assert_eq!(
+            Quote::of(&entry, Whose::Subagent(Some(" ")))
+                .map(|q| q.as_str().to_string())
+                .as_deref(),
+            Some("(subagent) Bash ls")
         );
     }
 

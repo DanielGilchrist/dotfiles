@@ -3665,6 +3665,7 @@ mod tests {
     fn send_box(m: &mut Model) -> String {
         m.overlay = Overlay::Talk {
             to: name("obs-layout-4"),
+            quote: None,
             text: String::new(),
         };
         screen(&render(m, (100, 30))).join("\n")
@@ -3680,6 +3681,90 @@ mod tests {
         let text = send_box(&mut m);
         assert!(text.contains("Send to obs-layout-4"), "{text}");
         assert!(text.contains("⏎ send") && !text.contains("held"), "{text}");
+    }
+
+    fn replying(m: &mut Model, quote: &str, text: &str) -> String {
+        use crate::log::{Entry, Quote, Whose};
+        m.overlay = Overlay::Talk {
+            to: name("obs-layout-4"),
+            quote: Quote::of(&Entry::Said(quote), Whose::Activity),
+            text: text.into(),
+        };
+        screen(&render(m, (100, 30))).join("\n")
+    }
+
+    #[test]
+    fn a_reply_box_shows_the_quote_above_the_input_and_what_was_typed_apart_from_it() {
+        let mut m = fleet(10);
+        let text = replying(&mut m, "Bash cargo test", "why did it fail?");
+        assert!(text.contains("Reply to obs-layout-4"), "{text}");
+        let rows: Vec<&str> = text.lines().collect();
+        let quoted = rows.iter().position(|r| r.contains("> Bash cargo test"));
+        let typed = rows.iter().position(|r| r.contains("› why did it fail?"));
+        assert!(
+            matches!((quoted, typed), (Some(q), Some(t)) if q + 1 == t),
+            "{text}"
+        );
+        assert!(!rows[typed.expect("typed")].contains("Bash"), "{text}");
+    }
+
+    #[test]
+    fn a_long_quote_is_cut_to_the_box_and_the_data_keeps_all_of_it() {
+        let mut m = fleet(10);
+        let long = "word ".repeat(40);
+        let text = replying(&mut m, &long, "");
+        let row = text
+            .lines()
+            .find(|r| r.contains("> word"))
+            .expect("the quote row");
+        assert!(row.contains('…'), "{row}");
+    }
+
+    #[test]
+    fn a_reply_with_review_comments_drafted_is_titled_a_review() {
+        let mut m = fleet(10);
+        m.track(&name("obs-layout-4")).draft.push(
+            crate::review::Comment::on(
+                &[&crate::fixtures::line_info("a.rs", "+x", 1)],
+                None,
+                "note",
+            )
+            .expect("a comment"),
+        );
+        let text = replying(&mut m, "one", "");
+        assert!(text.contains("Send review to obs-layout-4"), "{text}");
+        assert!(text.contains("> one"), "{text}");
+    }
+
+    #[test]
+    fn a_reply_box_squeezed_by_a_short_screen_keeps_its_input_and_the_quote() {
+        use crate::log::{Entry, Quote, Whose};
+        let mut m = fleet(10);
+        m.overlay = Overlay::Talk {
+            to: name("obs-layout-4"),
+            quote: Quote::of(&Entry::Said("the quote"), Whose::Activity),
+            text: "typed".into(),
+        };
+        for height in [6, 7, 8] {
+            let text = screen(&render(&mut m, (100, height))).join("\n");
+            assert!(text.contains("› typed"), "{height}: {text}");
+        }
+        let text = screen(&render(&mut m, (100, 8))).join("\n");
+        assert!(text.contains("> the quote"), "{text}");
+    }
+
+    #[test]
+    fn the_footer_says_reply_for_s_on_a_log_entry_and_send_elsewhere() {
+        let mut m = reading_a_log();
+        let footer = footer_of(&mut m, (200, 40));
+        assert!(footer.contains("s reply"), "{footer}");
+        assert!(footer.contains("message"), "{footer}");
+        let mut m = fleet(10);
+        let footer = footer_of(&mut m, (200, 40));
+        assert!(
+            footer.contains("s send") && !footer.contains("s reply"),
+            "{footer}"
+        );
     }
 
     #[test]

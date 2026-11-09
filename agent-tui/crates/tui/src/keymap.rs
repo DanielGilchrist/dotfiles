@@ -6,7 +6,7 @@
 //! when a handler and this table disagree.
 
 use crate::document::Hover;
-use crate::model::{LEAVE_PAUSED, MOVE_HERE, Model, Panel, Reach, View, Visibility};
+use crate::model::{LEAVE_PAUSED, MOVE_HERE, Model, Panel, Quoting, Reach, View, Visibility};
 use crate::tree::{ChangesScope, ChangesView, Node};
 use agent_core::model::Entry;
 use agent_core::ports::Compared;
@@ -96,6 +96,7 @@ pub struct Situation {
     pub toggle: Toggle,
     /// Where `⏎` takes [0] from the activity's entry under the cursor.
     pub jump: Option<crate::log::Jump>,
+    pub reply: Quoting,
     pub next_tab: &'static str,
     /// What `]` names while [3] has the keys.
     pub next_changes_tab: &'static str,
@@ -324,6 +325,11 @@ impl Situation {
         self.ctx == Ctx::Main && self.activity() == Some(ActivityDoc::Log)
     }
 
+    /// [0] shows a log with entries to put a cursor on, a subagent's or the activity's.
+    fn reads_entries(&self) -> bool {
+        self.subagent_row() || self.reads_log()
+    }
+
     fn reads_log(&self) -> bool {
         self.activity() == Some(ActivityDoc::Log)
     }
@@ -362,6 +368,7 @@ impl Situation {
             left: if left { Left::Agent } else { Left::Nobody },
             toggle: Self::toggle(m),
             jump: m.activity_jump().cloned(),
+            reply: m.reply,
             next_changes_tab: match m.changes_scope.toggled() {
                 ChangesScope::Uncommitted => "tab: uncommitted",
                 ChangesScope::Since => {
@@ -693,11 +700,11 @@ pub const BINDINGS: &[Binding] = &[
     Binding::new(
         &["⏎"],
         Ctxs::of(&[Ctx::Main]),
-        RankBy(|s| (s.subagent_row() || s.reads_log()).then_some(8)),
+        RankBy(|s| s.reads_entries().then_some(8)),
         By(|s| match s.jump {
             Some(crate::log::Jump::Subagent(_)) => Some("open subagent"),
             Some(crate::log::Jump::File(_)) => Some("open diff"),
-            None => (s.subagent_row() || s.reads_log()).then_some("fold"),
+            None => s.reads_entries().then_some("fold"),
         }),
         "Expand or collapse the log entry under the cursor: the whole prompt or text, a call's input and result, or a run of calls. On an Agent call that started a subagent it opens the subagent's log, and on an edit or a touched file it opens the file's diff in [3]. Esc goes back to the activity.",
     ),
@@ -705,7 +712,7 @@ pub const BINDINGS: &[Binding] = &[
         &["=", "-"],
         Ctxs::of(&[Ctx::Main]),
         Hidden,
-        By(|s| (s.subagent_row() || s.reads_log()).then_some("expand all / collapse all")),
+        By(|s| s.reads_entries().then_some("expand all / collapse all")),
         "Expand every entry of a log, or collapse them all. Folded phases of an activity open too.",
     ),
     Binding::new(
@@ -735,6 +742,13 @@ pub const BINDINGS: &[Binding] = &[
         RankBy(|s| s.diff().then_some(7)),
         By(|s| s.diff().then_some("hunk")),
         "Jump to the previous or next hunk of the diff.",
+    ),
+    Binding::new(
+        &["[", "]"],
+        Ctxs::of(&[Ctx::Main]),
+        RankBy(|s| s.reads_entries().then_some(7)),
+        By(|s| s.reads_entries().then_some(if s.subagent_row() { "message" } else { "phase" })),
+        "Move the entry cursor to the first entry of the previous or next phase of the activity. A subagent's log has no folded phases, so there it goes to the previous or next message, or the first call after a queued message or a compaction. It stays put at the first or last, and going back from inside a phase goes to its start.",
     ),
     Binding::new(
         &["."],
@@ -778,8 +792,16 @@ pub const BINDINGS: &[Binding] = &[
         &["s"],
         EVERYWHERE,
         RankBy(|s| s.can(|a| a.send).then_some(7)),
-        By(|s| s.on_agent().then_some(if s.agent().is_some_and(|a| a.draft == Draft::Comments) { "send review" } else { "send" })),
-        "Compose a message to the selected agent without attaching. It is typed at once, and held only while the agent is asking, its session is starting or hasn't reported, a tool just started, or the last message is too recent or was a command.",
+        By(|s| {
+            s.on_agent().then_some(if s.agent().is_some_and(|a| a.draft == Draft::Comments) {
+                "send review"
+            } else if s.reply == Quoting::Yes {
+                "reply"
+            } else {
+                "send"
+            })
+        }),
+        "Compose a message to the selected agent without attaching. It is typed at once, and held only while the agent is asking, its session is starting or hasn't reported, a tool just started, or the last message is too recent or was a command. With the entry cursor on an entry in [0]'s activity or a subagent's log it reads reply: the entry's first line shows above the input and goes before your message, only when you typed one. Backspace on empty text drops the quote. Review comments drafted for the agent go after the message.",
     ),
     Binding::new(
         &["v"],
@@ -1109,6 +1131,7 @@ mod tests {
             left: Left::Agent,
             toggle: Toggle::Worth("show all"),
             jump: None,
+            reply: Quoting::No,
             next_tab: "tab: agents",
             next_changes_tab: "tab: branch",
         }

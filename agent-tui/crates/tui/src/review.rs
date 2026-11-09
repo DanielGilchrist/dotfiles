@@ -3,6 +3,8 @@
 
 use agent_core::names::{CarriageReturn, clean};
 use agent_core::ports::FileState;
+
+use crate::model::Direction;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
@@ -196,9 +198,19 @@ pub fn hunk(lines: &[LineInfo], from: usize, forward: bool) -> Option<usize> {
     after(previous)
 }
 
+/// The first of `starts`, which are in order, after `from` going forward.
+/// Going back, the last one before `from`, which is the start of the
+/// section `from` is in when it is past it.
+pub fn next_start(starts: &[usize], from: usize, direction: Direction) -> Option<usize> {
+    match direction {
+        Direction::Forward => starts.iter().copied().find(|&start| start > from),
+        Direction::Back => starts.iter().rev().copied().find(|&start| start < from),
+    }
+}
+
 /// The first line of the next file after `from`, or of the one `from` is
 /// in when going back.
-pub fn file(lines: &[LineInfo], from: usize, forward: bool) -> Option<usize> {
+pub fn file(lines: &[LineInfo], from: usize, direction: Direction) -> Option<usize> {
     let mut starts = Vec::new();
     let mut previous: Option<&Path> = None;
     for (i, line) in lines.iter().enumerate().filter(|(_, l)| l.selectable()) {
@@ -207,14 +219,7 @@ pub fn file(lines: &[LineInfo], from: usize, forward: bool) -> Option<usize> {
         }
         previous = Some(&line.path);
     }
-    let current = starts.iter().rposition(|&s| s <= from)?;
-    if forward {
-        starts.get(current + 1).copied()
-    } else if starts[current] < from {
-        Some(starts[current])
-    } else {
-        current.checked_sub(1).map(|i| starts[i])
-    }
+    next_start(&starts, from, direction)
 }
 
 /// `path:42`, `path:10-14`, or for removed lines `path:7 (removed)`. In a
@@ -337,6 +342,21 @@ mod tests {
     use super::*;
     use crate::fixtures::{line_info, nz};
 
+    #[test]
+    fn the_next_start_is_the_one_after_going_forward_and_this_sections_going_back_from_inside_it() {
+        use crate::model::Direction::{Back, Forward};
+        let starts = [2, 5, 9];
+        assert_eq!(next_start(&starts, 0, Forward), Some(2));
+        assert_eq!(next_start(&starts, 2, Forward), Some(5));
+        assert_eq!(next_start(&starts, 9, Forward), None);
+        assert_eq!(next_start(&starts, 11, Forward), None);
+        assert_eq!(next_start(&starts, 7, Back), Some(5), "inside a section");
+        assert_eq!(next_start(&starts, 5, Back), Some(2), "on a start");
+        assert_eq!(next_start(&starts, 2, Back), None);
+        assert_eq!(next_start(&starts, 0, Back), None);
+        assert_eq!(next_start(&[], 3, Forward), None);
+    }
+
     fn text(lines: &[&str]) -> Vec<String> {
         lines.iter().map(|l| (*l).to_string()).collect()
     }
@@ -405,10 +425,10 @@ mod tests {
         assert_eq!(hunk(&lines, 5, false), Some(4), "back to the hunk's start");
         assert_eq!(hunk(&lines, 4, false), Some(1), "then the one before");
         assert_eq!(hunk(&lines, 1, false), None);
-        assert_eq!(file(&lines, 2, true), Some(7));
-        assert_eq!(file(&lines, 7, false), Some(1));
-        assert_eq!(file(&lines, 2, false), Some(1));
-        assert_eq!(file(&lines, 7, true), None);
+        assert_eq!(file(&lines, 2, Direction::Forward), Some(7));
+        assert_eq!(file(&lines, 7, Direction::Back), Some(1));
+        assert_eq!(file(&lines, 2, Direction::Back), Some(1));
+        assert_eq!(file(&lines, 7, Direction::Forward), None);
     }
 
     #[test]

@@ -1257,9 +1257,10 @@ pub enum Overlay {
     Help(HelpState),
     /// The configured actions, to run on this agent.
     Actions(SessionName),
-    /// A message being typed for an agent.
+    /// A message being typed for an agent, in reply to a log entry or not.
     Talk {
         to: SessionName,
+        quote: Option<crate::log::Quote>,
         text: String,
     },
     /// A comment being typed on lines of a diff, for an agent's draft review.
@@ -1518,6 +1519,13 @@ pub struct ActivityFiles {
     pub jump: Option<crate::log::Jump>,
 }
 
+/// Whether `s` in [0] quotes an entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Quoting {
+    No,
+    Yes,
+}
+
 /// How an activity says the files it touched.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Shown {
@@ -1560,6 +1568,14 @@ pub enum Asking {
 pub enum LogKey {
     Subagent(SubagentKey),
     Activity(SessionName),
+}
+
+impl LogKey {
+    pub fn session(&self) -> &SessionName {
+        match self {
+            Self::Subagent((name, _)) | Self::Activity(name) => name,
+        }
+    }
 }
 
 pub enum Load {
@@ -1650,6 +1666,8 @@ pub struct Model {
     /// What the activity in [0] has that takes more than a lookup, as of the
     /// last message.
     pub activity_files: Option<ActivityFiles>,
+    /// Whether `s` would quote the log entry under the cursor in [0].
+    pub reply: Quoting,
     /// The agent whose terminal the peek float shows.
     pub peek: Option<Peek>,
     /// What the main view [0] reads when it isn't the terminal.
@@ -1714,6 +1732,7 @@ impl Model {
             diff_view: crate::review::DiffView::default(),
             opened: None,
             activity_files: None,
+            reply: Quoting::No,
             peek: None,
             docs: Documents::default(),
             screen: Screen::Split,
@@ -2706,6 +2725,11 @@ impl Model {
         self.activity_files = match &hover {
             Some(Hover::Activity(name)) => self.read_activity_files(name),
             _ => None,
+        };
+        self.reply = if self.main_focused() && crate::update::reply_quote(self).is_some() {
+            Quoting::Yes
+        } else {
+            Quoting::No
         };
     }
 

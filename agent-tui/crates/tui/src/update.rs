@@ -1583,7 +1583,7 @@ fn peek_command(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
     let name = m.peek_name()?.clone();
     match code {
         KeyCode::Esc | KeyCode::Char('v') => m.peek = None,
-        KeyCode::Char('s') => open_talk(m, &name),
+        KeyCode::Char('s') => open_talk(m, &name, None),
         KeyCode::Char('t') => m.info(SEND_MOVED),
         KeyCode::Char('i') | KeyCode::Enter => return Some(activate(m, &name, Intent::Activate)),
         _ => return None,
@@ -1892,7 +1892,12 @@ fn diff_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
                 }
                 return Some(Vec::new());
             }
-            match crate::review::file(lines, at, forward) {
+            let direction = if forward {
+                Direction::Forward
+            } else {
+                Direction::Back
+            };
+            match crate::review::file(lines, at, direction) {
                 Some(to) => {
                     m.diff_view.cursor = to;
                     m.diff_view.anchor = None;
@@ -1922,9 +1927,16 @@ fn reveal_entry(areas: &Areas, docs: &mut Documents, key: &LogKey, entry: &Entry
 
 /// The log [0] reads, with what moves over it.
 struct OpenLog<'a> {
-    source: Source<'a>,
+    contents: Contents<'a>,
     nav: &'a mut Nav,
+}
+
+/// What [0] lists for a log, apart from where its cursor is.
+struct Contents<'a> {
+    source: Source<'a>,
     entries: Vec<(crate::log::Entry<'a>, EntryKey)>,
+    /// Where in `entries` each phase starts.
+    phases: Vec<usize>,
     /// Whether it is still growing, so its cursor starts at the end and
     /// moving there follows it.
     running: bool,
@@ -1954,13 +1966,42 @@ impl Source<'_> {
     }
 }
 
-/// What the model knows of an agent's activity that opening its log needs.
+/// What the model knows of an agent's activity that listing its log needs.
 struct ActivityNow {
     running: bool,
     closing: Option<String>,
 }
 
 type Agents = HashMap<SessionName, crate::model::Tracked>;
+
+fn subagent_contents(detail: &Log) -> Contents<'_> {
+    let entries = crate::log::entries(detail);
+    Contents {
+        phases: crate::log::phase_positions(&detail.log, &entries),
+        entries,
+        source: Source::Subagent(detail),
+        running: !matches!(detail.outcome, agent_core::ports::Outcome::Finished { .. }),
+    }
+}
+
+fn activity_contents<'a>(
+    detail: &'a ActivityDetail,
+    now: &'a ActivityNow,
+    touched: &'a [TouchedFile],
+) -> Contents<'a> {
+    let closing = now.closing.as_deref();
+    let entries = crate::log::activity_entries(&detail.log, closing, touched).flat();
+    Contents {
+        phases: crate::log::phase_positions(&detail.log.log, &entries),
+        entries,
+        source: Source::Activity {
+            detail,
+            closing,
+            touched,
+        },
+        running: now.running,
+    }
+}
 
 /// The subagent's log, if it was read.
 fn open_subagent_log<'a>(
@@ -1973,9 +2014,7 @@ fn open_subagent_log<'a>(
         return None;
     };
     Some(OpenLog {
-        source: Source::Subagent(detail),
-        entries: crate::log::entries(detail),
-        running: !matches!(detail.outcome, agent_core::ports::Outcome::Finished { .. }),
+        contents: subagent_contents(detail),
         nav: &mut watch.nav,
     })
 }
@@ -1991,17 +2030,58 @@ fn open_activity_log<'a>(
     let Some(Ok(Some(detail))) = &watch.log else {
         return None;
     };
-    let closing = now.closing.as_deref();
     Some(OpenLog {
-        entries: crate::log::activity_entries(&detail.log, closing, touched).flat(),
-        source: Source::Activity {
-            detail,
-            closing,
-            touched,
-        },
-        running: now.running,
+        contents: activity_contents(detail, now, touched),
         nav: &mut watch.nav,
     })
+}
+
+/// What a reply to the entry under [0]'s log cursor quotes, and the agent
+/// it goes to. `None` when [0] isn't on a log or the entry has no text.
+pub fn reply_quote(m: &Model) -> Option<(SessionName, crate::log::Quote)> {
+    let key = log_of(m)?;
+    let nav = m.nav(&key)?;
+    let (contents, whose);
+    let title;
+    let now;
+    match &key {
+        LogKey::Subagent(subagent) => {
+            let Some(Ok(Some(detail))) = m
+                .watched(subagent)
+                .map(|w| &w.watch.log)
+                .and_then(Option::as_ref)
+            else {
+                return None;
+            };
+            contents = subagent_contents(detail);
+            title = subagent_title(m, &subagent.1);
+            whose = crate::log::Whose::Subagent(title.as_deref());
+        }
+        LogKey::Activity(name) => {
+            now = ActivityNow {
+                running: m.activity_running(name),
+                closing: m.closing(name),
+            };
+            let touched = m
+                .activity_files(name)
+                .map_or(&[][..], ActivityFiles::listed);
+            contents = activity_contents(m.activity_detail(name)?, &now, touched);
+            whose = crate::log::Whose::Activity;
+        }
+    }
+    if contents.entries.is_empty() {
+        return None;
+    }
+    let entry = &contents.entries[nav.at(contents.running, &contents.entries)].0;
+    Some((key.session().clone(), crate::log::Quote::of(entry, whose)?))
+}
+
+/// The description of a subagent of the selected agent, as its row says it.
+fn subagent_title(m: &Model, id: &AgentId) -> Option<String> {
+    m.subagent_rows()
+        .into_iter()
+        .find(|(held, _)| *held == id)
+        .and_then(|(_, s)| s.description.clone())
 }
 
 /// The checkout, title and file name for writing the log `key` names out
@@ -2010,12 +2090,7 @@ fn transcript_target(m: &Model, key: &LogKey) -> Option<(PathBuf, String, String
     let root = selected_root(m)?;
     Some(match key {
         LogKey::Subagent((name, id)) => {
-            let title = m
-                .subagent_rows()
-                .into_iter()
-                .find(|(held, _)| *held == id)
-                .and_then(|(_, s)| s.description.clone())
-                .unwrap_or_else(|| "subagent".into());
+            let title = subagent_title(m, id).unwrap_or_else(|| "subagent".into());
             (root, title, format!("{}-{}", name.as_str(), id.as_str()))
         }
         LogKey::Activity(name) => (
@@ -2076,19 +2151,30 @@ fn walk(
     at: usize,
     (docs, areas, key): (&mut Documents, &Areas, &LogKey),
 ) -> Option<()> {
-    let last = open.entries.len().checked_sub(1)?;
+    let last = open.contents.entries.len().checked_sub(1)?;
     let (to, motion) = match code {
         KeyCode::Char('j') | KeyCode::Down => ((at + 1).min(last), Motion::Down),
         KeyCode::Char('k') | KeyCode::Up => (at.saturating_sub(1), Motion::Up),
         KeyCode::Char('g') | KeyCode::Home => (0, Motion::Start),
         KeyCode::Char('G') | KeyCode::End => (last, Motion::End),
+        KeyCode::Char(c @ ('[' | ']')) => {
+            let (direction, motion) = if c == ']' {
+                (Direction::Forward, Motion::Down)
+            } else {
+                (Direction::Back, Motion::Up)
+            };
+            let Some(to) = crate::review::next_start(&open.contents.phases, at, direction) else {
+                return Some(());
+            };
+            (to, motion)
+        }
         _ => return None,
     };
-    let to_key = open.entries[to].1.clone();
+    let to_key = open.contents.entries[to].1.clone();
     open.nav.cursor = Some(to_key.clone());
     match motion {
         Motion::Down => {
-            if open.running && at + 1 >= last {
+            if open.contents.running && to >= last {
                 docs.scroll_to_end();
             }
             reveal_entry(areas, docs, key, &to_key);
@@ -2124,7 +2210,10 @@ fn read_log(m: &mut Model, code: KeyCode, files: Option<&ActivityFiles>) -> Opti
             (open, files.and_then(|f| f.jump.clone()))
         }
     };
-    let at = open.nav.at(open.running, &open.entries);
+    if open.contents.entries.is_empty() {
+        return None;
+    }
+    let at = open.nav.at(open.contents.running, &open.contents.entries);
     if walk(code, &mut open, at, (&mut m.docs, &m.areas, &key)).is_some() {
         return Some(Vec::new());
     }
@@ -2139,7 +2228,7 @@ fn read_log(m: &mut Model, code: KeyCode, files: Option<&ActivityFiles>) -> Opti
             m.follow_page();
         }
         KeyCode::Enter => {
-            let entry_key = open.entries[at].1.clone();
+            let entry_key = open.contents.entries[at].1.clone();
             open.nav.cursor = Some(entry_key.clone());
             match jump {
                 Some(jump) => return Some(follow(m, jump)),
@@ -2152,13 +2241,21 @@ fn read_log(m: &mut Model, code: KeyCode, files: Option<&ActivityFiles>) -> Opti
             open.nav.open.clear();
         }
         KeyCode::Char('y') => {
-            let text = crate::log::entry_text(&open.entries[at].0);
-            open.nav.cursor = Some(open.entries[at].1.clone());
+            let text = crate::log::entry_text(&open.contents.entries[at].0);
+            open.nav.cursor = Some(open.contents.entries[at].1.clone());
             return Some(copy(m, text));
         }
-        KeyCode::Char('e') => return Some(edit_log(&open.source, editing?, at)),
+        KeyCode::Char('e') => return Some(edit_log(&open.contents.source, editing?, at)),
         _ => return None,
     }
+    Some(Vec::new())
+}
+
+/// `s` on a log entry: the send box quoting it. `None` leaves the key to
+/// the plain send.
+fn reply_to_entry(m: &mut Model) -> Option<Vec<Effect>> {
+    let (name, quote) = reply_quote(m)?;
+    open_talk(m, &name, Some(quote));
     Some(Vec::new())
 }
 
@@ -2240,6 +2337,9 @@ fn on_document_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
         m.changes_scope = spot.scope;
         m.panel = spot.panel();
         return Some(Vec::new());
+    }
+    if code == KeyCode::Char('s') {
+        return reply_to_entry(m);
     }
     if let Some(effects) = log_key(m, code)
         .or_else(|| diff_key(m, code))
@@ -2517,7 +2617,7 @@ fn overlay_key(m: &mut Model, key: &KeyEvent, selected: Option<&Entry>) -> Optio
         KeyCode::Char('c') if !m.main_focused() => open_form(m, FormKind::Checkout),
         KeyCode::Char('s') => {
             if let Some(entry) = selected {
-                open_talk(m, entry.name());
+                open_talk(m, entry.name(), None);
             }
         }
         KeyCode::Char('t') => m.info(SEND_MOVED),
@@ -2704,7 +2804,7 @@ fn request_removal(m: &mut Model) -> Vec<Effect> {
 }
 
 /// Opens the message box for `name`, or says why it can't be messaged.
-fn open_talk(m: &mut Model, name: &SessionName) {
+fn open_talk(m: &mut Model, name: &SessionName, quote: Option<crate::log::Quote>) {
     let Some(entry) = m.snapshot().and_then(|s| s.entry(name)).map(|(_, e)| e) else {
         return;
     };
@@ -2712,6 +2812,7 @@ fn open_talk(m: &mut Model, name: &SessionName) {
         Ok(to) => {
             m.overlay = Overlay::Talk {
                 to: to.name().clone(),
+                quote,
                 text: String::new(),
             }
         }
@@ -2754,12 +2855,21 @@ fn open_peek(m: &mut Model) -> Vec<Effect> {
 }
 
 /// Queues a message for its agent and sends the first one that can go.
-fn talk(m: &mut Model, to: SessionName, text: String) -> Vec<Effect> {
+fn talk(
+    m: &mut Model,
+    to: SessionName,
+    quote: Option<crate::log::Quote>,
+    text: String,
+) -> Vec<Effect> {
     let draft = m.draft(&to).to_vec();
+    let typed = match &quote {
+        Some(quote) if !text.trim().is_empty() => quote.before(&text),
+        _ => text.clone(),
+    };
     let message = if draft.is_empty() {
-        text.clone()
+        typed
     } else {
-        crate::review::review_message(&text, &draft)
+        crate::review::review_message(&typed, &draft)
     };
     let prompt = match message.parse::<Prompt>() {
         Ok(prompt) => prompt,
@@ -2770,7 +2880,7 @@ fn talk(m: &mut Model, to: SessionName, text: String) -> Vec<Effect> {
                     format!("the message has a control character ({c:?}) · Esc closes")
                 }
             });
-            m.overlay = Overlay::Talk { to, text };
+            m.overlay = Overlay::Talk { to, quote, text };
             return Vec::new();
         }
     };
@@ -3140,7 +3250,7 @@ fn on_overlay_key(m: &mut Model, key: KeyEvent) -> Vec<Effect> {
             m.overlay = Overlay::New(form);
             on_new_key(m, &key)
         }
-        Overlay::Talk { to, text } => on_talk_key(m, to, text, &key),
+        Overlay::Talk { to, quote, text } => on_talk_key(m, (to, quote), text, &key),
         Overlay::Comment(draft) => on_comment_key(m, draft, &key),
         Overlay::Switcher(query) => on_switcher_key(m, query, &key),
         Overlay::Picker(query) => on_picker_key(m, query, &key),
@@ -3167,14 +3277,20 @@ fn type_text(text: &mut String, key: &KeyEvent) {
     }
 }
 
-fn on_talk_key(m: &mut Model, to: SessionName, mut text: String, key: &KeyEvent) -> Vec<Effect> {
+fn on_talk_key(
+    m: &mut Model,
+    (to, mut quote): (SessionName, Option<crate::log::Quote>),
+    mut text: String,
+    key: &KeyEvent,
+) -> Vec<Effect> {
     match key.code {
         KeyCode::Esc => return Vec::new(),
-        KeyCode::Enter => return talk(m, to, text),
+        KeyCode::Enter => return talk(m, to, quote, text),
+        KeyCode::Backspace if text.is_empty() => quote = None,
         _ if ctrl(key, 'x') => clear_queue(m, &to),
         _ => type_text(&mut text, key),
     }
-    m.overlay = Overlay::Talk { to, text };
+    m.overlay = Overlay::Talk { to, quote, text };
     Vec::new()
 }
 
@@ -8258,6 +8374,318 @@ mod tests {
         assert!(
             matches!(effects.as_slice(), [Effect::Copy(text)] if text.contains("input")),
             "y copies the phase's entry"
+        );
+    }
+
+    fn cursor_of(m: &Model, key: &LogKey) -> Option<EntryKey> {
+        m.nav(key).and_then(|nav| nav.cursor.clone())
+    }
+
+    /// An agent at work with `story()` as its activity, [0] focused on it.
+    fn reading_the_story() -> (Model, SessionName) {
+        let mut m = at_work();
+        let who = name("payroll-fix-3");
+        m.set_activity(&who, Ok(Some(crate::log::fixtures::activity_of(story()))));
+        update(&mut m, key(KeyCode::Char('2')));
+        update(&mut m, key(KeyCode::Char('0')));
+        (m, who)
+    }
+
+    /// The cursor after each of `keys`.
+    fn after_each(m: &mut Model, log: &LogKey, keys: &str) -> Vec<Option<EntryKey>> {
+        keys.chars()
+            .map(|c| {
+                update(m, key(KeyCode::Char(c)));
+                cursor_of(m, log)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn brackets_move_the_activity_cursor_to_the_first_entry_of_the_previous_or_next_phase() {
+        let (mut m, who) = reading_the_story();
+        let log = LogKey::Activity(who);
+        update(&mut m, key(KeyCode::Char('g')));
+        assert_eq!(
+            after_each(&mut m, &log, "]]]]"),
+            [
+                Some(EntryKey::Log(0)),
+                Some(EntryKey::Log(2)),
+                Some(EntryKey::Log(4)),
+                Some(EntryKey::Log(4)),
+            ],
+            "two folded phases, then the open one from its first message, and the end stays put"
+        );
+        update(&mut m, key(KeyCode::Char('G')));
+        assert_eq!(cursor_of(&m, &log), Some(EntryKey::Log(5)));
+        assert_eq!(
+            after_each(&mut m, &log, "[[[["),
+            [
+                Some(EntryKey::Log(4)),
+                Some(EntryKey::Log(2)),
+                Some(EntryKey::Log(0)),
+                Some(EntryKey::Log(0)),
+            ],
+            "back from inside a phase goes to its start, and the first phase stays put"
+        );
+        update(&mut m, key(KeyCode::Char('g')));
+        assert_eq!(after_each(&mut m, &log, "["), [Some(EntryKey::Prompt)]);
+    }
+
+    #[test]
+    fn brackets_on_a_running_log_start_from_its_end_when_the_cursor_was_never_moved() {
+        let (mut m, who) = reading_the_story();
+        let log = LogKey::Activity(who);
+        assert_eq!(cursor_of(&m, &log), None);
+        assert_eq!(after_each(&mut m, &log, "]"), [None], "already at the end");
+        assert_eq!(
+            after_each(&mut m, &log, "["),
+            [Some(EntryKey::Log(4))],
+            "the end is inside the open phase, so back goes to its start"
+        );
+    }
+
+    #[test]
+    fn jumping_to_a_phase_that_is_the_last_entry_of_a_running_log_scrolls_to_its_end() {
+        use crate::log::fixtures::{activity_of, bash, said};
+        use agent_core::ports::{CallState, Summary};
+        let mut m = at_work();
+        let who = name("payroll-fix-3");
+        let ok = CallState::Done {
+            summary: Summary::NoOutput,
+            took: None,
+        };
+        m.set_activity(
+            &who,
+            Ok(Some(activity_of(vec![
+                said("one"),
+                bash("ls", ok),
+                said("two"),
+            ]))),
+        );
+        update(&mut m, key(KeyCode::Char('2')));
+        update(&mut m, key(KeyCode::Char('0')));
+        update(&mut m, key(KeyCode::Char('g')));
+        update(&mut m, key(KeyCode::Char(']')));
+        assert_ne!(m.docs.scroll, usize::MAX, "not on the last entry yet");
+        update(&mut m, key(KeyCode::Char(']')));
+        assert_eq!(
+            cursor_of(&m, &LogKey::Activity(who)),
+            Some(EntryKey::Log(2))
+        );
+        assert_eq!(
+            m.docs.scroll,
+            usize::MAX,
+            "scrolled to the end, which follows it"
+        );
+    }
+
+    #[test]
+    fn brackets_move_a_subagent_logs_cursor_between_its_messages() {
+        let mut m = delegating();
+        update(&mut m, key(KeyCode::Char('2')));
+        update(&mut m, key(KeyCode::Char('j')));
+        let subagent = LogKey::Subagent(with_log(&mut m, true));
+        update(&mut m, key(KeyCode::Char('0')));
+        update(&mut m, key(KeyCode::Char('g')));
+        assert_eq!(
+            after_each(&mut m, &subagent, "]]]["),
+            [
+                Some(EntryKey::Log(0)),
+                Some(EntryKey::Log(2)),
+                Some(EntryKey::Log(2)),
+                Some(EntryKey::Log(0)),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_running_activity_with_nothing_in_it_ignores_the_entry_keys_instead_of_panicking() {
+        let mut m = at_work();
+        let who = name("payroll-fix-3");
+        let mut empty = crate::log::fixtures::activity_of(Vec::new());
+        empty.log.prompt = None;
+        m.set_activity(&who, Ok(Some(empty)));
+        update(&mut m, key(KeyCode::Char('2')));
+        update(&mut m, key(KeyCode::Char('0')));
+        for c in ['j', ']', 'y', 's'] {
+            update(&mut m, key(KeyCode::Char(c)));
+        }
+        assert!(m.hover().is_some(), "still alive");
+    }
+
+    fn talk_of(m: &Model) -> Option<(Option<&str>, &str)> {
+        match &m.overlay {
+            Overlay::Talk { quote, text, .. } => {
+                Some((quote.as_ref().map(crate::log::Quote::as_str), text))
+            }
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn s_on_an_activity_entry_opens_the_box_quoting_it_and_elsewhere_opens_it_without() {
+        let (mut m, _) = reading_the_story();
+        update(&mut m, key(KeyCode::Esc));
+        update(&mut m, key(KeyCode::Char('s')));
+        assert_eq!(
+            talk_of(&m),
+            Some((None, "")),
+            "from the list, nothing is quoted"
+        );
+        update(&mut m, key(KeyCode::Esc));
+        update(&mut m, key(KeyCode::Char('0')));
+
+        update(&mut m, key(KeyCode::Char('g')));
+        update(&mut m, key(KeyCode::Char('s')));
+        assert_eq!(
+            talk_of(&m),
+            Some((Some("Fix the statusline."), "")),
+            "the prompt"
+        );
+        update(&mut m, key(KeyCode::Esc));
+
+        update(&mut m, key(KeyCode::Char(']')));
+        update(&mut m, key(KeyCode::Char('s')));
+        assert_eq!(
+            talk_of(&m),
+            Some((Some("one"), "")),
+            "a folded phase quotes what it said"
+        );
+        update(&mut m, key(KeyCode::Esc));
+
+        update(&mut m, key(KeyCode::Char('G')));
+        update(&mut m, key(KeyCode::Char('s')));
+        assert_eq!(
+            talk_of(&m),
+            Some((Some("Bash cargo test"), "")),
+            "a call quotes its summary"
+        );
+    }
+
+    #[test]
+    fn s_on_a_subagent_log_entry_quotes_it_naming_the_subagent_without_control_characters() {
+        let mut m = delegating();
+        update(&mut m, key(KeyCode::Char('2')));
+        update(&mut m, key(KeyCode::Char('j')));
+        let (who, id) = m.subagent_selected().expect("a subagent");
+        m.set_log(
+            (who, id),
+            Ok(Some(crate::log::fixtures::detail(vec![
+                crate::log::fixtures::said("\u{1b}[2Jwiped\nsecond"),
+            ]))),
+        );
+        update(&mut m, key(KeyCode::Char('0')));
+        update(&mut m, key(KeyCode::Char('g')));
+        update(&mut m, key(KeyCode::Char('j')));
+        update(&mut m, key(KeyCode::Char('s')));
+        let (quote, text) = talk_of(&m).expect("the box");
+        assert!(
+            quote.is_some_and(|q| q.starts_with("(subagent") && q.ends_with(") wiped")),
+            "{quote:?}"
+        );
+        assert_eq!(text, "");
+    }
+
+    #[test]
+    fn s_on_a_subagent_log_whose_row_has_no_description_quotes_it_as_a_bare_subagent() {
+        let mut m = delegating();
+        update(&mut m, key(KeyCode::Char('2')));
+        update(&mut m, key(KeyCode::Char('j')));
+        let (who, id) = m.subagent_selected().expect("a subagent");
+        m.activities
+            .as_mut()
+            .and_then(|a| a.get_mut(&who))
+            .and_then(|a| a.subagents.get_mut(&id))
+            .expect("the subagent")
+            .description = None;
+        m.set_log(
+            (who, id),
+            Ok(Some(crate::log::fixtures::detail(vec![
+                crate::log::fixtures::said("hello"),
+            ]))),
+        );
+        update(&mut m, key(KeyCode::Char('0')));
+        update(&mut m, key(KeyCode::Char('g')));
+        update(&mut m, key(KeyCode::Char('j')));
+        update(&mut m, key(KeyCode::Char('s')));
+        assert_eq!(talk_of(&m), Some((Some("(subagent) hello"), "")));
+    }
+
+    fn type_text_and_send(m: &mut Model, text: &str) {
+        for c in text.chars() {
+            update(m, key(KeyCode::Char(c)));
+        }
+        update(m, key(KeyCode::Enter));
+    }
+
+    fn last_sent<'a>(m: &'a Model, who: &SessionName) -> &'a str {
+        m.outbox(who)
+            .expect("queued")
+            .iter()
+            .last()
+            .expect("queued")
+            .as_ref()
+    }
+
+    #[test]
+    fn the_quote_goes_before_the_message_and_only_with_one() {
+        let (mut m, who) = reading_the_story();
+        update(&mut m, key(KeyCode::Char('g')));
+        update(&mut m, key(KeyCode::Char(']')));
+        update(&mut m, key(KeyCode::Char('s')));
+        update(&mut m, key(KeyCode::Enter));
+        assert!(
+            matches!(&m.overlay, Overlay::Talk { quote: Some(_), text, .. } if text.is_empty()),
+            "enter with nothing typed keeps the box, quote and all"
+        );
+        assert!(m.outbox(&who).is_none(), "and sends nothing");
+        type_text_and_send(&mut m, "why?");
+        assert_eq!(last_sent(&m, &who), "> one\n\nwhy?");
+    }
+
+    #[test]
+    fn backspace_on_empty_text_drops_the_quote_and_ctrl_u_keeps_it() {
+        let (mut m, _) = reading_the_story();
+        update(&mut m, key(KeyCode::Char('g')));
+        update(&mut m, key(KeyCode::Char('s')));
+        update(&mut m, key(KeyCode::Char('a')));
+        update(
+            &mut m,
+            Msg::Key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL)),
+        );
+        assert_eq!(talk_of(&m), Some((Some("Fix the statusline."), "")));
+        update(&mut m, key(KeyCode::Backspace));
+        assert_eq!(talk_of(&m), Some((None, "")));
+    }
+
+    #[test]
+    fn a_quote_goes_before_what_you_type_and_review_comments_after_and_is_not_sent_alone() {
+        let (mut m, who) = reading_the_story();
+        let line = crate::fixtures::line_info("a.rs", "+let x = 3;", 4);
+        add_comment(&mut m, &who, &[line], "Use the limit.", None);
+        update(&mut m, key(KeyCode::Char('g')));
+        update(&mut m, key(KeyCode::Char(']')));
+        update(&mut m, key(KeyCode::Char('s')));
+        assert_eq!(talk_of(&m), Some((Some("one"), "")));
+        assert_eq!(m.draft(&who).len(), 1, "opening the box keeps the draft");
+        type_text_and_send(&mut m, "why?");
+        let sent = last_sent(&m, &who);
+        assert!(sent.starts_with("Review comments."), "{sent}");
+        assert!(
+            sent.contains("> one\n\nwhy?\n\na.rs:4\n> +let x = 3;\nUse the limit."),
+            "{sent}"
+        );
+        assert_eq!(m.drafted(), 0);
+
+        let line = crate::fixtures::line_info("a.rs", "+let y = 4;", 9);
+        add_comment(&mut m, &who, &[line], "Why?", None);
+        update(&mut m, key(KeyCode::Char('s')));
+        update(&mut m, key(KeyCode::Enter));
+        let sent = last_sent(&m, &who);
+        assert!(
+            !sent.contains("> one"),
+            "no text typed, no quote sent: {sent}"
         );
     }
 

@@ -952,21 +952,7 @@ impl Rows<'_, '_> {
     /// took and the one thing about it worth knowing.
     fn phase(&mut self, phase: &Phase<'_>) {
         let calls: Vec<&Call> = phase.entries.iter().flat_map(Entry::calls).collect();
-        let heading = phase
-            .entries
-            .iter()
-            .find_map(|e| match e {
-                Entry::Said(text) => {
-                    Some(tame(text).lines().next().unwrap_or_default().to_string())
-                }
-                _ => None,
-            })
-            .or_else(|| {
-                calls
-                    .first()
-                    .map(|c| format!("{} {}", c.tool, target_text(&c.target)))
-            })
-            .unwrap_or_default();
+        let heading = phase.heading().map(|h| tame(&h)).unwrap_or_default();
         let mut right = vec![Span::styled(plural(calls.len(), "call", "calls"), dim())];
         if let Some(note) = phase_note(&calls, phase.took) {
             right.push(Span::raw("  "));
