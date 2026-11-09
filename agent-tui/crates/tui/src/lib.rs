@@ -14,6 +14,7 @@ mod worker;
 #[cfg(test)]
 mod fixtures;
 
+use std::num::NonZeroU16;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -24,9 +25,9 @@ use std::time::{Duration, Instant};
 use agent_core::config::Config;
 use agent_core::names::{CarriageReturn, SessionName, clean};
 use agent_core::ops::Backend;
-use agent_core::ports::HarnessId;
+use agent_core::ports::{ClientId, HarnessId, Observation};
 use agent_core::process::LaunchSpec;
-use agent_term::{EmulatorFactory, Liveness, TermSize, Terminal};
+use agent_term::{Emulator, EmulatorFactory, Liveness, TermSize, Terminal};
 use anyhow::{Context, Result};
 use crossterm::event::{
     self, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
@@ -39,7 +40,9 @@ use crossterm::terminal::{
 use ratatui::DefaultTerminal;
 use ratatui::layout::Rect;
 
-use model::{Connection, Intent, Mode, Model, Moment, Pane, StatusKind, TerminalFocus, Ticket};
+use model::{
+    Connection, Intent, Mode, Model, Moment, Pane, StatusKind, TerminalFocus, Ticket, Watch,
+};
 use palette::{Colours, Palette};
 use update::{Background, Effect, Open};
 use worker::{Job, Msg, Workers};
@@ -223,6 +226,14 @@ fn spawn_input(msgs: Sender<Msg>, ctl: Receiver<InputCtl>) {
     });
 }
 
+/// A watcher's terminal is never bigger than this, whatever size the session host
+/// reports, so a garbage display area can't ask the kernel and the emulator
+/// for a huge grid. The float crops anything bigger than the screen anyway.
+const OBSERVED_MAX: TermSize = TermSize {
+    cols: NonZeroU16::new(500).unwrap(),
+    rows: NonZeroU16::new(200).unwrap(),
+};
+
 struct Runtime {
     backend: Arc<Backend>,
     emulator: EmulatorFactory,
@@ -239,24 +250,51 @@ impl Runtime {
         intent: Intent,
         ticket: Ticket,
     ) -> Result<()> {
-        let Some(_) = m.pane.awaiting(ticket) else {
+        if m.pane.awaiting(ticket).is_none() {
             return Ok(());
-        };
-        let spec = spec.env_remove(self.backend.host.nesting_env().iter().copied());
+        }
         let size = TermSize::of(m.areas.terminal).context("the terminal pane has no size")?;
-        let term = Terminal::spawn(&spec, size, (self.emulator)(size))
+        let term = self
+            .start_terminal(spec, size)
             .with_context(|| format!("attaching to {name}"))?;
-        m.pane = Pane::Connected(Connection {
+        m.set_pane(Pane::Connected(Connection {
             name: name.clone(),
+            id: ClientId::new(term.pid()),
             term,
             mode: Mode::Nav,
             opened: m.clock.mono,
-        });
+        }));
         m.touch_mru(name);
         for work in update::connected(m, intent) {
             self.dispatch(work)?;
         }
         Ok(())
+    }
+
+    /// Starts, or restarts, the float's read-only view at the size the
+    /// session host reports for it.
+    fn observe(&self, m: &mut Model, observation: Observation, ticket: Ticket) -> Result<()> {
+        let now = m.clock.mono;
+        let Some(watch) = m.watch_mut().filter(|w| w.awaiting(ticket).is_some()) else {
+            return Ok(());
+        };
+        let seen = (observation.cols, observation.rows);
+        let size = TermSize {
+            cols: observation.cols.min(OBSERVED_MAX.cols),
+            rows: observation.rows.min(OBSERVED_MAX.rows),
+        };
+        let term = self.start_terminal(observation.spec, size)?;
+        watch.install(term, seen, now);
+        Ok(())
+    }
+
+    fn start_terminal(
+        &self,
+        spec: LaunchSpec,
+        size: TermSize,
+    ) -> std::io::Result<Terminal<Box<dyn Emulator>>> {
+        let spec = spec.env_remove(self.backend.host.nesting_env().iter().copied());
+        Terminal::spawn(&spec, size, (self.emulator)(size))
     }
 
     /// Sends what a connection starts in the background.
@@ -389,6 +427,14 @@ impl Runtime {
                     let spec = self.backend.host.attach(&name);
                     let result = self.connect(m, &name, spec, intent, ticket);
                     Self::connect_failed(m, ticket, result);
+                }
+                Effect::Observe {
+                    observation,
+                    ticket,
+                } => {
+                    if let Err(e) = self.observe(m, observation, ticket) {
+                        update::observe_failed(m, ticket, format!("{e:#}"));
+                    }
                 }
                 Effect::Connect {
                     launch,
@@ -534,7 +580,7 @@ impl Runtime {
 
     fn connect_failed(m: &mut Model, ticket: Ticket, result: Result<()>) {
         let Err(e) = result else { return };
-        m.pane.abandon(ticket);
+        m.abandon(ticket);
         m.error(format!("{e:#}"));
     }
 }
@@ -603,9 +649,12 @@ fn event_loop(
         if let Pane::Connected(c) = &mut m.pane
             && c.term.pump() == Liveness::Exited
         {
-            let name = c.name.clone();
-            m.pane = Pane::Empty;
-            m.info(format!("detached from {name}"));
+            update::connection_ended(&mut m);
+        }
+        if let Some(watcher) = m.watch_mut().and_then(Watch::watcher_mut)
+            && watcher.term.pump() == Liveness::Exited
+        {
+            update::watcher_ended(&mut m);
         }
         let size = Rect::from(terminal.size()?);
         if size != m.size {

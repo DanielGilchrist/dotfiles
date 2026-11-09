@@ -11,7 +11,7 @@ use agent_core::model::{Entry, EntryState, RepoKey, Snapshot};
 use agent_core::names::{CarriageReturn, InvalidPrompt, Prompt, SessionName, clean};
 use agent_core::ops::{Approved, Launch};
 use agent_core::paths::{RepoRoot, Typed, typed_path};
-use agent_core::ports::{ActivityDetail, ClientId, Listing, Log};
+use agent_core::ports::{ActivityDetail, ClientId, Listing, Log, Observation};
 use agent_term::{CellPos, encode_key, encode_mouse};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind};
 use ratatui::layout::Position;
@@ -23,9 +23,10 @@ use crate::model::{
     ActivityFiles, ActivityRow, AfterCheck, Answer, Areas, CheckHealth, Chord, CommentDraft,
     Company, Confirm, Cursor, DirCheck, Direction, Drawn, Edge, Enter, Field, Focus, Follow,
     FormKind, HelpState, INFO_TTL, Inspected, Inspection, Intent, Listed, LogKey, Look, Missing,
-    Mode, Model, Moment, NamingState, Need, NewAgent, Outbox, Overlay, Pane, Panel, Phase, Query,
-    Reach, RepoInput, Screen, StatusKind, Submission, TerminalFocus, Ticket, Unreachable, View,
-    WorkRoom, elsewhere_banner, fuzzy_match, match_rank, repo_matches, unlisted,
+    Mode, Model, Moment, NamingState, Need, NewAgent, Outbox, Overlay, Pane, Panel, Peek, Phase,
+    Query, Reach, Reply, RepoInput, Screen, StatusKind, Submission, TerminalFocus, Ticket,
+    Unreachable, View, Watch, WatchView, WorkRoom, elsewhere_banner, fuzzy_match, match_rank,
+    repo_matches, unlisted,
 };
 use crate::touched::{Baseline, TouchedFile};
 use crate::track::{LiveSince, Release, Seen};
@@ -122,6 +123,11 @@ pub enum Effect {
     },
     /// Look for the windows showing any session, off the UI thread.
     CheckElsewhere(Look),
+    /// Show a session read-only at the size it was found to have.
+    Observe {
+        observation: Observation,
+        ticket: Ticket,
+    },
     Connect {
         launch: Launch,
         intent: Intent,
@@ -175,10 +181,7 @@ fn selected_root(m: &Model) -> Option<PathBuf> {
 }
 
 fn own_client(m: &Model) -> Option<ClientId> {
-    m.pane
-        .connection()
-        .and_then(|c| c.term.pid())
-        .map(ClientId::new)
+    m.pane.connection().map(|c| c.id)
 }
 
 pub fn update(m: &mut Model, msg: Msg) -> Vec<Effect> {
@@ -223,6 +226,7 @@ fn step(m: &mut Model, msg: Msg) -> Vec<Effect> {
             Vec::new()
         }
         Msg::Launched { ticket, result } => on_launched(m, ticket, result),
+        Msg::Observed { ticket, result } => on_observed(m, ticket, result),
         Msg::Done(Ok(outcome)) => {
             report(m, outcome);
             Vec::new()
@@ -541,21 +545,24 @@ const CHECK_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Asks whether another window shows `name` before attaching to it.
 fn check_first(m: &mut Model, name: &SessionName, then: AfterCheck) -> Effect {
-    m.pane = Pane::Checking {
+    m.set_pane(Pane::Checking {
         name: name.clone(),
         then,
         until: m.clock.mono + CHECK_TIMEOUT,
-    };
+    });
     Effect::CheckElsewhere(looking(m, Need::Decision))
 }
 
 /// The one place the pane starts waiting on a client.
 fn connecting(m: &mut Model, name: &SessionName) -> Ticket {
     let ticket = m.ticket();
-    m.pane = Pane::Connecting {
+    if matches!(&m.peek, Some(Peek::Watch(w)) if &w.name == name) {
+        m.peek = Some(Peek::Pane);
+    }
+    m.set_pane(Pane::Connecting {
         name: name.clone(),
         ticket,
-    };
+    });
     ticket
 }
 
@@ -565,6 +572,95 @@ fn starting(m: &mut Model, name: &SessionName) -> Ticket {
     let now = m.clock.wall;
     m.track(name).launched(now);
     ticket
+}
+
+/// Turns a float over the pane's paused session into a watch of it, since
+/// another window shows it and a client of ours would squish that window.
+fn start_watching(m: &mut Model) -> Vec<Effect> {
+    let (Some(Peek::Pane), Some(name)) = (&m.peek, m.pane.held_elsewhere().cloned()) else {
+        return Vec::new();
+    };
+    let ticket = m.ticket();
+    m.peek = Some(Peek::Watch(Watch::new(name.clone(), ticket)));
+    vec![Effect::Job(Job::Observe { name, ticket })]
+}
+
+/// What the look for other windows means to a float watching a session:
+/// ask for its size again while the other window is there, and go back to
+/// the pane with a client once it has gone.
+fn watch_looked(m: &mut Model) -> Vec<Effect> {
+    let ticket = m.ticket();
+    let Some(Peek::Watch(watch)) = &mut m.peek else {
+        return Vec::new();
+    };
+    let name = watch.name.clone();
+    if !m.company(&name).is_elsewhere() {
+        return reattach_preview(m, name);
+    }
+    match m.watch_mut().and_then(|watch| watch.measure(ticket)) {
+        Some(name) => vec![Effect::Job(Job::Observe {
+            name: name.clone(),
+            ticket,
+        })],
+        None => Vec::new(),
+    }
+}
+
+/// What the size found for a watch means: start or restart the watcher,
+/// close the float when it can't start, or nothing when the float moved on.
+pub fn on_observed(
+    m: &mut Model,
+    ticket: Ticket,
+    result: Result<Observation, String>,
+) -> Vec<Effect> {
+    let Some(watch) = m.watch_mut() else {
+        return Vec::new();
+    };
+    match watch.reply(ticket, result) {
+        Reply::Spawn(observation) => vec![Effect::Observe {
+            observation,
+            ticket,
+        }],
+        Reply::Failed(why) => {
+            if let Some(name) = m.peek_name().cloned() {
+                m.error(format!("couldn't peek at {name}: {why}"));
+            }
+            m.peek = None;
+            Vec::new()
+        }
+        Reply::Ignore => Vec::new(),
+    }
+}
+
+/// The watcher couldn't be started: answers the size request with a failure.
+pub fn observe_failed(m: &mut Model, ticket: Ticket, why: String) {
+    on_observed(m, ticket, Err(why));
+}
+
+/// The float's watcher ended on its own, so the float closes with it.
+pub fn watcher_ended(m: &mut Model) {
+    let Some((name, mut watcher)) = m.take_watcher() else {
+        return;
+    };
+    m.info(match watcher.term.exit_reason() {
+        Some(reason) => format!("peek at {name} ended: {reason}"),
+        None => format!("peek at {name} ended"),
+    });
+}
+
+/// The pane's connection ended on its own, so a float showing it closes
+/// with it.
+pub fn connection_ended(m: &mut Model) {
+    let Some(name) = m.pane.connection().map(|c| c.name.clone()) else {
+        return;
+    };
+    let peeked = matches!(m.peek, Some(Peek::Pane));
+    m.set_pane(Pane::Empty);
+    m.info(if peeked {
+        format!("peek at {name} ended")
+    } else {
+        format!("detached from {name}")
+    });
 }
 
 fn attach(m: &mut Model, name: SessionName, intent: Intent) -> Vec<Effect> {
@@ -581,7 +677,10 @@ fn attach(m: &mut Model, name: SessionName, intent: Intent) -> Vec<Effect> {
 fn empty_if_exited(m: &mut Model, name: &SessionName) -> bool {
     let exited = !m.attachable(name);
     if exited {
-        m.pane = Pane::Empty;
+        m.set_pane(Pane::Empty);
+        if m.peek_over(name) {
+            m.peek = None;
+        }
     }
     exited
 }
@@ -621,6 +720,12 @@ fn on_elsewhere(
         let company = sightings.get(&name).cloned().unwrap_or_default();
         m.record_company(&name, company);
     }
+    let mut effects = watch_looked(m);
+    effects.extend(pane_looked(m));
+    effects
+}
+
+fn pane_looked(m: &mut Model) -> Vec<Effect> {
     match &m.pane {
         Pane::Checking { name, then, .. } => {
             let (name, then) = (name.clone(), *then);
@@ -629,6 +734,11 @@ fn on_elsewhere(
         Pane::Elsewhere { name } if !m.company(name).is_elsewhere() => {
             let name = name.clone();
             reattach_preview(m, name)
+        }
+        Pane::Connected(c) if m.peek_client_squishes() => {
+            let name = c.name.clone();
+            m.set_pane(Pane::Elsewhere { name });
+            start_watching(m)
         }
         _ => Vec::new(),
     }
@@ -673,12 +783,9 @@ fn checked(m: &mut Model, name: SessionName, then: AfterCheck) -> Vec<Effect> {
     }
     match (m.company(&name).clone(), then) {
         (Company::Alone, _) => attach(m, name, then.intent()),
-        (Company::Elsewhere(_), AfterCheck::Preview) if m.peek.as_ref() == Some(&name) => {
-            attach(m, name, Intent::Preview)
-        }
         (Company::Elsewhere(_), AfterCheck::Preview) => {
-            m.pane = Pane::Elsewhere { name };
-            Vec::new()
+            m.set_pane(Pane::Elsewhere { name });
+            start_watching(m)
         }
         (Company::Elsewhere(_), AfterCheck::Activate) => stay_elsewhere(m, &name),
     }
@@ -687,24 +794,14 @@ fn checked(m: &mut Model, name: SessionName, then: AfterCheck) -> Vec<Effect> {
 /// Drops the client of a connection another window shares, once the keys are
 /// back in NAV and no peek needs it, so that window gets the full size.
 fn pause_if_elsewhere(m: &mut Model) {
-    let leaving = match &m.pane {
-        Pane::Connected(c)
-            if c.mode == Mode::Nav
-                && m.company(&c.name).is_elsewhere()
-                && m.peek.as_ref() != Some(&c.name) =>
-        {
-            Some(c.name.clone())
-        }
-        _ => None,
-    };
-    if let Some(name) = leaving {
-        m.pane = Pane::Elsewhere { name };
+    if let Some(name) = m.client_to_release() {
+        m.set_pane(Pane::Elsewhere { name });
     }
 }
 
 /// Leaves `name`, selected, to its other window and says how to take it.
 fn stay_elsewhere(m: &mut Model, name: &SessionName) -> Vec<Effect> {
-    m.pane = Pane::Elsewhere { name: name.clone() };
+    m.set_pane(Pane::Elsewhere { name: name.clone() });
     if m.cursor().and_then(Cursor::entry_name) != Some(name) {
         m.set_cursor(Cursor::Entry(name.clone()));
     }
@@ -773,7 +870,7 @@ fn preview(m: &mut Model) -> Option<Effect> {
         Some(name) if m.pane.session() == Some(&name) => None,
         Some(name) => Some(check_first(m, &name, AfterCheck::Preview)),
         None => {
-            m.pane = Pane::Empty;
+            m.set_pane(Pane::Empty);
             None
         }
     }
@@ -809,7 +906,7 @@ fn on_launched(m: &mut Model, ticket: Ticket, result: Result<Launch, String>) ->
             }]
         }
         Err(e) => {
-            m.pane.abandon(ticket);
+            m.abandon(ticket);
             m.follow = m.follow.take().filter(|f| {
                 !matches!(f, Follow::Submitted { ticket: t, .. } | Follow::Backgrounded { ticket: t, .. } if *t == ticket)
             });
@@ -1031,12 +1128,17 @@ fn look(m: &mut Model, after: Duration) -> Option<Job> {
             .and_then(|t| t.activity_view.looked.since)
             .is_some_and(|since| now.saturating_duration_since(since) >= after)
     });
-    let watching = m
-        .pane
-        .connection()
-        .filter(|c| now.saturating_duration_since(c.opened) >= after)
+    let shown = match &m.peek {
+        Some(Peek::Watch(Watch {
+            name,
+            view: WatchView::Watched(w),
+        })) => Some((name, w.opened)),
+        _ => m.pane.connection().map(|c| (&c.name, c.opened)),
+    };
+    let watching = shown
+        .filter(|(_, opened)| now.saturating_duration_since(*opened) >= after)
         .filter(|_| m.terminal_visible())
-        .map(|c| c.name.clone());
+        .map(|(name, _)| name.clone());
     let front = watching.or(steady).filter(|_| focused);
     if let Some(name) = &front {
         let wall = m.clock.wall;
@@ -1085,14 +1187,24 @@ fn forget_gone(m: &mut Model) {
             ));
         }
     }
-    if m.peek.as_ref().is_some_and(|name| !known.contains(name)) {
+    if m.peek_name().is_some_and(|name| !known.contains(name)) {
         m.peek = None;
+    }
+    // A watcher exiting with its session was only verified on one session host
+    // version, so the snapshot closes the float too.
+    let ended = match &m.peek {
+        Some(Peek::Watch(watch)) if !m.attachable(&watch.name) => Some(watch.name.clone()),
+        _ => None,
+    };
+    if let Some(name) = ended {
+        m.peek = None;
+        m.info(format!("peek at {name} ended"));
     }
     if m.pane
         .held_elsewhere()
         .is_some_and(|name| !known.contains(name))
     {
-        m.pane = Pane::Empty;
+        m.set_pane(Pane::Empty);
     }
     m.docs.forget(|name| known.contains(name));
 }
@@ -1273,7 +1385,7 @@ fn activate(m: &mut Model, name: &SessionName, intent: Intent) -> Vec<Effect> {
                 Intent::Activate | Intent::Preview => stay_elsewhere(m, name),
             };
         }
-        m.pane = Pane::Empty;
+        m.set_pane(Pane::Empty);
     }
     if m.pane.connection().is_some_and(|c| &c.name == name) {
         return enter_agent(m);
@@ -1314,11 +1426,11 @@ fn on_key(m: &mut Model, key: KeyEvent) -> Vec<Effect> {
         return on_overlay_key(m, key);
     }
     let nav = m.keys.nav();
-    if let Some(c) = m.pane.connection_mut().filter(|c| c.mode == Mode::Agent) {
+    if let Some(c) = m.pane.connection().filter(|c| c.mode == Mode::Agent) {
         if pressed(&key, nav) {
-            c.mode = Mode::Nav;
-            m.chord = Chord::Armed;
             let name = c.name.clone();
+            m.pane.set_nav();
+            m.chord = Chord::Armed;
             if m.selected_entry().is_none_or(|e| e.name() != &name) {
                 m.set_cursor(Cursor::Entry(name));
                 m.preview_at = None;
@@ -1345,7 +1457,7 @@ const SEND_MOVED: &str = "send is s now";
 /// The peek float reads the terminal and passes nothing to it.
 /// What `code` does in the peek, or `None` when nothing is bound to it.
 fn peek_command(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
-    let name = m.peek.clone()?;
+    let name = m.peek_name()?.clone();
     match code {
         KeyCode::Esc | KeyCode::Char('v') => m.peek = None,
         KeyCode::Char('s') => open_talk(m, &name),
@@ -2455,8 +2567,8 @@ fn open_talk(m: &mut Model, name: &SessionName) {
     }
 }
 
-/// Opens the peek float on the selected live agent. A paused one gets a
-/// client for as long as the float is open.
+/// Opens the peek float on the selected live agent, which the pane moves to
+/// first. A paused one is watched read-only for as long as the float is open.
 fn open_peek(m: &mut Model) -> Vec<Effect> {
     let Some(entry) = m.selected_entry() else {
         m.info("select an agent to peek at");
@@ -2465,18 +2577,24 @@ fn open_peek(m: &mut Model) -> Vec<Effect> {
     let name = entry.name().clone();
     match m.reach(entry) {
         reach if reach.is_attach() => {
-            m.peek = Some(name.clone());
-            if m.pane.held_elsewhere() == Some(&name) {
-                return attach(m, name, Intent::Preview);
-            }
+            let mut effects = Vec::new();
             if m.pane.session() != Some(&name) {
-                m.schedule_preview();
+                m.preview_at = None;
+                effects.push(check_first(m, &name, AfterCheck::Preview));
             }
+            m.peek = Some(Peek::Pane);
+            effects.extend(start_watching(m));
+            effects
         }
-        Reach::Own => m.info(format!("{name} is where this TUI runs")),
-        Reach::Other { .. } => m.info(format!("{name} isn't running · ⏎ starts it")),
+        Reach::Own => {
+            m.info(format!("{name} is where this TUI runs"));
+            Vec::new()
+        }
+        Reach::Other { .. } => {
+            m.info(format!("{name} isn't running · ⏎ starts it"));
+            Vec::new()
+        }
     }
-    Vec::new()
 }
 
 /// Queues a message for its agent and sends the first one that can go.
@@ -3015,7 +3133,7 @@ fn on_new_key(m: &mut Model, key: &KeyEvent) -> Vec<Effect> {
         // the agent previews once a refresh shows it.
         if key.code == KeyCode::Esc {
             let (ticket, name) = (*ticket, launch.session());
-            m.pane.abandon(ticket);
+            m.abandon(ticket);
             m.follow = Some(Follow::Backgrounded { name, ticket });
             m.overlay = Overlay::None;
         }
@@ -3112,10 +3230,10 @@ fn submit(m: &mut Model) -> Vec<Effect> {
         launch: launch.clone(),
     };
     let session = launch.session();
-    m.pane = Pane::Connecting {
+    m.set_pane(Pane::Connecting {
         name: session.clone(),
         ticket,
-    };
+    });
     m.launching.push((ticket, session.clone()));
     m.follow = Some(Follow::Submitted {
         name: session,
@@ -3130,7 +3248,7 @@ fn submit(m: &mut Model) -> Vec<Effect> {
 
 fn drop_connection_to(m: &mut Model, name: &SessionName) {
     if m.pane.session() == Some(name) {
-        m.pane = Pane::Empty;
+        m.set_pane(Pane::Empty);
     }
 }
 
@@ -3201,9 +3319,7 @@ fn on_lower_panel(
         }
         return Some(Vec::new());
     }
-    if let Some(c) = m.pane.connection_mut() {
-        c.mode = Mode::Nav;
-    }
+    m.pane.set_nav();
     if over_agent {
         let row = row_at(&m.areas.agent_rows);
         m.panel.leave_document();
@@ -3278,9 +3394,7 @@ fn on_mouse(m: &mut Model, mouse: MouseEvent) -> Vec<Effect> {
         return effects;
     }
     if clicked {
-        if let Some(c) = m.pane.connection_mut() {
-            c.mode = Mode::Nav;
-        }
+        m.pane.set_nav();
         let hit = m
             .areas
             .rows
@@ -7086,16 +7200,15 @@ mod tests {
         m.pane = Pane::Connected(crate::model::Connection {
             name: name(AGENT),
             term,
-            mode: Mode::Agent,
             opened: Instant::now(),
+            mode: Mode::Agent,
+            id: ClientId::new(1),
         });
         assert_eq!(
             replies(&report(&mut m, reported(done(), 0))),
             Vec::<String>::new()
         );
-        if let Some(c) = m.pane.connection_mut() {
-            c.mode = Mode::Nav;
-        }
+        m.pane.set_nav();
         assert_eq!(replies(&tick(&mut m)), ["rebase"], "resumes in NAV");
     }
 
@@ -7742,7 +7855,7 @@ mod tests {
             m.set_cursor(Cursor::Entry(name("auth-refresh-2")));
             update(&mut m, key(KeyCode::Char('2')));
             crate::fixtures::connect(&mut m, "obs-layout-4", Mode::Nav);
-            m.peek = Some(name("obs-layout-4"));
+            m.peek = Some(Peek::Pane);
             let base = m.clock;
             let at = |secs| Moment {
                 wall: base.wall + Duration::from_secs(secs),
@@ -7754,6 +7867,38 @@ mod tests {
             assert_eq!(seen(&mut m, "obs-layout-4"), Some(at(5).wall), "the pane");
             assert_eq!(seen(&mut m, "auth-refresh-2"), None, "covered by the peek");
         }
+    }
+
+    #[test]
+    fn a_watched_float_is_what_is_seen_even_when_the_pane_is_on_another_agent() {
+        let mut m = crate::fixtures::fleet(10);
+        m.set_cursor(Cursor::Entry(name("auth-refresh-2")));
+        update(&mut m, key(KeyCode::Char('2')));
+        crate::fixtures::connect(&mut m, "obs-layout-4", Mode::Nav);
+        crate::fixtures::watch(&mut m, "auth-refresh-2");
+        set_state(&mut m, "auth-refresh-2", done(), 1);
+        let base = m.clock;
+        let at = |secs| Moment {
+            wall: base.wall + Duration::from_secs(secs),
+            mono: base.mono + Duration::from_secs(secs),
+        };
+        tick_at(&mut m, at(0));
+        let effects = tick_at(&mut m, at(5));
+        let seen = |m: &mut Model, who: &str| m.track(&name(who)).activity_view.looked.seen;
+        assert_eq!(
+            seen(&mut m, "auth-refresh-2"),
+            Some(at(5).wall),
+            "the float"
+        );
+        assert_eq!(seen(&mut m, "obs-layout-4"), None, "the pane behind it");
+        let acknowledged: Vec<String> = effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::Job(Job::Acknowledge(who)) => Some(who.to_string()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(acknowledged, ["auth-refresh-2"]);
     }
 
     #[test]

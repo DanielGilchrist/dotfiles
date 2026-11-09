@@ -42,6 +42,15 @@ pub struct Modes {
     pub bracketed_paste: bool,
     pub mouse: MouseReporting,
     pub cursor_visible: bool,
+    pub screen: Screen,
+}
+
+/// Which of a terminal's two screens a program is drawing on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Screen {
+    #[default]
+    Main,
+    Alternate,
 }
 
 /// Parses program output into a screen. Implementations need not be `Send`:

@@ -3176,7 +3176,8 @@ mod tests {
             render(&mut m, (100, 30));
             m.areas.terminal
         };
-        m.peek = Some(name("obs-layout-4"));
+        crate::fixtures::connect(&mut m, "obs-layout-4", crate::model::Mode::Nav);
+        m.peek = Some(crate::model::Peek::Pane);
         let terminal = render(&mut m, (100, 30));
         let rows = screen(&terminal);
         let title = rows.iter().find(|r| r.contains("╔")).expect("a float");
@@ -3197,7 +3198,10 @@ mod tests {
         let mut m = fleet(10);
         m.set_cursor(Cursor::Entry(name("obs-layout-4")));
         m.record_company(&name("obs-layout-4"), crate::fixtures::in_nvim());
-        m.peek = Some(name("obs-layout-4"));
+        m.pane = crate::model::Pane::Elsewhere {
+            name: name("obs-layout-4"),
+        };
+        m.peek = Some(crate::model::Peek::Pane);
         let rows = screen(&render(&mut m, (100, 30)));
         let title = rows.iter().find(|r| r.contains("╔")).expect("a float");
         assert!(title.contains("⇄ in nvim"), "{title}");
@@ -3677,7 +3681,9 @@ mod tests {
             (Ctx::Main, reading_a_log),
             (Ctx::Peek, || {
                 let mut m = tree_fleet();
-                m.peek = Some(name("obs-layout-4"));
+                let selected = m.selected_entry().expect("an agent").name().clone();
+                crate::fixtures::connect(&mut m, selected.as_str(), crate::model::Mode::Nav);
+                m.peek = Some(crate::model::Peek::Pane);
                 m
             }),
         ];

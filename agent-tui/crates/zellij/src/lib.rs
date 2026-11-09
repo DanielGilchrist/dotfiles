@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io::Write;
+use std::num::NonZeroU16;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
@@ -9,7 +10,7 @@ use std::time::{Duration, SystemTime};
 use agent_core::model::Running;
 use agent_core::names::SessionName;
 use agent_core::ports::{
-    ClientControl, ClientId, HostError, PaneCommand, Place, SessionHost, SessionInfo,
+    ClientControl, ClientId, HostError, Observation, PaneCommand, Place, SessionHost, SessionInfo,
     SessionStatus, TerminalApp, Window,
 };
 use agent_core::process::{self, CommandError, LaunchSpec, parallel_map};
@@ -111,6 +112,40 @@ fn panes(name: &SessionName) -> Result<Vec<serde_json::Value>, HostError> {
 
 fn terminal_panes(panes: &[serde_json::Value]) -> impl Iterator<Item = &serde_json::Value> {
     panes.iter().filter(|p| p["is_plugin"] != true)
+}
+
+/// The size zellij draws a session at, from the display area of the active
+/// tab, else the first.
+fn display_size(tabs: &[serde_json::Value]) -> Option<(NonZeroU16, NonZeroU16)> {
+    let tab = tabs
+        .iter()
+        .find(|t| t["active"] == true)
+        .or_else(|| tabs.first())?;
+    let dimension = |key: &str| {
+        u16::try_from(tab[key].as_u64()?)
+            .ok()
+            .and_then(NonZeroU16::new)
+    };
+    Some((
+        dimension("display_area_columns")?,
+        dimension("display_area_rows")?,
+    ))
+}
+
+fn session_size(name: &SessionName) -> Result<(NonZeroU16, NonZeroU16), HostError> {
+    let mut cmd = session_cmd(name);
+    cmd.args(["action", "list-tabs", "--json"]);
+    let out = process::output_within(&mut cmd, PANE_QUERY_TIMEOUT)?;
+    if !out.status.success() {
+        return Err(process::failed(&cmd, &out).into());
+    }
+    let parse = |detail: String| CommandError::Parse {
+        command: process::describe(&cmd),
+        detail,
+    };
+    let tabs: Vec<serde_json::Value> =
+        serde_json::from_slice(&out.stdout).map_err(|e| parse(e.to_string()))?;
+    display_size(&tabs).ok_or_else(|| parse("no tab with a display area".into()).into())
 }
 
 /// Where zellij keeps resurrection layouts, from `zellij setup --check`.
@@ -523,6 +558,15 @@ impl SessionHost for Zellij {
         LaunchSpec::new("zellij").args(["attach", name.as_str()])
     }
 
+    fn observe(&self, name: &SessionName) -> Result<Observation, HostError> {
+        let (cols, rows) = session_size(name)?;
+        Ok(Observation {
+            spec: LaunchSpec::new("zellij").args(["watch", name.as_str()]),
+            cols,
+            rows,
+        })
+    }
+
     fn create(&self, name: &SessionName, pane: &PaneCommand) -> Result<LaunchSpec, HostError> {
         if list()?
             .iter()
@@ -722,6 +766,43 @@ mod tests {
 
     fn client(args: &str, name: &str) -> bool {
         attached_session(&args.split_whitespace().collect::<Vec<_>>()) == Some(name)
+    }
+
+    #[test]
+    fn a_watch_is_not_a_client_of_the_session_it_names() {
+        assert!(!client("watch fix", "fix"));
+        assert!(!client("w fix", "fix"));
+    }
+
+    #[test]
+    fn a_watcher_is_not_a_window_of_the_session_it_shows() {
+        let procs = table(&[
+            (10, 1, "fish"),
+            (11, 10, "zellij watch fix"),
+            (12, 10, "zellij w fix"),
+        ]);
+        assert_eq!(windows(&procs, None), Vec::<u32>::new());
+    }
+
+    #[test]
+    fn a_session_is_watched_at_its_active_tabs_display_area() {
+        let tabs: Vec<serde_json::Value> = serde_json::from_str(
+            r#"[{"active":false,"display_area_columns":90,"display_area_rows":30},
+                {"active":true,"display_area_columns":200,"display_area_rows":50}]"#,
+        )
+        .expect("succeeds");
+        let (cols, rows) = display_size(&tabs).expect("a size");
+        assert_eq!((cols.get(), rows.get()), (200, 50));
+    }
+
+    #[test]
+    fn a_session_with_no_tab_or_a_zero_display_area_has_no_size_to_watch_at() {
+        assert!(display_size(&[]).is_none());
+        let zero: Vec<serde_json::Value> = serde_json::from_str(
+            r#"[{"active":true,"display_area_columns":0,"display_area_rows":50}]"#,
+        )
+        .expect("succeeds");
+        assert!(display_size(&zero).is_none());
     }
 
     #[test]

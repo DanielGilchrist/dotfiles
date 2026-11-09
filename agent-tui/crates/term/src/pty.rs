@@ -7,10 +7,12 @@ use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system}
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 
-use crate::{Emulator, Modes, TermSize};
+use crate::{Emulator, Modes, Screen, TermSize};
 
 /// Output chunks buffered before the reader waits for the UI to catch up.
 const OUTPUT_BACKLOG: usize = 64;
+/// How much of the end of a program's output is kept to say why it ended.
+const TAIL_KEPT: usize = 512;
 /// Output parsed per frame, so a flood can't keep the UI from drawing.
 const PUMP_BUDGET: usize = 256 * 1024;
 
@@ -40,7 +42,8 @@ pub struct Terminal<E> {
     emulator: E,
     master: Box<dyn MasterPty + Send>,
     child: Option<Box<dyn Child + Send + Sync>>,
-    pid: Option<u32>,
+    pid: u32,
+    tail: Vec<u8>,
     input: Sender<Vec<u8>>,
     output: Receiver<Vec<u8>>,
     size: TermSize,
@@ -66,6 +69,9 @@ impl<E: Emulator> Terminal<E> {
         }
         let child = pair.slave.spawn_command(cmd).map_err(to_io)?;
         drop(pair.slave);
+        let pid = child
+            .process_id()
+            .ok_or_else(|| io::Error::other("the program has no process id"))?;
 
         let (output_tx, output) = mpsc::sync_channel(OUTPUT_BACKLOG);
         let reader = pair.master.try_clone_reader().map_err(to_io)?;
@@ -88,7 +94,8 @@ impl<E: Emulator> Terminal<E> {
         Ok(Self {
             emulator,
             master: pair.master,
-            pid: child.process_id(),
+            pid,
+            tail: Vec::new(),
             child: Some(child),
             input,
             output,
@@ -106,6 +113,11 @@ impl<E: Emulator> Terminal<E> {
                 Ok(bytes) => {
                     fed += bytes.len();
                     self.emulator.feed(&bytes);
+                    if self.emulator.modes().screen == Screen::Alternate {
+                        self.tail.clear();
+                    } else {
+                        keep_tail(&mut self.tail, &bytes);
+                    }
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
@@ -141,12 +153,84 @@ impl<E: Emulator> Terminal<E> {
         self.emulator.modes()
     }
 
-    pub fn pid(&self) -> Option<u32> {
+    pub fn pid(&self) -> u32 {
         self.pid
+    }
+
+    /// Why the program ended: the last thing it printed, or else its exit
+    /// status when that wasn't success.
+    pub fn exit_reason(&mut self) -> Option<String> {
+        if let Some(said) = last_line(&self.tail) {
+            return Some(said);
+        }
+        let status = self.child.as_mut()?.try_wait().ok().flatten()?;
+        (!status.success()).then(|| format!("exited with status {}", status.exit_code()))
     }
 
     pub fn render(&self, area: Rect, buf: &mut Buffer, show_cursor: bool) {
         self.emulator.render(area, buf, show_cursor);
+    }
+}
+
+/// Keeps the end of `tail`. A cut lands mid-sequence or mid-character, so
+/// what follows it up to the next line break or escape is dropped too.
+fn keep_tail(tail: &mut Vec<u8>, bytes: &[u8]) {
+    tail.extend_from_slice(bytes);
+    let excess = tail.len().saturating_sub(TAIL_KEPT);
+    if excess == 0 {
+        return;
+    }
+    let resume = tail[excess..]
+        .iter()
+        .position(|b| matches!(b, b'\n' | b'\r' | 0x1b))
+        .map_or(tail.len(), |at| excess + at);
+    tail.drain(..resume);
+}
+
+/// The last non-blank line of terminal output as a person would read it:
+/// escape sequences are left out, and only a carriage return, a newline or a
+/// cursor-moving sequence ends a line.
+fn last_line(bytes: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(bytes);
+    let mut lines = vec![String::new()];
+    let mut chars = text.chars();
+    let break_line = |lines: &mut Vec<String>| lines.push(String::new());
+    while let Some(c) = chars.next() {
+        match c {
+            '\u{1b}' => match chars.next() {
+                Some('[') => {
+                    let moves = chars
+                        .by_ref()
+                        .find(|c| ('@'..='~').contains(c))
+                        .is_some_and(|fin| "HfdABEFJ".contains(fin));
+                    if moves {
+                        break_line(&mut lines);
+                    }
+                }
+                Some(']' | 'P' | '_') => skip_string(&mut chars),
+                Some('(' | ')' | '*' | '+') => {
+                    chars.next();
+                }
+                _ => {}
+            },
+            '\r' | '\n' => break_line(&mut lines),
+            c if c.is_control() => {}
+            c => lines.last_mut().expect("a line").push(c),
+        }
+    }
+    lines
+        .iter()
+        .map(|line| line.trim())
+        .rfind(|line| !line.is_empty())
+        .map(String::from)
+}
+
+/// Skips to the end of an OSC, DCS or APC string: a bell or ESC `\`.
+fn skip_string(chars: &mut std::str::Chars<'_>) {
+    while let Some(c) = chars.next() {
+        if c == '\u{7}' || (c == '\u{1b}' && chars.next() == Some('\\')) {
+            return;
+        }
     }
 }
 
@@ -174,5 +258,64 @@ impl<E> Drop for Terminal<E> {
             let _ = child.kill();
             thread::spawn(move || child.wait());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TAIL_KEPT, keep_tail, last_line};
+
+    #[test]
+    fn the_last_words_of_a_program_are_its_last_non_blank_line_without_escapes() {
+        let out = b"\x1b[?1049l\x1b[m\x1b[?25h\x1b[20;1HLost connection to the Zellij server\r\n";
+        assert_eq!(
+            last_line(out).as_deref(),
+            Some("Lost connection to the Zellij server")
+        );
+    }
+
+    #[test]
+    fn output_of_only_escapes_says_nothing() {
+        assert_eq!(last_line(b"\x1b[2J\x1b]11;?\x1b\\\x1bP1\x1b\\"), None);
+    }
+
+    #[test]
+    fn colour_inside_a_line_does_not_split_it() {
+        assert_eq!(
+            last_line(b"\x1b[31mlost\x1b[0m connection\n").as_deref(),
+            Some("lost connection")
+        );
+    }
+
+    #[test]
+    fn a_charset_selection_leaves_no_stray_character() {
+        assert_eq!(last_line(b"\x1b(Bgone\x1b(0\n").as_deref(), Some("gone"));
+    }
+
+    #[test]
+    fn a_carriage_return_starts_a_new_line() {
+        assert_eq!(last_line(b"Loading\rDone\r\n").as_deref(), Some("Done"));
+    }
+
+    #[test]
+    fn other_control_characters_are_dropped() {
+        assert_eq!(last_line(b"a\x08b\x07c").as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn a_tail_cut_mid_sequence_resumes_at_the_next_line_break() {
+        let mut tail = Vec::new();
+        keep_tail(&mut tail, &vec![b'x'; TAIL_KEPT]);
+        keep_tail(&mut tail, b"\x1b[3");
+        keep_tail(&mut tail, b"1mred\r\nlast words");
+        assert_eq!(last_line(&tail).as_deref(), Some("last words"));
+        assert!(tail.len() <= TAIL_KEPT);
+    }
+
+    #[test]
+    fn a_tail_with_no_boundary_after_the_cut_is_dropped() {
+        let mut tail = Vec::new();
+        keep_tail(&mut tail, &vec![b'x'; TAIL_KEPT + 10]);
+        assert_eq!(tail, Vec::<u8>::new());
     }
 }

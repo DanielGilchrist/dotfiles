@@ -3,7 +3,7 @@ use ratatui::layout::Rect;
 use ratatui::widgets::Widget;
 use tui_term::widget::{Cursor, PseudoTerminal};
 
-use crate::{Emulator, Modes, MouseReporting, TermSize};
+use crate::{Emulator, Modes, MouseReporting, Screen, TermSize};
 
 pub struct Vt100(vt100::Parser);
 
@@ -37,6 +37,11 @@ impl Emulator for Vt100 {
                 MouseReporting::Off
             },
             cursor_visible: !screen.hide_cursor(),
+            screen: if screen.alternate_screen() {
+                Screen::Alternate
+            } else {
+                Screen::Main
+            },
         }
     }
 

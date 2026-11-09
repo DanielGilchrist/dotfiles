@@ -18,9 +18,9 @@ use crate::keymap::{self, Situation};
 use crate::model::{
     AgentStatus, Areas, Blocked, Confirm, Derived, Drawn, Enter, Field, Focus, FormKind, HelpState,
     Launchable, Load, Model, NameCheck, NameSource, NamingState, NewAgent, OfferEffect, Overlay,
-    Pane, Phase, Proposal, Pulse, Query, Reach, RepoInput, Row, Screen, StatusKind, Submission,
-    View, Waiting, Windows, WorkRoom, elsewhere_banner, elsewhere_note, fuzzy_match, invalid_chars,
-    repo_matches,
+    Pane, Peek, Phase, Proposal, Pulse, Query, Reach, RepoInput, Row, Screen, StatusKind,
+    Submission, View, Waiting, Watch, WatchView, Windows, WorkRoom, elsewhere_banner,
+    elsewhere_note, fuzzy_match, invalid_chars, repo_matches,
 };
 use crate::palette::Palette;
 use crate::update::{Pick, Picks, Unusable, picker_matches, switcher_matches};
@@ -1822,16 +1822,17 @@ fn draw_comment(
 /// The peek float: the agent's terminal at the pty's size, over everything
 /// else, which is dimmed. A pty bigger than the screen is cropped.
 fn draw_peek(frame: &mut Frame<'_>, m: &Model, terminal: Rect) {
-    let Some(name) = m.peek.as_ref().filter(|_| m.peeking()) else {
+    let (Some(peek), Some(name)) = (m.peek.as_ref().filter(|_| m.peeking()), m.peek_name()) else {
         return;
     };
+    let shown = shown(m, peek);
     let screen = frame.area();
     for cell in &mut frame.buffer_mut().content {
         cell.modifier.insert(Modifier::DIM);
     }
-    let size = match &m.pane {
-        Pane::Connected(c) if &c.name == name => Some(c.term.size()),
-        _ => None,
+    let size = match &shown {
+        Shown::Live(term) => Some(term.size()),
+        Shown::Watching | Shown::Attaching => None,
     };
     let (cols, rows) = size.map_or((terminal.width, terminal.height), |s| {
         (s.cols.get(), s.rows.get())
@@ -1879,19 +1880,48 @@ fn draw_peek(frame: &mut Frame<'_>, m: &Model, terminal: Rect) {
     }
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    match &m.pane {
-        Pane::Connected(c) if &c.name == name => {
-            if cropped {
-                render_bottom(&c.term, (cols, rows), inner, frame.buffer_mut());
-            } else {
-                c.term.render(inner, frame.buffer_mut(), false);
-            }
+    match shown {
+        Shown::Live(term) if cropped => {
+            render_bottom(term, (cols, rows), inner, frame.buffer_mut());
         }
-        _ => centered(
+        Shown::Live(term) => term.render(inner, frame.buffer_mut(), false),
+        Shown::Watching => centered(
+            frame,
+            inner,
+            vec![Line::styled(format!("watching {name}…"), dim())],
+        ),
+        Shown::Attaching => centered(
             frame,
             inner,
             vec![Line::styled(format!("attaching to {name}…"), dim())],
         ),
+    }
+}
+
+/// What the float has to show.
+enum Shown<'a> {
+    Live(&'a agent_term::Terminal<Box<dyn agent_term::Emulator>>),
+    Watching,
+    Attaching,
+}
+
+fn shown<'a>(m: &'a Model, peek: &'a Peek) -> Shown<'a> {
+    match peek {
+        Peek::Watch(Watch {
+            view: WatchView::Watched(watcher),
+            ..
+        }) => Shown::Live(&watcher.term),
+        Peek::Watch(Watch {
+            view: WatchView::Watching(_),
+            ..
+        }) => Shown::Watching,
+        Peek::Pane => match &m.pane {
+            Pane::Connected(c) => Shown::Live(&c.term),
+            Pane::Empty
+            | Pane::Checking { .. }
+            | Pane::Connecting { .. }
+            | Pane::Elsewhere { .. } => Shown::Attaching,
+        },
     }
 }
 

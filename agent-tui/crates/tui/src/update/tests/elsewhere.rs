@@ -1,8 +1,12 @@
 use super::*;
-use crate::fixtures::elsewhere_on;
 use crate::fixtures::sighted;
-use crate::model::{Intent, Need, Windows, elsewhere_banner, elsewhere_note};
+use crate::fixtures::{elsewhere_on, watch};
+use crate::model::{
+    AfterCheck, Intent, Need, Peek, WatchView, Windows, elsewhere_banner, elsewhere_note,
+};
+use agent_core::ports::Observation;
 use agent_core::ports::Place;
+use std::num::NonZeroU16;
 
 const SHARED: &str = "obs-layout-4";
 
@@ -481,33 +485,357 @@ fn a_window_that_opens_beside_a_preview_leaves_it_alone() {
     assert_eq!(m.pane.held_elsewhere(), Some(&name(SHARED)));
 }
 
+fn observe_job(effects: &[Effect]) -> Option<(SessionName, Ticket)> {
+    effects.iter().find_map(|e| match e {
+        Effect::Job(Job::Observe { name, ticket }) => Some((name.clone(), *ticket)),
+        _ => None,
+    })
+}
+
+fn observes(effects: &[Effect]) -> Vec<String> {
+    observe_job(effects)
+        .into_iter()
+        .map(|(name, _)| name.to_string())
+        .collect()
+}
+
+fn session_of(cols: u16, rows: u16) -> Observation {
+    Observation {
+        spec: agent_core::process::LaunchSpec::new("cat"),
+        cols: NonZeroU16::new(cols).expect("nonzero"),
+        rows: NonZeroU16::new(rows).expect("nonzero"),
+    }
+}
+
+fn answered(m: &mut Model, ticket: Ticket, result: Result<Observation, String>) -> Vec<Effect> {
+    update(m, Msg::Observed { ticket, result })
+}
+
+fn observed(m: &mut Model, effects: &[Effect]) -> Vec<Effect> {
+    let (_, ticket) = observe_job(effects).expect("an observe job");
+    answered(m, ticket, Ok(session_of(200, 50)))
+}
+
+/// The pane is paused on an agent another window shows, and the peek float
+/// over it is watching.
+fn watched_model() -> Model {
+    let mut m = held_elsewhere_model();
+    watch(&mut m, SHARED);
+    m
+}
+
+fn view(m: &Model) -> Option<&WatchView> {
+    match &m.peek {
+        Some(Peek::Watch(watch)) => Some(&watch.view),
+        Some(Peek::Pane) | None => None,
+    }
+}
+
 #[test]
-fn peeking_an_agent_open_elsewhere_holds_a_client_only_while_the_float_is_open() {
+fn peeking_an_agent_open_elsewhere_watches_it_instead_of_attaching_a_client() {
     let mut m = held_elsewhere_model();
     let effects = update(&mut m, key(KeyCode::Char('v')));
-    assert_eq!(attaches(&effects), [Intent::Preview]);
-    assert_eq!(m.peek, Some(name(SHARED)));
-    crate::fixtures::connect(&mut m, SHARED, Mode::Nav);
-    assert!(m.pane.connection().is_some(), "the float has its client");
-    update(&mut m, key(KeyCode::Char('v')));
+    assert_eq!(attaches(&effects), []);
+    assert_eq!(observes(&effects), [SHARED]);
+    assert!(matches!(view(&m), Some(WatchView::Watching(_))));
     assert_eq!(
         m.pane.held_elsewhere(),
         Some(&name(SHARED)),
-        "detached with the float"
+        "[0] keeps its banner"
     );
 }
 
 #[test]
-fn enter_in_a_peek_before_any_answer_never_enters_agent_on_an_agent_open_elsewhere() {
+fn the_size_found_for_a_peek_starts_a_watcher_at_that_size() {
+    let mut m = held_elsewhere_model();
+    let peeked = update(&mut m, key(KeyCode::Char('v')));
+    let effects = observed(&mut m, &peeked);
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Observe { observation, .. }]
+            if observation.cols.get() == 200 && observation.rows.get() == 50
+    ));
+}
+
+#[test]
+fn a_size_that_arrives_after_the_peek_closed_starts_nothing() {
+    let mut m = held_elsewhere_model();
+    let peeked = update(&mut m, key(KeyCode::Char('v')));
+    update(&mut m, key(KeyCode::Esc));
+    assert_eq!(observed(&mut m, &peeked).len(), 0);
+    assert!(m.peek.is_none());
+    assert_eq!(m.pane.held_elsewhere(), Some(&name(SHARED)));
+}
+
+#[test]
+fn a_size_for_an_older_peek_starts_nothing_in_a_newer_one() {
+    let mut m = held_elsewhere_model();
+    let first = update(&mut m, key(KeyCode::Char('v')));
+    update(&mut m, key(KeyCode::Esc));
+    update(&mut m, key(KeyCode::Char('v')));
+    assert_eq!(observed(&mut m, &first).len(), 0);
+    assert!(matches!(view(&m), Some(WatchView::Watching(_))));
+}
+
+#[test]
+fn a_session_that_cannot_be_watched_closes_the_peek_and_leaves_the_agent_paused() {
+    let mut m = held_elsewhere_model();
+    let peeked = update(&mut m, key(KeyCode::Char('v')));
+    let (_, ticket) = observe_job(&peeked).expect("an observe job");
+    let effects = answered(&mut m, ticket, Err("no tab".into()));
+    stays_held_elsewhere(&m, &effects, SHARED);
+    assert!(!m.peeking());
+    assert!(
+        m.status
+            .as_ref()
+            .is_some_and(|s| s.kind == StatusKind::Error
+                && s.text.contains("couldn't peek at obs-layout-4: no tab"))
+    );
+}
+
+#[test]
+fn closing_the_peek_drops_the_watcher_and_the_agent_stays_paused() {
+    let mut m = watched_model();
+    update(&mut m, key(KeyCode::Char('v')));
+    assert!(m.peek.is_none());
+    assert_eq!(m.pane.held_elsewhere(), Some(&name(SHARED)));
+}
+
+#[test]
+fn enter_in_a_watched_peek_leaves_the_agent_paused_and_never_enters_agent() {
     for code in [KeyCode::Enter, KeyCode::Char('i')] {
-        let mut m = held_elsewhere_model();
-        let peeked = update(&mut m, key(KeyCode::Char('v')));
-        assert_eq!(attaches(&peeked), [Intent::Preview]);
-        crate::fixtures::connect(&mut m, SHARED, Mode::Nav);
+        let mut m = watched_model();
         let effects = update(&mut m, key(code));
         stays_held_elsewhere(&m, &effects, SHARED);
         assert!(!m.peeking(), "{code:?}");
     }
+}
+
+#[test]
+fn enter_in_a_watched_peek_whose_other_window_has_gone_attaches() {
+    let mut m = watched_model();
+    m.record_company(&name(SHARED), Company::Alone);
+    let effects = update(&mut m, key(KeyCode::Enter));
+    assert_eq!(looks_asked(&effects), 1);
+    assert!(matches!(
+        m.pane,
+        Pane::Checking {
+            then: AfterCheck::Activate,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn the_watcher_goes_back_to_the_pane_and_a_client_attaches_when_the_other_window_goes() {
+    let mut m = watched_model();
+    recheck_elsewhere(&mut m);
+    let effects = crate::fixtures::sighted(&mut m, &[]);
+    assert_eq!(attaches(&effects), [Intent::Preview]);
+    assert!(matches!(m.peek, Some(Peek::Pane)));
+    assert!(m.peeking(), "the float stays open over the new client");
+}
+
+#[test]
+fn a_watcher_stays_while_the_other_window_is_still_there() {
+    let mut m = watched_model();
+    recheck_elsewhere(&mut m);
+    let effects = crate::fixtures::sighted(&mut m, &[(SHARED, crate::fixtures::in_nvim())]);
+    assert_eq!(attaches(&effects), []);
+    assert!(matches!(view(&m), Some(WatchView::Watched(_))));
+}
+
+#[test]
+fn a_look_while_watching_asks_for_the_size_again_once_at_a_time() {
+    let mut m = watched_model();
+    recheck_elsewhere(&mut m);
+    let first = crate::fixtures::sighted(&mut m, &[(SHARED, crate::fixtures::in_nvim())]);
+    assert_eq!(observes(&first), [SHARED]);
+    recheck_elsewhere(&mut m);
+    let second = crate::fixtures::sighted(&mut m, &[(SHARED, crate::fixtures::in_nvim())]);
+    assert_eq!(observes(&second), Vec::<String>::new(), "one is still out");
+}
+
+#[test]
+fn a_changed_size_restarts_the_watcher_and_an_unchanged_one_keeps_it() {
+    let mut m = watched_model();
+    recheck_elsewhere(&mut m);
+    let asked = crate::fixtures::sighted(&mut m, &[(SHARED, crate::fixtures::in_nvim())]);
+    let (_, ticket) = observe_job(&asked).expect("asked");
+    assert_eq!(answered(&mut m, ticket, Ok(session_of(200, 50))).len(), 0);
+    assert!(matches!(view(&m), Some(WatchView::Watched(_))), "same size");
+    recheck_elsewhere(&mut m);
+    let asked = crate::fixtures::sighted(&mut m, &[(SHARED, crate::fixtures::in_nvim())]);
+    let (_, ticket) = observe_job(&asked).expect("asked again");
+    let effects = answered(&mut m, ticket, Ok(session_of(120, 40)));
+    assert!(matches!(effects.as_slice(), [Effect::Observe { .. }]));
+    assert!(
+        matches!(view(&m), Some(WatchView::Watched(_))),
+        "the old watcher shows until the new one starts"
+    );
+}
+
+#[test]
+fn a_restarted_watcher_keeps_the_time_the_watch_first_opened() {
+    let mut m = watched_model();
+    let before = view(&m)
+        .and_then(|v| match v {
+            WatchView::Watched(w) => Some(w.opened),
+            WatchView::Watching(_) => None,
+        })
+        .expect("watched");
+    let later = later(&m, Duration::from_secs(60));
+    m.clock = later;
+    let size = |n| NonZeroU16::new(n).expect("nonzero");
+    let term = crate::fixtures::cat();
+    if let Some(watch) = m.watch_mut() {
+        watch.install(term, (size(120), size(40)), later.mono);
+    }
+    let after = view(&m).and_then(|v| match v {
+        WatchView::Watched(w) => Some((w.opened, w.seen)),
+        WatchView::Watching(_) => None,
+    });
+    assert_eq!(after, Some((before, (size(120), size(40)))));
+}
+
+#[test]
+fn a_float_over_the_pane_closes_when_the_pane_moves_to_another_agent() {
+    let mut m = crate::fixtures::fleet(10);
+    m.set_cursor(Cursor::Entry(name(SHARED)));
+    crate::fixtures::connect(&mut m, SHARED, Mode::Nav);
+    m.peek = Some(Peek::Pane);
+    m.set_pane(Pane::Elsewhere { name: name(SHARED) });
+    assert!(m.peek.is_some(), "the same session keeps it");
+    m.set_pane(Pane::Elsewhere {
+        name: name("auth-refresh-2"),
+    });
+    assert!(m.peek.is_none());
+}
+
+#[test]
+fn a_float_over_the_pane_closes_when_the_pane_empties() {
+    let mut m = crate::fixtures::fleet(10);
+    crate::fixtures::connect(&mut m, SHARED, Mode::Nav);
+    m.peek = Some(Peek::Pane);
+    m.set_pane(Pane::Empty);
+    assert!(m.peek.is_none());
+}
+
+#[test]
+fn a_watch_of_one_agent_does_not_follow_the_pane_to_another() {
+    let mut m = watched_model();
+    m.set_pane(Pane::Elsewhere {
+        name: name("auth-refresh-2"),
+    });
+    assert_eq!(m.peek_name(), Some(&name(SHARED)));
+}
+
+#[test]
+fn opening_a_peek_moves_the_pane_to_the_agent_first() {
+    let mut m = crate::fixtures::fleet(10);
+    m.set_cursor(Cursor::Entry(name(SHARED)));
+    crate::fixtures::connect(&mut m, "auth-refresh-2", Mode::Nav);
+    let effects = update(&mut m, key(KeyCode::Char('v')));
+    assert_eq!(checked_sessions(&m, &effects), [SHARED]);
+    assert_eq!(m.pane.session(), Some(&name(SHARED)));
+    assert!(matches!(m.peek, Some(Peek::Pane)));
+    assert!(m.peeking());
+}
+
+#[test]
+fn a_watch_whose_agent_the_snapshot_no_longer_lets_attach_closes_with_a_message() {
+    let mut m = crate::fixtures::fleet(10);
+    let exited = m
+        .snapshot()
+        .and_then(|s| {
+            s.entries()
+                .map(|(_, e)| e.name().clone())
+                .find(|n| !m.attachable(n))
+        })
+        .expect("an agent that isn't live");
+    watch(&mut m, exited.as_str());
+    forget_gone(&mut m);
+    assert!(m.peek.is_none());
+    assert!(m.status.as_ref().is_some_and(|s| s.text.ends_with("ended")));
+}
+
+#[test]
+fn a_failed_size_look_keeps_the_watcher_it_has() {
+    let mut m = watched_model();
+    recheck_elsewhere(&mut m);
+    let asked = crate::fixtures::sighted(&mut m, &[(SHARED, crate::fixtures::in_nvim())]);
+    let (_, ticket) = observe_job(&asked).expect("asked");
+    answered(&mut m, ticket, Err("busy".into()));
+    assert!(matches!(view(&m), Some(WatchView::Watched(_))));
+    assert!(m.status.is_none());
+}
+
+#[test]
+fn a_peek_closes_when_its_watcher_ends_and_says_so() {
+    let mut m = watched_model();
+    watcher_ended(&mut m);
+    assert!(!m.peeking());
+    assert_eq!(m.pane.held_elsewhere(), Some(&name(SHARED)));
+    assert!(
+        m.status
+            .as_ref()
+            .is_some_and(|s| s.text.starts_with("peek at obs-layout-4 ended"))
+    );
+}
+
+#[test]
+fn a_peek_closes_with_the_pane_connection_that_ends_instead_of_waiting_to_attach() {
+    let mut m = crate::fixtures::fleet(10);
+    m.set_cursor(Cursor::Entry(name(SHARED)));
+    crate::fixtures::connect(&mut m, SHARED, Mode::Nav);
+    m.peek = Some(crate::model::Peek::Pane);
+    connection_ended(&mut m);
+    assert!(!m.peeking());
+    assert!(matches!(m.pane, Pane::Empty));
+    assert!(
+        m.status
+            .as_ref()
+            .is_some_and(|s| s.text == "peek at obs-layout-4 ended")
+    );
+}
+
+#[test]
+fn a_window_that_opens_while_peeking_a_client_swaps_it_for_a_watcher() {
+    let mut m = crate::fixtures::fleet(10);
+    m.set_cursor(Cursor::Entry(name(SHARED)));
+    crate::fixtures::connect(&mut m, SHARED, Mode::Nav);
+    m.peek = Some(crate::model::Peek::Pane);
+    recheck_elsewhere(&mut m);
+    let effects = crate::fixtures::sighted(&mut m, &[(SHARED, crate::fixtures::in_nvim())]);
+    assert_eq!(observes(&effects), [SHARED]);
+    assert_eq!(
+        m.pane.held_elsewhere(),
+        Some(&name(SHARED)),
+        "the client is dropped"
+    );
+}
+
+#[test]
+fn a_peek_that_waits_on_the_check_watches_when_it_finds_another_window() {
+    let mut m = crate::fixtures::fleet(10);
+    m.set_cursor(Cursor::Entry(name(SHARED)));
+    update(&mut m, key(KeyCode::Char('v')));
+    previewed(&mut m);
+    let effects = crate::fixtures::sighted(&mut m, &[(SHARED, crate::fixtures::in_nvim())]);
+    assert_eq!(attaches(&effects), []);
+    assert_eq!(observes(&effects), [SHARED]);
+    assert_eq!(m.pane.held_elsewhere(), Some(&name(SHARED)));
+}
+
+#[test]
+fn a_peek_of_an_agent_nobody_else_shows_still_attaches_a_client() {
+    let mut m = crate::fixtures::fleet(10);
+    m.set_cursor(Cursor::Entry(name(SHARED)));
+    update(&mut m, key(KeyCode::Char('v')));
+    previewed(&mut m);
+    let effects = crate::fixtures::sighted(&mut m, &[]);
+    assert_eq!(attaches(&effects), [Intent::Preview]);
+    assert_eq!(observes(&effects), Vec::<String>::new());
 }
 
 #[test]

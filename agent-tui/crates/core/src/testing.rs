@@ -13,9 +13,9 @@ use crate::paths::{AgentWorktree, RepoRoot};
 use crate::ports::{
     AgentRecord, BranchLog, BranchState, Change, Checkout, ClientControl, Compared, DiffBase,
     Fetch, FileDiff, Forge, Harness, HarnessError, HarnessId, Harnesses, HostError, LaunchCtx,
-    Listing, LocalBranch, PaneCommand, PendingPrompt, PullRequestHead, RemoteBranch, RepoWorktrees,
-    Seen, SessionHost, SessionInfo, SessionStatus, Store, StoreError, Unlisting, Vcs,
-    WorktreeFacts, WorktreeStart,
+    Listing, LocalBranch, Observation, PaneCommand, PendingPrompt, PullRequestHead, RemoteBranch,
+    RepoWorktrees, Seen, SessionHost, SessionInfo, SessionStatus, Store, StoreError, Unlisting,
+    Vcs, WorktreeFacts, WorktreeStart,
 };
 use crate::process::{CommandError, LaunchSpec};
 
@@ -285,6 +285,14 @@ impl SessionHost for FakeHost {
 
     fn attach(&self, name: &SessionName) -> LaunchSpec {
         LaunchSpec::new("attach").arg(name.as_str())
+    }
+
+    fn observe(&self, name: &SessionName) -> Result<Observation, HostError> {
+        Ok(Observation {
+            spec: LaunchSpec::new("observe").arg(name.as_str()),
+            cols: std::num::NonZeroU16::new(80).expect("nonzero"),
+            rows: std::num::NonZeroU16::new(24).expect("nonzero"),
+        })
     }
 
     fn create(&self, name: &SessionName, pane: &PaneCommand) -> Result<LaunchSpec, HostError> {

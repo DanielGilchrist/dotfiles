@@ -15,7 +15,7 @@ use agent_core::names::{AgentName, Prompt, SessionName};
 use agent_core::ops::{self, Approved, Backend, Launch, RemovalPlan, Removed};
 use agent_core::paths::RepoRoot;
 use agent_core::ports::{
-    ActivityDetail, ClientId, FileDiff, HarnessId, HostError, Log, Place, Window,
+    ActivityDetail, ClientId, FileDiff, HarnessId, HostError, Log, Observation, Place, Window,
 };
 use crossterm::event::{KeyEvent, MouseEvent};
 
@@ -46,6 +46,11 @@ pub enum Msg {
     Launched {
         ticket: Ticket,
         result: Result<Launch, String>,
+    },
+    /// A session can be observed at this size, or why it can't.
+    Observed {
+        ticket: Ticket,
+        result: Result<Observation, String>,
     },
     RemovalPlanned {
         ticket: Ticket,
@@ -160,6 +165,11 @@ pub enum Job {
         harness: HarnessId,
         ticket: Ticket,
     },
+    /// Find the size to observe `name` at.
+    Observe {
+        name: SessionName,
+        ticket: Ticket,
+    },
     Kill(Running),
     /// `own` is the session the TUI runs in, never offered for killing.
     PlanRemoval {
@@ -209,6 +219,7 @@ impl Job {
             | Self::Select(_)
             | Self::CheckDir(_)
             | Self::CloseElsewhere { .. }
+            | Self::Observe { .. }
             | Self::Acknowledge(_)
             | Self::Reply { .. }
             | Self::Run { .. } => false,
@@ -817,6 +828,10 @@ fn run(backend: &Arc<Backend>, job: Job, msgs: &Sender<Msg>) -> Option<Msg> {
             let result = reply(svc, &to, &prompt, not_before);
             Msg::Sent { to, result }
         }
+        Job::Observe { name, ticket } => Msg::Observed {
+            ticket,
+            result: svc.host.observe(&name).map_err(|e| describe(&e)),
+        },
         Job::Kill(running) => Msg::Done(
             ops::kill(svc, &running)
                 .map(|()| Outcome::Killed(running.name().clone()))

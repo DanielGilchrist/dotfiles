@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fmt;
 use std::io;
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU16, NonZeroUsize};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::{Duration, SystemTime};
@@ -715,11 +715,23 @@ pub struct PaneCommand {
     pub cwd: PathBuf,
 }
 
+/// A read-only view of a live session. It isn't a client, so it resizes
+/// nothing, and it draws the session at the session's own size, so its
+/// terminal must be `cols` by `rows`.
+#[derive(Debug, Clone)]
+pub struct Observation {
+    pub spec: LaunchSpec,
+    pub cols: NonZeroU16,
+    pub rows: NonZeroU16,
+}
+
 /// Where agent sessions persist (zellij today).
 pub trait SessionHost: Send + Sync {
     fn sessions(&self) -> Result<Vec<SessionInfo>, HostError>;
     /// Attach to an existing (live or resurrectable) session in the foreground.
     fn attach(&self, name: &SessionName) -> LaunchSpec;
+    /// Observe a live session without joining it.
+    fn observe(&self, name: &SessionName) -> Result<Observation, HostError>;
     /// Create `name` running `pane`, replacing a dead session of the same
     /// name, and attach in the foreground.
     fn create(&self, name: &SessionName, pane: &PaneCommand) -> Result<LaunchSpec, HostError>;

@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU16, NonZeroUsize};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -15,8 +15,8 @@ use agent_core::names::{AgentName, BranchName, Checkout, Prompt, SessionName};
 use agent_core::ops::{Approved, Hazardous, RemovalPlan};
 use agent_core::paths::{RepoRoot, Typed, typed_path};
 use agent_core::ports::{
-    ActivityDetail, CallKind, Change, ClientId, FileState, HarnessId, Place, Progress, Readiness,
-    Uncommitted, WorktreeFacts,
+    ActivityDetail, CallKind, Change, ClientId, FileState, HarnessId, Observation, Place, Progress,
+    Readiness, Uncommitted, WorktreeFacts,
 };
 use agent_term::{Emulator, Terminal};
 use ratatui::layout::Rect;
@@ -589,11 +589,134 @@ pub enum CheckHealth {
     Failing,
 }
 
+/// A client of a session, sized to the pane, that keys can go to.
 pub struct Connection {
     pub name: SessionName,
     pub term: Terminal<Box<dyn Emulator>>,
     pub mode: Mode,
     pub opened: Instant,
+    /// The client as other windows' lookups know it, so it is never counted
+    /// as one of them.
+    pub id: ClientId,
+}
+
+/// The peek float. It shows whatever the pane is on, or a watcher of its
+/// own for a session whose client the TUI mustn't be.
+pub enum Peek {
+    Pane,
+    Watch(Watch),
+}
+
+pub struct Watch {
+    pub name: SessionName,
+    pub view: WatchView,
+}
+
+pub enum WatchView {
+    /// Waiting for the size to start the watcher at.
+    Watching(Ticket),
+    Watched(Watcher),
+}
+
+/// A read-only view of a session another window shows: no client, so the
+/// session isn't resized for it and no key reaches it.
+pub struct Watcher {
+    pub term: Terminal<Box<dyn Emulator>>,
+    pub opened: Instant,
+    /// The size the session host reported when it started, which a later look
+    /// compares to follow the other window being resized.
+    pub seen: (NonZeroU16, NonZeroU16),
+    pub measure: Measure,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Measure {
+    Idle,
+    Asked(Ticket),
+}
+
+/// What the answer to a size request means to a watch.
+pub enum Reply {
+    Spawn(Observation),
+    Failed(String),
+    Ignore,
+}
+
+impl Watch {
+    pub fn new(name: SessionName, ticket: Ticket) -> Self {
+        Self {
+            name,
+            view: WatchView::Watching(ticket),
+        }
+    }
+
+    /// The session the watch is waiting to (re)start for `ticket`.
+    pub fn awaiting(&self, ticket: Ticket) -> Option<&SessionName> {
+        let waiting = match &self.view {
+            WatchView::Watching(t) => *t == ticket,
+            WatchView::Watched(w) => w.measure == Measure::Asked(ticket),
+        };
+        waiting.then_some(&self.name)
+    }
+
+    /// Asks for the size again, unless a request is out.
+    pub fn measure(&mut self, ticket: Ticket) -> Option<&SessionName> {
+        match &mut self.view {
+            WatchView::Watched(w) if w.measure == Measure::Idle => {
+                w.measure = Measure::Asked(ticket);
+                Some(&self.name)
+            }
+            WatchView::Watching(_) | WatchView::Watched(_) => None,
+        }
+    }
+
+    pub fn reply(&mut self, ticket: Ticket, result: Result<Observation, String>) -> Reply {
+        match (&mut self.view, result) {
+            (WatchView::Watching(t), Ok(found)) if *t == ticket => Reply::Spawn(found),
+            (WatchView::Watching(t), Err(why)) if *t == ticket => Reply::Failed(why),
+            (WatchView::Watched(w), Ok(found))
+                if w.measure == Measure::Asked(ticket) && w.seen != (found.cols, found.rows) =>
+            {
+                Reply::Spawn(found)
+            }
+            (WatchView::Watched(w), _) if w.measure == Measure::Asked(ticket) => {
+                w.measure = Measure::Idle;
+                Reply::Ignore
+            }
+            _ => Reply::Ignore,
+        }
+    }
+
+    /// Shows `term`. A restart keeps the time the watch first opened.
+    pub fn install(
+        &mut self,
+        term: Terminal<Box<dyn Emulator>>,
+        seen: (NonZeroU16, NonZeroU16),
+        now: Instant,
+    ) {
+        match &mut self.view {
+            WatchView::Watching(_) => {
+                self.view = WatchView::Watched(Watcher {
+                    term,
+                    opened: now,
+                    seen,
+                    measure: Measure::Idle,
+                });
+            }
+            WatchView::Watched(w) => {
+                w.term = term;
+                w.seen = seen;
+                w.measure = Measure::Idle;
+            }
+        }
+    }
+
+    pub fn watcher_mut(&mut self) -> Option<&mut Watcher> {
+        match &mut self.view {
+            WatchView::Watched(w) => Some(w),
+            WatchView::Watching(_) => None,
+        }
+    }
 }
 
 /// The right-hand pane. Only a live connection takes keyboard input, so
@@ -634,6 +757,12 @@ impl Pane {
         }
     }
 
+    pub fn set_nav(&mut self) {
+        if let Some(c) = self.connection_mut() {
+            c.mode = Mode::Nav;
+        }
+    }
+
     pub fn session(&self) -> Option<&SessionName> {
         match self {
             Self::Empty => None,
@@ -660,17 +789,6 @@ impl Pane {
                 ticket: pending,
             } if *pending == ticket => Some(name),
             _ => None,
-        }
-    }
-
-    /// Stops waiting for `ticket`'s connection, if the pane still is.
-    pub fn abandon(&mut self, ticket: Ticket) {
-        if let Self::Connecting {
-            ticket: pending, ..
-        } = self
-            && *pending == ticket
-        {
-            *self = Self::Empty;
         }
     }
 }
@@ -1453,7 +1571,7 @@ pub struct Model {
     /// last message.
     pub activity_files: Option<ActivityFiles>,
     /// The agent whose terminal the peek float shows.
-    pub peek: Option<SessionName>,
+    pub peek: Option<Peek>,
     /// What the main view [0] reads when it isn't the terminal.
     pub docs: Documents,
     pub screen: Screen,
@@ -1735,6 +1853,78 @@ impl Model {
         let held = self.pane.held_elsewhere() == Some(name);
         let connected = self.pane.connection().is_some_and(|c| &c.name == name);
         (held || connected) && self.company(name).is_elsewhere()
+    }
+
+    /// The connection in NAV to a session another window shows: it squishes
+    /// that window, and the pane gives it up as soon as no peek needs it.
+    fn nav_client_elsewhere(&self) -> Option<&Connection> {
+        self.pane
+            .connection()
+            .filter(|c| c.mode == Mode::Nav && self.company(&c.name).is_elsewhere())
+    }
+
+    /// The session the peek float is over.
+    pub fn peek_name(&self) -> Option<&SessionName> {
+        match &self.peek {
+            Some(Peek::Pane) => self.pane.session(),
+            Some(Peek::Watch(watch)) => Some(&watch.name),
+            None => None,
+        }
+    }
+
+    pub fn peek_over(&self, name: &SessionName) -> bool {
+        self.peek_name() == Some(name)
+    }
+
+    /// The only way to change the pane, which closes a float showing it once
+    /// the pane is on another session or none.
+    pub fn set_pane(&mut self, pane: Pane) {
+        if matches!(self.peek, Some(Peek::Pane)) && self.pane.session() != pane.session() {
+            self.peek = None;
+        }
+        self.pane = pane;
+    }
+
+    /// Stops waiting for `ticket`'s connection, if the pane still is.
+    pub fn abandon(&mut self, ticket: Ticket) {
+        if self.pane.awaiting(ticket).is_some() {
+            self.set_pane(Pane::Empty);
+        }
+    }
+
+    pub fn watch_mut(&mut self) -> Option<&mut Watch> {
+        match &mut self.peek {
+            Some(Peek::Watch(watch)) => Some(watch),
+            Some(Peek::Pane) | None => None,
+        }
+    }
+
+    /// Closes the float and hands back its watcher.
+    pub fn take_watcher(&mut self) -> Option<(SessionName, Watcher)> {
+        match self.peek.take() {
+            Some(Peek::Watch(Watch {
+                name,
+                view: WatchView::Watched(watcher),
+            })) => Some((name, watcher)),
+            other => {
+                self.peek = other;
+                None
+            }
+        }
+    }
+
+    /// Whether the pane's client squishes another window only for the peek
+    /// over it, which a watcher can serve instead.
+    pub fn peek_client_squishes(&self) -> bool {
+        matches!(self.peek, Some(Peek::Pane)) && self.nav_client_elsewhere().is_some()
+    }
+
+    /// The session whose client the pane should give up now: one shared with
+    /// another window while no peek is over it.
+    pub fn client_to_release(&self) -> Option<SessionName> {
+        self.nav_client_elsewhere()
+            .filter(|c| !self.peek_over(&c.name))
+            .map(|c| c.name.clone())
     }
 
     /// The windows that squish what the TUI types into, while it is typing

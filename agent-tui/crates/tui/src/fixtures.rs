@@ -44,19 +44,38 @@ pub fn sighted(m: &mut Model, windows: &[(&str, Company)]) -> Vec<Effect> {
 
 /// A pty running `cat` as the pane's client for `agent`.
 pub fn connect(m: &mut Model, agent: &str, mode: Mode) {
+    m.pane = Pane::Connected(Connection {
+        name: name(agent),
+        term: cat(),
+        mode,
+        opened: std::time::Instant::now(),
+        id: agent_core::ports::ClientId::new(1),
+    });
+}
+
+pub fn cat() -> agent_term::Terminal<Box<dyn agent_term::Emulator>> {
     let size = agent_term::TermSize::of(ratatui::layout::Rect::new(0, 0, 80, 24)).expect("size");
-    let term = agent_term::Terminal::spawn(
+    agent_term::Terminal::spawn(
         &agent_core::process::LaunchSpec::new("cat"),
         size,
         Box::new(agent_term::Vt100::new(size)) as Box<dyn agent_term::Emulator>,
     )
-    .expect("a pty");
-    m.pane = Pane::Connected(Connection {
+    .expect("a pty")
+}
+
+/// The peek float watching `agent`'s session, which the other window shows
+/// at 200 by 50.
+pub fn watch(m: &mut Model, agent: &str) {
+    let size = |n| std::num::NonZeroU16::new(n).expect("nonzero");
+    m.peek = Some(crate::model::Peek::Watch(crate::model::Watch {
         name: name(agent),
-        term,
-        mode,
-        opened: std::time::Instant::now(),
-    });
+        view: crate::model::WatchView::Watched(crate::model::Watcher {
+            term: cat(),
+            opened: std::time::Instant::now(),
+            seen: (size(200), size(50)),
+            measure: crate::model::Measure::Idle,
+        }),
+    }));
 }
 
 /// A fleet with the cursor on `agent`, whose other window has the pane paused.
