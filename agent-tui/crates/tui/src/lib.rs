@@ -414,6 +414,12 @@ impl Runtime {
                 Effect::ReadActivity { name, workdir, at } => {
                     self.workers.read_activity(name, workdir, at);
                 }
+                Effect::ProbeTranscript {
+                    name,
+                    at,
+                    standing,
+                    seen,
+                } => self.workers.probe(name, at, standing, seen),
                 Effect::SuggestName {
                     prompt,
                     harness,

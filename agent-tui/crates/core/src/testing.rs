@@ -6,16 +6,16 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
 
-use crate::activity::{Activity, Reported};
+use crate::activity::{Activity, Going, Reported, Stopped, TranscriptRef};
 use crate::model::{Head, Running, Worktree};
 use crate::names::{BranchName, Prompt, PullRequest, SessionName};
 use crate::paths::{AgentWorktree, RepoRoot};
 use crate::ports::{
     AgentRecord, BranchLog, BranchState, Change, Checkout, ClientControl, Compared, DiffBase,
     Fetch, FileDiff, Forge, Harness, HarnessError, HarnessId, Harnesses, HostError, LaunchCtx,
-    Listing, LocalBranch, Observation, PaneCommand, PendingPrompt, PullRequestHead, RemoteBranch,
-    RepoWorktrees, Seen, SessionHost, SessionInfo, SessionStatus, Store, StoreError, Unlisting,
-    Vcs, WorktreeFacts, WorktreeStart,
+    Listing, LocalBranch, Observation, PaneCommand, PendingPrompt, Probe, PullRequestHead,
+    RemoteBranch, RepoWorktrees, Seen, SessionHost, SessionInfo, SessionStatus, Store, StoreError,
+    TranscriptStamp, Unlisting, Vcs, WorktreeFacts, WorktreeStart,
 };
 use crate::process::{CommandError, LaunchSpec};
 
@@ -415,6 +415,25 @@ impl Store for MemStore {
         Ok(())
     }
 
+    fn interrupt(
+        &self,
+        name: &SessionName,
+        proof: Going,
+        at: SystemTime,
+    ) -> Result<(), StoreError> {
+        if let Some(activity) = self.activities.lock().expect("lock").get_mut(name) {
+            *activity = activity.clone().interrupted(proof, at);
+        }
+        Ok(())
+    }
+
+    fn resume(&self, name: &SessionName, proof: Stopped) -> Result<(), StoreError> {
+        if let Some(activity) = self.activities.lock().expect("lock").get_mut(name) {
+            *activity = activity.clone().resumed(proof, SystemTime::now());
+        }
+        Ok(())
+    }
+
     fn activities(&self) -> Result<HashMap<SessionName, Activity>, StoreError> {
         Ok(self.activities.lock().expect("lock").clone())
     }
@@ -458,6 +477,8 @@ impl Store for MemStore {
 pub struct FakeHarness {
     id: HarnessId,
     pub active: AtomicBool,
+    /// What every probe of a transcript finds.
+    pub probe: Mutex<Probe>,
 }
 
 impl Default for FakeHarness {
@@ -465,6 +486,7 @@ impl Default for FakeHarness {
         Self {
             id: "fake".parse().expect("parses"),
             active: AtomicBool::new(false),
+            probe: Mutex::new(Probe::NoTranscript),
         }
     }
 }
@@ -491,6 +513,15 @@ impl Harness for FakeHarness {
 
     fn submit(&self, prompt: &Prompt) -> Vec<u8> {
         format!("{prompt}\r").into_bytes()
+    }
+
+    fn interruption(
+        &self,
+        _: &TranscriptRef,
+        _: SystemTime,
+        _: Option<&TranscriptStamp>,
+    ) -> Result<Probe, HarnessError> {
+        Ok(self.probe.lock().expect("lock").clone())
     }
 }
 

@@ -7,6 +7,8 @@ use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
+use crate::ports::Probe;
+
 /// No event for this long while working, with no tool running, looks stuck.
 /// Thinking through a long answer can go a few minutes without an event,
 /// and a running tool (a test suite, a build) can take as long as it likes.
@@ -122,6 +124,18 @@ pub struct Reported {
     /// Where the harness said the agent's transcript is, when the event
     /// carried it.
     pub transcript: Option<TranscriptRef>,
+    pub interrupts: InterruptSignal,
+}
+
+/// How the harness lets the TUI know the user interrupted an activity.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InterruptSignal {
+    /// It sends an event, so the TUI has nothing to look for.
+    #[default]
+    Reported,
+    /// Only the transcript shows it, which the TUI has to read.
+    Transcript,
 }
 
 impl Reported {
@@ -130,6 +144,7 @@ impl Reported {
             event: Event::Main(event.into()),
             lineage: Lineage::Untraced,
             transcript: None,
+            interrupts: InterruptSignal::Reported,
         }
     }
 
@@ -138,7 +153,14 @@ impl Reported {
             event: Event::Subagent(id, event.into()),
             lineage: Lineage::Untraced,
             transcript: None,
+            interrupts: InterruptSignal::Reported,
         }
+    }
+
+    #[must_use]
+    pub fn interrupted_in_transcript(mut self) -> Self {
+        self.interrupts = InterruptSignal::Transcript;
+        self
     }
 
     #[must_use]
@@ -324,7 +346,16 @@ pub enum State {
     Failed {
         reason: String,
     },
+    /// The user stopped the activity. It stays until the next prompt.
+    Interrupted,
     Exited,
+}
+
+impl State {
+    /// Working or delegating: the activity has more to do.
+    pub fn is_going(&self) -> bool {
+        matches!(self, Self::Working { .. } | Self::Delegating)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -502,6 +533,64 @@ impl Session {
     }
 }
 
+/// How many reports an activity had taken when a proof was made.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Revision(u64);
+
+/// Proof that an activity was going when its transcript was about to be
+/// read, and as of which report. Only [`Activity::going`] makes one, and
+/// only an activity still at that report takes what the read concluded, so
+/// a conclusion about an earlier turn can't change a later one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Going {
+    revision: Revision,
+    after: SystemTime,
+}
+
+/// The same for an activity that was interrupted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Stopped {
+    revision: Revision,
+    after: SystemTime,
+}
+
+/// What a transcript is read to find out about an activity, with the proof
+/// the answer is applied under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Standing {
+    /// Whether the user has interrupted it.
+    Going(Going),
+    /// Whether it has carried on after all.
+    Stopped(Stopped),
+}
+
+/// What an answer about a transcript does to the activity it was asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Move {
+    /// The user interrupted it, by the record written at the time given.
+    Interrupted(Going, SystemTime),
+    Resumed(Stopped),
+}
+
+impl Standing {
+    /// Records older than this say nothing about the activity as it stands.
+    pub fn after(self) -> SystemTime {
+        match self {
+            Self::Going(Going { after, .. }) | Self::Stopped(Stopped { after, .. }) => after,
+        }
+    }
+
+    /// How `probe` moves the activity this proves, if it does rather than
+    /// confirms it.
+    pub fn moved_by(self, probe: &Probe) -> Option<Move> {
+        match (self, probe) {
+            (Self::Going(proof), Probe::Interrupted(_, at)) => Some(Move::Interrupted(proof, *at)),
+            (Self::Stopped(proof), Probe::Going(_)) => Some(Move::Resumed(proof)),
+            _ => None,
+        }
+    }
+}
+
 /// An agent's state, since when, what it was last asked, and what it's
 /// waiting on.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -518,8 +607,9 @@ pub struct Activity {
     pub prompt_event: u64,
     /// When the harness last reported anything.
     pub heard: SystemTime,
-    /// Counts the harness's reports, so a view can show progress as it
-    /// happens.
+    /// Counts the harness's reports and the conclusions applied under a proof,
+    /// so a view can show progress as it happens and a proof can tell
+    /// whether anything has been applied since it was made.
     pub events: u64,
     /// Open questions, at most one per asker, oldest first.
     pub asks: Vec<Ask>,
@@ -527,6 +617,7 @@ pub struct Activity {
     pub session: Session,
     /// The latest transcript the harness reported.
     pub transcript: Option<TranscriptRef>,
+    pub interrupts: InterruptSignal,
 }
 
 /// How much earlier than a bound a launch may be recorded and still count
@@ -537,6 +628,43 @@ pub const LAUNCH_SLACK: Duration = Duration::from_secs(15);
 /// How long a session that just reported starting must stay quiet before
 /// typed text is safe: a startup dialog may be open without any report.
 pub const BOOT_QUIET: Duration = Duration::from_secs(5);
+
+/// How long after a tool starts typing waits. Its permission prompt is
+/// reported after the start, so until then a menu may be open that the
+/// activity doesn't show, and Enter would approve the tool.
+pub const TOOL_GRACE: Duration = Duration::from_millis(1500);
+
+/// Why text can't be typed into an agent yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Hold {
+    /// A question or permission menu is open, where typed text could pick
+    /// an option.
+    Asking,
+    /// The session only just reported starting, and a startup dialog may be
+    /// open without any report.
+    Booting,
+    /// Nothing has been reported since the session started, so the record
+    /// may be from an earlier run.
+    Unreported,
+    /// The harness reported the session over, so what's typed would reach
+    /// whatever is left in its terminal.
+    Ended,
+    /// A tool started a moment ago and a permission prompt for it may be
+    /// open without having been reported.
+    ToolStarting,
+}
+
+impl Hold {
+    /// What holds typing into the agent whose activity is `activity`, as far
+    /// as the activity shows. One that has reported nothing is unreported.
+    pub fn of(
+        activity: Option<&Activity>,
+        not_before: Option<SystemTime>,
+        now: SystemTime,
+    ) -> Option<Self> {
+        activity.map_or(Some(Self::Unreported), |a| a.hold(not_before, now))
+    }
+}
 
 impl Activity {
     /// Whether the user's prompt began an activity since `before`. A subagent
@@ -567,6 +695,7 @@ impl Activity {
                 join: Join::Untraced,
             },
             transcript: None,
+            interrupts: InterruptSignal::Reported,
         }
     }
 
@@ -583,6 +712,7 @@ impl Activity {
         if reported.transcript.is_some() {
             activity.transcript = reported.transcript;
         }
+        activity.interrupts = reported.interrupts;
         let answered = activity.answer(&reported.event);
         activity.apply(reported.event, answered, now);
         if !same_kind(&before, &activity.state) {
@@ -648,13 +778,7 @@ impl Activity {
                     self.prompt = Some(text);
                     self.prompts += 1;
                     self.prompt_event = self.events + 1;
-                    self.subagents
-                        .retain(|_, s| s.launch == Launch::Background && s.is_running());
-                    let subagents = &self.subagents;
-                    self.asks.retain(|ask| match &ask.asker {
-                        Origin::Subagent(id) => subagents.contains_key(id),
-                        Origin::Main => false,
-                    });
+                    self.keep_background();
                 }
                 State::Working { tools: Vec::new() }
             }
@@ -818,28 +942,61 @@ impl Activity {
             .map_or(Answer::AnyTool, |t| Answer::ToolEnding(t.id.clone()))
     }
 
+    /// Drops what only the foreground held: its subagents, and every question
+    /// except those of the background subagents still running.
+    fn keep_background(&mut self) {
+        self.subagents
+            .retain(|_, s| s.launch == Launch::Background && s.is_running());
+        let subagents = &self.subagents;
+        self.asks.retain(|ask| match &ask.asker {
+            Origin::Subagent(id) => subagents.contains_key(id),
+            Origin::Main => false,
+        });
+    }
+
     fn forget_subagents(&mut self) {
         self.subagents.clear();
         self.asks.clear();
     }
 
-    /// Its activity is over with nothing running and nothing asked, so nothing
-    /// can open a prompt that typed text would answer.
-    pub fn at_rest(&self) -> bool {
-        matches!(self.state, State::Idle | State::Done { .. })
-            && self.asks.is_empty()
-            && self.running() == 0
-    }
-
-    /// [`Self::at_rest`], the bound is met, and a session that only just
-    /// reported starting has had [`BOOT_QUIET`] to show a dialog.
-    pub fn ready_for_text(&self, not_before: Option<SystemTime>, now: SystemTime) -> bool {
-        self.at_rest()
-            && self.bound_met(not_before)
-            && !(self.session.is_booting()
-                && now
-                    .duration_since(self.heard)
-                    .is_ok_and(|quiet| quiet < BOOT_QUIET))
+    /// Why typing into the agent has to wait, if it does. Text typed
+    /// while a menu is open picks one of its options, so the agent is held
+    /// while a question is open, while the session is too new for its
+    /// reports to say, and just after a tool starts, since its permission
+    /// prompt is reported after the start. Working isn't a reason: the
+    /// harness queues what is typed mid-activity.
+    pub fn hold(&self, not_before: Option<SystemTime>, now: SystemTime) -> Option<Hold> {
+        if !self.bound_met(not_before) {
+            return Some(Hold::Unreported);
+        }
+        if matches!(self.state, State::Exited) {
+            return Some(Hold::Ended);
+        }
+        if !self.asks.is_empty() {
+            return Some(Hold::Asking);
+        }
+        let booting = match self.session {
+            Session::Launched { .. } => true,
+            Session::Booting { .. } => now
+                .duration_since(self.heard)
+                .is_ok_and(|quiet| quiet < BOOT_QUIET),
+            Session::LaunchReported { .. } | Session::Live { .. } => false,
+        };
+        if booting {
+            return Some(Hold::Booting);
+        }
+        let own = match &self.state {
+            State::Working { tools } => tools.as_slice(),
+            _ => &[],
+        };
+        let starting = own
+            .iter()
+            .chain(self.subagents.values().flat_map(Subagent::tools))
+            .any(|tool| {
+                !now.duration_since(tool.since)
+                    .is_ok_and(|age| age >= TOOL_GRACE)
+            });
+        starting.then_some(Hold::ToolStarting)
     }
 
     /// The record can't be from before the session `not_before` marks: it
@@ -877,6 +1034,60 @@ impl Activity {
             },
             _ => self,
         }
+    }
+
+    /// The proof to read its transcript for an interrupt, while it is going.
+    pub fn going(&self) -> Option<Going> {
+        self.state.is_going().then_some(Going {
+            revision: Revision(self.events),
+            after: self.since,
+        })
+    }
+
+    /// The proof to read its transcript for it carrying on, while it is
+    /// interrupted.
+    pub fn stopped(&self) -> Option<Stopped> {
+        matches!(self.state, State::Interrupted).then_some(Stopped {
+            revision: Revision(self.events),
+            after: self.since,
+        })
+    }
+
+    /// What its transcript is worth reading for, if anything.
+    pub fn standing(&self) -> Option<Standing> {
+        self.going()
+            .map(Standing::Going)
+            .or_else(|| self.stopped().map(Standing::Stopped))
+    }
+
+    /// The user interrupted the activity `proof` was made for, by the record
+    /// written at `at`, which is when it counts as interrupted. Reports and
+    /// applied conclusions are counted, so an activity still at the proof's
+    /// count has had none since, and nothing else moves a going activity on.
+    /// Any other activity is returned as it was.
+    #[must_use]
+    pub fn interrupted(mut self, proof: Going, at: SystemTime) -> Self {
+        if proof.revision != Revision(self.events) {
+            return self;
+        }
+        self.keep_background();
+        self.state = State::Interrupted;
+        self.since = at;
+        self.events += 1;
+        self
+    }
+
+    /// The interrupted activity `proof` was made for carried on after all,
+    /// under the same rule as [`Self::interrupted`].
+    #[must_use]
+    pub fn resumed(mut self, proof: Stopped, now: SystemTime) -> Self {
+        if proof.revision != Revision(self.events) {
+            return self;
+        }
+        self.state = State::Working { tools: Vec::new() };
+        self.since = now;
+        self.events += 1;
+        self
     }
 
     /// The tool most recently started, if any is running.
@@ -924,6 +1135,8 @@ struct Stored {
     #[serde(default)]
     transcript: Option<TranscriptRef>,
     #[serde(default)]
+    interrupts: InterruptSignal,
+    #[serde(default)]
     booting: bool,
     #[serde(default)]
     launcher: Option<u32>,
@@ -947,6 +1160,7 @@ struct Written {
     subagents: BTreeMap<AgentId, Subagent>,
     session: Session,
     transcript: Option<TranscriptRef>,
+    interrupts: InterruptSignal,
     booting: bool,
     launcher: Option<u32>,
     launched: Option<SystemTime>,
@@ -970,6 +1184,7 @@ impl From<Activity> for Written {
             subagents: activity.subagents,
             session: activity.session,
             transcript: activity.transcript,
+            interrupts: activity.interrupts,
             booting: activity.session.is_booting(),
             launcher,
             launched: activity.session.launched_at(),
@@ -1081,6 +1296,7 @@ impl From<Stored> for Activity {
             subagents,
             session,
             transcript,
+            interrupts,
             booting,
             launcher,
             launched,
@@ -1109,6 +1325,7 @@ impl From<Stored> for Activity {
             subagents,
             session: session.unwrap_or_else(|| legacy_session(booting, launcher, launched)),
             transcript,
+            interrupts,
         }
     }
 }
@@ -1139,6 +1356,7 @@ fn finish(state: State, id: &ToolId) -> State {
             State::Working { tools }
         }
         State::Delegating => State::Delegating,
+        State::Interrupted => State::Interrupted,
         State::Idle | State::Done { .. } | State::Failed { .. } | State::Exited => {
             State::Working { tools: Vec::new() }
         }
@@ -1675,6 +1893,7 @@ mod tests {
             State::Failed {
                 reason: "overloaded".into(),
             },
+            State::Interrupted,
             State::Exited,
         ];
         for state in states {
@@ -1696,14 +1915,16 @@ mod tests {
     #[test]
     fn text_waits_for_a_report_after_the_session_went_live() {
         let a = run(vec![(10, main(finished(&[])))]);
-        assert!(a.ready_for_text(None, at(11)));
-        assert!(a.ready_for_text(Some(at(9)), at(11)));
-        assert!(
-            !a.ready_for_text(Some(at(10)), at(11)),
+        assert_eq!(a.hold(None, at(11)), None);
+        assert_eq!(a.hold(Some(at(9)), at(11)), None);
+        assert_eq!(
+            a.hold(Some(at(10)), at(11)),
+            Some(Hold::Unreported),
             "heard at the bound"
         );
-        assert!(
-            !a.ready_for_text(Some(at(20)), at(30)),
+        assert_eq!(
+            a.hold(Some(at(20)), at(30)),
+            Some(Hold::Unreported),
             "a record from an earlier run"
         );
     }
@@ -1712,15 +1933,20 @@ mod tests {
     fn a_launch_at_or_after_the_bound_makes_the_record_its_own_authority() {
         let a = run(vec![(20, main(fresh(7))), (30, main(finished(&[])))]);
         assert!(a.session.launched_at().is_some());
-        assert!(a.ready_for_text(Some(at(25)), at(100)));
-        assert!(a.ready_for_text(Some(at(20 + LAUNCH_SLACK.as_secs())), at(100)));
-        assert!(
-            !a.ready_for_text(Some(at(500)), at(900)),
+        assert_eq!(a.hold(Some(at(25)), at(100)), None);
+        assert_eq!(a.hold(Some(at(20 + LAUNCH_SLACK.as_secs())), at(100)), None);
+        assert_eq!(
+            a.hold(Some(at(500)), at(900)),
+            Some(Hold::Unreported),
             "a launch far before the bound doesn't count"
         );
         let a = run(vec![(10, main(finished(&[])))]);
         assert!(a.session.launched_at().is_none());
-        assert!(!a.ready_for_text(Some(at(20)), at(1000)), "no lapse");
+        assert_eq!(
+            a.hold(Some(at(20)), at(1000)),
+            Some(Hold::Unreported),
+            "no lapse"
+        );
         assert!(!a.bound_met(Some(at(20))));
     }
 
@@ -1730,33 +1956,239 @@ mod tests {
             (10, main(finished(&[]))),
             (20, main(MainEvent::Started)),
         ]);
-        assert!(a.at_rest() && a.session.is_booting());
-        assert!(!a.ready_for_text(Some(at(15)), at(21)));
-        assert!(a.ready_for_text(Some(at(15)), at(20 + BOOT_QUIET.as_secs())));
+        assert!(matches!(a.state, State::Idle) && a.session.is_booting());
+        assert_eq!(a.hold(Some(at(15)), at(21)), Some(Hold::Booting));
+        assert_eq!(a.hold(Some(at(15)), at(20 + BOOT_QUIET.as_secs())), None);
         let a = run(vec![
             (20, main(MainEvent::Started)),
             (21, main(user("go"))),
             (22, main(finished(&[]))),
         ]);
         assert!(!a.session.is_booting());
-        assert!(a.ready_for_text(Some(at(15)), at(23)));
+        assert_eq!(a.hold(Some(at(15)), at(23)), None);
     }
 
     #[test]
-    fn a_launched_agent_is_busy_until_its_session_has_been_quiet() {
+    fn a_launched_agent_is_held_until_it_reports_however_long_that_takes() {
         let a = run(vec![(10, main(finished(&[]))), (20, main(fresh(7)))]);
-        assert!(!a.at_rest() && a.session.is_booting());
-        assert!(!a.ready_for_text(Some(at(15)), at(100)));
+        assert!(a.state.is_going() && a.session.is_booting());
+        assert_eq!(a.hold(Some(at(15)), at(100)), Some(Hold::Booting));
+        assert_eq!(a.hold(Some(at(15)), at(100_000)), Some(Hold::Booting));
         let a = run(vec![
             (10, main(finished(&[]))),
             (20, main(fresh(7))),
             (21, main(MainEvent::Started)),
         ]);
-        assert!(a.at_rest() && a.session.is_booting());
-        assert!(!a.ready_for_text(Some(at(15)), at(22)));
-        assert!(a.ready_for_text(Some(at(15)), at(21 + BOOT_QUIET.as_secs())));
+        assert!(matches!(a.state, State::Idle) && a.session.is_booting());
+        assert_eq!(a.hold(Some(at(15)), at(22)), Some(Hold::Booting));
+        assert_eq!(a.hold(Some(at(15)), at(21 + BOOT_QUIET.as_secs())), None);
         let a = run(vec![(10, main(finished(&[]))), (20, main(fresh(7)))]);
         assert!(a.asks.is_empty() && a.subagents.is_empty());
+    }
+
+    #[test]
+    fn a_working_agent_takes_text_because_the_harness_queues_it() {
+        let working = run(vec![(10, main(user("go"))), (11, main(MainEvent::Started))]);
+        let working = Activity::next(Some(working), main(user("go")), at(30));
+        assert!(matches!(working.state, State::Working { .. }));
+        assert_eq!(working.hold(None, at(31)), None);
+        let delegating = run(vec![(10, main(user("go"))), (11, main(finished(&["a"])))]);
+        assert!(matches!(delegating.state, State::Delegating));
+        assert_eq!(delegating.hold(None, at(100)), None);
+    }
+
+    #[test]
+    fn an_open_question_holds_the_text_whoever_asked() {
+        let asking = run(vec![(10, main(user("go"))), (11, main(asked("Bash: ls")))]);
+        assert_eq!(asking.hold(None, at(100)), Some(Hold::Asking));
+        let sub_asking = run(vec![
+            (10, main(user("go"))),
+            (11, sub("a", started())),
+            (12, sub("a", asked("Bash: ls"))),
+        ]);
+        assert_eq!(sub_asking.hold(None, at(100)), Some(Hold::Asking));
+        let answered = Activity::next(Some(asking), main(end("t")), at(101));
+        assert_eq!(answered.hold(None, at(102)), None);
+    }
+
+    #[test]
+    fn an_ended_session_holds_the_text_so_it_cannot_reach_a_shell() {
+        let ended = run(vec![(10, main(user("go"))), (11, main(MainEvent::Ended))]);
+        assert_eq!(ended.hold(None, at(100)), Some(Hold::Ended));
+    }
+
+    fn working_on_a_prompt() -> Activity {
+        run(vec![(10, main(user("go"))), (11, main(started_tool("t1")))])
+    }
+
+    fn started_tool(id: &str) -> Common {
+        Common::ToolStarted {
+            id: ToolId::new(id),
+            tool: "Bash".into(),
+            target: None,
+        }
+    }
+
+    fn interrupted(working: Activity) -> Activity {
+        let proof = working.going().expect("going");
+        working.interrupted(proof, at(20))
+    }
+
+    fn prompted_again(activity: Activity) -> Activity {
+        Activity::next(Some(activity), main(user("and another")), at(15))
+    }
+
+    #[test]
+    fn an_interrupt_proved_at_the_current_report_takes_a_working_agent_to_rest() {
+        let stopped = interrupted(working_on_a_prompt());
+        assert_eq!(stopped.state, State::Interrupted);
+        assert_eq!(stopped.since, at(20));
+        assert_eq!(stopped.hold(None, at(21)), None);
+    }
+
+    #[test]
+    fn a_delegating_agent_is_going_and_an_interrupt_ends_it() {
+        let delegating = run(vec![
+            (10, main(user("go"))),
+            (11, sub("a", launched("t"))),
+            (12, main(finished(&["a"]))),
+        ]);
+        assert!(matches!(delegating.state, State::Delegating));
+        assert_eq!(interrupted(delegating).state, State::Interrupted);
+    }
+
+    #[test]
+    fn an_interrupt_proved_before_a_newer_prompt_cannot_idle_the_newer_turn() {
+        let working = working_on_a_prompt();
+        let stale = working.going().expect("going");
+        let newer = prompted_again(working);
+        let after = newer.clone().interrupted(stale, at(20));
+        assert_eq!(after, newer, "unchanged");
+        assert!(matches!(after.state, State::Working { .. }));
+    }
+
+    #[test]
+    fn an_interrupt_proved_before_any_later_report_is_dropped_too() {
+        let working = working_on_a_prompt();
+        let stale = working.going().expect("going");
+        let later = Activity::next(Some(working), main(started_tool("t2")), at(15));
+        assert_eq!(later.clone().interrupted(stale, at(20)), later);
+    }
+
+    #[test]
+    fn only_a_going_activity_can_be_proved_going_and_only_an_interrupted_one_stopped() {
+        for state in [
+            State::Idle,
+            State::Done { summary: None },
+            State::Failed {
+                reason: "overloaded".into(),
+            },
+            State::Exited,
+        ] {
+            let mut resting = working_on_a_prompt();
+            resting.state = state;
+            assert_eq!(resting.standing(), None);
+        }
+        let working = working_on_a_prompt();
+        assert!(matches!(working.standing(), Some(Standing::Going(_))));
+        assert!(working.stopped().is_none());
+        let stopped = interrupted(working);
+        assert!(matches!(stopped.standing(), Some(Standing::Stopped(_))));
+        assert!(stopped.going().is_none());
+    }
+
+    #[test]
+    fn the_proof_says_from_when_a_transcript_record_counts() {
+        let working = working_on_a_prompt();
+        assert_eq!(working.standing().map(Standing::after), Some(at(10)));
+        let stopped = interrupted(working);
+        assert_eq!(stopped.standing().map(Standing::after), Some(at(20)));
+    }
+
+    #[test]
+    fn an_interrupt_closes_questions_and_foreground_subagents_but_not_background_ones() {
+        let working = run(vec![
+            (10, main(user("go"))),
+            (11, sub("fg", started())),
+            (
+                12,
+                Reported::subagent(
+                    AgentId::new("bg"),
+                    SubagentEvent::Launched {
+                        tool: ToolId::new("launch"),
+                        kind: "Explore".into(),
+                        description: "look".into(),
+                    },
+                ),
+            ),
+            (13, sub("fg", asked("Bash: ls"))),
+            (14, sub("bg", asked("Read"))),
+            (15, main(asked("Edit"))),
+        ]);
+        assert_eq!(working.asks.len(), 3);
+        let stopped = interrupted(working);
+        assert_eq!(
+            stopped
+                .subagents
+                .keys()
+                .map(AgentId::as_str)
+                .collect::<Vec<_>>(),
+            ["bg"]
+        );
+        assert_eq!(questions(&stopped), ["Read"]);
+        assert_eq!(stopped.running(), 1, "a background subagent still runs");
+    }
+
+    #[test]
+    fn a_tool_finishing_late_does_not_wake_an_interrupted_agent() {
+        let stopped = interrupted(working_on_a_prompt());
+        let late = Activity::next(Some(stopped), main(end("t1")), at(21));
+        assert_eq!(late.state, State::Interrupted);
+    }
+
+    #[test]
+    fn the_next_prompt_after_an_interrupt_starts_a_new_activity() {
+        let next = Activity::next(
+            Some(interrupted(working_on_a_prompt())),
+            main(user("try again")),
+            at(30),
+        );
+        assert!(matches!(next.state, State::Working { .. }));
+        assert_eq!(next.prompt.as_deref(), Some("try again"));
+    }
+
+    #[test]
+    fn an_interrupted_agent_goes_back_to_work_only_under_a_proof_that_is_still_current() {
+        let stopped = interrupted(working_on_a_prompt());
+        let proof = stopped.stopped().expect("stopped");
+        let resumed = stopped.clone().resumed(proof, at(40));
+        assert!(matches!(resumed.state, State::Working { ref tools } if tools.is_empty()));
+        assert_eq!(resumed.since, at(40));
+        let moved_on = Activity::next(Some(stopped), main(user("again")), at(35));
+        assert_eq!(moved_on.clone().resumed(proof, at(40)), moved_on);
+    }
+
+    #[test]
+    fn typing_waits_a_moment_after_a_tool_starts_for_its_permission_prompt() {
+        let working = working_on_a_prompt();
+        let started = at(11);
+        assert_eq!(working.hold(None, started), Some(Hold::ToolStarting));
+        assert_eq!(
+            working.hold(None, started + TOOL_GRACE - Duration::from_millis(1)),
+            Some(Hold::ToolStarting)
+        );
+        assert_eq!(working.hold(None, started + TOOL_GRACE), None);
+    }
+
+    #[test]
+    fn a_subagents_tool_starting_holds_typing_too() {
+        let working = run(vec![
+            (10, main(user("go"))),
+            (11, sub("a", started())),
+            (12, sub("a", started_tool("s1"))),
+        ]);
+        assert_eq!(working.hold(None, at(12)), Some(Hold::ToolStarting));
+        assert_eq!(working.hold(None, at(12) + TOOL_GRACE), None);
     }
 
     #[test]
@@ -1771,19 +2203,19 @@ mod tests {
             (20, main(fresh(7))),
             (21, from(&[99, 98], finished(&[]))),
         ]);
-        assert!(!a.at_rest() && a.session.is_booting());
+        assert!(a.state.is_going() && a.session.is_booting());
         assert_eq!(a.heard, at(20));
         let a = run(vec![
             (20, main(fresh(7))),
             (21, from(&[50, 7, 3], MainEvent::Started)),
         ]);
-        assert!(a.at_rest());
+        assert!(matches!(a.state, State::Idle));
     }
 
     #[test]
     fn untraceable_or_unrecorded_reports_are_accepted() {
         let a = run(vec![(20, main(fresh(7))), (21, main(MainEvent::Started))]);
-        assert!(a.at_rest(), "no lineage");
+        assert!(matches!(a.state, State::Idle), "no lineage");
         let a = run(vec![
             (20, main(untraced())),
             (
@@ -1791,34 +2223,12 @@ mod tests {
                 main(MainEvent::Started).from_lineage(Lineage::Traced(vec![pid(99)])),
             ),
         ]);
-        assert!(a.at_rest(), "reattached session");
+        assert!(matches!(a.state, State::Idle), "reattached session");
         let a = run(vec![(
             21,
             main(MainEvent::Started).from_lineage(Lineage::Traced(vec![pid(99)])),
         )]);
-        assert!(a.at_rest(), "old record");
-    }
-
-    #[test]
-    fn only_a_finished_activity_with_nothing_running_is_at_rest() {
-        assert!(run(vec![(0, main(finished(&[])))]).at_rest());
-        assert!(!run(vec![(0, main(user("go")))]).at_rest(), "working");
-        assert!(
-            !run(vec![
-                (0, sub("a", launched("t"))),
-                (1, main(finished(&["a"])))
-            ])
-            .at_rest(),
-            "delegating"
-        );
-        assert!(
-            !run(vec![
-                (0, main(finished(&[]))),
-                (1, main(asked("Which DB?")))
-            ])
-            .at_rest(),
-            "asking"
-        );
+        assert!(matches!(a.state, State::Idle), "old record");
     }
 
     #[test]

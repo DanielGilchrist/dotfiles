@@ -20,7 +20,7 @@ use crate::model::{
     Launchable, Load, Model, NameCheck, NameSource, NamingState, NewAgent, OfferEffect, Overlay,
     Pane, Peek, Phase, Proposal, Pulse, Query, Reach, RepoInput, Row, Screen, StatusKind,
     Submission, View, Waiting, Watch, WatchView, Windows, WorkRoom, elsewhere_banner,
-    elsewhere_note, fuzzy_match, invalid_chars, repo_matches,
+    elsewhere_note, fuzzy_match, held, invalid_chars, repo_matches,
 };
 use crate::palette::Palette;
 use crate::update::{Pick, Picks, Unusable, picker_matches, switcher_matches};
@@ -177,6 +177,7 @@ fn glyph(status: &AgentStatus, now: SystemTime) -> Span<'static> {
         AgentStatus::Asking { .. } => Span::styled("◆", warning().add_modifier(Modifier::BOLD)),
         AgentStatus::Failed { .. } => Span::styled("!", error().add_modifier(Modifier::BOLD)),
         AgentStatus::Done { .. } => Span::styled("✓", success().add_modifier(Modifier::BOLD)),
+        AgentStatus::Interrupted { .. } => Span::styled("■", dim()),
     }
 }
 
@@ -187,7 +188,9 @@ fn name_style(status: &AgentStatus, selected: bool) -> Style {
         AgentStatus::Asking { .. } | AgentStatus::Failed { .. } | AgentStatus::Done { .. } => {
             Style::new().add_modifier(Modifier::BOLD)
         }
-        AgentStatus::Idle | AgentStatus::Working { .. } => Style::new(),
+        AgentStatus::Idle | AgentStatus::Working { .. } | AgentStatus::Interrupted { .. } => {
+            Style::new()
+        }
     };
     if selected {
         base.add_modifier(Modifier::BOLD)
@@ -1703,27 +1706,19 @@ fn draw_talk(frame: &mut Frame<'_>, m: &Model, to: &SessionName, text: &str) {
     .unwrap_or(3);
     let area = centred(frame, 72, height);
     clear_around(frame, area);
-    let ready = m.ready_for_text(to);
-    let verb = if draft.is_empty() {
-        "send"
+    let (what, verb) = if draft.is_empty() {
+        ("Send", "send")
     } else {
-        "send review"
+        ("Send review", "send review")
     };
-    let hint_keys: &[(&str, &str)] = match (ready, queued.is_empty()) {
-        (true, true) => &[("⏎", verb), ("Esc", "close")],
-        (_, true) => &[("⏎", "queue"), ("Esc", "close")],
-        (_, false) => &[("⏎", "queue"), ("⌃X", "clear queue"), ("Esc", "close")],
+    let (title, verb) = match m.hold(to) {
+        None => (format!("{what} to {to}"), verb),
+        Some(hold) => (format!("{what} to {to} · {}", held(hold)), "hold"),
     };
-    let title = if !draft.is_empty() && ready {
-        format!("Send review to {to}")
-    } else if !draft.is_empty() {
-        format!("Send review to {to} · queues until it's at rest")
-    } else if ready {
-        format!("Send to {to}")
-    } else if m.awaiting_report(to) {
-        format!("Send to {to} · queues until it reports")
+    let hint_keys: &[(&str, &str)] = if queued.is_empty() {
+        &[("⏎", verb), ("Esc", "close")]
     } else {
-        format!("Send to {to} · queues until it's at rest")
+        &[("⏎", verb), ("⌃X", "clear queue"), ("Esc", "close")]
     };
     let block = overlay_block(&title, hints(hint_keys), dim());
     let inner = block.inner(area);

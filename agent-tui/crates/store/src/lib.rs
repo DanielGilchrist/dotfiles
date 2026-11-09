@@ -4,7 +4,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use agent_core::activity::{Activity, Reported};
+use agent_core::activity::{Activity, Going, Reported, Stopped};
 use agent_core::names::SessionName;
 use agent_core::paths::{PathError, RepoRoot, home};
 use agent_core::ports::{AgentRecord, Listing, Store, StoreError, Unlisting};
@@ -20,6 +20,22 @@ pub struct FsStore {
 }
 
 impl FsStore {
+    /// Replaces `name`'s activity with what `change` makes of it, if it has
+    /// one.
+    fn rewrite(
+        &self,
+        name: &SessionName,
+        change: impl FnOnce(Activity) -> Activity,
+    ) -> Result<(), StoreError> {
+        let _lock = self.lock()?;
+        let path = self.activity_path(name);
+        let Some(activity) = Self::read_activity(&path)? else {
+            return Ok(());
+        };
+        let json = serde_json::to_vec(&change(activity)).expect("activity serializes");
+        write_atomic(&path, &json)
+    }
+
     pub fn new(dir: PathBuf) -> Self {
         Self { dir }
     }
@@ -330,14 +346,20 @@ impl Store for FsStore {
     }
 
     fn acknowledge(&self, name: &SessionName) -> Result<(), StoreError> {
-        let _lock = self.lock()?;
-        let path = self.activity_path(name);
-        let Some(activity) = Self::read_activity(&path)? else {
-            return Ok(());
-        };
-        let json = serde_json::to_vec(&activity.acknowledged(SystemTime::now()))
-            .expect("activity serializes");
-        write_atomic(&path, &json)
+        self.rewrite(name, |activity| activity.acknowledged(SystemTime::now()))
+    }
+
+    fn interrupt(
+        &self,
+        name: &SessionName,
+        proof: Going,
+        at: SystemTime,
+    ) -> Result<(), StoreError> {
+        self.rewrite(name, |activity| activity.interrupted(proof, at))
+    }
+
+    fn resume(&self, name: &SessionName, proof: Stopped) -> Result<(), StoreError> {
+        self.rewrite(name, |activity| activity.resumed(proof, SystemTime::now()))
     }
 
     /// Unreadable files (corrupt, or from an older format) are left out
@@ -487,6 +509,41 @@ mod tests {
         let log = std::fs::read_to_string(dir.path().join("errors.log")).expect("logged");
         assert_eq!(log.lines().count(), 2, "{log}");
         assert!(log.starts_with('[') && log.contains("a.json"), "{log}");
+    }
+
+    #[test]
+    fn an_interrupt_is_written_only_for_the_activity_it_was_proved_for_and_can_be_undone() {
+        use agent_core::activity::{Input, MainEvent, State};
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let store = FsStore::new(dir.path().to_path_buf());
+        let prompt = || Reported::main(MainEvent::Prompted(Input::User("go".into())));
+        let state = || store.activities().expect("reads")[&name("a")].state.clone();
+        store.report(&name("a"), prompt()).expect("reports");
+        let stale = store.activities().expect("reads")[&name("a")]
+            .going()
+            .expect("going");
+        store.report(&name("a"), prompt()).expect("reports");
+        store
+            .interrupt(&name("a"), stale, SystemTime::now())
+            .expect("succeeds");
+        assert!(matches!(state(), State::Working { .. }));
+
+        let current = store.activities().expect("reads")[&name("a")]
+            .going()
+            .expect("going");
+        store
+            .interrupt(&name("a"), current, SystemTime::now())
+            .expect("succeeds");
+        assert_eq!(state(), State::Interrupted);
+
+        let stopped = store.activities().expect("reads")[&name("a")]
+            .stopped()
+            .expect("stopped");
+        store.resume(&name("a"), stopped).expect("succeeds");
+        assert!(matches!(state(), State::Working { .. }));
+        store
+            .resume(&name("never-reported"), stopped)
+            .expect("nothing to change is fine");
     }
 
     #[test]

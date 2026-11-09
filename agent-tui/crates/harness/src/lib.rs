@@ -10,7 +10,7 @@ use agent_core::activity::{
 use agent_core::names::Prompt;
 use agent_core::ports::{
     ActivityDetail, Harness, HarnessError, HarnessId, Harnesses, LaunchCtx, Log, Outcome,
-    PendingPrompt, Seen, ends_with_report,
+    PendingPrompt, Probe, PromptKind, Seen, TranscriptStamp, ends_with_report,
 };
 use agent_core::process::{LaunchSpec, quiet};
 use serde::Deserialize;
@@ -216,6 +216,17 @@ impl Claude {
         Ok(newest.map(|(_, path)| path))
     }
 
+    /// The transcript file `at` names, if it is one under the projects
+    /// directory.
+    fn named_transcript(&self, at: &TranscriptRef) -> Option<PathBuf> {
+        let projects = self.projects.canonicalize().ok()?;
+        at.path()
+            .canonicalize()
+            .ok()
+            .filter(|path| path.extension().is_some_and(|e| e == "jsonl") && path.is_file())
+            .filter(|path| path.starts_with(&projects))
+    }
+
     /// The transcript of the agent's current conversation: the one the hooks
     /// named, if it is a transcript file under the projects directory, and
     /// otherwise the one
@@ -225,11 +236,7 @@ impl Claude {
         workdir: &Path,
         at: Option<&TranscriptRef>,
     ) -> io::Result<Option<PathBuf>> {
-        let projects = self.projects.canonicalize().ok();
-        let named = at
-            .and_then(|at| at.path().canonicalize().ok())
-            .filter(|path| path.extension().is_some_and(|e| e == "jsonl") && path.is_file())
-            .filter(|path| projects.as_ref().is_some_and(|dir| path.starts_with(dir)));
+        let named = at.and_then(|at| self.named_transcript(at));
         if named.is_some() {
             return Ok(named);
         }
@@ -328,7 +335,7 @@ impl Harness for Claude {
     }
 
     fn event(&self, payload: &str) -> Option<Reported> {
-        claude_event(payload)
+        claude_event(payload).map(Reported::interrupted_in_transcript)
     }
 
     fn acknowledged(
@@ -411,9 +418,51 @@ impl Harness for Claude {
         activity::read(&file).map_err(context)
     }
 
+    fn interruption(
+        &self,
+        at: &TranscriptRef,
+        after: SystemTime,
+        seen: Option<&TranscriptStamp>,
+    ) -> Result<Probe, HarnessError> {
+        let context = |source| HarnessError {
+            context: "checking the transcript for an interrupt".into(),
+            source,
+        };
+        let Some(path) = self.named_transcript(at) else {
+            return Ok(Probe::NoTranscript);
+        };
+        let meta = std::fs::metadata(&path).map_err(context)?;
+        let stamp = TranscriptStamp::new(meta.len(), meta.modified().ok());
+        if seen == Some(&stamp) {
+            return Ok(Probe::Unchanged);
+        }
+        let mut file = std::fs::File::open(&path).map_err(context)?;
+        let mut window = PROBE_BYTES;
+        loop {
+            let tail = read_tail(&mut file, meta.len(), window, TAIL_BYTES).map_err(context)?;
+            if transcript::unfinished(tail.text()) {
+                return Ok(Probe::Unchanged);
+            }
+            match transcript::last_conversational(tail.text()) {
+                Some(last) => return Ok(verdict(last, after, stamp)),
+                None if tail.reaches_start() => return Ok(Probe::Older(stamp)),
+                None if window >= TAIL_BYTES => return Ok(Probe::Unchanged),
+                None => window = (window * 4).min(TAIL_BYTES),
+            }
+        }
+    }
+
     /// Bracketed paste keeps a multi-line prompt as one message; Enter submits it.
     fn submit(&self, prompt: &Prompt) -> Vec<u8> {
         format!("\x1b[200~{prompt}\x1b[201~\r").into_bytes()
+    }
+
+    fn prompt_kind(&self, prompt: &Prompt) -> PromptKind {
+        if prompt.as_str().starts_with(['/', '!']) {
+            PromptKind::Command
+        } else {
+            PromptKind::Message
+        }
     }
 }
 
@@ -440,6 +489,15 @@ impl Harnesses for Registry {
 
     fn all(&self) -> Vec<&dyn Harness> {
         vec![&self.claude]
+    }
+}
+
+/// What the newest conversational record says, if it is later than `after`.
+fn verdict(last: transcript::Last, after: SystemTime, stamp: TranscriptStamp) -> Probe {
+    match (last.beat, last.at) {
+        (transcript::Beat::Interrupt, Some(at)) if at > after => Probe::Interrupted(stamp, at),
+        (transcript::Beat::Work, Some(at)) if at > after => Probe::Going(stamp),
+        _ => Probe::Older(stamp),
     }
 }
 
@@ -703,6 +761,14 @@ fn snippet(text: &str) -> String {
 fn long(text: &str) -> String {
     text.trim().chars().take(LONG).collect()
 }
+
+/// What the text of the record Claude Code writes for the user stopping a
+/// turn starts with (`[Request interrupted by user]`, or `… for tool use]`).
+pub(crate) const INTERRUPTED: &str = "[Request interrupted by user";
+
+/// How much of the end of a transcript is read to see whether it ends in an
+/// interrupt, widened while it holds no conversational record.
+const PROBE_BYTES: u64 = 64 * 1024;
 
 /// Prompts Claude Code writes to tell the agent something, like a
 /// background subagent finishing.
@@ -1335,6 +1401,27 @@ mod tests {
     }
 
     #[test]
+    fn claude_tells_of_an_interrupt_only_in_its_transcript() {
+        let reported = Claude::with_program(Path::new("/h"), "/usr/bin/true".into())
+            .event(r#"{"hook_event_name":"Stop"}"#)
+            .expect("an event");
+        assert_eq!(
+            reported.interrupts,
+            agent_core::activity::InterruptSignal::Transcript
+        );
+    }
+
+    #[test]
+    fn claude_runs_a_slash_or_bang_prompt_as_a_command() {
+        let claude = Claude::with_program(Path::new("/h"), "/usr/bin/true".into());
+        let kind = |text: &str| claude.prompt_kind(&text.parse().expect("a prompt"));
+        assert_eq!(kind("/model"), PromptKind::Command);
+        assert_eq!(kind("!ls"), PromptKind::Command);
+        assert_eq!(kind("rebase on main"), PromptKind::Message);
+        assert_eq!(kind("what does /tmp hold"), PromptKind::Message);
+    }
+
+    #[test]
     fn a_denial_without_a_call_is_a_decline() {
         assert_eq!(
             claude_event(r#"{"hook_event_name":"PermissionDenied"}"#),
@@ -1714,6 +1801,166 @@ mod tests {
                 detail(Some(&TranscriptRef::new(refused))).as_deref(),
                 Some("from the newest"),
                 "{refused} isn't a transcript to read"
+            );
+        }
+    }
+
+    mod interruption {
+        use super::*;
+        use crate::fixtures::{said, stopped, typed, user, write};
+
+        const BEFORE: &str = "2026-11-08T10:00:00.000Z";
+        const MARKER: &str = "2026-11-08T10:00:05.000Z";
+        const AFTER: &str = "2026-11-08T10:00:09.000Z";
+
+        struct Setup {
+            _home: tempfile::TempDir,
+            claude: Claude,
+            file: PathBuf,
+        }
+
+        fn setup(lines: &[String]) -> Setup {
+            let home = tempfile::tempdir().expect("a temp dir");
+            let claude = Claude::with_program(home.path(), "/usr/bin/true".into());
+            let dir = claude.projects.join("proj");
+            std::fs::create_dir_all(&dir).expect("creates");
+            let file = write(&dir, lines);
+            Setup {
+                _home: home,
+                claude,
+                file,
+            }
+        }
+
+        fn since(stamp: &str) -> SystemTime {
+            transcript::parse_time(stamp).expect("a time")
+        }
+
+        fn asked(s: &Setup, after: &str, seen: Option<&TranscriptStamp>) -> Probe {
+            let at = TranscriptRef::new(s.file.to_string_lossy());
+            s.claude
+                .interruption(&at, since(after), seen)
+                .expect("reads")
+        }
+
+        fn marker() -> Vec<String> {
+            vec![
+                typed("p", BEFORE, "go"),
+                said("2026-11-08T10:00:01.000Z", "On it."),
+                stopped("p", MARKER, "[Request interrupted by user]"),
+            ]
+        }
+
+        #[test]
+        fn a_marker_later_than_the_activity_began_is_an_interrupt_whatever_bookkeeping_follows() {
+            let mut lines = marker();
+            lines.extend(["last-prompt", "cost-state"].map(crate::fixtures::bookkeeping));
+            let s = setup(&lines);
+            assert!(matches!(asked(&s, BEFORE, None), Probe::Interrupted(..)));
+        }
+
+        #[test]
+        fn a_marker_from_before_the_activity_began_is_not() {
+            let s = setup(&marker());
+            assert!(matches!(asked(&s, AFTER, None), Probe::Older(_)));
+        }
+
+        #[test]
+        fn work_after_the_marker_means_it_carried_on() {
+            let mut lines = marker();
+            lines.push(typed("q", AFTER, "try again"));
+            let s = setup(&lines);
+            assert!(matches!(asked(&s, MARKER, None), Probe::Going(_)));
+        }
+
+        #[test]
+        fn the_marker_only_counts_by_its_message_id_or_as_a_lone_text_block() {
+            let plain = user("p", MARKER, r#""[Request interrupted by user]""#, "");
+            let with_more = user(
+                "p",
+                MARKER,
+                r#"[{"type":"text","text":"[Request interrupted by user]"},{"type":"text","text":"and then"}]"#,
+                "",
+            );
+            let named = user(
+                "p",
+                MARKER,
+                r#"[{"type":"text","text":"stopped"}]"#,
+                r#","interruptedMessageId":"msg_1""#,
+            );
+            for (record, interrupted) in [(plain, false), (with_more, false), (named, true)] {
+                let s = setup(&[record]);
+                assert_eq!(
+                    matches!(asked(&s, BEFORE, None), Probe::Interrupted(..)),
+                    interrupted
+                );
+            }
+        }
+
+        #[test]
+        fn a_half_written_last_line_leaves_the_file_inconclusive() {
+            let s = setup(&marker());
+            let mut text = std::fs::read_to_string(&s.file).expect("reads");
+            text.push_str(r#"{"type":"assistant","timest"#);
+            std::fs::write(&s.file, &text).expect("writes");
+            assert_eq!(asked(&s, BEFORE, None), Probe::Unchanged);
+            std::fs::write(&s.file, text.trim_end_matches(|c| c != '\n')).expect("writes");
+            assert!(matches!(asked(&s, BEFORE, None), Probe::Interrupted(..)));
+        }
+
+        #[test]
+        fn more_bookkeeping_than_the_window_still_finds_the_marker_and_saves_no_stamp_without_one()
+        {
+            let mut lines = marker();
+            let filler = format!(r#"{{"type":"attachment","pad":"{}"}}"#, "x".repeat(4096));
+            lines.extend(std::iter::repeat_n(
+                filler,
+                (usize::try_from(PROBE_BYTES).expect("fits") / 4096) * 2,
+            ));
+            let s = setup(&lines);
+            assert!(matches!(asked(&s, BEFORE, None), Probe::Interrupted(..)));
+
+            let none = setup(&[
+                format!(
+                    r#"{{"type":"attachment","pad":"{}"}}"#,
+                    "x".repeat(usize::try_from(TAIL_BYTES).expect("fits") * 2)
+                ),
+                crate::fixtures::bookkeeping("last-prompt"),
+            ]);
+            assert_eq!(asked(&none, BEFORE, None), Probe::Unchanged);
+        }
+
+        #[test]
+        fn a_file_unchanged_since_its_stamp_is_not_read_again() {
+            let s = setup(&[typed("p", BEFORE, "go")]);
+            let Probe::Going(stamp) = asked(&s, "2026-11-08T09:00:00.000Z", None) else {
+                panic!("it went on");
+            };
+            assert_eq!(asked(&s, BEFORE, Some(&stamp)), Probe::Unchanged);
+            let mut lines = marker();
+            lines.insert(0, typed("o", "2026-11-08T09:59:00.000Z", "earlier"));
+            std::fs::write(&s.file, lines.join("\n") + "\n").expect("writes");
+            assert!(matches!(
+                asked(&s, BEFORE, Some(&stamp)),
+                Probe::Interrupted(..)
+            ));
+        }
+
+        #[test]
+        fn a_path_outside_the_projects_directory_is_no_transcript() {
+            let s = setup(&marker());
+            let outside = s
+                .file
+                .parent()
+                .expect("a dir")
+                .join("../../elsewhere.jsonl");
+            std::fs::write(&outside, "").expect("writes");
+            let at = TranscriptRef::new(outside.to_string_lossy());
+            assert_eq!(
+                s.claude
+                    .interruption(&at, since(BEFORE), None)
+                    .expect("refused quietly"),
+                Probe::NoTranscript
             );
         }
     }

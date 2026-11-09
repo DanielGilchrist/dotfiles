@@ -25,7 +25,7 @@ use super::{
 use crate::document::{
     BranchKey, CommitKey, DiffKey, Doc, FolderDocs, FolderKey, Hover, Key, Laid, Placed, Resolved,
 };
-use crate::model::{ActivityFiles, AgentStatus, Asking, LogKey, MainLayout, Model};
+use crate::model::{ActivityFiles, AgentStatus, Asking, LogKey, MainLayout, Model, held};
 use crate::review::{self, DiffView, LineInfo};
 
 /// [0]'s title, what its top border says on the right, its bottom-right
@@ -897,6 +897,9 @@ fn activity_state<'a>(
             since: activity.since,
         },
         State::Done { .. } => log::ActivityStage::Done { seen: false },
+        State::Interrupted => log::ActivityStage::Interrupted {
+            since: activity.since,
+        },
         State::Idle | State::Exited => log::ActivityStage::Done { seen: true },
     }
 }
@@ -918,11 +921,8 @@ fn queue_rows(m: &Model, name: &SessionName, columns: usize) -> Vec<Line<'static
             )
         })
         .collect();
-    if queue.stalled(m.activity(name).map(|a| a.events), m.clock.mono) {
-        rows.push(Line::styled(
-            truncate_end(&format!("queued · waiting for {name} to report"), columns),
-            dim(),
-        ));
+    if let Some(hold) = m.hold(name) {
+        rows.push(Line::styled(truncate_end(&held(hold), columns), dim()));
     }
     rows
 }

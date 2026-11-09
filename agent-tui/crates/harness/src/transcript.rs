@@ -49,6 +49,79 @@ pub(crate) struct Parsed {
     pub asking: Option<(ToolId, Vec<Question>)>,
 }
 
+/// What a record of the conversation says about whether it is going on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Beat {
+    /// The user stopped the turn.
+    Interrupt,
+    /// The agent or the user said or did something else.
+    Work,
+}
+
+/// The beat `record` makes, none for the bookkeeping records between
+/// conversational ones (snapshots, titles, costs) and a subagent's own
+/// messages.
+pub(crate) fn beat(record: &Value) -> Option<Beat> {
+    if record.get("isSidechain").and_then(Value::as_bool) == Some(true) {
+        return None;
+    }
+    match record.get("type").and_then(Value::as_str)? {
+        "assistant" => Some(Beat::Work),
+        "user" => Some(if is_interrupt(record) {
+            Beat::Interrupt
+        } else {
+            Beat::Work
+        }),
+        _ => None,
+    }
+}
+
+/// Whether a user `record` is the one written when the user stops a turn:
+/// it names the message it stopped, or else holds one text block that says
+/// so.
+pub(crate) fn is_interrupt(record: &Value) -> bool {
+    let single_text = match record.pointer("/message/content") {
+        Some(Value::Array(parts)) => match parts.as_slice() {
+            [part] if part.get("type").and_then(Value::as_str) == Some("text") => {
+                part.get("text").and_then(Value::as_str)
+            }
+            _ => None,
+        },
+        _ => None,
+    };
+    record.get("interruptedMessageId").is_some()
+        || single_text.is_some_and(|text| text.starts_with(crate::INTERRUPTED))
+}
+
+/// The newest conversational record of a transcript.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Last {
+    pub beat: Beat,
+    pub at: Option<SystemTime>,
+}
+
+/// Whether `text` ends in a record still being written, which makes what
+/// precedes it out of date.
+pub(crate) fn unfinished(text: &str) -> bool {
+    !text.is_empty() && !text.ends_with('\n')
+}
+
+/// The newest conversational record in `text`, one JSON record per line.
+pub(crate) fn last_conversational(text: &str) -> Option<Last> {
+    text.lines()
+        .rev()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find_map(|record| {
+            Some(Last {
+                beat: beat(&record)?,
+                at: record
+                    .get("timestamp")
+                    .and_then(Value::as_str)
+                    .and_then(parse_time),
+            })
+        })
+}
+
 /// The records in `text`, one JSON per line. Lines that aren't whole records
 /// are skipped.
 pub(crate) fn parse(text: &str) -> Parsed {

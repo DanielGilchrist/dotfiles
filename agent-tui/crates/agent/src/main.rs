@@ -675,7 +675,8 @@ fn prompt(
         (None, Some(file)) => read_prompt(&file)?,
         (None, None) => unreachable!("clap requires text or --file"),
     };
-    Ok(ops::inject(svc, name, &prompt)?)
+    ops::inject(svc, name, &prompt)?;
+    Ok(())
 }
 
 fn main() -> Result<()> {

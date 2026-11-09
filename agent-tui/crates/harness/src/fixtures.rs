@@ -72,3 +72,24 @@ pub fn ended(at: &str, millis: u64) -> String {
         r#"{{"type":"system","subtype":"turn_duration","durationMs":{millis},"timestamp":"{at}"}}"#
     )
 }
+
+/// The record Claude Code writes when the user stops a turn, saying `text`.
+pub fn stopped(prompt_id: &str, at: &str, text: &str) -> String {
+    user(
+        prompt_id,
+        at,
+        &format!(r#"[{{"type":"text","text":"{text}"}}]"#),
+        r#","interruptedMessageId":"msg_01""#,
+    )
+}
+
+pub fn bookkeeping(kind: &str) -> String {
+    format!(r#"{{"type":"{kind}","sessionId":"s"}}"#)
+}
+
+/// Writes `lines` as a transcript in `dir`.
+pub fn write(dir: &std::path::Path, lines: &[String]) -> std::path::PathBuf {
+    let path = dir.join("session.jsonl");
+    std::fs::write(&path, lines.join("\n") + "\n").expect("writes");
+    path
+}

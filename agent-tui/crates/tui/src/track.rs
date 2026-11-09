@@ -6,12 +6,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
-use agent_core::activity::{AgentId, Subagent};
+use agent_core::activity::{AgentId, Standing, Subagent};
 use agent_core::names::Prompt;
-use agent_core::ports::{ActivityDetail, Log, WorktreeFacts};
+use agent_core::ports::PromptKind;
+use agent_core::ports::{ActivityDetail, Log, TranscriptStamp, WorktreeFacts};
 
 use crate::log::Nav;
-use crate::model::{Company, Inspection};
+use crate::model::{Company, Held, Inspection};
 use crate::touched::Baseline;
 use crate::tree::{ChangesScope, ChangesView, TreeRow};
 
@@ -50,7 +51,7 @@ pub struct Tracked {
     pub inspection: Option<Inspection>,
     /// Comments drafted on diffs, until sent.
     pub draft: Vec<crate::review::Comment>,
-    /// Messages waiting for it to be at rest.
+    /// Messages waiting to be typed in.
     pub outbox: Option<Outbox>,
     pub live_since: Option<LiveSince>,
     /// Whether a snapshot has listed it, and when this TUI last started or
@@ -62,6 +63,10 @@ pub struct Tracked {
     pub company: Company,
     /// Its current activity, as [0] last read it.
     pub activity_view: ActivityWatch,
+    /// Where reading its transcript for an interrupt stands.
+    pub probed: Option<Probed>,
+    /// The last message typed into it.
+    pub sent: Option<Sent>,
     /// Its changed files when that activity began.
     pub baseline: Baseline,
 }
@@ -95,6 +100,96 @@ impl Tracked {
         for folder in folders {
             self.collapsed.remove(folder);
         }
+    }
+}
+
+/// Where reading an agent's transcript for an interrupt stands: for which
+/// proof it was asked, when, and what the last answer left to know. Anything
+/// found only holds for the proof it was found under, since a report since
+/// then makes the verdict need taking again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Probed {
+    pub standing: Standing,
+    pub at: Instant,
+    pub found: Found,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Found {
+    /// No answer yet, or none that says anything about the file.
+    Nothing,
+    /// The file as the last answer found it.
+    Stamp(TranscriptStamp),
+    /// The last read failed, and the user was told.
+    Failed,
+    /// There is no transcript to read.
+    NoTranscript,
+}
+
+impl Probed {
+    /// Whether a read for `standing` is due at `now`, given the last one.
+    pub fn due(last: Option<&Self>, standing: Standing, now: Instant) -> bool {
+        match last.filter(|p| p.standing == standing) {
+            None => true,
+            Some(p) => p.found != Found::NoTranscript && now >= p.at + PROBE_EVERY,
+        }
+    }
+
+    /// What to keep for a read asked for at `now`, and the stamp to ask it
+    /// with: what the last one left to know, if it was for the same proof.
+    pub fn asked(
+        last: Option<Self>,
+        standing: Standing,
+        now: Instant,
+    ) -> (Self, Option<TranscriptStamp>) {
+        let (found, seen) = match last.filter(|p| p.standing == standing).map(|p| p.found) {
+            Some(Found::Stamp(stamp)) => (Found::Stamp(stamp.clone()), Some(stamp)),
+            Some(Found::Failed) => (Found::Failed, None),
+            Some(Found::Nothing | Found::NoTranscript) | None => (Found::Nothing, None),
+        };
+        (
+            Self {
+                standing,
+                at: now,
+                found,
+            },
+            seen,
+        )
+    }
+}
+
+/// How often a working agent's transcript is read for an interrupt.
+pub const PROBE_EVERY: Duration = Duration::from_secs(2);
+
+/// How long after a message is typed the next waits for the agent to report.
+pub const JUST_SENT_FOR: Duration = Duration::from_secs(2);
+
+/// How long after a command is typed, which reports nothing, the next
+/// message waits for the agent to report.
+pub const COMMAND_HOLD_FOR: Duration = Duration::from_secs(15);
+
+/// The last message typed into an agent: how many events it had reported
+/// then, when, and what it was.
+#[derive(Debug, Clone, Copy)]
+pub struct Sent {
+    pub events: u64,
+    pub at: Instant,
+    pub kind: PromptKind,
+}
+
+impl Sent {
+    /// Why the agent shouldn't be typed into again yet, if it shouldn't.
+    /// Hooks lag the typing, so until it has reported something it can't be
+    /// told whether the message opened a menu.
+    pub fn hold(&self, events: Option<u64>, now: Instant) -> Option<Held> {
+        if events != Some(self.events) {
+            return None;
+        }
+        let (lasts, hold) = match self.kind {
+            PromptKind::Message => (JUST_SENT_FOR, Held::JustSent),
+            PromptKind::Command => (COMMAND_HOLD_FOR, Held::Command),
+        };
+        (now.saturating_duration_since(self.at) < lasts).then_some(hold)
     }
 }
 
@@ -238,23 +333,11 @@ pub struct Queued {
     pub comments: Vec<crate::review::Comment>,
 }
 
-/// The last message typed into an agent: how many events it had reported
-/// then, since hooks lag the typing, and when.
-#[derive(Debug, Clone, Copy)]
-pub struct Typed {
-    pub events: u64,
-    pub at: Instant,
-}
-
-/// How long a hold lasts with no new activity before the worker is asked
+/// How long a refusal lasts with no new activity before the worker is asked
 /// again, which rechecks the store itself.
-pub const HOLD_FOR: Duration = Duration::from_secs(5);
+pub const REFUSED_FOR: Duration = Duration::from_secs(5);
 
-/// How long after typing a message with no hook report before the queue
-/// says it's waiting on the agent.
-pub const STALL_AFTER: Duration = Duration::from_secs(30);
-
-/// What lifts a hold before [`HOLD_FOR`] has passed.
+/// What lifts a refusal before [`REFUSED_FOR`] has passed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Release {
     /// The next read of the store, whatever it says.
@@ -269,9 +352,9 @@ pub enum Phase {
     Waiting,
     /// The first message is with the worker.
     InFlight,
-    /// The worker found the agent not ready or unreadable: wait for fresh
+    /// The worker found the agent held or unreadable: wait for fresh
     /// activity before asking again.
-    Held { release: Release, at: Instant },
+    Refused { release: Release, at: Instant },
 }
 
 /// What's queued to type into one agent, oldest first. It exists only
@@ -280,7 +363,6 @@ pub enum Phase {
 pub struct Outbox {
     first: Queued,
     rest: VecDeque<Queued>,
-    pub last_typed: Option<Typed>,
     phase: Phase,
 }
 
@@ -289,7 +371,6 @@ impl Outbox {
         Self {
             first: Queued { prompt, comments },
             rest: VecDeque::new(),
-            last_typed: None,
             phase: Phase::Waiting,
         }
     }
@@ -308,20 +389,13 @@ impl Outbox {
     }
 
     /// Whether the worker may be asked to type the first message, as far as
-    /// a hold goes.
-    pub fn unheld(&self, now: Instant) -> bool {
+    /// a refusal goes.
+    pub fn askable(&self, now: Instant) -> bool {
         match self.phase {
             Phase::Waiting => true,
             Phase::InFlight => false,
-            Phase::Held { at, .. } => now.saturating_duration_since(at) > HOLD_FOR,
+            Phase::Refused { at, .. } => now.saturating_duration_since(at) > REFUSED_FOR,
         }
-    }
-
-    /// Whether the agent has to report again before the next message goes
-    /// in, given how many events it has reported.
-    pub fn awaits_report(&self, events: Option<u64>) -> bool {
-        self.last_typed
-            .is_some_and(|typed| events.is_none_or(|now| now == typed.events))
     }
 
     pub fn front(&self) -> &Prompt {
@@ -352,17 +426,15 @@ impl Outbox {
         self.first.prompt.clone()
     }
 
-    /// The first message was typed, with what the agent had reported
-    /// then if it had reported anything: what's left, if anything.
-    pub fn delivered(mut self, typed: Option<Typed>) -> Option<Self> {
-        self.last_typed = typed;
+    /// The first message was typed: what's left, if anything.
+    pub fn delivered(mut self) -> Option<Self> {
         self.phase = Phase::Waiting;
         self.rest.pop_front().map(|first| Self { first, ..self })
     }
 
     /// The first message was refused for now.
     pub fn refused(&mut self, release: Release, at: Instant) {
-        self.phase = Phase::Held { release, at };
+        self.phase = Phase::Refused { release, at };
     }
 
     /// The first message can't be sent: it, and what's left if anything.
@@ -377,10 +449,10 @@ impl Outbox {
         }
     }
 
-    /// Lifts the hold if a read of the store, with the agent's event count
+    /// Lifts the refusal if a read of the store, with the agent's event count
     /// in it, answers it.
     pub fn read(&mut self, events: Option<u64>) {
-        if let Phase::Held { release, .. } = self.phase
+        if let Phase::Refused { release, .. } = self.phase
             && match release {
                 Release::NextRead => true,
                 Release::NewEvents(held) => events != Some(held),
@@ -388,16 +460,6 @@ impl Outbox {
         {
             self.phase = Phase::Waiting;
         }
-    }
-
-    /// A message went in and the agent hasn't reported since, which a slash
-    /// or `!` command never does.
-    pub fn stalled(&self, events: Option<u64>, now: Instant) -> bool {
-        !self.in_flight()
-            && self.last_typed.is_some_and(|typed| {
-                events == Some(typed.events)
-                    && now.saturating_duration_since(typed.at) > STALL_AFTER
-            })
     }
 }
 
@@ -419,38 +481,36 @@ mod tests {
         outbox
     }
 
-    fn typed(events: u64, at: Instant) -> Typed {
-        Typed { events, at }
-    }
-
     #[test]
     fn a_queue_starts_waiting_goes_in_flight_and_waits_again_once_the_first_is_typed() {
         let now = Instant::now();
         let mut outbox = outbox(&["one", "two"]);
         assert!(matches!(outbox.phase(), Phase::Waiting));
-        assert!(outbox.unheld(now));
+        assert!(outbox.askable(now));
         assert_eq!(outbox.start().as_str(), "one");
-        assert!(outbox.in_flight() && !outbox.unheld(now));
+        assert!(outbox.in_flight() && !outbox.askable(now));
 
-        let outbox = outbox.delivered(Some(typed(3, now))).expect("one is left");
+        let outbox = outbox.delivered().expect("one is left");
         assert!(matches!(outbox.phase(), Phase::Waiting));
         assert_eq!(outbox.front().as_str(), "two");
         assert_eq!(outbox.len(), 1);
-        assert_eq!(outbox.last_typed.map(|t| t.events), Some(3));
-        assert!(outbox.delivered(Some(typed(4, now))).is_none(), "emptied");
+        assert!(outbox.delivered().is_none(), "emptied");
     }
 
     #[test]
-    fn a_refusal_holds_until_its_release_or_the_hold_runs_out() {
+    fn a_refusal_lasts_until_its_release_or_its_time_runs_out() {
         let now = Instant::now();
         let mut outbox = outbox(&["one"]);
         outbox.start();
         outbox.refused(Release::NewEvents(5), now);
-        assert!(matches!(outbox.phase(), Phase::Held { .. }));
-        assert!(!outbox.unheld(now));
+        assert!(matches!(outbox.phase(), Phase::Refused { .. }));
+        assert!(!outbox.askable(now));
 
         outbox.read(Some(5));
-        assert!(matches!(outbox.phase(), Phase::Held { .. }), "nothing new");
+        assert!(
+            matches!(outbox.phase(), Phase::Refused { .. }),
+            "nothing new"
+        );
         outbox.read(None);
         assert!(matches!(outbox.phase(), Phase::Waiting), "it changed");
 
@@ -463,49 +523,24 @@ mod tests {
 
         outbox.refused(Release::NewEvents(5), now);
         assert!(
-            !outbox.unheld(now + HOLD_FOR),
-            "held for exactly the hold's time"
+            !outbox.askable(now + REFUSED_FOR),
+            "refused for exactly its time"
         );
         assert!(
-            outbox.unheld(now + HOLD_FOR + Duration::from_secs(1)),
-            "asked again after the hold's time"
+            outbox.askable(now + REFUSED_FOR + Duration::from_secs(1)),
+            "asked again after its time"
         );
     }
 
     #[test]
-    fn a_dropped_message_leaves_the_rest_waiting_and_remembers_what_was_typed() {
+    fn a_dropped_message_leaves_the_rest_waiting() {
         let mut outbox = outbox(&["one", "two"]);
-        outbox.last_typed = Some(typed(1, Instant::now()));
         outbox.start();
         let (dropped, rest) = outbox.dropped();
         assert_eq!(dropped.prompt.as_str(), "one");
         let rest = rest.expect("two is left");
         assert!(matches!(rest.phase(), Phase::Waiting));
         assert_eq!(rest.front().as_str(), "two");
-        assert!(rest.last_typed.is_some());
         assert!(rest.dropped().1.is_none());
-    }
-
-    #[test]
-    fn typing_waits_for_a_report_and_a_silent_agent_is_called_stalled() {
-        let now = Instant::now();
-        let mut outbox = outbox(&["one"]);
-        assert!(!outbox.awaits_report(Some(1)), "nothing typed yet");
-        outbox.last_typed = Some(typed(1, now));
-        assert!(outbox.awaits_report(Some(1)));
-        assert!(outbox.awaits_report(None), "nothing reported at all");
-        assert!(!outbox.awaits_report(Some(2)));
-        assert!(!outbox.stalled(Some(1), now), "just typed");
-
-        let later = now + STALL_AFTER * 2;
-        assert!(outbox.stalled(Some(1), later));
-        assert!(!outbox.stalled(Some(2), later), "it reported");
-
-        outbox.last_typed = None;
-        assert!(
-            !outbox.stalled(Some(1), later),
-            "nothing typed since it reported"
-        );
-        assert!(!outbox.awaits_report(None));
     }
 }

@@ -24,8 +24,8 @@ use super::{
     truncate_start, warning,
 };
 use crate::model::{
-    AgentStatus, Cursor, Doing, Drawn, Extent, Failure, Fold, ListScroll, Listed, Model,
-    Panel as Focused, Placement, Pulse, Row, Target, WorkRoom,
+    ActivityRow, AgentStatus, Cursor, Doing, Drawn, Extent, Failure, Fold, ListScroll, Listed,
+    Model, Panel as Focused, Placement, Pulse, Row, Target, WorkRoom, held,
 };
 use crate::tree::{ChangesScope, Counts, Node, TreeRow};
 
@@ -127,6 +127,7 @@ enum Gist<'a> {
     },
     HandingBack,
     Done(Option<&'a str>),
+    Interrupted,
 }
 
 impl<'a> Gist<'a> {
@@ -135,6 +136,7 @@ impl<'a> Gist<'a> {
     fn of(status: &'a AgentStatus, heard: SystemTime, now: SystemTime) -> Option<Self> {
         match status {
             AgentStatus::NoSession | AgentStatus::Exited | AgentStatus::Idle => None,
+            AgentStatus::Interrupted { .. } => Some(Self::Interrupted),
             AgentStatus::Asking { question, .. } => Some(Self::Asking(question)),
             AgentStatus::Failed { failure, .. } => Some(Self::Failed(failure)),
             AgentStatus::Done { summary, .. } => Some(Self::Done(summary.as_deref())),
@@ -182,6 +184,7 @@ impl<'a> Gist<'a> {
             (Self::HandingBack, _) => ("handing back".to_string(), Shown::Whole),
             (Self::Done(Some(summary)), _) => first_line(&plain(summary)),
             (Self::Done(None), _) => ("done".to_string(), Shown::Whole),
+            (Self::Interrupted, _) => ("interrupted".to_string(), Shown::Whole),
         };
         let fitted = truncate_end(&text, width);
         let shown = if fitted == text { shown } else { Shown::Cut };
@@ -203,6 +206,7 @@ impl<'a> Gist<'a> {
             Self::HandingBack => "handing back".to_string(),
             Self::Done(Some(summary)) => plain(summary),
             Self::Done(None) => "done".to_string(),
+            Self::Interrupted => "interrupted".to_string(),
             Self::Delegating { .. } => return None,
         })
     }
@@ -509,25 +513,66 @@ impl<'m> Deck<'m> {
 
     /// [2]'s rows: the activity, then one per subagent, and the row the cursor
     /// is on while [2] has the keys. What they say is [0]'s to show.
-    fn activity_rows(&self, entry: &Entry) -> (Vec<Line<'static>>, Option<usize>) {
+    fn activity_rows(&self, entry: &Entry) -> ActivityRows {
         let m = self.m;
         let Some(activity) = m.activity(entry.name()) else {
-            return (Vec::new(), None);
+            return ActivityRows::Vacant;
         };
-        let cursor = matches!(m.panel.list(), Listed::Agent { .. }).then(|| m.row_at());
-        let mut rows = vec![Line::raw(activity_row(
+        let cursor = match m.panel.list() {
+            Listed::Agent { offset, row } => Some(ActivityCursor {
+                at: m.row_at(),
+                offset,
+                row: row.clone(),
+            }),
+            Listed::Agents | Listed::Changes { .. } => None,
+        };
+        let at = cursor.as_ref().map(|c| c.at);
+        let first = Line::raw(activity_row(
             activity.prompt.as_deref(),
             self.content,
-            cursor == Some(0),
-        ))];
-        rows.extend(tree(
+            at == Some(0),
+        ));
+        let rest = tree(
             activity.subagents.values().collect(),
             self.form,
             self.content,
             m.clock.wall,
-            cursor.and_then(|row| row.checked_sub(1)),
-        ));
-        (rows, cursor)
+            at.and_then(|row| row.checked_sub(1)),
+        );
+        ActivityRows::Listed {
+            first,
+            rest,
+            cursor,
+        }
+    }
+}
+
+/// What [2] has to show: the activity's rows, or one row saying it has none.
+enum ActivityRows {
+    Listed {
+        /// The activity row, then a row per subagent.
+        first: Line<'static>,
+        rest: Vec<Line<'static>>,
+        /// Where [2]'s cursor is, while [2] has the keys.
+        cursor: Option<ActivityCursor>,
+    },
+    Vacant,
+}
+
+/// [2]'s cursor: the row it is on, and the panel's position as the focus
+/// has it.
+struct ActivityCursor {
+    at: usize,
+    offset: usize,
+    row: ActivityRow,
+}
+
+impl ActivityRows {
+    fn rows(&self) -> NonZeroUsize {
+        match self {
+            Self::Listed { rest, .. } => NonZeroUsize::MIN.saturating_add(rest.len()),
+            Self::Vacant => NonZeroUsize::MIN,
+        }
     }
 }
 
@@ -564,7 +609,8 @@ fn time_in_state(status: &AgentStatus, now: SystemTime) -> Vec<Span<'static>> {
             ..
         }
         | AgentStatus::Failed { since, .. }
-        | AgentStatus::Done { since, .. } => vec![Span::styled(ago(*since, now), dim())],
+        | AgentStatus::Done { since, .. }
+        | AgentStatus::Interrupted { since } => vec![Span::styled(ago(*since, now), dim())],
         AgentStatus::NoSession | AgentStatus::Exited | AgentStatus::Idle => Vec::new(),
     }
 }
@@ -576,7 +622,9 @@ fn settled_counts(m: &Model, repo: &Repo) -> (usize, usize) {
         .iter()
         .filter(|entry| m.active(entry))
         .fold((0, 0), |(live, exited), entry| match m.status(entry) {
-            AgentStatus::Idle | AgentStatus::Working { .. } => (live + 1, exited),
+            AgentStatus::Idle | AgentStatus::Working { .. } | AgentStatus::Interrupted { .. } => {
+                (live + 1, exited)
+            }
             AgentStatus::Exited => (live, exited + 1),
             AgentStatus::NoSession
             | AgentStatus::Asking { .. }
@@ -895,11 +943,18 @@ fn window(total: usize, rows: usize, cursor: Option<usize>) -> (usize, usize) {
 
 /// What [3]'s title says: the totals, and how many files are shared.
 struct Changes {
-    diff: DiffStat,
-    shared: usize,
+    /// What git read, once it has been.
+    counted: Option<Counted>,
     scope: ChangesScope,
     /// The second tab's name: `Branch` or `Unpushed`.
     second: &'static str,
+}
+
+/// The totals, and how many of the files are shared.
+#[derive(Clone, Copy)]
+struct Counted {
+    diff: DiffStat,
+    shared: usize,
 }
 
 /// The list's lines with the row each belongs to, the selected card's
@@ -1125,37 +1180,116 @@ fn more_row(hidden: NonZeroUsize, width: usize) -> Line<'static> {
     Line::styled(truncate_end(&format!("+{hidden} more"), width), dim())
 }
 
-/// What [3] has to show: the files and readiness, or why git couldn't be
-/// read.
+/// What [3] has to show: the files and readiness, or the reason it has no
+/// row to put a cursor on.
 enum Work<'a> {
     Facts {
         facts: &'a WorktreeFacts,
-        head: Option<Line<'static>>,
-        list: std::sync::Arc<Vec<TreeRow>>,
+        rows: FactRows,
     },
-    Unreadable(String),
+    Vacant(Vacancy<'a>),
 }
 
-impl Work<'_> {
-    /// The rows [3]'s cursor can be on.
-    fn rows(&self) -> usize {
+/// What [3] lists when it lists anything: the branch row with the files
+/// after it, or only files.
+enum FactRows {
+    Head {
+        head: Line<'static>,
+        list: std::sync::Arc<Vec<TreeRow>>,
+    },
+    Files(Files),
+}
+
+/// A listing of at least one file.
+struct Files(std::sync::Arc<Vec<TreeRow>>);
+
+impl Files {
+    fn new(list: std::sync::Arc<Vec<TreeRow>>) -> Option<Self> {
+        (!list.is_empty()).then_some(Self(list))
+    }
+}
+
+impl FactRows {
+    fn rows(&self) -> NonZeroUsize {
         match self {
-            Self::Facts { head, list, .. } => usize::from(head.is_some()) + list.len(),
-            Self::Unreadable(_) => 1,
+            Self::Head { list, .. } => NonZeroUsize::MIN.saturating_add(list.len()),
+            Self::Files(Files(list)) => {
+                NonZeroUsize::MIN.saturating_add(list.len().saturating_sub(1))
+            }
+        }
+    }
+
+    /// The branch row, if there is one, and the files.
+    fn into_parts(self) -> (Option<Line<'static>>, std::sync::Arc<Vec<TreeRow>>) {
+        match self {
+            Self::Head { head, list } => (Some(head), list),
+            Self::Files(Files(list)) => (None, list),
         }
     }
 }
 
-/// What [3] has to say about the selected agent, if anything.
-fn work_of<'m>(m: &'m Model, entry: &Entry) -> Option<Work<'m>> {
+/// Why [3] has nothing to list, so its one row can say.
+enum Vacancy<'a> {
+    /// The facts were read and the tab lists nothing.
+    NoChanges(&'a WorktreeFacts),
+    /// The facts were asked for and haven't come back.
+    Reading,
+    /// It has a checkout and nothing has asked for its facts yet.
+    NotRead,
+    /// It has no checkout to read.
+    NoCheckout,
+    Unreadable(String),
+}
+
+impl Vacancy<'_> {
+    fn text(&self) -> String {
+        match self {
+            Self::NoChanges(_) => "no changes".to_string(),
+            Self::Reading => "reading git…".to_string(),
+            Self::NotRead => "git not read yet".to_string(),
+            Self::NoCheckout => "no checkout".to_string(),
+            Self::Unreadable(why) => format!("git: {}", first_line(why).0),
+        }
+    }
+}
+
+impl Work<'_> {
+    /// The rows [3] draws, at least the one that says why it's empty.
+    fn rows(&self) -> NonZeroUsize {
+        match self {
+            Self::Facts { rows, .. } => rows.rows(),
+            Self::Vacant(_) => NonZeroUsize::MIN,
+        }
+    }
+}
+
+/// What [3] has to say about the selected agent.
+fn work_of<'m>(m: &'m Model, entry: &Entry) -> Work<'m> {
     match m.facts(entry.name()) {
         Some(Ok(facts)) => {
-            let head = m.branch_row().then(|| compared_summary(facts));
             let list = m.change_list();
-            (!list.is_empty() || head.is_some()).then_some(Work::Facts { facts, head, list })
+            let rows = if m.branch_row() {
+                Some(FactRows::Head {
+                    head: compared_summary(facts),
+                    list,
+                })
+            } else {
+                Files::new(list).map(FactRows::Files)
+            };
+            match rows {
+                Some(rows) => Work::Facts { facts, rows },
+                None => Work::Vacant(Vacancy::NoChanges(facts)),
+            }
         }
-        Some(Err(e)) => Some(Work::Unreadable(format!("git: {}", first_line(e).0))),
-        None => None,
+        Some(Err(e)) => Work::Vacant(Vacancy::Unreadable(e.clone())),
+        None => {
+            let asked = m.tracked(entry.name()).and_then(|t| t.inspection);
+            Work::Vacant(match (entry.head(), asked) {
+                (None, _) => Vacancy::NoCheckout,
+                (Some(_), Some(_)) => Vacancy::Reading,
+                (Some(_), None) => Vacancy::NotRead,
+            })
+        }
     }
 }
 
@@ -1175,26 +1309,14 @@ struct Lower {
 /// [`AGENT_ROWS`], and [3] has what's left. [3] keeps its readiness row and
 /// three files, or what it has of them, and [2] a row, so when both can't
 /// fit [2] takes everything.
-fn budget(rest: usize, activity_rows: usize, work_rows: usize) -> (usize, usize) {
-    let want_activity = if activity_rows == 0 {
-        0
-    } else {
-        2 + activity_rows.min(AGENT_ROWS)
-    };
-    let activity_floor = if activity_rows == 0 { 0 } else { 3 };
-    let work_least = if work_rows == 0 {
-        0
-    } else {
-        (2 + work_rows).min(2 + READINESS_ROW + CHANGES_MIN)
-    };
-    if work_rows > 0 && rest >= activity_floor + work_least {
-        let activity_height = if activity_floor == 0 {
-            0
-        } else {
-            want_activity.min(rest - work_least)
-        };
+fn budget(rest: usize, activity_rows: NonZeroUsize, work_rows: NonZeroUsize) -> (usize, usize) {
+    let want_activity = 2 + activity_rows.get().min(AGENT_ROWS);
+    let activity_floor = 3;
+    let work_least = (2 + work_rows.get()).min(2 + READINESS_ROW + CHANGES_MIN);
+    if rest >= activity_floor + work_least {
+        let activity_height = want_activity.min(rest - work_least);
         (activity_height, rest - activity_height)
-    } else if activity_floor > 0 && rest >= activity_floor {
+    } else if rest >= activity_floor {
         (rest, 0)
     } else {
         (0, 0)
@@ -1202,15 +1324,14 @@ fn budget(rest: usize, activity_rows: usize, work_rows: usize) -> (usize, usize)
 }
 
 /// [2] and [3] in `area`: [2] sized to its rows up to [`AGENT_ROWS`], [3]
-/// in what's left when it has the rows to say something and the room, and
-/// [2] in all of it when [3] has nothing.
+/// in what's left, and [2] in all of it when the column is too short for
+/// both. Each says why when it has nothing to list.
 fn lower_panels(deck: &Deck<'_>, repo: &Repo, entry: &Entry, area: Rect) -> Lower {
     let m = deck.m;
     let rest = usize::from(area.height);
-    let (detail, activity_cursor) = deck.activity_rows(entry);
+    let detail = deck.activity_rows(entry);
     let work = work_of(m, entry);
-    let work_rows = work.as_ref().map_or(0, Work::rows);
-    let (activity_height, work_height) = budget(rest, detail.len(), work_rows);
+    let (activity_height, work_height) = budget(rest, detail.rows(), work.rows());
     let at = |y: usize, height: usize| {
         Rect::new(
             area.x,
@@ -1219,86 +1340,145 @@ fn lower_panels(deck: &Deck<'_>, repo: &Repo, entry: &Entry, area: Rect) -> Lowe
             u16::try_from(height).unwrap_or(u16::MAX),
         )
     };
-
-    let mut focus = Focused::Agents;
-    let mut agent_rows = Vec::new();
-    let mut change_rows = Vec::new();
-    let agent = (activity_height > 0).then(|| {
-        let inside = activity_height - 2;
-        let first = match (m.panel.list(), activity_cursor) {
-            (
-                Listed::Agent {
-                    offset,
-                    row: activity_row,
-                },
-                Some(row),
-            ) => {
-                let first = scroll(offset, row, inside, detail.len());
-                focus = Focused::Agent {
-                    offset: first,
-                    row: activity_row.clone(),
-                };
-                first
-            }
-            _ => 0,
-        };
-        let lines: Vec<Line<'static>> = detail.into_iter().skip(first).take(inside).collect();
-        let top = at(0, activity_height).y + 1;
-        agent_rows = (0..lines.len())
-            .map(|i| (top + u16::try_from(i).unwrap_or(0), first + i))
-            .collect();
-        pad(at(0, activity_height), lines)
-    });
-    let changes = work.filter(|_| work_height > 0).map(|work| {
-        let area = at(activity_height, work_height);
-        let inside = work_height - 2;
-        let cursor = match m.panel.list() {
-            Listed::Changes { file } => {
-                let row = file.min(work_rows - 1);
-                focus = Focused::Changes { file: row };
-                Some(row)
-            }
-            _ => None,
-        };
-        let top = area.y + 1;
-        let (first, listed) = window(work_rows, inside, cursor);
-        change_rows = (0..listed)
-            .map(|i| (top + u16::try_from(i).unwrap_or(0), first + i))
-            .collect();
-        match work {
-            Work::Facts { facts, head, list } => {
-                let shared = deck.overlaps(repo, entry);
-                let lines = changes(&list, &shared, head, deck.content, inside, cursor);
-                (
-                    Panel { area, lines },
-                    summary(facts, &shared, m.changes_scope),
-                )
-            }
-            Work::Unreadable(text) => (
-                Panel {
-                    area,
-                    lines: vec![worktree_row(Line::raw(text), deck.content)],
-                },
-                Changes {
-                    diff: DiffStat::default(),
-                    shared: 0,
-                    scope: m.changes_scope,
-                    second: BRANCH_TAB,
-                },
-            ),
-        }
-    });
+    let agent = (activity_height > 0).then(|| activity_panel(detail, at(0, activity_height)));
+    let changes = (work_height > 0)
+        .then(|| changes_panel(deck, repo, entry, work, at(activity_height, work_height)));
+    let (agent, agent_rows, agent_focus) = match agent {
+        Some(a) => (Some(a.panel), a.rows, a.focus),
+        None => (None, Vec::new(), None),
+    };
+    let (changes, change_rows, changes_focus) = match changes {
+        Some(c) => (Some((c.panel, c.title)), c.rows, c.focus),
+        None => (None, Vec::new(), None),
+    };
     Lower {
         agent,
         agent_rows,
         changes,
         change_rows,
-        focus,
-        room: if work_height > 0 || work_rows == 0 {
+        focus: agent_focus.or(changes_focus).unwrap_or(Focused::Agents),
+        room: if work_height > 0 {
             WorkRoom::Fits
         } else {
             WorkRoom::TooShort
         },
+    }
+}
+
+/// [2] as drawn: its panel, the screen row of each of its rows with the
+/// index it stands for, and where the focus is when the keys are on it.
+struct ActivityPanel {
+    panel: Panel,
+    rows: Vec<(u16, usize)>,
+    focus: Option<Focused>,
+}
+
+fn activity_panel(detail: ActivityRows, area: Rect) -> ActivityPanel {
+    let inside = usize::from(area.height).saturating_sub(2);
+    match detail {
+        ActivityRows::Listed {
+            first: activity,
+            rest,
+            cursor,
+        } => {
+            let lines: Vec<Line<'static>> = std::iter::once(activity).chain(rest).collect();
+            let (first, focus) = match cursor {
+                Some(ActivityCursor { at, offset, row }) => {
+                    let first = scroll(offset, at, inside, lines.len());
+                    (first, Some(Focused::Agent { offset: first, row }))
+                }
+                None => (0, None),
+            };
+            let lines: Vec<Line<'static>> = lines.into_iter().skip(first).take(inside).collect();
+            let top = area.y + 1;
+            let rows = (0..lines.len())
+                .map(|i| (top + u16::try_from(i).unwrap_or(0), first + i))
+                .collect();
+            ActivityPanel {
+                panel: pad(area, lines),
+                rows,
+                focus,
+            }
+        }
+        ActivityRows::Vacant => ActivityPanel {
+            panel: pad(area, vec![Line::styled("no activity recorded", dim())]),
+            rows: Vec::new(),
+            focus: None,
+        },
+    }
+}
+
+/// [3] as drawn: its panel and title, the screen row of each of its rows
+/// with the index it stands for, and where the focus is when the keys are
+/// on it.
+struct ChangesPanel {
+    panel: Panel,
+    title: Changes,
+    rows: Vec<(u16, usize)>,
+    focus: Option<Focused>,
+}
+
+fn changes_panel(
+    deck: &Deck<'_>,
+    repo: &Repo,
+    entry: &Entry,
+    work: Work<'_>,
+    area: Rect,
+) -> ChangesPanel {
+    let m = deck.m;
+    let inside = usize::from(area.height).saturating_sub(2);
+    match work {
+        Work::Facts { facts, rows } => {
+            let total = rows.rows().get();
+            let (head, list) = rows.into_parts();
+            let (cursor, focus) = match m.panel.list() {
+                Listed::Changes { file } => {
+                    let row = file.min(total.saturating_sub(1));
+                    (Some(row), Some(Focused::Changes { file: row }))
+                }
+                _ => (None, None),
+            };
+            let top = area.y + 1;
+            let (first, listed) = window(total, inside, cursor);
+            let rows = (0..listed)
+                .map(|i| (top + u16::try_from(i).unwrap_or(0), first + i))
+                .collect();
+            let shared = deck.overlaps(repo, entry);
+            let lines = changes(&list, &shared, head, deck.content, inside, cursor);
+            ChangesPanel {
+                panel: Panel { area, lines },
+                title: summary(facts, &shared, m.changes_scope),
+                rows,
+                focus,
+            }
+        }
+        Work::Vacant(vacancy) => {
+            let row = worktree_row(Line::raw(vacancy.text()), deck.content);
+            let title = match vacancy {
+                Vacancy::NoChanges(facts) => {
+                    summary(facts, &deck.overlaps(repo, entry), m.changes_scope)
+                }
+                Vacancy::Reading
+                | Vacancy::NotRead
+                | Vacancy::NoCheckout
+                | Vacancy::Unreadable(_) => Changes {
+                    counted: None,
+                    scope: m.changes_scope,
+                    second: BRANCH_TAB,
+                },
+            };
+            let focus = matches!(m.panel.list(), Listed::Changes { .. })
+                .then_some(Focused::Changes { file: 0 });
+            ChangesPanel {
+                panel: Panel {
+                    area,
+                    lines: vec![row],
+                },
+                title,
+                rows: Vec::new(),
+                focus,
+            }
+        }
     }
 }
 
@@ -1320,11 +1500,13 @@ fn summary(
     scope: ChangesScope,
 ) -> Changes {
     Changes {
-        diff: match scope {
-            ChangesScope::Uncommitted => facts.pending_diff(),
-            ChangesScope::Since => facts.diff(),
-        },
-        shared: shared.len(),
+        counted: Some(Counted {
+            diff: match scope {
+                ChangesScope::Uncommitted => facts.pending_diff(),
+                ChangesScope::Since => facts.diff(),
+            },
+            shared: shared.len(),
+        }),
         scope,
         second: second_tab(&facts.compared),
     }
@@ -1427,16 +1609,15 @@ pub(super) fn subagent_rows(m: &Model, entry: &Entry, width: usize) -> Vec<Line<
     })
 }
 
-/// `queued: <first words>` for an agent with messages waiting, cut to
+/// `queued: <first words>` for an agent with messages waiting, or
+/// `held: asking · <first words>` while something holds them, cut to
 /// `width`.
 pub(super) fn queued_line(m: &Model, name: &SessionName, width: usize) -> Option<String> {
     let outbox = m.tracked(name)?.outbox.as_ref()?;
-    if outbox.stalled(m.activity(name).map(|a| a.events), m.clock.mono) {
-        return Some(truncate_end(
-            &format!("queued · waiting for {name} to report"),
-            width,
-        ));
-    }
+    let lead = match m.hold(name) {
+        Some(hold) => format!("{} · ", held(hold)),
+        None => "queued: ".to_string(),
+    };
     let first = crate::update::first_words(outbox.front().as_ref());
     let more = match outbox.len() {
         1 => String::new(),
@@ -1445,7 +1626,7 @@ pub(super) fn queued_line(m: &Model, name: &SessionName, width: usize) -> Option
     let room = width.saturating_sub(more.width());
     Some(format!(
         "{}{more}",
-        truncate_end(&format!("queued: {first}"), room)
+        truncate_end(&format!("{lead}{first}"), room)
     ))
 }
 
@@ -1528,7 +1709,9 @@ pub(super) fn draw(frame: &mut Frame<'_>, m: &Model, area: Rect, border: Style, 
         frame.render_widget(Paragraph::new(lines).block(block), area);
     }
     if let Some((Panel { area, lines }, changes)) = laid.changes {
-        let (added, removed) = counts_text(changes.diff.added, changes.diff.removed);
+        let (added, removed) = changes.counted.map_or_else(Default::default, |c| {
+            counts_text(c.diff.added, c.diff.removed)
+        });
         let mut title = changes_tabs(
             changes.scope,
             changes.second,
@@ -1540,23 +1723,24 @@ pub(super) fn draw(frame: &mut Frame<'_>, m: &Model, area: Rect, border: Style, 
                 title.push(Span::styled(count, Style::new().fg(colour)));
             }
         }
-        if changes.shared > 0 {
+        let shared = changes.counted.map_or(0, |c| c.shared);
+        if shared > 0 {
             title.push(Span::raw("  "));
-            title.push(Span::styled(format!("∩ {}", changes.shared), warning()));
+            title.push(Span::styled(format!("∩ {shared}"), warning()));
         }
         let title = fit(title, usize::from(area.width).saturating_sub(4));
-        let corner = vec![Span::styled(
-            format!(
-                "{} {}",
-                changes.diff.files,
-                if changes.diff.files == 1 {
-                    "file"
-                } else {
-                    "files"
-                }
-            ),
-            style_of(files),
-        )];
+        let corner = changes
+            .counted
+            .map_or_else(Vec::new, |Counted { diff, .. }| {
+                vec![Span::styled(
+                    format!(
+                        "{} {}",
+                        diff.files,
+                        if diff.files == 1 { "file" } else { "files" }
+                    ),
+                    style_of(files),
+                )]
+            });
         let block = panel(title, corner, style_of(files), nav && files);
         frame.render_widget(Paragraph::new(lines).block(block), area);
     }
@@ -1590,42 +1774,45 @@ mod tests {
     use agent_core::ports::Lines;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+    fn rows(n: usize) -> NonZeroUsize {
+        NonZeroUsize::new(n).expect("a row")
+    }
+
     #[test]
     fn the_activity_is_sized_to_its_rows_and_the_work_gets_the_rest() {
-        assert_eq!(budget(30, 3, 20), (5, 25));
-        assert_eq!(budget(30, 40, 20), (8, 22));
-        assert_eq!(budget(30, 0, 20), (0, 30));
+        assert_eq!(budget(30, rows(3), rows(20)), (5, 25));
+        assert_eq!(budget(30, rows(40), rows(20)), (8, 22));
+        assert_eq!(budget(30, rows(1), rows(20)), (3, 27));
     }
 
     #[test]
     fn the_work_keeps_its_least_before_the_activity_takes_more_than_its_floor() {
-        assert_eq!(budget(9, 10, 20), (3, 6));
-        assert_eq!(budget(10, 10, 20), (4, 6));
+        assert_eq!(budget(9, rows(10), rows(20)), (3, 6));
+        assert_eq!(budget(10, rows(10), rows(20)), (4, 6));
     }
 
     #[test]
     fn the_activity_takes_everything_when_both_cannot_fit() {
-        assert_eq!(budget(8, 10, 20), (8, 0));
-        assert_eq!(budget(3, 1, 20), (3, 0));
+        assert_eq!(budget(8, rows(10), rows(20)), (8, 0));
+        assert_eq!(budget(5, rows(1), rows(1)), (5, 0));
+        assert_eq!(budget(3, rows(1), rows(20)), (3, 0));
     }
 
     #[test]
     fn a_short_work_list_asks_for_no_more_than_its_rows() {
-        assert_eq!(budget(30, 2, 2), (4, 26));
-        assert_eq!(budget(5, 0, 2), (0, 5));
+        assert_eq!(budget(30, rows(2), rows(2)), (4, 26));
     }
 
     #[test]
-    fn nothing_is_shown_when_neither_has_the_room_or_the_rows() {
-        assert_eq!(budget(5, 0, 20), (0, 0));
-        assert_eq!(budget(2, 4, 0), (0, 0));
-        assert_eq!(budget(0, 0, 0), (0, 0));
-        assert_eq!(budget(10, 0, 0), (0, 0));
+    fn a_panel_with_only_its_reason_to_show_still_gets_a_title_and_a_row() {
+        assert_eq!(budget(6, rows(1), rows(1)), (3, 3));
+        assert_eq!(budget(7, rows(1), rows(1)), (3, 4));
     }
 
     #[test]
-    fn the_activity_alone_fills_the_room_when_there_is_no_work() {
-        assert_eq!(budget(10, 2, 0), (10, 0));
+    fn nothing_is_shown_when_the_room_is_under_one_panel() {
+        assert_eq!(budget(2, rows(4), rows(1)), (0, 0));
+        assert_eq!(budget(0, rows(1), rows(1)), (0, 0));
     }
 
     fn flat(facts: &WorktreeFacts) -> Vec<TreeRow> {
@@ -1910,11 +2097,12 @@ mod tests {
         for _ in 0..2 {
             let laid = laid(&mut m, (200, 50));
             let (panel, changes) = laid.changes.as_ref().expect("[3] shows");
+            let diff = changes.counted.expect("git was read").diff;
             shown.push((
                 texts(&panel.lines)[0].clone(),
-                changes.diff.files,
-                changes.diff.added,
-                changes.diff.removed,
+                diff.files,
+                diff.added,
+                diff.removed,
                 panel.lines.len(),
             ));
             m.toggle_changes_scope();
@@ -2319,7 +2507,7 @@ mod tests {
         m.set_cursor(Cursor::Entry(name("rate-limit-1")));
         let first = laid(&mut m, (200, 50));
         let (panel, changes) = first.changes.as_ref().expect("[3] shows");
-        assert_eq!(changes.shared, 1);
+        assert_eq!(changes.counted.map(|c| c.shared), Some(1));
         let flow = panel
             .lines
             .iter()
@@ -2375,7 +2563,7 @@ mod tests {
         );
         let first = laid(&mut m, (200, 50));
         let (panel, changes) = first.changes.as_ref().expect("[3] shows");
-        assert_eq!(changes.diff.files, 0);
+        assert_eq!(changes.counted.map(|c| c.diff.files), Some(0));
         assert_eq!(texts(&panel.lines), [" no changes"]);
         assert!(
             panel.lines[0].spans[1]
@@ -2507,6 +2695,70 @@ mod tests {
         assert_eq!((m.scroll.offset, row_after), (offset, row));
     }
 
+    fn changes_rows(m: &mut Model) -> Vec<String> {
+        let laid = laid(m, (80, 40));
+        let (panel, _) = laid.changes.as_ref().expect("[3] shows");
+        texts(&panel.lines)
+    }
+
+    #[test]
+    fn changes_stays_on_screen_and_says_no_changes_for_a_clean_worktree() {
+        let mut m = fleet(8);
+        let who = name("auth-refresh-2");
+        m.set_cursor(Cursor::Entry(who.clone()));
+        m.set_test_facts(&who, Ok(crate::fixtures::unchanged()));
+        assert_eq!(changes_rows(&mut m), [" no changes"]);
+    }
+
+    #[test]
+    fn changes_says_it_is_reading_git_only_while_the_facts_are_asked_for() {
+        let mut m = fleet(8);
+        let who = name("auth-refresh-2");
+        m.set_cursor(Cursor::Entry(who.clone()));
+        m.track(&who).facts = None;
+        m.track(&who).inspection = None;
+        assert_eq!(changes_rows(&mut m), [" git not read yet"]);
+        m.track(&who).inspection = Some(crate::model::Inspection {
+            events: None,
+            at: std::time::Instant::now(),
+        });
+        assert_eq!(changes_rows(&mut m), [" reading git…"]);
+    }
+
+    #[test]
+    fn changes_keeps_the_focus_when_it_becomes_vacant_under_the_cursor() {
+        let mut m = fleet(8);
+        let who = name("payroll-fix-3");
+        m.set_cursor(Cursor::Entry(who.clone()));
+        m.panel = Focused::Changes { file: 1 };
+        m.set_test_facts(&who, Ok(crate::fixtures::unchanged()));
+        let laid = laid(&mut m, (80, 40));
+        assert_eq!(laid.focus, Focused::Changes { file: 0 });
+    }
+
+    #[test]
+    fn changes_stays_on_screen_and_gives_git_s_error_when_it_cannot_be_read() {
+        let mut m = fleet(8);
+        let who = name("auth-refresh-2");
+        m.set_cursor(Cursor::Entry(who.clone()));
+        m.set_test_facts(&who, Err("fatal: not a repo".into()));
+        assert_eq!(changes_rows(&mut m), [" git: fatal: not a repo"]);
+    }
+
+    #[test]
+    fn activity_stays_on_screen_for_an_agent_that_has_reported_nothing() {
+        let mut m = fleet(8);
+        let who = name("auth-refresh-2");
+        m.set_cursor(Cursor::Entry(who.clone()));
+        m.activities.as_mut().expect("loaded").remove(&who);
+        let laid = laid(&mut m, (80, 40));
+        assert_eq!(agent_lines(&laid), [" no activity recorded"]);
+        assert!(
+            laid.agent_rows.is_empty(),
+            "there is no row to put a cursor on"
+        );
+    }
+
     #[test]
     fn the_readiness_row_never_eats_the_file_rows() {
         for height in 12..=24 {
@@ -2526,7 +2778,7 @@ mod tests {
                 .filter(|l| !l.trim_start().starts_with('+'))
                 .count();
             assert!(
-                files >= CHANGES_MIN.min(changes.diff.files),
+                files >= CHANGES_MIN.min(changes.counted.map_or(0, |c| c.diff.files)),
                 "{height} rows: {files} file rows under readiness\n{}",
                 rows.join("\n")
             );
@@ -2577,7 +2829,7 @@ mod tests {
         let laid = laid(&mut m, (200, 50));
         let (panel, changes) = laid.changes.as_ref().expect("[3] shows");
         assert_eq!(texts(&panel.lines), [" git: fatal: not a repo"]);
-        assert_eq!(changes.diff.files, 0);
+        assert!(changes.counted.is_none(), "nothing was counted");
     }
 
     #[test]
@@ -2614,8 +2866,9 @@ mod tests {
             Focused::Changes { file: 0 },
             "one file, so the last row"
         );
-        m.track(&name("rate-limit-1")).facts = None;
-        assert_eq!(laid(&mut m, (200, 50)).focus, Focused::Agents);
+        let short = laid(&mut m, (80, 9));
+        assert!(short.changes.is_none(), "no room for [3]");
+        assert_eq!(short.focus, Focused::Agents);
     }
 
     /// The screen as rows of text.
@@ -2851,7 +3104,7 @@ mod tests {
             terminal.backend().buffer()[(area.x - 2, area.y - 1)].fg
         };
         assert_ne!(border(&terminal), Color::Cyan, "[3] has the keys");
-        m.panel.focus_document();
+        m.focus_document();
         let terminal = render(&mut m, (100, 30));
         assert_eq!(border(&terminal), Color::Cyan, "[0] has them now");
     }
@@ -3322,17 +3575,83 @@ mod tests {
         }
     }
 
-    #[test]
-    fn the_send_box_says_queue_when_it_will_queue() {
-        let mut m = fleet(10);
+    fn send_box(m: &mut Model) -> String {
         m.overlay = Overlay::Talk {
             to: name("obs-layout-4"),
             text: String::new(),
         };
-        let text = screen(&render(&mut m, (100, 30))).join("\n");
+        screen(&render(m, (100, 30))).join("\n")
+    }
+
+    #[test]
+    fn the_send_box_says_send_while_the_agent_works() {
+        let mut m = fleet(10);
+        m.activities.get_or_insert_default().insert(
+            name("obs-layout-4"),
+            crate::fixtures::reported(State::Working { tools: Vec::new() }, 30),
+        );
+        let text = send_box(&mut m);
         assert!(text.contains("Send to obs-layout-4"), "{text}");
-        let queues = text.contains("queues until it's at rest");
-        assert_eq!(text.contains("⏎ queue"), queues, "{text}");
+        assert!(text.contains("⏎ send") && !text.contains("held"), "{text}");
+    }
+
+    #[test]
+    fn the_send_box_says_hold_and_why_while_a_question_is_open() {
+        let mut m = fleet(10);
+        crate::fixtures::ask(&mut m, "obs-layout-4");
+        let text = send_box(&mut m);
+        assert!(
+            text.contains("Send to obs-layout-4 · held: asking"),
+            "{text}"
+        );
+        assert!(
+            text.contains("⏎ hold") && !text.contains("⏎ send"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_card_says_why_its_queued_messages_are_held() {
+        let mut m = fleet(10);
+        m.set_cursor(Cursor::Entry(name("obs-layout-4")));
+        let mut booting = crate::fixtures::reported(State::Done { summary: None }, 1);
+        booting.session = crate::fixtures::booting();
+        m.activities
+            .get_or_insert_default()
+            .insert(name("obs-layout-4"), booting);
+        let mut outbox = crate::track::queued("rebase on main");
+        outbox.push("then run the tests".parse().expect("a prompt"), Vec::new());
+        m.track(&name("obs-layout-4")).outbox = Some(outbox);
+        let text = screen(&render(&mut m, (100, 30))).join("\n");
+        assert!(text.contains("held: booting · reb"), "{text}");
+        assert!(text.contains("+1"), "{text}");
+    }
+
+    #[test]
+    fn a_card_shows_an_interrupted_agent_as_stopped_not_working() {
+        let mut m = fleet(10);
+        m.set_cursor(Cursor::Entry(name("obs-layout-4")));
+        m.activities.get_or_insert_default().insert(
+            name("obs-layout-4"),
+            crate::fixtures::reported(State::Interrupted, 90),
+        );
+        let rows = screen(&render(&mut m, (100, 30)));
+        let at = rows
+            .iter()
+            .position(|r| r.contains("obs-layout-4") && r.contains('■'))
+            .unwrap_or_else(|| panic!("a ■ on its row\n{}", rows.join("\n")));
+        assert!(rows[at].contains("1m"), "how long ago\n{}", rows[at]);
+        assert!(
+            rows[at + 1].contains("interrupted"),
+            "{}\n{}",
+            rows[at],
+            rows[at + 1]
+        );
+        assert!(
+            !super::super::SPINNER.iter().any(|f| rows[at].contains(f)),
+            "{}",
+            rows[at]
+        );
     }
 
     fn open_help(panel: Focused) -> Model {
@@ -3649,7 +3968,7 @@ mod tests {
             Ok(Some(log_of(2, false))),
         );
         render(&mut m, (140, 40));
-        m.panel.focus_document();
+        m.focus_document();
         m.settle();
         m
     }
@@ -3736,12 +4055,28 @@ mod tests {
         )
     }
 
-    fn on_a_loaded_diff() -> Model {
+    /// [3] on a file whose diff is `lines`, loaded and drawn, with [0] not
+    /// focused.
+    fn with_a_loaded_diff(lines: &[String]) -> Model {
         use crate::document::Doc;
         use agent_core::ports::FileDiff;
         let mut m = tree_fleet();
         m.panel = Focused::Changes { file: 2 };
         let key = due_after_rest(&mut m);
+        m.docs.loaded(
+            &key,
+            Ok(Doc::Diff(FileDiff::Text {
+                lines: lines.to_vec(),
+                more: 0,
+            })),
+            std::time::Instant::now(),
+        );
+        m.settle();
+        render(&mut m, (140, 40));
+        m
+    }
+
+    fn on_a_loaded_diff() -> Model {
         let lines = [
             "@@ -10,3 +20,4 @@",
             " ctx",
@@ -3751,18 +4086,36 @@ mod tests {
             "@@ -40 +50 @@",
             "+far",
         ];
-        m.docs.loaded(
-            &key,
-            Ok(Doc::Diff(FileDiff::Text {
-                lines: lines.iter().map(|l| (*l).to_string()).collect(),
-                more: 0,
-            })),
-            std::time::Instant::now(),
-        );
-        m.settle();
-        render(&mut m, (140, 40));
-        m.panel.focus_document();
+        let mut m = with_a_loaded_diff(&lines.map(String::from));
+        m.focus_document();
         m
+    }
+
+    #[test]
+    fn the_diff_cursor_starts_on_a_line_that_shows_when_the_diff_was_scrolled_before_it_got_the_keys()
+     {
+        use crossterm::event::KeyCode;
+        let lines: Vec<String> = std::iter::once("@@ -1,60 +1,60 @@".to_string())
+            .chain((0..60).map(|n| format!("+line {n}")))
+            .collect();
+        let mut m = with_a_loaded_diff(&lines);
+        m.docs.scroll_by(30);
+        render(&mut m, (140, 24));
+        m.focus_document();
+        let top = m.areas.main.as_ref().expect("a document").top(&m.docs);
+        let line = &m.docs.lines()[m.diff_view.cursor];
+        assert!(
+            line.row >= top && line.row < top + 10,
+            "the cursor is on row {} and the screen starts at {top}",
+            line.row
+        );
+        press(&mut m, KeyCode::Char('j'));
+        render(&mut m, (140, 24));
+        let after = m.areas.main.as_ref().expect("a document").top(&m.docs);
+        assert!(
+            after.abs_diff(top) <= 1,
+            "the screen stays: {top} to {after}"
+        );
     }
 
     #[test]
@@ -3884,7 +4237,7 @@ mod tests {
             std::time::Instant::now(),
         );
         render(&mut m, (140, 40));
-        m.panel.focus_document();
+        m.focus_document();
         let text = screen(&render(&mut m, (140, 40))).join("\n");
         assert!(
             text.contains("▌abc1234"),
@@ -4169,7 +4522,7 @@ mod tests {
         fn opening_a_folded_phase_shows_what_it_said_and_did() {
             let mut m = fleet(10);
             let who = working(&mut m, "payroll-fix-3");
-            m.panel.focus_document();
+            m.focus_document();
             render(&mut m, (140, 40));
             let second = {
                 let detail = m.activity_detail(&who).expect("read");
@@ -4633,7 +4986,7 @@ mod tests {
             let mut m = fleet(10);
             let who = touching(&mut m, "auth-refresh-2", Progress::Finished { took: None });
             m.set_test_facts(&who, Ok(crate::fixtures::facts(Vec::new(), Vec::new())));
-            m.panel.focus_document();
+            m.focus_document();
             render(&mut m, (140, 40));
             m.track(&who).activity_view.watch.nav.cursor = Some(crate::log::EntryKey::Touched(
                 "nvim/lua/heucristic/status.lua".into(),
@@ -4804,6 +5157,86 @@ mod tests {
                 !text.contains("since you looked"),
                 "never looked: nothing to mark\n{text}"
             );
+        }
+
+        #[test]
+        fn an_interrupted_activity_says_so_and_stops_following_its_calls() {
+            let mut m = fleet(10);
+            let who = working(&mut m, "payroll-fix-3");
+            let activity = m
+                .activities
+                .as_mut()
+                .and_then(|a| a.get_mut(&who))
+                .expect("reports");
+            activity.state = State::Interrupted;
+            activity.since = m.clock.wall - Duration::from_secs(95);
+            for size in [(140, 40), (70, 26)] {
+                let text = page(&mut m, size).join("\n");
+                assert!(text.contains("■ interrupted"), "{size:?}\n{text}");
+                assert!(!text.contains("working"), "{size:?}\n{text}");
+                assert!(
+                    !text.contains("running 12s"),
+                    "a call it was in the middle of no longer runs\n{text}"
+                );
+            }
+        }
+
+        /// Opens the activity of `agent` in [0] on a screen `size` and says
+        /// which entry the cursor is on after `keys` are pressed once [0]
+        /// has the keys, with the rows of every entry.
+        fn cursor_after(
+            m: &mut Model,
+            who: &SessionName,
+            keys: &[crossterm::event::KeyCode],
+        ) -> (
+            Option<crate::log::EntryKey>,
+            Vec<crate::log::EntryKey>,
+            usize,
+        ) {
+            use crossterm::event::KeyCode;
+            press(m, KeyCode::Enter);
+            for key in keys {
+                press(m, *key);
+            }
+            page(m, (100, 14));
+            let main = m.areas.main.as_ref().expect("a document");
+            let entries = main.entries.iter().map(|e| e.key.clone()).collect();
+            let cursor = m
+                .nav(&crate::model::LogKey::Activity(who.clone()))
+                .and_then(|nav| nav.cursor.clone());
+            (cursor, entries, main.top(&m.docs))
+        }
+
+        #[test]
+        fn the_cursor_of_a_log_scrolled_to_the_top_starts_on_its_first_entry_and_moves_one() {
+            use crossterm::event::KeyCode;
+            let mut m = fleet(10);
+            let who = working(&mut m, "payroll-fix-3");
+            page(&mut m, (100, 14));
+            m.docs.scroll_to_start();
+            page(&mut m, (100, 14));
+            let (cursor, entries, top) = cursor_after(&mut m, &who, &[]);
+            assert_eq!((top, cursor.as_ref()), (0, entries.first()), "on screen");
+            assert!(entries.len() > 3, "the log overflows the screen");
+
+            let (cursor, entries, top) = cursor_after(&mut m, &who, &[KeyCode::Char('j')]);
+            assert_eq!(cursor.as_ref(), entries.get(1), "one entry down");
+            assert_eq!(top, 0, "and the screen stays where it was");
+        }
+
+        #[test]
+        fn the_cursor_of_a_log_following_its_end_starts_on_the_last_entry_showing_and_moves_up_one()
+        {
+            use crossterm::event::KeyCode;
+            let mut m = fleet(10);
+            let who = working(&mut m, "payroll-fix-3");
+            page(&mut m, (100, 14));
+            let (cursor, entries, top) = cursor_after(&mut m, &who, &[]);
+            assert_eq!(cursor.as_ref(), entries.last(), "the end is on screen");
+            assert!(top > 0, "it follows the end");
+
+            let (cursor, entries, _) = cursor_after(&mut m, &who, &[KeyCode::Char('k')]);
+            assert_eq!(cursor.as_ref(), entries.get(entries.len() - 2));
         }
 
         #[test]

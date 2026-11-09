@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Condvar, Mutex};
@@ -7,7 +8,7 @@ use std::thread::{self, JoinHandle};
 use agent_core::actions::CommandLine;
 use std::time::SystemTime;
 
-use agent_core::activity::{Activity, AgentId, TranscriptRef};
+use agent_core::activity::{Activity, AgentId, Hold, Standing, TranscriptRef};
 use agent_core::config::Sources;
 use agent_core::discover;
 use agent_core::model::{Removable, Running, Snapshot, Startable};
@@ -15,7 +16,8 @@ use agent_core::names::{AgentName, Prompt, SessionName};
 use agent_core::ops::{self, Approved, Backend, Launch, RemovalPlan, Removed};
 use agent_core::paths::RepoRoot;
 use agent_core::ports::{
-    ActivityDetail, ClientId, FileDiff, HarnessId, HostError, Log, Observation, Place, Window,
+    ActivityDetail, ClientId, FileDiff, HarnessId, HostError, Log, Observation, Place, Probe,
+    PromptKind, TranscriptStamp, Window,
 };
 use crossterm::event::{KeyEvent, MouseEvent};
 
@@ -29,7 +31,10 @@ const STDERR_TAIL: u64 = 64 * 1024;
 const INSPECTORS: usize = 2;
 
 /// Threads reading subagent transcripts.
-const SUBAGENT_READERS: usize = 1;
+const SUBAGENT_READERS: NonZeroUsize = NonZeroUsize::MIN;
+
+/// Threads checking transcripts for interrupts.
+const PROBERS: NonZeroUsize = NonZeroUsize::MIN.saturating_add(1);
 
 /// Threads reading diffs and branch logs.
 const DOCUMENT_READERS: usize = 2;
@@ -60,7 +65,7 @@ pub enum Msg {
     /// A message was typed into `to`, or wasn't.
     Sent {
         to: SessionName,
-        result: Result<(), SendError>,
+        result: Result<PromptKind, SendError>,
     },
     /// The windows besides this TUI's showing each session that has any,
     /// for the look `ticket` asked for, or why that couldn't be told.
@@ -116,6 +121,13 @@ pub enum Msg {
         name: SessionName,
         detail: Result<Option<ActivityDetail>, String>,
     },
+    /// What reading an agent's transcript found, for the activity `standing`
+    /// proves. What moved the activity is already recorded.
+    Probed {
+        name: SessionName,
+        standing: Standing,
+        result: Result<Probe, String>,
+    },
 }
 
 pub enum Outcome {
@@ -137,8 +149,9 @@ pub enum Outcome {
 /// Why a message wasn't typed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SendError {
-    /// The store says the agent isn't at rest: try again when it is.
-    Busy,
+    /// The store says typing would reach a menu or a session that isn't
+    /// ready: try again when that changes.
+    Held(Hold),
     /// The store couldn't be read, so nothing was typed: try again.
     Unreadable(String),
     Failed(String),
@@ -146,7 +159,7 @@ pub enum SendError {
 
 pub enum Job {
     /// Type a message into an agent and submit it, if the store still says
-    /// it's at rest.
+    /// nothing holds it.
     Reply {
         to: SessionName,
         prompt: Prompt,
@@ -247,6 +260,7 @@ pub struct Workers {
     inspector: Arc<Inspector>,
     subagents: Arc<SubagentReader>,
     activities: Arc<ActivityReader>,
+    probers: Arc<Prober>,
     documents: Arc<DocumentReader>,
     namer: Arc<Namer>,
     lookouts: Lookouts,
@@ -278,6 +292,19 @@ impl Workers {
     /// the transcript its hooks named.
     pub fn read_activity(&self, name: SessionName, workdir: PathBuf, at: Option<TranscriptRef>) {
         self.activities.request(name, (workdir, at));
+    }
+
+    /// Asks what the transcript at `at` says of the activity `standing` proves,
+    /// and records it if it moved. Nothing is read while `seen` still
+    /// describes the file.
+    pub fn probe(
+        &self,
+        name: SessionName,
+        at: TranscriptRef,
+        standing: Standing,
+        seen: Option<TranscriptStamp>,
+    ) {
+        self.probers.request(name, Probing { at, standing, seen });
     }
 
     /// Asks which windows besides this TUI's show any session, on threads of
@@ -447,49 +474,39 @@ fn spawn_document_readers(backend: &Arc<Backend>, msgs: &Sender<Msg>) -> Arc<Doc
     reader
 }
 
-/// The harness `name` runs, or the default one for an agent with no record.
-fn harness_of<'a>(backend: &'a Backend, name: &SessionName) -> &'a dyn agent_core::ports::Harness {
-    backend
-        .store
-        .record(name)
-        .ok()
-        .flatten()
-        .and_then(|record| backend.harnesses.get(&record.harness))
-        .unwrap_or_else(|| backend.harnesses.default_harness())
-}
-
 /// Reads subagent transcripts.
 type SubagentReader = Queue<(SessionName, AgentId), PathBuf>;
 
 /// Reads agents' current activities.
 type ActivityReader = Queue<SessionName, (PathBuf, Option<TranscriptRef>)>;
 
-/// Serves a queue of transcript reads on [`SUBAGENT_READERS`] threads.
-/// `read` asks the harness of the session `session` names and says what came
-/// back. The answer goes out before the key is free again, so a newer read of
-/// the same key can't be answered first and then overwritten by this one.
-fn spawn_log_readers<K, V>(
+/// Serves a queue of reads on `threads` threads. `read` does one and says
+/// what came back. The answer goes out before the key is free again, so a
+/// newer read of the same key can't be answered first and then overwritten
+/// by this one.
+fn spawn_readers<K, V>(
     backend: &Arc<Backend>,
     msgs: &Sender<Msg>,
-    session: fn(&K) -> &SessionName,
-    read: fn(&dyn agent_core::ports::Harness, &K, V) -> Msg,
+    threads: NonZeroUsize,
+    read: fn(&Backend, &K, V) -> Vec<Msg>,
 ) -> Arc<Queue<K, V>>
 where
     K: Clone + Eq + std::hash::Hash + Send + 'static,
     V: Send + 'static,
 {
     let reader = Arc::new(Queue::<K, V>::new());
-    for _ in 0..SUBAGENT_READERS {
+    for _ in 0..threads.get() {
         let reader = Arc::clone(&reader);
         let backend = Arc::clone(backend);
         let msgs = msgs.clone();
         thread::spawn(move || {
             loop {
                 let (key, value) = reader.next();
-                let msg = read(harness_of(&backend, session(&key)), &key, value);
-                let sent = msgs.send(msg);
+                let alive = read(&backend, &key, value)
+                    .into_iter()
+                    .all(|msg| msgs.send(msg).is_ok());
                 reader.done(&key);
-                if sent.is_err() {
+                if !alive {
                     return;
                 }
             }
@@ -499,30 +516,70 @@ where
 }
 
 fn spawn_subagent_readers(backend: &Arc<Backend>, msgs: &Sender<Msg>) -> Arc<SubagentReader> {
-    spawn_log_readers(
+    spawn_readers(
         backend,
         msgs,
-        |(name, _)| name,
-        |harness, (name, id), workdir| Msg::Subagent {
-            name: name.clone(),
-            id: id.clone(),
-            detail: harness.subagent(&workdir, id).map_err(|e| describe(&e)),
+        SUBAGENT_READERS,
+        |backend, (name, id), workdir| {
+            vec![Msg::Subagent {
+                name: name.clone(),
+                id: id.clone(),
+                detail: ops::harness_for(backend.services(), name)
+                    .and_then(|harness| Ok(harness.subagent(&workdir, id)?))
+                    .map_err(|e| describe(&e)),
+            }]
         },
     )
 }
 
 fn spawn_activity_readers(backend: &Arc<Backend>, msgs: &Sender<Msg>) -> Arc<ActivityReader> {
-    spawn_log_readers(
+    spawn_readers(
         backend,
         msgs,
-        |name| name,
-        |harness, name, (workdir, at)| Msg::Activity {
-            name: name.clone(),
-            detail: harness
-                .activity_detail(&workdir, at.as_ref())
-                .map_err(|e| describe(&e)),
+        SUBAGENT_READERS,
+        |backend, name, (workdir, at)| {
+            vec![Msg::Activity {
+                name: name.clone(),
+                detail: ops::harness_for(backend.services(), name)
+                    .and_then(|harness| Ok(harness.activity_detail(&workdir, at.as_ref())?))
+                    .map_err(|e| describe(&e)),
+            }]
         },
     )
+}
+
+struct Probing {
+    at: TranscriptRef,
+    standing: Standing,
+    seen: Option<TranscriptStamp>,
+}
+
+type Prober = Queue<SessionName, Probing>;
+
+/// Reads a transcript for what `probing` asks. An answer that moved the
+/// activity is followed by every agent's activity as the store now has it,
+/// so the change shows without waiting for the next poll.
+fn probe(backend: &Backend, name: &SessionName, probing: &Probing) -> Vec<Msg> {
+    let result = ops::probe_interrupt(
+        backend.services(),
+        name,
+        &probing.at,
+        probing.standing,
+        probing.seen.as_ref(),
+    );
+    let moved = matches!(result, Ok((_, Some(_))));
+    let mut msgs = vec![Msg::Probed {
+        name: name.clone(),
+        standing: probing.standing,
+        result: result.map(|(probe, _)| probe).map_err(|e| describe(&e)),
+    }];
+    if moved {
+        match backend.store.activities() {
+            Ok(activities) => msgs.push(Msg::Activities(activities)),
+            Err(e) => msgs.push(Msg::Done(Err(describe(&e)))),
+        }
+    }
+    msgs
 }
 
 /// Asks the model to name prompts on one thread, one at a time. A model
@@ -675,6 +732,9 @@ pub fn spawn(backend: Arc<Backend>, sources: Sources, msgs: Sender<Msg>) -> Work
     let inspector = spawn_inspectors(&backend, &msgs);
     let subagents = spawn_subagent_readers(&backend, &msgs);
     let activities = spawn_activity_readers(&backend, &msgs);
+    let probers = spawn_readers(&backend, &msgs, PROBERS, |backend, name, probing| {
+        probe(backend, name, &probing)
+    });
     let documents = spawn_document_readers(&backend, &msgs);
     let lookouts = spawn_lookouts(&host_scan(&backend), &msgs);
     let namer = {
@@ -712,6 +772,7 @@ pub fn spawn(backend: Arc<Backend>, sources: Sources, msgs: Sender<Msg>) -> Work
         inspector,
         subagents,
         activities,
+        probers,
         documents,
         namer,
         lookouts,
@@ -910,17 +971,14 @@ fn reply(
     to: &SessionName,
     prompt: &Prompt,
     not_before: Option<SystemTime>,
-) -> Result<(), SendError> {
-    match svc.store.activities() {
-        Ok(all)
-            if all
-                .get(to)
-                .is_some_and(|a| a.ready_for_text(not_before, SystemTime::now())) =>
-        {
-            ops::inject(svc, to, prompt).map_err(|e| SendError::Failed(describe(&e)))
-        }
-        Ok(_) => Err(SendError::Busy),
-        Err(e) => Err(SendError::Unreadable(describe(&e))),
+) -> Result<PromptKind, SendError> {
+    let all = svc
+        .store
+        .activities()
+        .map_err(|e| SendError::Unreadable(describe(&e)))?;
+    match Hold::of(all.get(to), not_before, SystemTime::now()) {
+        None => ops::inject(svc, to, prompt).map_err(|e| SendError::Failed(describe(&e))),
+        Some(hold) => Err(SendError::Held(hold)),
     }
 }
 

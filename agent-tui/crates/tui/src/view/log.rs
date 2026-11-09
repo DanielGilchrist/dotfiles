@@ -759,11 +759,17 @@ pub(super) enum ActivityStage<'a> {
         reason: &'a str,
         since: SystemTime,
     },
+    Interrupted {
+        since: SystemTime,
+    },
 }
 
 impl ActivityStage<'_> {
     fn finished(&self) -> bool {
-        matches!(self, Self::Done { .. } | Self::Failed { .. })
+        matches!(
+            self,
+            Self::Done { .. } | Self::Failed { .. } | Self::Interrupted { .. }
+        )
     }
 }
 
@@ -1305,6 +1311,7 @@ fn activity_status(
         } => delegating_activity_row(&figures, *running, *quiet, *stale),
         ActivityStage::Done { seen } => done_activity_row(detail, &figures, *seen),
         ActivityStage::Failed { reason, since } => failed_activity_row(&figures, reason, *since),
+        ActivityStage::Interrupted { since } => interrupted_activity_row(&figures, *since),
     }
 }
 
@@ -1461,6 +1468,18 @@ fn failed_activity_row(
         Span::styled(" · ", dim()),
         Span::raw(tame(reason)),
     ];
+    let mut extras = vec![Some(Span::styled(ago(since, figures.ctx.now), dim()))];
+    if !figures.narrow {
+        extras.extend([Some(figures.calls.clone()), figures.errors(None)]);
+    }
+    with_tail(spans, extras)
+}
+
+fn interrupted_activity_row(
+    figures: &ActivityFigures<'_>,
+    since: SystemTime,
+) -> Vec<Span<'static>> {
+    let spans = vec![Span::styled("■", dim()), Span::raw(" interrupted")];
     let mut extras = vec![Some(Span::styled(ago(since, figures.ctx.now), dim()))];
     if !figures.narrow {
         extras.extend([Some(figures.calls.clone()), figures.errors(None)]);

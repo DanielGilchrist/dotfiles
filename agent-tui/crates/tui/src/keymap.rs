@@ -200,7 +200,7 @@ impl Situation {
             enter,
             can_kill,
             can_remove,
-            can_send: entry.is_some_and(|e| m.talkable(e).is_ok()),
+            can_send: entry.is_some_and(|e| m.reachable(e).is_ok()),
             can_peek,
             elsewhere,
             moves_here,
@@ -565,7 +565,7 @@ pub const BINDINGS: &[Binding] = &[
         EVERYWHERE,
         RankBy(|s| s.can_send.then_some(7)),
         By(|s| s.on_agent.then_some(if s.draft { "send review" } else { "send" })),
-        "Compose a message to the selected agent without attaching. It is sent now if the agent is at rest, otherwise queued until it is.",
+        "Compose a message to the selected agent without attaching. It is typed at once, and held only while the agent is asking, its session is starting or hasn't reported, a tool just started, or the last message is too recent or was a command.",
     ),
     Binding::new(
         &["v"],
@@ -677,7 +677,7 @@ pub const BINDINGS: &[Binding] = &[
         Ctxs::of(&[Ctx::Main]),
         RankBy(|s| s.diff.then_some(8)),
         By(|s| s.diff.then_some("comment")),
-        "Add a comment on the line, or the selected lines, to this agent's review. s sends every comment as one message, now if the agent is at rest, otherwise queued until it is.",
+        "Add a comment on the line, or the selected lines, to this agent's review. s sends every comment as one message, typed at once and held under the same conditions as any message.",
     ),
     Binding::new(
         &["c"],

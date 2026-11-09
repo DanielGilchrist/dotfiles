@@ -141,6 +141,13 @@ pub fn asking(question: &str, secs_ago: u64) -> Activity {
     activity
 }
 
+/// `agent` with a question open.
+pub fn ask(m: &mut Model, agent: &str) {
+    m.activities
+        .get_or_insert_default()
+        .insert(name(agent), asking("rm?", 1));
+}
+
 const REPOS: [&str; 5] = ["heucristic", "agent-tui", "tanda_cli", "lanjam", "payroll"];
 const AGENTS: [&str; 8] = [
     "triage-flow",

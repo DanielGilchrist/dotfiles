@@ -34,8 +34,8 @@ pub(crate) struct Cut {
 }
 
 /// Records that start with these are the harness talking to itself, not a
-/// prompt: a local command's output and an interrupt's marker.
-const NOT_PROMPTS: &[&str] = &["<local-command-", "[Request interrupted by user"];
+/// prompt: a local command's output.
+const NOT_PROMPTS: &[&str] = &["<local-command-"];
 
 /// What a user record says when it opens an activity.
 enum Said {
@@ -51,6 +51,7 @@ enum Said {
 fn said(record: &Value) -> Option<Said> {
     let flag = |key: &str| record.get(key).and_then(Value::as_bool) == Some(true);
     if record.get("type").and_then(Value::as_str) != Some("user")
+        || transcript::is_interrupt(record)
         || flag("isMeta")
         || flag("isCompactSummary")
         || flag("isSidechain")
@@ -234,7 +235,7 @@ pub(crate) fn read(path: &Path) -> io::Result<Option<ActivityDetail>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fixtures::{answer, ended, said, typed, use_of, user};
+    use crate::fixtures::{answer, ended, said, typed, use_of, user, write};
     use agent_core::activity::ToolId;
     use agent_core::ports::{CallState, LogEntry};
 
@@ -335,12 +336,6 @@ mod tests {
         let cut = cut(&text);
         assert_eq!((cut.opening, cut.from), (None, 0));
         assert_eq!(cut.id.as_deref(), Some("p9"));
-    }
-
-    fn write(dir: &Path, lines: &[String]) -> std::path::PathBuf {
-        let path = dir.join("session.jsonl");
-        std::fs::write(&path, lines.join("\n") + "\n").expect("writes");
-        path
     }
 
     #[test]

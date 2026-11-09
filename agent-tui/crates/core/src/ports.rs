@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
-use crate::activity::{Activity, AgentId, Reported, ToolId, TranscriptRef};
+use crate::activity::{Activity, AgentId, Going, Reported, Stopped, ToolId, TranscriptRef};
 use crate::model::{Head, Presence, Running, Worktree};
 use crate::names::{BranchName, NameError, Prompt, PullRequest, SessionName};
 use crate::paths::{AgentWorktree, RepoRoot};
@@ -834,6 +834,11 @@ pub trait Harness: Send + Sync {
     ) -> Result<Option<Seen>, HarnessError>;
     /// The bytes that type `prompt` into a running agent and submit it.
     fn submit(&self, prompt: &Prompt) -> Vec<u8>;
+    /// What typing `prompt` does.
+    fn prompt_kind(&self, prompt: &Prompt) -> PromptKind {
+        let _ = prompt;
+        PromptKind::Message
+    }
     /// A one-shot, non-interactive answer to `question` from the harness's
     /// quickest model (`claude -p`, `codex exec`, …), or `None` if it can't
     /// answer one-off questions. May take seconds: call it off the UI thread.
@@ -858,6 +863,19 @@ pub trait Harness: Send + Sync {
     ) -> Result<Option<ActivityDetail>, HarnessError> {
         let _ = (workdir, at);
         Ok(None)
+    }
+    /// Whether the user has interrupted the activity, from the end of the
+    /// transcript at `at`, for a harness that sends no event when they do.
+    /// It reads nothing when `seen` still describes the file. Reads files:
+    /// call it off the UI thread.
+    fn interruption(
+        &self,
+        at: &TranscriptRef,
+        after: SystemTime,
+        seen: Option<&TranscriptStamp>,
+    ) -> Result<Probe, HarnessError> {
+        let _ = (at, after, seen);
+        Ok(Probe::NoTranscript)
     }
 }
 
@@ -896,6 +914,48 @@ pub enum Progress {
     Finished { took: Option<Duration> },
     /// The transcript ends because the API gave up on it.
     Stopped,
+}
+
+/// What a transcript's length and modification time were when it was read,
+/// so a read can tell whether anything was written since.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranscriptStamp {
+    len: u64,
+    modified: Option<SystemTime>,
+}
+
+impl TranscriptStamp {
+    pub fn new(len: u64, modified: Option<SystemTime>) -> Self {
+        Self { len, modified }
+    }
+}
+
+/// What reading the end of an agent's transcript found about the activity
+/// it stands in, comparing only records later than the `after` it was asked
+/// with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Probe {
+    /// There was nothing to conclude: the file is as `seen` says, or what
+    /// was read held no conversational record.
+    Unchanged,
+    /// The last record is the agent or the user carrying on.
+    Going(TranscriptStamp),
+    /// The last record is the user stopping the activity, written at the time
+    /// given.
+    Interrupted(TranscriptStamp, SystemTime),
+    /// The last record is older than `after`.
+    Older(TranscriptStamp),
+    /// There is no transcript to read.
+    NoTranscript,
+}
+
+/// What typing a prompt into an agent does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptKind {
+    Message,
+    /// The agent runs it instead of treating it as a message: it reports
+    /// nothing and may open a picker.
+    Command,
 }
 
 /// An unanswered question call and what it asked.
@@ -1179,6 +1239,13 @@ pub trait Store: Send + Sync {
     fn report(&self, name: &SessionName, event: Reported) -> Result<(), StoreError>;
     /// The user has looked at `name`: a finished activity stops being news.
     fn acknowledge(&self, name: &SessionName) -> Result<(), StoreError>;
+    /// `name`'s transcript shows the user interrupted the activity `proof` was
+    /// made for, by the record written at `at`. An activity that has moved on
+    /// is left alone.
+    fn interrupt(&self, name: &SessionName, proof: Going, at: SystemTime)
+    -> Result<(), StoreError>;
+    /// `name`'s transcript shows the activity `proof` was made for carried on.
+    fn resume(&self, name: &SessionName, proof: Stopped) -> Result<(), StoreError>;
     /// Every agent's latest activity.
     fn activities(&self) -> Result<HashMap<SessionName, Activity>, StoreError>;
     /// The agent last selected in the TUI, to start on next time.

@@ -1,10 +1,14 @@
 use std::num::NonZeroUsize;
 use std::sync::atomic::Ordering;
+use std::time::SystemTime;
 
 use super::*;
+use crate::activity::{Activity, Input, Move, Standing, State, TranscriptRef};
 use crate::model::Head;
 use crate::names::PullRequest;
-use crate::ports::{LocalBranch, PullRequestHead, SessionInfo, SessionStatus};
+use crate::ports::{
+    LocalBranch, Probe, PullRequestHead, SessionInfo, SessionStatus, TranscriptStamp,
+};
 use crate::testing::{FakeForge, FakeHarnesses, FakeHost, FakeVcs, MemStore};
 
 struct World {
@@ -782,7 +786,6 @@ fn attaching_here_starts_the_worktrees_agent_and_never_creates_one() {
 
 #[test]
 fn launching_marks_a_previously_finished_agent_as_booting() {
-    use crate::activity::{Activity, MainEvent, Reported};
     let w = World::new();
     let repo = w.vcs.root.clone();
     attach(w.svc(), &agent("fix"), None, Some(&repo), w.harness()).expect("succeeds");
@@ -795,7 +798,7 @@ fn launching_marks_a_previously_finished_agent_as_booting() {
         }),
         long_ago,
     );
-    assert!(done.at_rest());
+    assert!(matches!(done.state, State::Done { .. }));
     w.store
         .activities
         .lock()
@@ -811,7 +814,7 @@ fn launching_marks_a_previously_finished_agent_as_booting() {
         .get(&session("fix"))
         .cloned()
         .expect("recorded");
-    assert!(!activity.at_rest() && activity.session.is_booting());
+    assert!(activity.state.is_going() && activity.session.is_booting());
     assert!(matches!(
         activity.session,
         crate::activity::Session::Launched {
@@ -819,4 +822,151 @@ fn launching_marks_a_previously_finished_agent_as_booting() {
             ..
         }
     ));
+}
+
+fn working_agent(w: &World, who: &str) -> Activity {
+    let working = Activity::next(
+        None,
+        Reported::main(MainEvent::Prompted(Input::User("go".into()))),
+        SystemTime::UNIX_EPOCH,
+    );
+    w.store
+        .activities
+        .lock()
+        .expect("lock")
+        .insert(session(who), working.clone());
+    working
+}
+
+fn stored_state(w: &World, who: &str) -> State {
+    w.store
+        .activities
+        .lock()
+        .expect("lock")
+        .get(&session(who))
+        .expect("recorded")
+        .state
+        .clone()
+}
+
+fn transcript() -> TranscriptRef {
+    TranscriptRef::new("/t/session.jsonl")
+}
+
+fn stamp() -> TranscriptStamp {
+    TranscriptStamp::new(10, None)
+}
+
+fn probing(w: &World, found: Probe) {
+    *w.harnesses.0.probe.lock().expect("lock") = found;
+}
+
+fn standing_of(activity: &Activity) -> Standing {
+    activity.standing().expect("going or stopped")
+}
+
+#[test]
+fn a_transcript_ending_in_an_interrupt_stops_the_working_agent_it_was_read_for() {
+    let w = World::new();
+    let working = working_agent(&w, "fix");
+    let marker = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(50);
+    probing(&w, Probe::Interrupted(stamp(), marker));
+    let (probe, moved) = probe_interrupt(
+        w.svc(),
+        &session("fix"),
+        &transcript(),
+        standing_of(&working),
+        None,
+    )
+    .expect("succeeds");
+    assert_eq!(probe, Probe::Interrupted(stamp(), marker));
+    assert!(matches!(moved, Some(Move::Interrupted(..))));
+    assert_eq!(stored_state(&w, "fix"), State::Interrupted);
+    let stored = w.store.activities.lock().expect("lock")[&session("fix")].clone();
+    assert_eq!(
+        stored.standing().map(Standing::after),
+        Some(marker),
+        "it counts as interrupted from the record, so work landing within the lag still reads as going"
+    );
+}
+
+#[test]
+fn a_transcript_still_going_or_older_leaves_the_agent_working() {
+    let w = World::new();
+    let working = working_agent(&w, "fix");
+    for found in [
+        Probe::Going(stamp()),
+        Probe::Older(stamp()),
+        Probe::Unchanged,
+        Probe::NoTranscript,
+    ] {
+        probing(&w, found);
+        probe_interrupt(
+            w.svc(),
+            &session("fix"),
+            &transcript(),
+            standing_of(&working),
+            None,
+        )
+        .expect("succeeds");
+        assert!(stored_state(&w, "fix").is_going());
+    }
+}
+
+#[test]
+fn an_interrupt_found_after_a_newer_prompt_arrived_does_not_idle_the_newer_turn() {
+    let w = World::new();
+    let working = working_agent(&w, "fix");
+    let asked_at = standing_of(&working);
+    let newer = Activity::next(
+        Some(working),
+        Reported::main(MainEvent::Prompted(Input::User("again".into()))),
+        SystemTime::UNIX_EPOCH,
+    );
+    w.store
+        .activities
+        .lock()
+        .expect("lock")
+        .insert(session("fix"), newer);
+    probing(&w, Probe::Interrupted(stamp(), SystemTime::UNIX_EPOCH));
+    probe_interrupt(w.svc(), &session("fix"), &transcript(), asked_at, None).expect("succeeds");
+    assert!(stored_state(&w, "fix").is_going());
+}
+
+#[test]
+fn an_interrupted_agent_whose_transcript_went_on_is_working_again() {
+    let w = World::new();
+    let working = working_agent(&w, "fix");
+    probing(&w, Probe::Interrupted(stamp(), SystemTime::UNIX_EPOCH));
+    probe_interrupt(
+        w.svc(),
+        &session("fix"),
+        &transcript(),
+        standing_of(&working),
+        None,
+    )
+    .expect("succeeds");
+    let stopped = w.store.activities.lock().expect("lock")[&session("fix")].clone();
+
+    probing(&w, Probe::Interrupted(stamp(), SystemTime::UNIX_EPOCH));
+    probe_interrupt(
+        w.svc(),
+        &session("fix"),
+        &transcript(),
+        standing_of(&stopped),
+        None,
+    )
+    .expect("succeeds");
+    assert_eq!(stored_state(&w, "fix"), State::Interrupted, "still stopped");
+
+    probing(&w, Probe::Going(stamp()));
+    probe_interrupt(
+        w.svc(),
+        &session("fix"),
+        &transcript(),
+        standing_of(&stopped),
+        None,
+    )
+    .expect("succeeds");
+    assert!(stored_state(&w, "fix").is_going());
 }

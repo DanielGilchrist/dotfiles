@@ -5,7 +5,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use agent_core::actions::Actions;
 use agent_core::activity::{
-    Activity, AgentId, Answer as AskedBy, Origin as Asker, State, Subagent, ToolId,
+    Activity, AgentId, Answer as AskedBy, Hold, Origin as Asker, State, Subagent, ToolId,
 };
 use agent_core::config::Keys;
 use agent_core::model::{
@@ -184,7 +184,7 @@ impl Panel {
     }
 
     /// Puts the keys in the panel's document. [1] has none.
-    pub fn focus_document(&mut self) {
+    fn focus_document(&mut self) {
         let from = match std::mem::replace(self, Self::Agents) {
             Self::Agent { offset, row } => Origin::Activity { offset, row },
             Self::Changes { file } => Origin::Changes { file },
@@ -214,6 +214,32 @@ impl Panel {
             Self::Agents | Self::Changes { .. } | Self::Main(Origin::Changes { .. }, _) => None,
         }
     }
+}
+
+/// Why typing into an agent waits: what its activity shows, or what was
+/// typed into it that it hasn't reported on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Held {
+    Activity(Hold),
+    /// A message was typed a moment ago and the agent hasn't reported since.
+    JustSent,
+    /// The last message was a command, which reports nothing and may open
+    /// a picker.
+    Command,
+}
+
+/// What a hold says wherever one is shown: `held: asking`.
+pub fn held(hold: Held) -> String {
+    let why = match hold {
+        Held::Activity(Hold::Asking) => "asking",
+        Held::Activity(Hold::Booting) => "booting",
+        Held::Activity(Hold::Unreported) => "no report yet",
+        Held::Activity(Hold::Ended) => "ended",
+        Held::Activity(Hold::ToolStarting) => "tool starting",
+        Held::JustSent => "just sent",
+        Held::Command => "command sent",
+    };
+    format!("held: {why}")
 }
 
 /// Whether the column is tall enough for [3] at all. Until a draw says
@@ -827,6 +853,10 @@ pub enum AgentStatus {
         summary: Option<String>,
         since: SystemTime,
     },
+    /// The user stopped the activity, and it is waiting for the next prompt.
+    Interrupted {
+        since: SystemTime,
+    },
 }
 
 /// When an agent's git facts were asked for, and how many events it had
@@ -977,7 +1007,11 @@ impl AgentStatus {
                 Some((Urgency::Blocked, *since))
             }
             Self::Done { since, .. } => Some((Urgency::Unseen, *since)),
-            Self::NoSession | Self::Exited | Self::Idle | Self::Working { .. } => None,
+            Self::NoSession
+            | Self::Exited
+            | Self::Idle
+            | Self::Working { .. }
+            | Self::Interrupted { .. } => None,
         }
     }
 }
@@ -1167,12 +1201,24 @@ impl Proposal {
     }
 }
 
-/// Why `t` can't message an agent.
+/// An agent that can be messaged, with the activity that says when.
+pub struct Reachable<'a> {
+    name: &'a SessionName,
+    activity: &'a Activity,
+}
+
+impl<'a> Reachable<'a> {
+    pub fn name(&self) -> &'a SessionName {
+        self.name
+    }
+}
+
+/// Why `s` can't message an agent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Unreachable {
     NotRunning,
     Own,
-    /// No hook activity: when it's at rest can't be known.
+    /// No hook activity: whether a menu is open can't be known.
     Unreported,
 }
 
@@ -1317,6 +1363,33 @@ impl MainLayout {
             .find(|e| e.start + e.len > top)
             .or_else(|| self.entries.last())
             .map(|e| e.key.clone())
+    }
+
+    /// The entry a cursor that is just getting the keys starts on: the one it
+    /// is already on if that shows, else the last showing while the log
+    /// follows its end and the first showing otherwise.
+    pub fn entry_to_start_on(
+        &self,
+        docs: &Documents,
+        on: Option<&crate::log::EntryKey>,
+    ) -> Option<crate::log::EntryKey> {
+        let placed = docs.placed(self.total, self.height, self.tails);
+        let shows = |e: &&crate::log::EntryRows| {
+            e.start < placed.top + self.height && e.start + e.len > placed.top
+        };
+        if let Some(key) =
+            on.filter(|key| self.entries.iter().filter(shows).any(|e| &e.key == *key))
+        {
+            return Some(key.clone());
+        }
+        let mut showing = self.entries.iter().filter(shows);
+        let pick = if placed.following() {
+            showing.next_back()
+        } else {
+            showing.next()
+        };
+        pick.map(|e| e.key.clone())
+            .or_else(|| self.entry_at(placed.top))
     }
 
     /// Scrolls `docs` so the log's entry `key` shows.
@@ -1977,9 +2050,8 @@ impl Model {
     /// Whether `name` is at work on its activity, so its log grows: working,
     /// delegating or waiting on an answer.
     pub fn activity_running(&self, name: &SessionName) -> bool {
-        self.activity(name).is_some_and(|a| {
-            a.waiting().is_some() || matches!(a.state, State::Working { .. } | State::Delegating)
-        })
+        self.activity(name)
+            .is_some_and(|a| a.waiting().is_some() || a.state.is_going())
     }
 
     /// What `name` is asking about, matched by tool id to its activity. `None`
@@ -2024,7 +2096,10 @@ impl Model {
         match &self.activity(name)?.state {
             State::Done { summary } => summary.clone().or_else(reported),
             State::Idle | State::Exited => reported(),
-            State::Working { .. } | State::Delegating | State::Failed { .. } => None,
+            State::Working { .. }
+            | State::Delegating
+            | State::Failed { .. }
+            | State::Interrupted => None,
         }
     }
 
@@ -2537,6 +2612,43 @@ impl Model {
         self.docs.reveal(first.row, last.row + last.height, height);
     }
 
+    /// Puts the keys in [0] with the cursor on what shows, so the first key
+    /// moves from there rather than from wherever it was left or from an
+    /// end the screen isn't at.
+    pub fn focus_document(&mut self) {
+        self.panel.focus_document();
+        let Some(main) = &self.areas.main else {
+            return;
+        };
+        let placed = self.docs.placed(main.total, main.height, main.tails);
+        let key = main.nav.clone();
+        let on = key
+            .as_ref()
+            .and_then(|key| self.nav(key))
+            .and_then(|nav| nav.cursor.clone());
+        let entry = main.entry_to_start_on(&self.docs, on.as_ref());
+        if main.diff.is_some() {
+            let lines = self.docs.lines();
+            let showing = |l: &crate::review::LineInfo| {
+                l.row < placed.top + main.height && l.row + l.height > placed.top
+            };
+            if !lines.get(self.diff_view.cursor).is_some_and(showing) {
+                let at = lines
+                    .iter()
+                    .position(|l| l.selectable() && l.row + l.height > placed.top);
+                if let Some(at) = at {
+                    self.diff_view.cursor = at;
+                    self.diff_view.anchor = None;
+                }
+            }
+        }
+        if let (Some(key), Some(entry)) = (key, entry)
+            && let Some(nav) = self.nav_mut(&key)
+        {
+            nav.cursor = Some(entry);
+        }
+    }
+
     /// Moves the cursor onto the first line or entry on screen after a page
     /// scroll, as the last draw laid the document out.
     pub fn follow_page(&mut self) {
@@ -2696,23 +2808,25 @@ impl Model {
                 summary: summary.clone(),
                 since,
             },
+            State::Interrupted => AgentStatus::Interrupted { since },
         }
     }
 
-    /// Whether `t` may message the agent: it's live, isn't the one this TUI
-    /// runs in, and reports through hooks, which is the only way to know
-    /// when typing is safe.
-    pub fn talkable<'a>(&self, entry: &'a Entry) -> Result<&'a SessionName, Unreachable> {
+    /// The agent `s` may message: it's live, isn't the one this TUI runs in,
+    /// and reports through hooks, which is the only way to know when a menu
+    /// is open in it.
+    pub fn reachable<'a>(&'a self, entry: &'a Entry) -> Result<Reachable<'a>, Unreachable> {
         let EntryState::Live = entry.state() else {
             return Err(Unreachable::NotRunning);
         };
         if self.own_session.as_ref() == Some(entry.name()) {
             return Err(Unreachable::Own);
         }
-        if self.activity(entry.name()).is_none() {
-            return Err(Unreachable::Unreported);
-        }
-        Ok(entry.name())
+        let activity = self.activity(entry.name()).ok_or(Unreachable::Unreported)?;
+        Ok(Reachable {
+            name: entry.name(),
+            activity,
+        })
     }
 
     /// The moment a hook report has to postdate before typing into `name`
@@ -2727,19 +2841,28 @@ impl Model {
         seen.max(tracked.seen.launched_at())
     }
 
-    /// `name` is at rest but hasn't reported since its session started and
-    /// never recorded a launch, so nothing can tell a restart from a record
-    /// left by an earlier run.
-    pub fn awaiting_report(&self, name: &SessionName) -> bool {
-        self.activity(name)
-            .is_some_and(|a| a.at_rest() && !a.bound_met(self.not_before(name)))
+    /// Why text typed now into `name` could land somewhere other than its
+    /// prompt, if it could: what its activity shows, or what was typed into
+    /// it a moment ago that it hasn't reported on.
+    pub fn hold(&self, name: &SessionName) -> Option<Held> {
+        Hold::of(self.activity(name), self.not_before(name), self.clock.wall)
+            .map(Held::Activity)
+            .or_else(|| self.sent_hold(name))
     }
 
-    /// Whether text typed now into `name` can't answer a prompt as far as
-    /// the record shows.
-    pub fn ready_for_text(&self, name: &SessionName) -> bool {
-        self.activity(name)
-            .is_some_and(|a| a.ready_for_text(self.not_before(name), self.clock.wall))
+    /// [`Self::hold`] for an agent known to have an activity.
+    pub fn hold_of(&self, to: &Reachable<'_>) -> Option<Held> {
+        to.activity
+            .hold(self.not_before(to.name), self.clock.wall)
+            .map(Held::Activity)
+            .or_else(|| self.sent_hold(to.name))
+    }
+
+    fn sent_hold(&self, name: &SessionName) -> Option<Held> {
+        self.tracked(name)?
+            .sent
+            .as_ref()?
+            .hold(self.activity(name).map(|a| a.events), self.clock.mono)
     }
 
     /// Whether the user's keys are going to `name`'s terminal.

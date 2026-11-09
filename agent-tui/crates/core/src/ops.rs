@@ -4,7 +4,7 @@ use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use crate::activity::{MainEvent, Reported};
+use crate::activity::{MainEvent, Move, Reported, Standing, TranscriptRef};
 use crate::discover::{self, Warning};
 use crate::model::{Presence, Removable, Running, Snapshot, Startable};
 use crate::names::{
@@ -13,8 +13,8 @@ use crate::names::{
 use crate::paths::{AgentWorktree, Layout, PathError, RepoRoot, TrashSlot, WorktreeState};
 use crate::ports::{
     AgentRecord, BranchState, Fetch, Forge, Harness, HarnessError, HarnessId, Harnesses, HostError,
-    LaunchCtx, Listing, PaneCommand, PendingPrompt, SessionHost, SessionInfo, SessionStatus, Store,
-    StoreError, Unlisting, Vcs, WorktreeStart,
+    LaunchCtx, Listing, PaneCommand, PendingPrompt, Probe, PromptKind, SessionHost, SessionInfo,
+    SessionStatus, Store, StoreError, TranscriptStamp, Unlisting, Vcs, WorktreeStart,
 };
 use crate::process::{CommandError, LaunchSpec};
 
@@ -430,13 +430,42 @@ fn create_worktree(
 
 /// Type `prompt` into a running session using its harness's input encoding;
 /// sessions agent didn't start get the default harness's.
-pub fn inject(svc: Services<'_>, name: &SessionName, prompt: &Prompt) -> Result<()> {
-    let harness = match svc.store.record(name)? {
-        Some(record) => svc.harness(&record.harness)?,
-        None => svc.harnesses.default_harness(),
-    };
+pub fn inject(svc: Services<'_>, name: &SessionName, prompt: &Prompt) -> Result<PromptKind> {
+    let harness = harness_for(svc, name)?;
     svc.host.write(name, &harness.submit(prompt))?;
-    Ok(())
+    Ok(harness.prompt_kind(prompt))
+}
+
+/// The harness `name` runs, or the default one for a session agent didn't
+/// start.
+pub fn harness_for<'a>(svc: Services<'a>, name: &SessionName) -> Result<&'a dyn Harness> {
+    match svc.store.record(name)? {
+        Some(record) => svc
+            .harnesses
+            .get(&record.harness)
+            .ok_or(Error::UnknownHarness(record.harness)),
+        None => Ok(svc.harnesses.default_harness()),
+    }
+}
+
+/// Reads `name`'s transcript for what `standing` asks, and records the move
+/// the answer makes, if it makes one. Nothing is read while `seen` still
+/// describes the file.
+pub fn probe_interrupt(
+    svc: Services<'_>,
+    name: &SessionName,
+    at: &TranscriptRef,
+    standing: Standing,
+    seen: Option<&TranscriptStamp>,
+) -> Result<(Probe, Option<Move>)> {
+    let probe = harness_for(svc, name)?.interruption(at, standing.after(), seen)?;
+    let moved = standing.moved_by(&probe);
+    match moved {
+        Some(Move::Interrupted(proof, at)) => svc.store.interrupt(name, proof, at)?,
+        Some(Move::Resumed(proof)) => svc.store.resume(name, proof)?,
+        None => {}
+    }
+    Ok((probe, moved))
 }
 
 fn deliver(svc: Services<'_>, session: &SessionName, task: Option<&Prompt>) -> Result<Delivery> {

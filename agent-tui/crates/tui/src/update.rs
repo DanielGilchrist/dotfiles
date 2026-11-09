@@ -5,13 +5,15 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use agent_core::actions::{Action, CommandLine, Context, EventName, Invocation};
-use agent_core::activity::{Activity, AgentId, State, TranscriptRef};
+use agent_core::activity::{Activity, AgentId, InterruptSignal, Standing, State, TranscriptRef};
 use agent_core::config::ControlKey;
 use agent_core::model::{Entry, EntryState, RepoKey, Snapshot};
 use agent_core::names::{CarriageReturn, InvalidPrompt, Prompt, SessionName, clean};
 use agent_core::ops::{Approved, Launch};
 use agent_core::paths::{RepoRoot, Typed, typed_path};
-use agent_core::ports::{ActivityDetail, ClientId, Listing, Log, Observation};
+use agent_core::ports::{
+    ActivityDetail, ClientId, Listing, Log, Observation, Probe, PromptKind, TranscriptStamp,
+};
 use agent_term::{CellPos, encode_key, encode_mouse};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind};
 use ratatui::layout::Position;
@@ -22,13 +24,14 @@ use crate::log::{EntryKey, Nav};
 use crate::model::{
     ActivityFiles, ActivityRow, AfterCheck, Answer, Areas, CheckHealth, Chord, CommentDraft,
     Company, Confirm, Cursor, DirCheck, Direction, Drawn, Edge, Enter, Field, Focus, Follow,
-    FormKind, HelpState, INFO_TTL, Inspected, Inspection, Intent, Listed, LogKey, Look, Missing,
-    Mode, Model, Moment, NamingState, Need, NewAgent, Outbox, Overlay, Pane, Panel, Peek, Phase,
-    Query, Reach, Reply, RepoInput, Screen, StatusKind, Submission, TerminalFocus, Ticket,
-    Unreachable, View, Watch, WatchView, WorkRoom, elsewhere_banner, fuzzy_match, match_rank,
+    FormKind, Held, HelpState, INFO_TTL, Inspected, Inspection, Intent, Listed, LogKey, Look,
+    Missing, Mode, Model, Moment, NamingState, Need, NewAgent, Outbox, Overlay, Pane, Panel, Peek,
+    Phase, Query, Reach, Reply, RepoInput, Screen, StatusKind, Submission, TerminalFocus, Ticket,
+    Unreachable, View, Watch, WatchView, WorkRoom, elsewhere_banner, fuzzy_match, held, match_rank,
     repo_matches, unlisted,
 };
 use crate::touched::{Baseline, TouchedFile};
+use crate::track::{Found, Probed, Sent};
 use crate::track::{LiveSince, Release, Seen};
 use crate::tree::ChangesView;
 use crate::worker::{Job, Msg, Outcome, SendError};
@@ -114,6 +117,16 @@ pub enum Effect {
         workdir: PathBuf,
         /// Where its hooks last said the transcript is.
         at: Option<TranscriptRef>,
+    },
+    /// Read the transcript at `at` for what it says of the activity
+    /// `standing` proves.
+    ProbeTranscript {
+        name: SessionName,
+        at: TranscriptRef,
+        standing: Standing,
+        /// The file as the last read found it, so nothing is read while it is
+        /// unchanged.
+        seen: Option<TranscriptStamp>,
     },
     /// Attach to an existing session (resurrecting it if it exited).
     Attach {
@@ -266,6 +279,14 @@ fn step(m: &mut Model, msg: Msg) -> Vec<Effect> {
             on_activity(m, &name, detail);
             Vec::new()
         }
+        Msg::Probed {
+            name,
+            standing,
+            result,
+        } => {
+            on_probed(m, &name, standing, result);
+            Vec::new()
+        }
         Msg::Subagent { name, id, detail } => {
             if let Some(watched) = m
                 .agents
@@ -300,6 +321,79 @@ fn on_activity(m: &mut Model, name: &SessionName, detail: Result<Option<Activity
         watch.watch.nav = Nav::default();
     }
     watch.watch.log = Some(detail);
+}
+
+/// A read of `name`'s transcript was answered. What it found is already
+/// recorded by the worker, and arrives as the activity changing. The file's
+/// stamp is kept for the proof it was read under, and a failure is told once
+/// and then read again whole.
+fn on_probed(m: &mut Model, name: &SessionName, standing: Standing, result: Result<Probe, String>) {
+    let Some(probed) = m
+        .agents
+        .get_mut(name)
+        .and_then(|t| t.probed.as_mut())
+        .filter(|p| p.standing == standing)
+    else {
+        return;
+    };
+    let told = probed.found == Found::Failed;
+    let found = match result {
+        Ok(Probe::Going(stamp) | Probe::Interrupted(stamp, _) | Probe::Older(stamp)) => {
+            Found::Stamp(stamp)
+        }
+        Ok(Probe::Unchanged) => return,
+        Ok(Probe::NoTranscript) => Found::NoTranscript,
+        Err(why) => {
+            if !told {
+                m.error(format!(
+                    "couldn't read {name}'s transcript for an interrupt: {why}"
+                ));
+            }
+            Found::Failed
+        }
+    };
+    if let Some(probed) = m.agents.get_mut(name).and_then(|t| t.probed.as_mut()) {
+        probed.found = found;
+    }
+}
+
+/// Asks for a read of the transcript of every agent that is going, or was
+/// interrupted, for whether the user stopped it or it carried on: its
+/// harness sends no event for that, so the transcript is the only place it
+/// shows. An agent is read again every [`PROBE_EVERY`], and nothing is read
+/// while its file is unchanged.
+fn probe_interrupts(m: &mut Model) -> Vec<Effect> {
+    let Some(snapshot) = m.snapshot() else {
+        return Vec::new();
+    };
+    let now = m.clock.mono;
+    let due: Vec<(SessionName, TranscriptRef, Standing)> = snapshot
+        .entries()
+        .filter(|(_, e)| matches!(e.state(), EntryState::Live))
+        .filter_map(|(_, entry)| {
+            let name = entry.name();
+            let activity = m
+                .activity(name)
+                .filter(|a| a.interrupts == InterruptSignal::Transcript)?;
+            let standing = activity.standing()?;
+            let transcript = activity.transcript.clone()?;
+            let last = m.tracked(name).and_then(|t| t.probed.as_ref());
+            Probed::due(last, standing, now).then(|| (name.clone(), transcript, standing))
+        })
+        .collect();
+    due.into_iter()
+        .map(|(name, at, standing)| {
+            let tracked = m.track(&name);
+            let (probed, seen) = Probed::asked(tracked.probed.take(), standing, now);
+            tracked.probed = Some(probed);
+            Effect::ProbeTranscript {
+                name,
+                at,
+                standing,
+                seen,
+            }
+        })
+        .collect()
 }
 
 fn on_paste(m: &mut Model, text: &str) -> Vec<Effect> {
@@ -531,6 +625,7 @@ fn tick_effects(m: &mut Model) -> Vec<Effect> {
     effects.extend(inspect(m));
     effects.extend(read_subagent(m));
     effects.extend(read_activity(m));
+    effects.extend(probe_interrupts(m));
     effects.extend(read_document(m));
     effects.extend(check_dir(m));
     effects
@@ -2157,7 +2252,7 @@ fn focus_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
 
 /// Opens the document under the list panel's cursor.
 fn open_document(m: &mut Model) -> Vec<Effect> {
-    m.panel.focus_document();
+    m.focus_document();
     m.opened = None;
     Vec::new()
 }
@@ -2552,17 +2647,17 @@ fn open_talk(m: &mut Model, name: &SessionName) {
     let Some(entry) = m.snapshot().and_then(|s| s.entry(name)).map(|(_, e)| e) else {
         return;
     };
-    match m.talkable(entry) {
+    match m.reachable(entry) {
         Ok(to) => {
             m.overlay = Overlay::Talk {
-                to: to.clone(),
+                to: to.name().clone(),
                 text: String::new(),
             }
         }
         Err(Unreachable::NotRunning) => m.info(format!("{name} isn't running · ⏎ starts it")),
         Err(Unreachable::Own) => m.info(format!("{name} is where this TUI runs")),
         Err(Unreachable::Unreported) => m.info(format!(
-            "{name} reports no hooks, so when it finishes can't be known · ⏎ attaches"
+            "{name} hasn't reported through hooks, so a menu open in it can't be known · ⏎ attaches"
         )),
     }
 }
@@ -2630,10 +2725,10 @@ fn talk(m: &mut Model, to: SessionName, text: String) -> Vec<Effect> {
         .is_some_and(Outbox::in_flight)
     {
         m.info(format!("sent to {to}"));
-    } else if m.awaiting_report(&to) {
-        m.info(format!("queued · waiting for {to} to report"));
+    } else if let Some(hold) = m.hold(&to) {
+        m.info(format!("{to} · {}", held(hold)));
     } else {
-        m.info(format!("queued for {to} · sends when it's at rest"));
+        m.info(format!("queued for {to}"));
     }
     effects
 }
@@ -2655,22 +2750,20 @@ fn restore_comments(
 }
 
 /// Starts typing the first queued message into every agent that is live,
-/// ready for text (at rest, reported since its session started, past its
-/// boot), not being typed into by the user, and has reported since the last
-/// one went in. The worker checks the store again just before typing.
+/// has nothing holding it (no open question, a session that has reported
+/// and got past its boot) and isn't being typed into by the user. The
+/// worker checks the store again just before typing.
 fn flush(m: &mut Model) -> Vec<Effect> {
     let ready: Vec<SessionName> = m
         .agents
         .iter()
         .filter_map(|(name, t)| Some((name, t.outbox.as_ref()?)))
-        .filter(|(_, o)| o.unheld(m.clock.mono))
-        .filter(|(name, o)| {
-            m.ready_for_text(name)
-                && !m.typing_into(name)
-                && !o.awaits_report(m.activity(name).map(|a| a.events))
+        .filter(|(_, o)| o.askable(m.clock.mono))
+        .filter(|(name, _)| {
+            !m.typing_into(name)
                 && m.snapshot()
                     .and_then(|s| s.entry(name))
-                    .is_some_and(|(_, e)| m.talkable(e).is_ok())
+                    .is_some_and(|(_, e)| m.reachable(e).is_ok_and(|to| m.hold_of(&to).is_none()))
         })
         .map(|(name, _)| name.clone())
         .collect();
@@ -2690,9 +2783,9 @@ fn flush(m: &mut Model) -> Vec<Effect> {
 }
 
 /// A typed message was delivered, or wasn't: the first of the queue is
-/// done if it was, kept for fresh activity if the agent wasn't ready or its
+/// done if it was, kept for fresh activity if the agent was held or its
 /// record couldn't be read, and dropped with the reason otherwise.
-fn on_sent(m: &mut Model, to: &SessionName, result: Result<(), SendError>) -> Vec<Effect> {
+fn on_sent(m: &mut Model, to: &SessionName, result: Result<PromptKind, SendError>) -> Vec<Effect> {
     let events = m.activity(to).map(|a| a.events);
     let now = m.clock.mono;
     let Some(tracked) = m.agents.get_mut(to) else {
@@ -2702,18 +2795,23 @@ fn on_sent(m: &mut Model, to: &SessionName, result: Result<(), SendError>) -> Ve
         return Vec::new();
     };
     match result {
-        Ok(()) => {
-            let typed = events.map(|events| crate::track::Typed { events, at: now });
-            tracked.outbox = outbox.delivered(typed);
+        Ok(kind) => {
+            tracked.sent = events.map(|events| Sent {
+                events,
+                at: now,
+                kind,
+            });
+            tracked.outbox = outbox.delivered();
             match tracked.outbox.as_ref().map(Outbox::len) {
                 None => m.info(format!("sent to {to}")),
                 Some(left) => m.info(format!("sent to {to} · {left} queued")),
             }
         }
-        Err(SendError::Busy) => {
+        Err(SendError::Held(hold)) => {
             let release = events.map_or(Release::NextRead, Release::NewEvents);
             outbox.refused(release, now);
             tracked.outbox = Some(outbox);
+            m.info(format!("{to} · {}", held(Held::Activity(hold))));
         }
         Err(SendError::Unreadable(e)) => {
             outbox.refused(Release::NextRead, now);
@@ -3359,7 +3457,7 @@ fn on_mouse(m: &mut Model, mouse: MouseEvent) -> Vec<Effect> {
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
         );
         if clicked && m.shows_document() {
-            m.panel.focus_document();
+            m.focus_document();
             return Vec::new();
         }
         if scrolling && m.shows_document() {
@@ -3411,11 +3509,14 @@ fn on_mouse(m: &mut Model, mouse: MouseEvent) -> Vec<Effect> {
 
 #[cfg(test)]
 mod tests {
-    use crate::track::{LOG_REFRESH, LOG_SLOW_REFRESH};
+    use crate::track::{
+        COMMAND_HOLD_FOR, JUST_SENT_FOR, LOG_REFRESH, LOG_SLOW_REFRESH, PROBE_EVERY,
+    };
     use std::time::{Instant, SystemTime};
 
     use crate::model::Found;
 
+    use agent_core::activity::Hold;
     use agent_core::discover::{Observation, assemble};
     use agent_core::paths::{Layout, RepoRoot};
     use agent_core::ports::{RepoWorktrees, SessionInfo, SessionStatus};
@@ -4935,6 +5036,203 @@ mod tests {
         Moment {
             wall: m.clock.wall + after,
             mono: m.clock.mono + after,
+        }
+    }
+
+    mod interrupts {
+        use super::*;
+        use agent_core::ports::{Probe, TranscriptStamp};
+
+        const WORKER: &str = "auth-refresh-2";
+
+        fn transcript() -> TranscriptRef {
+            TranscriptRef::new("/t/s.jsonl")
+        }
+
+        fn watching(states: &[(&str, State)]) -> Model {
+            let mut m = crate::fixtures::fleet(10);
+            let mut activities = HashMap::new();
+            for (agent, state) in states {
+                let mut activity = reported(state.clone(), 5);
+                activity.transcript = Some(transcript());
+                activity.interrupts = InterruptSignal::Transcript;
+                activities.insert(name(agent), activity);
+            }
+            m.activities = Some(activities);
+            m
+        }
+
+        fn probes(effects: &[Effect]) -> Vec<(String, Option<TranscriptStamp>)> {
+            effects
+                .iter()
+                .filter_map(|e| match e {
+                    Effect::ProbeTranscript { name, seen, .. } => {
+                        Some((name.to_string(), seen.clone()))
+                    }
+                    _ => None,
+                })
+                .collect()
+        }
+
+        fn working() -> State {
+            State::Working { tools: Vec::new() }
+        }
+
+        fn stamp(len: u64) -> TranscriptStamp {
+            TranscriptStamp::new(len, None)
+        }
+
+        fn standing(m: &Model) -> Standing {
+            m.activity(&name(WORKER))
+                .and_then(Activity::standing)
+                .expect("going or stopped")
+        }
+
+        fn answer(m: &mut Model, standing: Standing, result: Result<Probe, String>) {
+            update(
+                m,
+                Msg::Probed {
+                    name: name(WORKER),
+                    standing,
+                    result,
+                },
+            );
+        }
+
+        fn newer(m: &mut Model) {
+            let mut newer = reported(working(), 0);
+            newer.transcript = Some(transcript());
+            newer.interrupts = InterruptSignal::Transcript;
+            newer.events = 2;
+            update(m, Msg::Activities(HashMap::from([(name(WORKER), newer)])));
+        }
+
+        #[test]
+        fn every_going_or_interrupted_agent_is_read_not_only_the_one_shown() {
+            let mut m = watching(&[
+                (WORKER, working()),
+                ("obs-layout-4", State::Delegating),
+                ("docs-sweep-6", State::Interrupted),
+                ("payroll-fix-3", State::Done { summary: None }),
+                ("bell-fix-5", State::Idle),
+            ]);
+            m.set_cursor(Cursor::Entry(name("payroll-fix-3")));
+            let mut checked: Vec<String> = probes(&tick(&mut m)).into_iter().map(|p| p.0).collect();
+            checked.sort();
+            assert_eq!(checked, ["auth-refresh-2", "docs-sweep-6", "obs-layout-4"]);
+        }
+
+        #[test]
+        fn a_harness_that_sends_an_event_for_an_interrupt_is_not_read() {
+            let mut m = watching(&[(WORKER, working())]);
+            if let Some(activity) = m.activities.as_mut().and_then(|a| a.get_mut(&name(WORKER))) {
+                activity.interrupts = InterruptSignal::Reported;
+            }
+            assert_eq!(probes(&tick(&mut m)), []);
+        }
+
+        #[test]
+        fn an_agent_whose_hooks_named_no_transcript_has_none_to_read() {
+            let mut m = watching(&[(WORKER, working())]);
+            if let Some(activity) = m.activities.as_mut().and_then(|a| a.get_mut(&name(WORKER))) {
+                activity.transcript = None;
+            }
+            assert_eq!(probes(&tick(&mut m)), []);
+        }
+
+        #[test]
+        fn an_agent_is_read_again_only_once_the_interval_has_passed() {
+            let mut m = watching(&[(WORKER, working())]);
+            assert_eq!(probes(&tick(&mut m)).len(), 1);
+            let soon = later(&m, PROBE_EVERY / 2);
+            assert_eq!(probes(&tick_at(&mut m, soon)), [], "too soon");
+            let due = later(&m, PROBE_EVERY);
+            assert_eq!(probes(&tick_at(&mut m, due)).len(), 1);
+        }
+
+        #[test]
+        fn the_file_as_last_found_travels_with_the_next_read_while_nothing_new_was_reported() {
+            let mut m = watching(&[(WORKER, working())]);
+            let proof = standing(&m);
+            assert_eq!(probes(&tick(&mut m)), [(WORKER.to_string(), None)]);
+            answer(&mut m, proof, Ok(Probe::Going(stamp(10))));
+            let due = later(&m, PROBE_EVERY);
+            assert_eq!(
+                probes(&tick_at(&mut m, due)),
+                [(WORKER.to_string(), Some(stamp(10)))]
+            );
+        }
+
+        #[test]
+        fn a_report_since_the_last_read_makes_the_next_one_read_the_file_again() {
+            let mut m = watching(&[(WORKER, working())]);
+            let proof = standing(&m);
+            tick(&mut m);
+            answer(&mut m, proof, Ok(Probe::Going(stamp(10))));
+            newer(&mut m);
+            let due = later(&m, PROBE_EVERY);
+            assert_eq!(probes(&tick_at(&mut m, due)), [(WORKER.to_string(), None)]);
+        }
+
+        #[test]
+        fn an_answer_for_an_older_proof_does_not_overwrite_what_a_newer_read_found() {
+            let mut m = watching(&[(WORKER, working())]);
+            let old = standing(&m);
+            tick(&mut m);
+            newer(&mut m);
+            let due = later(&m, PROBE_EVERY);
+            tick_at(&mut m, due);
+            answer(&mut m, old, Ok(Probe::Going(stamp(10))));
+            let due = later(&m, PROBE_EVERY * 2);
+            assert_eq!(probes(&tick_at(&mut m, due)), [(WORKER.to_string(), None)]);
+        }
+
+        #[test]
+        fn a_failed_read_is_told_once_and_the_next_one_reads_the_file_again() {
+            let mut m = watching(&[(WORKER, working())]);
+            let proof = standing(&m);
+            tick(&mut m);
+            answer(&mut m, proof, Ok(Probe::Going(stamp(10))));
+            let due = later(&m, PROBE_EVERY);
+            tick_at(&mut m, due);
+            answer(&mut m, proof, Err("io".into()));
+            assert!(status(&m).contains("couldn't read auth-refresh-2's transcript"));
+            m.status = None;
+            let due = later(&m, PROBE_EVERY * 2);
+            assert_eq!(probes(&tick_at(&mut m, due)), [(WORKER.to_string(), None)]);
+            answer(&mut m, proof, Err("io".into()));
+            assert_eq!(status(&m), "", "once is enough");
+        }
+
+        #[test]
+        fn an_agent_with_no_transcript_is_not_read_again_for_that_proof() {
+            let mut m = watching(&[(WORKER, working())]);
+            let proof = standing(&m);
+            tick(&mut m);
+            answer(&mut m, proof, Ok(Probe::NoTranscript));
+            let due = later(&m, PROBE_EVERY * 5);
+            assert_eq!(probes(&tick_at(&mut m, due)), []);
+            newer(&mut m);
+            let due = later(&m, PROBE_EVERY * 6);
+            assert_eq!(
+                probes(&tick_at(&mut m, due)).len(),
+                1,
+                "a new proof asks again"
+            );
+        }
+
+        #[test]
+        fn an_interrupted_agent_is_shown_as_stopped_and_its_transcript_is_still_watched() {
+            let mut m = watching(&[(WORKER, State::Interrupted)]);
+            let (_, entry) = m
+                .snapshot()
+                .and_then(|s| s.entry(&name(WORKER)))
+                .expect("listed");
+            assert!(matches!(
+                m.status(entry),
+                crate::model::AgentStatus::Interrupted { .. }
+            ));
+            assert_eq!(probes(&tick(&mut m)).len(), 1, "it may carry on");
         }
     }
 
@@ -6618,11 +6916,15 @@ mod tests {
     }
 
     fn sent(m: &mut Model, agent: &str) -> Vec<Effect> {
+        sent_as(m, agent, PromptKind::Message)
+    }
+
+    fn sent_as(m: &mut Model, agent: &str, kind: PromptKind) -> Vec<Effect> {
         update(
             m,
             Msg::Sent {
                 to: name(agent),
-                result: Ok(()),
+                result: Ok(kind),
             },
         )
     }
@@ -6657,7 +6959,7 @@ mod tests {
         assert!(
             m.status
                 .as_ref()
-                .is_some_and(|s| s.text.contains("reports no hooks")),
+                .is_some_and(|s| s.text.contains("hasn't reported through hooks")),
             "says why"
         );
         let mut m = model(&[]);
@@ -6667,7 +6969,7 @@ mod tests {
     }
 
     #[test]
-    fn a_message_to_an_agent_at_rest_is_sent_now() {
+    fn a_message_to_a_finished_agent_is_sent_now() {
         let mut m = crate::fixtures::fleet(10);
         set_state(&mut m, "auth-refresh-2", done(), 1);
         let effects = talk_to(&mut m, "auth-refresh-2", "rebase");
@@ -6676,40 +6978,88 @@ mod tests {
     }
 
     #[test]
-    fn a_message_to_a_working_agent_is_queued_and_sent_only_once_it_is_at_rest() {
+    fn a_message_to_a_working_agent_is_typed_at_once() {
         let mut m = crate::fixtures::fleet(10);
         set_state(&mut m, "auth-refresh-2", working(), 1);
         let effects = talk_to(&mut m, "auth-refresh-2", "rebase");
-        assert!(effects.is_empty(), "nothing is typed while it works");
-        assert_eq!(m.outbox(&name("auth-refresh-2")).expect("queued").len(), 1);
-        assert_eq!(replies(&tick(&mut m)).len(), 0);
+        assert_eq!(replies(&effects), ["rebase"], "the harness queues it");
+    }
 
-        let mut asking_now = crate::fixtures::asking("rm?", 1);
-        asking_now.events = 2;
+    #[test]
+    fn a_message_to_a_delegating_agent_is_typed_at_once() {
+        let mut m = crate::fixtures::fleet(10);
+        set_state(
+            &mut m,
+            "auth-refresh-2",
+            agent_core::activity::State::Delegating,
+            1,
+        );
+        assert_eq!(
+            replies(&talk_to(&mut m, "auth-refresh-2", "rebase")),
+            ["rebase"]
+        );
+    }
+
+    #[test]
+    fn a_message_waits_while_a_question_is_open_and_goes_once_it_is_answered() {
+        let mut m = crate::fixtures::fleet(10);
+        let agent = "auth-refresh-2";
+        crate::fixtures::ask(&mut m, agent);
+        let effects = talk_to(&mut m, agent, "rebase");
+        assert_eq!(replies(&effects), Vec::<String>::new(), "a prompt is open");
+        assert_eq!(m.hold(&name(agent)), Some(Held::Activity(Hold::Asking)));
+        assert_eq!(m.outbox(&name(agent)).expect("held").len(), 1);
+        assert_eq!(replies(&tick(&mut m)), Vec::<String>::new());
+
+        let mut answered = reported(working(), 0);
+        answered.events = 2;
         let effects = update(
             &mut m,
-            Msg::Activities(HashMap::from([(name("auth-refresh-2"), asking_now)])),
+            Msg::Activities(HashMap::from([(name(agent), answered)])),
         );
-        assert!(replies(&effects).is_empty(), "a prompt is open");
-
-        let mut finished = reported(done(), 0);
-        finished.events = 3;
-        let effects = update(
-            &mut m,
-            Msg::Activities(HashMap::from([(name("auth-refresh-2"), finished)])),
-        );
-        assert_eq!(replies(&effects), ["rebase"], "the first rest sends it");
-        assert!(
-            replies(&tick(&mut m)).is_empty(),
+        assert_eq!(replies(&effects), ["rebase"], "the answer releases it");
+        assert_eq!(
+            replies(&tick(&mut m)),
+            Vec::<String>::new(),
             "not again while it is being typed"
         );
     }
 
     #[test]
-    fn queued_messages_go_in_order_one_per_rest_and_busy_keeps_them() {
+    fn a_message_waits_a_moment_after_a_tool_starts_for_its_permission_prompt() {
+        let mut m = crate::fixtures::fleet(10);
+        let mut activity = reported(working(), 5);
+        activity.state = State::Working {
+            tools: vec![agent_core::activity::Tool {
+                id: agent_core::activity::ToolId::new("t1"),
+                name: "Bash".into(),
+                target: None,
+                since: m.clock.wall,
+            }],
+        };
+        m.activities
+            .get_or_insert_default()
+            .insert(name(AGENT), activity);
+        assert_eq!(
+            replies(&talk_to(&mut m, AGENT, "rebase")),
+            Vec::<String>::new(),
+            "Enter could approve the tool"
+        );
+        assert_eq!(
+            m.hold(&name(AGENT)),
+            Some(Held::Activity(Hold::ToolStarting))
+        );
+        let soon = later(&m, agent_core::activity::TOOL_GRACE / 2);
+        assert_eq!(replies(&tick_at(&mut m, soon)), Vec::<String>::new());
+        let past = later(&m, agent_core::activity::TOOL_GRACE);
+        assert_eq!(replies(&tick_at(&mut m, past)), ["rebase"]);
+    }
+
+    #[test]
+    fn queued_messages_go_in_order_one_at_a_time_and_a_hold_keeps_them() {
         let mut m = crate::fixtures::fleet(10);
         let agent = "auth-refresh-2";
-        set_state(&mut m, agent, working(), 1);
+        crate::fixtures::ask(&mut m, agent);
         talk_to(&mut m, agent, "first");
         talk_to(&mut m, agent, "second");
         let queue = |m: &Model| -> Vec<String> {
@@ -6721,7 +7071,7 @@ mod tests {
         };
         assert_eq!(queue(&m), ["first", "second"]);
 
-        set_state(&mut m, agent, done(), 2);
+        set_state(&mut m, agent, working(), 2);
         let all = m.activities.clone().expect("reported");
         assert_eq!(replies(&update(&mut m, Msg::Activities(all))), ["first"]);
 
@@ -6729,31 +7079,86 @@ mod tests {
             &mut m,
             Msg::Sent {
                 to: name(agent),
-                result: Err(crate::worker::SendError::Busy),
+                result: Err(crate::worker::SendError::Held(Hold::Asking)),
             },
         );
-        assert!(
-            replies(&effects).is_empty(),
-            "held until the record changes"
+        assert_eq!(
+            replies(&effects),
+            Vec::<String>::new(),
+            "refused until the record changes"
         );
+        assert_eq!(status(&m), format!("{agent} · held: asking"));
         assert_eq!(queue(&m), ["first", "second"]);
-        set_state(&mut m, agent, done(), 5);
+        set_state(&mut m, agent, working(), 5);
         let all = m.activities.clone().expect("reported");
         assert_eq!(replies(&update(&mut m, Msg::Activities(all))), ["first"]);
+    }
+
+    #[test]
+    fn a_burst_goes_one_message_at_a_time_each_waiting_for_a_report_or_a_moment() {
+        let mut m = crate::fixtures::fleet(10);
+        let agent = "auth-refresh-2";
+        set_state(&mut m, agent, working(), 1);
+        assert_eq!(replies(&talk_to(&mut m, agent, "first")), ["first"]);
+        talk_to(&mut m, agent, "second");
+        talk_to(&mut m, agent, "third");
 
         let effects = sent(&mut m, agent);
-        assert!(
-            replies(&effects).is_empty(),
-            "the next waits for the agent to report again"
+        assert_eq!(
+            replies(&effects),
+            Vec::<String>::new(),
+            "it hasn't reported on the first"
         );
-        assert_eq!(queue(&m), ["second"]);
+        assert_eq!(m.hold(&name(agent)), Some(Held::JustSent));
+        let soon = later(&m, JUST_SENT_FOR / 2);
+        assert_eq!(replies(&tick_at(&mut m, soon)), Vec::<String>::new());
 
-        set_state(&mut m, agent, working(), 3);
-        set_state(&mut m, agent, done(), 4);
+        set_state(&mut m, agent, working(), 2);
         let all = m.activities.clone().expect("reported");
-        assert_eq!(replies(&update(&mut m, Msg::Activities(all))), ["second"]);
-        sent(&mut m, agent);
-        assert_eq!(m.queued(), 0);
+        assert_eq!(
+            replies(&update(&mut m, Msg::Activities(all))),
+            ["second"],
+            "a report lifts the hold"
+        );
+        assert_eq!(replies(&sent(&mut m, agent)), Vec::<String>::new());
+        let due = later(&m, JUST_SENT_FOR);
+        assert_eq!(
+            replies(&tick_at(&mut m, due)),
+            ["third"],
+            "a silent agent is waited on only a moment"
+        );
+    }
+
+    #[test]
+    fn after_a_command_the_next_message_waits_for_a_report_or_a_long_time() {
+        let mut m = crate::fixtures::fleet(10);
+        let agent = "auth-refresh-2";
+        set_state(&mut m, agent, done(), 1);
+        assert_eq!(replies(&talk_to(&mut m, agent, "/model")), ["/model"]);
+        talk_to(&mut m, agent, "next");
+        sent_as(&mut m, agent, PromptKind::Command);
+        let mid = later(&m, JUST_SENT_FOR * 2);
+        assert_eq!(
+            replies(&tick_at(&mut m, mid)),
+            Vec::<String>::new(),
+            "a picker may be open and no hook says so"
+        );
+        assert_eq!(m.hold(&name(agent)), Some(Held::Command));
+        let long = later(&m, COMMAND_HOLD_FOR);
+        assert_eq!(replies(&tick_at(&mut m, long)), ["next"]);
+    }
+
+    #[test]
+    fn a_command_that_reports_releases_the_next_message_at_once() {
+        let mut m = crate::fixtures::fleet(10);
+        let agent = "auth-refresh-2";
+        set_state(&mut m, agent, done(), 1);
+        talk_to(&mut m, agent, "!ls");
+        talk_to(&mut m, agent, "next");
+        sent_as(&mut m, agent, PromptKind::Command);
+        set_state(&mut m, agent, working(), 2);
+        let all = m.activities.clone().expect("reported");
+        assert_eq!(replies(&update(&mut m, Msg::Activities(all))), ["next"]);
     }
 
     fn status(m: &Model) -> String {
@@ -6773,10 +7178,12 @@ mod tests {
         let mut m = crate::fixtures::fleet(10);
         set_state(&mut m, AGENT, working(), 1);
         talk_to(&mut m, AGENT, "rebase");
-        assert_eq!(
-            status(&m),
-            format!("queued for {AGENT} · sends when it's at rest")
-        );
+        assert_eq!(status(&m), format!("sent to {AGENT}"));
+
+        let mut m = crate::fixtures::fleet(10);
+        crate::fixtures::ask(&mut m, AGENT);
+        talk_to(&mut m, AGENT, "rebase");
+        assert_eq!(status(&m), format!("{AGENT} · held: asking"));
 
         let mut m = crate::fixtures::fleet(10);
         set_state(&mut m, AGENT, done(), 1);
@@ -6806,19 +7213,15 @@ mod tests {
             replies(&talk_to(&mut m, AGENT, "rebase")),
             Vec::<String>::new()
         );
-        assert!(m.awaiting_report(&name(AGENT)));
-        assert!(
-            m.status
-                .as_ref()
-                .is_some_and(|s| s.text.contains("waiting for"))
-        );
+        assert_eq!(m.hold(&name(AGENT)), Some(Held::Activity(Hold::Unreported)));
+        assert_eq!(status(&m), format!("{AGENT} · held: no report yet"));
         std::thread::sleep(Duration::from_millis(5));
         assert_eq!(replies(&tick(&mut m)), Vec::<String>::new());
         assert_eq!(replies(&report(&mut m, reported(done(), 0))), ["rebase"]);
     }
 
     #[test]
-    fn a_quiet_agent_launched_before_the_tui_saw_it_live_sends_at_rest() {
+    fn a_quiet_agent_launched_before_the_tui_saw_it_live_is_sent_to() {
         let mut m = crate::fixtures::fleet(10);
         let mut a = reported(done(), 20);
         a.session = crate::fixtures::launch_reported(Duration::from_secs(25));
@@ -7128,30 +7531,34 @@ mod tests {
     #[test]
     fn a_fresh_session_start_gets_quiet_time_for_a_startup_dialog() {
         let mut m = crate::fixtures::fleet(10);
-        set_state(&mut m, AGENT, working(), 1);
         live_since(&mut m, 30);
-        talk_to(&mut m, AGENT, "rebase");
         let mut booted = reported(done(), 1);
         booted.session = crate::fixtures::booting();
-        assert!(
-            replies(&report(&mut m, booted)).is_empty(),
-            "1s after SessionStart"
+        report(&mut m, booted);
+        assert_eq!(
+            replies(&talk_to(&mut m, AGENT, "rebase")),
+            Vec::<String>::new()
         );
+        assert_eq!(m.hold(&name(AGENT)), Some(Held::Activity(Hold::Booting)));
+        assert_eq!(status(&m), format!("{AGENT} · held: booting"));
         let mut quiet = reported(done(), 6);
         quiet.session = crate::fixtures::booting();
         assert_eq!(replies(&report(&mut m, quiet)), ["rebase"]);
     }
 
     #[test]
-    fn busy_holds_the_queue_until_the_record_changes() {
+    fn a_refusal_holds_the_queue_until_the_record_changes() {
         let mut m = crate::fixtures::fleet(10);
         set_state(&mut m, AGENT, done(), 1);
         talk_to(&mut m, AGENT, "rebase");
-        let busy = || Msg::Sent {
+        let refused = || Msg::Sent {
             to: name(AGENT),
-            result: Err(SendError::Busy),
+            result: Err(SendError::Held(Hold::Asking)),
         };
-        assert!(replies(&update(&mut m, busy())).is_empty(), "no hot loop");
+        assert!(
+            replies(&update(&mut m, refused())).is_empty(),
+            "no hot loop"
+        );
         assert_eq!(replies(&tick(&mut m)), Vec::<String>::new());
         let same = m.activities.clone().expect("reported");
         assert!(
@@ -7187,7 +7594,7 @@ mod tests {
     #[test]
     fn nothing_is_typed_while_the_user_types_into_that_agent() {
         let mut m = crate::fixtures::fleet(10);
-        set_state(&mut m, AGENT, working(), 1);
+        crate::fixtures::ask(&mut m, AGENT);
         talk_to(&mut m, AGENT, "rebase");
         let term = agent_term::Terminal::spawn(
             &agent_core::process::LaunchSpec::new("cat"),
@@ -7205,31 +7612,11 @@ mod tests {
             id: ClientId::new(1),
         });
         assert_eq!(
-            replies(&report(&mut m, reported(done(), 0))),
+            replies(&report(&mut m, reported(working(), 0))),
             Vec::<String>::new()
         );
         m.pane.set_nav();
         assert_eq!(replies(&tick(&mut m)), ["rebase"], "resumes in NAV");
-    }
-
-    #[test]
-    fn a_queue_the_agent_never_reports_on_says_it_is_waiting() {
-        let mut m = crate::fixtures::fleet(10);
-        set_state(&mut m, AGENT, done(), 1);
-        talk_to(&mut m, AGENT, "/compact");
-        talk_to(&mut m, AGENT, "next");
-        sent(&mut m, AGENT);
-        let outbox = &m.outbox(&name(AGENT)).expect("queued");
-        assert!(!outbox.stalled(Some(1), m.clock.mono), "just sent");
-        let mut outbox = crate::track::queued("next");
-        outbox.last_typed = Some(crate::track::Typed {
-            events: 1,
-            at: m.clock.mono,
-        });
-        let later = m.clock.mono + crate::track::STALL_AFTER * 2;
-        assert!(outbox.stalled(Some(1), later));
-        assert!(!outbox.stalled(Some(2), later), "it reported");
-        assert!(replies(&tick(&mut m)).is_empty(), "never sent blindly");
     }
 
     #[test]
@@ -7256,7 +7643,7 @@ mod tests {
     fn the_queue_survives_selection_changes_and_ctrl_x_in_the_box_clears_it() {
         let mut m = crate::fixtures::fleet(10);
         let agent = "auth-refresh-2";
-        set_state(&mut m, agent, working(), 1);
+        crate::fixtures::ask(&mut m, agent);
         talk_to(&mut m, agent, "one");
         talk_to(&mut m, agent, "two");
         m.set_cursor(Cursor::Entry(name("obs-layout-4")));
