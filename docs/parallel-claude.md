@@ -1,62 +1,28 @@
 # Parallel agents: workflow & keybinds
 
-One Rust binary, `agent` (source in `~/.config/agent-tui`), runs coding
-agents (Claude Code today, with pluggable harnesses) in git worktrees, one
-zellij session per agent. Bare `agent` opens a TUI that lists every agent
-by repo and embeds the selected one. The subcommands are for scripts,
-nvim and wezterm.
+One Rust binary, `agent` (source in `~/.config/agent-tui`), runs coding agents (Claude Code today, with pluggable harnesses) in git worktrees, one zellij session per agent. Bare `agent` opens a TUI that lists every agent by repo and embeds the selected one. The subcommands are for scripts, nvim and wezterm.
 
-Install or update it with `~/.config/agent-tui/install.sh`, which builds
-it into `~/.local/bin/agent`. Session layouts record that path, so keep it.
+Install or update it with `~/.config/agent-tui/install.sh`, which builds it into `~/.local/bin/agent`. Session layouts record that path, so keep it.
 
 ## Concepts
 
-- **Worktree per agent** at `~/worktrees/<repo>/<name>`, checked out
-  detached at `origin/HEAD`. The agent creates its own branch: the first
-  prompt tells it to `git checkout -b <kebab-case-name>` first. While git
-  is still checking the files out the worktree isn't listed, so a big repo
-  takes a moment to appear.
-- **Zellij session per agent**, named after the worktree. Sessions persist
-  across terminal and laptop restarts and can be attached from anywhere
-  (`zellij attach <name>`, another tab, a phone over SSH). After a reboot
-  they show as exited. Selecting one in the TUI starts it again through
-  `agent` (so it reports its state), resuming the harness's last
-  conversation. Sessions `agent` doesn't own are resurrected by zellij.
-- **Background Claude sessions.** Claude Code keeps a session running when
-  its terminal goes, so `d` (killing the zellij session) leaves the
-  conversation alive under `~/.local/share/claude/ClaudeCode.app`, and `⏎`
-  reattaches to it with everything intact. A resurrect with a queued
-  prompt stops it first and resumes, since `claude attach` can't carry
-  one. To really quit every session: `claude stop <id>` for each entry in
-  `~/.claude/sessions/*.json`, then kill the zellij sessions.
-- **Repo sessions**: `agent repo` runs an agent in the repo's main checkout
-  (no worktree), named after the repo.
-- **Listed repos** stay in the TUI with nothing running in them, as one row
-  for the main checkout, so `⏎` starts the repo session there. A repo is
-  listed by `agent add`, the TUI's `p` picker, `agent repo`, or creating an
-  agent in it, and `agent forget` drops it. The list lives in
-  `~/.local/state/agent/repos`.
-- **Catalogue**: `[repos] dirs` in `~/.config/agent/config.toml` names
-  directories that are repos or hold repos (`~/repos` offers every clone in
-  it). The `p` picker and the `n` form's repo field offer them, and picking
-  one lists it. They aren't shown until picked.
+- **Worktree per agent** at `~/worktrees/<repo>/<name>`, checked out detached at `origin/HEAD`. The agent creates its own branch: the first prompt tells it to `git checkout -b <kebab-case-name>` first. While git is still checking the files out the worktree isn't listed, so a big repo takes a moment to appear.
+- **Zellij session per agent**, named after the worktree. Sessions persist across terminal and laptop restarts and can be attached from anywhere (`zellij attach <name>`, another tab, a phone over SSH). After a reboot they show as exited. Selecting one in the TUI starts it again through `agent` (so it reports its state), resuming the harness's last conversation. Sessions `agent` doesn't own are resurrected by zellij.
+- **Background Claude sessions.** Claude Code keeps a session running when its terminal goes, so `d` (killing the zellij session) leaves the conversation alive under `~/.local/share/claude/ClaudeCode.app`, and `⏎` reattaches to it with everything intact. A resurrect with a queued prompt stops it first and resumes, since `claude attach` can't carry one. To really quit every session: `claude stop <id>` for each entry in `~/.claude/sessions/*.json`, then kill the zellij sessions.
+- **Repo sessions**: `agent repo` runs an agent in the repo's main checkout (no worktree), named after the repo.
+- **Listed repos** stay in the TUI with nothing running in them, as one row for the main checkout, so `⏎` starts the repo session there. A repo is listed by `agent add`, the TUI's `p` picker, `agent repo`, or creating an agent in it, and `agent forget` drops it. The list lives in `~/.local/state/agent/repos`.
+- **Catalogue**: `[repos] dirs` in `~/.config/agent/config.toml` names directories that are repos or hold repos (`~/repos` offers every clone in it). The `p` picker and the `n` form's repo field offer them, and picking one lists it. They aren't shown until picked.
 
   ```toml
   [repos]
   dirs = ["~/repos", "~/.config"]
   ```
-- **Names** are ≤20 chars of `[A-Za-z0-9._-]` (the session host's limit:
-  zellij's socket path budget on macOS). `agents` is reserved. A worktree
-  already named longer than the limit is still listed and can be removed,
-  and `⏎` on it says why it can't start.
-- **State** lives in `~/.local/state/agent`: per-agent records (harness,
-  undelivered first prompt), pins, zellij layouts and the TUI's last
-  selection.
+- **Names** are ≤20 chars of `[A-Za-z0-9._-]` (the session host's limit: zellij's socket path budget on macOS). `agents` is reserved. A worktree already named longer than the limit is still listed and can be removed, and `⏎` on it says why it can't start.
+- **State** lives in `~/.local/state/agent`: per-agent records (harness, undelivered first prompt), pins, zellij layouts and the TUI's last selection.
 
 ## The TUI
 
-`agent` (or `agent tui`). Two modes: NAV moves around the list, AGENT
-types into the embedded session. `?` shows every key.
+`agent` (or `agent tui`). Two modes: NAV moves around the list, AGENT types into the embedded session. `?` shows every key.
 
 | Key | Action |
 |---|---|
@@ -99,9 +65,7 @@ The footer shows as many hints as fit, most important for the focused panel firs
 
 ### What agents are doing
 
-Agents launched by `agent` report their state through Claude Code hooks
-passed with `--settings` (your own settings stay untouched), recorded by
-`agent event` in `~/.local/state/agent/activity/`.
+Agents launched by `agent` report their state through Claude Code hooks passed with `--settings` (your own settings stay untouched), recorded by `agent event` in `~/.local/state/agent/activity/`.
 
 - `◆` asking you (a permission prompt or a question)
 - `!` failed (rate limited, overloaded)
@@ -110,34 +74,15 @@ passed with `--settings` (your own settings stay untouched), recorded by
 - `■` interrupted: you pressed Esc and nothing has followed (Claude Code fires no hook for it, so `agent` reads it from the transcript)
 - `●` idle, `○` exited, `·` no session
 
-The Agents tab opens with a **Needs you** group, the status bar and terminal
-title show `◆ ! ✓` counts, and a bell rings when an agent you're not
-typing into starts waiting. Each agent's card has a second line saying
-what it's doing or what it said (the question, the tool, the last
-message), when there's room. Under the list, panel [2] lists the activity and
-its subagents and panel [3] lists the work in two tabs, `[` `]` to switch: `Uncommitted` (the default) lists only files with uncommitted state counted against the last commit, and `Branch` what this branch changes compared with where it left origin/main, like a PR plus your uncommitted work (on the trunk the tab is `Unpushed`: commits not yet on origin plus uncommitted work, which a push empties). Both panels stay on screen while an agent is selected, and with nothing to list a panel's one row says why: `no changes`, `reading git…`, git's error, or `no activity recorded`. The second tab's first row is a short branch summary (`↑27 · 4 uncommitted`, `↓n` when behind), and hovering it shows the branch in [0]: titled `Unpushed · main vs origin/main` or `Branch · fix-thing vs origin/main`, then its commits and uncommitted files. `Uncommitted` lists only its files and the panel's corner counts them. Files carry lazygit's status code (staged letter green, unstaged red, `??` untracked, nothing for committed-only files, a `●` on folders holding uncommitted files), a `∩` on any file another agent
-in the repo changed too, and `∩ n` in the title counting them. The right pane
-[0] shows what the cursor in the focused panel is on: the agent's terminal
-for [1], the activity document or a subagent's log for [2] (a status row, the prompt, what it said and a row per call with failures spelled out, its report first once finished; it follows the tail until you scroll up and `G` resumes; with [0] focused `j` `k` move over entries, `⏎` expands one and `=` `-` expand or collapse all). The activity row reads the main transcript the same way: its current activity cut at your last prompt, the agent's words and calls with every phase but the latest folded to one `▸` row, the whole question pinned on top while it asks, its closing message once done, and a `since you looked` marker. An agent whose harness keeps no transcript shows the prompt, message and subagents instead, and the branch, a file's diff, or a folder's files with each diff under its own header (up to 20 files) for [3], with who else changed the file in its title. Clicking a row of [2] or [3] puts the cursor there, and the wheel scrolls.
-When the selected agent asks while you read, a banner at the top of [0] says
-so and `i` answers it (the activity view pins the whole question instead). An agent whose terminal isn't showing still counts for
-`a`, the bell and the status counts, and doesn't clear its `✓` while you
-read its diff.
-Agents started before this existed report nothing until restarted: `d`
-then `⏎` in the TUI restarts one through `agent`, resuming its conversation.
+The Agents tab opens with a **Needs you** group, the status bar and terminal title show `◆ ! ✓` counts, and a bell rings when an agent you're not typing into starts waiting. Each agent's card has a second line saying what it's doing or what it said (the question, the tool, the last message), when there's room. Under the list, panel [2] lists the activity and its subagents and panel [3] lists the work in two tabs, `[` `]` to switch: `Uncommitted` (the default) lists only files with uncommitted state counted against the last commit, and `Branch` what this branch changes compared with where it left origin/main, like a PR plus your uncommitted work (on the trunk the tab is `Unpushed`: commits not yet on origin plus uncommitted work, which a push empties). Both panels stay on screen while an agent is selected, and with nothing to list a panel's one row says why: `no changes`, `reading git…`, git's error, or `no activity recorded`. The second tab's first row is a short branch summary (`↑27 · 4 uncommitted`, `↓n` when behind), and hovering it shows the branch in [0]: titled `Unpushed · main vs origin/main` or `Branch · fix-thing vs origin/main`, then its commits and uncommitted files. `Uncommitted` lists only its files and the panel's corner counts them. Files carry lazygit's status code (staged letter green, unstaged red, `??` untracked, nothing for committed-only files, a `●` on folders holding uncommitted files), a `∩` on any file another agent in the repo changed too, and `∩ n` in the title counting them. The right pane [0] shows what the cursor in the focused panel is on: the agent's terminal for [1], the activity document or a subagent's log for [2] (a status row, the prompt, what it said and a row per call with failures spelled out, its report first once finished; it follows the tail until you scroll up and `G` resumes; with [0] focused `j` `k` move over entries, `⏎` expands one and `=` `-` expand or collapse all). The activity row reads the main transcript the same way: its current activity cut at your last prompt, the agent's words and calls with every phase but the latest folded to one `▸` row, the whole question pinned on top while it asks, its closing message once done, and a `since you looked` marker. An agent whose harness keeps no transcript shows the prompt, message and subagents instead, and the branch, a file's diff, or a folder's files with each diff under its own header (up to 20 files) for [3], with who else changed the file in its title. Clicking a row of [2] or [3] puts the cursor there, and the wheel scrolls. When the selected agent asks while you read, a banner at the top of [0] says so and `i` answers it (the activity view pins the whole question instead). An agent whose terminal isn't showing still counts for `a`, the bell and the status counts, and doesn't clear its `✓` while you read its diff. Agents started before this existed report nothing until restarted: `d` then `⏎` in the TUI restarts one through `agent`, resuming its conversation.
 
 ### Actions
 
-Actions live in `~/.config/agent/config.toml`. They see the agent only
-through the `{name}`, `{path}` (its checkout) and `{repo}` (main checkout)
-placeholders in their arguments, and `{{`/`}}` are literal braces. Each one
-does one of these:
+Actions live in `~/.config/agent/config.toml`. They see the agent only through the `{name}`, `{path}` (its checkout) and `{repo}` (main checkout) placeholders in their arguments, and `{{`/`}}` are literal braces. Each one does one of these:
 
-- `run`: starts a command (an argv with no shell) detached, with failures
-  shown in the status bar.
+- `run`: starts a command (an argv with no shell) detached, with failures shown in the status bar.
 - `interactive`: hands the TUI's terminal to a command until it exits.
-- `terminal_event`: sends the terminal a user variable (`OSC 1337
-  SetUserVar`) for its config to handle.
+- `terminal_event`: sends the terminal a user variable (`OSC 1337 SetUserVar`) for its config to handle.
 
 
 ```toml
@@ -158,29 +103,20 @@ interactive = ["lazygit"]
 cwd = "{path}"
 ```
 
-Commands run in `cwd` if it's set, otherwise in the directory `agent` was
-started in.
+Commands run in `cwd` if it's set, otherwise in the directory `agent` was started in.
 
-The key that leaves an agent lives in the same file. It must be `ctrl-`
-plus a letter or one of `\ ] ^ _`:
+The key that leaves an agent lives in the same file. It must be `ctrl-` plus a letter or one of `\ ] ^ _`:
 
 ```toml
 [keys]
 nav = "ctrl-\\"
-``` Keys are one printable character (`Esc` closes
-the overlay). The config is checked at startup, and mistakes stop `agent` with
-the reason.
+```
+
+Keys are one printable character (`Esc` closes the overlay). The config is checked at startup, and mistakes stop `agent` with the reason.
 
 ### Theme
 
-Colours follow the terminal's palette: the defaults are its ANSI cyan,
-yellow, red and green. Secondary text is your foreground blended into your
-background, which `agent` asks the terminal for at startup (`OSC 10`/`OSC
-11`), with enough foreground to stay readable on light themes. It's asked
-once, so restart `agent` after changing theme. A terminal that doesn't
-answer, or doesn't set `COLORTERM=truecolor`, gets its faint attribute
-instead. `[theme]` overrides any role with `#rrggbb`, `default` (the
-terminal's foreground) or an ANSI name (`cyan`, `bright-blue`):
+Colours follow the terminal's palette: the defaults are its ANSI cyan, yellow, red and green. Secondary text is your foreground blended into your background, which `agent` asks the terminal for at startup (`OSC 10`/`OSC 11`), with enough foreground to stay readable on light themes. It's asked once, so restart `agent` after changing theme. A terminal that doesn't answer, or doesn't set `COLORTERM=truecolor`, gets its faint attribute instead. `[theme]` overrides any role with `#rrggbb`, `default` (the terminal's foreground) or an ANSI name (`cyan`, `bright-blue`):
 
 ```toml
 [theme]
@@ -203,19 +139,11 @@ success = "green"    # finished activities, added lines
 | `CMD+Left` / `CMD+Right` | Cycle tabs, skipping the `agent` tab |
 | `Shift+Alt+{` / `}` | Move tabs (the `agent` tab stays put) |
 
-The `agent-edit` event (`wezterm/agent_edit.lua`) backs the `t` (nvim in tab)
-and `r` (nvim right) actions in `~/.config/agent/config.toml`, run with `x`
-then the key. The payload is `<tab|right>|<cwd>`. If a local pane already runs
-`$EDITOR` in that checkout, its tab and window are focused. Otherwise `$EDITOR`
-opens there in a new tab or in a split right of the TUI. The handler runs on
-the machine whose wezterm draws the TUI and refuses a `cwd` that isn't a
-directory there, so over SSH these actions only say so. Panes that aren't
-local can't be inspected, so they are never matched.
+The `agent-edit` event (`wezterm/agent_edit.lua`) backs the `t` (nvim in tab) and `r` (nvim right) actions in `~/.config/agent/config.toml`, run with `x` then the key. The payload is `<tab|right>|<cwd>`, and `$EDITOR` opens there in a new tab or in a split right of the TUI. The handler runs on the machine whose wezterm draws the TUI and refuses a `cwd` that isn't a directory there, so over SSH these actions only say so.
 
 ## Commands
 
-`agent <cmd> --help` has the details. Fish completions come from
-`agent completions fish`.
+`agent <cmd> --help` has the details. Fish completions come from `agent completions fish`.
 
 | Command | Description |
 |---|---|
@@ -244,22 +172,14 @@ local can't be inspected, so they are never matched.
 
 `agent` is a binary on PATH, so call it from any shell.
 
-1. **Pass `-e`, `--seed` or `--no-prompt`** on a fresh spawn. Without a
-   terminal, `agent attach` starts the session detached, prints
-   `agent: <name> is running` and returns.
-2. **For non-trivial prompts, write the seed to a file and pass `--seed`**,
-   e.g. `/tmp/agent-seed-<name>.md`, then
-   `agent attach <name> --seed /tmp/agent-seed-<name>.md`. Don't pass
-   `--headless`: it only prepares the session for the caller to run.
+1. **Pass `-e`, `--seed` or `--no-prompt`** on a fresh spawn. Without a terminal, `agent attach` starts the session detached, prints `agent: <name> is running` and returns.
+2. **For non-trivial prompts, write the seed to a file and pass `--seed`**, e.g. `/tmp/agent-seed-<name>.md`, then `agent attach <name> --seed /tmp/agent-seed-<name>.md`. Don't pass `--headless`: it only prepares the session for the caller to run.
 3. **Names must fit the rules above.** `agent` rejects others with the reason.
-4. **Repeat-attach semantics:** a running agent gets `-e`/`--seed` typed
-   into it, and an exited session or idle worktree gets a new session that
-   resumes its conversation.
+4. **Repeat-attach semantics:** a running agent gets `-e`/`--seed` typed into it, and an exited session or idle worktree gets a new session that resumes its conversation.
 
 ## Neovim keybinds (`agent_nvim` plugin, `<leader>a`)
 
-The neovim plugin runs the `agent` binary for spawning, removing and
-previews, and attaches to the zellij sessions directly.
+The neovim plugin runs the `agent` binary for spawning, removing and previews, and attaches to the zellij sessions directly.
 
 | Key | Action |
 |---|---|
@@ -285,79 +205,32 @@ previews, and attaches to the zellij sessions directly.
 | `]r` / `[r` | Jump to the next / previous change in the inline diff (review mode). |
 | `<C-.>` (n/i/t/x) | Toggle between the agent tab and wherever you were. |
 
-Each agent opens in its own nvim tab page with `tcd` set to the worktree
-cwd, a Snacks dashboard on the left, and the zellij attach terminal on
-the right. Your main work tab is unaffected. Switch between tabs with
-`gt`/`gT` or the `<leader><Tab>` group (`l` for a picker, `r` to rename,
-`n`/`p`/`x`/`t`/`o` for next/prev/close/new/only).
+Each agent opens in its own nvim tab page with `tcd` set to the worktree cwd, a Snacks dashboard on the left, and the zellij attach terminal on the right. Your main work tab is unaffected. Switch between tabs with `gt`/`gT` or the `<leader><Tab>` group (`l` for a picker, `r` to rename, `n`/`p`/`x`/`t`/`o` for next/prev/close/new/only).
 
 ## Reviewing an agent's work
 
-The local, iterative alternative to the PR round-trip. Lives in
-`agent_nvim/lua/agent/review.lua`. You review on real, LSP-live buffers and
-send comments straight to the running session.
+The local, iterative alternative to the PR round-trip. Lives in `agent_nvim/lua/agent/review.lua`. You review on real, LSP-live buffers and send comments straight to the running session.
 
-1. Open the agent whose work you want to review (`<leader>ao` for a
-   worktree agent puts you in its tab, `tcd`'d into the worktree).
-2. `<leader>arr` starts review. It first asks which **mode**, i.e. what base
-   to diff your working tree against:
+1. Open the agent whose work you want to review (`<leader>ao` for a worktree agent puts you in its tab, `tcd`'d into the worktree).
+2. `<leader>arr` starts review. It first asks which **mode**, i.e. what base to diff your working tree against:
    - **Working tree**: uncommitted changes only (base `HEAD`).
-   - **Branch**: everything since the fork point (`merge-base HEAD
-     origin/HEAD`), hidden on the trunk, where it's meaningless.
-   - **Since a commit…**: pick a commit from a log picker to see everything
-     after it (to review one commit, pick its parent on a clean tree).
-   The default is preselected (from `config.review.base`), `<cr>` accepts.
-   It then renders an **inline unified diff** (unified.nvim) of the current
-   file vs that base: removed lines in red, added in green, in sequence,
-   GitHub-style, on the real syntax-highlighted buffer. (unified's own file
-   tree is disabled in `plugins/unified.lua`, and `<leader>arf` is the file
-   navigator instead.) `<leader>arr` again stops review (prompts first if
-   comments are still pending, since it discards them).
-3. `<leader>arf` opens a snacks fuzzy picker over the changed files (with a
-   diff preview) as a nicer alternative to the tree. `<CR>` opens one into
-   the inline diff. `<leader>arm` (in a buffer) or `<a-m>` (inside the
-   picker) marks a file reviewed: it gets a ✓ and sinks to the bottom of the
-   picker (nothing is hidden), so the cursor always lands on the next
-   unreviewed file. Good for large reviews. Marks clear when you stop.
+   - **Branch**: everything since the fork point (`merge-base HEAD origin/HEAD`), hidden on the trunk, where it's meaningless.
+   - **Since a commit…**: pick a commit from a log picker to see everything after it (to review one commit, pick its parent on a clean tree). The default is preselected (from `config.review.base`), `<cr>` accepts. It then renders an **inline unified diff** (unified.nvim) of the current file vs that base: removed lines in red, added in green, in sequence, GitHub-style, on the real syntax-highlighted buffer. (unified's own file tree is disabled in `plugins/unified.lua`, and `<leader>arf` is the file navigator instead.) `<leader>arr` again stops review (prompts first if comments are still pending, since it discards them).
+3. `<leader>arf` opens a snacks fuzzy picker over the changed files (with a diff preview) as a nicer alternative to the tree. `<CR>` opens one into the inline diff. `<leader>arm` (in a buffer) or `<a-m>` (inside the picker) marks a file reviewed: it gets a ✓ and sinks to the bottom of the picker (nothing is hidden), so the cursor always lands on the next unreviewed file. Good for large reviews. Marks clear when you stop.
 4. Read the code like normal: full LSP, jump to definition, edit, run.
-5. `<leader>arc` on a line (or over a visual selection) → type a note in the
-   floating editor. It's anchored with an extmark (tracks edits) and shown
-   as a gutter sign + virtual note. `<leader>arC` adds a whole-file comment
-   (not tied to a line, rendered as a header above line 1) for feedback about
-   the file as a whole. `<leader>arg` writes an overview message for the
-   review as a whole (prepended to what's sent). `<leader>arl` lists comments,
-   `<leader>are` edits, and `<leader>ard` deletes the one under the cursor.
-   `]r` / `[r` jump between changes in the diff. Only allowed while review is
-   active.
-6. `<leader>ars` opens a paginated preview: the overview message (if any) then
-   one comment per page, `]`/`[` (or `<Tab>`/`<S-Tab>`) to move through them,
-   `<C-s>` to send all, `q` to cancel. On send it writes the overview plus all
-   comments (file:line + quoted code + note, with whole-file comments as headers)
-   to `.agent-review.md` at the repo root, adds it to `.git/info/exclude`, and
-   tells the active agent to read it and work through each one. Sending ends
-   the review (the diff closes and pending state clears). (Set
-   `config.review.delivery = "inline"` to push the markdown straight into the
-   prompt instead.)
+5. `<leader>arc` on a line (or over a visual selection) → type a note in the floating editor. It's anchored with an extmark (tracks edits) and shown as a gutter sign + virtual note. `<leader>arC` adds a whole-file comment (not tied to a line, rendered as a header above line 1) for feedback about the file as a whole. `<leader>arg` writes an overview message for the review as a whole (prepended to what's sent). `<leader>arl` lists comments, `<leader>are` edits, and `<leader>ard` deletes the one under the cursor. `]r` / `[r` jump between changes in the diff. Only allowed while review is active.
+6. `<leader>ars` opens a paginated preview: the overview message (if any) then one comment per page, `]`/`[` (or `<Tab>`/`<S-Tab>`) to move through them, `<C-s>` to send all, `q` to cancel. On send it writes the overview plus all comments (file:line + quoted code + note, with whole-file comments as headers) to `.agent-review.md` at the repo root, adds it to `.git/info/exclude`, and tells the active agent to read it and work through each one. Sending ends the review (the diff closes and pending state clears). (Set `config.review.delivery = "inline"` to push the markdown straight into the prompt instead.)
 
-While a review is active the statusline shows `review N/M · K✎` (files
-marked reviewed out of changed, and pending comments).
+While a review is active the statusline shows `review N/M · K✎` (files marked reviewed out of changed, and pending comments).
 
-A review (base, comments, marked files) is saved on exit and restored per
-repo: if you close nvim mid-review, the next `<leader>arr` in that repo
-offers to resume it. Stopping a review clears its saved state. While the
-comment editor is open, the lines you're commenting on are highlighted in
-the buffer above (`config.review.editing_hl`).
+A review (base, comments, marked files) is saved on exit and restored per repo: if you close nvim mid-review, the next `<leader>arr` in that repo offers to resume it. Stopping a review clears its saved state. While the comment editor is open, the lines you're commenting on are highlighted in the buffer above (`config.review.editing_hl`).
 
-`config.review` (in `agent/config.lua`) tunes it: `base` (`"fork"` |
-`"head"`) sets which mode the picker preselects, `delivery` (`"file"` |
-`"inline"`), the sign/glyph/highlights, and `review_file`.
+`config.review` (in `agent/config.lua`) tunes it: `base` (`"fork"` | `"head"`) sets which mode the picker preselects, `delivery` (`"file"` | `"inline"`), the sign/glyph/highlights, and `review_file`.
 
 ## Typical flow
 
-1. `CMD+Shift+A` (or `n` in the TUI, or `<leader>an` in nvim) → prompt →
-   name (suggested) → repo.
-2. `agent` creates `~/worktrees/<repo>/<name>` detached at `origin/HEAD`,
-   writes the session layout and starts the harness with the prompt.
+1. `CMD+Shift+A` (or `n` in the TUI, or `<leader>an` in nvim) → prompt → name (suggested) → repo.
+2. `agent` creates `~/worktrees/<repo>/<name>` detached at `origin/HEAD`, writes the session layout and starts the harness with the prompt.
 3. The agent picks a branch name, runs `git checkout -b` and gets to work.
 4. `CMD+0` to watch it in the TUI, and `CMD+0` again to return.
 5. `D` in the TUI (or `agent rm <name>`) when done.

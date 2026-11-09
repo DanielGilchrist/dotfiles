@@ -16,9 +16,8 @@ terminal_event = { name = "agent-spawn-dev", value = "{path}" }
 [[action]]
 key = "t"
 label = "nvim in tab"
-# wezterm/agent_edit.lua handles these two: focus the pane already running
-# $EDITOR in the checkout, or open it in a new tab or a split right of the
-# TUI. They need the TUI to run on this machine.
+# wezterm/agent_edit.lua handles these two: open $EDITOR in the checkout in a
+# new tab or a split right of the TUI. They need the TUI to run on this machine.
 terminal_event = { name = "agent-edit", value = "tab|{path}" }
 
 [[action]]
