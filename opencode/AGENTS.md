@@ -27,6 +27,23 @@ Read @~/.config/docs/parallel-claude.md
 - If a request is ambiguous, ask one question rather than guessing. Never invent an API to fill a gap, grep or read the source.
 - Brevity is not terseness. Length should align with the complexity of my question, not the topic. If I ask why, give the actual reason (still in clear language with clear examples), not a summary.
 
+### Development loop
+Use this loop only when my message contains the keyword `devloop`. Without it, work as normal. Under `devloop`, work in steps and run each step through the loop, continuing from step to step without asking. Only stop for a decision that is mine to make.
+
+- Read the project's `AGENTS.md` first. It is the bar for implementers and reviewers alike. If a substantial project has none, propose one.
+- UI or UX changes start with a design: research, a written proposal with mockups, then an adversarial design review against the project's design doc. Bring me the decisions it leaves open as one question each, with a recommendation.
+- Hand implementation to a subagent with a tight brief: the goal, the files and docs to read, what's ruled out, the rules below. Pick the cheapest model that can do the task: haiku for lookups, sonnet for implementing a clear spec and routine review, opus where judgement is hard.
+- After every step, run three adversarial reviewers in parallel. Never skip this for a small or display-only change.
+  - Principles (opus): type-driven design and the project's `AGENTS.md`. It also gets the other reviewers' bug lists.
+  - Correctness (sonnet): bugs, edge cases, races, and whether tests assert what they're named for.
+  - Redundancy (sonnet): dead code, duplicated helpers, derivable state stored twice, docs that contradict code.
+- Every bug gets the question "what representation makes this unrepresentable?" A fix of the form "call the right accessor" or "add a guard" is rejected when a type change can make the wrong call impossible. A guard needs a stated reason a type change isn't practical. Check this yourself before forwarding fixes. Don't pass reviewer suggestions through unexamined.
+- Send all findings to the implementer in one round, then re-review the fixes narrowly. Repeat until a review comes back with no findings.
+- Verify yourself before committing: run the project's definition of done and report the real output. Smoke-test against the real tools where possible, in isolation (private sockets, scratch dirs and state). Never run experiments against my live sessions, processes or state.
+- Commit each step once its review is clean, title line only, and install it if the project has an install step. Then start the next step.
+- Subagents never `git stash`, `checkout`, `reset` or commit in a shared tree, and never touch files outside their task, especially my uncommitted work.
+- Report to me what changed for me, what isn't verified, and what's next. Keep reviewer back-and-forth out of it.
+
 ### Banned phrasing
 The list below is illustrative, not exhaustive. The pattern is: never use language whose function is to signal that a point matters, to perform enthusiasm, or to make a short answer feel substantial. If a phrase could be deleted without losing information, delete it.
 
