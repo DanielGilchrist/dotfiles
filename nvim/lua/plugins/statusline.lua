@@ -26,6 +26,8 @@ return {
           local search = S.section_searchcount({ trunc_width = 75 })
           local ok, review = pcall(function() return require("agent.review").status() end)
           review = (ok and review) or ""
+          local has_heucristic, heucristic = pcall(function() return require("heucristic.status").status() end)
+          heucristic = (has_heucristic and heucristic) or ""
 
           return S.combine_groups({
             { hl = mode_hl, strings = { mode } },
@@ -33,7 +35,7 @@ return {
             "%<",
             { hl = "MiniStatuslineFilename", strings = { filename } },
             "%=",
-            { hl = "MiniStatuslineDevinfo", strings = { review } },
+            { hl = "MiniStatuslineDevinfo", strings = { heucristic, review } },
             { hl = "MiniStatuslineFileinfo", strings = { fileinfo } },
             { hl = mode_hl, strings = { search, location } },
           })

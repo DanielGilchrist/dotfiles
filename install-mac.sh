@@ -149,6 +149,18 @@ install_asdf_plugin crystal https://github.com/asdf-community/asdf-crystal.git
 install_asdf_plugin nodejs https://github.com/asdf-vm/asdf-nodejs.git
 install_asdf_plugin golang https://github.com/asdf-community/asdf-golang.git
 
+# heucristic needs LLVM to build its macro helper. Homebrew's llvm is keg-only,
+# so llvm-config isn't on PATH and command_exists can't detect it.
+if brew list llvm >/dev/null 2>&1; then
+  echo "llvm is already installed."
+else
+  echo "Installing llvm..."
+  brew install llvm
+fi
+
+echo "Installing heucristic..."
+fish -c heucristic_install
+
 if ! command_exists rustup; then
   echo "Installing rustup..."
   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh

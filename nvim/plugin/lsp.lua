@@ -150,7 +150,7 @@ end, {})
 
 vim.lsp.enable({
   "arduino_language_server",
-  "crystalline",
+  "heucristic",
   "gopls",
   "kotlin_lsp",
   "lua_ls",
