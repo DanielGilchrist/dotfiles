@@ -1,8 +1,6 @@
 set CONFIG_DIR "$HOME/.config"
 
-if test -f $CONFIG_DIR/fish/alias.fish
-  source $CONFIG_DIR/fish/alias.fish
-end
+test -f $CONFIG_DIR/fish/alias.fish; and source $CONFIG_DIR/fish/alias.fish
 
 if test -d $CONFIG_DIR/fish/secret
   for f in $CONFIG_DIR/fish/secret/**/*.fish
@@ -17,9 +15,7 @@ switch (uname)
     source $CONFIG_DIR/fish/config/linux.fish
 end
 
-if test -f "$HOME/.cargo/env.fish"
-  source "$HOME/.cargo/env.fish"
-end
+test -f "$HOME/.cargo/env.fish"; and source "$HOME/.cargo/env.fish"
 
 set -gx MAKEFLAGS "-j$(nproc)"
 set -gx XDG_CONFIG_HOME $CONFIG_DIR
@@ -44,5 +40,5 @@ set -gx tide_character_vi_icon_default "❯"
 
 export PATH="$HOME/.local/bin:$PATH"
 
-thefug init fish | source
-tanda_cli completions fish | source
+_if_installed "$PERSONAL_DIR/thefug/target/release/thefug" init fish | source
+_if_installed "$PERSONAL_DIR/tanda_cli/bin/tanda_cli" completions fish | source

@@ -1,4 +1,4 @@
-eval "$(/opt/homebrew/bin/brew shellenv)"
+_if_installed /opt/homebrew/bin/brew shellenv | source
 
 if type -q asdf
     asdf completion fish | source
