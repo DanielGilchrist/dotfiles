@@ -336,11 +336,10 @@ fn plain(text: &str) -> String {
 
 /// The first non-empty line of `text`, plain, cut to `max` characters.
 fn first_line(text: &str, max: usize) -> String {
-    let line = text
-        .lines()
-        .find(|l| !l.trim().is_empty())
-        .unwrap_or_default();
-    plain(line.trim()).chars().take(max).collect()
+    plain(agent_core::names::first_line(text).unwrap_or_default())
+        .chars()
+        .take(max)
+        .collect()
 }
 
 fn status(todo: &Value) -> Option<&str> {

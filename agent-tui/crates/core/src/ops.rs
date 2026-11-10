@@ -3,8 +3,9 @@ use std::io;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::SystemTime;
 
-use crate::activity::{MainEvent, Move, Reported, Standing, TranscriptRef};
+use crate::activity::{Hold, Join, MainEvent, Move, Reported, Standing, TranscriptRef};
 use crate::discover::{self, Warning};
 use crate::model::{HostedRepo, HostedWorktree, Presence, Removable, Running, Snapshot, Startable};
 use crate::names::{
@@ -13,8 +14,8 @@ use crate::names::{
 use crate::paths::{AgentWorktree, Layout, PathError, RepoRoot, TrashSlot, WorktreeState};
 use crate::ports::{
     AgentRecord, BranchState, Fetch, Forge, Harness, HarnessError, HarnessId, Harnesses, HostError,
-    LaunchCtx, Listing, PaneCommand, PendingPrompt, Probe, PromptKind, SessionHost, SessionInfo,
-    SessionStatus, Store, StoreError, TranscriptStamp, Unlisting, Vcs, WorktreeStart,
+    LaunchCtx, Listing, PaneCommand, PendingPrompt, Probe, SessionHost, SessionInfo, SessionStatus,
+    Store, StoreError, TranscriptStamp, Unlisting, Vcs, WorktreeStart,
 };
 use crate::process::{CommandError, LaunchSpec};
 
@@ -61,6 +62,8 @@ pub enum Error {
     WorktreeGone { name: SessionName, path: PathBuf },
     #[error("{0} isn't running, so the prompt can't be delivered. Attach first, then send it")]
     NotRunning(SessionName),
+    #[error("nothing sent: {} · {}", .hold.says(.name), .hold.hint())]
+    Held { name: SessionName, hold: Hold },
     #[error("would lose work: {}", describe_hazards(.0))]
     Hazards(Vec<Hazard>),
     #[error("{0} is the session this runs in. Remove it from somewhere else")]
@@ -396,8 +399,8 @@ pub enum Delivery {
     None,
     /// Typed into the running agent.
     Injected,
-    /// Queued for the agent's next launch.
-    Queued,
+    /// Passed to the harness when the agent next launches.
+    AtLaunch,
 }
 
 /// What to run in a terminal to reach an agent.
@@ -444,12 +447,38 @@ fn create_worktree(
     Ok(())
 }
 
-/// Type `prompt` into a running session using its harness's input encoding.
-/// Sessions agent didn't start get the default harness's.
-pub fn inject(svc: Services<'_>, name: &SessionName, prompt: &Prompt) -> Result<PromptKind> {
-    let harness = harness_for(svc, name)?;
-    svc.host.write(name, &harness.submit(prompt))?;
-    Ok(harness.prompt_kind(prompt))
+/// Proof that the store showed nothing holding text typed into a session.
+/// Only [`check_typeable`] makes one, and only [`type_into`] takes it.
+struct Clear<'a> {
+    name: &'a SessionName,
+}
+
+/// Refuses with [`Error::Held`] when the store says text typed into `name`
+/// could land in a menu. A session with no activity record at all, one agent
+/// didn't start, has nothing to refuse on.
+fn check_typeable<'a>(svc: Services<'_>, name: &'a SessionName) -> Result<Clear<'a>> {
+    let activities = svc.store.activities()?;
+    match activities.get(name).and_then(|a| a.hold(SystemTime::now())) {
+        Some(hold) => Err(Error::Held {
+            name: name.clone(),
+            hold,
+        }),
+        None => Ok(Clear { name }),
+    }
+}
+
+/// Types `prompt` into the session `clear` is for, using its harness's input
+/// encoding. Sessions agent didn't start get the default harness's.
+fn type_into(svc: Services<'_>, clear: &Clear<'_>, prompt: &Prompt) -> Result<()> {
+    let harness = harness_for(svc, clear.name)?;
+    svc.host.write(clear.name, &harness.submit(prompt))?;
+    Ok(())
+}
+
+/// Types `prompt` into a running session unless the store shows a menu
+/// could take it.
+pub fn inject(svc: Services<'_>, name: &SessionName, prompt: &Prompt) -> Result<()> {
+    type_into(svc, &check_typeable(svc, name)?, prompt)
 }
 
 /// The harness `name` runs, or the default one for a session agent didn't
@@ -494,6 +523,33 @@ fn deliver(svc: Services<'_>, session: &SessionName, task: Option<&Prompt>) -> R
     }
 }
 
+/// Records that `name` is about to launch, so a record left by an earlier
+/// run reads as booting from before the session can be listed. `exec_spec`
+/// refines it once the harness is started.
+fn mark_launch(svc: Services<'_>, name: &SessionName) -> Result<()> {
+    svc.store
+        .report(name, Reported::main(MainEvent::Launched(Join::Untraced)))?;
+    Ok(())
+}
+
+/// Marks a resurrection when `agent` started the session. One it didn't
+/// start runs no `agent exec`, so nothing would ever refine or end the mark
+/// and the session's missing record, which tells the TUI it can't know what
+/// is open in it, would be replaced by a false one.
+fn mark_resurrection(svc: Services<'_>, name: &SessionName) -> Result<()> {
+    if svc.store.record(name)?.is_some() {
+        mark_launch(svc, name)?;
+    }
+    Ok(())
+}
+
+/// Attaches to the exited session `session`, which resurrects and runs
+/// `agent exec` again.
+pub fn resurrect(svc: Services<'_>, session: &SessionName) -> Result<Launch> {
+    mark_resurrection(svc, session)?;
+    join(svc, session, None)
+}
+
 /// Attaches to the existing session `session` (resurrecting it if it
 /// exited), typing `task` into it first.
 pub fn join(svc: Services<'_>, session: &SessionName, task: Option<&Prompt>) -> Result<Launch> {
@@ -529,7 +585,7 @@ pub fn create(
 }
 
 /// Carries out an [`AttachPlan`]. `task` is typed into a running agent or
-/// queued for a new one. It's an error if neither is possible. `harness`
+/// passed at launch to a new one. It's an error if neither is possible. `harness`
 /// only applies to agents that don't already have one.
 pub fn execute(
     svc: Services<'_>,
@@ -543,7 +599,10 @@ pub fn execute(
             presence: Presence::Exited,
             ..
         } if task.is_some() => Err(Error::NotRunning(session)),
-        Plan::Attach { cwd, .. } => {
+        Plan::Attach { cwd, presence, .. } => {
+            if presence == Presence::Exited {
+                mark_resurrection(svc, &session)?;
+            }
             let delivery = deliver(svc, &session, task)?;
             let spec = svc.host.attach(&session);
             let spec = match cwd {
@@ -559,8 +618,15 @@ pub fn execute(
         // The session is live while git checks the files out again, so the
         // TUI lists it as an orphan until the next refresh after this.
         Plan::Recreate { worktree, repo } => {
+            let clear = task.map(|_| check_typeable(svc, &session)).transpose()?;
             create_worktree(svc, &repo, &worktree, &WorktreeStart::DefaultBase)?;
-            let delivery = deliver(svc, &session, task)?;
+            let delivery = match clear.zip(task) {
+                Some((clear, task)) => {
+                    type_into(svc, &clear, task)?;
+                    Delivery::Injected
+                }
+                None => Delivery::None,
+            };
             Ok(Launch {
                 spec: svc.host.attach(&session).cwd(worktree.at().path()),
                 session,
@@ -588,7 +654,7 @@ pub fn attach(
 
 /// Start a session whose pane runs `agent exec`, which asks the agent's
 /// harness to resume or launch. An agent that already has a record keeps
-/// its harness. `prompt` is queued for the next launch.
+/// its harness. `prompt` is passed at the next launch.
 pub fn start(
     svc: Services<'_>,
     at: &Startable,
@@ -602,7 +668,7 @@ pub fn start(
         .map_or_else(|| harness.id().clone(), |r| r.harness.clone());
     svc.harness(&harness_id)?;
     let (delivery, pending) = match prompt {
-        Some(prompt) => (Delivery::Queued, Some(PendingPrompt::now(prompt))),
+        Some(prompt) => (Delivery::AtLaunch, Some(PendingPrompt::now(prompt))),
         None => (Delivery::None, None),
     };
 
@@ -611,7 +677,14 @@ pub fn start(
         args: vec!["exec".into(), name.to_string()],
         cwd: at.cwd().into(),
     };
-    let spec = svc.host.create(at.host_name(), &pane)?;
+    mark_launch(svc, &name)?;
+    let spec = match svc.host.create(at.host_name(), &pane) {
+        Ok(spec) => spec,
+        Err(e) => {
+            let _ = svc.store.report(&name, Reported::main(MainEvent::Ended));
+            return Err(e.into());
+        }
+    };
     svc.store.put_record(
         &name,
         &AgentRecord {
@@ -674,8 +747,8 @@ pub fn attach_here(
     execute(svc, plan, None, harness)
 }
 
-/// The harness command for a session's pane. A queued prompt is passed until
-/// the agent shows activity after it was queued, then dropped, so a crash
+/// The harness command for a session's pane. A pending prompt is passed until
+/// the agent shows activity after it was recorded, then dropped, so a crash
 /// before the agent saw it retries and a resurrection doesn't replay it.
 pub fn exec_spec(svc: Services<'_>, name: &SessionName, workdir: &Path) -> Result<LaunchSpec> {
     let mut record = svc

@@ -14,10 +14,12 @@ use agent_core::ports::{
 };
 
 use agent_core::activity::{AgentId, TranscriptRef};
-use agent_core::names::{CarriageReturn, clean};
+use agent_core::names::first_line;
 
 use crate::touched::{Now, Roots, TouchedFile};
 
+/// The most characters of a subagent's description a quote names it by.
+const TITLE_MAX: usize = 40;
 /// Consecutive successful explore calls of one tool fold into one row.
 const GROUP_AT: usize = 3;
 /// Failures of one call in a row, or of the last [`WINDOW`] calls, that
@@ -26,6 +28,77 @@ const FAILING_AT: usize = 3;
 const WINDOW: usize = 5;
 /// A failing call has to be this recent, in calls, to still count.
 const RECENT: usize = 6;
+
+/// What [0] lists for a log, apart from where its cursor is.
+pub struct Contents<'a> {
+    pub source: Source<'a>,
+    pub entries: Vec<(Entry<'a>, EntryKey)>,
+    /// Whether it is still growing, so its cursor starts at the end and
+    /// moving there follows it.
+    pub running: bool,
+}
+
+/// What a log is read from, which decides how it is written as Markdown.
+pub enum Source<'a> {
+    Subagent(&'a Log),
+    Activity {
+        detail: &'a ActivityDetail,
+        closing: Option<&'a str>,
+        /// The files it lists as entries.
+        touched: &'a [TouchedFile],
+        /// Where `⏎` goes from the entry under its cursor.
+        jump: Option<&'a Jump>,
+    },
+}
+
+impl Source<'_> {
+    pub fn markdown(&self, title: &str) -> (String, Vec<NonZeroUsize>) {
+        match self {
+            Self::Subagent(detail) => markdown(detail, title),
+            Self::Activity {
+                detail,
+                closing,
+                touched,
+                ..
+            } => activity_markdown(detail, title, *closing, touched),
+        }
+    }
+
+    fn jump(&self) -> Option<&Jump> {
+        match self {
+            Self::Subagent(_) => None,
+            Self::Activity { jump, .. } => *jump,
+        }
+    }
+
+    fn log(&self) -> &[LogEntry] {
+        match self {
+            Self::Subagent(detail) => &detail.log,
+            Self::Activity { detail, .. } => &detail.log.log,
+        }
+    }
+}
+
+impl Contents<'_> {
+    pub fn last(&self) -> Option<usize> {
+        self.entries.len().checked_sub(1)
+    }
+
+    pub fn jump(&self) -> Option<&Jump> {
+        self.source.jump()
+    }
+
+    /// Where `nav`'s cursor is, or `None` when there are no entries.
+    pub fn at(&self, nav: &Nav) -> Option<usize> {
+        nav.at(self.running, &self.entries)
+    }
+
+    /// Where in `entries` each phase starts. It reads the whole log, so it
+    /// is asked for only by the keys that jump between phases.
+    pub fn phases(&self) -> Vec<usize> {
+        phase_positions(self.source.log(), &self.entries)
+    }
+}
 
 /// What the cursor moves over.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -220,7 +293,7 @@ fn pieces(log: &[LogEntry]) -> Vec<Piece<'_>> {
 
 /// Where in `entries` each phase of `log` starts, in order: the entry that
 /// stands for the phase's first log entry, folded or not.
-pub fn phase_positions(log: &[LogEntry], entries: &[(Entry<'_>, EntryKey)]) -> Vec<usize> {
+fn phase_positions(log: &[LogEntry], entries: &[(Entry<'_>, EntryKey)]) -> Vec<usize> {
     let starts: HashSet<usize> = pieces(log)
         .iter()
         .filter_map(|piece| match piece {
@@ -467,15 +540,7 @@ pub fn failing(detail: &Log) -> Option<String> {
         .then(|| format!("{failed} of the last {WINDOW} calls failed"))
 }
 
-/// The first line of `text` with something on it, trimmed.
-pub fn first_line(text: &str) -> Option<&str> {
-    text.split(['\n', '\r'])
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-}
-
-/// A call as one plain line: its tool and what it is aimed at.
-pub fn call_line(call: &Call) -> String {
+fn call_line(call: &Call) -> String {
     format!("{} {}", call.tool, target_text(&call.target))
         .trim_end()
         .to_string()
@@ -488,7 +553,7 @@ impl Phase<'_> {
         self.entries
             .iter()
             .find_map(|entry| match entry {
-                Entry::Said(text) => first_line(text).map(str::to_string),
+                Entry::Said(text) => first_printable_line(text),
                 _ => None,
             })
             .or_else(|| {
@@ -506,7 +571,7 @@ impl Entry<'_> {
     fn head(&self) -> Option<String> {
         match self {
             Self::Prompt(text) | Self::Said(text) | Self::Queued(text) => {
-                first_line(text).map(str::to_string)
+                first_printable_line(text)
             }
             Self::Compacted => Some("compacted".to_string()),
             Self::Call(call) => Some(call_line(call)),
@@ -538,8 +603,15 @@ impl Quote {
         }
         Some(Self(match whose {
             Whose::Activity => line,
-            Whose::Subagent(title) => match title.and_then(first_line).map(scrub) {
-                Some(title) => format!("(subagent {title}) {line}"),
+            Whose::Subagent(title) => match title
+                .and_then(first_printable_line)
+                .map(|title| scrub(&title))
+                .filter(|title| !title.is_empty())
+            {
+                Some(title) => format!(
+                    "(subagent {}) {line}",
+                    title.chars().take(TITLE_MAX).collect::<String>()
+                ),
                 None => format!("(subagent) {line}"),
             },
         }))
@@ -555,43 +627,14 @@ impl Quote {
     }
 }
 
-/// `text` without terminal escape sequences: CSI up to its final byte, OSC
-/// up to a bell or a string terminator. A lone escape character is left to
-/// [`clean`].
-fn strip_escapes(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut chars = text.chars().peekable();
-    while let Some(c) = chars.next() {
-        match (c, chars.peek()) {
-            ('\x1b', Some('[')) => {
-                chars.next();
-                for follower in chars.by_ref() {
-                    if ('@'..='~').contains(&follower) {
-                        break;
-                    }
-                }
-            }
-            ('\x1b', Some(']')) => {
-                chars.next();
-                while let Some(follower) = chars.next() {
-                    if follower == '\x07'
-                        || (follower == '\x1b' && chars.next_if_eq(&'\\').is_some())
-                    {
-                        break;
-                    }
-                }
-            }
-            _ => out.push(c),
-        }
-    }
-    out
+/// The first line with something printable on it, so a line of only escape
+/// sequences doesn't hide the real one under it.
+pub(crate) fn first_printable_line(text: &str) -> Option<String> {
+    first_line(&agent_term::printable(text, agent_term::Lines::Keep)).map(str::to_string)
 }
 
-/// `text` on one row: no escape sequences, no control characters, tabs as
-/// spaces.
 fn scrub(text: &str) -> String {
-    clean(&strip_escapes(text), CarriageReturn::Drop, None)
-        .replace('\t', " ")
+    agent_term::printable(text, agent_term::Lines::Flatten)
         .trim()
         .to_string()
 }
@@ -605,15 +648,18 @@ pub struct Nav {
 }
 
 impl Nav {
-    /// Where the cursor is among `entries`, which are not empty. A log
-    /// still growing starts at its end, one that is over at its start, and
-    /// so does a cursor whose entry is gone.
-    pub fn at(&self, running: bool, entries: &[(Entry<'_>, EntryKey)]) -> usize {
-        let default = if running { entries.len() - 1 } else { 0 };
-        self.cursor
-            .as_ref()
-            .and_then(|key| entries.iter().position(|(_, k)| k == key))
-            .unwrap_or(default)
+    /// Where the cursor is among `entries`, or `None` when there are none. A
+    /// log still growing starts at its end, one that is over at its start,
+    /// and so does a cursor whose entry is gone.
+    pub fn at(&self, running: bool, entries: &[(Entry<'_>, EntryKey)]) -> Option<usize> {
+        let last = entries.len().checked_sub(1)?;
+        let default = if running { last } else { 0 };
+        Some(
+            self.cursor
+                .as_ref()
+                .and_then(|key| entries.iter().position(|(_, k)| k == key))
+                .unwrap_or(default),
+        )
     }
 
     pub fn is_open(&self, key: &EntryKey) -> bool {
@@ -945,6 +991,13 @@ pub(crate) mod fixtures {
                 took: None,
             },
         )))
+    }
+
+    pub fn call_of(entry: &LogEntry) -> &Call {
+        match entry {
+            LogEntry::Called(call) => call,
+            other => panic!("a call, not {other:?}"),
+        }
     }
 
     pub fn bash(command: &str, state: CallState) -> LogEntry {
@@ -1317,7 +1370,10 @@ mod tests {
             all: false,
         };
         let (before, after) = (flat(&detail, &two), flat(&detail, &three));
-        let (was, now) = (nav.at(false, &before), nav.at(false, &after));
+        let (was, now) = (
+            nav.at(false, &before).expect("entries"),
+            nav.at(false, &after).expect("entries"),
+        );
         assert_eq!(was + 1, now, "one more row above, so one position down");
         assert_eq!(after[now].1, EntryKey::Log(2), "still on the same phase");
         assert!(
@@ -1326,7 +1382,7 @@ mod tests {
         );
         nav.cursor = Some(EntryKey::Touched("b.rs".into()));
         assert_eq!(
-            after[nav.at(false, &after)].1,
+            after[nav.at(false, &after).expect("entries")].1,
             EntryKey::Touched("b.rs".into())
         );
     }
@@ -1579,26 +1635,94 @@ mod tests {
         }
     }
 
+    fn line(entry: &Entry<'_>, whose: Whose<'_>) -> Option<String> {
+        Quote::of(entry, whose).map(|q| q.as_str().to_string())
+    }
+
     #[test]
-    fn a_quote_is_the_entrys_first_line_without_csi_or_osc_sequences_or_control_characters() {
-        let said = Quote::of(
-            &Entry::Said(
-                "\n  First \u{1b}]0;title\u{7}line \u{1b}[31mred\u{1b}[0m\u{7}\u{1b}]8;;u\u{1b}\\!\nsecond",
-            ),
-            Whose::Activity,
+    fn a_quote_is_the_entrys_first_line_without_escape_sequences_or_control_characters() {
+        assert_eq!(
+            line(
+                &Entry::Said(
+                    "\n  First \u{1b}]0;title\u{7}line \u{1b}[31mred\u{1b}[0m\u{7}\u{1b}]8;;u\u{1b}\\!\nsecond",
+                ),
+                Whose::Activity
+            )
+            .as_deref(),
+            Some("First line red!")
         );
-        assert_eq!(said.expect("a quote").as_str(), "First line red!");
         let long = "x".repeat(200);
         assert_eq!(
-            Quote::of(&Entry::Said(&long), Whose::Activity)
-                .expect("a quote")
-                .as_str()
-                .len(),
-            200,
+            line(&Entry::Said(&long), Whose::Activity).map(|l| l.len()),
+            Some(200),
             "the view cuts it to the box, the data keeps it"
         );
-        assert_eq!(Quote::of(&Entry::Said("  \n "), Whose::Activity), None);
-        assert_eq!(Quote::of(&Entry::Said("\u{7}"), Whose::Activity), None);
+        assert_eq!(line(&Entry::Said("  \n "), Whose::Activity), None);
+        assert_eq!(line(&Entry::Said("\u{7}"), Whose::Activity), None);
+    }
+
+    #[test]
+    fn a_quote_drops_every_kind_of_escape_the_terminal_knows() {
+        let text = "a\x1b(Bb\x1bPq\x1b\\c\x1b_x\x07d\x1bXy\x07e\x1b^z\x07f\u{9b}31mg\u{9d}0;t\x07h";
+        assert_eq!(
+            line(&Entry::Said(text), Whose::Activity).as_deref(),
+            Some("abcdefgh")
+        );
+    }
+
+    #[test]
+    fn a_line_of_only_escapes_does_not_hide_the_real_first_line() {
+        let entry = Entry::Said("\u{1b}[0m\n\u{1b}]0;t\u{7}\nthe real line\nmore");
+        assert_eq!(
+            line(&entry, Whose::Activity).as_deref(),
+            Some("the real line")
+        );
+        let phase = Phase {
+            entries: vec![entry],
+            took: None,
+        };
+        assert_eq!(phase.heading().as_deref(), Some("the real line"));
+    }
+
+    #[test]
+    fn a_stray_c1_string_start_ends_with_its_line_instead_of_eating_the_quote() {
+        let entry = Entry::Said("before \u{9d}stray\nnot this line");
+        assert_eq!(line(&entry, Whose::Activity).as_deref(), Some("before"));
+        let phase = Entry::Phase(Phase {
+            entries: vec![Entry::Said("kept \u{90}x\nnot this")],
+            took: None,
+        });
+        assert_eq!(line(&phase, Whose::Activity).as_deref(), Some("kept"));
+    }
+
+    #[test]
+    fn a_subagent_title_that_scrubs_to_nothing_is_dropped_and_a_long_one_is_cut() {
+        let call = bash("ls", ok());
+        let entry = Entry::Call(call_of(&call));
+        assert_eq!(
+            line(&entry, Whose::Subagent(Some("\u{1b}[1m\u{7}"))).as_deref(),
+            Some("(subagent) Bash ls")
+        );
+        let long = "w".repeat(200);
+        let quote = line(&entry, Whose::Subagent(Some(&long))).expect("a quote");
+        assert_eq!(quote, format!("(subagent {}) Bash ls", "w".repeat(40)));
+    }
+
+    #[test]
+    fn a_quote_is_one_line_even_when_a_call_target_holds_line_breaks() {
+        for breaks in ["\n", "\r\n", "\u{2028}", "\u{2029}", "\u{85}"] {
+            let entry = read(&format!("src/a{breaks}b.rs"));
+            let quote = line(&Entry::Call(call_of(&entry)), Whose::Activity).expect("a quote");
+            assert_eq!(quote, "Read src/a b.rs", "{breaks:?}");
+            let message = Quote::of(&Entry::Call(call_of(&entry)), Whose::Activity)
+                .expect("a quote")
+                .before("why?");
+            assert!(
+                message.lines().next().is_some_and(|l| l.starts_with("> "))
+                    && message.lines().count() == 3,
+                "{message:?}"
+            );
+        }
     }
 
     #[test]
@@ -1610,11 +1734,7 @@ mod tests {
     #[test]
     fn a_call_is_quoted_as_its_tool_and_target_and_a_phase_as_its_heading() {
         let call = bash("cargo test", ok());
-        let LogEntry::Called(boxed) = &call else {
-            panic!("a call");
-        };
-        let line =
-            |entry: &Entry<'_>, whose| Quote::of(entry, whose).map(|q| q.as_str().to_string());
+        let boxed = call_of(&call);
         assert_eq!(
             line(&Entry::Call(boxed), Whose::Activity).as_deref(),
             Some("Bash cargo test")
@@ -1644,28 +1764,26 @@ mod tests {
     #[test]
     fn a_quote_from_a_subagent_names_it() {
         let call = bash("ls", ok());
-        let LogEntry::Called(boxed) = &call else {
-            panic!("a call");
-        };
-        let entry = Entry::Call(boxed);
+        let entry = Entry::Call(call_of(&call));
         assert_eq!(
-            Quote::of(&entry, Whose::Subagent(Some("\n Find the\nbug")))
-                .map(|q| q.as_str().to_string())
-                .as_deref(),
+            line(&entry, Whose::Subagent(Some("\n Find the\nbug"))).as_deref(),
             Some("(subagent Find the) Bash ls")
         );
         assert_eq!(
-            Quote::of(&entry, Whose::Subagent(None))
-                .map(|q| q.as_str().to_string())
-                .as_deref(),
+            line(&entry, Whose::Subagent(None)).as_deref(),
             Some("(subagent) Bash ls")
         );
         assert_eq!(
-            Quote::of(&entry, Whose::Subagent(Some(" ")))
-                .map(|q| q.as_str().to_string())
-                .as_deref(),
+            line(&entry, Whose::Subagent(Some(" "))).as_deref(),
             Some("(subagent) Bash ls")
         );
+    }
+
+    #[test]
+    fn a_log_with_no_entries_has_no_cursor_position() {
+        let nav = Nav::default();
+        assert_eq!(nav.at(true, &[]), None);
+        assert_eq!(nav.at(false, &[]), None);
     }
 
     #[test]

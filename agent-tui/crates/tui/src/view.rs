@@ -1,4 +1,5 @@
 use std::cell::Cell;
+use std::fmt::Write as _;
 use std::path::Path;
 use std::time::SystemTime;
 
@@ -20,10 +21,11 @@ use crate::model::{
     AgentStatus, Areas, Blocked, Confirm, Derived, Drawn, Enter, Field, Focus, FormKind, HelpState,
     Launchable, Load, Model, NameCheck, NameSource, NamingState, NewAgent, OfferEffect, Overlay,
     Pane, Peek, Phase, Proposal, Pulse, Query, Reach, RepoInput, Row, Screen, StatusKind,
-    Submission, View, Waiting, Watch, WatchView, Windows, WorkRoom, elsewhere_banner,
-    elsewhere_note, fuzzy_match, held, invalid_chars, repo_matches,
+    Submission, Unsent, View, Waiting, Watch, WatchView, Windows, WorkRoom, elsewhere_banner,
+    elsewhere_note, fuzzy_match, invalid_chars, repo_matches,
 };
 use crate::palette::Palette;
+use crate::track::Compose;
 use crate::update::{Pick, Picks, Unusable, picker_matches, switcher_matches};
 
 mod log;
@@ -378,7 +380,7 @@ pub fn draw(frame: &mut Frame<'_>, m: &Model) -> Drawn {
         Overlay::Confirm(confirm) => draw_confirm(frame, confirm),
         Overlay::Help(help) => drawn.overlay_offset = Some(draw_help(frame, m, help)),
         Overlay::Actions(target) => draw_actions(frame, m, target),
-        Overlay::Talk { to, quote, text } => draw_talk(frame, m, to, quote.as_ref(), text),
+        Overlay::Talk(to) => draw_talk(frame, m, to),
         Overlay::Comment(draft) => {
             draw_comment(
                 frame,
@@ -665,8 +667,8 @@ fn drop_to_fit(hints: &mut Vec<Hint<'_>>, room: usize) {
     }
 }
 
-/// What needs you, led by the key that goes there, then the drafted and
-/// queued counts. It shows and hides as a block at the right edge, so the
+/// What needs you, led by the key that goes there, then the drafted
+/// count. It shows and hides as a block at the right edge, so the
 /// hints never shift.
 fn status_counts(m: &Model, focus: &Focus<'_>, nav: &str) -> Vec<Span<'static>> {
     let mut counts: Vec<Span<'static>> = Vec::new();
@@ -706,17 +708,6 @@ fn status_counts(m: &Model, focus: &Focus<'_>, nav: &str) -> Vec<Span<'static>> 
             counts.pop();
         }
     }
-    let queued = m.queued();
-    if queued > 0 {
-        let lead = [
-            Span::styled(format!("{queued} queued"), dim()),
-            Span::raw("  "),
-        ];
-        counts.splice(0..0, lead);
-        if counts.len() == 2 {
-            counts.pop();
-        }
-    }
     counts
 }
 
@@ -744,7 +735,7 @@ fn draw_status_bar(frame: &mut Frame<'_>, m: &Model, area: Rect) {
             ranked("⌃R", "use suggestion", 1),
         ]);
     } else if let Focus::Overlay(
-        Overlay::Switcher(_) | Overlay::Picker(_) | Overlay::Talk { .. } | Overlay::Comment(_),
+        Overlay::Switcher(_) | Overlay::Picker(_) | Overlay::Talk(_) | Overlay::Comment(_),
     ) = focus
     {
         // The overlay's border carries its keys, so the footer doesn't
@@ -802,11 +793,21 @@ fn overlay_area(frame: &Frame<'_>, width: u16, height: u16) -> Rect {
     centred(frame, width, height.max(5))
 }
 
-/// A centred rect of at most `width` x `height`, leaving a margin around it.
+/// The least a box is drawn at, margin or not: a border around one row.
+const MIN_BOX: (u16, u16) = (8, 3);
+
+/// A centred rect of at most `width` x `height`, leaving a margin around it
+/// while the screen has the room for [`MIN_BOX`] beside it.
 fn centred(frame: &Frame<'_>, width: u16, height: u16) -> Rect {
     let area = frame.area();
-    let width = width.min(area.width.saturating_sub(4));
-    let height = height.min(area.height.saturating_sub(2));
+    let width = width
+        .min(area.width.saturating_sub(4))
+        .max(width.min(MIN_BOX.0))
+        .min(area.width);
+    let height = height
+        .min(area.height.saturating_sub(2))
+        .max(height.min(MIN_BOX.1))
+        .min(area.height);
     let [area] = Layout::horizontal([Constraint::Length(width)])
         .flex(Flex::Center)
         .areas(area);
@@ -1561,15 +1562,14 @@ fn confirm_card(confirm: &Confirm) -> ConfirmCard {
             [destructive("y/⏎", "kill"), hints(&[("n/Esc", "cancel")])].concat(),
             warn,
         ),
-        Confirm::Quit(queued) => (
-            "Quit with unsent messages".to_string(),
+        Confirm::Quit(unsent) => (
+            "Quit with unsent work".to_string(),
             vec![
                 Line::raw(format!(
-                    "{queued} queued message{} or draft comment{} would be lost. Agents keep running.",
-                    if *queued == 1 { "" } else { "s" },
-                    if *queued == 1 { "" } else { "s" }
+                    "{} would be lost. Agents keep running.",
+                    unsent_words(*unsent)
                 )),
-                Line::styled("Queues and drafts live in this TUI, not on disk.", dim()),
+                Line::styled("They live in this TUI, not on disk.", dim()),
             ],
             [destructive("y/⏎", "quit"), hints(&[("n/Esc", "stay")])].concat(),
             warn,
@@ -1626,6 +1626,18 @@ fn confirm_card(confirm: &Confirm) -> ConfirmCard {
         keys,
         border,
     }
+}
+
+fn unsent_words(unsent: Unsent) -> String {
+    let plural = |n: usize, what: &str| format!("{n} {what}{}", if n == 1 { "" } else { "s" });
+    let mut parts = Vec::new();
+    if unsent.comments > 0 {
+        parts.push(plural(unsent.comments, "draft comment"));
+    }
+    if unsent.messages > 0 {
+        parts.push(plural(unsent.messages, "unsent message"));
+    }
+    parts.join(" and ")
 }
 
 fn draw_confirm(frame: &mut Frame<'_>, confirm: &Confirm) {
@@ -1715,83 +1727,105 @@ fn draw_actions(frame: &mut Frame<'_>, m: &Model, target: &SessionName) {
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
-fn draw_talk(
-    frame: &mut Frame<'_>,
+fn draw_talk(frame: &mut Frame<'_>, m: &Model, to: &SessionName) {
+    let compose = m.tracked(to).and_then(|t| t.compose.as_ref());
+    let (quote, text, sending) = match compose {
+        Some(Compose::Editing { quote, text }) => (quote.as_ref(), text.as_str(), false),
+        Some(Compose::Sending { text, .. }) => (None, text.as_str(), true),
+        None => (None, "", false),
+    };
+    let draft = m.draft(to);
+    let shown = draft.len().min(3);
+    let height =
+        u16::try_from(3 + shown + usize::from(draft.len() > shown) + usize::from(quote.is_some()))
+            .unwrap_or(3);
+    let area = centred(frame, 72, height);
+    clear_around(frame, area);
+    let room = usize::from(area.width).saturating_sub(6);
+    let rows_above = area.height.saturating_sub(3);
+    let quote_in_title = quote.is_some() && rows_above == 0;
+    let (title, keys) = if sending {
+        (format!("Sending to {to}…"), hints(&[("Esc", "close")]))
+    } else {
+        (
+            talk_title(m, to, quote, quote_in_title.then_some(room)),
+            hints(&[("⏎", "send"), ("Esc", "close")]),
+        )
+    };
+    let block = overlay_block(&title, keys, dim());
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let lines = talk_rows(draft, shown, quote.filter(|_| !quote_in_title), room);
+    let [above, input] =
+        Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(inner);
+    let hidden = u16::try_from(lines.len())
+        .unwrap_or(u16::MAX)
+        .saturating_sub(above.height);
+    frame.render_widget(Paragraph::new(lines).scroll((hidden, 0)), above);
+    let (typed, cursor) = if sending {
+        (dim(), "")
+    } else {
+        (Style::new(), "█")
+    };
+    frame.render_widget(
+        Line::from(vec![
+            Span::styled(" › ", accent()),
+            Span::styled(truncate_start(text, room), typed),
+            Span::styled(cursor, dim()),
+        ]),
+        input,
+    );
+}
+
+/// The quote joins the title when the box has no row to show it above the
+/// input, so a reply never hides what it answers.
+fn talk_title(
     m: &Model,
     to: &SessionName,
     quote: Option<&crate::log::Quote>,
-    text: &str,
-) {
-    let draft = m.draft(to);
-    let queued: Vec<&str> = m
-        .tracked(to)
-        .and_then(|t| t.outbox.as_ref())
-        .map(|o| o.iter().map(AsRef::as_ref).collect())
-        .unwrap_or_default();
-    let shown = queued.len().min(3);
-    let drafted = draft.len().min(3);
-    let height = u16::try_from(
-        3 + shown
-            + usize::from(queued.len() > shown)
-            + drafted
-            + usize::from(draft.len() > drafted)
-            + usize::from(quote.is_some()),
-    )
-    .unwrap_or(3);
-    let area = centred(frame, 72, height);
-    clear_around(frame, area);
-    let (what, verb) = match (draft.is_empty(), quote) {
-        (false, _) => ("Send review", "send review"),
-        (true, Some(_)) => ("Reply", "send"),
-        (true, None) => ("Send", "send"),
+    quote_room: Option<usize>,
+) -> String {
+    let what = match (m.draft(to).is_empty(), quote) {
+        (false, _) => "Send review",
+        (true, Some(_)) => "Reply",
+        (true, None) => "Send",
     };
-    let (title, verb) = match m.hold(to) {
-        None => (format!("{what} to {to}"), verb),
-        Some(hold) => (format!("{what} to {to} · {}", held(hold)), "hold"),
-    };
-    let hint_keys: &[(&str, &str)] = if queued.is_empty() {
-        &[("⏎", verb), ("Esc", "close")]
-    } else {
-        &[("⏎", verb), ("⌃X", "clear queue"), ("Esc", "close")]
-    };
-    let block = overlay_block(&title, hints(hint_keys), dim());
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    let room = usize::from(inner.width).saturating_sub(4);
-    let mut lines: Vec<Line<'static>> = queued
+    let mut title = format!("{what} to {to}");
+    if let Some(hold) = m.hold(to) {
+        let _ = write!(title, " · {}", hold.label());
+    }
+    if let (Some(quote), Some(room)) = (quote, quote_room) {
+        let left = room.saturating_sub(title.width() + 5);
+        let _ = write!(title, " · > {}", truncate_end(quote.as_str(), left));
+    }
+    title
+}
+
+fn talk_rows(
+    draft: &[crate::review::Comment],
+    shown: usize,
+    quote: Option<&crate::log::Quote>,
+    room: usize,
+) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = draft
         .iter()
         .take(shown)
-        .map(|q| {
-            Line::styled(
-                format!(
-                    " queued: {}",
-                    truncate_end(&crate::update::first_words(q), room.saturating_sub(8))
+        .map(|comment| {
+            Line::from(vec![
+                Span::styled(" ✎ ", warning()),
+                Span::styled(
+                    truncate_end(
+                        &format!("{}  {}", comment.label, comment.text),
+                        room.saturating_sub(2),
+                    ),
+                    dim(),
                 ),
-                dim(),
-            )
+            ])
         })
         .collect();
-    if queued.len() > shown {
+    if draft.len() > shown {
         lines.push(Line::styled(
-            format!(" +{} more queued", queued.len() - shown),
-            dim(),
-        ));
-    }
-    for comment in draft.iter().take(drafted) {
-        lines.push(Line::from(vec![
-            Span::styled(" ✎ ", warning()),
-            Span::styled(
-                truncate_end(
-                    &format!("{}  {}", comment.label, comment.text),
-                    room.saturating_sub(2),
-                ),
-                dim(),
-            ),
-        ]));
-    }
-    if draft.len() > drafted {
-        lines.push(Line::styled(
-            format!(" +{} more comments", draft.len() - drafted),
+            format!(" +{} more comments", draft.len() - shown),
             dim(),
         ));
     }
@@ -1804,20 +1838,7 @@ fn draw_talk(
             dim(),
         ));
     }
-    let [above, input] =
-        Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(inner);
-    let hidden = u16::try_from(lines.len())
-        .unwrap_or(u16::MAX)
-        .saturating_sub(above.height);
-    frame.render_widget(Paragraph::new(lines).scroll((hidden, 0)), above);
-    frame.render_widget(
-        Line::from(vec![
-            Span::styled(" › ", accent()),
-            Span::raw(truncate_start(text, room)),
-            Span::styled("█", dim()),
-        ]),
-        input,
-    );
+    lines
 }
 
 /// The box that takes a comment on lines of a diff: the quoted lines DIM,

@@ -7,6 +7,7 @@ use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system}
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 
+use crate::escapes::{Sequence, consume};
 use crate::{Emulator, Modes, Screen, TermSize};
 
 /// Output chunks buffered before the reader waits for the UI to catch up.
@@ -196,26 +197,11 @@ fn last_line(bytes: &[u8]) -> Option<String> {
     let mut chars = text.chars();
     let break_line = |lines: &mut Vec<String>| lines.push(String::new());
     while let Some(c) = chars.next() {
-        match c {
-            '\u{1b}' => match chars.next() {
-                Some('[') => {
-                    let moves = chars
-                        .by_ref()
-                        .find(|c| ('@'..='~').contains(c))
-                        .is_some_and(|fin| "HfdABEFJ".contains(fin));
-                    if moves {
-                        break_line(&mut lines);
-                    }
-                }
-                Some(']' | 'P' | '_') => skip_string(&mut chars),
-                Some('(' | ')' | '*' | '+') => {
-                    chars.next();
-                }
-                _ => {}
-            },
-            '\r' | '\n' => break_line(&mut lines),
-            c if c.is_control() => {}
-            c => lines.last_mut().expect("a line").push(c),
+        match (c, consume(c, &mut chars)) {
+            (_, Some(Sequence::Moves)) | ('\r' | '\n', None) => break_line(&mut lines),
+            (_, Some(Sequence::Other)) => {}
+            (c, None) if c.is_control() => {}
+            (c, None) => lines.last_mut().expect("a line").push(c),
         }
     }
     lines
@@ -223,15 +209,6 @@ fn last_line(bytes: &[u8]) -> Option<String> {
         .map(|line| line.trim())
         .rfind(|line| !line.is_empty())
         .map(String::from)
-}
-
-/// Skips to the end of an OSC, DCS or APC string: a bell or ESC `\`.
-fn skip_string(chars: &mut std::str::Chars<'_>) {
-    while let Some(c) = chars.next() {
-        if c == '\u{7}' || (c == '\u{1b}' && chars.next() == Some('\\')) {
-            return;
-        }
-    }
 }
 
 fn read_output(mut reader: Box<dyn Read + Send>, output: &SyncSender<Vec<u8>>) {

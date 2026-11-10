@@ -20,7 +20,7 @@ use super::{
 };
 use crate::log::{
     Entry, EntryKey, EntryRows, Nav, Phase, activity_entries, agent_count, call_count, delegates,
-    entries, error_count, failing, target_text, time_of, unrecovered_count,
+    entries, error_count, failing, first_printable_line, target_text, time_of, unrecovered_count,
 };
 use crate::model::Asking;
 use crate::touched::{Now, Roots, TouchedFile};
@@ -155,14 +155,7 @@ fn unwind(path: &str, ctx: &Context<'_>) -> String {
 
 /// Printable text on one row: tabs widened, other control characters gone.
 fn tame(text: &str) -> String {
-    text.chars()
-        .filter_map(|c| match c {
-            '\t' => Some(' '),
-            '\n' => Some('\n'),
-            c if c.is_control() => None,
-            c => Some(c),
-        })
-        .collect()
+    agent_term::printable(text, agent_term::Lines::Keep)
 }
 
 fn gutter() -> Span<'static> {
@@ -281,14 +274,14 @@ impl Rows<'_, '_> {
             }
             return;
         }
-        let first = prompt.lines().next().unwrap_or_default();
+        let first = first_printable_line(&prompt).unwrap_or_default();
         let more = prompt.lines().count().saturating_sub(1);
         let room = self.ctx.columns.saturating_sub(3);
         self.push(Line::from(vec![
             gutter(),
             lead,
             Span::raw(" "),
-            Span::raw(truncate_end(first, room)),
+            Span::raw(truncate_end(&first, room)),
         ]));
         if more > 0 {
             self.push(indented(
@@ -1409,7 +1402,7 @@ fn asking_activity_row(
         Span::raw(format!(" asking {}", ago(since, ctx.now))),
         Span::styled(" · ", dim()),
     ];
-    let first = |text: &str| tame(text.lines().next().unwrap_or_default().trim());
+    let first = |text: &str| first_printable_line(text).unwrap_or_default();
     let about = match (asking, by) {
         (Some(Asking::Choice { questions, .. }), _) => questions
             .first()
@@ -1796,3 +1789,19 @@ fn permission_rows(
 const SAID_BEFORE: usize = 2;
 /// The most rows of a permission prompt's call that stay pinned.
 const PERMISSION_ROWS: usize = 6;
+
+#[cfg(test)]
+mod tests {
+    use super::tame;
+
+    #[test]
+    fn a_heading_with_escape_sequences_reads_the_way_its_quote_does() {
+        let heading = "Checking \u{1b}[31mthe\u{1b}[0m \u{1b}]0;t\u{7}lint\u{7}";
+        assert_eq!(tame(heading), "Checking the lint");
+        let quote = crate::log::Quote::of(
+            &crate::log::Entry::Said(heading),
+            crate::log::Whose::Activity,
+        );
+        assert_eq!(quote.expect("a quote").as_str(), tame(heading));
+    }
+}

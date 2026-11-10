@@ -6,7 +6,7 @@
 //! when a handler and this table disagree.
 
 use crate::document::Hover;
-use crate::model::{LEAVE_PAUSED, MOVE_HERE, Model, Panel, Quoting, Reach, View, Visibility};
+use crate::model::{LEAVE_PAUSED, MOVE_HERE, Model, Panel, Reach, View, Visibility};
 use crate::tree::{ChangesScope, ChangesView, Node};
 use agent_core::model::Entry;
 use agent_core::ports::Compared;
@@ -82,6 +82,12 @@ const EVERYWHERE: Ctxs = Ctxs::of(&[
 ]);
 const AGENTS: Ctxs = Ctxs::of(&[Ctx::Agents]);
 const LISTS: Ctxs = Ctxs::of(&[Ctx::Activity, Ctx::Changes]);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Quoting {
+    No,
+    Yes,
+}
 
 /// What the bindings' labels and ranks depend on, read once from the model.
 #[derive(Debug, Clone)]
@@ -325,7 +331,6 @@ impl Situation {
         self.ctx == Ctx::Main && self.activity() == Some(ActivityDoc::Log)
     }
 
-    /// [0] shows a log with entries to put a cursor on, a subagent's or the activity's.
     fn reads_entries(&self) -> bool {
         self.subagent_row() || self.reads_log()
     }
@@ -368,7 +373,10 @@ impl Situation {
             left: if left { Left::Agent } else { Left::Nobody },
             toggle: Self::toggle(m),
             jump: m.activity_jump().cloned(),
-            reply: m.reply,
+            reply: match &m.reply {
+                Some(_) => Quoting::Yes,
+                None => Quoting::No,
+            },
             next_changes_tab: match m.changes_scope.toggled() {
                 ChangesScope::Uncommitted => "tab: uncommitted",
                 ChangesScope::Since => {
@@ -801,7 +809,7 @@ pub const BINDINGS: &[Binding] = &[
                 "send"
             })
         }),
-        "Compose a message to the selected agent without attaching. It is typed at once, and held only while the agent is asking, its session is starting or hasn't reported, a tool just started, or the last message is too recent or was a command. With the entry cursor on an entry in [0]'s activity or a subagent's log it reads reply: the entry's first line shows above the input and goes before your message, only when you typed one. Backspace on empty text drops the quote. Review comments drafted for the agent go after the message.",
+        "Compose a message to the selected agent without attaching. It is typed at once, and refused only while the agent is asking, its session is starting, or it ended. What you typed stays for the next s: Esc keeps it and ctrl-U clears it. With the entry cursor on an entry in [0]'s activity or a subagent's log it reads reply: the entry's first line shows above the input and goes before your message, only when you typed one. Backspace on empty text drops the quote. In a peek it always sends without a quote. Review comments drafted for the agent go after the message.",
     ),
     Binding::new(
         &["v"],
@@ -976,7 +984,7 @@ pub const BINDINGS: &[Binding] = &[
         PANELS,
         Hidden,
         Say("quit"),
-        "Quit. Agents keep running. It confirms first when messages are queued.",
+        "Quit. Agents keep running. It confirms first when review comments are drafted or a message is written and not yet typed.",
     ),
     Binding::new(
         &["?"],

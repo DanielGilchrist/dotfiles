@@ -243,7 +243,7 @@ fn a_branch_checked_out_by_another_repos_agent_is_not_this_repos() {
 }
 
 #[test]
-fn new_agents_get_a_worktree_a_record_and_a_queued_bootstrap() {
+fn new_agents_get_a_worktree_a_record_and_a_bootstrap_for_launch() {
     let w = World::new();
     let repo = w.vcs.root.clone();
     let launch = attach(
@@ -254,7 +254,7 @@ fn new_agents_get_a_worktree_a_record_and_a_queued_bootstrap() {
         w.harness(),
     )
     .expect("succeeds");
-    assert_eq!(launch.delivery, Delivery::Queued);
+    assert_eq!(launch.delivery, Delivery::AtLaunch);
     assert!(
         w.layout
             .worktree(&repo, agent("fix"))
@@ -280,7 +280,7 @@ fn new_agents_get_a_worktree_a_record_and_a_queued_bootstrap() {
 }
 
 #[test]
-fn queued_prompts_are_resent_until_the_agent_shows_activity() {
+fn pending_prompts_are_resent_until_the_agent_shows_activity() {
     let w = World::new();
     let repo = w.vcs.root.clone();
     attach(
@@ -336,7 +336,7 @@ fn restarts_keep_the_agents_recorded_harness() {
 }
 
 #[test]
-fn exited_agents_restart_through_agent_with_the_prompt_queued() {
+fn exited_agents_restart_through_agent_with_the_prompt_passed_at_launch() {
     let w = World::new();
     w.existing_worktree("fix");
     w.add_session("fix", SessionStatus::Exited { cwd: None });
@@ -348,7 +348,7 @@ fn exited_agents_restart_through_agent_with_the_prompt_queued() {
         w.harness(),
     )
     .expect("succeeds");
-    assert_eq!(launch.delivery, Delivery::Queued);
+    assert_eq!(launch.delivery, Delivery::AtLaunch);
     assert_eq!(
         w.host.created.lock().expect("lock").len(),
         1,
@@ -362,6 +362,7 @@ fn prompts_for_live_sessions_are_typed_in_with_the_harness_encoding() {
     let w = World::new();
     w.existing_worktree("fix");
     w.add_session("fix", SessionStatus::Live { cwd: None });
+    working_agent(&w, "fix");
     let launch = attach(
         w.svc(),
         &agent("fix"),
@@ -372,6 +373,119 @@ fn prompts_for_live_sessions_are_typed_in_with_the_harness_encoding() {
     .expect("succeeds");
     assert_eq!(launch.delivery, Delivery::Injected);
     assert_eq!(w.host.written.lock().expect("lock")[0].1, b"hi\r");
+}
+
+fn live_fix(w: &World) {
+    w.existing_worktree("fix");
+    w.add_session("fix", SessionStatus::Live { cwd: None });
+}
+
+fn ask_in_fix(w: &World) {
+    let asking = Activity::next(
+        Some(working_agent(w, "fix")),
+        Reported::main(MainEvent::Common(crate::activity::Common::Asked {
+            question: "Bash: ls".into(),
+            about: crate::activity::About::Unknown,
+        })),
+        SystemTime::UNIX_EPOCH,
+    );
+    w.store
+        .activities
+        .lock()
+        .expect("lock")
+        .insert(session("fix"), asking);
+}
+
+fn nothing_typed(w: &World) -> bool {
+    w.host.written.lock().expect("lock").is_empty()
+}
+
+#[test]
+fn a_prompt_for_an_agent_that_is_asking_is_refused_and_nothing_is_typed() {
+    let w = World::new();
+    live_fix(&w);
+    ask_in_fix(&w);
+    let result = attach(
+        w.svc(),
+        &agent("fix"),
+        Some(&prompt("hi")),
+        None,
+        w.harness(),
+    );
+    let Err(
+        error @ Error::Held {
+            hold: Hold::Asking, ..
+        },
+    ) = result
+    else {
+        panic!("{result:?}");
+    };
+    assert_eq!(
+        error.to_string(),
+        "nothing sent: fix is asking · attach to answer"
+    );
+    assert!(nothing_typed(&w));
+}
+
+#[test]
+fn a_prompt_to_a_vanished_worktree_is_refused_before_the_worktree_is_made() {
+    let w = World::new();
+    let gone = w.layout.worktree(&w.vcs.root, agent("fix"));
+    w.add_session(
+        "fix",
+        SessionStatus::Live {
+            cwd: Some(gone.path().to_path_buf()),
+        },
+    );
+    ask_in_fix(&w);
+    let repo = w.vcs.root.clone();
+    let result = attach(
+        w.svc(),
+        &agent("fix"),
+        Some(&prompt("hi")),
+        Some(&repo),
+        w.harness(),
+    );
+    assert!(matches!(result, Err(Error::Held { .. })), "{result:?}");
+    assert_eq!(
+        w.layout.scan().expect("succeeds"),
+        [],
+        "no worktree was made"
+    );
+    assert!(nothing_typed(&w));
+}
+
+#[test]
+fn a_session_with_no_activity_record_is_typed_into() {
+    let w = World::new();
+    live_fix(&w);
+    inject(w.svc(), &session("fix"), &prompt("hi")).expect("types");
+    assert_eq!(w.host.written.lock().expect("lock")[0].1, b"hi\r");
+}
+
+#[test]
+fn a_launched_session_that_has_not_reported_is_booting() {
+    let w = World::new();
+    live_fix(&w);
+    let launched = Activity::next(
+        None,
+        Reported::main(MainEvent::Launched(crate::activity::Join::Untraced)),
+        SystemTime::now(),
+    );
+    w.store
+        .activities
+        .lock()
+        .expect("lock")
+        .insert(session("fix"), launched);
+    let result = inject(w.svc(), &session("fix"), &prompt("hi"));
+    assert!(matches!(
+        result,
+        Err(Error::Held {
+            hold: Hold::Booting,
+            ..
+        })
+    ));
+    assert!(nothing_typed(&w));
 }
 
 #[test]
@@ -845,6 +959,94 @@ fn launching_marks_a_previously_finished_agent_as_booting() {
             ..
         }
     ));
+}
+
+fn finished_long_ago() -> Activity {
+    Activity::next(
+        None,
+        Reported::main(MainEvent::Finished {
+            summary: None,
+            running: Vec::new(),
+        }),
+        SystemTime::UNIX_EPOCH,
+    )
+}
+
+fn hold_of_fix(w: &World) -> Option<Hold> {
+    w.store
+        .activities
+        .lock()
+        .expect("lock")
+        .get(&session("fix"))
+        .expect("recorded")
+        .hold(SystemTime::now())
+}
+
+#[test]
+fn a_record_from_an_earlier_run_reads_as_booting_as_soon_as_the_session_starts() {
+    let w = World::new();
+    w.existing_worktree("fix");
+    w.store
+        .activities
+        .lock()
+        .expect("lock")
+        .insert(session("fix"), finished_long_ago());
+    assert_eq!(hold_of_fix(&w), None, "the stale record says it is idle");
+    attach(w.svc(), &agent("fix"), None, None, w.harness()).expect("succeeds");
+    assert_eq!(hold_of_fix(&w), Some(Hold::Booting));
+}
+
+fn record_for_fix(w: &World) {
+    w.store
+        .put_record(
+            &session("fix"),
+            &AgentRecord {
+                harness: w.harness().id().clone(),
+                pending: None,
+            },
+        )
+        .expect("stores");
+}
+
+#[test]
+fn a_session_agent_did_not_start_is_not_marked_when_it_resurrects() {
+    let w = World::new();
+    w.existing_worktree("fix");
+    w.add_session("fix", SessionStatus::Exited { cwd: None });
+    resurrect(w.svc(), &session("fix")).expect("succeeds");
+    assert!(w.store.activities.lock().expect("lock").is_empty());
+}
+
+#[test]
+fn a_session_that_cannot_be_created_ends_instead_of_booting_for_good() {
+    let w = World::new();
+    w.existing_worktree("fix");
+    *w.host.create_fails.lock().expect("lock") = true;
+    let result = attach(w.svc(), &agent("fix"), None, None, w.harness());
+    assert!(matches!(result, Err(Error::Host(_))), "{result:?}");
+    assert_eq!(hold_of_fix(&w), Some(Hold::Ended));
+}
+
+#[test]
+fn resurrecting_an_exited_session_marks_its_record_booting_first() {
+    let w = World::new();
+    w.existing_worktree("fix");
+    record_for_fix(&w);
+    w.add_session("fix", SessionStatus::Exited { cwd: None });
+    w.store
+        .activities
+        .lock()
+        .expect("lock")
+        .insert(session("fix"), finished_long_ago());
+    attach(w.svc(), &agent("fix"), None, None, w.harness()).expect("succeeds");
+    assert_eq!(hold_of_fix(&w), Some(Hold::Booting));
+    w.store
+        .activities
+        .lock()
+        .expect("lock")
+        .insert(session("fix"), finished_long_ago());
+    resurrect(w.svc(), &session("fix")).expect("succeeds");
+    assert_eq!(hold_of_fix(&w), Some(Hold::Booting));
 }
 
 fn working_agent(w: &World, who: &str) -> Activity {

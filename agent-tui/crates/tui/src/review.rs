@@ -183,9 +183,9 @@ pub fn last(lines: &[LineInfo]) -> Option<usize> {
 
 /// The first line of the next hunk after `from`, or of the one `from` is in
 /// when going back from past its first line.
-pub fn hunk(lines: &[LineInfo], from: usize, forward: bool) -> Option<usize> {
+pub fn hunk(lines: &[LineInfo], from: usize, direction: Direction) -> Option<usize> {
     let after = |header: usize| step(lines, header, 1);
-    if forward {
+    if direction == Direction::Forward {
         let next = (from + 1..lines.len()).find(|&i| lines[i].is_hunk())?;
         return after(next);
     }
@@ -196,16 +196,6 @@ pub fn hunk(lines: &[LineInfo], from: usize, forward: bool) -> Option<usize> {
     }
     let previous = (0..current).rfind(|&i| lines[i].is_hunk())?;
     after(previous)
-}
-
-/// The first of `starts`, which are in order, after `from` going forward.
-/// Going back, the last one before `from`, which is the start of the
-/// section `from` is in when it is past it.
-pub fn next_start(starts: &[usize], from: usize, direction: Direction) -> Option<usize> {
-    match direction {
-        Direction::Forward => starts.iter().copied().find(|&start| start > from),
-        Direction::Back => starts.iter().rev().copied().find(|&start| start < from),
-    }
 }
 
 /// The first line of the next file after `from`, or of the one `from` is
@@ -219,7 +209,7 @@ pub fn file(lines: &[LineInfo], from: usize, direction: Direction) -> Option<usi
         }
         previous = Some(&line.path);
     }
-    next_start(&starts, from, direction)
+    direction.next_start(&starts, from)
 }
 
 /// `path:42`, `path:10-14`, or for removed lines `path:7 (removed)`. In a
@@ -342,21 +332,6 @@ mod tests {
     use super::*;
     use crate::fixtures::{line_info, nz};
 
-    #[test]
-    fn the_next_start_is_the_one_after_going_forward_and_this_sections_going_back_from_inside_it() {
-        use crate::model::Direction::{Back, Forward};
-        let starts = [2, 5, 9];
-        assert_eq!(next_start(&starts, 0, Forward), Some(2));
-        assert_eq!(next_start(&starts, 2, Forward), Some(5));
-        assert_eq!(next_start(&starts, 9, Forward), None);
-        assert_eq!(next_start(&starts, 11, Forward), None);
-        assert_eq!(next_start(&starts, 7, Back), Some(5), "inside a section");
-        assert_eq!(next_start(&starts, 5, Back), Some(2), "on a start");
-        assert_eq!(next_start(&starts, 2, Back), None);
-        assert_eq!(next_start(&starts, 0, Back), None);
-        assert_eq!(next_start(&[], 3, Forward), None);
-    }
-
     fn text(lines: &[&str]) -> Vec<String> {
         lines.iter().map(|l| (*l).to_string()).collect()
     }
@@ -416,15 +391,23 @@ mod tests {
         assert_eq!(last(&lines), Some(7));
         assert_eq!(step(&lines, 2, 1), Some(4), "over the second hunk's header");
         assert_eq!(step(&lines, 1, -1), None);
-        assert_eq!(hunk(&lines, 1, true), Some(4));
+        assert_eq!(hunk(&lines, 1, Direction::Forward), Some(4));
         assert_eq!(
-            hunk(&lines, 4, true),
+            hunk(&lines, 4, Direction::Forward),
             Some(7),
             "into the next file's first hunk"
         );
-        assert_eq!(hunk(&lines, 5, false), Some(4), "back to the hunk's start");
-        assert_eq!(hunk(&lines, 4, false), Some(1), "then the one before");
-        assert_eq!(hunk(&lines, 1, false), None);
+        assert_eq!(
+            hunk(&lines, 5, Direction::Back),
+            Some(4),
+            "back to the hunk's start"
+        );
+        assert_eq!(
+            hunk(&lines, 4, Direction::Back),
+            Some(1),
+            "then the one before"
+        );
+        assert_eq!(hunk(&lines, 1, Direction::Back), None);
         assert_eq!(file(&lines, 2, Direction::Forward), Some(7));
         assert_eq!(file(&lines, 7, Direction::Back), Some(1));
         assert_eq!(file(&lines, 2, Direction::Back), Some(1));

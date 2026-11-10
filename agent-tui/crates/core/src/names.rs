@@ -299,6 +299,12 @@ pub fn clean(text: &str, cr: CarriageReturn, replacement: Option<char>) -> Strin
     out
 }
 
+pub fn first_line(text: &str) -> Option<&str> {
+    text.split(['\n', '\r'])
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+}
+
 /// Text to send an agent: not blank, and no control characters other than
 /// newlines and tabs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -393,6 +399,13 @@ impl FromStr for Checkout {
 mod tests {
     use super::*;
     use crate::testing::NAME_LIMIT;
+
+    #[test]
+    fn the_first_line_skips_blank_ones_and_is_trimmed() {
+        assert_eq!(first_line("\n  \r\n  hello  \nworld"), Some("hello"));
+        assert_eq!(first_line(" \n\t"), None);
+        assert_eq!(first_line(""), None);
+    }
 
     #[test]
     fn agent_names_are_single_safe_components() {

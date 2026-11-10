@@ -277,6 +277,8 @@ pub struct FakeHost {
     pub killed: Mutex<Vec<SessionName>>,
     pub deleted: Mutex<Vec<SessionName>>,
     pub written: Mutex<Vec<(SessionName, Vec<u8>)>>,
+    /// Creating a session fails, as when the host can't be reached.
+    pub create_fails: Mutex<bool>,
 }
 
 pub const NAME_LIMIT: NameLimit = NameLimit::new(NonZeroUsize::new(20).expect("nonzero"));
@@ -304,6 +306,12 @@ impl SessionHost for FakeHost {
 
     fn create(&self, name: &HostName, pane: &PaneCommand) -> Result<LaunchSpec, HostError> {
         name.within(NAME_LIMIT)?;
+        if *self.create_fails.lock().expect("lock") {
+            return Err(HostError::Io {
+                context: "creating a session".into(),
+                source: std::io::Error::other("no host"),
+            });
+        }
         let name = name.session();
         self.created
             .lock()

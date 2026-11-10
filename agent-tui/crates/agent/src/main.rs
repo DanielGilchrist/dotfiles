@@ -12,7 +12,7 @@ use agent_core::ops::{
     self, Backend, Consent, Delivery, Hazard, Launch, Planned, Removed, Services,
 };
 use agent_core::paths::{self, Layout, RepoRoot, WorktreeState};
-use agent_core::ports::{Harness, HarnessId, Listing, Unlisting, Window};
+use agent_core::ports::{Harness, HarnessId, Listing, Unlisting};
 use agent_git::{Git, GitHub};
 use agent_harness::Registry;
 use agent_store::FsStore;
@@ -114,8 +114,6 @@ enum Cmd {
         #[arg(short, long)]
         verbose: bool,
     },
-    /// Print the client pids of the windows showing a session, one per line
-    Windows { name: SessionName },
     /// Print an agent's screen with ANSI styling
     Dump { name: SessionName },
     /// Type a prompt into a running agent
@@ -413,14 +411,6 @@ fn attach(
     };
     let launch = ops::execute(svc, plan, task.as_ref(), harness)?;
     finish(svc, &launch, frontend)
-}
-
-fn window_pids(windows: &[Window], name: &SessionName) -> String {
-    windows
-        .iter()
-        .filter(|w| &w.session == name)
-        .map(|w| w.client.get().to_string() + "\n")
-        .collect()
 }
 
 fn own_session() -> Option<SessionName> {
@@ -771,14 +761,6 @@ fn main() -> Result<()> {
         Cmd::Add { path } => add(svc, path),
         Cmd::Forget { path } => forget(svc, path),
         Cmd::Merged { verbose } => merged(svc, verbose),
-        Cmd::Windows { name } => {
-            let clients = svc
-                .host
-                .clients()
-                .context("this host has no clients to list")?;
-            print!("{}", window_pids(&clients.windows(None)?, &name));
-            Ok(())
-        }
         Cmd::Dump { name } => {
             print!("{}", svc.host.screen(&name)?);
             Ok(())
@@ -857,21 +839,6 @@ mod tests {
     #[test]
     fn the_cli_is_well_formed() {
         Cli::command().debug_assert();
-    }
-
-    #[test]
-    fn windows_prints_one_client_pid_per_line_for_the_named_session_only() {
-        use agent_core::ports::{ClientId, Place};
-        let window = |pid, session: &str| Window {
-            client: ClientId::new(pid),
-            session: session.parse().expect("a name"),
-            place: Place::Unknown,
-        };
-        let windows = [window(31, "fix"), window(40, "other"), window(52, "fix")];
-        let fix = "fix".parse().expect("a name");
-        assert_eq!(window_pids(&windows, &fix), "31\n52\n");
-        let none = "none".parse().expect("a name");
-        assert_eq!(window_pids(&windows, &none), "");
     }
 
     #[test]

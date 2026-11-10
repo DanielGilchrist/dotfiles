@@ -10,7 +10,7 @@ use agent_core::activity::{
 use agent_core::names::Prompt;
 use agent_core::ports::{
     ActivityDetail, Harness, HarnessError, HarnessId, Harnesses, LaunchCtx, Log, Outcome,
-    PendingPrompt, Probe, PromptKind, Seen, TranscriptStamp, ends_with_report,
+    PendingPrompt, Probe, Seen, TranscriptStamp, ends_with_report,
 };
 use agent_core::process::{LaunchSpec, quiet};
 use serde::Deserialize;
@@ -356,7 +356,7 @@ impl Harness for Claude {
             .iter()
             .filter_map(|(_, meta)| meta.modified().ok())
             .max();
-        Ok(latest.filter(|m| *m >= pending.queued).map(Seen::at))
+        Ok(latest.filter(|m| *m >= pending.since).map(Seen::at))
     }
 
     /// `claude -p` with the quick model: print one answer and exit.
@@ -455,14 +455,6 @@ impl Harness for Claude {
     /// Bracketed paste keeps a multi-line prompt as one message. Enter submits it.
     fn submit(&self, prompt: &Prompt) -> Vec<u8> {
         format!("\x1b[200~{prompt}\x1b[201~\r").into_bytes()
-    }
-
-    fn prompt_kind(&self, prompt: &Prompt) -> PromptKind {
-        if prompt.as_str().starts_with(['/', '!']) {
-            PromptKind::Command
-        } else {
-            PromptKind::Message
-        }
     }
 }
 
@@ -1409,16 +1401,6 @@ mod tests {
             reported.interrupts,
             agent_core::activity::InterruptSignal::Transcript
         );
-    }
-
-    #[test]
-    fn claude_runs_a_slash_or_bang_prompt_as_a_command() {
-        let claude = Claude::with_program(Path::new("/h"), "/usr/bin/true".into());
-        let kind = |text: &str| claude.prompt_kind(&text.parse().expect("a prompt"));
-        assert_eq!(kind("/model"), PromptKind::Command);
-        assert_eq!(kind("!ls"), PromptKind::Command);
-        assert_eq!(kind("rebase on main"), PromptKind::Message);
-        assert_eq!(kind("what does /tmp hold"), PromptKind::Message);
     }
 
     #[test]

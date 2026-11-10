@@ -410,14 +410,6 @@ pub fn launched(ago: Duration) -> Session {
     }
 }
 
-/// A session launched `ago` ago that has reported since, but not starting.
-pub fn launch_reported(ago: Duration) -> Session {
-    Session::LaunchReported {
-        join: Join::Untraced,
-        at: SystemTime::now() - ago,
-    }
-}
-
 pub fn booting() -> Session {
     Session::Booting {
         join: Join::Untraced,

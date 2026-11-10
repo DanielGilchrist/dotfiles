@@ -12,8 +12,8 @@ impl Cause {
         Self(text)
     }
 
-    pub fn first_line(&self) -> &str {
-        self.0.lines().next().unwrap_or_default()
+    pub fn first_line(&self) -> String {
+        crate::log::first_printable_line(&self.0).unwrap_or_default()
     }
 }
 

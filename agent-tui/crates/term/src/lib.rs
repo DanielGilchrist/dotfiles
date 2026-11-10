@@ -1,7 +1,9 @@
+mod escapes;
 mod input;
 mod pty;
 mod vt;
 
+pub use escapes::{Lines, printable, strip_escapes};
 pub use input::{CellPos, encode_key, encode_mouse};
 pub use pty::{Liveness, Terminal};
 pub use vt::Vt100;

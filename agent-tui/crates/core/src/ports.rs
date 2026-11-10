@@ -828,7 +828,7 @@ pub trait Harness: Send + Sync {
     fn event(&self, _payload: &str) -> Option<Reported> {
         None
     }
-    /// Evidence the agent was active after `pending` was queued, so it has
+    /// Evidence the agent was active after `pending` was recorded, so it has
     /// seen the prompt.
     fn acknowledged(
         &self,
@@ -837,11 +837,6 @@ pub trait Harness: Send + Sync {
     ) -> Result<Option<Seen>, HarnessError>;
     /// The bytes that type `prompt` into a running agent and submit it.
     fn submit(&self, prompt: &Prompt) -> Vec<u8>;
-    /// What typing `prompt` does.
-    fn prompt_kind(&self, prompt: &Prompt) -> PromptKind {
-        let _ = prompt;
-        PromptKind::Message
-    }
     /// A one-shot, non-interactive answer to `question` from the harness's
     /// quickest model (`claude -p`, `codex exec`, …), or `None` if it can't
     /// answer one-off questions. May take seconds: call it off the UI thread.
@@ -950,15 +945,6 @@ pub enum Probe {
     Older(TranscriptStamp),
     /// There is no transcript to read.
     NoTranscript,
-}
-
-/// What typing a prompt into an agent does.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PromptKind {
-    Message,
-    /// The agent runs it instead of treating it as a message: it reports
-    /// nothing and may open a picker.
-    Command,
 }
 
 /// An unanswered question call and what it asked.
@@ -1178,14 +1164,15 @@ pub trait Harnesses: Send + Sync {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingPrompt {
     pub prompt: Prompt,
-    pub queued: SystemTime,
+    #[serde(alias = "queued")]
+    pub since: SystemTime,
 }
 
 impl PendingPrompt {
     pub fn now(prompt: Prompt) -> Self {
         Self {
             prompt,
-            queued: SystemTime::now(),
+            since: SystemTime::now(),
         }
     }
 }
@@ -1193,7 +1180,7 @@ impl PendingPrompt {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentRecord {
     pub harness: HarnessId,
-    /// Sent on launches until the agent shows activity after it was queued.
+    /// Sent on launches until the agent shows activity after it was recorded.
     #[serde(default)]
     pub pending: Option<PendingPrompt>,
 }
@@ -1205,7 +1192,7 @@ impl AgentRecord {
     }
 }
 
-/// Activity a harness observed at or after a prompt was queued. Only
+/// Activity a harness observed at or after a prompt was recorded. Only
 /// harnesses should construct one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Seen(SystemTime);

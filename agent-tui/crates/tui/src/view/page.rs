@@ -26,7 +26,8 @@ use crate::cause::Cause;
 use crate::document::{
     BranchKey, CommitKey, DiffKey, Doc, FolderDocs, FolderKey, Hover, Key, Laid, Placed, Resolved,
 };
-use crate::model::{ActivityFiles, AgentStatus, Asking, LogKey, MainLayout, Model, held};
+use crate::log::first_printable_line;
+use crate::model::{ActivityFiles, AgentStatus, Asking, LogKey, MainLayout, Model};
 use crate::review::{self, DiffView, LineInfo};
 
 /// [0]'s title, what its top border says on the right, its bottom-right
@@ -200,12 +201,12 @@ pub(super) fn page(m: &Model, area: Rect, width: usize, border: Style) -> Option
 fn question_lines(question: &str, columns: usize) -> Vec<Line<'static>> {
     let ask = "i answer";
     let room = columns.saturating_sub(ask.len() + 3);
-    let text = question.lines().next().unwrap_or_default().trim();
+    let text = first_printable_line(question).unwrap_or_default();
     vec![
         justify(
             vec![
                 Span::styled("◆ ", warning().add_modifier(Modifier::BOLD)),
-                Span::styled(truncate_end(text, room), warning()),
+                Span::styled(truncate_end(&text, room), warning()),
             ],
             vec![Span::raw(ask)],
             columns,
@@ -629,10 +630,7 @@ fn branch_body(m: &Model, key: &BranchKey, columns: usize) -> Body {
             Rows::Doc(m.docs.laid(&key, columns, || match loaded.as_ref() {
                 Ok(Doc::Branch(log)) => branch_rows(log, &compared, behind, columns),
                 Ok(Doc::Diff(_) | Doc::Folder(_)) => (Vec::new(), Vec::new()),
-                Err(e) => (
-                    vec![Line::styled(e.first_line().to_string(), error())],
-                    Vec::new(),
-                ),
+                Err(e) => (vec![Line::styled(e.first_line(), error())], Vec::new()),
             }))
         }
         Resolved::Missing => Rows::Built(Vec::new()),
@@ -802,7 +800,7 @@ fn activity_body(m: &Model, name: &SessionName, columns: usize, height: usize) -
     let watch = m.tracked(name).map(|t| &t.activity_view);
     let Some(detail) = m.activity_detail(name) else {
         let failed = match watch.and_then(|w| w.watch.log.as_ref()) {
-            Some(Err(e)) => Some(e.first_line().to_string()).filter(|line| !line.is_empty()),
+            Some(Err(e)) => Some(e.first_line()).filter(|line| !line.is_empty()),
             _ => None,
         };
         return Some(plain_activity_body(
@@ -814,7 +812,7 @@ fn activity_body(m: &Model, name: &SessionName, columns: usize, height: usize) -
     let files = m.activity_files(name);
     let view = log::ActivityView {
         state: activity_state(m, activity, asking.as_ref()),
-        closing: closing.as_deref(),
+        closing,
         looked: watch.and_then(|w| w.looked.seen),
         height,
         touched: files.map_or(&[], |f| &f.touched),
@@ -834,18 +832,12 @@ fn activity_body(m: &Model, name: &SessionName, columns: usize, height: usize) -
             home: m.home.as_deref(),
         },
     );
-    let mut rows = rendered.rows;
-    let queue = queue_rows(m, name, columns);
-    if !queue.is_empty() {
-        rows.push(Line::raw(""));
-        rows.extend(queue);
-    }
     Some(Body {
         tails: !rendered.finished,
         pinned: rendered.pinned,
         entries: rendered.layout,
         nav: Some(LogKey::Activity(name.clone())),
-        ..Body::built(title, rows)
+        ..Body::built(title, rendered.rows)
     })
 }
 
@@ -859,12 +851,7 @@ fn activity_state<'a>(
     let stale = activity.stale(m.clock.wall);
     if let Some(ask) = activity.waiting() {
         let by = match asking {
-            Some(Asking::Subagent(id)) => activity.subagents.get(id).map(|s| {
-                s.description
-                    .clone()
-                    .filter(|d| !d.is_empty())
-                    .unwrap_or_else(|| s.kind.clone())
-            }),
+            Some(Asking::Subagent(id)) => activity.subagents.get(id).map(|s| s.title().to_string()),
             _ => None,
         };
         return log::ActivityStage::Asking {
@@ -901,29 +888,6 @@ fn activity_state<'a>(
     }
 }
 
-/// `queued: …` rows for messages waiting to be typed into the agent.
-fn queue_rows(m: &Model, name: &SessionName, columns: usize) -> Vec<Line<'static>> {
-    let Some(queue) = m.tracked(name).and_then(|t| t.outbox.as_ref()) else {
-        return Vec::new();
-    };
-    let mut rows: Vec<Line<'static>> = queue
-        .iter()
-        .map(|q| {
-            Line::styled(
-                truncate_end(
-                    &format!("queued: {}", crate::update::first_words(q.as_ref())),
-                    columns,
-                ),
-                dim(),
-            )
-        })
-        .collect();
-    if let Some(hold) = m.hold(name) {
-        rows.push(Line::styled(truncate_end(&held(hold), columns), dim()));
-    }
-    rows
-}
-
 /// The activity as the hooks tell it, for a harness with no transcript to read:
 /// the whole prompt, the whole message or question, and the subagents.
 fn plain_activity_body(
@@ -952,11 +916,6 @@ fn plain_activity_body(
     }
     if let Some(message) = activity_message(m, entry) {
         rows.extend(wrap(&message, columns).into_iter().map(Line::raw));
-        rows.push(Line::raw(""));
-    }
-    let queue = queue_rows(m, name, columns);
-    if !queue.is_empty() {
-        rows.extend(queue);
         rows.push(Line::raw(""));
     }
     let subagents = subagent_rows(m, entry, columns);
@@ -991,20 +950,17 @@ fn log_body(m: &Model, name: &SessionName, id: &AgentId, columns: usize, budget:
     let subagent = m
         .subagent_rows()
         .into_iter()
-        .find(|(held, _)| *held == id)
+        .find(|(listed, _)| *listed == id)
         .map(|(_, s)| s);
     let mut title = vec![Span::raw("[0] ")];
     match subagent {
-        Some(s) => match s.description.as_deref().filter(|d| !d.is_empty()) {
-            Some(description) => {
-                title.push(Span::styled(description.to_string(), bold()));
-                let kind = format!(" · {}", s.kind);
-                if line_width(&title) + kind.chars().count() <= budget {
-                    title.push(Span::styled(kind, dim()));
-                }
+        Some(s) => {
+            title.push(Span::styled(s.title().to_string(), bold()));
+            let kind = format!(" · {}", s.kind);
+            if s.label().is_some() && line_width(&title) + kind.chars().count() <= budget {
+                title.push(Span::styled(kind, dim()));
             }
-            None => title.push(Span::styled(s.kind.clone(), bold())),
-        },
+        }
         None => title.push(Span::styled("subagent", bold())),
     }
     let note = |text: String, style: Style| Body {
@@ -1019,7 +975,7 @@ fn log_body(m: &Model, name: &SessionName, id: &AgentId, columns: usize, budget:
                 ..note(String::new(), dim())
             };
         }
-        Some(Err(e)) => return note(e.first_line().to_string(), error()),
+        Some(Err(e)) => return note(e.first_line(), error()),
         Some(Ok(None)) => return note("no transcript for this subagent".into(), dim()),
         Some(Ok(Some(detail))) => detail,
     };
@@ -1071,7 +1027,7 @@ fn diff_rows_info(
     };
     let width = width.saturating_sub(1).max(1);
     match loaded {
-        Err(e) => note(e.first_line().to_string(), error()),
+        Err(e) => note(e.first_line(), error()),
         Ok(FileDiff::Binary { bytes }) => note(
             match bytes {
                 Some(bytes) => format!("binary · {}", size(*bytes)),

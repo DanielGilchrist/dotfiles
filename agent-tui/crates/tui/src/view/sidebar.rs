@@ -26,7 +26,7 @@ use super::{
 use crate::cause::Cause;
 use crate::model::{
     ActivityRow, AgentStatus, Cursor, Doing, Drawn, Extent, Failure, Fold, ListScroll, Listed,
-    Model, Panel as Focused, Placement, Pulse, Row, Target, WorkRoom, held,
+    Model, Panel as Focused, Placement, Pulse, Row, Target, WorkRoom,
 };
 use crate::tree::{ChangesScope, Counts, Node, TreeRow};
 
@@ -167,8 +167,8 @@ impl<'a> Gist<'a> {
     /// The second line in `width` columns, and whether that's all of it.
     fn line(&self, form: Form, width: usize) -> (String, Shown) {
         let (text, shown) = match (self, form) {
-            (Self::Asking(question), _) => first_line(question),
-            (Self::Failed(failure), _) => first_line(failure_text(failure)),
+            (Self::Asking(question), _) => gist_of(question),
+            (Self::Failed(failure), _) => gist_of(failure_text(failure)),
             (Self::Tool { name, target }, form) => tool_line(name, *target, form, width),
             (Self::Thinking, _) => ("thinking".to_string(), Shown::Whole),
             (Self::Delegating { subagents, quiet }, Form::Long) => {
@@ -183,7 +183,7 @@ impl<'a> Gist<'a> {
                 (format!("↳{subagents} · quiet {quiet}"), Shown::Whole)
             }
             (Self::HandingBack, _) => ("handing back".to_string(), Shown::Whole),
-            (Self::Done(Some(summary)), _) => first_line(&plain(summary)),
+            (Self::Done(Some(summary)), _) => gist_of(&without_markdown(summary)),
             (Self::Done(None), _) => ("done".to_string(), Shown::Whole),
             (Self::Interrupted, _) => ("interrupted".to_string(), Shown::Whole),
         };
@@ -205,7 +205,7 @@ impl<'a> Gist<'a> {
             Self::Tool { name, target: None } => (*name).to_string(),
             Self::Thinking => "thinking".to_string(),
             Self::HandingBack => "handing back".to_string(),
-            Self::Done(Some(summary)) => plain(summary),
+            Self::Done(Some(summary)) => without_markdown(summary),
             Self::Done(None) => "done".to_string(),
             Self::Interrupted => "interrupted".to_string(),
             Self::Delegating { .. } => return None,
@@ -246,7 +246,7 @@ fn tool_line(name: &str, target: Option<&Target>, form: Form, width: usize) -> (
 }
 
 /// The first line with text, and whether any other line has text.
-fn first_line(text: &str) -> (String, Shown) {
+fn gist_of(text: &str) -> (String, Shown) {
     let mut lines = text.lines().map(str::trim).filter(|l| !l.is_empty());
     let first = lines.next().unwrap_or_default().to_string();
     match lines.next() {
@@ -257,7 +257,7 @@ fn first_line(text: &str) -> (String, Shown) {
 
 /// `text` without the markdown marks that read as noise outside a
 /// renderer.
-fn plain(text: &str) -> String {
+fn without_markdown(text: &str) -> String {
     text.lines()
         .map(|line| line.trim_start_matches(['#', '>']).trim_start())
         .collect::<Vec<_>>()
@@ -361,24 +361,7 @@ impl<'m> Deck<'m> {
             _ => m.subagents(entry),
         };
         let indent = title.indent();
-        let elsewhere = matches!(title, Title::Elsewhere(_));
         let line1 = self.line1(entry, &status, title, subagents, selected);
-        let blocked = matches!(gist, Some(Gist::Asking(_) | Gist::Failed(_)));
-        if !blocked
-            && !elsewhere
-            && self.has_line2(entry.name())
-            && let Some(text) = queued_line(
-                m,
-                entry.name(),
-                self.content.saturating_sub(indent.width() + 2),
-            )
-        {
-            let line2 = Line::from(vec![
-                Span::raw(format!("{indent}  ")),
-                Span::styled(text, dim()),
-            ]);
-            return (vec![line1, line2], Shown::Whole);
-        }
         match gist {
             Some(gist) => {
                 let room = self.content.saturating_sub(indent.width() + 2);
@@ -666,13 +649,11 @@ fn tree(
                     (Span::raw(spinner(now)), ago(subagent.since, now))
                 }
             };
-            let described = subagent.description.as_deref().filter(|d| !d.is_empty());
-            let (label, kind_only, right) = match (described, form) {
-                (Some(description), Form::Long) => {
-                    (description, false, format!(" {}  {since}", subagent.kind))
-                }
-                (Some(description), Form::Short) => (description, false, format!(" {since}")),
-                (None, _) => (subagent.kind.as_str(), true, format!(" {since}")),
+            let kind_only = subagent.label().is_none();
+            let label = subagent.title();
+            let right = match (kind_only, form) {
+                (false, Form::Long) => format!(" {}  {since}", subagent.kind),
+                (true, _) | (false, Form::Short) => format!(" {since}"),
             };
             let selected = cursor == Some(i);
             let mut line = justify(
@@ -1249,7 +1230,7 @@ impl Vacancy<'_> {
             Self::Reading => "reading git…".to_string(),
             Self::NotRead => "git not read yet".to_string(),
             Self::NoCheckout => "no checkout".to_string(),
-            Self::Unreadable(why) => format!("git: {}", first_line(&why.to_string()).0),
+            Self::Unreadable(why) => format!("git: {}", gist_of(&why.to_string()).0),
         }
     }
 }
@@ -1608,27 +1589,6 @@ pub(super) fn subagent_rows(m: &Model, entry: &Entry, width: usize) -> Vec<Line<
             None,
         )
     })
-}
-
-/// `queued: <first words>` for an agent with messages waiting, or
-/// `held: asking · <first words>` while something holds them, cut to
-/// `width`.
-pub(super) fn queued_line(m: &Model, name: &SessionName, width: usize) -> Option<String> {
-    let outbox = m.tracked(name)?.outbox.as_ref()?;
-    let lead = match m.hold(name) {
-        Some(hold) => format!("{} · ", held(hold)),
-        None => "queued: ".to_string(),
-    };
-    let first = crate::update::first_words(outbox.front().as_ref());
-    let more = match outbox.len() {
-        1 => String::new(),
-        n => format!(" +{}", n - 1),
-    };
-    let room = width.saturating_sub(more.width());
-    Some(format!(
-        "{}{more}",
-        truncate_end(&format!("{lead}{first}"), room)
-    ))
 }
 
 /// The selected agent's state as one line: its glyph, name, what it's doing
@@ -3548,19 +3508,6 @@ mod tests {
     }
 
     #[test]
-    fn a_card_says_what_is_queued_for_its_agent() {
-        let mut m = fleet(10);
-        m.set_cursor(Cursor::Entry(name("obs-layout-4")));
-        let mut outbox = crate::track::queued("rebase on main");
-        outbox.push("then run the tests".parse().expect("a prompt"), Vec::new());
-        m.track(&name("obs-layout-4")).outbox = Some(outbox);
-        let text = screen(&render(&mut m, (100, 30))).join("\n");
-        assert!(text.contains("queued: rebase on ma"), "{text}");
-        assert!(text.contains("+1"), "{text}");
-        assert!(text.contains("2 queued"), "the status bar says so\n{text}");
-    }
-
-    #[test]
     fn a_repo_row_shows_its_checkouts_in_the_main_view() {
         let mut m = fleet(10);
         m.show_view(View::Overview);
@@ -3662,12 +3609,17 @@ mod tests {
         }
     }
 
+    fn talking(m: &mut Model, quote: Option<crate::log::Quote>, text: &str) {
+        let to = name("obs-layout-4");
+        m.track(&to).compose = Some(crate::track::Compose::Editing {
+            quote,
+            text: text.into(),
+        });
+        m.overlay = Overlay::Talk(to);
+    }
+
     fn send_box(m: &mut Model) -> String {
-        m.overlay = Overlay::Talk {
-            to: name("obs-layout-4"),
-            quote: None,
-            text: String::new(),
-        };
+        talking(m, None, "");
         screen(&render(m, (100, 30))).join("\n")
     }
 
@@ -3685,11 +3637,7 @@ mod tests {
 
     fn replying(m: &mut Model, quote: &str, text: &str) -> String {
         use crate::log::{Entry, Quote, Whose};
-        m.overlay = Overlay::Talk {
-            to: name("obs-layout-4"),
-            quote: Quote::of(&Entry::Said(quote), Whose::Activity),
-            text: text.into(),
-        };
+        talking(m, Quote::of(&Entry::Said(quote), Whose::Activity), text);
         screen(&render(m, (100, 30))).join("\n")
     }
 
@@ -3737,20 +3685,44 @@ mod tests {
     }
 
     #[test]
-    fn a_reply_box_squeezed_by_a_short_screen_keeps_its_input_and_the_quote() {
+    fn a_reply_box_squeezed_by_a_short_or_narrow_screen_keeps_its_input_and_the_quote() {
         use crate::log::{Entry, Quote, Whose};
         let mut m = fleet(10);
-        m.overlay = Overlay::Talk {
-            to: name("obs-layout-4"),
-            quote: Quote::of(&Entry::Said("the quote"), Whose::Activity),
-            text: "typed".into(),
-        };
-        for height in [6, 7, 8] {
+        m.track(&name("obs-layout-4")).draft.push(
+            crate::review::Comment::on(
+                &[&crate::fixtures::line_info("a.rs", "+x", 1)],
+                None,
+                "note",
+            )
+            .expect("a comment"),
+        );
+        talking(
+            &mut m,
+            Quote::of(&Entry::Said("the quote"), Whose::Activity),
+            "typed",
+        );
+        for height in [3, 4, 5, 6, 8] {
             let text = screen(&render(&mut m, (100, height))).join("\n");
             assert!(text.contains("› typed"), "{height}: {text}");
+            assert!(text.contains("the quote"), "{height}: {text}");
         }
-        let text = screen(&render(&mut m, (100, 8))).join("\n");
-        assert!(text.contains("> the quote"), "{text}");
+        for width in [6, 9, 12] {
+            for height in [3, 4] {
+                let text = screen(&render(&mut m, (width, height))).join("\n");
+                assert!(text.contains('›'), "{width}x{height}: {text}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_reply_box_with_room_shows_the_quote_above_the_input_not_in_the_title() {
+        let mut m = fleet(10);
+        let text = replying(&mut m, "the quote", "typed");
+        let title = text
+            .lines()
+            .find(|r| r.contains("Reply to"))
+            .expect("a title");
+        assert!(!title.contains("the quote"), "{title}");
     }
 
     #[test]
@@ -3768,35 +3740,23 @@ mod tests {
     }
 
     #[test]
-    fn the_send_box_says_hold_and_why_while_a_question_is_open() {
-        let mut m = fleet(10);
-        crate::fixtures::ask(&mut m, "obs-layout-4");
-        let text = send_box(&mut m);
+    fn the_footer_says_send_in_a_peek_over_a_log_because_s_there_sends_without_a_quote() {
+        let mut m = reading_a_log();
+        m.peek = Some(crate::model::Peek::Pane);
+        m.settle();
+        let footer = footer_of(&mut m, (200, 40));
         assert!(
-            text.contains("Send to obs-layout-4 · held: asking"),
-            "{text}"
-        );
-        assert!(
-            text.contains("⏎ hold") && !text.contains("⏎ send"),
-            "{text}"
+            footer.contains("s send") && !footer.contains("s reply"),
+            "{footer}"
         );
     }
 
     #[test]
-    fn a_card_says_why_its_queued_messages_are_held() {
+    fn the_send_box_says_why_while_a_question_is_open() {
         let mut m = fleet(10);
-        m.set_cursor(Cursor::Entry(name("obs-layout-4")));
-        let mut booting = crate::fixtures::reported(State::Done { summary: None }, 1);
-        booting.session = crate::fixtures::booting();
-        m.activities
-            .get_or_insert_default()
-            .insert(name("obs-layout-4"), booting);
-        let mut outbox = crate::track::queued("rebase on main");
-        outbox.push("then run the tests".parse().expect("a prompt"), Vec::new());
-        m.track(&name("obs-layout-4")).outbox = Some(outbox);
-        let text = screen(&render(&mut m, (100, 30))).join("\n");
-        assert!(text.contains("held: booting · reb"), "{text}");
-        assert!(text.contains("+1"), "{text}");
+        crate::fixtures::ask(&mut m, "obs-layout-4");
+        let text = send_box(&mut m);
+        assert!(text.contains("Send to obs-layout-4 · asking"), "{text}");
     }
 
     #[test]
@@ -5439,26 +5399,6 @@ mod tests {
 
             let (cursor, entries, _) = cursor_after(&mut m, &who, &[KeyCode::Char('k')]);
             assert_eq!(cursor.as_ref(), entries.get(entries.len() - 2));
-        }
-
-        #[test]
-        fn queued_messages_stay_under_the_activity() {
-            let mut m = fleet(10);
-            let who = working(&mut m, "payroll-fix-3");
-            m.track(&who).outbox = Some(crate::track::Outbox::new(
-                "also check lsp.lua".parse().expect("parses"),
-                Vec::new(),
-            ));
-            let rows = page(&mut m, (140, 40));
-            let queued = rows
-                .iter()
-                .rposition(|r| r.contains("queued: also check lsp.lua"))
-                .unwrap_or_else(|| panic!("{}", rows.join("\n")));
-            let live = rows
-                .iter()
-                .rposition(|r| r.contains("running"))
-                .expect("shown");
-            assert!(queued > live);
         }
     }
 }

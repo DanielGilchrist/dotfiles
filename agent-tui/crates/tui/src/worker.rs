@@ -6,7 +6,6 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 
 use agent_core::actions::CommandLine;
-use std::time::SystemTime;
 
 use agent_core::activity::{Activity, AgentId, Hold, Standing, TranscriptRef};
 use agent_core::config::Sources;
@@ -17,7 +16,7 @@ use agent_core::ops::{self, Approved, Backend, Launch, RemovalPlan, Removed};
 use agent_core::paths::RepoRoot;
 use agent_core::ports::{
     ActivityDetail, ClientId, FileDiff, HarnessId, HostError, Log, Observation, Place, Probe,
-    PromptKind, TranscriptStamp, Window,
+    TranscriptStamp, Window,
 };
 use crossterm::event::{KeyEvent, MouseEvent};
 
@@ -65,10 +64,11 @@ pub enum Msg {
         result: Result<RemovalPlan, Cause>,
     },
     Done(Result<Outcome, Cause>),
-    /// A message was typed into `to`, or wasn't.
+    /// The message sent under `ticket` was typed into `to`, or wasn't.
     Sent {
         to: SessionName,
-        result: Result<PromptKind, SendError>,
+        ticket: Ticket,
+        result: Result<(), SendError>,
     },
     /// The windows besides this TUI's showing each session that has any,
     /// for the look `ticket` asked for, or why that couldn't be told.
@@ -153,10 +153,8 @@ pub enum Outcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SendError {
     /// The store says typing would reach a menu or a session that isn't
-    /// ready: try again when that changes.
+    /// ready.
     Held(Hold),
-    /// The store couldn't be read, so nothing was typed: try again.
-    Unreadable(Cause),
     Failed(Cause),
 }
 
@@ -166,9 +164,12 @@ pub enum Job {
     Reply {
         to: SessionName,
         prompt: Prompt,
-        /// The agent must have reported after this: its session was live
-        /// by then, so the record isn't from an earlier run.
-        not_before: Option<SystemTime>,
+        ticket: Ticket,
+    },
+    /// Resurrect an exited session the host replays, marking the launch first.
+    Resurrect {
+        name: SessionName,
+        ticket: Ticket,
     },
     Start {
         at: Startable,
@@ -219,6 +220,7 @@ impl Job {
     fn mutates(&self) -> bool {
         match self {
             Self::Start { .. }
+            | Self::Resurrect { .. }
             | Self::Launch { .. }
             | Self::Kill(_)
             | Self::Remove(_)
@@ -866,6 +868,10 @@ fn run(backend: &Arc<Backend>, job: Job, msgs: &Sender<Msg>) -> Option<Msg> {
                 .map_err(err);
             Msg::Launched { ticket, result }
         }
+        Job::Resurrect { name, ticket } => Msg::Launched {
+            ticket,
+            result: ops::resurrect(svc, &name).map_err(err),
+        },
         Job::Launch {
             launch,
             harness,
@@ -874,13 +880,12 @@ fn run(backend: &Arc<Backend>, job: Job, msgs: &Sender<Msg>) -> Option<Msg> {
             ticket,
             result: launch_session(svc, launch, &harness).map_err(err),
         },
-        Job::Reply {
-            to,
-            prompt,
-            not_before,
-        } => {
-            let result = reply(svc, &to, &prompt, not_before);
-            Msg::Sent { to, result }
+        Job::Reply { to, prompt, ticket } => {
+            let result = ops::inject(svc, &to, &prompt).map_err(|e| match e {
+                ops::Error::Held { hold, .. } => SendError::Held(hold),
+                e => SendError::Failed(Cause::of(&e)),
+            });
+            Msg::Sent { to, ticket, result }
         }
         Job::Observe { name, ticket } => Msg::Observed {
             ticket,
@@ -952,24 +957,8 @@ fn launch_session(
             Some(name),
             svc.harness(harness)?,
         ),
-        Launchable::Resurrect(name) => ops::join(svc, &name.session(), None),
+        Launchable::Resurrect(name) => ops::resurrect(svc, &name.session()),
         Launchable::Start { at, task } => ops::start(svc, &at, svc.harness(harness)?, task),
-    }
-}
-
-fn reply(
-    svc: ops::Services<'_>,
-    to: &SessionName,
-    prompt: &Prompt,
-    not_before: Option<SystemTime>,
-) -> Result<PromptKind, SendError> {
-    let all = svc
-        .store
-        .activities()
-        .map_err(|e| SendError::Unreadable(Cause::of(&e)))?;
-    match Hold::of(all.get(to), not_before, SystemTime::now()) {
-        None => ops::inject(svc, to, prompt).map_err(|e| SendError::Failed(Cause::of(&e))),
-        Some(hold) => Err(SendError::Held(hold)),
     }
 }
 

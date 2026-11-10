@@ -28,8 +28,8 @@ use crate::document::{BranchKey, CommitKey, DiffKey, Documents, FolderKey, Hover
 use crate::log::Nav;
 use crate::palette::Palette;
 use crate::touched::{self, Roots, TouchedFile};
-use crate::track::{CachedTree, FactsEpoch, FactsRead, LiveSince};
-pub use crate::track::{Inspected, Outbox, Tracked, Watched};
+use crate::track::{CachedTree, FactsEpoch, FactsRead};
+pub use crate::track::{Inspected, Tracked, Watched};
 use crate::tree::{self, ChangesScope, ChangesView, Node, TreeRow};
 
 pub const PREVIEW_DEBOUNCE: Duration = Duration::from_millis(150);
@@ -219,32 +219,6 @@ impl Panel {
     }
 }
 
-/// Why typing into an agent waits: what its activity shows, or what was
-/// typed into it that it hasn't reported on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Held {
-    Activity(Hold),
-    /// A message was typed a moment ago and the agent hasn't reported since.
-    JustSent,
-    /// The last message was a command, which reports nothing and may open
-    /// a picker.
-    Command,
-}
-
-/// What a hold says wherever one is shown: `held: asking`.
-pub fn held(hold: Held) -> String {
-    let why = match hold {
-        Held::Activity(Hold::Asking) => "asking",
-        Held::Activity(Hold::Booting) => "booting",
-        Held::Activity(Hold::Unreported) => "no report yet",
-        Held::Activity(Hold::Ended) => "ended",
-        Held::Activity(Hold::ToolStarting) => "tool starting",
-        Held::JustSent => "just sent",
-        Held::Command => "command sent",
-    };
-    format!("held: {why}")
-}
-
 /// Whether the column is tall enough for [3] at all. Until a draw says
 /// otherwise there's room, so keys aren't refused on a guess.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -291,6 +265,18 @@ pub enum Wrap {
 pub enum Direction {
     Forward,
     Back,
+}
+
+impl Direction {
+    /// The first of `starts`, which are in order, after `from` going
+    /// forward. Going back, the last one before `from`, which is the start
+    /// of the section `from` is in when it is past it.
+    pub fn next_start(self, starts: &[usize], from: usize) -> Option<usize> {
+        match self {
+            Self::Forward => starts.iter().copied().find(|&start| start > from),
+            Self::Back => starts.iter().rev().copied().find(|&start| start < from),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1112,10 +1098,17 @@ impl Query {
     }
 }
 
+/// What lives only in this TUI: drafted review comments and messages
+/// written or sent whose answer hasn't come.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Unsent {
+    pub comments: usize,
+    pub messages: usize,
+}
+
 pub enum Confirm {
     Kill(Running),
-    /// Quitting would lose this many queued messages.
-    Quit(usize),
+    Quit(Unsent),
     Remove(Proposal),
 }
 
@@ -1207,10 +1200,9 @@ impl Proposal {
     }
 }
 
-/// An agent that can be messaged, with the activity that says when.
+/// An agent that can be messaged.
 pub struct Reachable<'a> {
     name: &'a SessionName,
-    activity: &'a Activity,
 }
 
 impl<'a> Reachable<'a> {
@@ -1257,12 +1249,8 @@ pub enum Overlay {
     Help(HelpState),
     /// The configured actions, to run on this agent.
     Actions(SessionName),
-    /// A message being typed for an agent, in reply to a log entry or not.
-    Talk {
-        to: SessionName,
-        quote: Option<crate::log::Quote>,
-        text: String,
-    },
+    /// The box for the message in the agent's `Compose`.
+    Talk(SessionName),
     /// A comment being typed on lines of a diff, for an agent's draft review.
     Comment(CommentDraft),
     /// Working out what removing `name` would lose. The confirmation
@@ -1519,11 +1507,12 @@ pub struct ActivityFiles {
     pub jump: Option<crate::log::Jump>,
 }
 
-/// Whether `s` in [0] quotes an entry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Quoting {
-    No,
-    Yes,
+/// What `s` in [0] answers: the entry under a log's cursor and the agent it
+/// goes to.
+#[derive(Debug, Clone)]
+pub struct ReplyTo {
+    pub to: SessionName,
+    pub quote: crate::log::Quote,
 }
 
 /// How an activity says the files it touched.
@@ -1666,8 +1655,7 @@ pub struct Model {
     /// What the activity in [0] has that takes more than a lookup, as of the
     /// last message.
     pub activity_files: Option<ActivityFiles>,
-    /// Whether `s` would quote the log entry under the cursor in [0].
-    pub reply: Quoting,
+    pub reply: Option<ReplyTo>,
     /// The agent whose terminal the peek float shows.
     pub peek: Option<Peek>,
     /// What the main view [0] reads when it isn't the terminal.
@@ -1732,7 +1720,7 @@ impl Model {
             diff_view: crate::review::DiffView::default(),
             opened: None,
             activity_files: None,
-            reply: Quoting::No,
+            reply: None,
             peek: None,
             docs: Documents::default(),
             screen: Screen::Split,
@@ -2040,6 +2028,10 @@ impl Model {
         self.agents.get(name)
     }
 
+    pub fn tracked_mut(&mut self, name: &SessionName) -> Option<&mut Tracked> {
+        self.agents.get_mut(name)
+    }
+
     /// `name`'s record, started if there is none.
     pub fn track(&mut self, name: &SessionName) -> &mut Tracked {
         self.agents.entry(name.clone()).or_default()
@@ -2048,6 +2040,74 @@ impl Model {
     /// What is known about `name`'s subagent `id`, if it is being watched.
     pub fn watched(&self, (name, id): &SubagentKey) -> Option<&Watched> {
         self.agents.get(name)?.subagents.get(id)
+    }
+
+    /// The log [0] reads, when it reads one.
+    pub fn open_log(&self) -> Option<LogKey> {
+        match self.hover()? {
+            Hover::Subagent(name, id) => Some(LogKey::Subagent((name, id))),
+            Hover::Activity(name) => Some(LogKey::Activity(name)),
+            _ => None,
+        }
+    }
+
+    /// What [0] lists for the log `key` names, once it was read.
+    pub fn contents(&self, key: &LogKey) -> Option<crate::log::Contents<'_>> {
+        use crate::log::{Contents, Source};
+        match key {
+            LogKey::Subagent(subagent) => {
+                let Some(Ok(Some(detail))) = self.watched(subagent)?.watch.log.as_ref() else {
+                    return None;
+                };
+                Some(Contents {
+                    entries: crate::log::entries(detail),
+                    source: Source::Subagent(detail),
+                    running: !matches!(detail.outcome, agent_core::ports::Outcome::Finished { .. }),
+                })
+            }
+            LogKey::Activity(name) => {
+                let detail = self.activity_detail(name)?;
+                let closing = self.closing(name);
+                let touched = self
+                    .activity_files(name)
+                    .map_or(&[][..], ActivityFiles::listed);
+                Some(Contents {
+                    entries: crate::log::activity_entries(&detail.log, closing, touched).flat(),
+                    source: Source::Activity {
+                        detail,
+                        closing,
+                        touched,
+                        jump: self.activity_jump(),
+                    },
+                    running: self.activity_running(name),
+                })
+            }
+        }
+    }
+
+    /// What a reply to the entry under the open log's cursor would quote.
+    /// `None` when [0] isn't on a log or the entry has no text.
+    fn reply_target(&self) -> Option<ReplyTo> {
+        use crate::log::{Quote, Whose};
+        let key = self.open_log()?;
+        let contents = self.contents(&key)?;
+        let at = contents.at(self.nav(&key)?)?;
+        let whose = match &key {
+            LogKey::Subagent((_, id)) => Whose::Subagent(self.subagent_label(id)),
+            LogKey::Activity(_) => Whose::Activity,
+        };
+        Some(ReplyTo {
+            to: key.session().clone(),
+            quote: Quote::of(&contents.entries[at].0, whose)?,
+        })
+    }
+
+    /// The description of a subagent of the selected agent, as its row says it.
+    pub fn subagent_label(&self, id: &AgentId) -> Option<&str> {
+        self.subagent_rows()
+            .into_iter()
+            .find(|(listed, _)| *listed == id)
+            .and_then(|(_, s)| s.label())
     }
 
     /// The cursor and folds of the log `key` names.
@@ -2114,13 +2174,13 @@ impl Model {
     /// What `name` ended its activity with, once it has: the message its hook
     /// reported, or else the transcript's last line. It is shown apart from
     /// the activity's log.
-    pub fn closing(&self, name: &SessionName) -> Option<String> {
+    pub fn closing(&self, name: &SessionName) -> Option<&str> {
         let reported = || match &self.activity_detail(name)?.log.outcome {
-            agent_core::ports::Outcome::Finished { report } => report.clone(),
+            agent_core::ports::Outcome::Finished { report } => report.as_deref(),
             _ => None,
         };
         match &self.activity(name)?.state {
-            State::Done { summary } => summary.clone().or_else(reported),
+            State::Done { summary } => summary.as_deref().or_else(reported),
             State::Idle | State::Exited => reported(),
             State::Working { .. }
             | State::Delegating
@@ -2160,13 +2220,17 @@ impl Model {
         self.agents.values().map(|t| t.draft.len()).sum()
     }
 
-    /// How many messages are queued across every agent.
-    pub fn queued(&self) -> usize {
-        self.agents
-            .values()
-            .filter_map(|t| t.outbox.as_ref())
-            .map(Outbox::len)
-            .sum()
+    /// What quitting would lose across every agent.
+    pub fn unsent(&self) -> Unsent {
+        Unsent {
+            comments: self.drafted(),
+            messages: self
+                .agents
+                .values()
+                .filter_map(|t| t.compose.as_ref())
+                .filter(|c| c.holds_work())
+                .count(),
+        }
     }
 
     /// Records `name`'s freshly read facts: the epoch moves on, the
@@ -2228,20 +2292,19 @@ impl Model {
 
     /// Moves [3]'s cursor to the next or previous file row, over folders and
     /// the branch row, while [0] keeps the keys. `false` when there is none.
-    pub fn step_file(&mut self, forward: bool) -> bool {
+    pub fn step_file(&mut self, direction: Direction) -> bool {
         let Listed::Changes { file } = self.panel.list() else {
             return false;
         };
         let rows = self.change_rows();
         let mut at = file.min(rows.saturating_sub(1));
         loop {
-            at = if forward {
-                at + 1
-            } else {
-                match at.checked_sub(1) {
+            at = match direction {
+                Direction::Forward => at + 1,
+                Direction::Back => match at.checked_sub(1) {
                     Some(at) => at,
                     None => return false,
-                }
+                },
             };
             if at >= rows {
                 return false;
@@ -2412,11 +2475,13 @@ impl Model {
             shown,
             jump: None,
         };
-        let closing = self.closing(name);
         let entries =
-            crate::log::activity_entries(&detail.log, closing.as_deref(), files.listed()).flat();
-        files.jump = (!entries.is_empty())
-            .then(|| tracked.activity_view.watch.nav.at(running, &entries))
+            crate::log::activity_entries(&detail.log, self.closing(name), files.listed()).flat();
+        files.jump = tracked
+            .activity_view
+            .watch
+            .nav
+            .at(running, &entries)
             .and_then(|at| entries.get(at))
             .and_then(|(entry, _)| crate::log::jump_of(entry, &roots));
         Some(files)
@@ -2726,10 +2791,10 @@ impl Model {
             Some(Hover::Activity(name)) => self.read_activity_files(name),
             _ => None,
         };
-        self.reply = if self.main_focused() && crate::update::reply_quote(self).is_some() {
-            Quoting::Yes
+        self.reply = if self.peek.is_none() && self.main_focused() {
+            self.reply_target()
         } else {
-            Quoting::No
+            None
         };
     }
 
@@ -2849,54 +2914,14 @@ impl Model {
         if self.own_session.as_ref() == Some(entry.name()) {
             return Err(Unreachable::Own);
         }
-        let activity = self.activity(entry.name()).ok_or(Unreachable::Unreported)?;
-        Ok(Reachable {
-            name: entry.name(),
-            activity,
-        })
-    }
-
-    /// The moment a hook report has to postdate before typing into `name`
-    /// is safe: its session's latest start as far as this TUI knows. A
-    /// record that has itself launched since doesn't need it.
-    pub fn not_before(&self, name: &SessionName) -> Option<SystemTime> {
-        let tracked = self.agents.get(name)?;
-        let seen = match tracked.live_since {
-            Some(LiveSince::Since(at)) => Some(at),
-            Some(LiveSince::Unknown) | None => None,
-        };
-        seen.max(tracked.seen.launched_at())
+        self.activity(entry.name()).ok_or(Unreachable::Unreported)?;
+        Ok(Reachable { name: entry.name() })
     }
 
     /// Why text typed now into `name` could land somewhere other than its
-    /// prompt, if it could: what its activity shows, or what was typed into
-    /// it a moment ago that it hasn't reported on.
-    pub fn hold(&self, name: &SessionName) -> Option<Held> {
-        Hold::of(self.activity(name), self.not_before(name), self.clock.wall)
-            .map(Held::Activity)
-            .or_else(|| self.sent_hold(name))
-    }
-
-    /// [`Self::hold`] for an agent known to have an activity.
-    pub fn hold_of(&self, to: &Reachable<'_>) -> Option<Held> {
-        to.activity
-            .hold(self.not_before(to.name), self.clock.wall)
-            .map(Held::Activity)
-            .or_else(|| self.sent_hold(to.name))
-    }
-
-    fn sent_hold(&self, name: &SessionName) -> Option<Held> {
-        self.tracked(name)?
-            .sent
-            .as_ref()?
-            .hold(self.activity(name).map(|a| a.events), self.clock.mono)
-    }
-
-    /// Whether the user's keys are going to `name`'s terminal.
-    pub fn typing_into(&self, name: &SessionName) -> bool {
-        self.pane
-            .connection()
-            .is_some_and(|c| &c.name == name && c.mode == Mode::Agent)
+    /// prompt, if it could.
+    pub fn hold(&self, name: &SessionName) -> Option<Hold> {
+        self.activity(name)?.hold(self.clock.wall)
     }
 
     /// The selected agent's subagents, oldest first, as [2] lists them.
@@ -4578,15 +4603,26 @@ impl Model {
     pub fn watching(&self) -> usize {
         self.agents.values().map(|t| t.subagents.len()).sum()
     }
-
-    pub fn outbox(&self, name: &SessionName) -> Option<&Outbox> {
-        self.agents.get(name)?.outbox.as_ref()
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_next_start_is_the_one_after_going_forward_and_this_sections_going_back_from_inside_it() {
+        use Direction::{Back, Forward};
+        let starts = [2, 5, 9];
+        assert_eq!(Forward.next_start(&starts, 0), Some(2));
+        assert_eq!(Forward.next_start(&starts, 2), Some(5));
+        assert_eq!(Forward.next_start(&starts, 9), None);
+        assert_eq!(Forward.next_start(&starts, 11), None);
+        assert_eq!(Back.next_start(&starts, 7), Some(5), "inside a section");
+        assert_eq!(Back.next_start(&starts, 5), Some(2), "on a start");
+        assert_eq!(Back.next_start(&starts, 2), None);
+        assert_eq!(Back.next_start(&starts, 0), None);
+        assert_eq!(Forward.next_start(&[], 3), None);
+    }
 
     #[test]
     fn a_limit_shorter_than_the_numbered_suffix_gives_a_name_instead_of_panicking() {
