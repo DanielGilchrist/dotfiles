@@ -22,10 +22,18 @@ local edit_ns = vim.api.nvim_create_namespace("agent_review_editing")
 M.comments = {}
 M._next_id = 1
 M._base = nil ---@type string|nil
-M._total = 0
 M._active = false
 M._root = nil ---@type string|nil
 M._message = nil ---@type string|nil
+---@class ChangedFile
+---@field text string
+---@field file string
+---@field untracked boolean
+---@field add integer
+---@field del integer
+
+---@type ChangedFile[]|nil
+M._changed = nil
 ---@type table<string, boolean>
 M.reviewed = {}
 
@@ -149,12 +157,11 @@ local function current_base()
 end
 
 ---@param root string
----@param base string
----@return {text: string, file: string}[]
-local function list_changed(root, base)
-  local tracked = git(root, { "diff", "--name-only", base }) or ""
-  local untracked = git(root, { "ls-files", "--others", "--exclude-standard" }) or ""
-  local numstat = git(root, { "diff", "--numstat", "--no-renames", base }) or ""
+---@param tracked string
+---@param untracked string
+---@param numstat string
+---@return ChangedFile[]
+local function parse_changed(root, tracked, untracked, numstat)
   local stat = {}
   for line in numstat:gmatch("[^\n]+") do
     local a, d, rel = line:match("^(%S+)\t(%S+)\t(.+)$")
@@ -178,6 +185,37 @@ local function list_changed(root, base)
   for line in tracked:gmatch("[^\n]+") do add(line, false) end
   for line in untracked:gmatch("[^\n]+") do add(line, true) end
   return items
+end
+
+---@param root string
+---@param base string
+---@param cb fun(items: ChangedFile[])
+local function list_changed(root, base, cb)
+  local commands = {
+    tracked = { "diff", "--name-only", base },
+    untracked = { "ls-files", "--others", "--exclude-standard" },
+    numstat = { "diff", "--numstat", "--no-renames", base },
+  }
+  local outputs, pending = {}, vim.tbl_count(commands)
+  for key, args in pairs(commands) do
+    vim.system(vim.list_extend({ "git", "-C", root }, args), { text = true }, function(res)
+      outputs[key] = cmd_utils.success(res.code) and res.stdout or ""
+      pending = pending - 1
+      if pending > 0 then return end
+      vim.schedule(function() cb(parse_changed(root, outputs.tracked, outputs.untracked, outputs.numstat)) end)
+    end)
+  end
+end
+
+---@param on_done? fun(items: ChangedFile[])
+local function refresh_changed(on_done)
+  local root, base, session = M._root, current_base(), M._session
+  if not (M._active and root and base) then return end
+  list_changed(root, base, function(items)
+    if not (M._active and M._session == session) then return end
+    M._changed = items
+    if on_done then on_done(items) end
+  end)
 end
 
 ---@param root string
@@ -306,7 +344,7 @@ function M.status()
   if not M.is_active() then return "" end
   local done = 0
   for _ in pairs(M.reviewed) do done = done + 1 end
-  local s = ("review %d/%d"):format(done, M._total or 0)
+  local s = ("review %d/%d"):format(done, M._changed and #M._changed or 0)
   if #M.comments > 0 then s = s .. (" · %d✎"):format(#M.comments) end
   return s
 end
@@ -327,7 +365,8 @@ local function open_review(root, base, label)
   M._root = root
   M._base = base
   M._session = M._session + 1
-  M._total = #list_changed(root, base)
+  M._changed = nil
+  refresh_changed()
   vim.cmd("Unified " .. base)
   ensure_diff(vim.api.nvim_get_current_buf())
   notify.info(("reviewing vs %s (%s)"):format(label, base:sub(1, 8)))
@@ -432,33 +471,39 @@ end
 
 ---@param root string|nil
 ---@param base string|nil
-function M.changed_files(root, base)
-  if not require_active() then return end
-  root = root or repo_root(vim.api.nvim_buf_get_name(0))
-  if not root then return notify.warn("not in a git repo") end
-  base = base or current_base() or select(1, resolve_base(root))
-
-  local items = list_changed(root, base)
-  M._total = #items
-  if #items == 0 then return notify.info("no changes vs " .. base:sub(1, 8)) end
-
-  local ordered, tadd, tdel = {}, 0, 0
-  for _, it in ipairs(items) do
-    tadd, tdel = tadd + (it.add or 0), tdel + (it.del or 0)
-  end
+---@param items ChangedFile[]
+---@return ChangedFile[]
+local function unreviewed_first(items)
+  local ordered = {}
   for _, it in ipairs(items) do if not M.reviewed[it.file] then ordered[#ordered + 1] = it end end
   for _, it in ipairs(items) do if M.reviewed[it.file] then ordered[#ordered + 1] = it end end
+  return ordered
+end
 
-  Snacks.picker.pick({
+---@param base string
+---@param items ChangedFile[]
+---@return string
+local function changed_title(base, items)
+  local adds, dels = 0, 0
+  for _, it in ipairs(items) do adds, dels = adds + it.add, dels + it.del end
+  return ("changed vs %s   +%d -%d"):format(base:sub(1, 8), adds, dels)
+end
+
+---@param root string
+---@param base string
+---@param items ChangedFile[]
+---@return snacks.Picker
+local function pick_changed(root, base, items)
+  return Snacks.picker.pick({
     source = "agent_review_files",
-    title = ("changed vs %s   +%d -%d"):format(base:sub(1, 8), tadd, tdel),
-    items = ordered,
+    title = changed_title(base, items),
+    finder = function() return unreviewed_first(M._changed or items) end,
     format = function(item)
       local segs = M.reviewed[item.file]
         and { { "✓ ", "DiagnosticOk" }, { item.text, "Comment" } }
         or { { "  " }, { item.text, "SnacksPickerFile" } }
-      segs[#segs + 1] = { "  +" .. (item.add or 0), "Added" }
-      segs[#segs + 1] = { " -" .. (item.del or 0), "Removed" }
+      segs[#segs + 1] = { "  +" .. item.add, "Added" }
+      segs[#segs + 1] = { " -" .. item.del, "Removed" }
       return segs
     end,
     preview = function(ctx)
@@ -491,6 +536,32 @@ function M.changed_files(root, base)
   })
 end
 
+function M.changed_files()
+  if not require_active() then return end
+  local root, base = M._root, current_base()
+  if not (root and base) then return end
+
+  local cached = M._changed
+  if not cached then
+    return refresh_changed(function(items)
+      if #items == 0 then return notify.info("no changes vs " .. base:sub(1, 8)) end
+      pick_changed(root, base, items)
+    end)
+  end
+
+  if #cached == 0 then notify.info("no changes vs " .. base:sub(1, 8)) end
+  local picker = #cached > 0 and pick_changed(root, base, cached) or nil
+  refresh_changed(function(items)
+    if picker and not picker.closed then
+      picker.title = changed_title(base, items)
+      picker:update_titles()
+      picker:refresh()
+    elseif not picker and #items > 0 then
+      pick_changed(root, base, items)
+    end
+  end)
+end
+
 function M.toggle_reviewed()
   if not require_active() then return end
   local file = vim.api.nvim_buf_get_name(0)
@@ -499,14 +570,13 @@ function M.toggle_reviewed()
   end
   M.reviewed[file] = (not M.reviewed[file]) or nil
 
-  local root = repo_root(file)
-  local total = (root and #list_changed(root, current_base() or "HEAD")) or 0
-  M._total = total
+  local root = M._root
   local done = 0
   for _ in pairs(M.reviewed) do done = done + 1 end
+  local total = M._changed and tostring(#M._changed) or "?"
   local rel = (root and vim.startswith(file, root .. "/")) and file:sub(#root + 2)
     or path_utils.basename(file)
-  notify.info(("%s %s (%d/%d reviewed)"):format(M.reviewed[file] and "✓ marked" or "○ unmarked", rel, done, total))
+  notify.info(("%s %s (%d/%s reviewed)"):format(M.reviewed[file] and "✓ marked" or "○ unmarked", rel, done, total))
 end
 
 ---@return integer s, integer e
@@ -969,7 +1039,8 @@ function M.resume(root, data)
   M._root = root
   M._base = data.base
   M._session = M._session + 1
-  M._total = #list_changed(root, data.base)
+  M._changed = nil
+  refresh_changed()
   M.reviewed = {}
   for _, rel in ipairs(data.reviewed or {}) do M.reviewed[root .. "/" .. rel] = true end
   M._message = data.message
@@ -1005,7 +1076,7 @@ function M.reset()
   pcall(vim.cmd, "Unified reset")
   if M._root then clear_state(M._root) end
   M._base = nil
-  M._total = 0
+  M._changed = nil
   M._active = false
   M._root = nil
   M._message = nil
