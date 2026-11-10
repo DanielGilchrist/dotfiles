@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use agent_core::ports::{Change, ChangeKind, FileState, Lines};
+use agent_core::ports::{Added, Change, Count, FileState};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ChangesView {
@@ -90,27 +90,28 @@ impl Counts {
     }
 
     fn lines_of(change: &Change) -> Self {
-        match change.kind {
-            ChangeKind::Tracked {
-                lines: Lines::Counted { added, removed },
-                ..
-            } => Self {
+        match change.count() {
+            Count::Edited { added, removed } => Self {
                 added,
                 removed,
                 ..Self::default()
             },
-            ChangeKind::Tracked {
-                lines: Lines::Binary,
-                ..
-            } => Self {
+            Count::Binary => Self {
                 binary: 1,
                 ..Self::default()
             },
-            ChangeKind::Tracked {
-                lines: Lines::Unknown,
-                ..
-            } => Self::default(),
-            ChangeKind::Untracked => Self {
+            Count::Nothing => Self::default(),
+            Count::New(Added::Counted(added)) => Self {
+                added,
+                new: 1,
+                ..Self::default()
+            },
+            Count::New(Added::Binary) => Self {
+                new: 1,
+                binary: 1,
+                ..Self::default()
+            },
+            Count::New(Added::Unread) => Self {
                 new: 1,
                 ..Self::default()
             },
@@ -282,7 +283,7 @@ pub fn folders(changes: &[Change]) -> HashSet<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_core::ports::TrackedState;
+    use agent_core::ports::{Lines, TrackedState};
 
     fn change(path: &str, added: usize, removed: usize) -> Change {
         Change::tracked(
@@ -298,7 +299,7 @@ mod tests {
             change("crates/tui/src/update.rs", 12, 3),
             change("crates/tui/src/view/sidebar.rs", 4, 1),
             change("crates/tui/src/lib.rs", 2, 2),
-            Change::untracked("nvim/lsp/new.lua"),
+            Change::untracked("nvim/lsp/new.lua", Added::Unread),
             change("nvim/lua/a.lua", 5, 0),
         ]
     }
@@ -336,6 +337,23 @@ mod tests {
         assert_eq!((src.counts.added, src.counts.removed), (18, 6));
         let nvim = rows.iter().find(|r| r.label == "nvim").expect("nvim");
         assert_eq!((nvim.counts.added, nvim.counts.new), (5, 1));
+    }
+
+    #[test]
+    fn a_folder_sums_the_lines_of_untracked_files_under_it() {
+        let changes = [
+            change("nvim/lua/a.lua", 5, 1),
+            Change::untracked("nvim/lua/new.lua", Added::Counted(4)),
+        ];
+        let rows = build(&changes, ChangesView::Tree, &HashSet::new());
+        let nvim = rows
+            .iter()
+            .find(|r| r.label == "nvim/lua")
+            .expect("nvim/lua");
+        assert_eq!(
+            (nvim.counts.added, nvim.counts.removed, nvim.counts.new),
+            (9, 1, 1)
+        );
     }
 
     #[test]

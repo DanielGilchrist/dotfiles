@@ -897,7 +897,7 @@ impl Rows<'_, '_> {
         let right = match &file.now {
             Now::Changed(change) => {
                 left.extend(file_marker(change.state()));
-                count_spans(change.kind)
+                count_spans(change.count())
             }
             Now::Clean => {
                 left.push(Span::raw("   "));

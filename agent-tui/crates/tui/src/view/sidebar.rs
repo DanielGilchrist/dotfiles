@@ -738,22 +738,29 @@ fn tail(path: &str, width: usize) -> String {
         .unwrap_or_else(|| truncate_start(basename(path), width))
 }
 
-/// The counts at the right of a row: `+a` and `−r`, or `new` or `bin` when
-/// no line counts exist. A folder's are DIM.
+/// The counts at the right of a row: `+a` and `−r`, with `new` before them
+/// on an untracked file, or `new` or `bin` alone when no line counts exist.
+/// A folder's are DIM and never say `new` while it has counts.
 fn count_cells(counts: Counts, folder: bool) -> (Span<'static>, String) {
     let (added, removed) = counts_text(counts.added, counts.removed);
     if added.is_empty() && removed.is_empty() {
-        let word = if counts.new > 0 {
-            "new"
-        } else if counts.binary > 0 {
-            "bin"
-        } else {
-            ""
+        let word = match (counts.new > 0, counts.binary > 0, folder) {
+            (true, true, false) => "new bin",
+            (true, _, _) => "new",
+            (false, true, _) => "bin",
+            (false, false, _) => "",
         };
         return (Span::styled(word, dim()), String::new());
     }
-    let style = if folder { dim() } else { success() };
-    (Span::styled(added, style), removed)
+    if folder {
+        return (Span::styled(added, dim()), removed);
+    }
+    let added = if counts.new > 0 {
+        format!("new {added}")
+    } else {
+        added
+    };
+    (Span::styled(added, success()), removed)
 }
 
 /// Columns the marker and its space take before a row's name.
@@ -2086,6 +2093,104 @@ mod tests {
     }
 
     #[test]
+    fn untracked_files_add_their_lines_to_each_tabs_totals_and_rows() {
+        use agent_core::ports::{Added, Change, Lines, TrackedState};
+        let new_file = Change::untracked("new.rs", Added::Counted(9));
+        let empty_file = Change::untracked("empty.rs", Added::Counted(0));
+        let edited = Change::tracked(
+            "a.rs",
+            Lines::Counted {
+                added: 1,
+                removed: 2,
+            },
+            TrackedState::Committed,
+        );
+        let mut m = fleet(10);
+        m.set_cursor(Cursor::Entry(name("obs-layout-4")));
+        m.changes_view = crate::tree::ChangesView::Flat;
+        let Some(Ok(read)) = m
+            .track(&name("obs-layout-4"))
+            .facts
+            .as_mut()
+            .map(|f| &mut f.result)
+        else {
+            panic!("facts")
+        };
+        read.facts.compared = Compared::Branch {
+            branch: branch_name("fix"),
+            base: "origin/main".parse().expect("parses"),
+        };
+        read.facts.changed = vec![edited.clone(), new_file.clone()];
+        read.facts.pending = vec![new_file, empty_file];
+        let mut totals = Vec::new();
+        for pass in 0..2 {
+            let laid = laid(&mut m, (200, 50));
+            let (panel, changes) = laid.changes.as_ref().expect("[3] shows");
+            let diff = changes.counted.expect("git was read").diff;
+            let rows = texts(&panel.lines).join("\n");
+            assert!(rows.contains("new +9"), "a new file's row says so\n{rows}");
+            if pass == 0 {
+                let row = rows
+                    .lines()
+                    .find(|l| l.contains("empty.rs"))
+                    .expect("the uncommitted tab lists the empty file");
+                assert!(row.trim_end().ends_with("new"), "{row}");
+            }
+            totals.push((diff.files, diff.added, diff.removed));
+            m.toggle_changes_scope();
+        }
+        assert_eq!(totals, [(2, 9, 0), (2, 10, 2)]);
+    }
+
+    fn untracked_facts() -> WorktreeFacts {
+        use agent_core::ports::{Added, Change};
+        WorktreeFacts {
+            changed: vec![
+                Change::untracked(
+                    "src/payroll/deeply/nested/new_calculator.rs",
+                    Added::Counted(9),
+                ),
+                Change::untracked("assets/logo.png", Added::Binary),
+            ],
+            ..crate::fixtures::unchanged()
+        }
+    }
+
+    #[test]
+    fn a_new_files_row_keeps_part_of_its_name_beside_new_and_its_lines() {
+        let facts = untracked_facts();
+        for width in [30, 24, 20] {
+            let rows = texts(&changes(
+                &flat(&facts),
+                &HashMap::new(),
+                None,
+                width,
+                2,
+                None,
+            ));
+            assert!(rows[0].contains("new +9"), "{width}: {:?}", rows[0]);
+            assert!(rows[0].contains(".rs"), "{width}: {:?}", rows[0]);
+            assert!(rows[1].contains("new bin"), "{width}: {:?}", rows[1]);
+            assert!(rows[1].contains("png"), "{width}: {:?}", rows[1]);
+        }
+    }
+
+    #[test]
+    fn a_folder_sums_new_files_lines_dim_and_without_saying_new() {
+        let counts = Counts {
+            added: 9,
+            new: 1,
+            ..Counts::default()
+        };
+        let (folder, _) = count_cells(counts, true);
+        assert_eq!(folder.content, "+9");
+        assert_eq!(folder.style, dim());
+        let (file, _) = count_cells(counts, false);
+        assert_eq!(file.content, "new +9");
+        assert_eq!(file.style, success());
+    }
+
+    #[test]
     fn changed_files_keep_their_meaningful_tail() {
         assert_eq!(
             tail("agent-tui/crates/core/src/activity.rs", 40),
@@ -2126,7 +2231,7 @@ mod tests {
                     TrackedState::Staged(Edit::Added),
                 ),
                 Change::tracked("logo.png", Lines::Binary, TrackedState::Committed),
-                Change::untracked("notes.md"),
+                Change::untracked("notes.md", agent_core::ports::Added::Unread),
             ],
             ..crate::fixtures::unchanged()
         }
@@ -3714,6 +3819,120 @@ mod tests {
         }
     }
 
+    fn box_rows(text: &str) -> Vec<String> {
+        let lines: Vec<&str> = text.lines().collect();
+        let top = lines
+            .iter()
+            .position(|r| r.contains("╭ Send") || r.contains("╭ Reply"))
+            .expect("the box title");
+        let left = lines[top].chars().take_while(|c| *c != '╭').count();
+        lines[top + 1..]
+            .iter()
+            .map(|r| r.chars().skip(left).collect::<String>())
+            .take_while(|r| !r.starts_with('╰'))
+            .collect()
+    }
+
+    fn writing(lines: &[&str]) -> Model {
+        let mut m = fleet(10);
+        talking(&mut m, None, &lines.join("\n"));
+        m
+    }
+
+    #[test]
+    fn the_send_box_grows_one_row_per_line_and_only_the_first_has_the_prompt() {
+        let mut m = writing(&["one", "two", "three"]);
+        let rows = box_rows(&screen(&render(&mut m, (100, 30))).join("\n"));
+        assert_eq!(rows.len(), 3, "{rows:?}");
+        assert!(rows[0].contains("› one"), "{rows:?}");
+        assert!(
+            rows[1].contains("two") && !rows[1].contains('›'),
+            "{rows:?}"
+        );
+        assert!(rows[2].contains("three"), "{rows:?}");
+    }
+
+    #[test]
+    fn long_text_wraps_inside_the_box_at_words_and_breaks_a_word_longer_than_the_row() {
+        let columns = crate::view::talk_room(Rect::new(0, 0, 100, 30))
+            .expect("room")
+            .columns
+            .get();
+        let words = format!("{} {}", "a".repeat(columns - 2), "b".repeat(columns + 5));
+        let mut m = writing(&[&words]);
+        let rows = box_rows(&screen(&render(&mut m, (100, 30))).join("\n"));
+        assert_eq!(rows.len(), 3, "{rows:?}");
+        assert!(rows[0].contains(&"a".repeat(columns - 2)), "{rows:?}");
+        assert!(!rows[0].contains('b'), "{rows:?}");
+        assert!(rows[1].contains(&"b".repeat(columns)), "{rows:?}");
+        assert!(rows[2].contains(&"b".repeat(5)), "{rows:?}");
+    }
+
+    #[test]
+    fn wide_characters_wrap_by_their_display_width() {
+        let columns = crate::view::talk_room(Rect::new(0, 0, 100, 30))
+            .expect("room")
+            .columns
+            .get();
+        let text = "日".repeat(columns);
+        let mut m = writing(&[&text]);
+        let rows = box_rows(&screen(&render(&mut m, (100, 30))).join("\n"));
+        assert_eq!(rows.len(), 2, "{rows:?}");
+    }
+
+    #[test]
+    fn the_send_box_stops_growing_at_half_the_screen_and_follows_the_caret() {
+        let lines: Vec<String> = (1..=40).map(|n| format!("line{n}")).collect();
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let mut m = writing(&refs);
+        let tall = screen(&render(&mut m, (100, 50))).join("\n");
+        assert_eq!(box_rows(&tall).len(), 12, "{tall}");
+        let at_end = screen(&render(&mut m, (100, 24))).join("\n");
+        assert_eq!(box_rows(&at_end).len(), 12, "{at_end}");
+        assert!(
+            at_end.contains("line40") && !at_end.contains("line28"),
+            "{at_end}"
+        );
+        let at_end = screen(&render(&mut m, (100, 14))).join("\n");
+        assert_eq!(box_rows(&at_end).len(), 7, "half of 14 rows: {at_end}");
+
+        let to = name("obs-layout-4");
+        if let Some(crate::track::Compose::Editing { text, .. }) = m.track(&to).compose.as_mut() {
+            let columns = crate::view::talk_room(Rect::new(0, 0, 100, 30))
+                .expect("room")
+                .columns;
+            for _ in 0..39 {
+                text.up(columns);
+            }
+        }
+        let at_top = screen(&render(&mut m, (100, 24))).join("\n");
+        assert!(at_top.contains("› line1"), "{at_top}");
+        assert!(!at_top.contains("line40"), "{at_top}");
+    }
+
+    #[test]
+    fn a_multi_line_box_squeezed_by_a_short_screen_keeps_the_caret_row_and_the_quote() {
+        use crate::log::{Entry, Quote, Whose};
+        let mut m = fleet(10);
+        talking(
+            &mut m,
+            Quote::of(&Entry::Said("the quote"), Whose::Activity),
+            "one\ntwo\nthree\nfour",
+        );
+        for height in [3, 4, 5, 6, 8, 10] {
+            let text = screen(&render(&mut m, (100, height))).join("\n");
+            assert!(text.contains("four"), "{height}: {text}");
+            assert!(text.contains("the quote"), "{height}: {text}");
+        }
+    }
+
+    #[test]
+    fn the_send_box_hints_name_the_newline_key() {
+        let mut m = fleet(10);
+        let text = send_box(&mut m);
+        assert!(text.contains("⏎ send  ⌥⏎ newline  Esc close"), "{text}");
+    }
+
     #[test]
     fn a_reply_box_with_room_shows_the_quote_above_the_input_not_in_the_title() {
         let mut m = fleet(10);
@@ -5069,7 +5288,10 @@ mod tests {
             };
             m.set_activity(&who, Ok(Some(detail)));
             let pending = vec![
-                Change::untracked("nvim/lua/heucristic/status.lua"),
+                Change::untracked(
+                    "nvim/lua/heucristic/status.lua",
+                    agent_core::ports::Added::Unread,
+                ),
                 Change::tracked(
                     "nvim/plugin/lsp.lua",
                     Lines::Counted {

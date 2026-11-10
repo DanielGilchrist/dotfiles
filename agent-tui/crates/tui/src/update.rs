@@ -34,6 +34,7 @@ use crate::model::{
 use crate::touched::Baseline;
 use crate::track::{Compose, Found, Probed, Seen};
 use crate::tree::ChangesView;
+use crate::typed::{Columns, Message};
 use crate::worker::{Job, Msg, Outcome, SendError};
 
 /// How long the pane shows a finished agent, terminal focused, before it
@@ -410,14 +411,18 @@ fn on_paste(m: &mut Model, text: &str) -> Vec<Effect> {
         }
         Overlay::Talk(to) => {
             let to = to.clone();
+            let room = crate::view::talk_room(m.size);
             if let Some(Compose::Editing { text: typed, .. }) =
                 m.tracked_mut(&to).and_then(|t| t.compose.as_mut())
             {
-                typed.push_str(&clean(text, CarriageReturn::Newline, None));
+                typed.insert_str(&clean(text, CarriageReturn::Newline, None));
+                if let Some(room) = room {
+                    typed.reveal(room);
+                }
             }
         }
         Overlay::Comment(CommentDraft { text: typed, .. }) => {
-            typed.push_str(&clean(text, CarriageReturn::Newline, None));
+            typed.insert_str(&clean(text, CarriageReturn::Newline, None));
         }
         Overlay::None
         | Overlay::Switcher(_)
@@ -1665,7 +1670,7 @@ fn add_comment(
         m.overlay = Overlay::Comment(CommentDraft {
             to: to.clone(),
             lines: lines.to_vec(),
-            text: text.to_string(),
+            text: Message::from(text),
             rev,
         });
         return;
@@ -1677,7 +1682,7 @@ fn add_comment(
             m.overlay = Overlay::Comment(CommentDraft {
                 to: to.clone(),
                 lines: lines.to_vec(),
-                text: String::new(),
+                text: Message::default(),
                 rev,
             });
             return;
@@ -1722,7 +1727,7 @@ fn open_comment(m: &mut Model) {
         .find(|c| c.covers(first, rev.as_ref()));
     m.overlay = Overlay::Comment(CommentDraft {
         to: name,
-        text: existing.map(|c| c.text.clone()).unwrap_or_default(),
+        text: existing.map_or_else(Message::default, |c| Message::from(c.text.as_str())),
         lines,
         rev,
     });
@@ -2676,7 +2681,7 @@ fn open_talk(m: &mut Model, name: &SessionName, quote: Option<crate::log::Quote>
         none @ None => {
             *none = Some(Compose::Editing {
                 quote,
-                text: String::new(),
+                text: Message::default(),
             });
         }
     }
@@ -2722,8 +2727,8 @@ fn talk(m: &mut Model, to: SessionName) -> Vec<Effect> {
     };
     // A quote alone would send a message that says nothing, so it goes only with typed text.
     let typed = match quote {
-        Some(quote) if !text.trim().is_empty() => quote.before(text),
-        _ => text.clone(),
+        Some(quote) if !text.is_blank() => quote.before(text.as_str()),
+        _ => text.as_str().to_string(),
     };
     let message = if draft.is_empty() {
         typed
@@ -3015,19 +3020,39 @@ fn on_overlay_key(m: &mut Model, key: KeyEvent) -> Vec<Effect> {
     }
 }
 
-/// Edits the text of a one-line overlay.
-fn type_text(text: &mut String, key: &KeyEvent) {
+/// The editing keys the send box and the comment box share. Up and down
+/// move between wrapped rows, so they need the columns of the box, which
+/// the one-row comment box has none of. Query and form fields stay
+/// single-line strings.
+fn edit(text: &mut Message, key: &KeyEvent, columns: Option<Columns>) {
+    let control = key.modifiers.contains(KeyModifiers::CONTROL);
     match key.code {
-        KeyCode::Backspace => {
-            text.pop();
+        KeyCode::Backspace
+            if key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
+            text.delete_word();
         }
-        _ if ctrl(key, 'u') => text.clear(),
-        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => text.push(c),
+        KeyCode::Backspace => text.backspace(),
+        KeyCode::Delete => text.delete(),
+        KeyCode::Left => text.left(),
+        KeyCode::Right => text.right(),
+        KeyCode::Home => text.home(),
+        KeyCode::End => text.end(),
+        KeyCode::Up => columns.into_iter().for_each(|c| text.up(c)),
+        KeyCode::Down => columns.into_iter().for_each(|c| text.down(c)),
+        KeyCode::Char('u') if control => text.clear(),
+        KeyCode::Char('w') if control => text.delete_word(),
+        KeyCode::Char('a') if control => text.home(),
+        KeyCode::Char('e') if control => text.end(),
+        KeyCode::Char(c) if !control => text.insert(c),
         _ => {}
     }
 }
 
 fn on_talk_key(m: &mut Model, to: SessionName, key: &KeyEvent) -> Vec<Effect> {
+    let room = crate::view::talk_room(m.size);
     let Some(tracked) = m.tracked_mut(&to) else {
         return Vec::new();
     };
@@ -3044,14 +3069,25 @@ fn on_talk_key(m: &mut Model, to: SessionName, key: &KeyEvent) -> Vec<Effect> {
         Some(Compose::Editing { quote, text }) => {
             match key.code {
                 KeyCode::Esc => {
-                    if text.trim().is_empty() {
+                    if text.is_blank() {
                         tracked.compose = None;
                     }
                     return Vec::new();
                 }
+                KeyCode::Enter
+                    if key
+                        .modifiers
+                        .intersects(KeyModifiers::ALT | KeyModifiers::SHIFT) =>
+                {
+                    text.insert('\n');
+                }
                 KeyCode::Enter => return talk(m, to),
+                _ if ctrl(key, 'j') => text.insert('\n'),
                 KeyCode::Backspace if text.is_empty() => *quote = None,
-                _ => type_text(text, key),
+                _ => edit(text, key, room.map(|r| r.columns)),
+            }
+            if let Some(room) = room {
+                text.reveal(room);
             }
             m.overlay = Overlay::Talk(to);
             Vec::new()
@@ -3064,10 +3100,10 @@ fn on_comment_key(m: &mut Model, mut draft: CommentDraft, key: &KeyEvent) -> Vec
     match key.code {
         KeyCode::Esc => return Vec::new(),
         KeyCode::Enter => {
-            add_comment(m, &draft.to, &draft.lines, &draft.text, draft.rev);
+            add_comment(m, &draft.to, &draft.lines, draft.text.as_str(), draft.rev);
             return Vec::new();
         }
-        _ => type_text(&mut draft.text, key),
+        _ => edit(&mut draft.text, key, None),
     }
     m.overlay = Overlay::Comment(draft);
     Vec::new()
@@ -3553,10 +3589,7 @@ mod tests {
         let mut m = model(&[]);
         m.areas.page = 6;
         let selected_before = selected(&m);
-        update(
-            &mut m,
-            Msg::Key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL)),
-        );
+        update(&mut m, key_with(KeyCode::Char('d'), KeyModifiers::CONTROL));
         assert_ne!(selected(&m), selected_before, "moves the selection in [1]");
         assert_eq!(
             selected(&m).as_deref(),
@@ -3565,21 +3598,12 @@ mod tests {
         );
         m.panel = Panel::activity();
         paged(&mut m, 6);
-        update(
-            &mut m,
-            Msg::Key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL)),
-        );
+        update(&mut m, key_with(KeyCode::Char('d'), KeyModifiers::CONTROL));
         assert_eq!(m.docs.scroll, 3, "from [2] it's half a page of [0]");
-        update(
-            &mut m,
-            Msg::Key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL)),
-        );
+        update(&mut m, key_with(KeyCode::Char('u'), KeyModifiers::CONTROL));
         assert_eq!(m.docs.scroll, 0);
         paged(&mut m, 1);
-        update(
-            &mut m,
-            Msg::Key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL)),
-        );
+        update(&mut m, key_with(KeyCode::Char('d'), KeyModifiers::CONTROL));
         assert_eq!(m.docs.scroll, 1, "at least one row");
     }
 
@@ -3838,7 +3862,11 @@ mod tests {
     }
 
     fn key(code: KeyCode) -> Msg {
-        Msg::Key(KeyEvent::new(code, KeyModifiers::NONE))
+        key_with(code, KeyModifiers::NONE)
+    }
+
+    fn key_with(code: KeyCode, modifiers: KeyModifiers) -> Msg {
+        Msg::Key(KeyEvent::new(code, modifiers))
     }
 
     fn selected(m: &Model) -> Option<String> {
@@ -3939,7 +3967,12 @@ mod tests {
 
     fn with_changes(m: &mut Model, files: usize) {
         let changed: Vec<agent_core::ports::Change> = (0..files)
-            .map(|i| agent_core::ports::Change::untracked(format!("src/f{i}.rs")))
+            .map(|i| {
+                agent_core::ports::Change::untracked(
+                    format!("src/f{i}.rs"),
+                    agent_core::ports::Added::Unread,
+                )
+            })
             .collect();
         m.set_test_facts(
             &name("fix"),
@@ -4276,7 +4309,7 @@ mod tests {
         let refreshed = |m: &mut Model, paths: &[&str]| {
             let changed: Vec<agent_core::ports::Change> = paths
                 .iter()
-                .map(|p| agent_core::ports::Change::untracked(*p))
+                .map(|p| agent_core::ports::Change::untracked(*p, agent_core::ports::Added::Unread))
                 .collect();
             update(
                 m,
@@ -5012,10 +5045,7 @@ mod tests {
         update(&mut m, key(KeyCode::Tab));
         type_text(&mut m, "dm");
         assert_eq!(derived(&m).name, "dm");
-        update(
-            &mut m,
-            Msg::Key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)),
-        );
+        update(&mut m, key_with(KeyCode::Char('r'), KeyModifiers::CONTROL));
         assert_eq!(
             derived(&m).name,
             "add-dark-mode",
@@ -5515,10 +5545,7 @@ mod tests {
         update(&mut m, key(KeyCode::Tab));
         type_text(&mut m, "idle");
         assert!(matches!(&derived(&m).check, NameCheck::Idle { .. }));
-        update(
-            &mut m,
-            Msg::Key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL)),
-        );
+        update(&mut m, key_with(KeyCode::Char('u'), KeyModifiers::CONTROL));
         type_text(&mut m, "web");
         assert!(matches!(&derived(&m).check, NameCheck::MainCheckout { .. }));
         assert!(update(&mut m, key(KeyCode::Enter)).is_empty());
@@ -6651,16 +6678,10 @@ mod tests {
         update(&mut m, key(KeyCode::Char('K')));
         update(&mut m, key(KeyCode::Char('K')));
         assert_eq!(m.docs.scroll, 0);
-        update(
-            &mut m,
-            Msg::Key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL)),
-        );
+        update(&mut m, key_with(KeyCode::Char('d'), KeyModifiers::CONTROL));
         assert_eq!(m.docs.scroll, 5, "half a page of [0], not of the list");
         assert!(matches!(m.panel, Panel::Changes { file: 0 }));
-        update(
-            &mut m,
-            Msg::Key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL)),
-        );
+        update(&mut m, key_with(KeyCode::Char('u'), KeyModifiers::CONTROL));
         assert_eq!(m.docs.scroll, 0);
 
         update(&mut m, key(KeyCode::Char('j')));
@@ -6921,9 +6942,10 @@ mod tests {
 
     fn composing(m: &Model, agent: &str) -> Option<(Option<String>, String)> {
         match m.tracked(&name(agent))?.compose.as_ref()? {
-            Compose::Editing { quote, text } => {
-                Some((quote.as_ref().map(|q| q.as_str().to_string()), text.clone()))
-            }
+            Compose::Editing { quote, text } => Some((
+                quote.as_ref().map(|q| q.as_str().to_string()),
+                text.as_str().to_string(),
+            )),
             Compose::Sending { .. } => None,
         }
     }
@@ -7194,7 +7216,7 @@ mod tests {
         );
         update(&mut m, key(KeyCode::Char('x')));
         assert!(
-            matches!(m.tracked(&name(AGENT)).and_then(|t| t.compose.as_ref()), Some(Compose::Sending { text, .. }) if text == "one"),
+            matches!(m.tracked(&name(AGENT)).and_then(|t| t.compose.as_ref()), Some(Compose::Sending { text, .. }) if text.as_str() == "one"),
             "typing changes nothing while it is with the worker"
         );
 
@@ -7224,10 +7246,7 @@ mod tests {
         m.track(&name(AGENT)).draft = vec![drafted("a.rs", "+x")];
         let effects = talk_to(&mut m, AGENT, "one");
         update(&mut m, key(KeyCode::Char('s')));
-        update(
-            &mut m,
-            Msg::Key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL)),
-        );
+        update(&mut m, key_with(KeyCode::Char('u'), KeyModifiers::CONTROL));
         assert_eq!(status(&m), "sending · can't cancel");
         assert!(matches!(m.overlay, Overlay::Talk(_)), "still showing it");
         assert!(matches!(
@@ -7237,6 +7256,195 @@ mod tests {
         worker_says(&mut m, &effects, Ok(()));
         assert!(matches!(m.overlay, Overlay::None), "it was typed");
         assert_eq!(m.drafted(), 0);
+    }
+
+    fn open_box(m: &mut Model) {
+        set_state(m, AGENT, working(), 1);
+        m.set_cursor(Cursor::Entry(name(AGENT)));
+        update(m, key(KeyCode::Char('s')));
+    }
+
+    #[test]
+    fn alt_enter_ctrl_j_and_shift_enter_add_a_line_and_plain_enter_sends() {
+        for (code, modifiers) in [
+            (KeyCode::Enter, KeyModifiers::ALT),
+            (KeyCode::Char('j'), KeyModifiers::CONTROL),
+            (KeyCode::Enter, KeyModifiers::SHIFT),
+        ] {
+            let mut m = crate::fixtures::fleet(10);
+            open_box(&mut m);
+            type_text(&mut m, "one");
+            assert!(
+                update(&mut m, key_with(code, modifiers)).is_empty(),
+                "{code:?}"
+            );
+            type_text(&mut m, "two");
+            assert_eq!(
+                talk_of(&m),
+                Some((None, "one\ntwo")),
+                "{code:?} {modifiers:?}"
+            );
+            assert!(matches!(m.overlay, Overlay::Talk(_)), "still writing");
+            let sent = update(&mut m, key(KeyCode::Enter));
+            assert_eq!(replies(&sent), ["one\ntwo"], "{code:?} {modifiers:?}");
+        }
+    }
+
+    #[test]
+    fn a_message_of_several_lines_is_sent_with_its_newlines() {
+        let mut m = crate::fixtures::fleet(10);
+        open_box(&mut m);
+        update(&mut m, Msg::Paste("a\r\nb\rc".into()));
+        update(&mut m, key_with(KeyCode::Enter, KeyModifiers::ALT));
+        type_text(&mut m, "d");
+        assert_eq!(
+            replies(&update(&mut m, key(KeyCode::Enter))),
+            ["a\nb\nc\nd"]
+        );
+    }
+
+    #[test]
+    fn the_caret_moves_through_the_message_and_typing_and_backspace_act_at_it() {
+        let mut m = crate::fixtures::fleet(10);
+        open_box(&mut m);
+        type_text(&mut m, "ac");
+        update(&mut m, key(KeyCode::Left));
+        type_text(&mut m, "b");
+        assert_eq!(talk_of(&m), Some((None, "abc")));
+        update(&mut m, key(KeyCode::Right));
+        update(&mut m, key(KeyCode::Right));
+        update(&mut m, key(KeyCode::Left));
+        update(&mut m, key(KeyCode::Backspace));
+        assert_eq!(talk_of(&m), Some((None, "ac")));
+        update(&mut m, Msg::Paste("X\nY".into()));
+        assert_eq!(talk_of(&m), Some((None, "aX\nYc")));
+    }
+
+    #[test]
+    fn backspace_at_the_start_of_a_line_joins_it_to_the_one_above() {
+        let mut m = crate::fixtures::fleet(10);
+        open_box(&mut m);
+        type_text(&mut m, "one");
+        update(&mut m, key_with(KeyCode::Enter, KeyModifiers::ALT));
+        type_text(&mut m, "two");
+        for _ in 0..3 {
+            update(&mut m, key(KeyCode::Left));
+        }
+        update(&mut m, key(KeyCode::Backspace));
+        assert_eq!(talk_of(&m), Some((None, "onetwo")));
+    }
+
+    #[test]
+    fn up_and_down_move_the_caret_between_wrapped_rows_of_the_box() {
+        let mut m = crate::fixtures::fleet(10);
+        m.size = ratatui::layout::Rect::new(0, 0, 40, 30);
+        open_box(&mut m);
+        assert_eq!(
+            crate::view::talk_room(m.size).map(|room| room.columns),
+            crate::typed::Columns::new(30)
+        );
+        let first = "a".repeat(29);
+        type_text(&mut m, &format!("{first} bcd"));
+        update(&mut m, key(KeyCode::Up));
+        type_text(&mut m, "X");
+        assert_eq!(
+            talk_of(&m),
+            Some((None, format!("aaaX{} bcd", &first[3..]).as_str()))
+        );
+        update(&mut m, key(KeyCode::Down));
+        type_text(&mut m, "Y");
+        assert_eq!(
+            talk_of(&m),
+            Some((None, format!("aaaX{} bcdY", &first[3..]).as_str()))
+        );
+    }
+
+    #[test]
+    fn up_inside_the_rows_in_view_moves_the_caret_and_scrolls_only_at_the_edge() {
+        let mut m = crate::fixtures::fleet(10);
+        m.size = ratatui::layout::Rect::new(0, 0, 100, 24);
+        open_box(&mut m);
+        let lines: Vec<String> = (1..=20).map(|n| n.to_string()).collect();
+        update(&mut m, Msg::Paste(lines.join("\n")));
+        let top = |m: &Model| match m.tracked(&name(AGENT)).and_then(|t| t.compose.as_ref()) {
+            Some(Compose::Editing { text, .. }) => text.top(),
+            _ => panic!("the box is open"),
+        };
+        assert_eq!(top(&m), 8, "twelve rows end at the caret's row");
+        for _ in 0..11 {
+            update(&mut m, key(KeyCode::Up));
+        }
+        assert_eq!(top(&m), 8, "the caret moved inside the rows in view");
+        update(&mut m, key(KeyCode::Up));
+        assert_eq!(top(&m), 7, "it scrolled when the caret left them");
+    }
+
+    #[test]
+    fn home_end_delete_and_word_keys_edit_the_line_at_the_caret() {
+        let mut m = crate::fixtures::fleet(10);
+        open_box(&mut m);
+        type_text(&mut m, "one two three");
+        update(&mut m, key_with(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert_eq!(talk_of(&m), Some((None, "one two ")));
+        update(&mut m, key_with(KeyCode::Backspace, KeyModifiers::ALT));
+        assert_eq!(talk_of(&m), Some((None, "one ")));
+        update(&mut m, key_with(KeyCode::Backspace, KeyModifiers::CONTROL));
+        assert_eq!(talk_of(&m), Some((None, "")));
+        type_text(&mut m, "abc");
+        update(&mut m, key(KeyCode::Home));
+        update(&mut m, key(KeyCode::Delete));
+        assert_eq!(talk_of(&m), Some((None, "bc")));
+        update(&mut m, key(KeyCode::End));
+        type_text(&mut m, "d");
+        update(&mut m, key_with(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        type_text(&mut m, "^");
+        update(&mut m, key_with(KeyCode::Char('e'), KeyModifiers::CONTROL));
+        type_text(&mut m, "$");
+        assert_eq!(talk_of(&m), Some((None, "^bcd$")));
+    }
+
+    #[test]
+    fn a_box_with_no_room_yet_still_takes_text_and_ignores_the_row_keys() {
+        let mut m = crate::fixtures::fleet(10);
+        open_box(&mut m);
+        m.size = ratatui::layout::Rect::default();
+        type_text(&mut m, "ab");
+        update(&mut m, key(KeyCode::Up));
+        update(&mut m, key(KeyCode::Down));
+        type_text(&mut m, "c");
+        assert_eq!(talk_of(&m), Some((None, "abc")));
+    }
+
+    #[test]
+    fn the_comment_box_edits_at_the_caret_with_the_same_keys() {
+        let mut m = crate::fixtures::fleet(10);
+        m.overlay = Overlay::Comment(CommentDraft {
+            to: name(AGENT),
+            lines: Vec::new(),
+            text: Message::default(),
+            rev: None,
+        });
+        for c in "ad".chars() {
+            update(&mut m, key(KeyCode::Char(c)));
+        }
+        update(&mut m, key(KeyCode::Left));
+        update(&mut m, key(KeyCode::Char('b')));
+        update(&mut m, key(KeyCode::Char('c')));
+        update(&mut m, key(KeyCode::Right));
+        update(&mut m, key_with(KeyCode::Backspace, KeyModifiers::CONTROL));
+        assert!(
+            matches!(&m.overlay, Overlay::Comment(CommentDraft { text, .. }) if text.as_str() == ""),
+        );
+    }
+
+    #[test]
+    fn ctrl_u_clears_the_whole_multi_line_message() {
+        let mut m = crate::fixtures::fleet(10);
+        open_box(&mut m);
+        type_text(&mut m, "one");
+        update(&mut m, key_with(KeyCode::Enter, KeyModifiers::ALT));
+        update(&mut m, key_with(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert_eq!(talk_of(&m), Some((None, "")));
     }
 
     #[test]
@@ -7308,10 +7516,7 @@ mod tests {
         assert!(matches!(m.overlay, Overlay::None));
         update(&mut m, key(KeyCode::Char('s')));
         assert_eq!(talk_of(&m), Some((None, "half a thou")));
-        update(
-            &mut m,
-            Msg::Key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL)),
-        );
+        update(&mut m, key_with(KeyCode::Char('u'), KeyModifiers::CONTROL));
         assert_eq!(talk_of(&m), Some((None, "")));
         update(&mut m, key(KeyCode::Esc));
         assert_eq!(
@@ -7345,10 +7550,7 @@ mod tests {
             "{:?}",
             m.status.as_ref().map(|s| &s.text)
         );
-        update(
-            &mut m,
-            Msg::Key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL)),
-        );
+        update(&mut m, key_with(KeyCode::Char('u'), KeyModifiers::CONTROL));
         update(&mut m, key(KeyCode::Esc));
         talk_to(&mut m, "obs-layout-4", "  ");
         assert!(
@@ -7382,7 +7584,7 @@ mod tests {
         assert_eq!(m.drafted(), 0);
         assert!(
             matches!(&m.overlay, Overlay::Comment(CommentDraft { text, rev, .. })
-                if text == "a\x1bb" && rev.as_ref().map(ToString::to_string).as_deref() == Some("abc1234")),
+                if text.as_str() == "a\x1bb" && rev.as_ref().map(ToString::to_string).as_deref() == Some("abc1234")),
             "the box stays with its commit"
         );
         assert!(
@@ -8213,7 +8415,7 @@ mod tests {
         };
         match m.tracked(to)?.compose.as_ref()? {
             Compose::Editing { quote, text } => {
-                Some((quote.as_ref().map(crate::log::Quote::as_str), text))
+                Some((quote.as_ref().map(crate::log::Quote::as_str), text.as_str()))
             }
             Compose::Sending { .. } => None,
         }
@@ -8336,10 +8538,7 @@ mod tests {
         update(&mut m, key(KeyCode::Char('g')));
         update(&mut m, key(KeyCode::Char('s')));
         update(&mut m, key(KeyCode::Char('a')));
-        update(
-            &mut m,
-            Msg::Key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL)),
-        );
+        update(&mut m, key_with(KeyCode::Char('u'), KeyModifiers::CONTROL));
         assert_eq!(talk_of(&m), Some((Some("Fix the statusline."), "")));
         update(&mut m, key(KeyCode::Backspace));
         assert_eq!(talk_of(&m), Some((None, "")));

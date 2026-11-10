@@ -8,6 +8,7 @@ mod review;
 mod touched;
 mod track;
 mod tree;
+mod typed;
 mod update;
 mod view;
 mod worker;
@@ -33,11 +34,13 @@ use anyhow::{Context, Result};
 use cause::Cause;
 use crossterm::event::{
     self, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
-    EnableFocusChange, EnableMouseCapture, Event,
+    EnableFocusChange, EnableMouseCapture, Event, KeyboardEnhancementFlags,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    supports_keyboard_enhancement,
 };
 use ratatui::DefaultTerminal;
 use ratatui::layout::Rect;
@@ -141,7 +144,29 @@ enum InputCtl {
     Resume,
 }
 
-fn enter_screen() -> Result<()> {
+/// How the terminal reports keys.
+#[derive(Debug, Clone, Copy)]
+enum Keys {
+    /// The kitty keyboard protocol tells `⇧⏎` from `⏎`, and reports the
+    /// shifted character of `⌥⇧` keys, which crossterm puts in the event.
+    Disambiguated,
+    Legacy,
+}
+
+impl Keys {
+    /// Asks the terminal once. It needs raw mode, and it is asked before
+    /// the input thread takes the tty.
+    fn detect() -> Result<Self> {
+        enable_raw_mode()?;
+        Ok(if supports_keyboard_enhancement().unwrap_or(false) {
+            Self::Disambiguated
+        } else {
+            Self::Legacy
+        })
+    }
+}
+
+fn enter_screen(keys: Keys) -> Result<()> {
     enable_raw_mode()?;
     execute!(
         std::io::stdout(),
@@ -150,10 +175,24 @@ fn enter_screen() -> Result<()> {
         EnableBracketedPaste,
         EnableFocusChange
     )?;
+    if matches!(keys, Keys::Disambiguated) {
+        execute!(
+            std::io::stdout(),
+            PushKeyboardEnhancementFlags(
+                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                    | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
+            )
+        )?;
+    }
     Ok(())
 }
 
-fn leave_screen() {
+/// The terminal keeps a keyboard flag stack for each screen, so the flags
+/// pushed on the alternate screen are popped before leaving it.
+fn leave_screen(keys: Keys) {
+    if matches!(keys, Keys::Disambiguated) {
+        let _ = execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
+    }
     let _ = execute!(
         std::io::stdout(),
         DisableFocusChange,
@@ -165,24 +204,27 @@ fn leave_screen() {
 }
 
 /// Restores the terminal however the TUI exits, including by panic.
-struct ScreenGuard;
+struct ScreenGuard {
+    keys: Keys,
+}
 
 impl ScreenGuard {
     fn enter() -> Result<Self> {
+        let keys = Keys::detect()?;
         let previous = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
-            leave_screen();
+            leave_screen(keys);
             previous(info);
         }));
-        let guard = Self;
-        enter_screen()?;
+        let guard = Self { keys };
+        enter_screen(keys)?;
         Ok(guard)
     }
 }
 
 impl Drop for ScreenGuard {
     fn drop(&mut self) {
-        leave_screen();
+        leave_screen(self.keys);
     }
 }
 
@@ -241,6 +283,7 @@ struct Runtime {
     emulator: EmulatorFactory,
     workers: Workers,
     input: Sender<InputCtl>,
+    keys: Keys,
 }
 
 impl Runtime {
@@ -359,9 +402,9 @@ impl Runtime {
             .send(InputCtl::Pause(ack))
             .context("input thread is gone")?;
         parked.recv().context("input thread is gone")?;
-        leave_screen();
+        leave_screen(self.keys);
         let status = command.status();
-        let resumed = enter_screen();
+        let resumed = enter_screen(self.keys);
         let _ = self.input.send(InputCtl::Resume);
         forget_screen(terminal);
         resumed?;
@@ -606,10 +649,10 @@ pub fn run(options: Options) -> Result<()> {
     let colours = Colours::from_env();
     let backdrop = palette::backdrop(&options.config.theme, colours);
     let palette = Palette::resolve(&options.config.theme, backdrop, colours);
-    let _guard = ScreenGuard::enter()?;
+    let guard = ScreenGuard::enter()?;
     let mut terminal =
         ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stdout()))?;
-    event_loop(&mut terminal, options, label, palette)
+    event_loop(&mut terminal, options, label, palette, guard.keys)
 }
 
 fn event_loop(
@@ -617,6 +660,7 @@ fn event_loop(
     options: Options,
     label: String,
     palette: Palette,
+    keys: Keys,
 ) -> Result<()> {
     let (msgs, inbox) = mpsc::channel();
     let (input, input_ctl) = mpsc::channel();
@@ -632,6 +676,7 @@ fn event_loop(
         emulator: options.emulator,
         workers,
         input,
+        keys,
     };
 
     let mut m = Model::new(

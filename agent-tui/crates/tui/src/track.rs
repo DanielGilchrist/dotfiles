@@ -14,6 +14,7 @@ use crate::log::Nav;
 use crate::model::{Company, Inspection, Ticket};
 use crate::touched::Baseline;
 use crate::tree::{ChangesScope, ChangesView, TreeRow};
+use crate::typed::Message;
 
 /// Which read of an agent's git facts something was made from. Reads are
 /// counted across all agents, so an epoch never repeats for an agent that
@@ -41,7 +42,7 @@ impl Compose {
     /// worker may or may not have typed.
     pub fn holds_work(&self) -> bool {
         match self {
-            Self::Editing { text, .. } => !text.trim().is_empty(),
+            Self::Editing { text, .. } => !text.is_blank(),
             Self::Sending { .. } => true,
         }
     }
@@ -62,13 +63,13 @@ pub struct CachedTree {
 pub enum Compose {
     Editing {
         quote: Option<crate::log::Quote>,
-        text: String,
+        text: Message,
     },
     /// With the worker, which answers for `ticket`. The comments are the
     /// review it carries, given back to the draft if it isn't typed.
     Sending {
         quote: Option<crate::log::Quote>,
-        text: String,
+        text: Message,
         comments: Vec<crate::review::Comment>,
         ticket: Ticket,
     },

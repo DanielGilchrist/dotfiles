@@ -12,7 +12,7 @@ use agent_core::model::{Head, Worktree};
 use agent_core::names::SessionName;
 use agent_core::paths::{Layout, RepoRoot};
 use agent_core::ports::{
-    Change, Checkout, Compared, Lines, Place, RepoWorktrees, SessionInfo, SessionStatus,
+    Added, Change, Checkout, Compared, Lines, Place, RepoWorktrees, SessionInfo, SessionStatus,
     TrackedState, WorktreeFacts,
 };
 
@@ -274,7 +274,7 @@ fn fleet_facts(k: usize) -> WorktreeFacts {
         .take(k % 7)
         .map(|(path, lines)| match lines {
             Some(lines) => Change::tracked(*path, *lines, TrackedState::Committed),
-            None => Change::untracked(*path),
+            None => Change::untracked(*path, Added::Unread),
         })
         .collect();
     WorktreeFacts {
@@ -331,7 +331,7 @@ pub fn modified(path: &str) -> Change {
 /// `n` uncommitted files with no counts.
 pub fn pending_files(n: usize) -> Vec<Change> {
     (0..n)
-        .map(|i| Change::untracked(format!("pending{i}")))
+        .map(|i| Change::untracked(format!("pending{i}"), Added::Unread))
         .collect()
 }
 

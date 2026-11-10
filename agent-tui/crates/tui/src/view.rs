@@ -1,5 +1,6 @@
 use std::cell::Cell;
 use std::fmt::Write as _;
+use std::num::NonZeroUsize;
 use std::path::Path;
 use std::time::SystemTime;
 
@@ -13,6 +14,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Clear, Padding, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::cause::Cause;
@@ -26,6 +28,7 @@ use crate::model::{
 };
 use crate::palette::Palette;
 use crate::track::Compose;
+use crate::typed::{Columns, Message, Room, Wrapped, scrolled};
 use crate::update::{Pick, Picks, Unusable, picker_matches, switcher_matches};
 
 mod log;
@@ -795,15 +798,24 @@ fn overlay_area(frame: &Frame<'_>, width: u16, height: u16) -> Rect {
 
 /// The least a box is drawn at, margin or not: a border around one row.
 const MIN_BOX: (u16, u16) = (8, 3);
+const TALK_WIDTH: u16 = 72;
+/// Columns of the `›` prompt before the message's text.
+const TALK_PROMPT: usize = 3;
+/// The most rows the message's text takes before it scrolls.
+const TALK_MAX_INPUT: usize = 12;
+
+fn box_width(screen: u16, width: u16) -> u16 {
+    width
+        .min(screen.saturating_sub(4))
+        .max(width.min(MIN_BOX.0))
+        .min(screen)
+}
 
 /// A centred rect of at most `width` x `height`, leaving a margin around it
 /// while the screen has the room for [`MIN_BOX`] beside it.
 fn centred(frame: &Frame<'_>, width: u16, height: u16) -> Rect {
     let area = frame.area();
-    let width = width
-        .min(area.width.saturating_sub(4))
-        .max(width.min(MIN_BOX.0))
-        .min(area.width);
+    let width = box_width(area.width, width);
     let height = height
         .min(area.height.saturating_sub(2))
         .max(height.min(MIN_BOX.1))
@@ -1025,27 +1037,12 @@ fn highlighted_owned(text: &str, query: &str) -> Vec<Span<'static>> {
 /// `text` split into rows of at most `width` columns, breaking at spaces
 /// where it can and keeping its newlines.
 fn wrap(text: &str, width: usize) -> Vec<String> {
-    let width = width.max(1);
-    let mut rows = Vec::new();
-    for line in text.split('\n') {
-        let mut row = String::new();
-        for word in line.split_inclusive(' ') {
-            if row.width() + word.trim_end().width() > width && !row.is_empty() {
-                rows.push(std::mem::take(&mut row).trim_end().to_string());
-            }
-            for c in word.chars() {
-                if row.width() + c.width().unwrap_or(0) > width {
-                    rows.push(std::mem::take(&mut row));
-                    if c == ' ' {
-                        continue;
-                    }
-                }
-                row.push(c);
-            }
-        }
-        rows.push(row);
-    }
-    rows
+    let columns = Columns::new(width).unwrap_or(Columns::ONE);
+    Wrapped::of(text, columns)
+        .rows()
+        .iter()
+        .map(|row| text[row.clone()].trim_end().to_string())
+        .collect()
 }
 
 fn spinner(now: SystemTime) -> &'static str {
@@ -1727,54 +1724,130 @@ fn draw_actions(frame: &mut Frame<'_>, m: &Model, target: &SessionName) {
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
+/// The room the send box gives a message on `screen`: its columns are the
+/// box less its borders, the `›` prompt and a column for the caret, and its
+/// rows at most half the screen or [`TALK_MAX_INPUT`]. None while the screen
+/// leaves no column to type in. Draw and the key handler both ask it, so
+/// they agree on where a row ends.
+pub(crate) fn talk_room(screen: Rect) -> Option<Room> {
+    let inner = usize::from(box_width(screen.width, TALK_WIDTH).saturating_sub(2));
+    Some(Room {
+        columns: Columns::new(inner.saturating_sub(TALK_PROMPT + 1))?,
+        rows: NonZeroUsize::new(usize::from(screen.height / 2).min(TALK_MAX_INPUT))?,
+    })
+}
+
 fn draw_talk(frame: &mut Frame<'_>, m: &Model, to: &SessionName) {
     let compose = m.tracked(to).and_then(|t| t.compose.as_ref());
+    let empty = Message::default();
     let (quote, text, sending) = match compose {
-        Some(Compose::Editing { quote, text }) => (quote.as_ref(), text.as_str(), false),
-        Some(Compose::Sending { text, .. }) => (None, text.as_str(), true),
-        None => (None, "", false),
+        Some(Compose::Editing { quote, text }) => (quote.as_ref(), text, false),
+        Some(Compose::Sending { text, .. }) => (None, text, true),
+        None => (None, &empty, false),
     };
     let draft = m.draft(to);
     let shown = draft.len().min(3);
-    let height =
-        u16::try_from(3 + shown + usize::from(draft.len() > shown) + usize::from(quote.is_some()))
-            .unwrap_or(3);
-    let area = centred(frame, 72, height);
+    let room = talk_room(frame.area());
+    let wrapped = room.map(|r| Wrapped::of(text.as_str(), r.columns));
+    let input_rows = room
+        .zip(wrapped.as_ref())
+        .map_or(1, |(r, w)| w.rows().len().clamp(1, r.rows.get()));
+    let height = u16::try_from(
+        2 + input_rows + shown + usize::from(draft.len() > shown) + usize::from(quote.is_some()),
+    )
+    .unwrap_or(u16::MAX);
+    let area = centred(frame, TALK_WIDTH, height);
     clear_around(frame, area);
-    let room = usize::from(area.width).saturating_sub(6);
-    let rows_above = area.height.saturating_sub(3);
+    let title_room = usize::from(area.width).saturating_sub(6);
+    let inner_height = area.height.saturating_sub(2);
+    let input_height = u16::try_from(input_rows)
+        .unwrap_or(u16::MAX)
+        .min(inner_height);
+    let rows_above = inner_height - input_height;
     let quote_in_title = quote.is_some() && rows_above == 0;
     let (title, keys) = if sending {
         (format!("Sending to {to}…"), hints(&[("Esc", "close")]))
     } else {
         (
-            talk_title(m, to, quote, quote_in_title.then_some(room)),
-            hints(&[("⏎", "send"), ("Esc", "close")]),
+            talk_title(m, to, quote, quote_in_title.then_some(title_room)),
+            hints(&[("⏎", "send"), ("⌥⏎", "newline"), ("Esc", "close")]),
         )
     };
     let block = overlay_block(&title, keys, dim());
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let lines = talk_rows(draft, shown, quote.filter(|_| !quote_in_title), room);
-    let [above, input] =
-        Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(inner);
+    let lines = talk_rows(draft, shown, quote.filter(|_| !quote_in_title), title_room);
+    let [above, input] = Layout::vertical([
+        Constraint::Length(rows_above),
+        Constraint::Length(input_height),
+    ])
+    .areas(inner);
     let hidden = u16::try_from(lines.len())
         .unwrap_or(u16::MAX)
         .saturating_sub(above.height);
     frame.render_widget(Paragraph::new(lines).scroll((hidden, 0)), above);
-    let (typed, cursor) = if sending {
-        (dim(), "")
-    } else {
-        (Style::new(), "█")
-    };
-    frame.render_widget(
-        Line::from(vec![
-            Span::styled(" › ", accent()),
-            Span::styled(truncate_start(text, room), typed),
-            Span::styled(cursor, dim()),
-        ]),
-        input,
+    let rows = wrapped.map_or_else(
+        || vec![Line::from(Span::styled(" › ", accent()))],
+        |w| input_rows_of(text, &w, usize::from(input.height), sending),
     );
+    frame.render_widget(Paragraph::new(rows), input);
+}
+
+/// The rows of the message from the viewport's top, which `height` rows
+/// are shown of. The first carries the prompt.
+fn input_rows_of<'a>(
+    text: &'a Message,
+    wrapped: &Wrapped,
+    height: usize,
+    sending: bool,
+) -> Vec<Line<'a>> {
+    let caret_row = wrapped.row_of(text.caret());
+    let first = scrolled(text.top(), caret_row, wrapped.rows().len(), height);
+    wrapped
+        .rows()
+        .iter()
+        .enumerate()
+        .skip(first)
+        .take(height)
+        .map(|(i, row)| {
+            let prompt = if i == first {
+                Span::styled(" › ", accent())
+            } else {
+                Span::raw(" ".repeat(TALK_PROMPT))
+            };
+            let caret = (!sending && i == caret_row).then(|| text.caret() - row.start);
+            input_row(prompt, &text.as_str()[row.clone()], caret, sending)
+        })
+        .collect()
+}
+
+/// One row of the message, with the caret drawn on the cluster it sits
+/// before, or on a blank past the row's end.
+fn input_row<'a>(prompt: Span<'a>, row: &'a str, caret: Option<usize>, sending: bool) -> Line<'a> {
+    let style = if sending { dim() } else { Style::new() };
+    let Some(at) = caret else {
+        return Line::from(vec![prompt, Span::styled(row, style)]);
+    };
+    let (before, rest) = row.split_at(at);
+    let under = rest.graphemes(true).next().unwrap_or(" ");
+    let after = rest.get(under.len()..).unwrap_or_default();
+    Line::from(vec![
+        prompt,
+        Span::styled(before, style),
+        Span::styled(under, style.add_modifier(Modifier::REVERSED)),
+        Span::styled(after, style),
+    ])
+}
+
+/// What of a one-row `text` to show in `room` columns with its caret at
+/// byte `caret`, and where the caret is in that. The caret's cluster and
+/// some of what follows it stay in view.
+fn windowed(text: &str, caret: usize, room: usize) -> (String, usize) {
+    let (before, after) = text.split_at(caret);
+    let one_line = |s: &str| s.replace('\n', " ");
+    let after = truncate_end(&one_line(after), room.saturating_sub(1) / 2);
+    let before = truncate_start(&one_line(before), room.saturating_sub(1 + after.width()));
+    (format!("{before}{after}"), before.len())
 }
 
 /// The quote joins the title when the box has no row to show it above the
@@ -1847,7 +1920,7 @@ fn draw_comment(
     frame: &mut Frame<'_>,
     to: &SessionName,
     selected: &[crate::review::LineInfo],
-    text: &str,
+    text: &Message,
     rev: Option<&crate::review::Rev>,
 ) {
     let shown = selected.len().min(3);
@@ -1867,7 +1940,7 @@ fn draw_comment(
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let room = usize::from(inner.width).saturating_sub(4);
-    let mut lines: Vec<Line<'static>> = selected
+    let mut lines: Vec<Line<'_>> = selected
         .iter()
         .take(shown)
         .map(|l| Line::styled(format!(" {}", truncate_end(&l.text, room)), dim()))
@@ -1878,11 +1951,13 @@ fn draw_comment(
             dim(),
         ));
     }
-    lines.push(Line::from(vec![
+    let (row, caret) = windowed(text.as_str(), text.caret(), room);
+    lines.push(input_row(
         Span::styled(" › ", accent()),
-        Span::raw(truncate_start(text, room)),
-        Span::styled("█", dim()),
-    ]));
+        &row,
+        Some(caret),
+        false,
+    ));
     frame.render_widget(Paragraph::new(lines), inner);
 }
 

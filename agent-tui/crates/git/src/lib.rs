@@ -10,7 +10,7 @@ use agent_core::model::{Head, Worktree};
 use agent_core::names::{BranchName, NameError, PullRequest};
 use agent_core::paths::{AgentWorktree, RepoRoot};
 use agent_core::ports::{
-    BranchLog, BranchState, Change, ChangeKind, Checkout, Compared, DiffBase, Edit, Fetch,
+    Added, BranchLog, BranchState, Change, ChangeKind, Checkout, Compared, DiffBase, Edit, Fetch,
     FileDiff, FileState, Forge, Lines, LocalBranch, PullRequestHead, RemoteBranch, RemoteRef,
     RepoWorktrees, TrackedState, Uncommitted, Vcs, WorktreeFacts, WorktreeStart,
 };
@@ -21,6 +21,11 @@ const DIFF_LINES: usize = 5000;
 /// How much of a diff's text is read, and how much of one line is kept.
 const DIFF_BYTES: u64 = 2 * 1024 * 1024;
 const DIFF_LINE_CHARS: usize = 2000;
+/// The most bytes one facts read spends counting untracked files. A file
+/// that doesn't fit what is left is listed unread.
+const UNTRACKED_BUDGET: u64 = 8 * 1024 * 1024;
+/// How much of a file git looks at to call it binary.
+const BINARY_PROBE: usize = 8000;
 /// A diff that takes longer than this to produce is given up on.
 const DIFF_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -90,6 +95,68 @@ fn git(dir: &Path) -> Command {
         cmd.env("GIT_SSH_COMMAND", "ssh -oBatchMode=yes");
     }
     cmd
+}
+
+/// Bytes left to read untracked files with.
+struct Budget(u64);
+
+/// An untracked file as `git diff --numstat` would count it if it listed
+/// the file: all lines added, binary with a NUL in the first `BINARY_PROBE`
+/// bytes. A file that isn't a plain one, or doesn't fit `budget`, is
+/// unread and spends nothing.
+fn read_added(path: &Path, budget: &mut Budget) -> Added {
+    use std::io::Read;
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return Added::Unread;
+    };
+    if !meta.is_file() || meta.len() > budget.0 {
+        return Added::Unread;
+    }
+    let mut bytes = Vec::new();
+    let read =
+        std::fs::File::open(path).and_then(|file| file.take(budget.0).read_to_end(&mut bytes));
+    if read.is_err() {
+        return Added::Unread;
+    }
+    budget.0 -= bytes.len() as u64;
+    added_of(&bytes, meta.len())
+}
+
+/// `bytes` is what was read of a file that was `expected` bytes long. A file
+/// that changed size in between would be counted partly, so it is unread.
+fn added_of(bytes: &[u8], expected: u64) -> Added {
+    if bytes.len() as u64 != expected {
+        return Added::Unread;
+    }
+    if bytes[..bytes.len().min(BINARY_PROBE)].contains(&0) {
+        return Added::Binary;
+    }
+    Added::Counted(bytes.split_inclusive(|&b| b == b'\n').count())
+}
+
+/// What `git status` lists, the untracked files already read.
+struct Status {
+    tracked: Vec<(PathBuf, TrackedState)>,
+    untracked: Vec<Change>,
+}
+
+impl Status {
+    fn read(dir: &Path, files: Vec<Uncommitted>) -> Self {
+        let mut budget = Budget(UNTRACKED_BUDGET);
+        let mut status = Self {
+            tracked: Vec::new(),
+            untracked: Vec::new(),
+        };
+        for file in files {
+            if let Some(state) = file.state.tracked() {
+                status.tracked.push((file.path, state));
+            } else {
+                let added = read_added(&dir.join(&file.path), &mut budget);
+                status.untracked.push(Change::untracked(file.path, added));
+            }
+        }
+        status
+    }
 }
 
 /// `git diff --numstat -z` output: `added\tremoved\tpath\0` per file, with
@@ -342,16 +409,13 @@ impl Git {
     }
 
     /// `changes` with the state `status` gives each file, and the untracked
-    /// files, which no diff lists, last.
-    fn overlay(changes: Vec<Change>, status: &[Uncommitted]) -> Vec<Change> {
+    /// files last.
+    fn overlay(changes: Vec<Change>, status: &Status) -> Vec<Change> {
         let states: HashMap<&Path, TrackedState> = status
+            .tracked
             .iter()
-            .filter_map(|file| Some((file.path.as_path(), file.state.tracked()?)))
+            .map(|(path, state)| (path.as_path(), *state))
             .collect();
-        let untracked = status
-            .iter()
-            .filter(|file| file.state == FileState::Untracked)
-            .map(|file| Change::untracked(file.path.clone()));
         changes
             .into_iter()
             .map(|mut change| {
@@ -362,21 +426,22 @@ impl Git {
                 }
                 change
             })
-            .chain(untracked)
+            .chain(status.untracked.iter().cloned())
             .collect()
     }
 
     /// Every file `status` lists, counted against the last commit where a
     /// diff has counts for it. One with no diff left, such as a staged edit
     /// reverted in the working tree, is still uncommitted work.
-    fn pending(dir: &Path, status: &[Uncommitted]) -> Result<Vec<Change>, CommandError> {
+    fn pending(dir: &Path, status: &Status) -> Result<Vec<Change>, CommandError> {
         let mut changes = Self::overlay(Self::numstat(dir, "HEAD")?, status);
         let counted: HashSet<PathBuf> = changes.iter().map(|c| c.path.clone()).collect();
         changes.extend(
             status
+                .tracked
                 .iter()
-                .filter(|file| !counted.contains(&file.path))
-                .map(Change::listed),
+                .filter(|(path, _)| !counted.contains(path))
+                .map(|(path, state)| Change::tracked(path.clone(), Lines::Unknown, *state)),
         );
         Ok(changes)
     }
@@ -392,7 +457,7 @@ impl Git {
     fn fork_changes(
         dir: &Path,
         base: &RemoteRef,
-        status: &[Uncommitted],
+        status: &Status,
     ) -> Result<Vec<Change>, CommandError> {
         let fork = Self::fork_point(dir, base)?;
         Ok(Self::overlay(Self::numstat(dir, &fork)?, status))
@@ -583,7 +648,7 @@ impl Vcs for Git {
     }
 
     fn facts(&self, worktree: &Path) -> Result<WorktreeFacts, CommandError> {
-        let status = Self::status(worktree)?;
+        let status = Status::read(worktree, Self::status(worktree)?);
         let pending = Self::pending(worktree, &status)?;
         let base = Self::default_base(worktree)?;
         let compared = Compared::of(Self::checkout(worktree)?, base.clone());
@@ -672,7 +737,7 @@ impl Vcs for Git {
                 cmd.arg(since).arg("--").arg(path);
                 false
             }
-            ChangeKind::Untracked => {
+            ChangeKind::Untracked { .. } => {
                 cmd.args(["--no-index", "--", "/dev/null"]).arg(path);
                 true
             }
@@ -855,30 +920,8 @@ mod tests {
 
     #[test]
     fn fetching_a_ref_origin_lacks_is_nothing_fetched_not_a_failure() {
-        let tmp = tempfile::tempdir().expect("a temp dir");
-        let origin = tmp.path().join("origin");
-        let sh = |dir: &Path, args: &[&str]| {
-            let out = Command::new("git")
-                .arg("-C")
-                .arg(dir)
-                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
-                .args(args)
-                .output()
-                .expect("succeeds");
-            assert!(
-                out.status.success(),
-                "{}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-        };
-        std::fs::create_dir(&origin).expect("creates");
-        sh(&origin, &["init", "-q", "-b", "main"]);
-        sh(&origin, &["commit", "-q", "--allow-empty", "-m", "init"]);
-        sh(
-            tmp.path(),
-            &["clone", "-q", origin.to_str().expect("succeeds"), "work"],
-        );
-        let work = tmp.path().join("work").canonicalize().expect("exists");
+        let (_tmp, origin, work) = clone_with(&[]);
+        let work = work.canonicalize().expect("exists");
         let repo = Git.repo_of(&work).expect("succeeds").expect("a repo");
         let branch = |name: &str| name.parse::<BranchName>().expect("parses");
         Git.fetch(&repo, &Fetch::Branch(branch("nosuch")))
@@ -890,7 +933,7 @@ mod tests {
         );
         Git.fetch(&repo, &Fetch::PullRequest(99))
             .expect("a pull request origin lacks is nothing fetched");
-        sh(&origin, &["branch", "later"]);
+        run_git(&origin, &["branch", "later"]);
         Git.fetch(&repo, &Fetch::Branch(branch("later")))
             .expect("succeeds");
         assert!(
@@ -979,31 +1022,8 @@ mod tests {
 
     #[test]
     fn facts_classify_the_checkout_against_the_default_branch() {
-        let tmp = tempfile::tempdir().expect("a temp dir");
-        let origin = tmp.path().join("origin");
-        let work = tmp.path().join("work");
-        let run = |dir: &Path, args: &[&str]| {
-            let out = Command::new("git")
-                .arg("-C")
-                .arg(dir)
-                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
-                .args(args)
-                .output()
-                .expect("succeeds");
-            assert!(
-                out.status.success(),
-                "{}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-            String::from_utf8_lossy(&out.stdout).trim().to_string()
-        };
-        std::fs::create_dir_all(&origin).expect("creates");
-        run(&origin, &["init", "-q", "-b", "main"]);
-        run(&origin, &["commit", "-q", "--allow-empty", "-m", "init"]);
-        run(
-            tmp.path(),
-            &["clone", "-q", origin.to_str().expect("succeeds"), "work"],
-        );
+        let (_tmp, _origin, work) = clone_with(&[]);
+        let run = run_git;
         let compared = || Git.facts(&work).expect("succeeds").compared;
         let branch = |name: &str| -> BranchName { name.parse().expect("parses") };
         let base = || -> RemoteRef { "origin/main".parse().expect("parses") };
@@ -1037,30 +1057,8 @@ mod tests {
 
     #[test]
     fn facts_count_commits_both_ways_and_changes_since_the_fork() {
-        let tmp = tempfile::tempdir().expect("a temp dir");
-        let origin = tmp.path().join("origin");
-        let work = tmp.path().join("work");
-        let git = |dir: &Path, args: &[&str]| {
-            let out = Command::new("git")
-                .arg("-C")
-                .arg(dir)
-                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
-                .args(args)
-                .output()
-                .expect("succeeds");
-            assert!(
-                out.status.success(),
-                "{}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-        };
-        std::fs::create_dir_all(&origin).expect("creates");
-        git(&origin, &["init", "-q", "-b", "main"]);
-        git(&origin, &["commit", "-q", "--allow-empty", "-m", "init"]);
-        git(
-            tmp.path(),
-            &["clone", "-q", origin.to_str().expect("succeeds"), "work"],
-        );
+        let (_tmp, origin, work) = clone_with(&[]);
+        let git = run_git;
         std::fs::write(work.join("a.txt"), "one\ntwo\n").expect("writes");
         git(&work, &["add", "a.txt"]);
         std::fs::write(work.join("b.txt"), "b\n").expect("writes");
@@ -1082,6 +1080,7 @@ mod tests {
             }
         );
         std::fs::write(work.join("new.txt"), "x\n").expect("writes");
+        let new_txt = || Change::untracked("new.txt", Added::Counted(1));
         let facts = Git.facts(&work).expect("succeeds");
         assert_eq!(
             facts.changed,
@@ -1102,7 +1101,7 @@ mod tests {
                     },
                     TrackedState::Committed
                 ),
-                Change::untracked("new.txt"),
+                new_txt(),
             ],
             "uncommitted and untracked work counts too"
         );
@@ -1117,9 +1116,183 @@ mod tests {
                     },
                     TrackedState::Unstaged(Edit::Modified)
                 ),
-                Change::untracked("new.txt"),
+                new_txt(),
             ],
             "uncommitted files count against the last commit, committed ones are left out"
+        );
+    }
+
+    fn run_git(dir: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(args)
+            .output()
+            .expect("succeeds");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// An origin on `main` committed with `files`, and a clone of it.
+    fn clone_with(files: &[(&str, &str)]) -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let tmp = tempfile::tempdir().expect("a temp dir");
+        let origin = tmp.path().join("origin");
+        std::fs::create_dir_all(&origin).expect("creates");
+        run_git(&origin, &["init", "-q", "-b", "main"]);
+        for (name, text) in files {
+            std::fs::write(origin.join(name), text).expect("writes");
+            run_git(&origin, &["add", name]);
+        }
+        run_git(&origin, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        run_git(
+            tmp.path(),
+            &["clone", "-q", origin.to_str().expect("succeeds"), "work"],
+        );
+        let work = tmp.path().join("work");
+        (tmp, origin, work)
+    }
+
+    fn stat(added: usize, removed: usize, files: usize) -> agent_core::ports::DiffStat {
+        agent_core::ports::DiffStat {
+            files,
+            added,
+            removed,
+        }
+    }
+
+    #[test]
+    fn untracked_files_add_their_lines_in_both_tabs() {
+        let (_tmp, _origin, work) = clone_with(&[("a.txt", "one\n")]);
+        std::fs::create_dir_all(work.join("sub")).expect("creates");
+        std::fs::write(work.join("sub/three.txt"), "a\nb\nc").expect("writes");
+        std::fs::write(work.join("two.txt"), "a\nb\n").expect("writes");
+        std::fs::write(work.join("empty.txt"), "").expect("writes");
+        std::fs::write(work.join("logo.bin"), b"\x89PNG\0\0").expect("writes");
+        run_git(&work, &["checkout", "-q", "-b", "topic"]);
+        let facts = Git.facts(&work).expect("succeeds");
+        let added = |changes: &[Change], path: &str| {
+            let change = changes
+                .iter()
+                .find(|c| c.path == Path::new(path))
+                .unwrap_or_else(|| panic!("{path} is listed"));
+            let ChangeKind::Untracked { added } = change.kind else {
+                panic!("{path} is untracked");
+            };
+            added
+        };
+        for tab in [&facts.pending, &facts.changed] {
+            assert_eq!(
+                added(tab, "sub/three.txt"),
+                Added::Counted(3),
+                "a last line with no newline still counts"
+            );
+            assert_eq!(added(tab, "two.txt"), Added::Counted(2));
+            assert_eq!(added(tab, "empty.txt"), Added::Counted(0));
+            assert_eq!(added(tab, "logo.bin"), Added::Binary);
+        }
+        assert_eq!(facts.pending_diff(), stat(5, 0, 4));
+        assert_eq!(facts.diff(), stat(5, 0, 4));
+    }
+
+    #[test]
+    fn what_is_not_a_plain_file_is_unread() {
+        let tmp = tempfile::tempdir().expect("a temp dir");
+        let file = tmp.path().join("f.txt");
+        std::fs::write(&file, "x\n").expect("writes");
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&file, &link).expect("links");
+        let mut budget = Budget(UNTRACKED_BUDGET);
+        assert_eq!(read_added(&file, &mut budget), Added::Counted(1));
+        assert_eq!(read_added(&link, &mut budget), Added::Unread);
+        assert_eq!(read_added(tmp.path(), &mut budget), Added::Unread);
+        assert_eq!(
+            read_added(&tmp.path().join("missing"), &mut budget),
+            Added::Unread
+        );
+    }
+
+    #[test]
+    fn a_file_that_changed_size_while_it_was_read_is_unread() {
+        assert_eq!(added_of(b"a\nb\n", 4), Added::Counted(2));
+        assert_eq!(added_of(b"a\nb\n", 3), Added::Unread);
+    }
+
+    #[test]
+    fn a_nested_repo_is_listed_unread() {
+        let (_tmp, _origin, work) = clone_with(&[("a.txt", "one\n")]);
+        let inner = work.join("inner");
+        std::fs::create_dir_all(&inner).expect("creates");
+        run_git(&inner, &["init", "-q", "-b", "main"]);
+        std::fs::write(inner.join("f.txt"), "x\n").expect("writes");
+        let facts = Git.facts(&work).expect("succeeds");
+        assert_eq!(facts.pending.len(), 1, "the nested repo is one entry");
+        for change in &facts.pending {
+            assert_eq!(
+                change.kind,
+                ChangeKind::Untracked {
+                    added: Added::Unread
+                },
+                "{}",
+                change.path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn untracked_files_past_the_byte_budget_are_listed_unread() {
+        let (_tmp, _origin, work) = clone_with(&[("a.txt", "one\n")]);
+        let mib = 1024 * 1024;
+        let lines = vec![b'\n'; 5 * mib];
+        assert!(2 * lines.len() as u64 > UNTRACKED_BUDGET);
+        std::fs::write(work.join("a_first.log"), &lines).expect("writes");
+        std::fs::write(work.join("b_second.log"), &lines).expect("writes");
+        std::fs::write(work.join("c_small.txt"), "x\n").expect("writes");
+        let facts = Git.facts(&work).expect("succeeds");
+        let kinds: Vec<_> = facts.pending.iter().map(|c| c.kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                ChangeKind::Untracked {
+                    added: Added::Counted(5 * mib)
+                },
+                ChangeKind::Untracked {
+                    added: Added::Unread
+                },
+                ChangeKind::Untracked {
+                    added: Added::Counted(1)
+                },
+            ],
+            "a file that doesn't fit what is left is unread, a smaller one after it still counts"
+        );
+    }
+
+    #[test]
+    fn deleted_files_add_their_removed_lines_staged_unstaged_or_committed() {
+        let (_tmp, _origin, work) = clone_with(&[
+            ("unstaged.txt", "1\n2\n3\n"),
+            ("staged.txt", "1\n2\n"),
+            ("committed.txt", "1\n2\n3\n4\n"),
+        ]);
+        run_git(&work, &["checkout", "-q", "-b", "topic"]);
+        run_git(&work, &["rm", "-q", "committed.txt"]);
+        run_git(&work, &["commit", "-q", "-m", "drop"]);
+        run_git(&work, &["rm", "-q", "staged.txt"]);
+        std::fs::remove_file(work.join("unstaged.txt")).expect("removes");
+        let facts = Git.facts(&work).expect("succeeds");
+        assert_eq!(
+            facts.pending_diff(),
+            stat(0, 5, 2),
+            "uncommitted deletions count against the last commit"
+        );
+        assert_eq!(
+            facts.diff(),
+            stat(0, 9, 3),
+            "the branch's own deletion counts since the fork point"
         );
     }
 
@@ -1275,32 +1448,8 @@ mod tests {
 
     #[test]
     fn a_files_diff_runs_from_the_fork_and_shows_a_new_file_whole() {
-        let tmp = tempfile::tempdir().expect("a temp dir");
-        let origin = tmp.path().join("origin");
-        let work = tmp.path().join("work");
-        let git = |dir: &Path, args: &[&str]| {
-            let out = Command::new("git")
-                .arg("-C")
-                .arg(dir)
-                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
-                .args(args)
-                .output()
-                .expect("succeeds");
-            assert!(
-                out.status.success(),
-                "{}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-        };
-        std::fs::create_dir_all(&origin).expect("creates");
-        git(&origin, &["init", "-q", "-b", "main"]);
-        std::fs::write(origin.join("a.txt"), "one\n").expect("writes");
-        git(&origin, &["add", "a.txt"]);
-        git(&origin, &["commit", "-q", "-m", "init"]);
-        git(
-            tmp.path(),
-            &["clone", "-q", origin.to_str().expect("succeeds"), "work"],
-        );
+        let (_tmp, _origin, work) = clone_with(&[("a.txt", "one\n")]);
+        let git = run_git;
         std::fs::write(work.join("a.txt"), "one\ntwo\n").expect("writes");
         git(&work, &["commit", "-q", "-am", "two"]);
         std::fs::write(work.join("a.txt"), "one\ntwo\nthree\n").expect("writes");
@@ -1339,7 +1488,11 @@ mod tests {
             "only what's uncommitted"
         );
         let FileDiff::Text { lines, .. } = Git
-            .file_diff(&work, &Change::untracked("new.txt"), DiffBase::Fork)
+            .file_diff(
+                &work,
+                &Change::untracked("new.txt", Added::Unread),
+                DiffBase::Fork,
+            )
             .expect("succeeds")
         else {
             panic!("a text diff");
@@ -1548,13 +1701,13 @@ mod tests {
         assert_eq!(files[0].0.path, PathBuf::from("src/a.rs"));
         assert_eq!(
             files[0].0.lines(),
-            Some(Lines::Counted {
+            Lines::Counted {
                 added: 1,
                 removed: 1
-            })
+            }
         );
         assert_eq!(files[1].0.path, PathBuf::from("img.png"));
-        assert_eq!(files[1].0.lines(), Some(Lines::Binary));
+        assert_eq!(files[1].0.lines(), Lines::Binary);
     }
 
     #[test]

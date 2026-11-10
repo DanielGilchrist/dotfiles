@@ -152,12 +152,53 @@ pub struct Change {
     pub kind: ChangeKind,
 }
 
-/// A file git tracks has line counts and a state. One it doesn't has
-/// neither, since there is no diff to count.
+/// A file git tracks has line counts and a state. One it doesn't has no
+/// diff, so all its lines are additions, counted from the file itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChangeKind {
-    Untracked,
+    Untracked { added: Added },
     Tracked { lines: Lines, state: TrackedState },
+}
+
+/// What reading an untracked file gave.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Added {
+    Counted(usize),
+    Binary,
+    /// Not read: too big for what was left of the budget, or not a plain
+    /// file.
+    Unread,
+}
+
+impl ChangeKind {
+    pub fn lines(self) -> Lines {
+        match self {
+            Self::Tracked { lines, .. } => lines,
+            Self::Untracked {
+                added: Added::Counted(added),
+            } => Lines::Counted { added, removed: 0 },
+            Self::Untracked {
+                added: Added::Binary,
+            } => Lines::Binary,
+            Self::Untracked {
+                added: Added::Unread,
+            } => Lines::Unknown,
+        }
+    }
+}
+
+/// What a changed file's row says about its lines. Every surface that shows
+/// or sums them reads this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Count {
+    Edited {
+        added: usize,
+        removed: usize,
+    },
+    Binary,
+    /// A tracked file with nothing to count.
+    Nothing,
+    New(Added),
 }
 
 impl Change {
@@ -168,10 +209,10 @@ impl Change {
         }
     }
 
-    pub fn untracked(path: impl Into<PathBuf>) -> Self {
+    pub fn untracked(path: impl Into<PathBuf>, added: Added) -> Self {
         Self {
             path: path.into(),
-            kind: ChangeKind::Untracked,
+            kind: ChangeKind::Untracked { added },
         }
     }
 
@@ -179,22 +220,29 @@ impl Change {
     pub fn listed(file: &Uncommitted) -> Self {
         match file.state.tracked() {
             Some(state) => Self::tracked(file.path.clone(), Lines::Unknown, state),
-            None => Self::untracked(file.path.clone()),
+            None => Self::untracked(file.path.clone(), Added::Unread),
         }
     }
 
     pub fn state(&self) -> FileState {
         match self.kind {
-            ChangeKind::Untracked => FileState::Untracked,
+            ChangeKind::Untracked { .. } => FileState::Untracked,
             ChangeKind::Tracked { state, .. } => state.into(),
         }
     }
 
-    /// `None` for an untracked file.
-    pub fn lines(&self) -> Option<Lines> {
-        match self.kind {
-            ChangeKind::Untracked => None,
-            ChangeKind::Tracked { lines, .. } => Some(lines),
+    pub fn lines(&self) -> Lines {
+        self.kind.lines()
+    }
+
+    pub fn count(&self) -> Count {
+        match (self.kind, self.lines()) {
+            (ChangeKind::Untracked { added }, _) => Count::New(added),
+            (ChangeKind::Tracked { .. }, Lines::Counted { added, removed }) => {
+                Count::Edited { added, removed }
+            }
+            (ChangeKind::Tracked { .. }, Lines::Binary) => Count::Binary,
+            (ChangeKind::Tracked { .. }, Lines::Unknown) => Count::Nothing,
         }
     }
 }
@@ -391,16 +439,9 @@ pub struct DiffStat {
 impl DiffStat {
     pub fn of(changes: &[Change]) -> Self {
         let counted = || {
-            changes.iter().filter_map(|c| match c.kind {
-                ChangeKind::Tracked {
-                    lines: Lines::Counted { added, removed },
-                    ..
-                } => Some((added, removed)),
-                ChangeKind::Tracked {
-                    lines: Lines::Binary | Lines::Unknown,
-                    ..
-                }
-                | ChangeKind::Untracked => None,
+            changes.iter().filter_map(|c| match c.lines() {
+                Lines::Counted { added, removed } => Some((added, removed)),
+                Lines::Binary | Lines::Unknown => None,
             })
         };
         Self {
@@ -1293,7 +1334,7 @@ mod tests {
     use super::*;
 
     fn facts(dirty: usize, ahead: usize, behind: usize) -> WorktreeFacts {
-        let file = |n: usize| Change::untracked(format!("f{n}"));
+        let file = |n: usize| Change::untracked(format!("f{n}"), Added::Unread);
         WorktreeFacts {
             ahead,
             behind,
@@ -1410,12 +1451,41 @@ mod tests {
     }
 
     #[test]
+    fn an_untracked_files_lines_count_as_added_in_the_totals() {
+        let changes = [
+            Change::untracked("new.rs", Added::Counted(7)),
+            Change::untracked("logo.png", Added::Binary),
+            Change::untracked("big.log", Added::Unread),
+        ];
+        assert_eq!(
+            DiffStat::of(&changes),
+            DiffStat {
+                files: 3,
+                added: 7,
+                removed: 0
+            }
+        );
+    }
+
+    #[test]
+    fn an_untracked_file_is_new_even_when_it_has_no_lines() {
+        assert_eq!(
+            Change::untracked("empty", Added::Counted(0)).count(),
+            Count::New(Added::Counted(0))
+        );
+        assert_eq!(
+            Change::tracked("f", Lines::Unknown, TrackedState::Committed).count(),
+            Count::Nothing
+        );
+    }
+
+    #[test]
     fn a_file_only_git_status_lists_has_no_counts_to_add() {
         let listed = Change::listed(&Uncommitted {
             path: "f.rs".into(),
             state: FileState::Conflicted,
         });
-        assert_eq!(listed.lines(), Some(Lines::Unknown));
+        assert_eq!(listed.lines(), Lines::Unknown);
         assert_eq!(
             DiffStat::of(&[listed]),
             DiffStat {

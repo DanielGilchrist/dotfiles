@@ -809,7 +809,7 @@ pub const BINDINGS: &[Binding] = &[
                 "send"
             })
         }),
-        "Compose a message to the selected agent without attaching. It is typed at once, and refused only while the agent is asking, its session is starting, or it ended. What you typed stays for the next s: Esc keeps it and ctrl-U clears it. With the entry cursor on an entry in [0]'s activity or a subagent's log it reads reply: the entry's first line shows above the input and goes before your message, only when you typed one. Backspace on empty text drops the quote. In a peek it always sends without a quote. Review comments drafted for the agent go after the message.",
+        "Compose a message to the selected agent without attaching. It is typed at once, and refused only while the agent is asking, its session is starting, or it ended. The box wraps and grows with the text. alt-Enter, ctrl-J and shift-Enter add a line, Enter sends, and the arrows move the caret. What you typed stays for the next s: Esc keeps it and ctrl-U clears it. With the entry cursor on an entry in [0]'s activity or a subagent's log it reads reply: the entry's first line shows above the input and goes before your message, only when you typed one. Backspace on empty text drops the quote. In a peek it always sends without a quote. Review comments drafted for the agent go after the message.",
     ),
     Binding::new(
         &["v"],

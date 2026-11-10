@@ -5,7 +5,7 @@ use agent_core::activity::AgentId;
 use agent_core::model::{Head, RepoKey};
 use agent_core::names::{CarriageReturn, SessionName, clean};
 use agent_core::ports::{
-    BranchLog, Change, ChangeKind, Compared, Edit, FileDiff, FileState, Lines,
+    Added, BranchLog, Change, Compared, Count, Edit, FileDiff, FileState, Lines,
 };
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
@@ -372,29 +372,10 @@ fn diff_body(m: &Model, hover: &DiffKey, columns: usize, budget: usize) -> Body 
         Resolved::Missing => Rows::Built(Vec::new()),
     };
     let mut counts = Vec::new();
-    match hover.change.kind {
-        ChangeKind::Tracked {
-            lines: Lines::Counted { added, removed },
-            ..
-        } => {
-            for (count, text, style) in [
-                (added, format!(" +{added}"), success()),
-                (removed, format!(" −{removed}"), error()),
-            ] {
-                if count > 0 {
-                    counts.push(Span::styled(text, style));
-                }
-            }
-        }
-        ChangeKind::Tracked {
-            lines: Lines::Binary,
-            ..
-        } => counts.push(Span::styled(" bin", dim())),
-        ChangeKind::Tracked {
-            lines: Lines::Unknown,
-            ..
-        } => {}
-        ChangeKind::Untracked => counts.push(Span::styled(" new", dim())),
+    let shown = count_spans(hover.change.count());
+    if !shown.is_empty() {
+        counts.push(Span::raw(" "));
+        counts.extend(shown);
     }
     let others = others_on(m, &hover.name, &hover.change.path);
     let fixed = 4 + line_width(&counts);
@@ -443,14 +424,10 @@ fn folder_body(m: &Model, hover: &FolderKey, columns: usize, budget: usize) -> B
     };
     let (mut added, mut removed) = (0, 0);
     for change in &hover.files {
-        if let ChangeKind::Tracked {
-            lines:
-                Lines::Counted {
-                    added: a,
-                    removed: r,
-                },
-            ..
-        } = change.kind
+        if let Lines::Counted {
+            added: a,
+            removed: r,
+        } = change.lines()
         {
             added += a;
             removed += r;
@@ -482,33 +459,31 @@ fn folder_body(m: &Model, hover: &FolderKey, columns: usize, budget: usize) -> B
     }
 }
 
-pub(super) fn count_spans(kind: ChangeKind) -> Vec<Span<'static>> {
-    match kind {
-        ChangeKind::Tracked {
-            lines: Lines::Counted { added, removed },
-            ..
-        } => {
-            let mut spans = Vec::new();
-            if added > 0 {
-                spans.push(Span::styled(format!("+{added}"), success()));
+pub(super) fn count_spans(count: Count) -> Vec<Span<'static>> {
+    let edited = |added: usize, removed: usize| {
+        let mut spans = Vec::new();
+        if added > 0 {
+            spans.push(Span::styled(format!("+{added}"), success()));
+        }
+        if removed > 0 {
+            if !spans.is_empty() {
+                spans.push(Span::raw(" "));
             }
-            if removed > 0 {
-                if !spans.is_empty() {
-                    spans.push(Span::raw(" "));
-                }
-                spans.push(Span::styled(format!("−{removed}"), error()));
-            }
+            spans.push(Span::styled(format!("−{removed}"), error()));
+        }
+        spans
+    };
+    match count {
+        Count::Edited { added, removed } => edited(added, removed),
+        Count::Binary => vec![Span::styled("bin", dim())],
+        Count::Nothing => Vec::new(),
+        Count::New(Added::Counted(added)) if added > 0 => {
+            let mut spans = vec![Span::styled("new ", dim())];
+            spans.extend(edited(added, 0));
             spans
         }
-        ChangeKind::Tracked {
-            lines: Lines::Binary,
-            ..
-        } => vec![Span::styled("bin", dim())],
-        ChangeKind::Tracked {
-            lines: Lines::Unknown,
-            ..
-        } => Vec::new(),
-        ChangeKind::Untracked => vec![Span::styled("new", dim())],
+        Count::New(Added::Binary) => vec![Span::styled("new bin", dim())],
+        Count::New(Added::Counted(_) | Added::Unread) => vec![Span::styled("new", dim())],
     }
 }
 
@@ -539,7 +514,7 @@ fn section_rows(
             .to_string_lossy()
             .into_owned();
         let mut left = super::sidebar::file_marker(change.state());
-        let right = count_spans(change.kind);
+        let right = count_spans(change.count());
         let room = columns.saturating_sub(line_width(&left) + line_width(&right) + 1);
         left.push(Span::raw(truncate_start(&rel, room)));
         rows.push(justify(left, right, columns));
@@ -563,7 +538,7 @@ fn section_rows(
             ),
             bold(),
         )];
-        let counts = count_spans(file.change.kind);
+        let counts = count_spans(file.change.count());
         if !counts.is_empty() {
             head.push(Span::raw("  "));
             head.extend(counts);
@@ -1125,6 +1100,20 @@ fn thousands(n: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_new_file_says_new_before_its_lines_and_alone_when_it_has_none() {
+        let text = |count| {
+            count_spans(count)
+                .iter()
+                .map(|s| s.content.to_string())
+                .collect::<String>()
+        };
+        assert_eq!(text(Count::New(Added::Counted(9))), "new +9");
+        assert_eq!(text(Count::New(Added::Counted(0))), "new");
+        assert_eq!(text(Count::New(Added::Unread)), "new");
+        assert_eq!(text(Count::New(Added::Binary)), "new bin");
+    }
 
     #[test]
     fn rows_wrap_where_the_columns_run_out() {

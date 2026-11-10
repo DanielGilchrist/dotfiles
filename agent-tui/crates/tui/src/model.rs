@@ -1235,7 +1235,7 @@ pub struct HelpState {
 pub struct CommentDraft {
     pub to: SessionName,
     pub lines: Vec<crate::review::LineInfo>,
-    pub text: String,
+    pub text: crate::typed::Message,
     /// The commit the lines are from, when they aren't the checkout's.
     pub rev: Option<crate::review::Rev>,
 }

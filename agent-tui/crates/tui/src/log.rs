@@ -750,26 +750,19 @@ fn entry_markdown(entry: &Entry<'_>) -> String {
 }
 
 fn touched_note(file: &TouchedFile) -> String {
-    use agent_core::ports::{ChangeKind, Lines};
-    let kind = match &file.now {
-        Now::Changed(change) => change.kind,
+    use agent_core::ports::{Added, Count};
+    let change = match &file.now {
+        Now::Changed(change) => change,
         Now::Clean => return " (no difference now)".into(),
         Now::Unknown => return String::new(),
     };
-    match kind {
-        ChangeKind::Untracked => " (new)".into(),
-        ChangeKind::Tracked {
-            lines: Lines::Counted { added, removed },
-            ..
-        } => format!(" (+{added} \u{2212}{removed})"),
-        ChangeKind::Tracked {
-            lines: Lines::Binary,
-            ..
-        } => " (binary)".into(),
-        ChangeKind::Tracked {
-            lines: Lines::Unknown,
-            ..
-        } => String::new(),
+    match change.count() {
+        Count::Edited { added, removed } => format!(" (+{added} \u{2212}{removed})"),
+        Count::Binary => " (binary)".into(),
+        Count::Nothing => String::new(),
+        Count::New(Added::Counted(added)) if added > 0 => format!(" (new +{added})"),
+        Count::New(Added::Binary) => " (new binary)".into(),
+        Count::New(Added::Counted(_) | Added::Unread) => " (new)".into(),
     }
 }
 
@@ -1205,6 +1198,21 @@ pub(crate) mod fixtures {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_touched_new_file_says_new_with_its_lines_or_binary() {
+        use agent_core::ports::{Added, Change};
+        let note = |added| {
+            touched_note(&TouchedFile {
+                path: "f".into(),
+                now: Now::Changed(Change::untracked("f", added)),
+            })
+        };
+        assert_eq!(note(Added::Counted(9)), " (new +9)");
+        assert_eq!(note(Added::Binary), " (new binary)");
+        assert_eq!(note(Added::Counted(0)), " (new)");
+        assert_eq!(note(Added::Unread), " (new)");
+    }
+
     use super::fixtures::*;
     use super::*;
     use agent_core::ports::{Outcome, Summary};

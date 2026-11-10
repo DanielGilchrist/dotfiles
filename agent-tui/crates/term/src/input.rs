@@ -38,7 +38,8 @@ fn control_byte(c: char) -> Option<u8> {
         '\\' | '4' => Some(0x1c),
         ']' | '5' => Some(0x1d),
         '^' | '6' => Some(0x1e),
-        '_' | '/' | '7' => Some(0x1f),
+        '_' | '/' | '7' | '-' => Some(0x1f),
+        '8' | '?' => Some(0x7f),
         _ => None,
     }
 }
@@ -73,6 +74,7 @@ pub fn encode_key(key: KeyEvent, modes: Modes) -> Vec<u8> {
         KeyCode::Enter => b"\r".to_vec(),
         KeyCode::Tab => b"\t".to_vec(),
         KeyCode::BackTab => b"\x1b[Z".to_vec(),
+        KeyCode::Backspace if mods.contains(KeyModifiers::CONTROL) => vec![0x08],
         KeyCode::Backspace => vec![0x7f],
         KeyCode::Esc => vec![0x1b],
         KeyCode::Up => return cursor('A'),
@@ -162,6 +164,45 @@ mod tests {
             encode_key(key(KeyCode::Up, KeyModifiers::SHIFT), app),
             b"\x1b[1;2A"
         );
+    }
+
+    #[test]
+    fn keys_a_kitty_keyboard_reports_apart_reach_the_program_as_they_did_before() {
+        let none = Modes::default();
+        let sent = |code, mods| encode_key(key(code, mods), none);
+        assert_eq!(sent(KeyCode::Backspace, KeyModifiers::CONTROL), [0x08]);
+        assert_eq!(sent(KeyCode::Char('i'), KeyModifiers::CONTROL), [0x09]);
+        assert_eq!(sent(KeyCode::Char('m'), KeyModifiers::CONTROL), [0x0d]);
+        assert_eq!(sent(KeyCode::Char('['), KeyModifiers::CONTROL), [0x1b]);
+        assert_eq!(sent(KeyCode::Enter, KeyModifiers::CONTROL), b"\r");
+        assert_eq!(sent(KeyCode::Enter, KeyModifiers::ALT), b"\x1b\r");
+        let alt_shift = KeyModifiers::ALT;
+        assert_eq!(sent(KeyCode::Char('A'), alt_shift), b"\x1bA");
+        assert_eq!(sent(KeyCode::Char('!'), alt_shift), b"\x1b!");
+        assert_eq!(sent(KeyCode::Char('-'), KeyModifiers::CONTROL), [0x1f]);
+        assert_eq!(sent(KeyCode::Char('8'), KeyModifiers::CONTROL), [0x7f]);
+        assert_eq!(sent(KeyCode::Char('?'), KeyModifiers::CONTROL), [0x7f]);
+    }
+
+    #[test]
+    fn keypad_keys_a_kitty_keyboard_reports_apart_send_what_the_same_key_sends_without_it() {
+        use crossterm::event::{KeyEventKind, KeyEventState};
+        let keypad = |code| {
+            encode_key(
+                KeyEvent::new_with_kind_and_state(
+                    code,
+                    KeyModifiers::NONE,
+                    KeyEventKind::Press,
+                    KeyEventState::KEYPAD,
+                ),
+                Modes::default(),
+            )
+        };
+        assert_eq!(keypad(KeyCode::Char('7')), b"7");
+        assert_eq!(keypad(KeyCode::Char('+')), b"+");
+        assert_eq!(keypad(KeyCode::Enter), b"\r");
+        assert_eq!(keypad(KeyCode::Left), b"\x1b[D");
+        assert_eq!(keypad(KeyCode::Delete), b"\x1b[3~");
     }
 
     #[test]
