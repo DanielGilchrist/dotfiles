@@ -21,6 +21,7 @@ use anyhow::{Context, Result, bail};
 use clap::{ArgGroup, CommandFactory, Parser, Subcommand};
 
 mod lineage;
+mod restart;
 
 #[derive(Parser)]
 #[command(
@@ -102,6 +103,20 @@ enum Cmd {
         /// Every agent worktree (asks first)
         #[arg(short, long, conflicts_with = "name")]
         all: bool,
+    },
+    /// Restart an agent's harness so it runs the installed version, then resume its
+    /// conversation (inferred from the cwd)
+    Restart {
+        name: Option<SessionName>,
+        /// Interrupt an agent that is working
+        #[arg(short, long)]
+        force: bool,
+        /// Every agent
+        #[arg(short, long, conflicts_with = "name")]
+        all: bool,
+        /// With --all, leave out the agents that are working
+        #[arg(long, requires = "all", conflicts_with = "force")]
+        idle: bool,
     },
     /// List agents by repo
     Ls,
@@ -441,8 +456,8 @@ fn refuse_unless_forced(name: &SessionName, hazards: &[Hazard], consent: Consent
 fn remove(svc: Services<'_>, name: &SessionName, consent: Consent) -> Result<String> {
     let plan = match ops::plan_removal(svc, ops::removable(svc, name)?)? {
         Planned::Own(own) => {
-            refuse_unless_forced(name, own.hazards(), consent)?;
-            let needed = if own.hazards().is_empty() {
+            refuse_unless_forced(name, own.plan().hazards(), consent)?;
+            let needed = if own.plan().hazards().is_empty() {
                 Consent::Clean
             } else {
                 Consent::Discard
@@ -472,27 +487,79 @@ fn remove(svc: Services<'_>, name: &SessionName, consent: Consent) -> Result<Str
     })
 }
 
-/// Removing the session this runs in would kill the removal halfway, so
-/// hand it to a detached `agent rm` outside the session's process group.
-fn remove_own(name: &SessionName, consent: Consent) -> Result<String> {
-    let force = match consent {
-        Consent::Clean => None,
-        Consent::Discard => Some("--force"),
-    };
+/// Runs `agent <args>` in a process that outlives this one: outside the
+/// session's process group and without its name, so what it does to the
+/// session doesn't end it. Its output is dropped.
+fn detached_self(args: &[&str]) -> Result<()> {
     Command::new(std::env::current_exe().context("finding the agent binary")?)
-        .arg("rm")
-        .arg(name.as_str())
-        .args(force)
+        .args(args)
         .env_remove("ZELLIJ_SESSION_NAME")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .process_group(0)
         .spawn()
-        .context("starting the removal")?;
+        .with_context(|| format!("starting agent {}", args.join(" ")))?;
+    Ok(())
+}
+
+/// Removing the session this runs in would kill the removal halfway, so
+/// hand it to a detached `agent rm`.
+fn remove_own(name: &SessionName, consent: Consent) -> Result<String> {
+    let force = match consent {
+        Consent::Clean => None,
+        Consent::Discard => Some("--force"),
+    };
+    let args: Vec<&str> = ["rm", name.as_str()].into_iter().chain(force).collect();
+    detached_self(&args).context("starting the removal")?;
     Ok(format!(
         "removing {name} in the background. This session is about to end"
     ))
+}
+
+/// Restarting the session this runs in would end the restart halfway, so
+/// hand it to a detached `agent restart`, which reports a failure to the
+/// error log since nobody is reading its output.
+fn restart_own(name: &SessionName) -> Result<()> {
+    detached_self(&["restart", name.as_str(), "--force"]).context("starting the restart")
+}
+
+/// Asks `question` and reads a line of the answer.
+fn ask_line(question: &str) -> Result<String> {
+    print!("{question}");
+    std::io::stdout().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().lock().read_line(&mut answer)?;
+    Ok(answer.trim().to_string())
+}
+
+fn restart_command(svc: Services<'_>, target: restart::Target) -> Result<()> {
+    let terminal = if std::io::stdin().is_terminal() {
+        restart::Terminal::Attached
+    } else {
+        restart::Terminal::Absent
+    };
+    let mut ask = |question: &str| {
+        ask_line(question).is_ok_and(|answer| matches!(answer.as_str(), "y" | "Y" | "yes"))
+    };
+    let mut console = restart::Console {
+        terminal,
+        out: &mut std::io::stdout(),
+        err: &mut std::io::stderr(),
+        ask: &mut ask,
+        hand_over: &mut restart_own,
+    };
+    let done = match target {
+        restart::Target::All(policy) => restart::all(svc, policy, &mut console),
+        restart::Target::One(name, on_busy) => {
+            let name = infer_name(svc, name)?;
+            restart::one(svc, &name, on_busy, &mut console)
+        }
+    };
+    if let (Err(e), restart::Terminal::Absent) = (&done, terminal) {
+        svc.store.note(&format!("agent restart: {e:#}"));
+    }
+    done
 }
 
 fn rm_all(svc: Services<'_>, consent: Consent) -> Result<()> {
@@ -505,11 +572,7 @@ fn rm_all(svc: Services<'_>, consent: Consent) -> Result<()> {
     for wt in &worktrees {
         println!("  {}", wt.path().display());
     }
-    print!("type 'yes' to proceed: ");
-    std::io::stdout().flush()?;
-    let mut answer = String::new();
-    std::io::stdin().lock().read_line(&mut answer)?;
-    if answer.trim() != "yes" {
+    if ask_line("type 'yes' to proceed: ")? != "yes" {
         bail!("aborted");
     }
     let mut failed = 0;
@@ -757,6 +820,12 @@ fn main() -> Result<()> {
             println!("agent rm: {}", remove(svc, &name, consent(force))?);
             Ok(())
         }
+        Cmd::Restart {
+            name,
+            force,
+            all,
+            idle,
+        } => restart_command(svc, restart::Target::from_args(name, force, all, idle)),
         Cmd::Ls => ls(svc),
         Cmd::Add { path } => add(svc, path),
         Cmd::Forget { path } => forget(svc, path),

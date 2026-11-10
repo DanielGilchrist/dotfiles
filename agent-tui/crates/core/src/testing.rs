@@ -3,22 +3,49 @@
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
-use crate::activity::{Activity, Going, Reported, Stopped, TranscriptRef};
-use crate::model::{Head, Running, Worktree};
+use crate::activity::{Activity, Going, Input, MainEvent, Reported, Stopped, TranscriptRef};
+use crate::model::{Head, HostedWorktree, Running, Startable, Worktree};
 use crate::names::{BranchName, HostName, NameLimit, Prompt, PullRequest, SessionName};
-use crate::paths::{AgentWorktree, RepoRoot};
+use crate::ops::Services;
+use crate::paths::{AgentWorktree, Layout, RepoRoot};
 use crate::ports::{
     AgentRecord, BranchLog, BranchState, Change, Checkout, ClientControl, Compared, DiffBase,
     Fetch, FileDiff, Forge, Harness, HarnessError, HarnessId, Harnesses, HostError, LaunchCtx,
-    Listing, LocalBranch, Observation, PaneCommand, PendingPrompt, Probe, PullRequestHead,
-    RemoteBranch, RepoWorktrees, Seen, SessionHost, SessionInfo, SessionStatus, Store, StoreError,
-    TranscriptStamp, Unlisting, Vcs, WorktreeFacts, WorktreeStart,
+    Listing, LocalBranch, Lookup, Observation, PaneCommand, PendingPrompt, Probe, PullRequestHead,
+    RemoteBranch, RepoWorktrees, Seen, SessionHost, SessionInfo, SessionStatus, Stop, Store,
+    StoreError, Survivor, SurvivorState, TranscriptStamp, Unlisting, Vcs, WorktreeFacts,
+    WorktreeStart,
 };
 use crate::process::{CommandError, LaunchSpec};
+
+/// What the fakes did to the world, in order, so a test can assert that one
+/// port was used before another.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Step {
+    Kill(SessionName),
+    Stop(PathBuf),
+    Report(SessionName),
+    Create(SessionName),
+    Detach(SessionName),
+}
+
+/// Shared by the fakes of one test.
+#[derive(Debug, Clone, Default)]
+pub struct Journal(Arc<Mutex<Vec<Step>>>);
+
+impl Journal {
+    pub fn push(&self, step: Step) {
+        self.0.lock().expect("lock").push(step);
+    }
+
+    pub fn steps(&self) -> Vec<Step> {
+        self.0.lock().expect("lock").clone()
+    }
+}
 
 /// One repo whose agent worktrees are real directories (so `Layout::scan`
 /// finds them) with heads and branch states set by the test.
@@ -272,13 +299,58 @@ impl Forge for FakeForge {
 #[derive(Default)]
 pub struct FakeHost {
     pub sessions: Mutex<Vec<SessionInfo>>,
+    /// The panes sessions were created with. The journal says when.
     pub created: Mutex<Vec<(SessionName, PaneCommand)>>,
-    pub detached: Mutex<Vec<SessionName>>,
-    pub killed: Mutex<Vec<SessionName>>,
     pub deleted: Mutex<Vec<SessionName>>,
     pub written: Mutex<Vec<(SessionName, Vec<u8>)>>,
     /// Creating a session fails, as when the host can't be reached.
     pub create_fails: Mutex<bool>,
+    /// Killing a session fails.
+    pub kill_fails: Mutex<bool>,
+    /// Starting a session detached fails.
+    pub start_fails: Mutex<bool>,
+    /// How many listings still show a killed session running.
+    pub kill_lag: Mutex<usize>,
+    /// How many listings go by before a session started detached shows.
+    pub start_lag: Mutex<usize>,
+    lagging: Mutex<Vec<Lag>>,
+    pub journal: Journal,
+}
+
+/// A session the host lists as it was for a few more listings.
+struct Lag {
+    name: SessionName,
+    listings: usize,
+    shown: Option<SessionStatus>,
+}
+
+impl FakeHost {
+    pub fn with(journal: Journal) -> Self {
+        Self {
+            journal,
+            ..Self::default()
+        }
+    }
+
+    /// Sessions killed, in order.
+    pub fn killed(&self) -> Vec<SessionName> {
+        self.named(|step| match step {
+            Step::Kill(name) => Some(name),
+            _ => None,
+        })
+    }
+
+    /// Sessions started detached, in order.
+    pub fn detached(&self) -> Vec<SessionName> {
+        self.named(|step| match step {
+            Step::Detach(name) => Some(name),
+            _ => None,
+        })
+    }
+
+    fn named(&self, pick: impl Fn(Step) -> Option<SessionName>) -> Vec<SessionName> {
+        self.journal.steps().into_iter().filter_map(pick).collect()
+    }
 }
 
 pub const NAME_LIMIT: NameLimit = NameLimit::new(NonZeroUsize::new(20).expect("nonzero"));
@@ -289,7 +361,20 @@ impl SessionHost for FakeHost {
     }
 
     fn sessions(&self) -> Result<Vec<SessionInfo>, HostError> {
-        Ok(self.sessions.lock().expect("lock").clone())
+        let mut listed = self.sessions.lock().expect("lock").clone();
+        let mut lagging = self.lagging.lock().expect("lock");
+        for lag in lagging.iter_mut().filter(|lag| lag.listings > 0) {
+            lag.listings -= 1;
+            listed.retain(|s| s.name != lag.name);
+            if let Some(status) = lag.shown.clone() {
+                listed.push(SessionInfo {
+                    name: lag.name.clone(),
+                    status,
+                });
+            }
+        }
+        lagging.retain(|lag| lag.listings > 0);
+        Ok(listed)
     }
 
     fn attach(&self, name: &SessionName) -> LaunchSpec {
@@ -313,6 +398,7 @@ impl SessionHost for FakeHost {
             });
         }
         let name = name.session();
+        self.journal.push(Step::Create(name.clone()));
         self.created
             .lock()
             .expect("succeeds")
@@ -321,13 +407,54 @@ impl SessionHost for FakeHost {
     }
 
     fn start_detached(&self, name: &SessionName) -> Result<(), HostError> {
-        self.detached.lock().expect("lock").push(name.clone());
+        self.journal.push(Step::Detach(name.clone()));
+        if *self.start_fails.lock().expect("lock") {
+            return Err(HostError::Io {
+                context: format!("starting {name} detached"),
+                source: std::io::Error::other("no host"),
+            });
+        }
+        let mut sessions = self.sessions.lock().expect("lock");
+        sessions.retain(|s| &s.name != name);
+        sessions.push(SessionInfo {
+            name: name.clone(),
+            status: SessionStatus::Live { cwd: None },
+        });
+        let listings = std::mem::take(&mut *self.start_lag.lock().expect("lock"));
+        if listings > 0 {
+            self.lagging.lock().expect("lock").push(Lag {
+                name: name.clone(),
+                listings,
+                shown: None,
+            });
+        }
         Ok(())
     }
 
     fn kill(&self, session: &Running) -> Result<(), HostError> {
         let name = session.name();
-        self.killed.lock().expect("lock").push(name.clone());
+        self.journal.push(Step::Kill(name.clone()));
+        if *self.kill_fails.lock().expect("lock") {
+            return Err(HostError::Io {
+                context: format!("killing {name}"),
+                source: std::io::Error::other("no host"),
+            });
+        }
+        let listings = std::mem::take(&mut *self.kill_lag.lock().expect("lock"));
+        if listings > 0 {
+            let cwd = self
+                .sessions
+                .lock()
+                .expect("lock")
+                .iter()
+                .find(|s| &s.name == name)
+                .and_then(|s| s.cwd().map(Path::to_path_buf));
+            self.lagging.lock().expect("lock").push(Lag {
+                name: name.clone(),
+                listings,
+                shown: Some(SessionStatus::Live { cwd }),
+            });
+        }
         for s in self
             .sessions
             .lock()
@@ -381,6 +508,16 @@ pub struct MemStore {
     /// Applying a report fails, as when the state directory can't be written.
     pub report_fails: Mutex<bool>,
     pub notes: Mutex<Vec<String>>,
+    pub journal: Journal,
+}
+
+impl MemStore {
+    pub fn with(journal: Journal) -> Self {
+        Self {
+            journal,
+            ..Self::default()
+        }
+    }
 }
 
 impl Store for MemStore {
@@ -425,6 +562,7 @@ impl Store for MemStore {
     }
 
     fn report(&self, name: &SessionName, event: Reported) -> Result<(), StoreError> {
+        self.journal.push(Step::Report(name.clone()));
         if *self.report_fails.lock().expect("lock") {
             return Err(StoreError::Io {
                 path: std::path::PathBuf::from("/state"),
@@ -502,6 +640,31 @@ impl Store for MemStore {
     }
 }
 
+/// What stopping a fake's survivor does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stopping {
+    Works,
+    /// It reports an error and the process keeps running.
+    Fails,
+    /// It reports success and the process keeps running.
+    Ignored,
+}
+
+/// A process a fake harness left running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Lurking {
+    /// Stoppable at once.
+    Survivor(SurvivorState),
+    /// Alive but not stoppable for this many more lookups.
+    Appears { after: usize, state: SurvivorState },
+    /// Alive and never stoppable, like a process still in its terminal.
+    Interactive(SurvivorState),
+    /// Alive in a terminal in another directory.
+    Elsewhere,
+}
+
+type Lurkers = Arc<Mutex<HashMap<PathBuf, Lurking>>>;
+
 /// Launches `fake [bootstrap]`. Submits a prompt followed by a carriage
 /// return. Reports activity when told to.
 pub struct FakeHarness {
@@ -509,14 +672,62 @@ pub struct FakeHarness {
     pub active: AtomicBool,
     /// What every probe of a transcript finds.
     pub probe: Mutex<Probe>,
+    /// Processes left running after their session was killed, by workdir.
+    pub survivors: Lurkers,
+    pub stop: Arc<Mutex<Stopping>>,
+    /// Looking for a survivor fails, as when its registry can't be read.
+    pub lookup_fails: AtomicBool,
+    pub journal: Journal,
 }
 
 impl Default for FakeHarness {
     fn default() -> Self {
+        Self::with(Journal::default())
+    }
+}
+
+impl FakeHarness {
+    pub fn with(journal: Journal) -> Self {
         Self {
             id: "fake".parse().expect("parses"),
             active: AtomicBool::new(false),
             probe: Mutex::new(Probe::NoTranscript),
+            survivors: Lurkers::default(),
+            stop: Arc::new(Mutex::new(Stopping::Works)),
+            lookup_fails: AtomicBool::new(false),
+            journal,
+        }
+    }
+
+    pub fn lurk(&self, workdir: &Path, lurking: Lurking) {
+        self.survivors
+            .lock()
+            .expect("lock")
+            .insert(workdir.to_path_buf(), lurking);
+    }
+}
+
+struct FakeProcess {
+    workdir: PathBuf,
+    survivors: Lurkers,
+    stop: Arc<Mutex<Stopping>>,
+    journal: Journal,
+}
+
+impl Stop for FakeProcess {
+    fn stop(self: Box<Self>) -> Result<(), HarnessError> {
+        self.journal.push(Step::Stop(self.workdir.clone()));
+        let stopping = *self.stop.lock().expect("lock");
+        match stopping {
+            Stopping::Works => {
+                self.survivors.lock().expect("lock").remove(&self.workdir);
+                Ok(())
+            }
+            Stopping::Fails => Err(HarnessError {
+                context: "stopping the fake".into(),
+                source: std::io::Error::other("still running"),
+            }),
+            Stopping::Ignored => Ok(()),
         }
     }
 }
@@ -545,6 +756,37 @@ impl Harness for FakeHarness {
         format!("{prompt}\r").into_bytes()
     }
 
+    fn survivor(&self, workdir: &Path, _: Option<&TranscriptRef>) -> Result<Lookup, HarnessError> {
+        if self.lookup_fails.load(Ordering::SeqCst) {
+            return Err(HarnessError {
+                context: "reading the registry".into(),
+                source: std::io::Error::other("unreadable"),
+            });
+        }
+        let mut lurkers = self.survivors.lock().expect("lock");
+        let process = || {
+            Box::new(FakeProcess {
+                workdir: workdir.to_path_buf(),
+                survivors: Arc::clone(&self.survivors),
+                stop: Arc::clone(&self.stop),
+                journal: self.journal.clone(),
+            })
+        };
+        Ok(match lurkers.get_mut(workdir) {
+            None => Lookup::Gone,
+            Some(Lurking::Survivor(state)) => Lookup::Survivor(Survivor::new(*state, process())),
+            Some(Lurking::Appears { after, state }) if *after == 0 => {
+                Lookup::Survivor(Survivor::new(*state, process()))
+            }
+            Some(Lurking::Appears { after, state }) => {
+                *after -= 1;
+                Lookup::NotYet(*state)
+            }
+            Some(Lurking::Interactive(state)) => Lookup::NotYet(*state),
+            Some(Lurking::Elsewhere) => Lookup::Elsewhere,
+        })
+    }
+
     fn interruption(
         &self,
         _: &TranscriptRef,
@@ -569,5 +811,135 @@ impl Harnesses for FakeHarnesses {
 
     fn all(&self) -> Vec<&dyn Harness> {
         vec![&self.0]
+    }
+}
+
+/// What an agent in a [`World`] is doing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Doing {
+    Idle,
+    Working,
+}
+
+/// Every in-memory port, wired to one [`Journal`], with a temp directory for
+/// the agent worktrees.
+pub struct World {
+    _dir: tempfile::TempDir,
+    pub vcs: FakeVcs,
+    pub forge: FakeForge,
+    pub host: FakeHost,
+    pub store: MemStore,
+    pub harnesses: FakeHarnesses,
+    pub layout: Layout,
+    pub exe: PathBuf,
+    pub own: Option<SessionName>,
+}
+
+impl World {
+    pub fn new() -> Self {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let root = dir.path().join("src/api");
+        std::fs::create_dir_all(&root).expect("creates");
+        let journal = Journal::default();
+        Self {
+            host: FakeHost::with(journal.clone()),
+            store: MemStore::with(journal.clone()),
+            harnesses: FakeHarnesses(FakeHarness::with(journal)),
+            vcs: FakeVcs::new(&root),
+            forge: FakeForge::default(),
+            layout: Layout::new(dir.path().join("w")).expect("absolute"),
+            exe: "/bin/agent".into(),
+            own: None,
+            _dir: dir,
+        }
+    }
+
+    pub fn svc(&self) -> Services<'_> {
+        Services {
+            vcs: &self.vcs,
+            forge: &self.forge,
+            host: &self.host,
+            store: &self.store,
+            harnesses: &self.harnesses,
+            layout: &self.layout,
+            exe: &self.exe,
+            own: self.own.as_ref(),
+        }
+    }
+
+    pub fn harness(&self) -> &dyn Harness {
+        &self.harnesses.0
+    }
+
+    pub fn journal(&self) -> &Journal {
+        &self.host.journal
+    }
+
+    pub fn add_session(&self, name: &str, status: SessionStatus) {
+        self.host.sessions.lock().expect("lock").push(SessionInfo {
+            name: name.parse().expect("parses"),
+            status,
+        });
+    }
+
+    pub fn existing_worktree(&self, name: &str) -> AgentWorktree {
+        let wt = self
+            .layout
+            .worktree(&self.vcs.root, name.parse().expect("parses"));
+        self.vcs
+            .add_worktree(&self.vcs.root, &wt, &WorktreeStart::DefaultBase)
+            .expect("succeeds");
+        wt
+    }
+
+    /// An agent with a record, a live session and an activity.
+    pub fn agent(&self, name: &str, doing: Doing) -> Startable {
+        let wt = self.existing_worktree(name);
+        let session: SessionName = name.parse().expect("parses");
+        self.store
+            .put_record(
+                &session,
+                &AgentRecord::new(self.harness().id().clone(), None),
+            )
+            .expect("stores");
+        self.add_session(name, SessionStatus::Live { cwd: None });
+        let event = match doing {
+            Doing::Idle => MainEvent::Finished {
+                summary: None,
+                running: Vec::new(),
+            },
+            Doing::Working => MainEvent::Prompted(Input::User("go".into())),
+        };
+        self.store.activities.lock().expect("lock").insert(
+            session,
+            Activity::next(None, Reported::main(event), SystemTime::UNIX_EPOCH),
+        );
+        Startable::worktree(HostedWorktree::admit(NAME_LIMIT, wt).expect("admitted"))
+    }
+
+    /// An agent whose session exited.
+    pub fn exited(&self, name: &str) -> Startable {
+        let at = self.agent(name, Doing::Idle);
+        let session: SessionName = name.parse().expect("parses");
+        self.host
+            .sessions
+            .lock()
+            .expect("lock")
+            .retain(|s| s.name != session);
+        self.add_session(name, SessionStatus::Exited { cwd: None });
+        at
+    }
+
+    /// An agent whose session exited, leaving a harness process running.
+    pub fn ghost(&self, name: &str, lurking: Lurking) -> Startable {
+        let at = self.exited(name);
+        self.harnesses.0.lurk(at.cwd(), lurking);
+        at
+    }
+}
+
+impl Default for World {
+    fn default() -> Self {
+        Self::new()
     }
 }

@@ -17,14 +17,17 @@ use ratatui::{Frame, Terminal};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use agent_core::activity::Busy;
+use agent_core::ops::{End, Fleet, Interrupts, Restart};
+
 use crate::cause::Cause;
 use crate::keymap::{self, Situation};
 use crate::model::{
-    AgentStatus, Areas, Blocked, Confirm, Derived, Drawn, Enter, Field, Focus, FormKind, HelpState,
-    Launchable, Load, Model, NameCheck, NameSource, NamingState, NewAgent, OfferEffect, Overlay,
-    Pane, Peek, Phase, Proposal, Pulse, Query, Reach, RepoInput, Row, Screen, StatusKind,
-    Submission, Unsent, View, Waiting, Watch, WatchView, Windows, WorkRoom, elsewhere_banner,
-    elsewhere_note, fuzzy_match, invalid_chars, repo_matches,
+    AgentStatus, Areas, Blocked, Confirm, Derived, Drawn, Enter, Field, FleetAsk, Focus, FormKind,
+    HelpState, Launchable, Load, Model, NameCheck, NameSource, NamingState, NewAgent, OfferEffect,
+    Overlay, Pane, Peek, Phase, Planning, Proposal, Pulse, Query, Reach, RepoInput, RestartAsk,
+    Row, Screen, StatusKind, Submission, Unsent, View, Waiting, Watch, WatchView, Windows,
+    WorkRoom, elsewhere_banner, elsewhere_note, fuzzy_match, invalid_chars, repo_matches,
 };
 use crate::palette::Palette;
 use crate::track::Compose;
@@ -173,6 +176,7 @@ fn glyph(status: &AgentStatus, now: SystemTime) -> Span<'static> {
         AgentStatus::Exited => Span::styled("○", dim()),
         AgentStatus::Idle => Span::raw("●"),
         AgentStatus::Starting { .. }
+        | AgentStatus::Restarting
         | AgentStatus::Working {
             pulse: Pulse::Steady,
             ..
@@ -197,6 +201,7 @@ fn name_style(status: &AgentStatus, selected: bool) -> Style {
         }
         AgentStatus::Idle
         | AgentStatus::Starting { .. }
+        | AgentStatus::Restarting
         | AgentStatus::Working { .. }
         | AgentStatus::Interrupted { .. } => Style::new(),
     };
@@ -382,7 +387,7 @@ pub fn draw(frame: &mut Frame<'_>, m: &Model) -> Drawn {
         Overlay::New(form) => draw_new(frame, m, form),
         Overlay::Switcher(query) => drawn.overlay_offset = draw_switcher(frame, m, query),
         Overlay::Picker(query) => drawn.overlay_offset = Some(draw_picker(frame, m, query)),
-        Overlay::Confirm(confirm) => draw_confirm(frame, confirm),
+        Overlay::Confirm(confirm) => draw_confirm(frame, confirm, m.clock.wall),
         Overlay::Help(help) => drawn.overlay_offset = Some(draw_help(frame, m, help)),
         Overlay::Actions(target) => draw_actions(frame, m, target),
         Overlay::Talk(to) => draw_talk(frame, m, to),
@@ -395,7 +400,7 @@ pub fn draw(frame: &mut Frame<'_>, m: &Model) -> Drawn {
                 draft.rev.as_ref(),
             );
         }
-        Overlay::Planning { name, .. } => draw_planning(frame, m.clock.wall, name),
+        Overlay::Planning { planning, .. } => draw_planning(frame, m.clock.wall, planning),
     }
     drawn
 }
@@ -618,6 +623,7 @@ fn draw_terminal(frame: &mut Frame<'_>, m: &Model, area: Rect) {
         (_, _, Some((repo, None))) => action("⏎", format!("focus {}", repo.name())),
         (_, _, Some((_, Some(entry)))) => match m.reach(entry) {
             Reach::Own => Line::styled("this TUI runs here", dim()),
+            Reach::Restarting => Line::styled(format!("restarting {}…", entry.name()), dim()),
             Reach::Other {
                 enter: Enter::Attach,
                 ..
@@ -760,17 +766,14 @@ fn draw_status_bar(frame: &mut Frame<'_>, m: &Model, area: Rect) {
     let width = usize::from(area.width);
     drop_to_fit(&mut hints, width.saturating_sub(badge_width));
     let room_for_status = width.saturating_sub(badge_width + hints_width(&hints) + 3);
-    let mut status = match &m.status {
-        Some(status) if room_for_status > 0 => {
-            let style = if status.kind == StatusKind::Error {
+    let mut status = match m.shown_status() {
+        Some((text, kind)) if room_for_status > 0 => {
+            let style = if kind == StatusKind::Error {
                 error()
             } else {
                 Style::new()
             };
-            let mut spans = fit(
-                vec![Span::styled(status.text.clone(), style)],
-                room_for_status,
-            );
+            let mut spans = fit(vec![Span::styled(text, style)], room_for_status);
             spans.push(Span::raw(" "));
             spans
         }
@@ -1541,7 +1544,7 @@ struct ConfirmCard {
     border: Style,
 }
 
-fn confirm_card(confirm: &Confirm) -> ConfirmCard {
+fn confirm_card(confirm: &Confirm, now: SystemTime) -> ConfirmCard {
     let warn = warning();
     let danger = error();
     let destructive = |key: &'static str, desc: &'static str| {
@@ -1573,6 +1576,8 @@ fn confirm_card(confirm: &Confirm) -> ConfirmCard {
             [destructive("y/⏎", "quit"), hints(&[("n/Esc", "stay")])].concat(),
             warn,
         ),
+        Confirm::Restart(ask) => restart_card(ask, now),
+        Confirm::Restarts(ask) => restarts_card(ask, now),
         Confirm::Remove(proposal) => {
             let plan = proposal.plan();
             let mut body = vec![match plan.deletes() {
@@ -1627,9 +1632,159 @@ fn confirm_card(confirm: &Confirm) -> ConfirmCard {
     }
 }
 
+fn interrupt_glyph(interrupts: Interrupts, now: SystemTime) -> Span<'static> {
+    match interrupts {
+        Interrupts::Session(Busy::Asking) => {
+            Span::styled("◆", warning().add_modifier(Modifier::BOLD))
+        }
+        Interrupts::Session(Busy::Delegating) => Span::raw("↳"),
+        Interrupts::Session(Busy::Working | Busy::Booting) | Interrupts::Survivor => {
+            Span::raw(spinner(now))
+        }
+    }
+}
+
+type Card = (String, Vec<Line<'static>>, Vec<Span<'static>>, Style);
+
+/// The key that goes ahead with something that interrupts or destroys, which
+/// is BOLD Red so it differs from the border.
+fn go_ahead(key: &'static str, what: &str) -> Vec<Span<'static>> {
+    vec![
+        Span::styled(key, error().add_modifier(Modifier::BOLD)),
+        Span::styled(format!(" {what}"), dim()),
+        Span::raw("  "),
+    ]
+}
+
+fn restart_card(ask: &RestartAsk, now: SystemTime) -> Card {
+    let plan = ask.plan();
+    let mut body = Vec::new();
+    match plan.interrupts() {
+        Some(interrupts) => {
+            body.push(Line::from(vec![
+                interrupt_glyph(interrupts, now),
+                Span::raw(format!(" {}", interrupts.label())),
+            ]));
+            body.push(Line::raw("The activity stops. The conversation resumes."));
+        }
+        None => body.push(Line::raw(format!(
+            "Restarts {}. The conversation resumes.",
+            plan.label()
+        ))),
+    }
+    if let Some(windows) = &ask.windows {
+        body.push(Line::styled(
+            format!("{} · its window disconnects", elsewhere_note(windows)),
+            warning(),
+        ));
+    }
+    let keys = [go_ahead("y/⏎", "restart"), hints(&[("n/Esc", "cancel")])].concat();
+    (format!("Restart {}?", plan.name()), body, keys, warning())
+}
+
+const BUSY_LISTED: usize = 5;
+
+/// One row per busy agent, up to [`BUSY_LISTED`].
+fn busy_rows(fleet: &Fleet, now: SystemTime) -> Vec<Line<'static>> {
+    let mut rows: Vec<Line<'static>> = fleet
+        .busy()
+        .iter()
+        .take(BUSY_LISTED)
+        .map(|b| {
+            let plan = b.plan();
+            let what = match plan.end() {
+                End::Started => b.interrupts().label().to_string(),
+                End::LeftExited => format!("{} working, stays exited", plan.label()),
+            };
+            Line::from(vec![
+                interrupt_glyph(b.interrupts(), now),
+                Span::raw(format!(" {}  {what}", plan.name())),
+            ])
+        })
+        .collect();
+    if fleet.busy().len() > BUSY_LISTED {
+        rows.push(Line::styled(
+            format!("+{} more busy", fleet.busy().len() - BUSY_LISTED),
+            dim(),
+        ));
+    }
+    rows
+}
+
+/// The line after the busy rows: the idle agents, the exited ones whose
+/// harness is stopped, and what else the user should know.
+fn fleet_summary(ask: &FleetAsk) -> Option<String> {
+    let mut parts = Vec::new();
+    let (stopping, running): (Vec<_>, Vec<_>) = ask
+        .fleet
+        .idle()
+        .iter()
+        .map(Restart::plan)
+        .partition(|plan| plan.end() == End::LeftExited);
+    if !running.is_empty() {
+        parts.push(format!("{} idle", running.len()));
+    }
+    if !stopping.is_empty() {
+        let mut labels: Vec<_> = stopping.iter().map(|plan| plan.label()).collect();
+        labels.sort_unstable();
+        labels.dedup();
+        parts.push(format!(
+            "{} exited stop their {}",
+            stopping.len(),
+            labels.join("/")
+        ));
+    }
+    if ask.elsewhere > 0 {
+        parts.push(format!(
+            "{} open in other windows, which disconnect",
+            ask.elsewhere
+        ));
+    }
+    if ask.fleet.own().is_some() {
+        parts.push("this TUI's session stays".to_string());
+    }
+    let unplanned = ask.fleet.unplanned().len();
+    if unplanned > 0 {
+        parts.push(format!("{unplanned} can't be checked"));
+    }
+    (!parts.is_empty()).then(|| format!("{}.", parts.join(". ")))
+}
+
+fn restarts_card(ask: &FleetAsk, now: SystemTime) -> Card {
+    let fleet = &ask.fleet;
+    let mut body = busy_rows(fleet, now);
+    body.extend(fleet_summary(ask).map(Line::raw));
+    body.push(Line::styled(
+        if fleet.busy().is_empty() {
+            "Conversations resume."
+        } else {
+            "Busy ones stop mid-activity. Conversations resume."
+        },
+        dim(),
+    ));
+    let mut keys = go_ahead("y", &format!("restart {}", fleet.total()));
+    if !fleet.busy().is_empty() {
+        keys.push(Span::raw("i"));
+        keys.push(Span::styled(
+            format!(" idle only ({})", fleet.idle().len()),
+            dim(),
+        ));
+        keys.push(Span::raw("  "));
+    }
+    keys.extend(hints(&[("n/Esc", "cancel")]));
+    (fleet.title(), body, keys, warning())
+}
+
 fn unsent_words(unsent: Unsent) -> String {
     let plural = |n: usize, what: &str| format!("{n} {what}{}", if n == 1 { "" } else { "s" });
     let mut parts = Vec::new();
+    if unsent.restarts > 0 {
+        parts.push(format!(
+            "{} queued restart{} would not run",
+            unsent.restarts,
+            if unsent.restarts == 1 { "" } else { "s" }
+        ));
+    }
     if unsent.comments > 0 {
         parts.push(plural(unsent.comments, "draft comment"));
     }
@@ -1639,13 +1794,13 @@ fn unsent_words(unsent: Unsent) -> String {
     parts.join(" and ")
 }
 
-fn draw_confirm(frame: &mut Frame<'_>, confirm: &Confirm) {
+fn draw_confirm(frame: &mut Frame<'_>, confirm: &Confirm, now: SystemTime) {
     let ConfirmCard {
         title,
         body,
         keys,
         border,
-    } = confirm_card(confirm);
+    } = confirm_card(confirm, now);
     let content = body
         .iter()
         .map(Line::width)
@@ -1674,22 +1829,15 @@ fn draw_confirm(frame: &mut Frame<'_>, confirm: &Confirm) {
     frame.render_widget(paragraph.block(overlay_block(&title, keys, border)), area);
 }
 
-fn draw_planning(frame: &mut Frame<'_>, now: SystemTime, name: &SessionName) {
+fn draw_planning(frame: &mut Frame<'_>, now: SystemTime, planning: &Planning) {
     let line = Line::from(vec![
         Span::raw(" "),
-        Span::styled(
-            format!("{} checking what would be lost…", spinner(now)),
-            dim(),
-        ),
+        Span::styled(format!("{} {}", spinner(now), planning.checking()), dim()),
     ]);
     let width = u16::try_from(line.width() + 6).unwrap_or(u16::MAX);
     let area = centred(frame, width.max(30), 3);
     clear_around(frame, area);
-    let block = overlay_block(
-        &format!("Remove {name}"),
-        hints(&[("Esc", "cancel")]),
-        warning(),
-    );
+    let block = overlay_block(&planning.title(), hints(&[("Esc", "cancel")]), warning());
     frame.render_widget(Paragraph::new(line).block(block), area);
 }
 

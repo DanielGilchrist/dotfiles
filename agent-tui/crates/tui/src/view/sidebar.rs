@@ -122,6 +122,7 @@ enum Gist<'a> {
         target: Option<&'a Target>,
     },
     Starting,
+    Restarting,
     Thinking,
     Delegating {
         subagents: NonZeroUsize,
@@ -138,6 +139,7 @@ enum Gist<'a> {
 }
 
 const STARTING: &str = "starting";
+const RESTARTING: &str = "restarting";
 
 impl<'a> Gist<'a> {
     /// Settled agents (idle, exited, no session) have none. `heard` is when
@@ -150,6 +152,7 @@ impl<'a> Gist<'a> {
             AgentStatus::Failed { failure, .. } => Some(Self::Failed(failure)),
             AgentStatus::Done { summary, .. } => Some(Self::Done(summary.as_deref())),
             AgentStatus::Starting { .. } => Some(Self::Starting),
+            AgentStatus::Restarting => Some(Self::Restarting),
             AgentStatus::Working { doing, .. } => Some(match doing {
                 Doing::Thinking => Self::Thinking,
                 Doing::Tool { name, target } => Self::Tool {
@@ -184,6 +187,7 @@ impl<'a> Gist<'a> {
             (Self::Failed(failure), _) => gist_of(failure_text(failure)),
             (Self::Tool { name, target }, form) => tool_line(name, *target, form, width),
             (Self::Starting, _) => (STARTING.to_string(), Shown::Whole),
+            (Self::Restarting, _) => (RESTARTING.to_string(), Shown::Whole),
             (Self::Thinking, _) => ("thinking".to_string(), Shown::Whole),
             (Self::Delegating { subagents, quiet }, Form::Long) => {
                 let noun = if subagents.get() == 1 {
@@ -232,6 +236,7 @@ impl<'a> Gist<'a> {
             } => format!("{name}  {}", target_text(target)),
             Self::Tool { name, target: None } => (*name).to_string(),
             Self::Starting => STARTING.to_string(),
+            Self::Restarting => RESTARTING.to_string(),
             Self::Thinking => "thinking".to_string(),
             Self::HandingBack => "handing back".to_string(),
             Self::Done(Some(summary)) => without_markdown(summary),
@@ -625,7 +630,10 @@ fn time_in_state(status: &AgentStatus, now: SystemTime) -> Vec<Span<'static>> {
         | AgentStatus::Failed { since, .. }
         | AgentStatus::Done { since, .. }
         | AgentStatus::Interrupted { since } => vec![Span::styled(ago(*since, now), dim())],
-        AgentStatus::NoSession | AgentStatus::Exited | AgentStatus::Idle => Vec::new(),
+        AgentStatus::NoSession
+        | AgentStatus::Exited
+        | AgentStatus::Idle
+        | AgentStatus::Restarting => Vec::new(),
     }
 }
 
@@ -638,6 +646,7 @@ fn settled_counts(m: &Model, repo: &Repo) -> (usize, usize) {
         .fold((0, 0), |(live, exited), entry| match m.status(entry) {
             AgentStatus::Idle
             | AgentStatus::Starting { .. }
+            | AgentStatus::Restarting
             | AgentStatus::Working { .. }
             | AgentStatus::Interrupted { .. } => (live + 1, exited),
             AgentStatus::Exited => (live, exited + 1),
@@ -2792,6 +2801,82 @@ mod tests {
 
     type Surface = (Focused, fn(&Model) -> Overlay);
 
+    use agent_core::ports::SurvivorState;
+    use agent_core::testing::{Doing, Lurking};
+
+    fn restart_of_a_busy_agent(m: &Model) -> Overlay {
+        let world = agent_core::testing::World::new();
+        let plan = crate::fixtures::restart_plan(&world, "payroll-fix", Doing::Working);
+        let windows = m
+            .company(&name("payroll-fix"))
+            .windows()
+            .cloned()
+            .or_else(|| Some(crate::model::Windows::unknown()));
+        Overlay::Confirm(crate::model::Confirm::Restart(Box::new(
+            crate::model::RestartAsk {
+                go: plan.approve(),
+                windows,
+            },
+        )))
+    }
+
+    fn restart_of_the_fleet(_: &Model) -> Overlay {
+        let world = agent_core::testing::World::new();
+        for who in ["a-1", "a-2", "a-3", "a-4", "a-5", "a-6", "a-7"] {
+            world.agent(who, Doing::Working);
+        }
+        world.agent("idle-1", Doing::Idle);
+        world.ghost("ghost-1", Lurking::Survivor(SurvivorState::Idle));
+        Overlay::Confirm(crate::model::Confirm::Restarts(Box::new(
+            crate::model::FleetAsk {
+                fleet: crate::fixtures::restart_fleet(&world),
+                elsewhere: 1,
+            },
+        )))
+    }
+
+    #[test]
+    fn the_restart_confirmations_fit_every_size_and_name_their_keys() {
+        for size in SIZES {
+            let screen = |overlay: fn(&Model) -> Overlay| {
+                let mut m = fleet(8);
+                m.overlay = overlay(&m);
+                let terminal = render(&mut m, size);
+                let buffer = terminal.backend().buffer();
+                (0..buffer.area.height)
+                    .map(|y| {
+                        (0..buffer.area.width)
+                            .map(|x| buffer[(x, y)].symbol().to_string())
+                            .collect::<String>()
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            let one = screen(restart_of_a_busy_agent);
+            for wanted in [
+                "Restart payroll-fix?",
+                "working",
+                "its window disconnects",
+                "y/⏎ restart",
+                "n/Esc cancel",
+            ] {
+                assert!(one.contains(wanted), "{wanted:?} at {size:?}\n{one}");
+            }
+            let all = screen(restart_of_the_fleet);
+            for wanted in [
+                "Restart 8 · stop 1 exited · 7 busy",
+                "+2 more busy",
+                "1 idle",
+                "1 exited stop their fake",
+                "y restart 9",
+                "i idle only (2)",
+                "n/Esc cancel",
+            ] {
+                assert!(all.contains(wanted), "{wanted:?} at {size:?}\n{all}");
+            }
+        }
+    }
+
     fn checkout_of_a_link_to_another_repo(m: &Model) -> Overlay {
         let mut form = crate::model::NewAgent::new(
             crate::model::FormKind::Checkout,
@@ -2859,13 +2944,15 @@ mod tests {
         let palette = SENTINEL;
         let ours = [1, 2, 3, 4, 5].map(|n| Some(Color::Rgb(n, n, n)));
         for size in SIZES {
-            let cases: [Surface; 4] = [
+            let cases: [Surface; 6] = [
                 (Focused::Agents, |_| Overlay::None),
                 (Focused::activity(), |_| Overlay::None),
                 (Focused::Agents, |_| {
                     Overlay::Help(crate::model::HelpState::default())
                 }),
                 (Focused::Agents, checkout_of_a_link_to_another_repo),
+                (Focused::Agents, restart_of_a_busy_agent),
+                (Focused::Agents, restart_of_the_fleet),
             ];
             for (panel, overlay) in cases {
                 let mut m = fleet(8);

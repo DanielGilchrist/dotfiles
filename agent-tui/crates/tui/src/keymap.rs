@@ -167,6 +167,7 @@ pub struct AgentKeys {
     pub enter: Option<&'static str>,
     pub kill: Avail,
     pub remove: Avail,
+    pub restart: Avail,
     pub send: Avail,
     pub peek: Avail,
     pub actions: Avail,
@@ -241,6 +242,7 @@ struct ReachKeys {
     enter: Option<&'static str>,
     kill: Avail,
     remove: Avail,
+    restart: Avail,
     peek: Avail,
 }
 
@@ -251,18 +253,21 @@ fn reach_keys(reach: &Reach, moves_here: bool) -> ReachKeys {
             enter,
             kill,
             remove,
+            restart,
         } => ReachKeys {
             enter: enter
                 .verb()
                 .map(|verb| if moves_here { MOVE_HERE } else { verb }),
             kill: Avail::of(kill.as_ref()),
             remove: Avail::of(remove.as_ref()),
+            restart: Avail::from(restart.is_ok()),
             peek,
         },
-        Reach::Own => ReachKeys {
+        Reach::Own | Reach::Restarting => ReachKeys {
             enter: None,
             kill: Avail::Absent,
             remove: Avail::Absent,
+            restart: Avail::Absent,
             peek,
         },
     }
@@ -463,12 +468,14 @@ impl Situation {
             enter,
             kill,
             remove,
+            restart,
             peek,
         } = reach_keys(&reach, moves_here);
         AgentKeys {
             enter,
             kill,
             remove,
+            restart,
             send: Avail::from(m.reachable(entry).is_ok()),
             peek,
             actions: Avail::from(!m.actions.is_empty()),
@@ -945,6 +952,20 @@ pub const BINDINGS: &[Binding] = &[
         "Remove the session, worktree and branch. It lists anything that would be lost and asks first.",
     ),
     Binding::new(
+        &["r"],
+        PANELS,
+        RankBy(|s| s.can(|a| a.restart).then_some(0)),
+        By(|s| s.can(|a| a.restart).then_some("restart")),
+        "Restart the agent's harness so it runs the installed version, then resume its conversation. It asks first only if that would interrupt the agent or close another window showing it.",
+    ),
+    Binding::new(
+        &["R"],
+        PANELS,
+        Hidden,
+        Say("restart all"),
+        "Restart every agent's harness, resuming each conversation. It lists the agents it would interrupt and asks first. An exited agent whose harness still runs has it stopped and stays exited.",
+    ),
+    Binding::new(
         &["x"],
         PANELS,
         RankBy(|s| s.can(|a| a.actions).then_some(0)),
@@ -1112,6 +1133,7 @@ mod tests {
             enter: Some("attach"),
             kill: Avail::Offered,
             remove: Avail::Offered,
+            restart: Avail::Offered,
             send: Avail::Offered,
             peek: Avail::Offered,
             actions: Avail::Offered,
@@ -1193,6 +1215,28 @@ mod tests {
                 .any(|r| r.keys == "e" && r.label == "edit transcript")
         );
         assert!(labels.iter().all(|r| r.label != "edit checkout"));
+    }
+
+    #[test]
+    fn restart_is_offered_where_the_agent_can_be_restarted_and_restart_all_only_in_the_help() {
+        let on = |restart| Situation {
+            selected: Selected::Agent(AgentKeys {
+                restart,
+                ..agent_keys()
+            }),
+            ..situation(Ctx::Agents)
+        };
+        assert_eq!(hint(&on(Avail::Offered), "r"), Some("restart"));
+        assert_eq!(hint(&on(Avail::Absent), "r"), None);
+        assert_eq!(hint(&on(Avail::Offered), "R"), None, "R is help only");
+        let listed = help(&on(Avail::Offered), "⌃\\", "");
+        assert!(
+            listed
+                .local
+                .iter()
+                .chain(&listed.global)
+                .any(|r| r.keys == "R" && r.label == "restart all")
+        );
     }
 
     #[test]

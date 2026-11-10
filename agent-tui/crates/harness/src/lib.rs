@@ -1,6 +1,7 @@
 use std::ffi::OsString;
 use std::io::{self, BufRead, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use agent_core::activity::{
@@ -9,20 +10,22 @@ use agent_core::activity::{
 };
 use agent_core::names::Prompt;
 use agent_core::ports::{
-    ActivityDetail, Harness, HarnessError, HarnessId, Harnesses, LaunchCtx, Log, Outcome,
+    ActivityDetail, Harness, HarnessError, HarnessId, Harnesses, LaunchCtx, Log, Lookup, Outcome,
     PendingPrompt, Probe, Seen, TranscriptStamp, ends_with_report,
 };
 use agent_core::process::{LaunchSpec, quiet};
 use serde::Deserialize;
 
-use crate::background::{Found, Survivor};
+use crate::background::{Found, JobId, ProcStart, Survivor};
 use crate::conversation::{Chains, Conversation, SessionId};
+use crate::stopping::{Patience, Processes};
 
 mod activity;
 mod background;
 mod conversation;
 #[cfg(test)]
 mod fixtures;
+mod stopping;
 mod transcript;
 
 const ASK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -75,7 +78,7 @@ const INHERITED_SESSION_ENV: &[&str] = &[
 pub struct Claude {
     id: HarnessId,
     /// The `claude` executable: `$AGENT_CLAUDE`, or `claude` on the PATH.
-    program: OsString,
+    program: Arc<OsString>,
     /// The model for one-off questions.
     quick_model: String,
     projects: PathBuf,
@@ -84,6 +87,7 @@ pub struct Claude {
     permission_mode: String,
     add_dirs: Vec<PathBuf>,
     chains: Chains,
+    processes: Arc<dyn Processes>,
 }
 
 impl Claude {
@@ -95,63 +99,45 @@ impl Claude {
     }
 
     fn with_program(home: &Path, program: OsString) -> Self {
+        let program = Arc::new(program);
         Self {
             id: "claude".parse().expect("valid id"),
-            program,
+            program: Arc::clone(&program),
             quick_model: "haiku".into(),
             projects: home.join(".claude/projects"),
             sessions: home.join(".claude/sessions"),
             permission_mode: "auto".into(),
             add_dirs: vec![PathBuf::from("/tmp")],
             chains: Chains::default(),
+            processes: Arc::new(Machine { program }),
         }
     }
 
     /// A one-off `claude` invocation, outside any session this process is
     /// itself running in.
     fn command(&self) -> std::process::Command {
-        let mut cmd = quiet(&self.program);
-        for key in INHERITED_SESSION_ENV {
-            cmd.env_remove(key);
-        }
-        cmd
+        command(&self.program)
     }
 
     /// The background session running `conversation`, if any. Registry
     /// entries of its sessions that can't be read are added to `notes`,
-    /// since the worker may be among them.
+    /// since the worker may be among them. A process still in its terminal
+    /// isn't one to attach to or stop.
     fn in_background(
         &self,
         conversation: &Conversation,
         workdir: &Path,
         notes: &mut Vec<String>,
-    ) -> Result<Option<Found>, HarnessError> {
-        let search = background::find(&self.sessions, conversation, workdir)?;
+    ) -> Result<Option<Joinable>, HarnessError> {
+        let search = background::find(&self.sessions, std::slice::from_ref(conversation), workdir)?;
         if !search.unreadable.is_empty() {
-            let files: Vec<_> = search
-                .unreadable
-                .iter()
-                .map(|p| p.display().to_string())
-                .collect();
-            notes.push(format!(
-                "can't read Claude's registry entries {}, so a running background session may be missed",
-                files.join(", ")
-            ));
+            notes.push(unreadable_registry(&search.unreadable));
         }
-        Ok(search.found)
-    }
-
-    /// Stops the background session `survivor` so it can be resumed with a
-    /// prompt, which `attach` can't carry.
-    fn stop(&self, survivor: &Survivor) -> Result<(), HarnessError> {
-        let id = survivor.job.as_str();
-        let mut cmd = self.command();
-        cmd.args(["stop", id]);
-        agent_core::process::output_within(&mut cmd, STOP_TIMEOUT).map_err(|e| HarnessError {
-            context: format!("stopping background session {id}"),
-            source: io::Error::other(e),
-        })?;
-        Ok(())
+        Ok(match search.found {
+            Some(Found::Attachable(survivor)) => Some(Joinable::Attach(survivor)),
+            Some(Found::Unaddressable { pid, why }) => Some(Joinable::Unaddressable { pid, why }),
+            Some(Found::Pending(_) | Found::Elsewhere) | None => None,
+        })
     }
 
     /// Claude Code stores transcripts under the working directory with every
@@ -219,28 +205,47 @@ impl Claude {
     /// its messages, which is not `at`'s own when the conversation has moved
     /// on from it.
     fn named_transcript(&self, at: &TranscriptRef) -> io::Result<Option<PathBuf>> {
-        let Ok(projects) = self.projects.canonicalize() else {
+        Ok(match self.named(at)? {
+            None => None,
+            Some(Named::File(path)) => Some(path),
+            Some(Named::Chain { dir, conversation }) => {
+                Some(conversation.transcript_in(&dir)).filter(|live| live.is_file())
+            }
+        })
+    }
+
+    /// The conversation the transcript file `at` names belongs to, followed
+    /// to where it has moved on to. Its session ids include the one a
+    /// running process is registered under, which a `/clear` not yet
+    /// followed by a message leaves out of what `launch` would resume.
+    fn conversation_at(&self, at: &TranscriptRef) -> io::Result<Option<Conversation>> {
+        Ok(match self.named(at)? {
+            Some(Named::Chain { conversation, .. }) => Some(conversation),
+            Some(Named::File(_)) | None => None,
+        })
+    }
+
+    fn named(&self, at: &TranscriptRef) -> io::Result<Option<Named>> {
+        let Some(path) = self.named_file(at) else {
             return Ok(None);
         };
-        let Some(path) = at
-            .path()
+        let Some(start) = session_of(&path) else {
+            return Ok(Some(Named::File(path)));
+        };
+        let dir = path.parent().unwrap_or(&self.projects).to_path_buf();
+        let conversation = self.chains.of(&dir, start)?;
+        Ok(Some(Named::Chain { dir, conversation }))
+    }
+
+    /// The transcript file `at` names, if it is one under the projects
+    /// directory.
+    fn named_file(&self, at: &TranscriptRef) -> Option<PathBuf> {
+        let projects = self.projects.canonicalize().ok()?;
+        at.path()
             .canonicalize()
             .ok()
             .filter(|path| path.extension().is_some_and(|e| e == "jsonl") && path.is_file())
             .filter(|path| path.starts_with(&projects))
-        else {
-            return Ok(None);
-        };
-        let Some(start) = path
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .and_then(SessionId::parse)
-        else {
-            return Ok(Some(path));
-        };
-        let dir = path.parent().unwrap_or(&projects);
-        let live = self.chains.of(dir, start)?.transcript_in(dir);
-        Ok(Some(live).filter(|live| live.is_file()))
     }
 
     /// The transcript of the agent's current conversation: the one the hooks
@@ -298,6 +303,117 @@ impl Claude {
     }
 }
 
+fn command(program: &std::ffi::OsStr) -> std::process::Command {
+    let mut cmd = quiet(program);
+    for key in INHERITED_SESSION_ENV {
+        cmd.env_remove(key);
+    }
+    cmd
+}
+
+fn stop_command(program: &std::ffi::OsStr, job: &JobId) -> std::process::Command {
+    let mut cmd = command(program);
+    cmd.args(["stop", job.as_str()]);
+    cmd
+}
+
+fn term_command(pid: agent_core::activity::Pid) -> std::process::Command {
+    let mut cmd = quiet("kill");
+    cmd.args(["-TERM", &pid.get().to_string()]);
+    cmd
+}
+
+/// A background session a launch can do something about.
+enum Joinable {
+    Attach(Survivor),
+    Unaddressable {
+        pid: agent_core::activity::Pid,
+        why: background::Unaddressed,
+    },
+}
+
+/// What a transcript named by the hooks is.
+enum Named {
+    /// A transcript file whose name isn't a session id.
+    File(PathBuf),
+    Chain {
+        dir: PathBuf,
+        conversation: Conversation,
+    },
+}
+
+fn unreadable_registry(files: &[PathBuf]) -> String {
+    let files: Vec<_> = files.iter().map(|p| p.display().to_string()).collect();
+    format!(
+        "can't read Claude's registry entries {}, so a running background session may be missed",
+        files.join(", ")
+    )
+}
+
+fn session_of(transcript: &Path) -> Option<SessionId> {
+    transcript
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .and_then(SessionId::parse)
+}
+
+/// The real processes: `claude stop`, `ps` and `kill`.
+struct Machine {
+    program: Arc<OsString>,
+}
+
+impl Processes for Machine {
+    fn started(&self, pid: agent_core::activity::Pid) -> Option<ProcStart> {
+        ProcStart::of(pid)
+    }
+
+    fn stop_job(&self, job: &JobId) -> io::Result<()> {
+        let mut cmd = stop_command(&self.program, job);
+        let out =
+            agent_core::process::output_within(&mut cmd, STOP_TIMEOUT).map_err(io::Error::other)?;
+        if out.status.success() {
+            Ok(())
+        } else {
+            Err(io::Error::other(format!(
+                "{}: {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            )))
+        }
+    }
+
+    fn terminate(&self, pid: agent_core::activity::Pid) -> io::Result<()> {
+        let mut cmd = term_command(pid);
+        let out =
+            agent_core::process::output_within(&mut cmd, PS_TIMEOUT).map_err(io::Error::other)?;
+        if out.status.success() {
+            Ok(())
+        } else {
+            Err(io::Error::other(format!(
+                "kill: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            )))
+        }
+    }
+}
+
+/// Stops one background session through `claude stop`, then SIGTERM.
+struct ClaudeStop {
+    processes: Arc<dyn Processes>,
+    survivor: Survivor,
+}
+
+impl agent_core::ports::Stop for ClaudeStop {
+    fn stop(self: Box<Self>) -> Result<(), HarnessError> {
+        stopping::stop(
+            self.processes.as_ref(),
+            &self.survivor,
+            Patience::STOP,
+            Patience::TERM,
+        )
+    }
+}
+
 impl Harness for Claude {
     fn id(&self) -> &HarnessId {
         &self.id
@@ -322,8 +438,8 @@ impl Harness for Claude {
             && let Some(found) = self.in_background(conversation, &workdir, &mut notes)?
         {
             let survivor = match found {
-                Found::Attachable(survivor) => survivor,
-                Found::Unaddressable { pid, why } => {
+                Joinable::Attach(survivor) => survivor,
+                Joinable::Unaddressable { pid, why } => {
                     return Err(HarnessError {
                         context: format!(
                             "the background session of this conversation (pid {}) has {why} in Claude's registry, so it can't be attached or stopped",
@@ -337,18 +453,23 @@ impl Harness for Claude {
                 // Joining keeps everything the session had, hooks
                 // included, since this harness launched it.
                 None => {
-                    let spec = LaunchSpec::new(&self.program)
+                    let spec = LaunchSpec::new(self.program.as_os_str())
                         .cwd(&workdir)
                         .env_remove(INHERITED_SESSION_ENV.iter().copied())
                         .args(["attach", survivor.job.as_str()])
                         .untraced();
                     return Ok(notes.into_iter().fold(spec, LaunchSpec::noting));
                 }
-                Some(_) => self.stop(&survivor)?,
+                Some(_) => stopping::stop(
+                    self.processes.as_ref(),
+                    &survivor,
+                    Patience::STOP,
+                    Patience::TERM,
+                )?,
             }
         }
 
-        let mut spec = LaunchSpec::new(&self.program)
+        let mut spec = LaunchSpec::new(self.program.as_os_str())
             .cwd(&workdir)
             .env_remove(INHERITED_SESSION_ENV.iter().copied())
             .env("CLAUDE_CODE_FORCE_SESSION_PERSISTENCE", "1");
@@ -367,6 +488,53 @@ impl Harness for Claude {
             Some(prompt) => spec.arg("--").arg(prompt.as_str()),
             None => spec,
         })
+    }
+
+    fn survivor(&self, workdir: &Path, at: Option<&TranscriptRef>) -> Result<Lookup, HarnessError> {
+        let read = |source| HarnessError {
+            context: "looking for the conversation's background session".into(),
+            source,
+        };
+        let workdir = match workdir.canonicalize() {
+            Ok(workdir) => workdir,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Lookup::Gone),
+            Err(e) => return Err(read(e)),
+        };
+        let named = at
+            .map(|at| self.conversation_at(at))
+            .transpose()
+            .map_err(read)?
+            .flatten();
+        let conversations: Vec<Conversation> = named
+            .into_iter()
+            .chain(self.resumable(&workdir).map_err(read)?)
+            .collect();
+        let search = background::find(&self.sessions, &conversations, &workdir)?;
+        match search.found {
+            Some(Found::Attachable(survivor)) => {
+                Ok(Lookup::Survivor(agent_core::ports::Survivor::new(
+                    survivor.state,
+                    Box::new(ClaudeStop {
+                        processes: Arc::clone(&self.processes),
+                        survivor,
+                    }),
+                )))
+            }
+            Some(Found::Pending(state)) => Ok(Lookup::NotYet(state)),
+            Some(Found::Elsewhere) => Ok(Lookup::Elsewhere),
+            Some(Found::Unaddressable { pid, why }) => Err(HarnessError {
+                context: format!(
+                    "the background session of this conversation (pid {}) has {why} in Claude's registry, so it can't be stopped",
+                    pid.get()
+                ),
+                source: io::Error::other("unaddressable background session"),
+            }),
+            None if search.unreadable.is_empty() => Ok(Lookup::Gone),
+            None => Err(HarnessError {
+                context: "reading Claude's session registry".into(),
+                source: io::Error::other(unreadable_registry(&search.unreadable)),
+            }),
+        }
     }
 
     fn event(&self, payload: &str) -> Option<Reported> {
@@ -1248,19 +1416,50 @@ mod tests {
         use crate::background::{Found, JobField, ProcStart, Unaddressed};
         use crate::conversation::SessionId;
         use crate::fixtures::{continued, user_line, write_at};
+        use agent_core::ports::SurvivorState;
+        use std::sync::{Arc, Mutex};
+
+        /// Processes that exit when told to stop and are never signalled,
+        /// since a registered pid in these tests is the test's own.
+        #[derive(Default)]
+        struct Cooperative {
+            stopped: Mutex<Vec<String>>,
+        }
+
+        impl Processes for Cooperative {
+            fn started(&self, pid: agent_core::activity::Pid) -> Option<ProcStart> {
+                let stopped = self.stopped.lock().expect("lock").is_empty();
+                stopped.then(|| ProcStart::of(pid)).flatten()
+            }
+
+            fn stop_job(&self, job: &JobId) -> io::Result<()> {
+                self.stopped
+                    .lock()
+                    .expect("lock")
+                    .push(job.as_str().to_string());
+                Ok(())
+            }
+
+            fn terminate(&self, _: agent_core::activity::Pid) -> io::Result<()> {
+                panic!("a test never signals a process")
+            }
+        }
 
         struct Project {
             _home: tempfile::TempDir,
             work: tempfile::TempDir,
             claude: Claude,
             dir: PathBuf,
+            processes: Arc<Cooperative>,
         }
 
         impl Project {
             fn new() -> Self {
                 let home = tempfile::tempdir().expect("a temp dir");
                 let work = tempfile::tempdir().expect("a temp dir");
-                let claude = Claude::with_program(home.path(), "/usr/bin/true".into());
+                let mut claude = Claude::with_program(home.path(), "/usr/bin/true".into());
+                let processes = Arc::new(Cooperative::default());
+                claude.processes = processes.clone();
                 let dir = claude.project_dir(&work.path().canonicalize().expect("exists"));
                 std::fs::create_dir_all(&dir).expect("creates");
                 std::fs::create_dir_all(&claude.sessions).expect("creates");
@@ -1269,6 +1468,7 @@ mod tests {
                     work,
                     claude,
                     dir,
+                    processes,
                 }
             }
 
@@ -1295,6 +1495,9 @@ mod tests {
                 }
                 if entry.spare {
                     json["spare"] = true.into();
+                }
+                if let Some(status) = entry.status {
+                    json["status"] = status.into();
                 }
                 std::fs::write(self.claude.sessions.join(file), json.to_string()).expect("writes");
             }
@@ -1326,7 +1529,7 @@ mod tests {
                     crate::conversation::Conversation::of(&self.dir, first).expect("reads");
                 crate::background::find(
                     &self.claude.sessions,
-                    &conversation,
+                    std::slice::from_ref(&conversation),
                     &self.work.path().canonicalize().expect("exists"),
                 )
                 .expect("reads")
@@ -1341,6 +1544,7 @@ mod tests {
             spare: bool,
             cwd: Option<PathBuf>,
             started: Option<String>,
+            status: Option<&'a str>,
         }
 
         impl<'a> Entry<'a> {
@@ -1353,6 +1557,7 @@ mod tests {
                     spare: false,
                     cwd: None,
                     started: None,
+                    status: None,
                 }
             }
         }
@@ -1360,7 +1565,9 @@ mod tests {
         fn jobs_of(found: Option<Found>) -> Option<String> {
             match found {
                 Some(Found::Attachable(survivor)) => Some(survivor.job.as_str().to_string()),
-                Some(Found::Unaddressable { .. }) | None => None,
+                Some(Found::Unaddressable { .. } | Found::Pending(_) | Found::Elsewhere) | None => {
+                    None
+                }
             }
         }
 
@@ -1383,6 +1590,10 @@ mod tests {
             assert_eq!(
                 project.tail(Some(&go), 4),
                 ["--resume", "after-clear", "--", "--go"]
+            );
+            assert_eq!(
+                *project.processes.stopped.lock().expect("lock"),
+                ["470bb73a"]
             );
         }
 
@@ -1423,6 +1634,168 @@ mod tests {
             project.register("alive.json", Entry::bg("stub", "470bb73a"));
             let spec = project.launched(None).expect("launches");
             assert_eq!(spec.arguments(), ["attach", "470bb73a"]);
+        }
+
+        fn survivor_state(project: &Project, at: Option<&TranscriptRef>) -> Option<SurvivorState> {
+            match project
+                .claude
+                .survivor(project.work.path(), at)
+                .expect("looks")
+            {
+                Lookup::Survivor(survivor) => Some(survivor.state()),
+                Lookup::NotYet(_) | Lookup::Elsewhere | Lookup::Gone => None,
+            }
+        }
+
+        fn lookup(project: &Project) -> Lookup {
+            project
+                .claude
+                .survivor(project.work.path(), None)
+                .expect("looks")
+        }
+
+        #[test]
+        fn stopping_runs_claude_stop_with_the_job_id_and_signalling_is_a_plain_sigterm() {
+            let JobField::Valid(job) =
+                serde_json::from_str::<JobField>(r#""470bb73a""#).expect("parses")
+            else {
+                panic!("a valid job id")
+            };
+            let stop = stop_command(std::ffi::OsStr::new("claude"), &job);
+            assert_eq!(stop.get_program(), "claude");
+            assert_eq!(stop.get_args().collect::<Vec<_>>(), ["stop", "470bb73a"]);
+            let pid = agent_core::activity::Pid::new(4242).expect("a pid");
+            let term = term_command(pid);
+            assert_eq!(term.get_program(), "kill");
+            assert_eq!(term.get_args().collect::<Vec<_>>(), ["-TERM", "4242"]);
+        }
+
+        #[test]
+        fn a_process_still_registered_as_interactive_is_not_gone_but_not_stoppable_yet() {
+            let project = Project::new();
+            project.transcript("mine", &[user_line()], 1);
+            project.register(
+                "terminal.json",
+                Entry {
+                    kind: "interactive",
+                    status: Some("busy"),
+                    ..Entry::bg("mine", "470bb73a")
+                },
+            );
+            assert!(matches!(
+                lookup(&project),
+                Lookup::NotYet(SurvivorState::Busy)
+            ));
+            project.register("terminal.json", Entry::bg("mine", "470bb73a"));
+            assert!(matches!(lookup(&project), Lookup::Survivor(_)));
+        }
+
+        #[test]
+        fn an_interactive_process_in_another_directory_is_open_elsewhere_not_pending() {
+            let project = Project::new();
+            project.transcript("mine", &[user_line()], 1);
+            let elsewhere = tempfile::tempdir().expect("a temp dir");
+            project.register(
+                "terminal.json",
+                Entry {
+                    kind: "interactive",
+                    cwd: Some(elsewhere.path().to_path_buf()),
+                    ..Entry::bg("mine", "470bb73a")
+                },
+            );
+            assert!(matches!(lookup(&project), Lookup::Elsewhere));
+        }
+
+        #[test]
+        fn an_interactive_process_that_is_gone_a_spare_or_another_conversations_is_not_there() {
+            let project = Project::new();
+            project.transcript("mine", &[user_line()], 1);
+            for (file, entry) in [
+                (
+                    "gone",
+                    Entry {
+                        kind: "interactive",
+                        pid: 999_999_999,
+                        ..Entry::bg("mine", "j1")
+                    },
+                ),
+                (
+                    "spare",
+                    Entry {
+                        kind: "interactive",
+                        spare: true,
+                        ..Entry::bg("mine", "j2")
+                    },
+                ),
+                (
+                    "other",
+                    Entry {
+                        kind: "interactive",
+                        ..Entry::bg("someone-elses", "j3")
+                    },
+                ),
+            ] {
+                project.register(&format!("{file}.json"), entry);
+            }
+            assert!(matches!(lookup(&project), Lookup::Gone));
+        }
+
+        #[test]
+        fn a_survivor_is_the_conversations_process_and_says_whether_it_is_mid_task() {
+            let project = Project::new();
+            project.transcript("mine", &[user_line()], 1);
+            assert_eq!(survivor_state(&project, None), None);
+            project.register("alive.json", Entry::bg("mine", "470bb73a"));
+            assert_eq!(survivor_state(&project, None), Some(SurvivorState::Idle));
+            project.register(
+                "alive.json",
+                Entry {
+                    status: Some("busy"),
+                    ..Entry::bg("mine", "470bb73a")
+                },
+            );
+            assert_eq!(survivor_state(&project, None), Some(SurvivorState::Busy));
+        }
+
+        #[test]
+        fn a_process_running_a_session_cleared_without_a_message_is_found_through_the_hooks_transcript()
+         {
+            let project = Project::new();
+            project.transcript("before", &[user_line()], 1);
+            project.transcript("cleared", &[r#"{"type":"summary"}"#.to_string()], 2);
+            project.register("alive.json", Entry::bg("cleared", "470bb73a"));
+            assert_eq!(
+                survivor_state(&project, None),
+                None,
+                "nothing in the resumable chain names it"
+            );
+            let hooked = TranscriptRef::new(project.dir.join("cleared.jsonl").to_string_lossy());
+            assert_eq!(
+                survivor_state(&project, Some(&hooked)),
+                Some(SurvivorState::Idle)
+            );
+        }
+
+        #[test]
+        fn a_clear_followed_by_a_message_resumes_the_new_session_and_one_without_resumes_the_old() {
+            let project = Project::new();
+            project.transcript("before", &[user_line()], 1);
+            project.transcript("cleared", &[r#"{"type":"summary"}"#.to_string()], 2);
+            assert_eq!(project.tail(None, 2), ["--resume", "before"]);
+            project.transcript("cleared", &[user_line()], 2);
+            assert_eq!(project.tail(None, 2), ["--resume", "cleared"]);
+        }
+
+        #[test]
+        fn an_unreadable_registry_entry_of_the_conversation_is_an_error_for_a_stop() {
+            let project = Project::new();
+            project.transcript("mine", &[user_line()], 1);
+            std::fs::write(
+                project.claude.sessions.join("odd.json"),
+                r#"{"pid":1,"sessionId":"mine","kind":"bg"}"#,
+            )
+            .expect("writes");
+            assert!(project.claude.survivor(project.work.path(), None).is_err());
         }
 
         #[test]

@@ -70,6 +70,30 @@ pub enum Error {
     OwnSession(SessionName),
     #[error("{0} changed since the removal was confirmed. Check it again")]
     Changed(SessionName),
+    #[error("{name} {}", .interrupts.became())]
+    Busy {
+        name: SessionName,
+        interrupts: Interrupts,
+    },
+    #[error("{label} is still running for {name} after it was stopped")]
+    Survives {
+        name: SessionName,
+        label: &'static str,
+    },
+    #[error("{label} for {name} is still in a terminal")]
+    StillInTerminal {
+        name: SessionName,
+        label: &'static str,
+    },
+    #[error("{label} for {name} is open in another terminal")]
+    OpenElsewhere {
+        name: SessionName,
+        label: &'static str,
+    },
+    #[error("{0} is still running after it was killed")]
+    Lingers(SessionName),
+    #[error("{0} didn't start")]
+    NotStarted(SessionName),
     #[error("{0} appeared since it was checked. Try again")]
     Appeared(AgentName),
     #[error("{branch} is checked out at {}, outside the agent worktrees", .path.display())]
@@ -231,7 +255,7 @@ pub struct Unlisted {
     pub unlisting: Unlisting,
 }
 
-fn find_session(svc: Services<'_>, name: &SessionName) -> Result<Option<SessionInfo>> {
+pub(crate) fn find_session(svc: Services<'_>, name: &SessionName) -> Result<Option<SessionInfo>> {
     Ok(svc.host.sessions()?.into_iter().find(|s| &s.name == name))
 }
 
@@ -708,6 +732,18 @@ pub fn start(
     harness: &dyn Harness,
     prompt: Option<Prompt>,
 ) -> Result<Launch> {
+    start_then(svc, at, harness, prompt, || Ok(()))
+}
+
+/// [`start`], with `then` run while the launch is still marked, so a failure
+/// in it ends the record like any other failed launch.
+fn start_then(
+    svc: Services<'_>,
+    at: &Startable,
+    harness: &dyn Harness,
+    prompt: Option<Prompt>,
+    then: impl FnOnce() -> Result<()>,
+) -> Result<Launch> {
     let name = at.name();
     let existing = svc.store.record(&name)?;
     let harness_id = existing
@@ -733,6 +769,7 @@ pub fn start(
         .map_err(Error::from)
         .and_then(|spec| {
             svc.store.put_record(&name, &record)?;
+            then()?;
             Ok(spec)
         });
     let spec = mark.settle(created)?;
@@ -1203,45 +1240,52 @@ pub fn removable(svc: Services<'_>, name: &SessionName) -> Result<Removable> {
     }
 }
 
-/// A removal planned for a session other than the caller's own, the only
-/// kind [`remove`] can be handed.
+/// A plan for a session other than the caller's own, the only kind that can
+/// be approved. `O` is what is known of the caller's own session.
 #[derive(Debug)]
-pub enum Planned {
-    Elsewhere(RemovalPlan),
-    Own(OwnPlan),
+pub enum Planned<E, O = E> {
+    Elsewhere(E),
+    Own(Own<O>),
 }
 
-impl Planned {
+impl<E, O> Planned<E, O> {
     /// The plan, or [`Error::OwnSession`] when it targets the caller's own session.
-    pub fn elsewhere(self) -> Result<RemovalPlan> {
+    pub fn elsewhere(self) -> Result<E> {
         match self {
             Self::Elsewhere(plan) => Ok(plan),
-            Self::Own(own) => Err(Error::OwnSession(own.name())),
+            Self::Own(own) => Err(Error::OwnSession(own.name)),
         }
     }
 }
 
-/// A removal of the session the caller runs in. It can't be approved here
-/// because stopping the session would kill the removal halfway.
+/// A plan for the session the caller runs in. It has no approval because
+/// stopping the session would kill the work halfway.
 #[derive(Debug)]
-pub struct OwnPlan(RemovalPlan);
+pub struct Own<P> {
+    name: SessionName,
+    plan: P,
+}
 
-impl OwnPlan {
-    pub fn name(&self) -> SessionName {
-        self.0.name()
+impl<P> Own<P> {
+    fn new(name: SessionName, plan: P) -> Self {
+        Self { name, plan }
     }
 
-    pub fn hazards(&self) -> &[Hazard] {
-        self.0.hazards()
+    pub fn name(&self) -> SessionName {
+        self.name.clone()
+    }
+
+    pub fn plan(&self) -> &P {
+        &self.plan
     }
 }
 
 /// The session this process runs in is never offered for killing, and
 /// removing it is a [`Planned::Own`].
-pub fn plan_removal(svc: Services<'_>, target: Removable) -> Result<Planned> {
+pub fn plan_removal(svc: Services<'_>, target: Removable) -> Result<Planned<RemovalPlan>> {
     let plan = plan_target(svc, target, svc.own)?;
     Ok(if svc.own == Some(&plan.name()) {
-        Planned::Own(OwnPlan(plan))
+        Planned::Own(Own::new(plan.name(), plan))
     } else {
         Planned::Elsewhere(plan)
     })
@@ -1452,6 +1496,12 @@ pub fn merged(svc: Services<'_>) -> Result<Vec<(AgentWorktree, Option<BranchName
     }
     Ok(clean)
 }
+
+mod restart;
+pub use restart::{
+    Approvals, End, Fleet, Interrupt, Interrupting, Interrupts, OnExited, OwnRestart, Patience,
+    Restart, RestartPlan, Restarted, plan_restart, plan_restarts, restart, restart_within,
+};
 
 #[cfg(test)]
 mod tests;

@@ -10,11 +10,14 @@ use agent_core::activity::{
 use agent_core::config::Keys;
 use agent_core::model::{
     Entry, EntryKind, EntryState, Removable, Repo, RepoKey, Revival, Running, Snapshot, Startable,
+    Unstartable,
 };
 use agent_core::names::{
     AgentName, BranchName, Checkout, NameError, NameLimit, Prompt, SessionName,
 };
-use agent_core::ops::{Approved, Hazardous, RemovalPlan};
+use agent_core::ops::{
+    Approved, End, Fleet, Hazardous, Interrupting, Interrupts, RemovalPlan, Restart, RestartPlan,
+};
 use agent_core::paths::{RepoRoot, Typed, typed_path};
 use agent_core::ports::{
     ActivityDetail, CallKind, Change, ClientId, FileState, HarnessId, Observation, Place, Progress,
@@ -828,6 +831,8 @@ pub enum AgentStatus {
     Starting {
         since: SystemTime,
     },
+    /// Handed to the restart thread and not answered yet.
+    Restarting,
     Working {
         doing: Doing,
         since: SystemTime,
@@ -1006,6 +1011,7 @@ impl AgentStatus {
             | Self::Exited
             | Self::Idle
             | Self::Starting { .. }
+            | Self::Restarting
             | Self::Working { .. }
             | Self::Interrupted { .. } => None,
         }
@@ -1018,11 +1024,22 @@ impl AgentStatus {
 pub enum Reach {
     /// The session this TUI runs in: nothing here can act on it.
     Own,
+    /// The restart thread has it. Nothing acts on a session about to be
+    /// killed and started again.
+    Restarting,
     Other {
         enter: Enter,
         kill: Option<Running>,
         remove: Option<Removable>,
+        restart: Result<Box<Startable>, Unrestartable>,
     },
+}
+
+/// Why `r` has nothing to restart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Unrestartable {
+    NoSession,
+    Nowhere(Unstartable),
 }
 
 impl Reach {
@@ -1111,12 +1128,156 @@ impl Query {
 pub struct Unsent {
     pub comments: usize,
     pub messages: usize,
+    /// Restarts waiting behind the one in flight, which quitting drops.
+    pub restarts: usize,
 }
 
 pub enum Confirm {
     Kill(Running),
     Quit(Unsent),
     Remove(Proposal),
+    Restart(Box<RestartAsk>),
+    Restarts(Box<FleetAsk>),
+}
+
+/// A restart that needs the user's word, because it would interrupt the
+/// agent or close the window another place shows it in.
+pub struct RestartAsk {
+    pub go: Result<Restart, Interrupting>,
+    pub windows: Option<Windows>,
+}
+
+impl RestartAsk {
+    pub fn plan(&self) -> &RestartPlan {
+        match &self.go {
+            Ok(go) => go.plan(),
+            Err(interrupting) => interrupting.plan(),
+        }
+    }
+
+    pub fn go(self) -> Restart {
+        self.go.unwrap_or_else(Interrupting::force)
+    }
+}
+
+/// Every restart `R` found, put to the user, and how many of those agents
+/// another window shows.
+pub struct FleetAsk {
+    pub fleet: Fleet,
+    pub elsewhere: usize,
+}
+
+/// What the restart thread was given and what came back, until the last
+/// answer arrives. A restart still pending is what cards read as restarting.
+#[derive(Debug, Default)]
+pub struct Batch {
+    pending: Vec<SessionName>,
+    finished: Vec<(SessionName, Finish)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Finish {
+    Restarted {
+        end: End,
+        label: &'static str,
+    },
+    /// It became busy after the user agreed, so it was left alone.
+    Skipped(Interrupts),
+    Failed(Cause),
+}
+
+impl Batch {
+    pub fn add(&mut self, names: impl IntoIterator<Item = SessionName>) {
+        self.pending.extend(names);
+    }
+
+    pub fn restarting(&self, name: &SessionName) -> bool {
+        self.pending.contains(name)
+    }
+
+    /// Restarts that haven't begun, which quitting drops. The first pending
+    /// one is the one in flight.
+    pub fn queued(&self) -> usize {
+        self.pending.len().saturating_sub(1)
+    }
+
+    /// Records how `name` went. A name nothing is waiting on is ignored.
+    pub fn answer(&mut self, name: &SessionName, finish: Finish) {
+        if let Some(at) = self.pending.iter().position(|n| n == name) {
+            self.pending.remove(at);
+            self.finished.push((name.clone(), finish));
+        }
+    }
+
+    pub fn is_done(&self) -> bool {
+        self.pending.is_empty()
+    }
+
+    /// What to say while quitting waits for the restart in flight.
+    pub fn finishing(&self) -> Option<String> {
+        self.pending
+            .first()
+            .map(|name| format!("finishing restart of {name}…"))
+    }
+
+    pub fn progress(&self) -> String {
+        let total = self.pending.len() + self.finished.len();
+        match self.pending.first() {
+            Some(name) if total == 1 => format!("restarting {name}…"),
+            _ => format!("restarting {} of {total}…", self.finished.len() + 1),
+        }
+    }
+
+    /// What the status bar says once every restart has answered. It is an
+    /// error when any failed.
+    pub fn summary(&self, at: Instant) -> Status {
+        let (text, kind) = self.said();
+        Status { text, kind, at }
+    }
+
+    fn said(&self) -> (String, StatusKind) {
+        if let [(name, Finish::Restarted { end, label })] = self.finished.as_slice() {
+            return (end.says(name, label), StatusKind::Info);
+        }
+        let (mut started, mut stopped) = (0, 0);
+        let (mut skipped, mut failures) = (Vec::new(), Vec::new());
+        for (name, finish) in &self.finished {
+            match finish {
+                Finish::Restarted {
+                    end: End::Started, ..
+                } => started += 1,
+                Finish::Restarted {
+                    end: End::LeftExited,
+                    ..
+                } => stopped += 1,
+                Finish::Skipped(interrupts) => {
+                    skipped.push(format!("skipped {name}: {}", interrupts.became()));
+                }
+                Finish::Failed(cause) => failures.push(format!("{name}: {}", cause.first_line())),
+            }
+        }
+        let mut parts = Vec::new();
+        if started > 0 {
+            parts.push(format!("restarted {started}"));
+        }
+        if stopped > 0 {
+            parts.push(format!("stopped {stopped} exited"));
+        }
+        if !failures.is_empty() {
+            parts.push(format!("{} failed", failures.len()));
+        }
+        let kind = if failures.is_empty() {
+            StatusKind::Info
+        } else {
+            StatusKind::Error
+        };
+        parts.extend(skipped);
+        parts.extend(failures);
+        if parts.is_empty() {
+            parts.push("nothing restarted".to_string());
+        }
+        (parts.join(" · "), kind)
+    }
 }
 
 /// A removal waiting for the user's answer.
@@ -1223,6 +1384,7 @@ impl<'a> Reachable<'a> {
 pub enum Unreachable {
     NotRunning,
     Own,
+    Restarting,
     /// No hook activity: whether a menu is open can't be known.
     Unreported,
 }
@@ -1260,12 +1422,37 @@ pub enum Overlay {
     Talk(SessionName),
     /// A comment being typed on lines of a diff, for an agent's draft review.
     Comment(CommentDraft),
-    /// Working out what removing `name` would lose. The confirmation
-    /// replaces this when the answer arrives.
+    /// Working out what the confirmation will say. It replaces this when
+    /// the answer arrives.
     Planning {
         ticket: Ticket,
-        name: SessionName,
+        planning: Planning,
     },
+}
+
+/// What a plan is being made for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Planning {
+    Removal(SessionName),
+    Restart(SessionName),
+    Restarts,
+}
+
+impl Planning {
+    pub fn title(&self) -> String {
+        match self {
+            Self::Removal(name) => format!("Remove {name}"),
+            Self::Restart(name) => format!("Restart {name}"),
+            Self::Restarts => "Restart every agent".to_string(),
+        }
+    }
+
+    pub fn checking(&self) -> &'static str {
+        match self {
+            Self::Removal(_) => "checking what would be lost…",
+            Self::Restart(_) | Self::Restarts => "checking what would be interrupted…",
+        }
+    }
 }
 
 /// Why the model wants an agent selected when it next appears.
@@ -1609,6 +1796,8 @@ pub struct Model {
     /// worktree shows up before its session has started, and a second
     /// start from `⏎` would race the first and skip its prompt.
     pub launching: Vec<(Ticket, SessionName)>,
+    /// The restarts in flight, if any.
+    pub restarts: Option<Batch>,
     /// What was selected before a tab that doesn't list it was cycled
     /// to, restored by the next tab that does unless you moved meanwhile.
     displaced: Option<Cursor>,
@@ -1701,6 +1890,7 @@ impl Model {
             work_room: WorkRoom::Fits,
             follow: None,
             launching: Vec::new(),
+            restarts: None,
             displaced: None,
             next_ticket: 0,
             latest_look: None,
@@ -2237,6 +2427,7 @@ impl Model {
                 .filter_map(|t| t.compose.as_ref())
                 .filter(|c| c.holds_work())
                 .count(),
+            restarts: self.restarts.as_ref().map_or(0, Batch::queued),
         }
     }
 
@@ -2861,6 +3052,9 @@ impl Model {
     }
 
     pub fn status(&self, entry: &Entry) -> AgentStatus {
+        if self.restarting(entry.name()) {
+            return AgentStatus::Restarting;
+        }
         match entry.state() {
             EntryState::Idle(_) | EntryState::Unhostable(_) => return AgentStatus::NoSession,
             EntryState::Exited(_) => return AgentStatus::Exited,
@@ -2931,8 +3125,10 @@ impl Model {
         let EntryState::Live = entry.state() else {
             return Err(Unreachable::NotRunning);
         };
-        if self.own_session.as_ref() == Some(entry.name()) {
-            return Err(Unreachable::Own);
+        match self.reach(entry) {
+            Reach::Own => return Err(Unreachable::Own),
+            Reach::Restarting => return Err(Unreachable::Restarting),
+            Reach::Other { .. } => {}
         }
         self.activity(entry.name()).ok_or(Unreachable::Unreported)?;
         Ok(Reachable { name: entry.name() })
@@ -3195,6 +3391,9 @@ impl Model {
         if self.own_session.as_ref() == Some(entry.name()) {
             return Reach::Own;
         }
+        if self.restarting(entry.name()) {
+            return Reach::Restarting;
+        }
         let enter = match entry.state() {
             EntryState::Live => Enter::Attach,
             EntryState::Exited(Revival::Restart(at)) => Enter::Restart(at),
@@ -3206,6 +3405,11 @@ impl Model {
             enter,
             kill: entry.running(self.own_session.as_ref()),
             remove: entry.removable(),
+            restart: match (entry.presence(), entry.startable()) {
+                (None, _) => Err(Unrestartable::NoSession),
+                (Some(_), Err(why)) => Err(Unrestartable::Nowhere(why)),
+                (Some(_), Ok(at)) => Ok(Box::new(at)),
+            },
         }
     }
 
@@ -3741,6 +3945,22 @@ impl Model {
         {
             self.displaced = wanted;
         }
+    }
+
+    /// What the status bar shows: the latest status, or else how the restarts
+    /// in flight are going.
+    pub fn shown_status(&self) -> Option<(String, StatusKind)> {
+        match (&self.status, &self.restarts) {
+            (Some(status), _) => Some((status.text.clone(), status.kind)),
+            (None, Some(batch)) if !batch.is_done() => Some((batch.progress(), StatusKind::Info)),
+            (None, _) => None,
+        }
+    }
+
+    pub fn restarting(&self, name: &SessionName) -> bool {
+        self.restarts
+            .as_ref()
+            .is_some_and(|batch| batch.restarting(name))
     }
 
     pub fn info(&mut self, text: impl Into<String>) {

@@ -855,6 +855,84 @@ pub struct HarnessError {
     pub source: io::Error,
 }
 
+/// Whether a harness process that outlived its session is mid-task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SurvivorState {
+    Busy,
+    Idle,
+}
+
+/// How a harness stops a process it found. The harness builds one that
+/// holds whatever it needs to do that, so nothing else can stop the process.
+pub trait Stop: Send {
+    /// Stops the process and returns once it has exited, or says why it
+    /// hasn't.
+    fn stop(self: Box<Self>) -> Result<(), HarnessError>;
+}
+
+/// A harness process still running after its session was killed, and the
+/// means to stop it.
+pub struct Survivor {
+    state: SurvivorState,
+    process: Box<dyn Stop>,
+}
+
+impl Survivor {
+    pub fn new(state: SurvivorState, process: Box<dyn Stop>) -> Self {
+        Self { state, process }
+    }
+
+    pub fn state(&self) -> SurvivorState {
+        self.state
+    }
+
+    pub fn stop(self) -> Result<(), HarnessError> {
+        self.process.stop()
+    }
+}
+
+impl fmt::Debug for Survivor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Survivor")
+            .field("state", &self.state)
+            .finish_non_exhaustive()
+    }
+}
+
+/// What looking for a conversation's leftover process found.
+#[derive(Debug)]
+pub enum Lookup {
+    Survivor(Survivor),
+    /// A process of the conversation is alive but can't be stopped yet, as
+    /// when the harness hasn't noticed its terminal went. It may become a
+    /// survivor, or exit.
+    NotYet(SurvivorState),
+    /// A process of the conversation is alive in a terminal somewhere other
+    /// than the agent's checkout, which a restart can't take.
+    Elsewhere,
+    Gone,
+}
+
+impl Lookup {
+    /// Whether what is there is mid-task, if anything is there.
+    pub fn state(&self) -> Option<SurvivorState> {
+        match self {
+            Self::Survivor(survivor) => Some(survivor.state),
+            Self::NotYet(state) => Some(*state),
+            Self::Elsewhere | Self::Gone => None,
+        }
+    }
+
+    /// Whether what is there is mid-task, if it is something that can be
+    /// stopped now.
+    pub fn stoppable_state(&self) -> Option<SurvivorState> {
+        match self {
+            Self::Survivor(survivor) => Some(survivor.state),
+            Self::NotYet(_) | Self::Elsewhere | Self::Gone => None,
+        }
+    }
+}
+
 /// A coding agent (Claude Code, …): how to start or resume it in a worktree
 /// and how to type into it.
 pub trait Harness: Send + Sync {
@@ -884,6 +962,14 @@ pub trait Harness: Send + Sync {
     fn ask(&self, question: &Prompt) -> Result<Option<String>, HarnessError> {
         let _ = question;
         Ok(None)
+    }
+    /// The process still running `workdir`'s conversation after its session
+    /// was killed, for a harness that keeps one. `at` is where the hooks last
+    /// said the transcript is. The default is right for a harness whose
+    /// process dies with its session. Reads files: call it off the UI thread.
+    fn survivor(&self, workdir: &Path, at: Option<&TranscriptRef>) -> Result<Lookup, HarnessError> {
+        let _ = (workdir, at);
+        Ok(Lookup::Gone)
     }
     /// What subagent `id` of the agent working in `workdir` was told and has
     /// done, or `None` when the harness keeps no record of it (yet). Reads

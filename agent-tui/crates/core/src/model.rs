@@ -164,6 +164,15 @@ enum Start {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Startable(Start);
 
+/// Why an entry has nowhere to start a session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Unstartable {
+    /// A session agent didn't start, in a checkout it doesn't own.
+    NotOurs,
+    /// The session host can't take the agent's name.
+    Unhosted(NameError),
+}
+
 /// An entry's session, or where one can start when there's none.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EntryState {
@@ -342,6 +351,23 @@ impl Entry {
         match &self.kind {
             EntryKind::Agent { worktree, .. } => Some(worktree.at()),
             _ => None,
+        }
+    }
+
+    /// Where a session of this entry can start, whether or not it has one,
+    /// or why there is nowhere.
+    pub fn startable(&self) -> Result<Startable, Unstartable> {
+        match &self.kind {
+            EntryKind::Main { repo, .. } => Ok(Startable::main(repo.clone())),
+            EntryKind::Agent {
+                worktree: Hosting::Hosted(hosted),
+                ..
+            } => Ok(Startable::worktree(hosted.clone())),
+            EntryKind::Agent {
+                worktree: Hosting::Unhosted { why, .. },
+                ..
+            } => Err(Unstartable::Unhosted(why.clone())),
+            EntryKind::Adopted { .. } | EntryKind::Orphan { .. } => Err(Unstartable::NotOurs),
         }
     }
 

@@ -410,3 +410,20 @@ pub fn booting() -> Session {
         join: Join::Untraced,
     }
 }
+
+/// A restart plan for `agent`, which `world` gets doing `doing`.
+pub fn restart_plan(
+    world: &agent_core::testing::World,
+    agent: &str,
+    doing: agent_core::testing::Doing,
+) -> agent_core::ops::RestartPlan {
+    let at = world.agent(agent, doing);
+    agent_core::ops::plan_restart(world.svc(), at)
+        .expect("plans")
+        .elsewhere()
+        .expect("not own")
+}
+
+pub fn restart_fleet(world: &agent_core::testing::World) -> agent_core::ops::Fleet {
+    agent_core::ops::plan_restarts(world.svc()).expect("plans")
+}

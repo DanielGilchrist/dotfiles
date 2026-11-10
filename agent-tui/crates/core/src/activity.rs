@@ -718,6 +718,36 @@ impl Boot {
     }
 }
 
+/// What a restart would interrupt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Busy {
+    Asking,
+    Booting,
+    Working,
+    Delegating,
+}
+
+impl Busy {
+    /// `Hold` names the two it shares, so they are worded once. `Hold::Ended`
+    /// has nothing to interrupt and so no `Busy`.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Asking => Hold::Asking.label(),
+            Self::Booting => Hold::Booting.label(),
+            Self::Working => "working",
+            Self::Delegating => "delegating",
+        }
+    }
+
+    /// What an agent approved as idle did since.
+    pub fn became(self) -> String {
+        match self {
+            Self::Working => "started working".to_string(),
+            other => format!("is {}", other.label()),
+        }
+    }
+}
+
 /// Why text can't be typed into an agent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Hold {
@@ -1102,6 +1132,25 @@ impl Activity {
             return Some(Hold::Asking);
         }
         self.boot(now).map(|_| Hold::Booting)
+    }
+
+    /// What stopping the agent now would interrupt, if anything. A question
+    /// open or a session still coming up counts, as it does for [`hold`](Self::hold).
+    pub fn busy(&self, now: SystemTime) -> Option<Busy> {
+        match self.hold(now) {
+            Some(Hold::Asking) => Some(Busy::Asking),
+            Some(Hold::Booting) => Some(Busy::Booting),
+            Some(Hold::Ended) => None,
+            None => match self.state {
+                State::Working { .. } => Some(Busy::Working),
+                State::Delegating => Some(Busy::Delegating),
+                State::Idle
+                | State::Done { .. }
+                | State::Failed { .. }
+                | State::Interrupted
+                | State::Exited => None,
+            },
+        }
     }
 
     /// Whether the session is still coming up, which the card shows as
@@ -2313,6 +2362,41 @@ mod tests {
     fn an_ended_session_holds_the_text_so_it_cannot_reach_a_shell() {
         let ended = run(vec![(10, main(user("go"))), (11, main(MainEvent::Ended))]);
         assert_eq!(ended.hold(at(100)), Some(Hold::Ended));
+    }
+
+    #[test]
+    fn busy_names_what_a_restart_would_interrupt_and_agrees_with_hold() {
+        let working = working_on_a_prompt();
+        assert_eq!(working.busy(at(100)), Some(Busy::Working));
+        let delegating = run(vec![(10, main(user("go"))), (11, main(finished(&["a"])))]);
+        assert_eq!(delegating.busy(at(100)), Some(Busy::Delegating));
+        let asking = run(vec![(10, main(user("go"))), (11, main(asked("Bash: ls")))]);
+        assert_eq!(asking.busy(at(100)), Some(Busy::Asking));
+        let booting = run(vec![(10, main(finished(&[]))), (20, main(fresh(7)))]);
+        assert_eq!(booting.busy(at(21)), Some(Busy::Booting));
+        assert_eq!(booting.busy(at(20 + LAUNCH_GRACE.as_secs())), None);
+        let ended = run(vec![(10, main(user("go"))), (11, main(MainEvent::Ended))]);
+        assert_eq!(
+            ended.busy(at(100)),
+            None,
+            "an ended session has nothing to interrupt"
+        );
+        let idle = run(vec![(10, main(finished(&[])))]);
+        assert_eq!(idle.busy(at(100)), None);
+        for activity in [&working, &delegating, &asking, &booting, &ended, &idle] {
+            let now = at(21);
+            let expected = match activity.hold(now) {
+                Some(Hold::Asking) => Some(Busy::Asking),
+                Some(Hold::Booting) => Some(Busy::Booting),
+                Some(Hold::Ended) => None,
+                None => match activity.state {
+                    State::Working { .. } => Some(Busy::Working),
+                    State::Delegating => Some(Busy::Delegating),
+                    _ => None,
+                },
+            };
+            assert_eq!(activity.busy(now), expected, "{:?}", activity.state);
+        }
     }
 
     fn working_on_a_prompt() -> Activity {

@@ -353,6 +353,17 @@ impl Runtime {
         }
     }
 
+    fn restart(&self, restarts: Vec<agent_core::ops::Restart>) -> Result<()> {
+        for go in restarts {
+            self.workers
+                .restarts
+                .send(go)
+                .ok()
+                .context("the restart worker stopped")?;
+        }
+        Ok(())
+    }
+
     fn send(&self, job: Job) -> Result<()> {
         self.workers
             .jobs
@@ -442,6 +453,7 @@ impl Runtime {
             match effect {
                 Effect::Quit => return Ok(Flow::Quit),
                 Effect::Job(job) => self.send(job)?,
+                Effect::Restart(restarts) => self.restart(restarts)?,
                 Effect::CheckElsewhere(look) => self.workers.look_elsewhere(look),
                 Effect::Inspect {
                     name,
@@ -741,6 +753,10 @@ fn event_loop(
             Err(RecvTimeoutError::Disconnected) => break,
         }
         if let Flow::Quit = rt.apply(&mut m, terminal, effects)? {
+            if let Some(finishing) = m.restarts.as_ref().and_then(model::Batch::finishing) {
+                m.info(finishing);
+                view::paint(terminal, &mut m)?;
+            }
             break;
         }
 

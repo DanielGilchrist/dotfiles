@@ -6,7 +6,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use agent_core::activity::Pid;
-use agent_core::ports::HarnessError;
+use agent_core::ports::{HarnessError, SurvivorState};
 use agent_core::process::quiet;
 use serde::{Deserialize, Deserializer};
 
@@ -83,6 +83,7 @@ pub(crate) struct Survivor {
     pub(crate) job: JobId,
     pub(crate) pid: Pid,
     pub(crate) started: ProcStart,
+    pub(crate) state: SurvivorState,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -103,10 +104,25 @@ impl std::fmt::Display for Unaddressed {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Found {
     Attachable(Survivor),
-    Unaddressable { pid: Pid, why: Unaddressed },
+    Unaddressable {
+        pid: Pid,
+        why: Unaddressed,
+    },
+    /// A process of the conversation that is still in its terminal as far as
+    /// the registry knows, so it can't be stopped by job id yet.
+    Pending(SurvivorState),
+    /// Such a process, in a terminal in another directory than the agent's.
+    Elsewhere,
 }
 
 impl Survivor {
+    fn in_terminal(registered: &Registered, place: Place) -> Option<Found> {
+        (ProcStart::of(registered.pid).as_ref() == Some(&registered.started)).then(|| match place {
+            Place::Here => Found::Pending(registered.status.into()),
+            Place::Elsewhere => Found::Elsewhere,
+        })
+    }
+
     fn confirm(registered: Registered) -> Option<Found> {
         if ProcStart::of(registered.pid).as_ref() != Some(&registered.started) {
             return None;
@@ -117,6 +133,7 @@ impl Survivor {
                 job,
                 pid,
                 started: registered.started,
+                state: registered.status.into(),
             }),
             JobField::Missing => Found::Unaddressable {
                 pid,
@@ -134,6 +151,8 @@ impl Survivor {
 enum Kind {
     #[serde(rename = "bg")]
     Background,
+    #[serde(rename = "interactive")]
+    Interactive,
     #[serde(other)]
     Other,
 }
@@ -153,6 +172,25 @@ impl From<bool> for Role {
     }
 }
 
+/// What a registry entry says its process is doing.
+#[derive(Deserialize, Default, Clone, Copy)]
+enum Status {
+    #[serde(rename = "busy")]
+    Busy,
+    #[serde(other)]
+    #[default]
+    Other,
+}
+
+impl From<Status> for SurvivorState {
+    fn from(status: Status) -> Self {
+        match status {
+            Status::Busy => Self::Busy,
+            Status::Other => Self::Idle,
+        }
+    }
+}
+
 #[derive(Deserialize)]
 struct Registered {
     pid: Pid,
@@ -166,6 +204,8 @@ struct Registered {
     cwd: PathBuf,
     #[serde(rename = "jobId", default)]
     job: JobField,
+    #[serde(default)]
+    status: Status,
 }
 
 #[derive(Deserialize)]
@@ -185,9 +225,11 @@ enum Place {
 }
 
 impl Registered {
-    fn works_on(&self, conversation: &Conversation) -> bool {
-        matches!((&self.kind, &self.spare), (Kind::Background, Role::Worker))
-            && conversation.ids().any(|id| *id == self.session)
+    fn in_chain(&self, conversations: &[Conversation]) -> bool {
+        matches!(self.spare, Role::Worker)
+            && conversations
+                .iter()
+                .any(|c| c.ids().any(|id| *id == self.session))
     }
 
     fn place(&self, workdir: &Path) -> Place {
@@ -207,13 +249,13 @@ pub(crate) struct Search {
     pub(crate) unreadable: Vec<PathBuf>,
 }
 
-/// The background session running `conversation`, preferring one with a job
+/// The background session running any of `conversations`, preferring one with a job
 /// id and then one in `workdir`. An entry whose process is gone, a spare, or
 /// another conversation's doesn't count. A file that vanishes or isn't text
 /// between listing and reading is skipped like any other junk.
 pub(crate) fn find(
     sessions: &Path,
-    conversation: &Conversation,
+    conversations: &[Conversation],
     workdir: &Path,
 ) -> Result<Search, HarnessError> {
     let read = |source| HarnessError {
@@ -241,14 +283,24 @@ pub(crate) fn find(
             continue;
         };
         match serde_json::from_str::<Registered>(&text) {
-            Ok(registered) if registered.works_on(conversation) => {
+            Ok(registered) if registered.in_chain(conversations) => {
                 let place = registered.place(workdir);
-                candidates.extend(Survivor::confirm(registered).map(|found| (place, found)));
+                candidates.extend(
+                    match registered.kind {
+                        Kind::Background => Survivor::confirm(registered),
+                        Kind::Interactive => Survivor::in_terminal(&registered, place),
+                        Kind::Other => None,
+                    }
+                    .map(|found| (place, found)),
+                );
             }
             Ok(_) => {}
             Err(_) => {
-                let ours = serde_json::from_str::<Whose>(&text)
-                    .is_ok_and(|whose| conversation.ids().any(|id| *id == whose.session));
+                let ours = serde_json::from_str::<Whose>(&text).is_ok_and(|whose| {
+                    conversations
+                        .iter()
+                        .any(|c| c.ids().any(|id| *id == whose.session))
+                });
                 if ours {
                     unreadable.push(path);
                 }
@@ -257,7 +309,15 @@ pub(crate) fn find(
     }
     let found = candidates
         .into_iter()
-        .min_by_key(|(place, found)| (matches!(found, Found::Unaddressable { .. }), *place))
+        .min_by_key(|(place, found)| {
+            let rank = match found {
+                Found::Attachable(_) => 0,
+                Found::Unaddressable { .. } => 1,
+                Found::Pending(_) => 2,
+                Found::Elsewhere => 3,
+            };
+            (rank, *place)
+        })
         .map(|(_, found)| found);
     Ok(Search { found, unreadable })
 }

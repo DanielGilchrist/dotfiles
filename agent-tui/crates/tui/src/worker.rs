@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
@@ -12,7 +13,9 @@ use agent_core::config::Sources;
 use agent_core::discover;
 use agent_core::model::{Removable, Running, Snapshot, Startable};
 use agent_core::names::{AgentName, Prompt, SessionName};
-use agent_core::ops::{self, Approved, Backend, Launch, RemovalPlan, Removed};
+use agent_core::ops::{
+    self, Approved, Backend, Fleet, Launch, RemovalPlan, Removed, Restart, RestartPlan,
+};
 use agent_core::paths::RepoRoot;
 use agent_core::ports::{
     ActivityDetail, ClientId, FileDiff, HarnessId, HostError, Log, Observation, Place, Probe,
@@ -23,7 +26,7 @@ use crossterm::event::{KeyEvent, MouseEvent};
 use crate::cause::Cause;
 use crate::document::{Doc, Key, assemble};
 use crate::model::{
-    Company, Found, Inspected, Launchable, Look, Need, PromptEdit, RepoChoice, Ticket,
+    Company, Finish, Found, Inspected, Launchable, Look, Need, PromptEdit, RepoChoice, Ticket,
 };
 
 /// How much of a failed action's stderr is read for its last line.
@@ -62,6 +65,20 @@ pub enum Msg {
     RemovalPlanned {
         ticket: Ticket,
         result: Result<RemovalPlan, Cause>,
+    },
+    RestartPlanned {
+        ticket: Ticket,
+        result: Result<RestartPlan, Cause>,
+    },
+    FleetPlanned {
+        ticket: Ticket,
+        result: Result<Fleet, Cause>,
+    },
+    /// The restart thread finished with `name`. It sends a snapshot first, so
+    /// the one this arrives behind already shows the session it started.
+    Restarted {
+        name: SessionName,
+        finish: Finish,
     },
     Done(Result<Outcome, Cause>),
     /// The message sent under `ticket` was typed into `to`, or wasn't.
@@ -193,6 +210,13 @@ pub enum Job {
         ticket: Ticket,
     },
     Remove(Approved),
+    PlanRestart {
+        at: Startable,
+        ticket: Ticket,
+    },
+    PlanRestarts {
+        ticket: Ticket,
+    },
     Pin(SessionName),
     Unpin(SessionName),
     /// List the repo holding this directory.
@@ -228,6 +252,8 @@ impl Job {
             | Self::Unpin(_)
             | Self::ListRepo(_) => true,
             Self::PlanRemoval { .. }
+            | Self::PlanRestart { .. }
+            | Self::PlanRestarts { .. }
             | Self::Select(_)
             | Self::CheckDir(_)
             | Self::CloseElsewhere { .. }
@@ -241,6 +267,11 @@ impl Job {
 
 pub struct Workers {
     pub jobs: Sender<Job>,
+    /// Restarts run one at a time, in the order sent, on a thread of their
+    /// own because stopping a harness can take seconds.
+    pub restarts: Sender<Restart>,
+    stopping: Arc<AtomicBool>,
+    restarter: Option<JoinHandle<()>>,
     inspector: Arc<Inspector>,
     subagents: Arc<SubagentReader>,
     activities: Arc<ActivityReader>,
@@ -308,12 +339,19 @@ impl Workers {
 
 impl Drop for Workers {
     /// Stops taking jobs and waits for the one in flight, however the TUI
-    /// exits, so quitting can't interrupt a removal halfway.
+    /// exits, so quitting can't interrupt a removal halfway. Restarts still
+    /// waiting are dropped, and the one in flight finishes.
     fn drop(&mut self) {
+        self.stopping.store(true, Ordering::SeqCst);
         let (closed, _) = mpsc::channel();
         drop(std::mem::replace(&mut self.jobs, closed));
+        let (closed, _) = mpsc::channel();
+        drop(std::mem::replace(&mut self.restarts, closed));
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
+        }
+        if let Some(restarter) = self.restarter.take() {
+            let _ = restarter.join();
         }
     }
 }
@@ -739,6 +777,9 @@ pub fn spawn(backend: Arc<Backend>, sources: Sources, msgs: Sender<Msg>) -> Work
             &msgs,
         )
     };
+    let (restarts, restarts_rx) = mpsc::channel::<Restart>();
+    let stopping = Arc::new(AtomicBool::new(false));
+    let restarter = spawn_restarter(Arc::clone(&backend), msgs.clone(), restarts_rx, &stopping);
     let (jobs, rx) = mpsc::channel::<Job>();
     let after = refresh.clone();
     let worker = thread::spawn(move || {
@@ -756,6 +797,9 @@ pub fn spawn(backend: Arc<Backend>, sources: Sources, msgs: Sender<Msg>) -> Work
     });
     Workers {
         jobs,
+        restarts,
+        stopping,
+        restarter: Some(restarter),
         inspector,
         subagents,
         activities,
@@ -766,6 +810,39 @@ pub fn spawn(backend: Arc<Backend>, sources: Sources, msgs: Sender<Msg>) -> Work
         refresh,
         worker: Some(worker),
     }
+}
+
+/// Runs restarts in the order they come, each answered with a snapshot and
+/// then its own message. Once `stopping`, the ones still waiting are dropped.
+/// A flag does that because a receiver goes on yielding what was sent
+/// before its sender dropped.
+fn spawn_restarter(
+    backend: Arc<Backend>,
+    msgs: Sender<Msg>,
+    restarts: mpsc::Receiver<Restart>,
+    stopping: &Arc<AtomicBool>,
+) -> JoinHandle<()> {
+    let stopping = Arc::clone(stopping);
+    thread::spawn(move || {
+        for go in restarts {
+            if stopping.load(Ordering::SeqCst) {
+                return;
+            }
+            let name = go.name();
+            let finish = match ops::restart(backend.services(), go) {
+                Ok(restarted) => Finish::Restarted {
+                    end: restarted.end,
+                    label: restarted.label,
+                },
+                Err(ops::Error::Busy { interrupts, .. }) => Finish::Skipped(interrupts),
+                Err(e) => Finish::Failed(Cause::of(&e)),
+            };
+            let restarted = Msg::Restarted { name, finish };
+            if msgs.send(snapshot(&backend)).is_err() || msgs.send(restarted).is_err() {
+                return;
+            }
+        }
+    })
 }
 
 /// Starts the action detached from the TUI's terminal, reports that it
@@ -903,6 +980,16 @@ fn run(backend: &Arc<Backend>, job: Job, msgs: &Sender<Msg>) -> Option<Msg> {
                 .map_err(err),
         },
         Job::Remove(approved) => Msg::Done(remove(svc, approved)),
+        Job::PlanRestart { at, ticket } => Msg::RestartPlanned {
+            ticket,
+            result: ops::plan_restart(svc, at)
+                .and_then(ops::Planned::elsewhere)
+                .map_err(err),
+        },
+        Job::PlanRestarts { ticket } => Msg::FleetPlanned {
+            ticket,
+            result: ops::plan_restarts(svc).map_err(err),
+        },
         Job::CloseElsewhere { name, own } => Msg::ClosedElsewhere {
             closed: close_elsewhere(svc, &name, own).map_err(|e| Cause::of(&e)),
             name,

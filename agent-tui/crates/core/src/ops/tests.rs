@@ -6,75 +6,8 @@ use super::*;
 use crate::activity::{Activity, Input, Move, Standing, State, TranscriptRef};
 use crate::model::Head;
 use crate::names::PullRequest;
-use crate::ports::{
-    LocalBranch, Probe, PullRequestHead, SessionInfo, SessionStatus, TranscriptStamp,
-};
-use crate::testing::{FakeForge, FakeHarnesses, FakeHost, FakeVcs, MemStore};
-
-struct World {
-    _dir: tempfile::TempDir,
-    vcs: FakeVcs,
-    forge: FakeForge,
-    host: FakeHost,
-    store: MemStore,
-    harnesses: FakeHarnesses,
-    layout: Layout,
-    exe: PathBuf,
-    own: Option<SessionName>,
-}
-
-impl World {
-    fn new() -> Self {
-        let dir = tempfile::tempdir().expect("a temp dir");
-        let root = dir.path().join("src/api");
-        std::fs::create_dir_all(&root).expect("creates");
-        Self {
-            vcs: FakeVcs::new(&root),
-            forge: FakeForge::default(),
-            layout: Layout::new(dir.path().join("w")).expect("absolute"),
-            host: FakeHost::default(),
-            store: MemStore::default(),
-            harnesses: FakeHarnesses::default(),
-            exe: "/bin/agent".into(),
-            own: None,
-            _dir: dir,
-        }
-    }
-
-    fn svc(&self) -> Services<'_> {
-        Services {
-            vcs: &self.vcs,
-            forge: &self.forge,
-            host: &self.host,
-            store: &self.store,
-            harnesses: &self.harnesses,
-            layout: &self.layout,
-            exe: &self.exe,
-            own: self.own.as_ref(),
-        }
-    }
-
-    fn harness(&self) -> &dyn Harness {
-        &self.harnesses.0
-    }
-
-    fn add_session(&self, name: &str, status: SessionStatus) {
-        self.host.sessions.lock().expect("lock").push(SessionInfo {
-            name: name.parse().expect("parses"),
-            status,
-        });
-    }
-
-    fn existing_worktree(&self, name: &str) -> AgentWorktree {
-        let wt = self
-            .layout
-            .worktree(&self.vcs.root, name.parse().expect("parses"));
-        self.vcs
-            .add_worktree(&self.vcs.root, &wt, &WorktreeStart::DefaultBase)
-            .expect("succeeds");
-        wt
-    }
-}
+use crate::ports::{LocalBranch, Probe, PullRequestHead, SessionStatus, TranscriptStamp};
+use crate::testing::World;
 
 fn agent(s: &str) -> AgentName {
     s.parse().expect("parses")
@@ -1273,3 +1206,5 @@ fn an_interrupted_agent_whose_transcript_went_on_is_working_again() {
     .expect("succeeds");
     assert!(stored_state(&w, "fix").is_going());
 }
+
+mod restart;

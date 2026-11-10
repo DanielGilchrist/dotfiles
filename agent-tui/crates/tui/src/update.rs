@@ -11,7 +11,7 @@ use agent_core::activity::{
 use agent_core::config::ControlKey;
 use agent_core::model::{Entry, EntryState, RepoKey, Snapshot};
 use agent_core::names::{CarriageReturn, InvalidPrompt, Prompt, SessionName, clean};
-use agent_core::ops::{Approved, Launch};
+use agent_core::ops::{Approved, Launch, RemovalPlan};
 use agent_core::paths::{RepoRoot, Typed, typed_path};
 use agent_core::ports::{ActivityDetail, ClientId, Listing, Observation, Probe, TranscriptStamp};
 use agent_term::{CellPos, encode_key, encode_mouse};
@@ -26,16 +26,18 @@ use crate::model::{
     ActivityRow, AfterCheck, Answer, Areas, CheckHealth, Chord, CommentDraft, Company, Confirm,
     Cursor, DirCheck, Direction, Drawn, Edge, Enter, Field, Focus, Follow, FormKind, HelpState,
     INFO_TTL, Inspected, Inspection, Intent, Listed, LogKey, Look, Missing, Mode, Model, Moment,
-    NamingState, Need, NewAgent, Overlay, Pane, Panel, Peek, Phase, PromptEdit, Query, Reach,
-    Reply, ReplyTo, RepoInput, Screen, StatusKind, Submission, TerminalFocus, Ticket, Unreachable,
-    View, Watch, WatchView, WorkRoom, elsewhere_banner, fuzzy_match, match_rank, repo_matches,
-    unlisted,
+    NamingState, Need, NewAgent, Overlay, Pane, Panel, Peek, Phase, Planning, PromptEdit, Query,
+    Reach, Reply, ReplyTo, RepoInput, Screen, StatusKind, Submission, TerminalFocus, Ticket,
+    Unreachable, View, Watch, WatchView, WorkRoom, elsewhere_banner, fuzzy_match, match_rank,
+    repo_matches, unlisted,
 };
 use crate::touched::Baseline;
 use crate::track::{Compose, Found, Probed, Seen};
 use crate::tree::ChangesView;
 use crate::typed::{Columns, Message};
 use crate::worker::{Job, Msg, Outcome, SendError};
+
+mod restart;
 
 /// How long the pane shows a finished agent, terminal focused, before it
 /// counts as seen.
@@ -92,6 +94,8 @@ pub enum Background {
 
 pub enum Effect {
     Job(Job),
+    /// Hand restarts to the restart thread, which runs them in order.
+    Restart(Vec<agent_core::ops::Restart>),
     /// Read git facts about an agent's worktree.
     Inspect {
         name: SessionName,
@@ -229,16 +233,12 @@ fn step(m: &mut Model, msg: Msg) -> Vec<Effect> {
             Vec::new()
         }
         Msg::RemovalPlanned { ticket, result } => {
-            if !matches!(&m.overlay, Overlay::Planning { ticket: t, .. } if *t == ticket) {
-                return Vec::new();
-            }
-            m.overlay = Overlay::None;
-            match result {
-                Ok(plan) => m.overlay = Overlay::Confirm(Confirm::Remove(plan.into())),
-                Err(e) => m.error(e),
-            }
+            on_removal_planned(m, ticket, result);
             Vec::new()
         }
+        Msg::RestartPlanned { ticket, result } => restart::on_restart_planned(m, ticket, result),
+        Msg::FleetPlanned { ticket, result } => restart::on_fleet_planned(m, ticket, result),
+        Msg::Restarted { name, finish } => restart::on_restarted(m, &name, finish),
         Msg::Launched { ticket, result } => on_launched(m, ticket, result),
         Msg::Observed { ticket, result } => on_observed(m, ticket, result),
         Msg::Done(Ok(outcome)) => {
@@ -454,6 +454,23 @@ fn first_warning(warnings: &[String], hint: &str) -> String {
         [] => String::new(),
         [only] => only.clone(),
         [first, rest @ ..] => format!("{first} (+{} more{hint})", rest.len()),
+    }
+}
+
+/// Whether the overlay is still waiting on the plan `ticket` asked for, of
+/// the kind `wanted` picks.
+fn waiting_on(m: &Model, ticket: Ticket, wanted: fn(&Planning) -> bool) -> bool {
+    matches!(&m.overlay, Overlay::Planning { ticket: t, planning } if *t == ticket && wanted(planning))
+}
+
+fn on_removal_planned(m: &mut Model, ticket: Ticket, result: Result<RemovalPlan, Cause>) {
+    if !waiting_on(m, ticket, |p| matches!(p, Planning::Removal(_))) {
+        return;
+    }
+    m.overlay = Overlay::None;
+    match result {
+        Ok(plan) => m.overlay = Overlay::Confirm(Confirm::Remove(plan.into())),
+        Err(e) => m.error(e),
     }
 }
 
@@ -1510,9 +1527,16 @@ fn activate(m: &mut Model, name: &SessionName, intent: Intent) -> Vec<Effect> {
         m.info(format!("{name} is still starting"));
         return Vec::new();
     }
-    let Reach::Other { enter, .. } = reach else {
-        m.error(format!("this TUI is running inside {name}"));
-        return Vec::new();
+    let enter = match reach {
+        Reach::Own => {
+            m.error(format!("this TUI is running inside {name}"));
+            return Vec::new();
+        }
+        Reach::Restarting => {
+            m.info(format!("{name} is restarting"));
+            return Vec::new();
+        }
+        Reach::Other { enter, .. } => enter,
     };
     if m.elsewhere(name) {
         if matches!(enter, Enter::Attach) {
@@ -2237,7 +2261,7 @@ fn focus_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
             if m.selected_entry()
                 .is_some_and(|e| m.activity(e.name()).is_none()) =>
         {
-            m.info("no activity recorded · d then ⏎ restarts it through agent");
+            m.info("no activity recorded · r restarts it through agent");
         }
         (KeyCode::Char('2'), _) => m.panel = Panel::activity(),
         (KeyCode::Char('3'), _) if m.change_rows() == 0 => m.info("no files to move to"),
@@ -2481,6 +2505,9 @@ fn overlay_key(m: &mut Model, key: &KeyEvent, selected: Option<&Entry>) -> Optio
         KeyCode::Char('t') => m.info(SEND_MOVED),
         KeyCode::Char('v') => return Some(open_peek(m)),
         KeyCode::Char('x') => match selected {
+            Some(entry) if matches!(m.reach(entry), Reach::Restarting) => {
+                m.info(format!("{} is restarting", entry.name()));
+            }
             _ if m.actions.is_empty() => m.info(format!(
                 "no actions · add [[action]] to {}",
                 crate::CONFIG_HINT
@@ -2498,7 +2525,7 @@ fn action_key(m: &mut Model, key: &KeyEvent, selected: Option<Entry>) -> Option<
     match key.code {
         KeyCode::Char('q') => {
             let unsent = m.unsent();
-            if unsent.comments + unsent.messages == 0 {
+            if unsent.comments + unsent.messages + unsent.restarts == 0 {
                 return Some(vec![Effect::Quit]);
             }
             m.overlay = Overlay::Confirm(Confirm::Quit(unsent));
@@ -2542,6 +2569,8 @@ fn action_key(m: &mut Model, key: &KeyEvent, selected: Option<Entry>) -> Option<
         }
         KeyCode::Char('d') => kill_selected(m, selected),
         KeyCode::Char('D') => return Some(request_removal(m)),
+        KeyCode::Char('r') => return Some(restart::request_restart(m)),
+        KeyCode::Char('R') => return Some(restart::request_restarts(m)),
         KeyCode::Char('a') => {
             let here = m.visible_session().cloned();
             let next = m
@@ -2570,6 +2599,7 @@ fn kill_selected(m: &mut Model, selected: Option<Entry>) {
         Some((Reach::Own, entry)) => {
             m.error(format!("can't kill {}: this TUI runs in it", entry.name()));
         }
+        Some((Reach::Restarting, entry)) => m.info(format!("{} is restarting", entry.name())),
         Some((
             Reach::Other {
                 enter: Enter::Resurrect | Enter::Restart(_),
@@ -2650,13 +2680,14 @@ fn request_removal(m: &mut Model) -> Vec<Effect> {
             let ticket = m.ticket();
             m.overlay = Overlay::Planning {
                 ticket,
-                name: entry.name().clone(),
+                planning: Planning::Removal(entry.name().clone()),
             };
             return vec![Effect::Job(Job::PlanRemoval { target, ticket })];
         }
         Reach::Other { remove: None, .. } => {
             m.info(format!("{} has nothing to remove", entry.name()));
         }
+        Reach::Restarting => m.info(format!("{} is restarting", entry.name())),
     }
     Vec::new()
 }
@@ -2709,6 +2740,10 @@ fn open_peek(m: &mut Model) -> Vec<Effect> {
         }
         Reach::Own => {
             m.info(format!("{name} is where this TUI runs"));
+            Vec::new()
+        }
+        Reach::Restarting => {
+            m.info(format!("{name} is restarting"));
             Vec::new()
         }
         Reach::Other { .. } => {
@@ -2780,6 +2815,7 @@ fn unreachable_says(name: &SessionName, why: Unreachable) -> String {
     match why {
         Unreachable::NotRunning => format!("{name} isn't running · ⏎ starts it"),
         Unreachable::Own => format!("{name} is where this TUI runs"),
+        Unreachable::Restarting => format!("{name} is restarting"),
         Unreachable::Unreported => format!(
             "{name} hasn't reported through hooks, so a menu open in it can't be known · ⏎ attaches"
         ),
@@ -3010,9 +3046,9 @@ fn on_overlay_key(m: &mut Model, key: KeyEvent) -> Vec<Effect> {
         Overlay::Switcher(query) => on_switcher_key(m, query, &key),
         Overlay::Picker(query) => on_picker_key(m, query, &key),
         Overlay::Confirm(confirm) => on_confirm_key(m, confirm, &key),
-        Overlay::Planning { ticket, name } => {
+        Overlay::Planning { ticket, planning } => {
             if !matches!(key.code, KeyCode::Esc | KeyCode::Char('n' | 'q')) {
-                m.overlay = Overlay::Planning { ticket, name };
+                m.overlay = Overlay::Planning { ticket, planning };
             }
             Vec::new()
         }
@@ -3343,6 +3379,9 @@ fn on_confirm_key(m: &mut Model, confirm: Confirm, key: &KeyEvent) -> Vec<Effect
         }
         (Confirm::Quit(_), KeyCode::Char('y') | KeyCode::Enter) => vec![Effect::Quit],
         (_, KeyCode::Esc | KeyCode::Char('n' | 'q')) => Vec::new(),
+        (confirm @ (Confirm::Restart(_) | Confirm::Restarts(_)), code) => {
+            restart::on_restart_key(m, confirm, code)
+        }
         (Confirm::Remove(proposal), KeyCode::Char(key)) => match proposal.answer(key) {
             Ok(Answer::Remove(approved)) => remove(m, approved),
             Ok(Answer::KillOnly(running)) => {
@@ -6967,8 +7006,8 @@ mod tests {
             );
             update(&mut m, key(KeyCode::Esc));
         }
-        update(&mut m, key(KeyCode::Char('r')));
-        assert!(matches!(m.overlay, Overlay::None), "r is free");
+        update(&mut m, key(KeyCode::Char('z')));
+        assert!(matches!(m.overlay, Overlay::None), "z is free");
     }
 
     #[test]
@@ -7552,7 +7591,8 @@ mod tests {
             m.overlay,
             Overlay::Confirm(Confirm::Quit(Unsent {
                 comments: 0,
-                messages: 1
+                messages: 1,
+                restarts: 0
             }))
         ));
         update(&mut m, key(KeyCode::Esc));
@@ -7853,7 +7893,8 @@ mod tests {
             m.overlay,
             Overlay::Confirm(Confirm::Quit(Unsent {
                 comments: 1,
-                messages: 0
+                messages: 0,
+                restarts: 0
             }))
         ));
         update(&mut m, key(KeyCode::Esc));
@@ -9344,4 +9385,5 @@ mod tests {
         }
     }
     mod elsewhere;
+    mod restart;
 }
