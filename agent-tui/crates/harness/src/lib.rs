@@ -85,7 +85,14 @@ struct Registered {
     pid: i32,
     #[serde(rename = "sessionId")]
     session_id: String,
+    /// The short id `claude attach` and `claude stop` take. They refuse the
+    /// full session id.
+    #[serde(rename = "jobId")]
+    job_id: Option<String>,
 }
+
+/// A background session to join or stop, by the id Claude's CLI accepts.
+struct Job(String);
 
 impl Claude {
     pub fn new(home: &Path) -> Self {
@@ -117,14 +124,14 @@ impl Claude {
         cmd
     }
 
-    /// Whether the conversation `id` is still running as a background
-    /// session: Claude Code keeps a session alive when its terminal goes,
-    /// and `--resume` refuses one that's alive. A registry entry whose
-    /// process is gone doesn't count.
-    fn in_background(&self, id: &str) -> io::Result<bool> {
+    /// The background session still running the conversation `id`, if any:
+    /// Claude Code keeps a session alive when its terminal goes, and
+    /// `--resume` refuses one that's alive. A registry entry whose process is
+    /// gone doesn't count.
+    fn in_background(&self, id: &str) -> io::Result<Option<Job>> {
         let entries = match std::fs::read_dir(&self.sessions) {
             Ok(entries) => entries,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e),
         };
         for entry in entries {
@@ -138,17 +145,19 @@ impl Claude {
                 continue;
             };
             if registered.session_id == id && process_alive(registered.pid) {
-                return Ok(true);
+                return Ok(Some(Job(registered
+                    .job_id
+                    .unwrap_or(registered.session_id))));
             }
         }
-        Ok(false)
+        Ok(None)
     }
 
     /// Stops the background session `id` so it can be resumed with a
     /// prompt, which `attach` can't carry.
-    fn stop(&self, id: &str) -> Result<(), HarnessError> {
+    fn stop(&self, Job(id): &Job) -> Result<(), HarnessError> {
         let mut cmd = self.command();
-        cmd.args(["stop", id]);
+        cmd.args(["stop", id.as_str()]);
         agent_core::process::output_within(&mut cmd, STOP_TIMEOUT).map_err(|e| HarnessError {
             context: format!("stopping background session {id}"),
             source: io::Error::other(e),
@@ -295,7 +304,7 @@ impl Harness for Claude {
         })?;
 
         if let Some(id) = &resume
-            && self.in_background(id).map_err(|source| HarnessError {
+            && let Some(job) = self.in_background(id).map_err(|source| HarnessError {
                 context: "reading Claude's session registry".into(),
                 source,
             })?
@@ -307,10 +316,10 @@ impl Harness for Claude {
                     return Ok(LaunchSpec::new(&self.program)
                         .cwd(&workdir)
                         .env_remove(INHERITED_SESSION_ENV.iter().copied())
-                        .args(["attach".to_string(), id.clone()])
+                        .args(["attach".to_string(), job.0])
                         .untraced());
                 }
-                Some(_) => self.stop(id)?,
+                Some(_) => self.stop(&job)?,
             }
         }
 
@@ -1232,6 +1241,20 @@ mod tests {
         register("alive.json", std::process::id());
         let attached = claude.launch(&ctx(None)).expect("succeeds");
         assert_eq!(attached.arguments(), ["attach", "after-clear"]);
+        std::fs::write(
+            sessions.join("alive.json"),
+            format!(
+                r#"{{"pid":{},"sessionId":"after-clear","jobId":"470bb73a","cwd":"x"}}"#,
+                std::process::id()
+            ),
+        )
+        .expect("writes");
+        let by_job = claude.launch(&ctx(None)).expect("succeeds");
+        assert_eq!(
+            by_job.arguments(),
+            ["attach", "470bb73a"],
+            "attach takes the short job id, it refuses the full session id"
+        );
         let stopped = claude.launch(&ctx(Some(&go))).expect("succeeds");
         let args = stopped.arguments();
         assert_eq!(
