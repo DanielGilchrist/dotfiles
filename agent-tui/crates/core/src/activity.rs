@@ -386,17 +386,37 @@ pub enum Answer {
 }
 
 /// A subagent the agent started.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(from = "StoredSubagent", into = "WrittenSubagent")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(into = "WrittenSubagent")]
 pub struct Subagent {
     pub kind: String,
     pub description: Option<String>,
     pub launch: Launch,
     pub since: SystemTime,
-    pub status: SubagentStatus,
+    /// When the harness last reported anything from it, or about it while
+    /// it was listed as running.
+    heard: SystemTime,
+    status: SubagentStatus,
 }
 
 impl Subagent {
+    /// A subagent that began at `since` and is running.
+    pub fn running(
+        kind: impl Into<String>,
+        description: Option<String>,
+        launch: Launch,
+        since: SystemTime,
+    ) -> Self {
+        Self {
+            kind: kind.into(),
+            description,
+            launch,
+            since,
+            heard: since,
+            status: SubagentStatus::Running { tools: Vec::new() },
+        }
+    }
+
     /// Its description, unless it is missing or empty.
     pub fn label(&self) -> Option<&str> {
         self.description.as_deref().filter(|d| !d.is_empty())
@@ -412,7 +432,7 @@ impl Subagent {
 /// prompt so its row and transcript stay to be read.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum SubagentStatus {
+enum SubagentStatus {
     /// The tools it's running.
     Running {
         tools: Vec<Tool>,
@@ -422,19 +442,53 @@ pub enum SubagentStatus {
     },
 }
 
+/// How a subagent stands as of a moment, which is its recorded status
+/// unless it has gone quiet. Nothing in the record says a subagent that
+/// reports nothing is still alive: its session may have died with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Liveness<'a> {
+    Running {
+        tools: &'a [Tool],
+    },
+    /// Recorded as running, with no tool running, no question open and
+    /// nothing heard from it for [`STALE_AFTER`].
+    Lost {
+        since: SystemTime,
+    },
+    Finished {
+        at: SystemTime,
+    },
+}
+
+/// Whether a subagent has a question open. It is then waiting on the user,
+/// not gone quiet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Waiting {
+    On,
+    Off,
+}
+
+/// Whether nothing has been heard since `heard` for longer than
+/// [`STALE_AFTER`].
+fn quiet(heard: SystemTime, now: SystemTime) -> bool {
+    now.duration_since(heard).is_ok_and(|d| d > STALE_AFTER)
+}
+
 impl Subagent {
-    fn new(kind: String, launch: Launch, now: SystemTime) -> Self {
-        Self {
-            kind,
-            description: None,
-            launch,
-            since: now,
-            status: SubagentStatus::Running { tools: Vec::new() },
+    pub fn liveness(&self, now: SystemTime, waiting: Waiting) -> Liveness<'_> {
+        match (&self.status, waiting) {
+            (SubagentStatus::Finished { at }, _) => Liveness::Finished { at: *at },
+            (SubagentStatus::Running { tools }, Waiting::Off)
+                if tools.is_empty() && quiet(self.heard, now) =>
+            {
+                Liveness::Lost { since: self.heard }
+            }
+            (SubagentStatus::Running { tools }, _) => Liveness::Running { tools },
         }
     }
 
-    pub fn is_running(&self) -> bool {
-        matches!(self.status, SubagentStatus::Running { .. })
+    pub fn is_finished(&self) -> bool {
+        matches!(self.status, SubagentStatus::Finished { .. })
     }
 
     /// The tools it's running, none once it has finished.
@@ -447,7 +501,7 @@ impl Subagent {
 
     /// Marks it finished at `at`, unless it already was.
     pub fn finish(&mut self, at: SystemTime) {
-        if self.is_running() {
+        if !self.is_finished() {
             self.status = SubagentStatus::Finished { at };
         }
     }
@@ -626,6 +680,11 @@ pub struct Activity {
     /// Open questions, at most one per asker, oldest first.
     pub asks: Vec<Ask>,
     pub subagents: BTreeMap<AgentId, Subagent>,
+    /// Subagents that stopped before anything said they began, when they
+    /// stopped. Never drawn or counted, so a stop for one the activity
+    /// dropped can't show as a phantom. A later start or launch takes its
+    /// stop from here.
+    stopped_early: BTreeMap<AgentId, SystemTime>,
     pub session: Session,
     /// The latest transcript the harness reported.
     pub transcript: Option<TranscriptRef>,
@@ -641,6 +700,23 @@ pub const LAUNCH_GRACE: Duration = Duration::from_secs(30);
 /// How long a session that just reported starting must stay quiet before
 /// typed text is safe: a startup dialog may be open without any report.
 pub const BOOT_QUIET: Duration = Duration::from_secs(5);
+
+/// How a session that is still coming up got there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Boot {
+    /// Launched through `agent` and nothing reported since.
+    Launching { since: SystemTime },
+    /// The harness reported starting, and a dialog may still be open.
+    Starting { since: SystemTime },
+}
+
+impl Boot {
+    pub fn since(self) -> SystemTime {
+        match self {
+            Self::Launching { since } | Self::Starting { since } => since,
+        }
+    }
+}
 
 /// Why text can't be typed into an agent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -710,6 +786,7 @@ impl Activity {
             events: 0,
             asks: Vec::new(),
             subagents: BTreeMap::new(),
+            stopped_early: BTreeMap::new(),
             session: Session::Live {
                 join: Join::Untraced,
             },
@@ -767,7 +844,7 @@ impl Activity {
         let state = std::mem::replace(&mut self.state, State::Idle);
         self.state = match event {
             Event::Main(event) => self.apply_main(event, state, answered, now),
-            Event::Subagent(id, event) => self.apply_subagent(id, event, state, answered, now),
+            Event::Subagent(id, event) => self.apply_subagent(&id, event, state, answered, now),
         };
     }
 
@@ -779,11 +856,7 @@ impl Activity {
         now: SystemTime,
     ) -> State {
         match event {
-            MainEvent::Launched(_) => {
-                self.forget_subagents();
-                State::Working { tools: Vec::new() }
-            }
-            MainEvent::Started => {
+            MainEvent::Launched(_) | MainEvent::Started => {
                 self.forget_subagents();
                 State::Idle
             }
@@ -839,6 +912,40 @@ impl Activity {
 
     fn apply_subagent(
         &mut self,
+        id: &AgentId,
+        event: SubagentEvent,
+        state: State,
+        answered: Option<Ask>,
+        now: SystemTime,
+    ) -> State {
+        let state = self.apply_subagent_event(id.clone(), event, state, answered, now);
+        if let Some(subagent) = self.subagents.get_mut(id) {
+            subagent.heard = now;
+        }
+        state
+    }
+
+    /// The subagent `id`, listed if it wasn't: finished already when its
+    /// stop came first.
+    fn enter(
+        &mut self,
+        id: AgentId,
+        kind: String,
+        launch: Launch,
+        now: SystemTime,
+    ) -> &mut Subagent {
+        let stopped = self.stopped_early.remove(&id);
+        self.subagents.entry(id).or_insert_with(|| {
+            let mut subagent = Subagent::running(kind, None, launch, now);
+            if let Some(at) = stopped {
+                subagent.finish(at);
+            }
+            subagent
+        })
+    }
+
+    fn apply_subagent_event(
+        &mut self,
         id: AgentId,
         event: SubagentEvent,
         state: State,
@@ -847,9 +954,7 @@ impl Activity {
     ) -> State {
         match event {
             SubagentEvent::Started { kind } => {
-                self.subagents
-                    .entry(id)
-                    .or_insert_with(|| Subagent::new(kind, Launch::Foreground, now));
+                self.enter(id, kind, Launch::Foreground, now);
                 state
             }
             SubagentEvent::Launched {
@@ -857,17 +962,17 @@ impl Activity {
                 kind,
                 description,
             } => {
-                let subagent = self
-                    .subagents
-                    .entry(id)
-                    .or_insert_with(|| Subagent::new(kind, Launch::Background, now));
+                let subagent = self.enter(id, kind, Launch::Background, now);
                 subagent.launch = Launch::Background;
                 subagent.description = Some(description);
                 finish(state, &tool)
             }
             SubagentEvent::Stopped => {
-                if let Some(subagent) = self.subagents.get_mut(&id) {
-                    subagent.finish(now);
+                match self.subagents.get_mut(&id) {
+                    Some(subagent) => subagent.finish(now),
+                    None => {
+                        self.stopped_early.insert(id, now);
+                    }
                 }
                 state
             }
@@ -928,13 +1033,16 @@ impl Activity {
     /// The finished activity's background subagents replace the ones tracked.
     fn track_background(&mut self, running: &[Background], now: SystemTime) {
         self.subagents
-            .retain(|id, s| !s.is_running() || running.iter().any(|b| &b.id == id));
-        for b in running {
-            let subagent = self
-                .subagents
-                .entry(b.id.clone())
-                .or_insert_with(|| Subagent::new(b.kind.clone(), Launch::Background, now));
+            .retain(|id, s| s.is_finished() || running.iter().any(|b| &b.id == id));
+        for b in running
+            .iter()
+            .filter(|b| !self.stopped_early.contains_key(&b.id))
+        {
+            let subagent = self.subagents.entry(b.id.clone()).or_insert_with(|| {
+                Subagent::running(b.kind.clone(), None, Launch::Background, now)
+            });
             subagent.launch = Launch::Background;
+            subagent.heard = now;
             if b.description.is_some() {
                 subagent.description.clone_from(&b.description);
             }
@@ -965,7 +1073,8 @@ impl Activity {
     /// except those of the background subagents still running.
     fn keep_background(&mut self) {
         self.subagents
-            .retain(|_, s| s.launch == Launch::Background && s.is_running());
+            .retain(|_, s| s.launch == Launch::Background && !s.is_finished());
+        self.stopped_early.clear();
         let subagents = &self.subagents;
         self.asks.retain(|ask| match &ask.asker {
             Origin::Subagent(id) => subagents.contains_key(id),
@@ -975,6 +1084,7 @@ impl Activity {
 
     fn forget_subagents(&mut self) {
         self.subagents.clear();
+        self.stopped_early.clear();
         self.asks.clear();
     }
 
@@ -991,21 +1101,67 @@ impl Activity {
         if !self.asks.is_empty() {
             return Some(Hold::Asking);
         }
-        let booting = match self.session {
-            Session::Launched { at, .. } => now
-                .duration_since(at)
-                .is_ok_and(|waited| waited < LAUNCH_GRACE),
-            Session::Booting { .. } => now
-                .duration_since(self.heard)
-                .is_ok_and(|quiet| quiet < BOOT_QUIET),
-            Session::LaunchReported { .. } | Session::Live { .. } => false,
-        };
-        booting.then_some(Hold::Booting)
+        self.boot(now).map(|_| Hold::Booting)
     }
 
-    /// How many subagents are still running.
-    pub fn running(&self) -> usize {
-        self.subagents.values().filter(|s| s.is_running()).count()
+    /// Whether the session is still coming up, which the card shows as
+    /// starting and typed text is refused for. A launch that reports nothing
+    /// for [`LAUNCH_GRACE`] is taken to have failed, and a session that just
+    /// reported starting is quiet for [`BOOT_QUIET`] for a startup dialog.
+    pub fn boot(&self, now: SystemTime) -> Option<Boot> {
+        match self.session {
+            Session::Launched { at, .. }
+                if now
+                    .duration_since(at)
+                    .is_ok_and(|waited| waited < LAUNCH_GRACE) =>
+            {
+                Some(Boot::Launching { since: at })
+            }
+            Session::Booting { .. }
+                if now
+                    .duration_since(self.heard)
+                    .is_ok_and(|quiet| quiet < BOOT_QUIET) =>
+            {
+                Some(Boot::Starting { since: self.heard })
+            }
+            Session::Launched { .. }
+            | Session::LaunchReported { .. }
+            | Session::Booting { .. }
+            | Session::Live { .. } => None,
+        }
+    }
+
+    /// How subagent `id` stands as of `now`. One with a question open is
+    /// waiting on the user, not lost.
+    pub fn liveness(&self, id: &AgentId, now: SystemTime) -> Option<Liveness<'_>> {
+        let waiting = if self
+            .asks
+            .iter()
+            .any(|ask| matches!(&ask.asker, Origin::Subagent(asker) if asker == id))
+        {
+            Waiting::On
+        } else {
+            Waiting::Off
+        };
+        Some(self.subagents.get(id)?.liveness(now, waiting))
+    }
+
+    fn count(&self, now: SystemTime, wanted: impl Fn(Liveness<'_>) -> bool) -> usize {
+        self.subagents
+            .keys()
+            .filter_map(|id| self.liveness(id, now))
+            .filter(|l| wanted(*l))
+            .count()
+    }
+
+    /// How many subagents are running as of `now`.
+    pub fn running(&self, now: SystemTime) -> usize {
+        self.count(now, |l| matches!(l, Liveness::Running { .. }))
+    }
+
+    /// How many subagents are recorded as running but have gone quiet.
+    pub fn lost(&self, now: SystemTime) -> usize {
+        self.count(now, |l| matches!(l, Liveness::Lost { .. }))
     }
 
     /// The question that's waited longest, if any.
@@ -1093,7 +1249,7 @@ impl Activity {
     /// and nothing heard for [`STALE_AFTER`]: probably interrupted without
     /// the harness saying so, stuck, or its subagents died with the session.
     pub fn stale(&self, now: SystemTime) -> bool {
-        let quiet = now.duration_since(self.heard).unwrap_or_default() > STALE_AFTER;
+        let quiet = quiet(self.heard, now);
         let subagent_busy = self.subagents.values().any(|s| !s.tools().is_empty());
         match &self.state {
             State::Working { tools } => tools.is_empty() && !subagent_busy && quiet,
@@ -1120,7 +1276,9 @@ struct Stored {
     #[serde(default)]
     asks: Vec<Ask>,
     #[serde(default)]
-    subagents: BTreeMap<AgentId, Subagent>,
+    subagents: BTreeMap<AgentId, StoredSubagent>,
+    #[serde(default)]
+    stopped_early: BTreeMap<AgentId, SystemTime>,
     #[serde(default)]
     session: Option<Session>,
     #[serde(default)]
@@ -1149,6 +1307,7 @@ struct Written {
     events: u64,
     asks: Vec<Ask>,
     subagents: BTreeMap<AgentId, Subagent>,
+    stopped_early: BTreeMap<AgentId, SystemTime>,
     session: Session,
     transcript: Option<TranscriptRef>,
     interrupts: InterruptSignal,
@@ -1173,6 +1332,7 @@ impl From<Activity> for Written {
             events: activity.events,
             asks: activity.asks,
             subagents: activity.subagents,
+            stopped_early: activity.stopped_early,
             session: activity.session,
             transcript: activity.transcript,
             interrupts: activity.interrupts,
@@ -1193,6 +1353,7 @@ struct WrittenSubagent {
     since: SystemTime,
     tools: Vec<Tool>,
     finished: Option<SystemTime>,
+    heard: SystemTime,
     status: SubagentStatus,
 }
 
@@ -1205,6 +1366,7 @@ impl From<Subagent> for WrittenSubagent {
         Self {
             tools: subagent.tools().to_vec(),
             finished,
+            heard: subagent.heard,
             kind: subagent.kind,
             description: subagent.description,
             launch: subagent.launch,
@@ -1227,22 +1389,27 @@ struct StoredSubagent {
     #[serde(default)]
     finished: Option<SystemTime>,
     #[serde(default)]
+    heard: Option<SystemTime>,
+    #[serde(default)]
     status: Option<SubagentStatus>,
 }
 
-impl From<StoredSubagent> for Subagent {
-    fn from(stored: StoredSubagent) -> Self {
-        let status = stored.status.unwrap_or(match stored.finished {
+impl StoredSubagent {
+    /// A file from before `heard` was kept says nothing about when the
+    /// subagent was last heard from, so it counts from when its agent last
+    /// reported, which is `agent_heard`, rather than showing every one of
+    /// them lost at once.
+    fn into_subagent(self, agent_heard: SystemTime) -> Subagent {
+        let status = self.status.unwrap_or(match self.finished {
             Some(at) => SubagentStatus::Finished { at },
-            None => SubagentStatus::Running {
-                tools: stored.tools,
-            },
+            None => SubagentStatus::Running { tools: self.tools },
         });
-        Self {
-            kind: stored.kind,
-            description: stored.description,
-            launch: stored.launch,
-            since: stored.since,
+        Subagent {
+            kind: self.kind,
+            description: self.description,
+            launch: self.launch,
+            since: self.since,
+            heard: self.heard.unwrap_or(agent_heard),
             status,
         }
     }
@@ -1285,6 +1452,7 @@ impl From<Stored> for Activity {
             events,
             mut asks,
             subagents,
+            stopped_early,
             session,
             transcript,
             interrupts,
@@ -1313,7 +1481,11 @@ impl From<Stored> for Activity {
             heard,
             events,
             asks,
-            subagents,
+            subagents: subagents
+                .into_iter()
+                .map(|(id, subagent)| (id, subagent.into_subagent(heard)))
+                .collect(),
+            stopped_early,
             session: session.unwrap_or_else(|| legacy_session(booting, launcher, launched)),
             transcript,
             interrupts,
@@ -1437,6 +1609,10 @@ mod tests {
         SubagentEvent::Started {
             kind: "general-purpose".into(),
         }
+    }
+
+    fn stopped() -> SubagentEvent {
+        SubagentEvent::Stopped
     }
 
     fn launched(tool: &str) -> SubagentEvent {
@@ -1587,7 +1763,7 @@ mod tests {
             (2, sub("a", start("x", "Bash"))),
             (3, sub("a", asked("Bash: rm -rf target"))),
             (4, sub("b", start("y", "Read"))),
-            (5, sub("b", SubagentEvent::Stopped)),
+            (5, sub("b", stopped())),
             (6, main(MainEvent::Compacted)),
         ]);
         assert_eq!(questions(&asking), ["Bash: rm -rf target"]);
@@ -1700,16 +1876,16 @@ mod tests {
             (1, sub("a", launched("t"))),
             (3, main(finished(&["a"]))),
             (90, main(MainEvent::Prompted(Input::Notification))),
-            (91, sub("a", SubagentEvent::Stopped)),
+            (91, sub("a", stopped())),
         ]);
         assert_eq!(
             handed_back.prompt.as_deref(),
             Some("review it"),
             "a notification isn't the user's prompt"
         );
-        assert_eq!(handed_back.running(), 0);
+        assert_eq!(handed_back.running(at(92)), 0);
         assert!(
-            !handed_back.subagents[&AgentId::new("a")].is_running(),
+            handed_back.subagents[&AgentId::new("a")].is_finished(),
             "the finished one stays until the next prompt"
         );
         let done = Activity::next(Some(handed_back), main(finished(&[])), at(95));
@@ -1732,12 +1908,159 @@ mod tests {
         assert_eq!((answered.state, answered.since), (State::Delegating, at(1)));
     }
 
+    fn lost_after() -> u64 {
+        STALE_AFTER.as_secs() + 1
+    }
+
+    #[test]
+    fn a_background_subagent_nobody_has_heard_from_stops_counting_as_running() {
+        let a = run(vec![
+            (0, main(user("review it"))),
+            (1, sub("a", launched("t"))),
+            (2, main(finished(&["a"]))),
+        ]);
+        let a_id = AgentId::new("a");
+        assert_eq!(a.running(at(2 + STALE_AFTER.as_secs())), 1);
+        let later = at(2 + lost_after());
+        assert_eq!(a.running(later), 0);
+        assert_eq!(
+            a.liveness(&a_id, later),
+            Some(Liveness::Lost { since: at(2) })
+        );
+    }
+
+    #[test]
+    fn a_quiet_subagent_with_a_tool_running_is_not_lost() {
+        let a = run(vec![
+            (1, sub("a", launched("t"))),
+            (2, sub("a", start("x", "Bash"))),
+        ]);
+        assert_eq!(a.running(at(2 + 10 * lost_after())), 1);
+    }
+
+    #[test]
+    fn a_lost_subagent_that_reports_again_is_running_again() {
+        let lost = run(vec![(1, sub("a", launched("t")))]);
+        assert_eq!(lost.running(at(1 + lost_after())), 0);
+        let back = Activity::next(Some(lost), sub("a", started()), at(1 + lost_after()));
+        assert_eq!(back.running(at(2 + lost_after())), 1);
+    }
+
+    #[test]
+    fn a_finished_activity_listing_a_subagent_as_running_vouches_for_it() {
+        let a = run(vec![
+            (1, sub("a", launched("t"))),
+            (2 + lost_after(), main(finished(&["a"]))),
+        ]);
+        assert_eq!(a.running(at(3 + lost_after())), 1);
+    }
+
+    #[test]
+    fn a_finished_activity_drops_a_background_subagent_it_does_not_list() {
+        let a = run(vec![
+            (1, sub("a", launched("t"))),
+            (2, sub("b", launched("u"))),
+            (3, main(finished(&["b"]))),
+        ]);
+        assert_eq!(
+            a.subagents.keys().map(AgentId::as_str).collect::<Vec<_>>(),
+            ["b"]
+        );
+    }
+
+    #[test]
+    fn a_stop_that_arrives_before_the_start_leaves_the_subagent_finished() {
+        let a = run(vec![
+            (1, sub("a", stopped())),
+            (2, sub("a", started())),
+            (3, sub("a", start("x", "Bash"))),
+        ]);
+        assert_eq!(a.running(at(3)), 0);
+        assert_eq!(
+            a.liveness(&AgentId::new("a"), at(3)),
+            Some(Liveness::Finished { at: at(1) })
+        );
+    }
+
+    #[test]
+    fn a_background_launch_after_its_stop_keeps_it_finished_and_described() {
+        let a = run(vec![(1, sub("a", stopped())), (2, sub("a", launched("t")))]);
+        let subagent = &a.subagents[&AgentId::new("a")];
+        assert!(subagent.is_finished());
+        assert_eq!(
+            (subagent.launch, subagent.label()),
+            (Launch::Background, Some("review"))
+        );
+    }
+
+    #[test]
+    fn a_stop_for_a_subagent_nothing_listed_is_never_drawn_or_counted() {
+        let a = run(vec![(1, main(user("go"))), (2, sub("late", stopped()))]);
+        assert!(a.subagents.is_empty());
+        assert_eq!(a.running(at(3)), 0);
+    }
+
+    #[test]
+    fn a_listing_of_running_background_subagents_cannot_revive_one_that_already_stopped() {
+        let a = run(vec![
+            (1, main(user("go"))),
+            (2, sub("late", stopped())),
+            (3, main(finished(&["late"]))),
+        ]);
+        assert!(a.subagents.is_empty(), "{:?}", a.subagents);
+    }
+
+    #[test]
+    fn a_new_session_forgets_the_stops_it_was_holding() {
+        let a = run(vec![
+            (1, sub("a", stopped())),
+            (2, main(MainEvent::Started)),
+            (3, sub("a", started())),
+        ]);
+        assert_eq!(a.running(at(3)), 1);
+    }
+
+    #[test]
+    fn a_subagent_asking_is_waiting_not_lost() {
+        let a = run(vec![
+            (1, sub("a", launched("t"))),
+            (2, sub("a", asked("Bash: rm -rf target"))),
+        ]);
+        let later = at(2 + 10 * lost_after());
+        assert_eq!(a.running(later), 1);
+        assert_eq!(a.lost(later), 0);
+        let answered = Activity::next(Some(a), sub("a", end("x")), later);
+        assert_eq!(answered.lost(later), 0, "answering is hearing from it");
+    }
+
+    #[test]
+    fn a_subagent_stored_without_when_it_was_heard_counts_from_when_its_agent_last_reported() {
+        let time = r#"{"secs_since_epoch":10,"nanos_since_epoch":0}"#;
+        let a = old_file(&format!(
+            r#","subagents":{{"a":{{"kind":"Explore","description":null,"launch":"background","since":{time},"tools":[]}}}}"#
+        ));
+        assert_eq!(
+            a.lost(at(10 + lost_after())),
+            0,
+            "counted from when its agent last reported, not from when it began"
+        );
+        assert_eq!(a.lost(at(20 + lost_after())), 1);
+    }
+
+    #[test]
+    fn a_subagent_keeps_when_it_was_heard_through_a_round_trip() {
+        let a = run(vec![(1, sub("a", launched("t"))), (9, sub("a", started()))]);
+        let json = serde_json::to_string(&a).expect("serializes");
+        let back: Activity = serde_json::from_str(&json).expect("parses");
+        assert_eq!(back.subagents[&AgentId::new("a")].heard, at(9));
+    }
+
     #[test]
     fn a_subagent_that_stops_takes_its_question_with_it() {
         let gone = run(vec![
             (0, sub("a", started())),
             (1, sub("a", asked("Bash: ls"))),
-            (2, sub("a", SubagentEvent::Stopped)),
+            (2, sub("a", stopped())),
         ]);
         assert_eq!(questions(&gone), [""; 0]);
     }
@@ -1757,10 +2080,10 @@ mod tests {
         let back = run(vec![
             (0, main(start("t", "Agent"))),
             (1, sub("a", started())),
-            (5, sub("a", SubagentEvent::Stopped)),
+            (5, sub("a", stopped())),
             (6, main(end("t"))),
         ]);
-        assert_eq!(back.running(), 0);
+        assert_eq!(back.running(at(6)), 0);
         let next = Activity::next(
             Some(back),
             Reported::main(MainEvent::Prompted(Input::User("again".into()))),
@@ -1924,7 +2247,7 @@ mod tests {
     #[test]
     fn a_launched_agent_is_held_until_it_reports_or_the_launch_is_given_up_on() {
         let a = run(vec![(10, main(finished(&[]))), (20, main(fresh(7)))]);
-        assert!(a.state.is_going() && a.session.is_booting());
+        assert!(matches!(a.state, State::Idle) && a.session.is_booting());
         assert_eq!(a.hold(at(21)), Some(Hold::Booting));
         assert_eq!(
             a.hold(at(20 + LAUNCH_GRACE.as_secs() - 1)),
@@ -1945,6 +2268,20 @@ mod tests {
             "a launch that never came up doesn't refuse text for good"
         );
         assert!(a.asks.is_empty() && a.subagents.is_empty());
+    }
+
+    #[test]
+    fn a_launch_is_not_work_and_is_launching_only_until_the_grace_runs_out() {
+        let a = run(vec![(10, main(user("go"))), (20, main(fresh(7)))]);
+        assert!(!a.state.is_going(), "{:?}", a.state);
+        assert_eq!(a.boot(at(21)), Some(Boot::Launching { since: at(20) }));
+        assert_eq!(a.boot(at(20 + LAUNCH_GRACE.as_secs())), None);
+        let reported = Activity::next(Some(a), main(MainEvent::Started), at(22));
+        assert_eq!(
+            reported.boot(at(23)),
+            Some(Boot::Starting { since: at(22) })
+        );
+        assert_eq!(reported.boot(at(22 + BOOT_QUIET.as_secs())), None);
     }
 
     #[test]
@@ -2097,7 +2434,11 @@ mod tests {
             ["bg"]
         );
         assert_eq!(questions(&stopped), ["Read"]);
-        assert_eq!(stopped.running(), 1, "a background subagent still runs");
+        assert_eq!(
+            stopped.running(at(20)),
+            1,
+            "a background subagent still runs"
+        );
     }
 
     #[test]
@@ -2153,7 +2494,7 @@ mod tests {
             (20, main(fresh(7))),
             (21, from(&[99, 98], finished(&[]))),
         ]);
-        assert!(a.state.is_going() && a.session.is_booting());
+        assert!(matches!(a.state, State::Idle) && a.session.is_booting());
         assert_eq!(a.heard, at(20));
         let a = run(vec![
             (20, main(fresh(7))),
@@ -2203,7 +2544,7 @@ mod tests {
     fn a_tool_starting_after_its_subagent_stopped_isnt_running() {
         let a = run(vec![
             (0, sub("a", started())),
-            (1, sub("a", SubagentEvent::Stopped)),
+            (1, sub("a", stopped())),
             (2, sub("a", start("x", "Bash"))),
         ]);
         let subagent = &a.subagents[&AgentId::new("a")];
@@ -2211,13 +2552,13 @@ mod tests {
             (subagent.status.clone(), subagent.tools().len()),
             (SubagentStatus::Finished { at: at(1) }, 0)
         );
-        assert!(!a.stale(at(3)) && a.running() == 0);
+        assert!(!a.stale(at(3)) && a.running(at(3)) == 0);
         let working = run(vec![(0, main(user("go")))]);
         assert!(working.stale(at(400)), "no subagent keeps it busy");
         let a = run(vec![
             (0, main(user("go"))),
             (1, sub("a", launched("t"))),
-            (2, sub("a", SubagentEvent::Stopped)),
+            (2, sub("a", stopped())),
             (3, sub("a", start("x", "Bash"))),
         ]);
         assert!(a.stale(at(400)), "a stopped subagent's tool can't hold it");
@@ -2289,11 +2630,20 @@ mod tests {
             a.subagents[&AgentId::new("a")].clone()
         };
         let running = subagent(&format!(r#","tools":[{tool}]"#));
-        assert_eq!((running.is_running(), running.tools().len()), (true, 1));
+        assert!(matches!(
+            running.liveness(at(0), Waiting::Off),
+            Liveness::Running { tools } if tools.len() == 1
+        ));
         let finished = subagent(&format!(r#","tools":[],"finished":{time}"#));
-        assert_eq!(finished.status, SubagentStatus::Finished { at: at(20) });
+        assert_eq!(
+            finished.liveness(at(0), Waiting::Off),
+            Liveness::Finished { at: at(20) }
+        );
         let bare = subagent("");
-        assert!(bare.is_running() && bare.tools().is_empty());
+        assert!(matches!(
+            bare.liveness(at(0), Waiting::Off),
+            Liveness::Running { tools } if tools.is_empty()
+        ));
     }
 
     #[test]
@@ -2301,7 +2651,7 @@ mod tests {
         let a = run(vec![
             (0, main(fresh(7))),
             (1, sub("a", launched("t"))),
-            (2, sub("a", SubagentEvent::Stopped)),
+            (2, sub("a", stopped())),
         ]);
         let json = serde_json::to_string(&a).expect("json");
         assert_eq!(serde_json::from_str::<Activity>(&json).expect("json"), a);

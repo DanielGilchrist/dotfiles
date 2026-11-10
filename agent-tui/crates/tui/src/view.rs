@@ -172,7 +172,8 @@ fn glyph(status: &AgentStatus, now: SystemTime) -> Span<'static> {
         AgentStatus::NoSession => Span::styled("·", dim()),
         AgentStatus::Exited => Span::styled("○", dim()),
         AgentStatus::Idle => Span::raw("●"),
-        AgentStatus::Working {
+        AgentStatus::Starting { .. }
+        | AgentStatus::Working {
             pulse: Pulse::Steady,
             ..
         } => Span::raw(spinner(now)),
@@ -194,9 +195,10 @@ fn name_style(status: &AgentStatus, selected: bool) -> Style {
         AgentStatus::Asking { .. } | AgentStatus::Failed { .. } | AgentStatus::Done { .. } => {
             Style::new().add_modifier(Modifier::BOLD)
         }
-        AgentStatus::Idle | AgentStatus::Working { .. } | AgentStatus::Interrupted { .. } => {
-            Style::new()
-        }
+        AgentStatus::Idle
+        | AgentStatus::Starting { .. }
+        | AgentStatus::Working { .. }
+        | AgentStatus::Interrupted { .. } => Style::new(),
     };
     if selected {
         base.add_modifier(Modifier::BOLD)

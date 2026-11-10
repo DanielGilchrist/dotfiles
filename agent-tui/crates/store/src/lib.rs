@@ -239,6 +239,10 @@ impl FsStore {
 }
 
 impl Store for FsStore {
+    fn note(&self, message: &str) {
+        self.log(message);
+    }
+
     fn pinned(&self) -> Result<Vec<SessionName>, StoreError> {
         self.read_pins()
     }
@@ -487,6 +491,17 @@ mod tests {
             .map(|e| e.expect("entry").path())
             .filter(|p| p.extension().is_some_and(|e| e == "corrupt"))
             .collect()
+    }
+
+    #[test]
+    fn a_note_lands_in_the_error_log() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        FsStore::new(dir.path().to_path_buf()).note("something odd");
+        let log = std::fs::read_to_string(dir.path().join("errors.log")).expect("logged");
+        assert!(
+            log.starts_with('[') && log.trim_end().ends_with("something odd"),
+            "{log}"
+        );
     }
 
     #[test]

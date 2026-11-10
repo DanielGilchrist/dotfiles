@@ -260,6 +260,7 @@ pub struct LaunchSpec {
     env: Vec<(OsString, OsString)>,
     env_remove: Vec<OsString>,
     join: Join,
+    notes: Vec<String>,
 }
 
 impl LaunchSpec {
@@ -271,6 +272,7 @@ impl LaunchSpec {
             env: Vec::new(),
             env_remove: Vec::new(),
             join: Pid::current().map_or(Join::Untraced, Join::Fresh),
+            notes: Vec::new(),
         }
     }
 
@@ -280,6 +282,18 @@ impl LaunchSpec {
     pub fn untraced(mut self) -> Self {
         self.join = Join::Untraced;
         self
+    }
+
+    /// Something to record about how this was worked out. The terminal it
+    /// starts in is no place to print it.
+    #[must_use]
+    pub fn noting(mut self, note: String) -> Self {
+        self.notes.push(note);
+        self
+    }
+
+    pub fn notes(&self) -> &[String] {
+        &self.notes
     }
 
     pub fn join(&self) -> Join {

@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::{Duration, SystemTime};
 
 use agent_core::activity::ToolId;
-use agent_core::activity::{Subagent, SubagentStatus};
+use agent_core::activity::{Liveness, STALE_AFTER, Subagent};
 use agent_core::ports::{
     ActivityDetail, Call, CallState, Excerpt, Log, LogEntry, Outcome, Progress, Summary, Target,
 };
@@ -46,8 +46,6 @@ impl Context<'_> {
 const SUMMARY_WIDE: usize = 32;
 const SUMMARY_NARROW: usize = 10;
 const SAID_ROWS: usize = 4;
-/// A call that has run this long, or a subagent this quiet, may be stuck.
-const STUCK: Duration = Duration::from_secs(300);
 const RESULT_LINES: usize = 40;
 const DURATION_FROM: u64 = 5;
 
@@ -58,6 +56,14 @@ pub(super) struct Context<'a> {
     /// The agent's checkout, to show paths inside it relative.
     pub roots: Option<&'a Roots>,
     pub home: Option<&'a Path>,
+}
+
+/// A subagent and how it stands now, which only its agent's activity can say
+/// (a question it has open keeps it from going quiet).
+#[derive(Clone, Copy)]
+pub(super) struct Listing<'a> {
+    pub subagent: &'a Subagent,
+    pub liveness: Liveness<'a>,
 }
 
 pub(super) struct Rendered {
@@ -393,7 +399,7 @@ impl Rows<'_, '_> {
                     .or(self.running_since)
                     .and_then(|from| self.ctx.now.duration_since(from).ok());
                 let mut text = ran.map(span).unwrap_or_default();
-                let stuck = ran.is_some_and(|d| d >= STUCK);
+                let stuck = ran.is_some_and(|d| d >= STALE_AFTER);
                 if self.ctx.width() == Width::Wide || text.is_empty() {
                     text = if text.is_empty() {
                         "running".into()
@@ -629,7 +635,7 @@ struct Figures {
 
 fn status_row(
     detail: &Log,
-    subagent: Option<&Subagent>,
+    subagent: Option<Listing<'_>>,
     ctx: &Context<'_>,
     standing: Standing,
 ) -> Vec<Span<'static>> {
@@ -641,18 +647,18 @@ fn status_row(
         _ if over => ended_row(figures),
         _ => match failing(detail) {
             Some(reason) => failing_row(&reason, figures, ctx),
-            None => working_row(detail, figures, ctx, standing),
+            None => working_row(detail, subagent.map(|s| s.liveness), figures, ctx, standing),
         },
     }
 }
 
-fn figures(detail: &Log, subagent: Option<&Subagent>, ctx: &Context<'_>) -> Figures {
+fn figures(detail: &Log, subagent: Option<Listing<'_>>, ctx: &Context<'_>) -> Figures {
     let calls = Span::styled(calls_label(detail), dim());
     let errors = error_count(detail);
-    let began = subagent.map(|s| s.since).or(detail.started);
-    let ended = match subagent.map(|s| &s.status) {
-        Some(SubagentStatus::Finished { at }) => Some(*at),
-        Some(SubagentStatus::Running { .. }) | None => detail.last_heard,
+    let began = subagent.map(|s| s.subagent.since).or(detail.started);
+    let ended = match subagent.map(|s| s.liveness) {
+        Some(Liveness::Finished { at }) => Some(at),
+        Some(Liveness::Running { .. } | Liveness::Lost { .. }) | None => detail.last_heard,
     };
     Figures {
         calls,
@@ -748,6 +754,7 @@ fn failing_row(reason: &str, figures: Figures, ctx: &Context<'_>) -> Vec<Span<'s
 
 fn working_row(
     detail: &Log,
+    liveness: Option<Liveness<'_>>,
     figures: Figures,
     ctx: &Context<'_>,
     standing: Standing,
@@ -761,14 +768,13 @@ fn working_row(
             figures.working.map(|w| format!(" {w}")).unwrap_or_default()
         )),
     ];
-    let quiet = stalled
-        .then(|| {
-            detail
-                .last_heard
-                .and_then(|at| ctx.now.duration_since(at).ok())
-        })
-        .flatten()
-        .map(|d| Span::styled(format!("quiet {} ?", ago(ctx.now - d, ctx.now)), dim()));
+    let quiet_since = match liveness {
+        Some(Liveness::Lost { since }) => Some(since),
+        Some(Liveness::Running { .. } | Liveness::Finished { .. }) | None => detail.last_heard,
+    };
+    let quiet = quiet_since
+        .filter(|_| stalled)
+        .map(|at| Span::styled(format!("quiet {} ?", ago(at, ctx.now)), dim()));
     with_tail(
         spans,
         vec![quiet, Some(figures.calls), figures.errors, figures.model],
@@ -796,6 +802,8 @@ pub(super) enum ActivityStage<'a> {
     },
     Delegating {
         running: usize,
+        /// Subagents recorded as running that have gone quiet.
+        lost: usize,
         quiet: Duration,
         stale: bool,
     },
@@ -1005,24 +1013,27 @@ fn phase_note(calls: &[&Call], took: Option<Duration>) -> Option<Vec<Span<'stati
 
 pub(super) fn render(
     detail: &Log,
-    subagent: Option<&Subagent>,
+    subagent: Option<Listing<'_>>,
     nav: &Nav,
     ctx: &Context<'_>,
 ) -> Rendered {
     let finished = matches!(detail.outcome, Outcome::Finished { .. })
-        || subagent.is_some_and(|s| !s.is_running());
+        || subagent.is_some_and(|s| matches!(s.liveness, Liveness::Finished { .. }));
     let live = !finished;
-    let idle = subagent.is_none_or(|s| s.tools().is_empty())
+    let idle = subagent.is_none_or(|s| s.subagent.tools().is_empty())
         && !detail
             .log
             .iter()
             .any(|e| matches!(e, agent_core::ports::LogEntry::Called(c) if matches!(c.state, CallState::Running)));
-    let silent = detail
-        .last_heard
-        .or(subagent.map(|s| s.since))
-        .and_then(|at| ctx.now.duration_since(at).ok())
-        .is_some_and(|d| d >= STUCK);
-    let stale = live && idle && silent;
+    let stale = if let Some(s) = subagent {
+        matches!(s.liveness, Liveness::Lost { .. })
+    } else {
+        let silent = detail
+            .last_heard
+            .and_then(|at| ctx.now.duration_since(at).ok())
+            .is_some_and(|d| d >= STALE_AFTER);
+        live && idle && silent
+    };
     let standing = Standing::of(live, stale);
     let status = status_row(detail, subagent, ctx, standing);
     let pinned = status_rows(status, ctx.columns);
@@ -1032,7 +1043,9 @@ pub(super) fn render(
         standing,
         concurrency: Concurrency::LastOnly,
         waiting: None,
-        running_since: subagent.and_then(|s| s.tools().last()).map(|t| t.since),
+        running_since: subagent
+            .and_then(|s| s.subagent.tools().last())
+            .map(|t| t.since),
         out: Vec::new(),
         last_row: LastRow::Text,
     };
@@ -1335,9 +1348,12 @@ fn activity_status(
             asking,
             by,
         } => asking_activity_row(&figures, *since, question, *asking, by.as_deref()),
-        ActivityStage::Delegating { running, quiet, .. } => {
-            delegating_activity_row(&figures, standing, *running, *quiet)
-        }
+        ActivityStage::Delegating {
+            running,
+            lost,
+            quiet,
+            ..
+        } => delegating_activity_row(&figures, standing, (*running, *lost), *quiet),
         ActivityStage::Done { seen } => done_activity_row(detail, &figures, *seen),
         ActivityStage::Failed { reason, since } => failed_activity_row(&figures, reason, *since),
         ActivityStage::Interrupted { since } => interrupted_activity_row(&figures, *since),
@@ -1433,7 +1449,7 @@ const ANSWER_HINT: &str = "i answer in the terminal";
 fn delegating_activity_row(
     figures: &ActivityFigures<'_>,
     standing: Standing,
-    running: usize,
+    (running, lost): (usize, usize),
     quiet: Duration,
 ) -> Vec<Span<'static>> {
     let stalled = standing == Standing::Going(Pace::Stalled);
@@ -1448,7 +1464,11 @@ fn delegating_activity_row(
             spinner_span(standing, figures.ctx),
             Span::raw(" delegating"),
         ],
-        vec![Some(Span::styled(format!("↳{running}"), dim())), quiet],
+        vec![
+            Some(Span::styled(format!("↳{running}"), dim())),
+            (lost > 0).then(|| Span::styled(format!("{lost} lost"), dim())),
+            quiet,
+        ],
     )
 }
 
@@ -1803,5 +1823,44 @@ mod tests {
             crate::log::Whose::Activity,
         );
         assert_eq!(quote.expect("a quote").as_str(), tame(heading));
+    }
+
+    #[test]
+    fn a_lost_subagents_status_row_counts_its_quiet_from_when_it_was_last_heard() {
+        use super::{Context, Listing, render};
+        use agent_core::activity::TranscriptRef;
+        use agent_core::activity::{Launch, STALE_AFTER, Subagent, Waiting};
+        use agent_core::ports::{Log, Outcome};
+        use std::time::{Duration, SystemTime};
+        let began = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
+        let now = began + STALE_AFTER + Duration::from_secs(60);
+        let subagent = Subagent::running("general-purpose", None, Launch::Background, began);
+        let detail = Log {
+            prompt: None,
+            log: Vec::new(),
+            transcript: TranscriptRef::new("t.jsonl"),
+            outcome: Outcome::Running,
+            model: None,
+            started: Some(began),
+            last_heard: Some(now),
+            truncated: false,
+        };
+        let rendered = render(
+            &detail,
+            Some(Listing {
+                subagent: &subagent,
+                liveness: subagent.liveness(now, Waiting::Off),
+            }),
+            &crate::log::Nav::default(),
+            &Context {
+                columns: 100,
+                now,
+                spinner: "x",
+                roots: None,
+                home: None,
+            },
+        );
+        let pinned: String = rendered.pinned.iter().map(ToString::to_string).collect();
+        assert!(pinned.contains("quiet 6m ?"), "{pinned}");
     }
 }

@@ -93,3 +93,25 @@ pub fn write(dir: &std::path::Path, lines: &[String]) -> std::path::PathBuf {
     std::fs::write(&path, lines.join("\n") + "\n").expect("writes");
     path
 }
+
+/// A user record with no text of interest, which is what makes a transcript
+/// one the user has spoken in.
+pub fn user_line() -> String {
+    r#"{"type":"user","message":{"role":"user","content":"hi"}}"#.to_string()
+}
+
+/// What Claude Code appends to a transcript when its session moves to the
+/// background as `to`.
+pub fn continued(from: &str, to: &str) -> String {
+    format!(r#"{{"type":"continued-in","sessionId":"{from}","continuedInSessionId":"{to}"}}"#)
+}
+
+/// Writes `lines` as `<id>.jsonl` in `dir`, modified `secs` from now.
+pub fn write_at(dir: &std::path::Path, id: &str, lines: &[String], secs: u64) {
+    let path = dir.join(format!("{id}.jsonl"));
+    std::fs::write(&path, lines.join("\n") + "\n").expect("writes");
+    std::fs::File::open(&path)
+        .expect("opens")
+        .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(secs))
+        .expect("sets mtime");
+}

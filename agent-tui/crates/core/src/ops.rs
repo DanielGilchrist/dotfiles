@@ -523,22 +523,51 @@ fn deliver(svc: Services<'_>, session: &SessionName, task: Option<&Prompt>) -> R
     }
 }
 
+/// A session `agent` has recorded as launching, until the launch is
+/// settled. A launch that fails leaves nothing to report from the session,
+/// so [`settle`](Self::settle) ends the record on an error.
+#[must_use = "a launch mark must be settled with the launch's result"]
+struct LaunchMark<'a> {
+    svc: Services<'a>,
+    name: SessionName,
+}
+
+impl LaunchMark<'_> {
+    /// `launched`, after ending the record when it failed so a launch that
+    /// never came up isn't left reading as starting.
+    fn settle<T>(self, launched: Result<T>) -> Result<T> {
+        if launched.is_err() {
+            let _ = self
+                .svc
+                .store
+                .report(&self.name, Reported::main(MainEvent::Ended));
+        }
+        launched
+    }
+}
+
 /// Records that `name` is about to launch, so a record left by an earlier
 /// run reads as booting from before the session can be listed. `exec_spec`
 /// refines it once the harness is started.
-fn mark_launch(svc: Services<'_>, name: &SessionName) -> Result<()> {
+fn mark_launch<'a>(svc: Services<'a>, name: &SessionName) -> Result<LaunchMark<'a>> {
     svc.store
         .report(name, Reported::main(MainEvent::Launched(Join::Untraced)))?;
-    Ok(())
+    Ok(LaunchMark {
+        svc,
+        name: name.clone(),
+    })
 }
 
 /// Marks a resurrection when `agent` started the session. One it didn't
 /// start runs no `agent exec`, so nothing would ever refine or end the mark
 /// and the session's missing record, which tells the TUI it can't know what
-/// is open in it, would be replaced by a false one.
+/// is open in it, would be replaced by a false one. It is made last, once
+/// nothing else can fail, and it is `exec_spec` that ends the record if the
+/// launch then fails.
 fn mark_resurrection(svc: Services<'_>, name: &SessionName) -> Result<()> {
     if svc.store.record(name)?.is_some() {
-        mark_launch(svc, name)?;
+        svc.store
+            .report(name, Reported::main(MainEvent::Launched(Join::Untraced)))?;
     }
     Ok(())
 }
@@ -546,8 +575,9 @@ fn mark_resurrection(svc: Services<'_>, name: &SessionName) -> Result<()> {
 /// Attaches to the exited session `session`, which resurrects and runs
 /// `agent exec` again.
 pub fn resurrect(svc: Services<'_>, session: &SessionName) -> Result<Launch> {
+    let launch = join(svc, session, None)?;
     mark_resurrection(svc, session)?;
-    join(svc, session, None)
+    Ok(launch)
 }
 
 /// Attaches to the existing session `session` (resurrecting it if it
@@ -599,19 +629,27 @@ pub fn execute(
             presence: Presence::Exited,
             ..
         } if task.is_some() => Err(Error::NotRunning(session)),
-        Plan::Attach { cwd, presence, .. } => {
-            if presence == Presence::Exited {
-                mark_resurrection(svc, &session)?;
-            }
-            let delivery = deliver(svc, &session, task)?;
-            let spec = svc.host.attach(&session);
-            let spec = match cwd {
-                Some(cwd) => spec.cwd(cwd),
-                None => spec,
-            };
+        Plan::Attach {
+            cwd,
+            presence: Presence::Exited,
+            ..
+        } => {
+            mark_resurrection(svc, &session)?;
             Ok(Launch {
+                spec: attach_spec(svc, &session, cwd),
                 session,
-                spec,
+                delivery: Delivery::None,
+            })
+        }
+        Plan::Attach {
+            cwd,
+            presence: Presence::Live,
+            ..
+        } => {
+            let delivery = deliver(svc, &session, task)?;
+            Ok(Launch {
+                spec: attach_spec(svc, &session, cwd),
+                session,
                 delivery,
             })
         }
@@ -639,6 +677,14 @@ pub fn execute(
             start(svc, &at, harness, Some(bootstrap_prompt(task)))
         }
         Plan::Start(Start::Existing(at)) => start(svc, &at, harness, task.cloned()),
+    }
+}
+
+fn attach_spec(svc: Services<'_>, session: &SessionName, cwd: Option<PathBuf>) -> LaunchSpec {
+    let spec = svc.host.attach(session);
+    match cwd {
+        Some(cwd) => spec.cwd(cwd),
+        None => spec,
     }
 }
 
@@ -680,15 +726,16 @@ pub fn start(
         args: vec!["exec".into(), name.to_string()],
         cwd: at.cwd().into(),
     };
-    mark_launch(svc, &name)?;
-    let spec = match svc.host.create(at.host_name(), &pane) {
-        Ok(spec) => spec,
-        Err(e) => {
-            let _ = svc.store.report(&name, Reported::main(MainEvent::Ended));
-            return Err(e.into());
-        }
-    };
-    svc.store.put_record(&name, &record)?;
+    let mark = mark_launch(svc, &name)?;
+    let created = svc
+        .host
+        .create(at.host_name(), &pane)
+        .map_err(Error::from)
+        .and_then(|spec| {
+            svc.store.put_record(&name, &record)?;
+            Ok(spec)
+        });
+    let spec = mark.settle(created)?;
     Ok(Launch {
         session: name,
         spec,
@@ -748,6 +795,15 @@ pub fn attach_here(
 /// the agent shows activity after it was recorded, then dropped, so a crash
 /// before the agent saw it retries and a resurrection doesn't replay it.
 pub fn exec_spec(svc: Services<'_>, name: &SessionName, workdir: &Path) -> Result<LaunchSpec> {
+    let mark = mark_launch(svc, name).ok();
+    let spec = launch_spec(svc, name, workdir);
+    match mark {
+        Some(mark) => mark.settle(spec),
+        None => spec,
+    }
+}
+
+fn launch_spec(svc: Services<'_>, name: &SessionName, workdir: &Path) -> Result<LaunchSpec> {
     let mut record = svc
         .store
         .record(name)?
@@ -773,6 +829,9 @@ pub fn exec_spec(svc: Services<'_>, name: &SessionName, workdir: &Path) -> Resul
     let _ = svc
         .store
         .report(name, Reported::main(MainEvent::Launched(spec.join())));
+    for note in spec.notes() {
+        svc.store.note(note);
+    }
     Ok(spec)
 }
 

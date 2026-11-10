@@ -378,9 +378,16 @@ pub struct MemStore {
     pub last_selected: Mutex<Option<SessionName>>,
     pub activities: Mutex<HashMap<SessionName, Activity>>,
     pub repos: Mutex<Vec<RepoRoot>>,
+    /// Applying a report fails, as when the state directory can't be written.
+    pub report_fails: Mutex<bool>,
+    pub notes: Mutex<Vec<String>>,
 }
 
 impl Store for MemStore {
+    fn note(&self, message: &str) {
+        self.notes.lock().expect("lock").push(message.to_string());
+    }
+
     fn pinned(&self) -> Result<Vec<SessionName>, StoreError> {
         Ok(self.pins.lock().expect("lock").clone())
     }
@@ -418,6 +425,12 @@ impl Store for MemStore {
     }
 
     fn report(&self, name: &SessionName, event: Reported) -> Result<(), StoreError> {
+        if *self.report_fails.lock().expect("lock") {
+            return Err(StoreError::Io {
+                path: std::path::PathBuf::from("/state"),
+                source: std::io::Error::other("read-only"),
+            });
+        }
         let mut activities = self.activities.lock().expect("lock");
         let next = Activity::next(activities.remove(name), event, SystemTime::now());
         activities.insert(name.clone(), next);

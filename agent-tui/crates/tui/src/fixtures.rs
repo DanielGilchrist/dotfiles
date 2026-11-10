@@ -4,8 +4,7 @@ use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
 use agent_core::activity::{
-    Activity, AgentId, Answer, Ask, Join, Launch, Origin, Session, State, Subagent, SubagentStatus,
-    Tool, ToolId,
+    Activity, AgentId, Answer, Ask, Join, Launch, Origin, Session, State, Subagent, Tool, ToolId,
 };
 use agent_core::discover::{Observation, assemble};
 use agent_core::model::{Head, Worktree};
@@ -118,16 +117,13 @@ pub fn wt(path: &str) -> Worktree {
 
 pub fn reported(state: State, secs_ago: u64) -> Activity {
     let since = SystemTime::now() - Duration::from_secs(secs_ago);
-    Activity {
-        state,
-        since,
-        prompt: Some("go".into()),
-        prompts: 1,
-        prompt_event: 1,
-        heard: since,
-        events: 1,
-        ..Activity::fresh(since)
-    }
+    let mut activity = Activity::fresh(since);
+    activity.state = state;
+    activity.prompt = Some("go".into());
+    activity.prompts = 1;
+    activity.prompt_event = 1;
+    activity.events = 1;
+    activity
 }
 
 pub fn asking(question: &str, secs_ago: u64) -> Activity {
@@ -203,13 +199,12 @@ fn doing(k: usize) -> Option<Activity> {
             {
                 activity.subagents.insert(
                     AgentId::new(format!("s{i}")),
-                    Subagent {
-                        kind: "general-purpose".into(),
-                        description: Some(description.into()),
-                        launch: Launch::Background,
-                        since: SystemTime::now() - Duration::from_secs(30 + 10 * i as u64),
-                        status: SubagentStatus::Running { tools: Vec::new() },
-                    },
+                    Subagent::running(
+                        "general-purpose",
+                        Some(description.into()),
+                        Launch::Background,
+                        SystemTime::now() - Duration::from_secs(30 + 10 * i as u64),
+                    ),
                 );
             }
             Some(activity)

@@ -1291,6 +1291,8 @@ pub trait Store: Send + Sync {
     fn record(&self, name: &SessionName) -> Result<Option<AgentRecord>, StoreError>;
     fn put_record(&self, name: &SessionName, record: &AgentRecord) -> Result<(), StoreError>;
     fn forget(&self, name: &SessionName) -> Result<(), StoreError>;
+    /// Appends `message` to the error log. It can't fail the caller.
+    fn note(&self, message: &str);
     /// Applies what `name`'s harness reported to its activity.
     fn report(&self, name: &SessionName, event: Reported) -> Result<(), StoreError>;
     /// The user has looked at `name`: a finished activity stops being news.

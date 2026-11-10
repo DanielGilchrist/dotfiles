@@ -1014,7 +1014,8 @@ fn launching_marks_a_previously_finished_agent_as_booting() {
         .get(&session("fix"))
         .cloned()
         .expect("recorded");
-    assert!(activity.state.is_going() && activity.session.is_booting());
+    assert!(matches!(activity.state, State::Idle) && activity.session.is_booting());
+    assert!(!activity.state.is_going(), "a launch isn't work");
     assert!(matches!(
         activity.session,
         crate::activity::Session::Launched {
@@ -1084,6 +1085,23 @@ fn a_session_that_cannot_be_created_ends_instead_of_booting_for_good() {
     *w.host.create_fails.lock().expect("lock") = true;
     let result = attach(w.svc(), &agent("fix"), None, None, w.harness());
     assert!(matches!(result, Err(Error::Host(_))), "{result:?}");
+    assert_eq!(hold_of_fix(&w), Some(Hold::Ended));
+}
+
+#[test]
+fn a_launch_mark_that_cannot_be_written_does_not_stop_the_launch() {
+    let w = World::new();
+    record_for_fix(&w);
+    *w.store.report_fails.lock().expect("lock") = true;
+    let spec = exec_spec(w.svc(), &session("fix"), Path::new("/x"));
+    assert!(spec.is_ok(), "{spec:?}");
+}
+
+#[test]
+fn a_launch_that_cannot_start_the_harness_ends_instead_of_booting_for_good() {
+    let w = World::new();
+    let result = exec_spec(w.svc(), &session("fix"), Path::new("/x"));
+    assert!(matches!(result, Err(Error::NoRecord(_))), "{result:?}");
     assert_eq!(hold_of_fix(&w), Some(Hold::Ended));
 }
 

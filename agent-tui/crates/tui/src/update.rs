@@ -6409,7 +6409,7 @@ mod tests {
         assert!(
             m.watched(&(by.clone(), id.clone()))
                 .and_then(|w| w.held.as_ref())
-                .is_some_and(agent_core::activity::Subagent::is_running),
+                .is_some_and(|s| !s.is_finished()),
             "remembered as listed"
         );
 
@@ -6455,7 +6455,7 @@ mod tests {
         assert!(
             m.watched(&(by.clone(), id.clone()))
                 .and_then(|w| w.held.as_ref())
-                .is_some_and(|h| !h.is_running()),
+                .is_some_and(agent_core::activity::Subagent::is_finished),
             "nothing will say it finished afterwards"
         );
 
@@ -7146,6 +7146,94 @@ mod tests {
             Vec::<String>::new()
         );
         assert_eq!(replies(&tick(&mut m)), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_launched_agent_shows_as_starting_until_it_reports_or_the_launch_is_given_up_on() {
+        use crate::model::AgentStatus;
+        use agent_core::activity::{Join, MainEvent, Reported};
+        let status_of = |m: &Model| {
+            let (_, entry) = m
+                .snapshot()
+                .and_then(|s| s.entry(&name(AGENT)))
+                .expect("listed");
+            m.status(entry)
+        };
+        let mut m = crate::fixtures::fleet(10);
+        let mut launched = Activity::next(
+            None,
+            Reported::main(MainEvent::Launched(Join::Untraced)),
+            m.clock.wall - Duration::from_secs(1),
+        );
+        launched.events = 1;
+        report(&mut m, launched);
+        assert!(
+            matches!(status_of(&m), AgentStatus::Starting { .. }),
+            "{:?}",
+            status_of(&m)
+        );
+
+        let expired = later(&m, agent_core::activity::LAUNCH_GRACE);
+        tick_at(&mut m, expired);
+        assert_eq!(
+            status_of(&m),
+            AgentStatus::Idle,
+            "a launch that reported nothing isn't working"
+        );
+    }
+
+    #[test]
+    fn the_card_and_the_send_refusal_agree_on_a_session_that_just_reported_starting() {
+        use crate::model::AgentStatus;
+        let mut m = crate::fixtures::fleet(10);
+        let mut booted = reported(State::Idle, 1);
+        booted.session = crate::fixtures::booting();
+        booted.heard = m.clock.wall;
+        report(&mut m, booted);
+        let (_, entry) = m
+            .snapshot()
+            .and_then(|s| s.entry(&name(AGENT)))
+            .expect("listed");
+        assert!(matches!(m.status(entry), AgentStatus::Starting { .. }));
+        assert_eq!(
+            m.hold(&name(AGENT)),
+            Some(agent_core::activity::Hold::Booting)
+        );
+
+        let quiet = later(&m, agent_core::activity::BOOT_QUIET);
+        tick_at(&mut m, quiet);
+        let (_, entry) = m
+            .snapshot()
+            .and_then(|s| s.entry(&name(AGENT)))
+            .expect("listed");
+        assert_eq!(m.status(entry), AgentStatus::Idle);
+        assert_eq!(m.hold(&name(AGENT)), None);
+    }
+
+    #[test]
+    fn an_agent_delegating_to_subagents_that_all_went_quiet_says_so_not_handing_back() {
+        use crate::model::{AgentStatus, Doing};
+        use agent_core::activity::{Launch, Subagent};
+        let mut m = crate::fixtures::fleet(10);
+        let mut a = reported(State::Delegating, 700);
+        a.subagents.insert(
+            AgentId::new("s"),
+            Subagent::running(
+                "general-purpose",
+                None,
+                Launch::Background,
+                m.clock.wall - Duration::from_secs(600),
+            ),
+        );
+        report(&mut m, a);
+        let (_, entry) = m
+            .snapshot()
+            .and_then(|s| s.entry(&name(AGENT)))
+            .expect("listed");
+        let AgentStatus::Working { doing, .. } = m.status(entry) else {
+            panic!("working");
+        };
+        assert!(matches!(doing, Doing::Lost(n) if n.get() == 1), "{doing:?}");
     }
 
     #[test]

@@ -15,13 +15,19 @@ use agent_core::ports::{
 use agent_core::process::{LaunchSpec, quiet};
 use serde::Deserialize;
 
+use crate::background::{Found, Survivor};
+use crate::conversation::{Chains, Conversation, SessionId};
+
 mod activity;
+mod background;
+mod conversation;
 #[cfg(test)]
 mod fixtures;
 mod transcript;
 
 const ASK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+const PS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// The hook events that move an agent's state. Notification only matters
 /// for questions: permission prompts arrive as `PermissionRequest` with more
 /// detail, and `idle_prompt` fires while background work still runs.
@@ -77,22 +83,8 @@ pub struct Claude {
     sessions: PathBuf,
     permission_mode: String,
     add_dirs: Vec<PathBuf>,
+    chains: Chains,
 }
-
-/// A live Claude Code process, as its registry entry records it.
-#[derive(serde::Deserialize)]
-struct Registered {
-    pid: i32,
-    #[serde(rename = "sessionId")]
-    session_id: String,
-    /// The short id `claude attach` and `claude stop` take. They refuse the
-    /// full session id.
-    #[serde(rename = "jobId")]
-    job_id: Option<String>,
-}
-
-/// A background session to join or stop, by the id Claude's CLI accepts.
-struct Job(String);
 
 impl Claude {
     pub fn new(home: &Path) -> Self {
@@ -111,6 +103,7 @@ impl Claude {
             sessions: home.join(".claude/sessions"),
             permission_mode: "auto".into(),
             add_dirs: vec![PathBuf::from("/tmp")],
+            chains: Chains::default(),
         }
     }
 
@@ -124,40 +117,36 @@ impl Claude {
         cmd
     }
 
-    /// The background session still running the conversation `id`, if any:
-    /// Claude Code keeps a session alive when its terminal goes, and
-    /// `--resume` refuses one that's alive. A registry entry whose process is
-    /// gone doesn't count.
-    fn in_background(&self, id: &str) -> io::Result<Option<Job>> {
-        let entries = match std::fs::read_dir(&self.sessions) {
-            Ok(entries) => entries,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(e),
-        };
-        for entry in entries {
-            let path = entry?.path();
-            if path.extension().is_none_or(|e| e != "json") {
-                continue;
-            }
-            let Ok(registered) =
-                serde_json::from_str::<Registered>(&std::fs::read_to_string(&path)?)
-            else {
-                continue;
-            };
-            if registered.session_id == id && process_alive(registered.pid) {
-                return Ok(Some(Job(registered
-                    .job_id
-                    .unwrap_or(registered.session_id))));
-            }
+    /// The background session running `conversation`, if any. Registry
+    /// entries of its sessions that can't be read are added to `notes`,
+    /// since the worker may be among them.
+    fn in_background(
+        &self,
+        conversation: &Conversation,
+        workdir: &Path,
+        notes: &mut Vec<String>,
+    ) -> Result<Option<Found>, HarnessError> {
+        let search = background::find(&self.sessions, conversation, workdir)?;
+        if !search.unreadable.is_empty() {
+            let files: Vec<_> = search
+                .unreadable
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect();
+            notes.push(format!(
+                "can't read Claude's registry entries {}, so a running background session may be missed",
+                files.join(", ")
+            ));
         }
-        Ok(None)
+        Ok(search.found)
     }
 
-    /// Stops the background session `id` so it can be resumed with a
+    /// Stops the background session `survivor` so it can be resumed with a
     /// prompt, which `attach` can't carry.
-    fn stop(&self, Job(id): &Job) -> Result<(), HarnessError> {
+    fn stop(&self, survivor: &Survivor) -> Result<(), HarnessError> {
+        let id = survivor.job.as_str();
         let mut cmd = self.command();
-        cmd.args(["stop", id.as_str()]);
+        cmd.args(["stop", id]);
         agent_core::process::output_within(&mut cmd, STOP_TIMEOUT).map_err(|e| HarnessError {
             context: format!("stopping background session {id}"),
             source: io::Error::other(e),
@@ -225,43 +214,64 @@ impl Claude {
         Ok(newest.map(|(_, path)| path))
     }
 
-    /// The transcript file `at` names, if it is one under the projects
-    /// directory.
-    fn named_transcript(&self, at: &TranscriptRef) -> Option<PathBuf> {
-        let projects = self.projects.canonicalize().ok()?;
-        at.path()
+    /// The transcript of the conversation the transcript file `at` names
+    /// belongs to, if that is under the projects directory: the one holding
+    /// its messages, which is not `at`'s own when the conversation has moved
+    /// on from it.
+    fn named_transcript(&self, at: &TranscriptRef) -> io::Result<Option<PathBuf>> {
+        let Ok(projects) = self.projects.canonicalize() else {
+            return Ok(None);
+        };
+        let Some(path) = at
+            .path()
             .canonicalize()
             .ok()
             .filter(|path| path.extension().is_some_and(|e| e == "jsonl") && path.is_file())
             .filter(|path| path.starts_with(&projects))
+        else {
+            return Ok(None);
+        };
+        let Some(start) = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .and_then(SessionId::parse)
+        else {
+            return Ok(Some(path));
+        };
+        let dir = path.parent().unwrap_or(&projects);
+        let live = self.chains.of(dir, start)?.transcript_in(dir);
+        Ok(Some(live).filter(|live| live.is_file()))
     }
 
     /// The transcript of the agent's current conversation: the one the hooks
     /// named, if it is a transcript file under the projects directory, and
-    /// otherwise the one
-    /// `launch` would resume.
+    /// otherwise the one `launch` would resume.
     fn activity_file(
         &self,
         workdir: &Path,
         at: Option<&TranscriptRef>,
     ) -> io::Result<Option<PathBuf>> {
-        let named = at.and_then(|at| self.named_transcript(at));
-        if named.is_some() {
-            return Ok(named);
+        if let Some(named) = at
+            .map(|at| self.named_transcript(at))
+            .transpose()?
+            .flatten()
+        {
+            return Ok(Some(named));
         }
         let workdir = workdir.canonicalize()?;
+        let dir = self.project_dir(&workdir);
         Ok(self
             .resumable(&workdir)?
-            .map(|id| self.project_dir(&workdir).join(format!("{id}.jsonl"))))
+            .map(|conversation| conversation.transcript_in(&dir)))
     }
 
     /// The conversation to resume: the newest transcript written since the
-    /// worktree was created that the user has spoken in. Older ones belong
-    /// to a previous agent that used the same name. `/clear` starts a new
-    /// transcript, so the newest is the one the user means, and a launch
-    /// that died before any message leaves one with no user prompt, which is
-    /// skipped.
-    fn resumable(&self, workdir: &Path) -> io::Result<Option<String>> {
+    /// worktree was created that the user has spoken in, followed to where
+    /// the conversation has moved on to. Older ones belong to a previous
+    /// agent that used the same name. `/clear` starts a new transcript, so
+    /// the newest is the one the user means, and a launch that died before
+    /// any message leaves one with no user prompt, which is skipped.
+    fn resumable(&self, workdir: &Path) -> io::Result<Option<Conversation>> {
         let born = std::fs::metadata(workdir)?
             .created()
             .unwrap_or(SystemTime::UNIX_EPOCH);
@@ -276,8 +286,12 @@ impl Claude {
             if !has_user_prompt(&path)? {
                 continue;
             }
-            if let Some(id) = path.file_stem().and_then(|s| s.to_str()) {
-                return Ok(Some(id.to_string()));
+            if let Some(id) = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .and_then(SessionId::parse)
+            {
+                return self.chains.of(&self.project_dir(workdir), id).map(Some);
             }
         }
         Ok(None)
@@ -303,23 +317,34 @@ impl Harness for Claude {
             source,
         })?;
 
-        if let Some(id) = &resume
-            && let Some(job) = self.in_background(id).map_err(|source| HarnessError {
-                context: "reading Claude's session registry".into(),
-                source,
-            })?
+        let mut notes = Vec::new();
+        if let Some(conversation) = &resume
+            && let Some(found) = self.in_background(conversation, &workdir, &mut notes)?
         {
+            let survivor = match found {
+                Found::Attachable(survivor) => survivor,
+                Found::Unaddressable { pid, why } => {
+                    return Err(HarnessError {
+                        context: format!(
+                            "the background session of this conversation (pid {}) has {why} in Claude's registry, so it can't be attached or stopped",
+                            pid.get()
+                        ),
+                        source: io::Error::other("unaddressable background session"),
+                    });
+                }
+            };
             match ctx.bootstrap {
                 // Joining keeps everything the session had, hooks
                 // included, since this harness launched it.
                 None => {
-                    return Ok(LaunchSpec::new(&self.program)
+                    let spec = LaunchSpec::new(&self.program)
                         .cwd(&workdir)
                         .env_remove(INHERITED_SESSION_ENV.iter().copied())
-                        .args(["attach".to_string(), job.0])
-                        .untraced());
+                        .args(["attach", survivor.job.as_str()])
+                        .untraced();
+                    return Ok(notes.into_iter().fold(spec, LaunchSpec::noting));
                 }
-                Some(_) => self.stop(&job)?,
+                Some(_) => self.stop(&survivor)?,
             }
         }
 
@@ -334,9 +359,10 @@ impl Harness for Claude {
         spec = spec
             .arg("--settings")
             .arg(hook_settings(ctx.report, ctx.session.as_str()));
-        if let Some(id) = resume {
-            spec = spec.args(["--resume".to_string(), id]);
+        if let Some(conversation) = resume {
+            spec = spec.args(["--resume", conversation.resumable().as_str()]);
         }
+        let spec = notes.into_iter().fold(spec, LaunchSpec::noting);
         Ok(match ctx.bootstrap {
             Some(prompt) => spec.arg("--").arg(prompt.as_str()),
             None => spec,
@@ -437,7 +463,7 @@ impl Harness for Claude {
             context: "checking the transcript for an interrupt".into(),
             source,
         };
-        let Some(path) = self.named_transcript(at) else {
+        let Some(path) = self.named_transcript(at).map_err(context)? else {
             return Ok(Probe::NoTranscript);
         };
         let meta = std::fs::metadata(&path).map_err(context)?;
@@ -500,10 +526,6 @@ fn verdict(last: transcript::Last, after: SystemTime, stamp: TranscriptStamp) ->
         (transcript::Beat::Work, Some(at)) if at > after => Probe::Going(stamp),
         _ => Probe::Older(stamp),
     }
-}
-
-fn process_alive(pid: i32) -> bool {
-    nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
 }
 
 /// How much of each transcript line is looked at. A record can hold a
@@ -1219,49 +1241,445 @@ mod tests {
             ["--resume", "after-clear"],
             "the newest the user spoke in, not the largest or the empty newer one"
         );
+    }
 
-        // A session Claude Code kept running in the background is attached
-        // to, unless there's a prompt to deliver, which attach can't carry.
-        let sessions = home.path().join(".claude/sessions");
-        std::fs::create_dir_all(&sessions).expect("creates");
-        let register = |file: &str, pid: u32| {
+    mod background_sessions {
+        use super::*;
+        use crate::background::{Found, JobField, ProcStart, Unaddressed};
+        use crate::conversation::SessionId;
+        use crate::fixtures::{continued, user_line, write_at};
+
+        struct Project {
+            _home: tempfile::TempDir,
+            work: tempfile::TempDir,
+            claude: Claude,
+            dir: PathBuf,
+        }
+
+        impl Project {
+            fn new() -> Self {
+                let home = tempfile::tempdir().expect("a temp dir");
+                let work = tempfile::tempdir().expect("a temp dir");
+                let claude = Claude::with_program(home.path(), "/usr/bin/true".into());
+                let dir = claude.project_dir(&work.path().canonicalize().expect("exists"));
+                std::fs::create_dir_all(&dir).expect("creates");
+                std::fs::create_dir_all(&claude.sessions).expect("creates");
+                Self {
+                    _home: home,
+                    work,
+                    claude,
+                    dir,
+                }
+            }
+
+            fn transcript(&self, id: &str, lines: &[String], secs: u64) {
+                write_at(&self.dir, id, lines, secs);
+            }
+
+            fn register(&self, file: &str, entry: Entry) {
+                let pid = agent_core::activity::Pid::new(entry.pid).expect("a pid");
+                let started = entry.started.unwrap_or_else(|| {
+                    ProcStart::of(pid)
+                        .map(|s| s.to_string())
+                        .unwrap_or_default()
+                });
+                let mut json = serde_json::json!({
+                    "pid": entry.pid,
+                    "sessionId": entry.session,
+                    "kind": entry.kind,
+                    "cwd": entry.cwd.unwrap_or_else(|| self.work.path().to_path_buf()),
+                    "procStart": started,
+                });
+                if let Some(job) = entry.job {
+                    json["jobId"] = job.into();
+                }
+                if entry.spare {
+                    json["spare"] = true.into();
+                }
+                std::fs::write(self.claude.sessions.join(file), json.to_string()).expect("writes");
+            }
+
+            fn launched(&self, bootstrap: Option<&Prompt>) -> Result<LaunchSpec, HarnessError> {
+                let session = "fix".parse().expect("parses");
+                self.claude.launch(&LaunchCtx {
+                    session: &session,
+                    workdir: self.work.path(),
+                    bootstrap,
+                    report: Path::new("/bin/agent"),
+                })
+            }
+
+            fn tail(&self, bootstrap: Option<&Prompt>, n: usize) -> Vec<String> {
+                let spec = self.launched(bootstrap).expect("launches");
+                let args: Vec<String> = spec
+                    .arguments()
+                    .iter()
+                    .map(|a| a.to_string_lossy().into_owned())
+                    .collect();
+                args[args.len().saturating_sub(n)..].to_vec()
+            }
+
+            fn search(&self, ids: &[&str]) -> crate::background::Search {
+                let mut ids = ids.iter().map(|id| SessionId::parse(id).expect("an id"));
+                let first = ids.next().expect("an id");
+                let conversation =
+                    crate::conversation::Conversation::of(&self.dir, first).expect("reads");
+                crate::background::find(
+                    &self.claude.sessions,
+                    &conversation,
+                    &self.work.path().canonicalize().expect("exists"),
+                )
+                .expect("reads")
+            }
+        }
+
+        struct Entry<'a> {
+            pid: u32,
+            session: &'a str,
+            kind: &'a str,
+            job: Option<&'a str>,
+            spare: bool,
+            cwd: Option<PathBuf>,
+            started: Option<String>,
+        }
+
+        impl<'a> Entry<'a> {
+            fn bg(session: &'a str, job: &'a str) -> Self {
+                Self {
+                    pid: std::process::id(),
+                    session,
+                    kind: "bg",
+                    job: Some(job),
+                    spare: false,
+                    cwd: None,
+                    started: None,
+                }
+            }
+        }
+
+        fn jobs_of(found: Option<Found>) -> Option<String> {
+            match found {
+                Some(Found::Attachable(survivor)) => Some(survivor.job.as_str().to_string()),
+                Some(Found::Unaddressable { .. }) | None => None,
+            }
+        }
+
+        #[test]
+        fn a_running_background_session_is_attached_to_by_its_job_id() {
+            let project = Project::new();
+            project.transcript("after-clear", &[user_line()], 1);
+            assert_eq!(project.tail(None, 2), ["--resume", "after-clear"]);
+            project.register("alive.json", Entry::bg("after-clear", "470bb73a"));
+            let spec = project.launched(None).expect("launches");
+            assert_eq!(spec.arguments(), ["attach", "470bb73a"]);
+        }
+
+        #[test]
+        fn a_prompt_stops_the_background_session_and_resumes_the_conversation() {
+            let project = Project::new();
+            project.transcript("after-clear", &[user_line()], 1);
+            project.register("alive.json", Entry::bg("after-clear", "470bb73a"));
+            let go: Prompt = "--go".parse().expect("parses");
+            assert_eq!(
+                project.tail(Some(&go), 4),
+                ["--resume", "after-clear", "--", "--go"]
+            );
+        }
+
+        #[test]
+        fn a_transcript_the_conversation_left_with_the_newer_mtime_still_finds_its_fork() {
+            let project = Project::new();
+            project.transcript("old", &[user_line(), continued("old", "new")], 5);
+            project.transcript("new", &[user_line(), user_line()], 1);
+            assert_eq!(
+                project.tail(None, 2),
+                ["--resume", "new"],
+                "the id that holds the messages, not the one named most recently"
+            );
+            project.register("alive.json", Entry::bg("new", "470bb73a"));
+            let spec = project.launched(None).expect("launches");
+            assert_eq!(spec.arguments(), ["attach", "470bb73a"]);
+        }
+
+        #[test]
+        fn a_session_registered_under_any_id_of_the_chain_is_the_conversations() {
+            let project = Project::new();
+            project.transcript("a", &[user_line(), continued("a", "b")], 3);
+            project.transcript("b", &[user_line(), continued("b", "c")], 2);
+            project.transcript("c", &[user_line()], 1);
+            for (i, id) in ["a", "b", "c"].into_iter().enumerate() {
+                project.register("alive.json", Entry::bg(id, &format!("job{i}")));
+                let spec = project.launched(None).expect("launches");
+                assert_eq!(spec.arguments(), ["attach", format!("job{i}").as_str()]);
+            }
+        }
+
+        #[test]
+        fn a_fork_with_no_messages_is_attached_to_but_the_conversation_resumes_from_its_origin() {
+            let project = Project::new();
+            project.transcript("old", &[user_line(), continued("old", "stub")], 2);
+            project.transcript("stub", &[r#"{"type":"summary"}"#.to_string()], 1);
+            assert_eq!(project.tail(None, 2), ["--resume", "old"]);
+            project.register("alive.json", Entry::bg("stub", "470bb73a"));
+            let spec = project.launched(None).expect("launches");
+            assert_eq!(spec.arguments(), ["attach", "470bb73a"]);
+        }
+
+        #[test]
+        fn entries_that_are_not_this_conversations_running_worker_are_ignored() {
+            let project = Project::new();
+            project.transcript("mine", &[user_line()], 1);
+            let ignored = [
+                (
+                    "spare",
+                    Entry {
+                        spare: true,
+                        ..Entry::bg("mine", "j1")
+                    },
+                ),
+                (
+                    "spare-kind",
+                    Entry {
+                        kind: "bg-spare",
+                        ..Entry::bg("mine", "j2")
+                    },
+                ),
+                (
+                    "interactive",
+                    Entry {
+                        kind: "interactive",
+                        ..Entry::bg("mine", "j3")
+                    },
+                ),
+                ("other-conversation", Entry::bg("someone-elses", "j4")),
+                (
+                    "gone",
+                    Entry {
+                        pid: 999_999_999,
+                        ..Entry::bg("mine", "j6")
+                    },
+                ),
+                (
+                    "pid-reused",
+                    Entry {
+                        started: Some("Mon Jan  1 00:00:00 1990".into()),
+                        ..Entry::bg("mine", "j7")
+                    },
+                ),
+            ];
+            for (file, entry) in ignored {
+                project.register(&format!("{file}.json"), entry);
+            }
+            std::fs::write(project.claude.sessions.join("junk.json"), "{").expect("writes");
+            std::fs::write(project.claude.sessions.join("binary.json"), [0xff, 0xfe])
+                .expect("writes");
+            assert_eq!(project.tail(None, 2), ["--resume", "mine"]);
+        }
+
+        #[test]
+        fn a_worker_in_another_directory_still_counts_but_one_in_the_agents_is_preferred() {
+            let project = Project::new();
+            project.transcript("mine", &[user_line()], 1);
+            let elsewhere = tempfile::tempdir().expect("a temp dir");
+            project.register(
+                "a.json",
+                Entry {
+                    cwd: Some(elsewhere.path().to_path_buf()),
+                    ..Entry::bg("mine", "faraway")
+                },
+            );
+            let found = project.search(&["mine"]).found;
+            assert_eq!(jobs_of(found).as_deref(), Some("faraway"));
+            project.register("b.json", Entry::bg("mine", "nearby"));
+            let found = project.search(&["mine"]).found;
+            assert_eq!(jobs_of(found).as_deref(), Some("nearby"));
+        }
+
+        #[test]
+        fn a_worker_with_a_job_id_is_preferred_to_one_without() {
+            let project = Project::new();
+            project.transcript("mine", &[user_line()], 1);
+            project.register(
+                "a.json",
+                Entry {
+                    job: None,
+                    ..Entry::bg("mine", "")
+                },
+            );
+            project.register("b.json", Entry::bg("mine", "reachable"));
+            let found = project.search(&["mine"]).found;
+            assert_eq!(jobs_of(found).as_deref(), Some("reachable"));
+        }
+
+        #[test]
+        fn a_running_session_without_a_usable_job_id_is_reported_with_why_and_its_pid() {
+            let project = Project::new();
+            project.transcript("mine", &[user_line()], 1);
+            project.register(
+                "alive.json",
+                Entry {
+                    job: None,
+                    ..Entry::bg("mine", "")
+                },
+            );
+            let error = project.launched(None).expect_err("can't be attached");
+            assert!(
+                error.context.contains("no job id")
+                    && error.context.contains(&std::process::id().to_string()),
+                "{}",
+                error.context
+            );
+            assert!(
+                project
+                    .launched(Some(&"go".parse().expect("parses")))
+                    .is_err(),
+                "it can't be stopped either"
+            );
+        }
+
+        #[test]
+        fn a_job_id_that_could_pass_for_a_flag_is_malformed_and_said_so() {
+            let project = Project::new();
+            project.transcript("mine", &[user_line()], 1);
+            project.register("alive.json", Entry::bg("mine", "--help"));
+            let found = project.search(&["mine"]).found;
+            assert!(
+                matches!(
+                    found,
+                    Some(Found::Unaddressable {
+                        why: Unaddressed::Malformed(ref raw),
+                        ..
+                    }) if raw == "--help"
+                ),
+                "{found:?}"
+            );
+            let error = project.launched(None).expect_err("refused");
+            assert!(error.context.contains("--help"), "{}", error.context);
+        }
+
+        #[test]
+        fn job_ids_read_as_missing_malformed_or_valid() {
+            let field = |json: &str| serde_json::from_str::<JobField>(json).expect("parses");
+            assert_eq!(field("null"), JobField::Missing);
+            assert!(matches!(field("\"470bb73a\""), JobField::Valid(_)));
+            assert_eq!(field("\"-x\""), JobField::Malformed("-x".into()));
+            assert_eq!(field("12"), JobField::Malformed("12".into()));
+        }
+
+        #[test]
+        fn unreadable_entries_reach_the_launch_as_notes_not_as_output() {
+            let project = Project::new();
+            project.transcript("mine", &[user_line()], 1);
             std::fs::write(
-                sessions.join(file),
-                format!(r#"{{"pid":{pid},"sessionId":"after-clear","cwd":"x"}}"#),
+                project.claude.sessions.join("odd.json"),
+                r#"{"pid":1,"sessionId":"mine","kind":"bg"}"#,
             )
             .expect("writes");
-        };
-        register("dead.json", 999_999_999);
-        let args = claude.launch(&ctx(None)).expect("succeeds");
-        assert_eq!(
-            args.arguments()[args.arguments().len() - 2..],
-            ["--resume", "after-clear"],
-            "a registry entry whose process is gone doesn't count"
-        );
-        register("alive.json", std::process::id());
-        let attached = claude.launch(&ctx(None)).expect("succeeds");
-        assert_eq!(attached.arguments(), ["attach", "after-clear"]);
-        std::fs::write(
-            sessions.join("alive.json"),
-            format!(
-                r#"{{"pid":{},"sessionId":"after-clear","jobId":"470bb73a","cwd":"x"}}"#,
-                std::process::id()
-            ),
-        )
-        .expect("writes");
-        let by_job = claude.launch(&ctx(None)).expect("succeeds");
-        assert_eq!(
-            by_job.arguments(),
-            ["attach", "470bb73a"],
-            "attach takes the short job id, it refuses the full session id"
-        );
-        let stopped = claude.launch(&ctx(Some(&go))).expect("succeeds");
-        let args = stopped.arguments();
-        assert_eq!(
-            args[args.len() - 4..],
-            ["--resume", "after-clear", "--", "--go"],
-            "with a prompt the background session is stopped and resumed"
-        );
+            let spec = project.launched(None).expect("launches");
+            assert!(
+                spec.notes().iter().any(|n| n.contains("odd.json")),
+                "{:?}",
+                spec.notes()
+            );
+        }
+
+        #[test]
+        fn an_entry_of_the_conversation_that_cannot_be_read_is_reported_not_skipped_silently() {
+            let project = Project::new();
+            project.transcript("mine", &[user_line()], 1);
+            std::fs::write(
+                project.claude.sessions.join("odd.json"),
+                r#"{"pid":1,"sessionId":"mine","kind":"bg"}"#,
+            )
+            .expect("writes");
+            std::fs::write(
+                project.claude.sessions.join("other.json"),
+                r#"{"pid":1,"sessionId":"theirs"}"#,
+            )
+            .expect("writes");
+            let search = project.search(&["mine"]);
+            assert_eq!(search.found, None);
+            assert_eq!(
+                search.unreadable,
+                [project.claude.sessions.join("odd.json")]
+            );
+        }
+
+        #[test]
+        fn a_conversation_is_looked_up_again_only_when_a_transcript_of_its_chain_changed() {
+            let project = Project::new();
+            project.transcript("a", &[user_line(), continued("a", "b")], 2);
+            project.transcript("b", &[user_line()], 1);
+            let id = |raw: &str| SessionId::parse(raw).expect("an id");
+            let first = project
+                .claude
+                .chains
+                .of(&project.dir, id("a"))
+                .expect("reads");
+            assert_eq!(first.resumable().as_str(), "b");
+            std::fs::remove_file(project.dir.join("b.jsonl")).expect("removes");
+            let again = project
+                .claude
+                .chains
+                .of(&project.dir, id("a"))
+                .expect("reads");
+            assert_eq!(
+                again.resumable().as_str(),
+                "a",
+                "the fork's transcript changed, so the chain is read again"
+            );
+        }
+
+        fn prompted(text: &str) -> String {
+            crate::fixtures::typed("p", "2026-11-08T10:00:00.000Z", text)
+        }
+
+        #[test]
+        fn the_activity_is_read_from_the_conversations_live_transcript_not_a_superseded_one() {
+            let project = Project::new();
+            project.transcript(
+                "old",
+                &[prompted("from the old"), continued("old", "new")],
+                5,
+            );
+            project.transcript("new", &[prompted("from the fork")], 1);
+
+            let read = |at: Option<&TranscriptRef>| {
+                project
+                    .claude
+                    .activity_detail(project.work.path(), at)
+                    .expect("reads")
+                    .and_then(|t| t.log.prompt)
+            };
+            let hooked = TranscriptRef::new(project.dir.join("old.jsonl").to_string_lossy());
+            assert_eq!(read(Some(&hooked)).as_deref(), Some("from the fork"));
+            assert_eq!(read(None).as_deref(), Some("from the fork"));
+        }
+
+        #[test]
+        fn an_interrupt_is_looked_for_in_the_live_transcript_of_the_conversation() {
+            let project = Project::new();
+            project.transcript("old", &[prompted("go"), continued("old", "new")], 5);
+            project.transcript(
+                "new",
+                &[
+                    prompted("go"),
+                    crate::fixtures::stopped(
+                        "p",
+                        "2026-11-08T10:00:05.000Z",
+                        "[Request interrupted by user]",
+                    ),
+                ],
+                1,
+            );
+            let hooked = TranscriptRef::new(project.dir.join("old.jsonl").to_string_lossy());
+            let after = transcript::parse_time("2026-11-08T10:00:00.000Z").expect("a time");
+            let probe = project
+                .claude
+                .interruption(&hooked, after, None)
+                .expect("reads");
+            assert!(matches!(probe, Probe::Interrupted(..)), "{probe:?}");
+        }
     }
 
     #[test]

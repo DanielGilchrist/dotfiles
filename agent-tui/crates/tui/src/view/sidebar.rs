@@ -7,7 +7,7 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use agent_core::activity::{Subagent, SubagentStatus};
+use agent_core::activity::{Liveness, Subagent};
 use agent_core::model::{Entry, Head, Repo, RepoKey, Snapshot};
 use agent_core::names::SessionName;
 use agent_core::ports::{Compared, DiffStat, Edit, FileState, WorktreeFacts};
@@ -121,8 +121,14 @@ enum Gist<'a> {
         name: &'a str,
         target: Option<&'a Target>,
     },
+    Starting,
     Thinking,
     Delegating {
+        subagents: NonZeroUsize,
+        quiet: String,
+    },
+    /// Every subagent it waits on has gone quiet.
+    Lost {
         subagents: NonZeroUsize,
         quiet: String,
     },
@@ -130,6 +136,8 @@ enum Gist<'a> {
     Done(Option<&'a str>),
     Interrupted,
 }
+
+const STARTING: &str = "starting";
 
 impl<'a> Gist<'a> {
     /// Settled agents (idle, exited, no session) have none. `heard` is when
@@ -141,6 +149,7 @@ impl<'a> Gist<'a> {
             AgentStatus::Asking { question, .. } => Some(Self::Asking(question)),
             AgentStatus::Failed { failure, .. } => Some(Self::Failed(failure)),
             AgentStatus::Done { summary, .. } => Some(Self::Done(summary.as_deref())),
+            AgentStatus::Starting { .. } => Some(Self::Starting),
             AgentStatus::Working { doing, .. } => Some(match doing {
                 Doing::Thinking => Self::Thinking,
                 Doing::Tool { name, target } => Self::Tool {
@@ -148,6 +157,10 @@ impl<'a> Gist<'a> {
                     target: target.as_ref(),
                 },
                 Doing::Delegating(subagents) => Self::Delegating {
+                    subagents: *subagents,
+                    quiet: ago(heard, now),
+                },
+                Doing::Lost(subagents) => Self::Lost {
                     subagents: *subagents,
                     quiet: ago(heard, now),
                 },
@@ -170,6 +183,7 @@ impl<'a> Gist<'a> {
             (Self::Asking(question), _) => gist_of(question),
             (Self::Failed(failure), _) => gist_of(failure_text(failure)),
             (Self::Tool { name, target }, form) => tool_line(name, *target, form, width),
+            (Self::Starting, _) => (STARTING.to_string(), Shown::Whole),
             (Self::Thinking, _) => ("thinking".to_string(), Shown::Whole),
             (Self::Delegating { subagents, quiet }, Form::Long) => {
                 let noun = if subagents.get() == 1 {
@@ -181,6 +195,20 @@ impl<'a> Gist<'a> {
             }
             (Self::Delegating { subagents, quiet }, Form::Short) => {
                 (format!("↳{subagents} · quiet {quiet}"), Shown::Whole)
+            }
+            (Self::Lost { subagents, quiet }, Form::Long) => {
+                let noun = if subagents.get() == 1 {
+                    "subagent"
+                } else {
+                    "subagents"
+                };
+                (
+                    format!("↳{subagents} {noun} lost · quiet {quiet}"),
+                    Shown::Whole,
+                )
+            }
+            (Self::Lost { subagents, quiet }, Form::Short) => {
+                (format!("↳{subagents} lost · quiet {quiet}"), Shown::Whole)
             }
             (Self::HandingBack, _) => ("handing back".to_string(), Shown::Whole),
             (Self::Done(Some(summary)), _) => gist_of(&without_markdown(summary)),
@@ -203,12 +231,13 @@ impl<'a> Gist<'a> {
                 target: Some(target),
             } => format!("{name}  {}", target_text(target)),
             Self::Tool { name, target: None } => (*name).to_string(),
+            Self::Starting => STARTING.to_string(),
             Self::Thinking => "thinking".to_string(),
             Self::HandingBack => "handing back".to_string(),
             Self::Done(Some(summary)) => without_markdown(summary),
             Self::Done(None) => "done".to_string(),
             Self::Interrupted => "interrupted".to_string(),
-            Self::Delegating { .. } => return None,
+            Self::Delegating { .. } | Self::Lost { .. } => return None,
         })
     }
 }
@@ -517,7 +546,7 @@ impl<'m> Deck<'m> {
             at == Some(0),
         ));
         let rest = tree(
-            activity.subagents.values().collect(),
+            listed(activity, m.clock.wall),
             self.form,
             self.content,
             m.clock.wall,
@@ -592,6 +621,7 @@ fn time_in_state(status: &AgentStatus, now: SystemTime) -> Vec<Span<'static>> {
             pulse: Pulse::Steady,
             ..
         }
+        | AgentStatus::Starting { since }
         | AgentStatus::Failed { since, .. }
         | AgentStatus::Done { since, .. }
         | AgentStatus::Interrupted { since } => vec![Span::styled(ago(*since, now), dim())],
@@ -606,9 +636,10 @@ fn settled_counts(m: &Model, repo: &Repo) -> (usize, usize) {
         .iter()
         .filter(|entry| m.active(entry))
         .fold((0, 0), |(live, exited), entry| match m.status(entry) {
-            AgentStatus::Idle | AgentStatus::Working { .. } | AgentStatus::Interrupted { .. } => {
-                (live + 1, exited)
-            }
+            AgentStatus::Idle
+            | AgentStatus::Starting { .. }
+            | AgentStatus::Working { .. }
+            | AgentStatus::Interrupted { .. } => (live + 1, exited),
             AgentStatus::Exited => (live, exited + 1),
             AgentStatus::NoSession
             | AgentStatus::Asking { .. }
@@ -621,33 +652,46 @@ fn settled_counts(m: &Model, repo: &Repo) -> (usize, usize) {
 /// place of the panel's padding, so rows keep their alignment.
 const GUTTER: &str = "▌";
 
+fn listed(
+    activity: &agent_core::activity::Activity,
+    now: SystemTime,
+) -> Vec<(&Subagent, Liveness<'_>)> {
+    activity
+        .subagents
+        .iter()
+        .filter_map(|(id, s)| Some((s, activity.liveness(id, now)?)))
+        .collect()
+}
+
 /// `├ ⠹ description  kind  4m`, oldest first, the last child on `└`.
 fn tree(
-    mut subagents: Vec<&Subagent>,
+    mut subagents: Vec<(&Subagent, Liveness<'_>)>,
     form: Form,
     width: usize,
     now: SystemTime,
     cursor: Option<usize>,
 ) -> Vec<Line<'static>> {
     let cursor = cursor.map(|at| at.min(subagents.len().saturating_sub(1)));
-    subagents.sort_by_key(|s| s.since);
+    subagents.sort_by_key(|(s, _)| s.since);
     subagents
         .iter()
         .enumerate()
-        .map(|(i, subagent)| {
+        .map(|(i, (subagent, liveness))| {
             let branch = if i + 1 == subagents.len() {
                 "└ "
             } else {
                 "├ "
             };
-            let (glyph, since) = match subagent.status {
-                SubagentStatus::Finished { at } => (
+            let (glyph, since) = match liveness {
+                Liveness::Finished { at } => (
                     Span::styled("✓", success().add_modifier(Modifier::BOLD)),
-                    ago(subagent.since, at),
+                    ago(subagent.since, *at),
                 ),
-                SubagentStatus::Running { .. } => {
-                    (Span::raw(spinner(now)), ago(subagent.since, now))
-                }
+                Liveness::Running { .. } => (Span::raw(spinner(now)), ago(subagent.since, now)),
+                Liveness::Lost { .. } => (
+                    Span::styled(super::SPINNER[0], dim()),
+                    ago(subagent.since, now),
+                ),
             };
             let kind_only = subagent.label().is_none();
             let label = subagent.title();
@@ -1589,7 +1633,7 @@ pub(crate) fn activity_message(m: &Model, entry: &Entry) -> Option<String> {
 pub(super) fn subagent_rows(m: &Model, entry: &Entry, width: usize) -> Vec<Line<'static>> {
     m.activity(entry.name()).map_or_else(Vec::new, |a| {
         tree(
-            a.subagents.values().collect(),
+            listed(a, m.clock.wall),
             Form::Long,
             width,
             m.clock.wall,
@@ -2494,6 +2538,44 @@ mod tests {
             "line 2 sits under the name"
         );
         assert!(lines[1].starts_with("   ◆ heucristic0"), "{}", lines[1]);
+    }
+
+    #[test]
+    fn a_subagent_nobody_has_heard_from_shows_a_frozen_spinner_not_a_turning_one() {
+        use agent_core::activity::{Launch, STALE_AFTER, Waiting};
+        use std::time::Duration;
+        let began = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
+        let subagent = agent_core::activity::Subagent::running(
+            "general-purpose",
+            Some("QA pass".into()),
+            Launch::Background,
+            began,
+        );
+        let row = |now| {
+            let liveness = subagent.liveness(now, Waiting::Off);
+            super::tree(vec![(&subagent, liveness)], Form::Long, 60, now, None)[0].to_string()
+        };
+        let turning = began + Duration::from_millis(100);
+        assert!(
+            row(turning).contains(crate::view::SPINNER[1]),
+            "{}",
+            row(turning)
+        );
+        let quiet = began + STALE_AFTER + Duration::from_millis(1100);
+        let frozen = row(quiet);
+        assert!(
+            frozen.contains(crate::view::SPINNER[0]) && !frozen.contains('✓'),
+            "{frozen}"
+        );
+    }
+
+    #[test]
+    fn a_starting_agent_says_so_on_its_second_line_and_never_thinking() {
+        let now = SystemTime::now();
+        let status = AgentStatus::Starting { since: now };
+        let gist = Gist::of(&status, now, now).expect("a starting agent has a second line");
+        assert_eq!(gist.line(Form::Long, 40).0, STARTING);
+        assert_eq!(gist.message().as_deref(), Some(STARTING));
     }
 
     #[test]
@@ -5146,13 +5228,12 @@ mod tests {
             activity.asks.clear();
             activity.subagents.insert(
                 AgentId::new("s9"),
-                agent_core::activity::Subagent {
-                    kind: "general-purpose".into(),
-                    description: Some("QA pass".into()),
-                    launch: agent_core::activity::Launch::Foreground,
-                    since: wall,
-                    status: agent_core::activity::SubagentStatus::Running { tools: Vec::new() },
-                },
+                agent_core::activity::Subagent::running(
+                    "general-purpose",
+                    Some("QA pass".into()),
+                    agent_core::activity::Launch::Foreground,
+                    wall,
+                ),
             );
             activity.asks.push(Ask {
                 asker: Origin::Subagent(AgentId::new("s9")),

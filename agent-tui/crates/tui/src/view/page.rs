@@ -840,10 +840,11 @@ fn activity_state<'a>(
         State::Working { .. } => log::ActivityStage::Working {
             since: activity.since,
             stale,
-            running: activity.running(),
+            running: activity.running(m.clock.wall),
         },
         State::Delegating => log::ActivityStage::Delegating {
-            running: activity.running(),
+            running: activity.running(m.clock.wall),
+            lost: activity.lost(m.clock.wall),
             quiet: m
                 .clock
                 .wall
@@ -960,9 +961,13 @@ fn log_body(m: &Model, name: &SessionName, id: &AgentId, columns: usize, budget:
         .map(|w| w.watch.nav.clone())
         .unwrap_or_default();
     let log_key = LogKey::Subagent(key);
+    let listing = subagent.map(|subagent| log::Listing {
+        subagent,
+        liveness: m.liveness(name, id, subagent),
+    });
     let rendered = log::render(
         detail,
-        subagent,
+        listing,
         &nav,
         &log::Context {
             columns,

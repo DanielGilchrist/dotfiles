@@ -824,6 +824,10 @@ pub enum AgentStatus {
     /// Live, with nothing to report: waiting for a prompt, seen, or a
     /// harness without hooks.
     Idle,
+    /// Launched through `agent` and nothing reported yet.
+    Starting {
+        since: SystemTime,
+    },
     Working {
         doing: Doing,
         since: SystemTime,
@@ -908,6 +912,8 @@ pub enum Doing {
     },
     /// Its activity ended and it waits on this many background subagents.
     Delegating(NonZeroUsize),
+    /// Its activity ended and every subagent it waits on has gone quiet.
+    Lost(NonZeroUsize),
     /// Its subagents finished and it's about to take their results.
     HandingBack,
 }
@@ -999,6 +1005,7 @@ impl AgentStatus {
             Self::NoSession
             | Self::Exited
             | Self::Idle
+            | Self::Starting { .. }
             | Self::Working { .. }
             | Self::Interrupted { .. } => None,
         }
@@ -2869,6 +2876,11 @@ impl Model {
                 since: ask.since,
             };
         }
+        if let Some(boot) = activity.boot(self.clock.wall) {
+            return AgentStatus::Starting {
+                since: boot.since(),
+            };
+        }
         match &activity.state {
             State::Idle | State::Exited => AgentStatus::Idle,
             State::Working { .. } | State::Delegating => {
@@ -2878,8 +2890,16 @@ impl Model {
                     Pulse::Steady
                 };
                 let doing = match (&activity.state, activity.current_tool()) {
-                    (State::Delegating, _) => NonZeroUsize::new(activity.running())
-                        .map_or(Doing::HandingBack, Doing::Delegating),
+                    (State::Delegating, _) => {
+                        match (
+                            NonZeroUsize::new(activity.running(self.clock.wall)),
+                            NonZeroUsize::new(activity.lost(self.clock.wall)),
+                        ) {
+                            (Some(running), _) => Doing::Delegating(running),
+                            (None, Some(lost)) => Doing::Lost(lost),
+                            (None, None) => Doing::HandingBack,
+                        }
+                    }
                     (_, Some(tool)) => Doing::Tool {
                         name: tool.name.clone(),
                         target: tool.target.as_deref().map(Target::of),
@@ -2922,6 +2942,20 @@ impl Model {
     /// prompt, if it could.
     pub fn hold(&self, name: &SessionName) -> Option<Hold> {
         self.activity(name)?.hold(self.clock.wall)
+    }
+
+    /// How subagent `id` of `by` stands now. One its activity no longer lists
+    /// is a copy held for [2]'s cursor, with no question open.
+    pub fn liveness<'a>(
+        &'a self,
+        by: &SessionName,
+        id: &AgentId,
+        subagent: &'a Subagent,
+    ) -> agent_core::activity::Liveness<'a> {
+        let now = self.clock.wall;
+        self.activity(by)
+            .and_then(|activity| activity.liveness(id, now))
+            .unwrap_or_else(|| subagent.liveness(now, agent_core::activity::Waiting::Off))
     }
 
     /// The selected agent's subagents, oldest first, as [2] lists them.
@@ -3096,7 +3130,7 @@ impl Model {
         let EntryState::Live = entry.state() else {
             return None;
         };
-        NonZeroUsize::new(self.activity(entry.name())?.running())
+        NonZeroUsize::new(self.activity(entry.name())?.running(self.clock.wall))
     }
 
     /// Agents that need the user, in the order `a` visits them: blocked ones
