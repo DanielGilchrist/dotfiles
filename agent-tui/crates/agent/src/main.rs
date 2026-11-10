@@ -620,7 +620,7 @@ fn event(svc: Services<'_>, name: &SessionName) {
         return;
     };
     let harness = match svc.store.record(name) {
-        Ok(Some(record)) => svc.harnesses.get(&record.harness),
+        Ok(Some(record)) => svc.harnesses.get(record.harness()),
         _ => None,
     }
     .unwrap_or_else(|| svc.harnesses.default_harness());

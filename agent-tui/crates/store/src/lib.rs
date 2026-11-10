@@ -457,11 +457,10 @@ mod tests {
     fn records_round_trip_and_forget_unpins() {
         let dir = tempfile::tempdir().expect("a temp dir");
         let store = FsStore::new(dir.path().to_path_buf());
-        let pending = agent_core::ports::PendingPrompt::now("go".parse().expect("parses"));
-        let record = AgentRecord {
-            harness: "claude".parse().expect("parses"),
-            pending: Some(pending),
-        };
+        let record = AgentRecord::new(
+            "claude".parse().expect("parses"),
+            Some("go".parse().expect("parses")),
+        );
         store.put_record(&name("a"), &record).expect("succeeds");
         store.pin(&name("a")).expect("succeeds");
         assert_eq!(store.record(&name("a")).expect("succeeds"), Some(record));

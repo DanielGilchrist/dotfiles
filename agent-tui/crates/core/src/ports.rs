@@ -1179,13 +1179,38 @@ impl PendingPrompt {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentRecord {
-    pub harness: HarnessId,
+    harness: HarnessId,
     /// Sent on launches until the agent shows activity after it was recorded.
     #[serde(default)]
-    pub pending: Option<PendingPrompt>,
+    pending: Option<PendingPrompt>,
 }
 
 impl AgentRecord {
+    pub fn new(harness: HarnessId, prompt: Option<Prompt>) -> Self {
+        Self {
+            harness,
+            pending: prompt.map(PendingPrompt::now),
+        }
+    }
+
+    /// This agent's record for another launch. A new prompt replaces the
+    /// pending one, and without one an unacknowledged pending prompt stays.
+    #[must_use]
+    pub fn relaunched(self, prompt: Option<Prompt>) -> Self {
+        match prompt {
+            Some(prompt) => Self::new(self.harness, Some(prompt)),
+            None => self,
+        }
+    }
+
+    pub fn harness(&self) -> &HarnessId {
+        &self.harness
+    }
+
+    pub fn pending(&self) -> Option<&PendingPrompt> {
+        self.pending.as_ref()
+    }
+
     /// The agent has seen its pending prompt, so it's no longer sent.
     pub fn acknowledge(&mut self, _: Seen) {
         self.pending = None;

@@ -269,7 +269,7 @@ fn new_agents_get_a_worktree_a_record_and_a_bootstrap_for_launch() {
         .expect("succeeds");
     assert!(
         record
-            .pending
+            .pending()
             .expect("succeeds")
             .prompt
             .as_str()
@@ -308,8 +308,74 @@ fn pending_prompts_are_resent_until_the_agent_shows_activity() {
             .record(&session("fix"))
             .expect("succeeds")
             .expect("succeeds")
-            .pending
+            .pending()
             .is_none()
+    );
+}
+
+#[test]
+fn restarting_without_a_prompt_keeps_the_undelivered_first_prompt() {
+    let w = World::new();
+    let repo = w.vcs.root.clone();
+    attach(
+        w.svc(),
+        &agent("fix"),
+        Some(&prompt("go")),
+        Some(&repo),
+        w.harness(),
+    )
+    .expect("succeeds");
+    let before = w
+        .store
+        .record(&session("fix"))
+        .expect("succeeds")
+        .expect("recorded");
+    w.add_session("fix", SessionStatus::Exited { cwd: None });
+    attach(w.svc(), &agent("fix"), None, None, w.harness()).expect("succeeds");
+    let after = w
+        .store
+        .record(&session("fix"))
+        .expect("succeeds")
+        .expect("recorded");
+    assert_eq!(after.pending(), before.pending());
+    assert!(after.pending().is_some());
+    let spec = exec_spec(w.svc(), &session("fix"), Path::new("/x")).expect("succeeds");
+    assert_eq!(spec.arguments().len(), 1);
+}
+
+#[test]
+fn restarting_with_a_prompt_replaces_the_pending_one() {
+    let w = World::new();
+    let repo = w.vcs.root.clone();
+    attach(
+        w.svc(),
+        &agent("fix"),
+        Some(&prompt("first")),
+        Some(&repo),
+        w.harness(),
+    )
+    .expect("succeeds");
+    w.add_session("fix", SessionStatus::Exited { cwd: None });
+    attach(
+        w.svc(),
+        &agent("fix"),
+        Some(&prompt("second")),
+        None,
+        w.harness(),
+    )
+    .expect("succeeds");
+    let record = w
+        .store
+        .record(&session("fix"))
+        .expect("succeeds")
+        .expect("recorded");
+    assert!(
+        record
+            .pending()
+            .expect("pending")
+            .prompt
+            .as_str()
+            .ends_with("second")
     );
 }
 
@@ -317,10 +383,7 @@ fn pending_prompts_are_resent_until_the_agent_shows_activity() {
 fn restarts_keep_the_agents_recorded_harness() {
     let w = World::new();
     let wt = w.existing_worktree("fix");
-    let record = AgentRecord {
-        harness: "codex".parse().expect("parses"),
-        pending: None,
-    };
+    let record = AgentRecord::new("codex".parse().expect("parses"), None);
     w.store
         .put_record(&session("fix"), &record)
         .expect("succeeds");
@@ -1000,10 +1063,7 @@ fn record_for_fix(w: &World) {
     w.store
         .put_record(
             &session("fix"),
-            &AgentRecord {
-                harness: w.harness().id().clone(),
-                pending: None,
-            },
+            &AgentRecord::new(w.harness().id().clone(), None),
         )
         .expect("stores");
 }

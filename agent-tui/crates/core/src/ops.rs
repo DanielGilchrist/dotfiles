@@ -14,8 +14,8 @@ use crate::names::{
 use crate::paths::{AgentWorktree, Layout, PathError, RepoRoot, TrashSlot, WorktreeState};
 use crate::ports::{
     AgentRecord, BranchState, Fetch, Forge, Harness, HarnessError, HarnessId, Harnesses, HostError,
-    LaunchCtx, Listing, PaneCommand, PendingPrompt, Probe, SessionHost, SessionInfo, SessionStatus,
-    Store, StoreError, TranscriptStamp, Unlisting, Vcs, WorktreeStart,
+    LaunchCtx, Listing, PaneCommand, Probe, SessionHost, SessionInfo, SessionStatus, Store,
+    StoreError, TranscriptStamp, Unlisting, Vcs, WorktreeStart,
 };
 use crate::process::{CommandError, LaunchSpec};
 
@@ -487,8 +487,8 @@ pub fn harness_for<'a>(svc: Services<'a>, name: &SessionName) -> Result<&'a dyn 
     match svc.store.record(name)? {
         Some(record) => svc
             .harnesses
-            .get(&record.harness)
-            .ok_or(Error::UnknownHarness(record.harness)),
+            .get(record.harness())
+            .ok_or_else(|| Error::UnknownHarness(record.harness().clone())),
         None => Ok(svc.harnesses.default_harness()),
     }
 }
@@ -654,7 +654,8 @@ pub fn attach(
 
 /// Start a session whose pane runs `agent exec`, which asks the agent's
 /// harness to resume or launch. An agent that already has a record keeps
-/// its harness. `prompt` is passed at the next launch.
+/// its harness. A `prompt` is passed at the next launch. Without one, an
+/// unacknowledged pending prompt carries over.
 pub fn start(
     svc: Services<'_>,
     at: &Startable,
@@ -665,11 +666,13 @@ pub fn start(
     let existing = svc.store.record(&name)?;
     let harness_id = existing
         .as_ref()
-        .map_or_else(|| harness.id().clone(), |r| r.harness.clone());
+        .map_or_else(|| harness.id().clone(), |r| r.harness().clone());
     svc.harness(&harness_id)?;
-    let (delivery, pending) = match prompt {
-        Some(prompt) => (Delivery::AtLaunch, Some(PendingPrompt::now(prompt))),
-        None => (Delivery::None, None),
+    let (record, delivery) = match (existing, prompt) {
+        (None, None) => (AgentRecord::new(harness_id, None), Delivery::None),
+        (None, Some(p)) => (AgentRecord::new(harness_id, Some(p)), Delivery::AtLaunch),
+        (Some(r), None) => (r.relaunched(None), Delivery::None),
+        (Some(r), Some(p)) => (r.relaunched(Some(p)), Delivery::AtLaunch),
     };
 
     let pane = PaneCommand {
@@ -685,13 +688,7 @@ pub fn start(
             return Err(e.into());
         }
     };
-    svc.store.put_record(
-        &name,
-        &AgentRecord {
-            harness: harness_id,
-            pending,
-        },
-    )?;
+    svc.store.put_record(&name, &record)?;
     Ok(Launch {
         session: name,
         spec,
@@ -755,17 +752,16 @@ pub fn exec_spec(svc: Services<'_>, name: &SessionName, workdir: &Path) -> Resul
         .store
         .record(name)?
         .ok_or_else(|| Error::NoRecord(name.clone()))?;
-    let harness = svc.harness(&record.harness)?;
+    let harness = svc.harness(record.harness())?;
     // If activity can't be read, keep the prompt: resending beats losing it.
     if let Some(seen) = record
-        .pending
-        .as_ref()
+        .pending()
         .and_then(|p| harness.acknowledged(workdir, p).ok().flatten())
     {
         record.acknowledge(seen);
         svc.store.put_record(name, &record)?;
     }
-    let bootstrap = record.pending.as_ref().map(|p| &p.prompt);
+    let bootstrap = record.pending().map(|p| &p.prompt);
     let spec = harness.launch(&LaunchCtx {
         session: name,
         workdir,
