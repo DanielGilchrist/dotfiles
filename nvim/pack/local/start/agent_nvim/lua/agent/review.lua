@@ -9,7 +9,6 @@ local edit_ns = vim.api.nvim_create_namespace("agent_review_editing")
 ---@class ReviewComment
 ---@field id integer
 ---@field bufnr integer|nil
----@field extmark integer|nil
 ---@field file string
 ---@field relpath string
 ---@field ft string
@@ -221,22 +220,64 @@ local function clear_highlight(buf)
   pcall(vim.api.nvim_buf_clear_namespace, buf, edit_ns, 0, -1)
 end
 
-M._diffed = {}
+M._session = 0
+
+local refresh_aug = vim.api.nvim_create_augroup("agent_review_refresh", { clear = true })
+
+---@param buf integer
+---@return boolean
+local function in_review(buf)
+  return M._active and vim.api.nvim_buf_is_valid(buf) and vim.b[buf].agent_review_session == M._session
+end
+
+---@param buf integer
+local function watch(buf)
+  vim.api.nvim_clear_autocmds({ group = refresh_aug, buffer = buf })
+  local running, pending, tick = false, false, 0
+
+  local function run()
+    if not in_review(buf) then return end
+    if running then
+      pending = true
+      return
+    end
+    running = true
+    require("unified.utils.async").run(function()
+      pcall(require("unified.git").show_git_diff_against_commit, current_base() or "HEAD", buf)
+      running = false
+      if pending then
+        pending = false
+        run()
+      end
+    end)
+  end
+
+  vim.api.nvim_create_autocmd({ "TextChanged", "InsertLeave", "BufWritePost", "FileChangedShellPost" }, {
+    group = refresh_aug,
+    buffer = buf,
+    callback = function()
+      tick = tick + 1
+      local scheduled = tick
+      vim.defer_fn(function()
+        if scheduled == tick then run() end
+      end, 300)
+    end,
+  })
+end
 
 ---@param buf integer
 local function ensure_diff(buf)
   if not M._active then return end
   if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
-  if M._diffed[buf] then return end
+  if vim.b[buf].agent_review_session == M._session then return end
   if is.not_empty(vim.bo[buf].buftype) then return end
   local file = vim.api.nvim_buf_get_name(buf)
   if is.empty(file) then return end
   if M._root and not vim.startswith(file, M._root .. "/") then return end
-  M._diffed[buf] = true
-  pcall(function()
-    require("unified.diff").show(current_base() or "HEAD", buf)
-    require("unified.auto_refresh").setup(buf)
-  end)
+  local ok, shown = pcall(require("unified.diff").show, current_base() or "HEAD", buf)
+  if not (ok and shown) then return end
+  vim.b[buf].agent_review_session = M._session
+  watch(buf)
 end
 
 ---@param file string
@@ -285,10 +326,10 @@ local function open_review(root, base, label)
   M._active = true
   M._root = root
   M._base = base
-  M._diffed = {}
+  M._session = M._session + 1
   M._total = #list_changed(root, base)
   vim.cmd("Unified " .. base)
-  M._diffed[vim.api.nvim_get_current_buf()] = true
+  ensure_diff(vim.api.nvim_get_current_buf())
   notify.info(("reviewing vs %s (%s)"):format(label, base:sub(1, 8)))
 end
 
@@ -482,9 +523,26 @@ local function target_range()
 end
 
 ---@param c ReviewComment
+---@return integer[]|nil
+local function extmark_pos(c)
+  if not (c.bufnr and vim.api.nvim_buf_is_valid(c.bufnr)) then return nil end
+  local pos = vim.api.nvim_buf_get_extmark_by_id(c.bufnr, ns, c.id, {})
+  if pos[1] then return pos end
+  return nil
+end
+
+---@param c ReviewComment
+---@return integer
+local function current_lnum(c)
+  local pos = extmark_pos(c)
+  if pos then return pos[1] + 1 end
+  return c.lnum
+end
+
+---@param c ReviewComment
 function M._render(c)
   if not (c.bufnr and vim.api.nvim_buf_is_valid(c.bufnr)) then return end
-  if c.extmark then pcall(vim.api.nvim_buf_del_extmark, c.bufnr, ns, c.extmark) end
+  c.lnum = current_lnum(c)
 
   local cfg = rcfg()
   local prefix = "  " .. (cfg.icon or "▌") .. " "
@@ -506,7 +564,8 @@ function M._render(c)
   end
 
   if c.file_level then
-    c.extmark = vim.api.nvim_buf_set_extmark(c.bufnr, ns, 0, 0, {
+    vim.api.nvim_buf_set_extmark(c.bufnr, ns, 0, 0, {
+      id = c.id,
       sign_text = cfg.sign or "▌",
       sign_hl_group = cfg.sign_hl or "DiagnosticInfo",
       virt_lines = virt,
@@ -517,7 +576,8 @@ function M._render(c)
 
   local last = vim.api.nvim_buf_line_count(c.bufnr) - 1
   local row = math.min(c.lnum - 1, last)
-  c.extmark = vim.api.nvim_buf_set_extmark(c.bufnr, ns, row, 0, {
+  vim.api.nvim_buf_set_extmark(c.bufnr, ns, row, 0, {
+    id = c.id,
     sign_text = cfg.sign or "▌",
     sign_hl_group = cfg.sign_hl or "DiagnosticInfo",
     virt_lines = virt,
@@ -525,16 +585,6 @@ function M._render(c)
     end_row = math.min(c.lnum - 1 + (c.nlines - 1), last),
     hl_group = cfg.range_hl,
   })
-end
-
----@param c ReviewComment
----@return integer
-local function current_lnum(c)
-  if c.bufnr and c.extmark and vim.api.nvim_buf_is_valid(c.bufnr) then
-    local pos = vim.api.nvim_buf_get_extmark_by_id(c.bufnr, ns, c.extmark, {})
-    if pos and pos[1] then return pos[1] + 1 end
-  end
-  return c.lnum
 end
 
 ---@param opts? {range?: integer[], file_level?: boolean}
@@ -616,8 +666,8 @@ end
 
 ---@param c ReviewComment
 local function forget(c)
-  if c.bufnr and c.extmark and vim.api.nvim_buf_is_valid(c.bufnr) then
-    pcall(vim.api.nvim_buf_del_extmark, c.bufnr, ns, c.extmark)
+  if c.bufnr and vim.api.nvim_buf_is_valid(c.bufnr) then
+    vim.api.nvim_buf_del_extmark(c.bufnr, ns, c.id)
   end
 end
 
@@ -918,7 +968,7 @@ function M.resume(root, data)
   M._active = true
   M._root = root
   M._base = data.base
-  M._diffed = {}
+  M._session = M._session + 1
   M._total = #list_changed(root, data.base)
   M.reviewed = {}
   for _, rel in ipairs(data.reviewed or {}) do M.reviewed[root .. "/" .. rel] = true end
@@ -939,7 +989,7 @@ function M.resume(root, data)
     M._next_id = M._next_id + 1
   end
   vim.cmd("Unified " .. data.base)
-  M._diffed[vim.api.nvim_get_current_buf()] = true
+  ensure_diff(vim.api.nvim_get_current_buf())
   for _, c in ipairs(M.comments) do
     local b = vim.fn.bufnr(c.file)
     if b ~= -1 and vim.api.nvim_buf_is_loaded(b) then
@@ -959,7 +1009,6 @@ function M.reset()
   M._active = false
   M._root = nil
   M._message = nil
-  M._diffed = {}
   M.reviewed = {}
   M.clear()
   notify.info("review ended")
@@ -973,7 +1022,7 @@ vim.api.nvim_create_autocmd("BufWinEnter", {
     if is.empty(file) then return end
     ensure_diff(args.buf)
     for _, c in ipairs(M.comments) do
-      if c.file == file and not (c.bufnr and vim.api.nvim_buf_is_valid(c.bufnr) and c.extmark) then
+      if c.file == file and not (c.bufnr == args.buf and extmark_pos(c)) then
         c.bufnr = args.buf
         M._render(c)
       end
@@ -981,9 +1030,13 @@ vim.api.nvim_create_autocmd("BufWinEnter", {
   end,
 })
 
-vim.api.nvim_create_autocmd("BufWipeout", {
+vim.api.nvim_create_autocmd("BufUnload", {
   group = aug,
-  callback = function(args) M._diffed[args.buf] = nil end,
+  callback = function(args)
+    for _, c in ipairs(M.comments) do
+      if c.bufnr == args.buf then c.lnum = current_lnum(c) end
+    end
+  end,
 })
 
 vim.api.nvim_create_autocmd("VimLeavePre", {
