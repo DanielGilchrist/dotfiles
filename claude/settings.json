@@ -101,7 +101,7 @@
     "deny": [],
     "defaultMode": "auto"
   },
-  "model": "opus",
+  "model": "sonnet",
   "enabledPlugins": {
     "developer-tooling@tanda-plugins": true
   },
