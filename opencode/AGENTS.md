@@ -32,7 +32,7 @@ Use this loop only when my message contains the keyword `devloop`. Without it, w
 
 - Read the project's `AGENTS.md` first. It is the bar for implementers and reviewers alike. If a substantial project has none, propose one.
 - UI or UX changes start with a design: research, a written proposal with mockups, then an adversarial design review against the project's design doc. Bring me the decisions it leaves open as one question each, with a recommendation.
-- Hand implementation to a subagent with a tight brief: the goal, the files and docs to read, what's ruled out, the rules below. Pick the cheapest model that can do the task: haiku for lookups, sonnet for implementing a clear spec and routine review, opus where judgement is hard.
+- Hand implementation to a subagent with a tight brief: the goal, the files and docs to read, what's ruled out, the rules below. Pick the cheapest model that can do the task: haiku for lookups, sonnet for implementing a clear spec and routine review, opus where judgement is hard and required. Prefer using cheaper models unless they are providing bad results and using me for judgement calls where Opus would be preferred unless I explicitly ask you to make calls for me.
 - After every step, run three adversarial reviewers in parallel. Never skip this for a small or display-only change.
   - Principles (opus): type-driven design and the project's `AGENTS.md`. It also gets the other reviewers' bug lists.
   - Correctness (sonnet): bugs, edge cases, races, and whether tests assert what they're named for.
