@@ -102,38 +102,6 @@
     "defaultMode": "auto"
   },
   "model": "opus",
-  "hooks": {
-    "UserPromptSubmit": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "PROMPT=$(cat | jq -r '.prompt // empty' 2>/dev/null); if echo \"$PROMPT\" | grep -qE '^/[a-z]'; then SKILL=$(echo \"$PROMPT\" | grep -oE '^/[a-z-]+' | sed 's/^\\///'); echo \"$SKILL\" >> /tmp/cc-user-invoked-skill; fi; exit 0"
-          }
-        ]
-      }
-    ],
-    "PreToolUse": [
-      {
-        "matcher": "Bash",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "INPUT=$(cat); CMD=$(echo \"$INPUT\" | jq -r '.tool_input.command // empty'); if echo \"$CMD\" | grep -qE '(^|[ ;&|])git[[:space:]]+push'; then BR=$(git branch --show-current 2>/dev/null); if [ \"$BR\" = main ] || [ \"$BR\" = master ]; then echo \"BLOCKED: refusing git push from protected branch '$BR'\" >&2; exit 2; fi; fi; exit 0"
-          }
-        ]
-      },
-      {
-        "matcher": "Skill",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "INPUT=$(cat); SKILL=$(echo \"$INPUT\" | jq -r '.tool_input.skill // empty'); USER_INVOKED=/tmp/cc-user-invoked-skill; if grep -qF \"$SKILL\" \"$USER_INVOKED\" 2>/dev/null; then sed -i '' \"/$SKILL/d\" \"$USER_INVOKED\"; exit 0; fi; echo \"BLOCKED: Use /$SKILL to invoke explicitly.\" >&2; exit 2"
-          }
-        ]
-      }
-    ]
-  },
   "enabledPlugins": {
     "developer-tooling@tanda-plugins": true
   },
