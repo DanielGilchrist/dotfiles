@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::num::{NonZeroU16, NonZeroUsize};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
@@ -8,6 +9,7 @@ use agent_core::activity::{
     Activity, AgentId, Answer as AskedBy, BackgroundCommands, CommandLine, Hold, Origin as Asker,
     Running as RunningCommand, State, Subagent, TaskId, ToolId,
 };
+use agent_core::config::Hop;
 use agent_core::model::{
     Entry, EntryKind, EntryState, Removable, Repo, RepoKey, Revival, Running, Snapshot, Startable,
     Unstartable,
@@ -24,6 +26,7 @@ use agent_core::ports::{
     Readiness, Uncommitted, WorktreeFacts,
 };
 use agent_term::{Emulator, ShownCommand, ShownName, Terminal};
+use crossterm::event::KeyEvent;
 use ratatui::layout::Rect;
 
 use crate::cause::Cause;
@@ -878,19 +881,49 @@ pub enum Seat {
 /// launch, or after a move here. The pane carries it, and `Model::arrival`
 /// is the only way to turn it into what happens, so a request the user has
 /// since moved away from downgrades to `Preview`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Landing {
     Preview,
-    Enter { from: Seat },
-    MoveHere { from: Seat },
+    Enter {
+        from: Seat,
+    },
+    MoveHere {
+        from: Seat,
+    },
+    /// An agent chord pressed in AGENT: enters like `Enter`, and holds what
+    /// is typed meanwhile for the new agent.
+    Hop {
+        from: Seat,
+        held: Held,
+    },
+}
+
+impl Landing {
+    /// This as a preview, handing back what it held.
+    fn preview(&mut self) -> Held {
+        match std::mem::replace(self, Self::Preview) {
+            Self::Hop { held, .. } => held,
+            Self::Preview | Self::Enter { .. } | Self::MoveHere { .. } => Held::default(),
+        }
+    }
+}
+
+impl Checked {
+    fn preview(&mut self) -> Held {
+        match std::mem::replace(self, Self::Preview) {
+            Self::Hop { held, .. } => held,
+            Self::Preview | Self::Enter { .. } => Held::default(),
+        }
+    }
 }
 
 /// What the check for other windows may leave pending. Moving here never
 /// waits for a check.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Checked {
     Preview,
     Enter { from: Seat },
+    Hop { from: Seat, held: Held },
 }
 
 impl From<Checked> for Landing {
@@ -898,8 +931,147 @@ impl From<Checked> for Landing {
         match checked {
             Checked::Preview => Self::Preview,
             Checked::Enter { from } => Self::Enter { from },
+            Checked::Hop { from, held } => Self::Hop { from, held },
         }
     }
+}
+
+/// One thing the user typed while a hop was connecting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Input {
+    Key(KeyEvent),
+    Paste(String),
+}
+
+impl Input {
+    fn weight(&self) -> usize {
+        match self {
+            Self::Key(_) => 1,
+            Self::Paste(text) => text.len(),
+        }
+    }
+}
+
+/// How much typed while a hop connects is kept.
+pub const HELD_CAP: usize = 4096;
+
+/// What was typed during a hop and not delivered.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Lost {
+    keys: usize,
+    pastes: usize,
+}
+
+impl Lost {
+    pub fn is_nothing(self) -> bool {
+        self.keys == 0 && self.pastes == 0
+    }
+
+    /// ` · dropped 3 keys and a paste`, to follow another message, or nothing.
+    pub fn suffix(self) -> String {
+        if self.is_nothing() {
+            String::new()
+        } else {
+            format!(" · {self}")
+        }
+    }
+}
+
+impl fmt::Display for Lost {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("dropped ")?;
+        let keys = match self.keys {
+            0 => None,
+            1 => Some("1 key".to_string()),
+            n => Some(format!("{n} keys")),
+        };
+        let pastes = match self.pastes {
+            0 => None,
+            1 => Some("a paste".to_string()),
+            n => Some(format!("{n} pastes")),
+        };
+        let parts: Vec<String> = keys.into_iter().chain(pastes).collect();
+        f.write_str(&parts.join(" and "))
+    }
+}
+
+/// What was typed during a hop, for the new agent. It is encoded once the
+/// new client's terminal has set its modes, since they decide the bytes.
+/// Past the cap nothing more is kept and nothing at all is delivered: a
+/// subset with a gap in it would type something nobody wrote.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Held {
+    Keeping { inputs: Vec<Input>, weight: usize },
+    Overflowed(Lost),
+}
+
+impl Default for Held {
+    fn default() -> Self {
+        Self::Keeping {
+            inputs: Vec::new(),
+            weight: 0,
+        }
+    }
+}
+
+impl Held {
+    pub fn push(&mut self, input: Input) {
+        match self {
+            Self::Keeping { inputs, weight } if *weight + input.weight() <= HELD_CAP => {
+                *weight += input.weight();
+                inputs.push(input);
+            }
+            Self::Keeping { .. } => {
+                let mut lost = self.lost();
+                lost.add(&input);
+                *self = Self::Overflowed(lost);
+            }
+            Self::Overflowed(lost) => lost.add(&input),
+        }
+    }
+
+    pub fn lost(&self) -> Lost {
+        match self {
+            Self::Keeping { inputs, .. } => {
+                let mut lost = Lost::default();
+                for input in inputs {
+                    lost.add(input);
+                }
+                lost
+            }
+            Self::Overflowed(lost) => *lost,
+        }
+    }
+
+    /// What to deliver, or `None` when too much was typed to deliver any.
+    pub fn deliverable(&self) -> Option<&[Input]> {
+        match self {
+            Self::Keeping { inputs, .. } => Some(inputs),
+            Self::Overflowed(_) => None,
+        }
+    }
+}
+
+impl Lost {
+    fn add(&mut self, input: &Input) {
+        match input {
+            Input::Key(_) => self.keys += 1,
+            Input::Paste(_) => self.pastes += 1,
+        }
+    }
+}
+
+/// How long a new client's terminal gets to print its first output before
+/// what was typed for it is given up on.
+pub const SETTLE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Whether a connection takes keys at once, or is waiting for its terminal's
+/// first output, so that what was typed meanwhile is encoded with the modes
+/// the program has set by then and not the defaults.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Typing {
+    Ready,
+    Settling { held: Held, until: Instant },
 }
 
 /// What `⏎` or `i` can ask for.
@@ -920,12 +1092,16 @@ impl Entering {
 
 /// What a connection does on arriving. Only `Model::arrival` builds one, so
 /// nothing else can start AGENT mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Arrival(Landing);
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Arrival {
+    landing: Landing,
+    /// Typed during a hop that didn't land, so not delivered.
+    dropped: Lost,
+}
 
 impl Arrival {
-    pub fn landing(self) -> Landing {
-        self.0
+    pub fn into_parts(self) -> (Landing, Lost) {
+        (self.landing, self.dropped)
     }
 }
 
@@ -942,6 +1118,7 @@ pub struct Connection {
     pub name: SessionName,
     pub term: Terminal<Box<dyn Emulator>>,
     pub mode: Mode,
+    pub typing: Typing,
     pub opened: Instant,
     /// The client as other windows' lookups know it, so it is never counted
     /// as one of them.
@@ -1094,19 +1271,70 @@ pub enum Pane {
 impl Pane {
     /// The latest explicit action on `name` wins over what was asked of it
     /// before: a pending entry becomes a preview.
-    pub fn downgrade_to_preview(&mut self, name: &SessionName) {
+    /// How many keys held for a hop to `name` this drops.
+    pub fn downgrade_to_preview(&mut self, name: &SessionName) -> Lost {
         match self {
             Self::Connecting {
                 name: waiting,
                 landing,
                 ..
-            } if waiting == name => *landing = Landing::Preview,
+            } if waiting == name => landing.preview().lost(),
             Self::Checking {
                 name: waiting,
                 then,
                 ..
-            } if waiting == name => *then = Checked::Preview,
-            _ => {}
+            } if waiting == name => then.preview().lost(),
+            _ => Lost::default(),
+        }
+    }
+
+    /// The keys held for the session a hop is connecting to, or for a
+    /// connection whose terminal hasn't printed yet.
+    pub fn hop_held(&mut self) -> Option<(&SessionName, &mut Held)> {
+        match self {
+            Self::Checking {
+                name,
+                then: Checked::Hop { held, .. },
+                ..
+            }
+            | Self::Connecting {
+                name,
+                landing: Landing::Hop { held, .. },
+                ..
+            }
+            | Self::Connected(Connection {
+                name,
+                typing: Typing::Settling { held, .. },
+                ..
+            }) => Some((name, held)),
+            Self::Empty
+            | Self::Checking { .. }
+            | Self::Connecting { .. }
+            | Self::Connected(_)
+            | Self::Elsewhere { .. } => None,
+        }
+    }
+
+    /// What the pane holds for a hop.
+    pub fn held_lost(&self) -> Lost {
+        match self {
+            Self::Checking {
+                then: Checked::Hop { held, .. },
+                ..
+            }
+            | Self::Connecting {
+                landing: Landing::Hop { held, .. },
+                ..
+            }
+            | Self::Connected(Connection {
+                typing: Typing::Settling { held, .. },
+                ..
+            }) => held.lost(),
+            Self::Empty
+            | Self::Checking { .. }
+            | Self::Connecting { .. }
+            | Self::Connected(_)
+            | Self::Elsewhere { .. } => Lost::default(),
         }
     }
 
@@ -2340,8 +2568,8 @@ impl Model {
     /// `then` as it stands now that the check for `name` is back.
     pub fn settled(&self, name: &SessionName, then: Checked) -> Checked {
         match then {
-            Checked::Enter { from } if self.holds(name, from) => then,
-            Checked::Enter { .. } | Checked::Preview => Checked::Preview,
+            Checked::Enter { from } | Checked::Hop { from, .. } if self.holds(name, from) => then,
+            Checked::Enter { .. } | Checked::Hop { .. } | Checked::Preview => Checked::Preview,
         }
     }
 
@@ -2354,15 +2582,27 @@ impl Model {
             landing,
         } = &self.pane
         else {
-            return Arrival(Landing::Preview);
+            return Arrival {
+                landing: Landing::Preview,
+                dropped: Lost::default(),
+            };
         };
-        let kept = match *landing {
-            Landing::Enter { from } | Landing::MoveHere { from } => {
-                *pending == ticket && self.holds(name, from)
+        let kept = match landing {
+            Landing::Enter { from } | Landing::MoveHere { from } | Landing::Hop { from, .. } => {
+                *pending == ticket && self.holds(name, *from)
             }
             Landing::Preview => false,
         };
-        Arrival(if kept { *landing } else { Landing::Preview })
+        if kept {
+            return Arrival {
+                landing: landing.clone(),
+                dropped: Lost::default(),
+            };
+        }
+        Arrival {
+            landing: Landing::Preview,
+            dropped: self.pane.held_lost(),
+        }
     }
 
     pub fn mru(&self) -> &[SessionName] {
@@ -2559,18 +2799,40 @@ impl Model {
 
     /// The only way to change the pane, which closes a float showing it once
     /// the pane is on another session or none.
-    pub fn set_pane(&mut self, pane: Pane) {
+    /// The one writer of the pane. Keys held for a hop that this pane
+    /// doesn't carry on or deliver are said to be dropped.
+    pub fn set_pane(&mut self, mut pane: Pane) {
         if matches!(self.peek, Some(Peek::Pane)) && self.pane.session() != pane.session() {
             self.peek = None;
+        }
+        let lost = self.pane.held_lost();
+        let handed_over =
+            matches!(pane, Pane::Connected(_)) && !matches!(self.pane, Pane::Connected(_));
+        let carried = handed_over || pane.hop_held().is_some();
+        if !lost.is_nothing() && !carried {
+            self.info(lost.to_string());
         }
         self.pane = pane;
     }
 
-    /// Stops waiting for `ticket`'s connection, if the pane still is.
-    pub fn abandon(&mut self, ticket: Ticket) {
-        if self.pane.awaiting(ticket).is_some() {
-            self.set_pane(Pane::Empty);
+    /// Makes the pending entry for `name` a preview, saying what that drops.
+    pub fn downgrade_pending(&mut self, name: &SessionName) {
+        let lost = self.pane.downgrade_to_preview(name);
+        if !lost.is_nothing() {
+            self.info(lost.to_string());
         }
+    }
+
+    /// Stops waiting for `ticket`'s connection, if the pane still is.
+    /// What was held for a hop that this gave up on, if the pane was waiting
+    /// for `ticket`.
+    pub fn abandon(&mut self, ticket: Ticket) -> Lost {
+        if self.pane.awaiting(ticket).is_none() {
+            return Lost::default();
+        }
+        let lost = self.pane.held_lost();
+        self.set_pane(Pane::Empty);
+        lost
     }
 
     pub fn watch_mut(&mut self) -> Option<&mut Watch> {
@@ -4091,6 +4353,73 @@ impl Model {
 
     pub fn items(&self) -> Vec<Cursor> {
         self.rows().iter().filter_map(Row::cursor).collect()
+    }
+
+    /// The session the keys are in or are about to be, while the user is
+    /// still on its row: what a hop starts from, so that a second hop
+    /// pressed before the first has connected goes on from the first.
+    pub fn inhabited(&self) -> Option<&SessionName> {
+        let on_row = |name: &SessionName| self.cursor().and_then(Cursor::entry_name) == Some(name);
+        match &self.pane {
+            Pane::Connected(c) if c.mode == Mode::Agent => Some(&c.name),
+            Pane::Checking {
+                name,
+                then: Checked::Enter { .. },
+                ..
+            }
+            | Pane::Connecting {
+                name,
+                landing: Landing::Enter { .. } | Landing::MoveHere { .. },
+                ..
+            } if on_row(name) => Some(name),
+            Pane::Empty
+            | Pane::Checking { .. }
+            | Pane::Connecting { .. }
+            | Pane::Connected(_)
+            | Pane::Elsewhere { .. } => None,
+        }
+    }
+
+    /// The agents in [1]'s order starting `hop` away from `from` (or from
+    /// the cursor) and wrapping, ending before it is reached again. Repo rows
+    /// are skipped and the agent it starts from is left out.
+    pub fn candidates(&self, hop: Hop, from: Option<&SessionName>) -> Vec<SessionName> {
+        let items = self.items();
+        let len = items.len();
+        if len == 0 {
+            return Vec::new();
+        }
+        let current = from.or_else(|| self.cursor().and_then(Cursor::entry_name));
+        let here = self
+            .cursor()
+            .filter(|cursor| cursor.entry_name() == current)
+            .and_then(|cursor| items.iter().position(|item| item == cursor))
+            .or_else(|| {
+                current.and_then(|name| {
+                    items
+                        .iter()
+                        .position(|item| item.entry_name() == Some(name))
+                })
+            });
+        let start = here.unwrap_or(match hop {
+            Hop::Next => len - 1,
+            Hop::Previous => 0,
+        });
+        let step = |at: usize| {
+            at.checked_add_signed(hop.delta())
+                .map_or(len - 1, |n| n % len)
+        };
+        std::iter::successors(Some(start), |at| Some(step(*at)))
+            .skip(1)
+            .take(len)
+            .filter_map(|at| items[at].entry_name())
+            .filter(|name| Some(*name) != current)
+            .fold(Vec::new(), |mut names: Vec<SessionName>, name| {
+                if !names.contains(name) {
+                    names.push(name.clone());
+                }
+                names
+            })
     }
 
     /// Replaces the snapshot, keeping the cursor on the same thing if it

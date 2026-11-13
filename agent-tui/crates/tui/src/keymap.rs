@@ -3,11 +3,14 @@
 //! `update` still do the dispatching.
 //! `nav_keys_do_something_exactly_where_the_keymap_table_says`, in the
 //! `view/sidebar.rs` tests, presses every key in every context and fails
-//! when a handler and this table disagree.
+//! when a handler and this table disagree. The `{nav}`, `{prev_agent}` and
+//! `{next_agent}` placeholders in a key are the configured keys.
 
 use crate::document::Hover;
+use crate::keyspec::Sendable;
 use crate::model::{LEAVE_PAUSED, MOVE_HERE, Model, Panel, Reach, View, Visibility};
 use crate::tree::{ChangesScope, ChangesView, Node};
+use agent_core::config::{Hop, KeyField};
 use agent_core::model::Entry;
 use agent_core::ports::Compared;
 
@@ -513,8 +516,6 @@ pub struct Binding {
     long: &'static str,
 }
 
-const NAV_KEY: &str = "{nav}";
-
 impl Binding {
     const fn new(
         keys: &'static [&'static str],
@@ -568,8 +569,87 @@ impl Binding {
     }
 }
 
-fn expand(text: &str, nav: &str) -> String {
-    text.replace(NAV_KEY, nav)
+/// A word of a table key: text as it is, or the configured key of a field,
+/// written `{nav}`, `{prev_agent}` and so on after the field's name.
+enum KeyText<'a> {
+    Plain(&'a str),
+    Field(KeyField),
+}
+
+impl<'a> KeyText<'a> {
+    fn of(word: &'a str) -> Self {
+        KeyField::all()
+            .find(|field| word == format!("{{{field}}}"))
+            .map_or(Self::Plain(word), Self::Field)
+    }
+}
+
+/// How the configured keys read where the table names a field. A field
+/// that is off has no spelling.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Spelling {
+    nav: String,
+    hops: Vec<(Hop, Option<String>)>,
+}
+
+impl Default for Spelling {
+    fn default() -> Self {
+        Self::of(&Sendable::default())
+    }
+}
+
+impl Spelling {
+    pub fn of(keys: &Sendable) -> Self {
+        Self {
+            nav: keys.nav().to_string(),
+            hops: Hop::ALL
+                .into_iter()
+                .map(|hop| (hop, keys.hop(hop).spec().map(|spec| spec.to_string())))
+                .collect(),
+        }
+    }
+
+    fn spelt(&self, field: KeyField) -> Option<&str> {
+        match field {
+            KeyField::Nav => Some(&self.nav),
+            KeyField::Hop(hop) => self
+                .hops
+                .iter()
+                .find(|(of, _)| *of == hop)
+                .and_then(|(_, spelt)| spelt.as_deref()),
+        }
+    }
+
+    pub fn nav(&self) -> &str {
+        &self.nav
+    }
+
+    /// The chords that are on, as one hint.
+    pub fn chords(&self) -> Option<String> {
+        let on: Vec<&str> = Hop::ALL
+            .into_iter()
+            .filter_map(|hop| self.spelt(KeyField::Hop(hop)))
+            .collect();
+        (!on.is_empty()).then(|| on.join(" "))
+    }
+
+    /// `key` with its fields spelt. A field that is off is dropped, and a
+    /// key with nothing left isn't there.
+    fn key(&self, key: &str) -> Option<String> {
+        let words: Vec<&str> = key
+            .split(' ')
+            .filter_map(|word| match KeyText::of(word) {
+                KeyText::Plain(text) => Some(text),
+                KeyText::Field(field) => self.spelt(field),
+            })
+            .collect();
+        (!words.is_empty()).then(|| words.join(" "))
+    }
+
+    fn keys<'a>(&self, keys: impl Iterator<Item = &'a str>, separator: &str) -> Option<String> {
+        let spelt: Vec<String> = keys.filter_map(|key| self.key(key)).collect();
+        (!spelt.is_empty()).then(|| spelt.join(separator))
+    }
 }
 
 use Label::{By, Fixed as Say};
@@ -1025,6 +1105,13 @@ pub const BINDINGS: &[Binding] = &[
         Say("select next needing you"),
         "Right after leaving an agent's terminal, select the agent that needs you most. It stays in NAV.",
     ),
+    Binding::new(
+        &["{prev_agent} {next_agent}"],
+        PANELS,
+        RankBy(|s| (s.ctx == Ctx::Agents).then_some(3)),
+        Say("agents"),
+        "Previous and next agent in [1]'s order, wrapping at the ends. In NAV they select and show it in [0]. In an agent's terminal they are not sent to the agent: they switch to the neighbouring agent and keep the keys in its terminal. In a terminal where Option isn't Alt they send nothing until it is. A key set to none in [keys] is off.",
+    ),
 ];
 
 #[derive(Debug, Clone)]
@@ -1052,13 +1139,15 @@ pub struct FooterHint {
 
 /// The footer's candidates in table order, one per key and label. The
 /// caller drops the lowest ranked until the rest fit.
-pub fn footer(s: &Situation, nav: &str) -> Vec<FooterHint> {
+pub fn footer(s: &Situation, spelling: &Spelling) -> Vec<FooterHint> {
     let mut out: Vec<FooterHint> = Vec::new();
     for b in BINDINGS {
         let (Some(label), Some(rank)) = (b.label_in(s), b.rank_in(s)) else {
             continue;
         };
-        let keys = expand(&b.keys.join("/"), nav);
+        let Some(keys) = spelling.keys(b.keys.iter().copied(), "/") else {
+            continue;
+        };
         if !out.iter().any(|h| h.keys == keys && h.label == label) {
             out.push(FooterHint { keys, label, rank });
         }
@@ -1086,14 +1175,16 @@ impl Help {
     }
 }
 
-pub fn help(s: &Situation, nav: &str, filter: &str) -> Help {
+pub fn help(s: &Situation, spelling: &Spelling, filter: &str) -> Help {
     let needle = filter.to_lowercase();
     let mut help = Help::default();
     for b in BINDINGS {
         let Some(label) = b.label_in(s) else {
             continue;
         };
-        let keys = expand(&b.all_keys().collect::<Vec<_>>().join(" "), nav);
+        let Some(keys) = spelling.keys(b.all_keys(), " ") else {
+            continue;
+        };
         if !needle.is_empty()
             && !keys.to_lowercase().contains(&needle)
             && !label.to_lowercase().contains(&needle)
@@ -1117,6 +1208,7 @@ pub fn help(s: &Situation, nav: &str, filter: &str) -> Help {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::keyspec::Keyboard;
 
     fn agent_keys() -> AgentKeys {
         AgentKeys {
@@ -1134,7 +1226,7 @@ mod tests {
     }
 
     fn hint(s: &Situation, key: &str) -> Option<&'static str> {
-        footer(s, "⌃]")
+        footer(s, &Spelling::default())
             .into_iter()
             .find(|h| h.keys == key)
             .map(|h| h.label)
@@ -1196,7 +1288,7 @@ mod tests {
             enter(&on_an_activity(Some(Jump::File("a.rs".into())))),
             Some("open diff")
         );
-        let help = help(&on_an_activity(None), "⌃]", "");
+        let help = help(&on_an_activity(None), &Spelling::default(), "");
         let labels: Vec<_> = help.local.iter().chain(&help.global).collect();
         assert!(
             labels
@@ -1218,7 +1310,7 @@ mod tests {
         assert_eq!(hint(&on(Avail::Offered), "r"), Some("restart"));
         assert_eq!(hint(&on(Avail::Absent), "r"), None);
         assert_eq!(hint(&on(Avail::Offered), "R"), None, "R is help only");
-        let listed = help(&on(Avail::Offered), "⌃]", "");
+        let listed = help(&on(Avail::Offered), &Spelling::default(), "");
         assert!(
             listed
                 .local
@@ -1246,7 +1338,7 @@ mod tests {
         assert_eq!(label(&elsewhere(Ctx::Agents), "⏎"), Some("move here"));
         assert_eq!(label(&elsewhere(Ctx::Peek), "⏎"), Some("leave paused"));
         assert_eq!(label(&elsewhere(Ctx::Main), "i"), None);
-        let help = help(&elsewhere(Ctx::Agents), "⌃]", "");
+        let help = help(&elsewhere(Ctx::Agents), &Spelling::default(), "");
         assert!(
             help.local
                 .iter()
@@ -1258,7 +1350,7 @@ mod tests {
     #[test]
     fn the_footer_never_repeats_a_hint_in_any_context() {
         for ctx in CTXS {
-            let hints = footer(&situation(ctx), "⌃]");
+            let hints = footer(&situation(ctx), &Spelling::default());
             for (i, a) in hints.iter().enumerate() {
                 for b in &hints[i + 1..] {
                     assert!(
@@ -1277,7 +1369,7 @@ mod tests {
     #[test]
     fn the_help_lists_a_panels_own_keys_before_the_global_ones() {
         for ctx in CTXS {
-            let help = help(&situation(ctx), "⌃]", "");
+            let help = help(&situation(ctx), &Spelling::default(), "");
             assert!(!help.local.is_empty(), "{ctx:?} has keys of its own");
             assert!(!help.global.is_empty(), "{ctx:?}");
             let all: Vec<&str> = (0..help.len())
@@ -1286,11 +1378,11 @@ mod tests {
                 .collect();
             assert_eq!(all.len(), help.local.len() + help.global.len());
         }
-        let detail = help(&situation(Ctx::Activity), "⌃]", "");
+        let detail = help(&situation(Ctx::Activity), &Spelling::default(), "");
         assert!(detail.local.iter().any(|r| r.label == "open"));
         assert!(detail.local.iter().any(|r| r.label == "edit transcript"));
         assert!(detail.global.iter().all(|r| r.label != "open"));
-        let agents = help(&situation(Ctx::Agents), "⌃]", "");
+        let agents = help(&situation(Ctx::Agents), &Spelling::default(), "");
         assert!(agents.local.iter().any(|r| r.label == "enter"));
         assert!(agents.local.iter().all(|r| r.label != "edit file"));
     }
@@ -1298,30 +1390,108 @@ mod tests {
     #[test]
     fn the_help_names_the_configured_nav_key_and_no_other() {
         let s = situation(Ctx::Agents);
-        let listed = help(&s, "⌥,", "");
+        let configured: agent_core::config::Config =
+            "[keys]\nnav = 'alt-x'".parse().expect("parses");
+        let spelling = Spelling::of(&Sendable::resolve(configured.keys, Keyboard::Legacy));
+        let listed = help(&s, &spelling, "");
         let keys: Vec<_> = listed
             .local
             .iter()
             .chain(&listed.global)
             .map(|r| r.keys.as_str())
             .collect();
-        assert!(keys.contains(&"⌥,"), "{keys:?}");
-        assert!(keys.contains(&"⌥, ⌥,"), "{keys:?}");
+        assert!(keys.contains(&"⌥x"), "{keys:?}");
+        assert!(keys.contains(&"⌥x ⌥x"), "{keys:?}");
         assert!(
             keys.iter().all(|k| !k.contains("⌃]") && !k.contains("⌃\\")),
             "{keys:?}"
         );
     }
 
+    fn spelt(keys: &str) -> Spelling {
+        let config: agent_core::config::Config = format!("[keys]\n{keys}").parse().expect("parses");
+        Spelling::of(&Sendable::resolve(config.keys, Keyboard::Legacy))
+    }
+
+    #[test]
+    fn the_agent_chords_are_a_footer_hint_where_agents_are_listed_and_nowhere_else() {
+        let in_ctx = |ctx, spelling: &Spelling| {
+            footer(&situation(ctx), spelling)
+                .into_iter()
+                .find(|h| h.keys.contains('⌥'))
+                .map(|h| (h.keys, h.label))
+        };
+        let default = Spelling::default();
+        assert_eq!(
+            in_ctx(Ctx::Agents, &default),
+            Some(("⌥, ⌥.".to_string(), "agents"))
+        );
+        for ctx in [Ctx::Activity, Ctx::Changes, Ctx::Main, Ctx::Peek] {
+            assert_eq!(in_ctx(ctx, &default), None, "{ctx:?}");
+        }
+        assert_eq!(
+            in_ctx(Ctx::Agents, &spelt("prev_agent = 'none'")),
+            Some(("⌥.".to_string(), "agents"))
+        );
+        assert_eq!(
+            in_ctx(
+                Ctx::Agents,
+                &spelt("prev_agent = 'none'\nnext_agent = 'off'")
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn the_help_lists_the_chords_in_every_panel_and_not_when_both_are_off() {
+        let has = |ctx, spelling: &Spelling| {
+            let listed = help(&situation(ctx), spelling, "");
+            listed
+                .local
+                .iter()
+                .chain(&listed.global)
+                .any(|r| r.keys == "⌥, ⌥." && r.label == "agents")
+        };
+        for ctx in [Ctx::Agents, Ctx::Activity, Ctx::Changes, Ctx::Main] {
+            assert!(has(ctx, &Spelling::default()), "{ctx:?}");
+        }
+        assert!(!has(Ctx::Peek, &Spelling::default()));
+        let off = spelt("prev_agent = 'none'\nnext_agent = 'none'");
+        assert!(!has(Ctx::Agents, &off));
+        assert_eq!(off.chords(), None);
+    }
+
+    #[test]
+    fn the_table_names_every_configurable_key_and_every_placeholder_is_a_key() {
+        for field in KeyField::all() {
+            let placeholder = format!("{{{field}}}");
+            assert!(
+                BINDINGS
+                    .iter()
+                    .flat_map(Binding::all_keys)
+                    .any(|key| key.split(' ').any(|word| word == placeholder)),
+                "{placeholder}"
+            );
+        }
+        let spelling = Spelling::default();
+        for key in BINDINGS.iter().flat_map(Binding::all_keys) {
+            let spelt = spelling.key(key).expect("every default key is on");
+            let unresolved = spelt
+                .split(' ')
+                .any(|word| word.len() > 1 && word.starts_with('{') && word.ends_with('}'));
+            assert!(!unresolved, "{key} is spelt {spelt}");
+        }
+    }
+
     #[test]
     fn the_filter_matches_keys_and_descriptions_in_any_case() {
         let s = situation(Ctx::Agents);
-        let by_label = help(&s, "⌃]", "PEEK");
+        let by_label = help(&s, &Spelling::default(), "PEEK");
         assert!(by_label.global.iter().any(|r| r.keys == "v"));
-        let by_key = help(&s, "⌃]", "pgdn");
+        let by_key = help(&s, &Spelling::default(), "pgdn");
         assert_eq!(by_key.len(), 1);
-        assert_eq!(help(&s, "⌃]", "zzzz").len(), 0);
-        assert!(help(&s, "⌃]", "").len() > by_label.len());
+        assert_eq!(help(&s, &Spelling::default(), "zzzz").len(), 0);
+        assert!(help(&s, &Spelling::default(), "").len() > by_label.len());
     }
 
     #[test]

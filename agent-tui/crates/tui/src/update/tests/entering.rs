@@ -9,7 +9,7 @@ const OTHER: &str = "obs-layout-4";
 const ENTER_FROM_LIST: Landing = Landing::Enter { from: Seat::Agents };
 
 fn arrives(m: &Model, ticket: Ticket) -> Landing {
-    m.arrival(ticket).landing()
+    m.arrival(ticket).into_parts().0
 }
 
 fn nav() -> Msg {
@@ -430,7 +430,7 @@ fn a_start_landing_with_the_keys_still_in_the_panel_that_asked_enters() {
     let from = Landing::Enter {
         from: Seat::Changes,
     };
-    let ticket = connecting_for(&mut m, OTHER, from);
+    let ticket = connecting_for(&mut m, OTHER, from.clone());
     m.panel = Panel::Changes { file: 1 };
     land(&mut m, OTHER, ticket);
     assert_eq!(arrives(&m, ticket), from);
@@ -459,7 +459,7 @@ fn attached_with_nav(nav: &str) -> Model {
 
 #[test]
 fn leaving_through_the_escape_hatch_does_not_arm_the_nav_key_chord() {
-    let mut m = attached_with_nav("alt-,");
+    let mut m = attached_with_nav("alt-x");
     update(&mut m, key_with(KeyCode::Char(']'), KeyModifiers::CONTROL));
     assert!(!in_agent(&m));
     assert_eq!(m.chord, crate::model::Chord::Idle);
@@ -467,8 +467,8 @@ fn leaving_through_the_escape_hatch_does_not_arm_the_nav_key_chord() {
 
 #[test]
 fn leaving_with_the_configured_nav_key_arms_the_chord() {
-    let mut m = attached_with_nav("alt-,");
-    update(&mut m, key_with(KeyCode::Char(','), KeyModifiers::ALT));
+    let mut m = attached_with_nav("alt-x");
+    update(&mut m, key_with(KeyCode::Char('x'), KeyModifiers::ALT));
     assert!(!in_agent(&m));
     assert!(m.chord.is_live(m.clock.mono));
 }

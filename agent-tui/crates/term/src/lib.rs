@@ -10,7 +10,7 @@ pub use commands::{
 };
 pub use escapes::{Lines, output_lines, printable, strip_escapes};
 pub use input::{CellPos, encode_key, encode_mouse};
-pub use pty::{Liveness, Terminal};
+pub use pty::{Closed, Liveness, Terminal};
 pub use vt::Vt100;
 
 use std::num::NonZeroU16;

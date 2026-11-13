@@ -22,7 +22,7 @@ use agent_core::ops::{End, Fleet, Interrupts, Restart, Stops, WouldStop};
 use agent_term::{CommandsShown, Remainder, truncate_end};
 
 use crate::cause::Cause;
-use crate::keymap::{self, Situation};
+use crate::keymap::{self, Situation, Spelling};
 use crate::model::{
     AgentStatus, Areas, Blocked, Confirm, Derived, Drawn, Enter, Field, FleetAsk, Focus, FormKind,
     HelpState, Launchable, Load, Model, NameCheck, NameSource, NamingState, NewAgent, OfferEffect,
@@ -724,17 +724,22 @@ fn status_counts(m: &Model, focus: &Focus<'_>, nav: &str) -> Vec<Span<'static>> 
 /// jitter as messages came and went, it's cut to fit instead.
 fn draw_status_bar(frame: &mut Frame<'_>, m: &Model, area: Rect) {
     let focus = m.focus();
-    let nav = m.keys.nav().to_string();
+    let spelling = Spelling::of(&m.keys);
+    let nav = spelling.nav();
     let twice = format!("{nav} {nav}");
     let hatch = m.keys.escape_hatch().map(|hatch| hatch.to_string());
+    let chords = spelling.chords();
     let table = if matches!(focus, Focus::Agent(_) | Focus::Overlay(Overlay::New(_))) {
         Vec::new()
     } else {
-        keymap::footer(&Situation::of(m), &nav)
+        keymap::footer(&Situation::of(m), &spelling)
     };
     let mut hints: Vec<Hint<'_>> = Vec::new();
     if let Focus::Agent(_) = focus {
-        hints.extend([ranked(&nav, "nav", 9), ranked(&twice, "previous", 8)]);
+        hints.extend([ranked(nav, "nav", 9), ranked(&twice, "previous", 8)]);
+        if let Some(chords) = chords.as_deref() {
+            hints.push(ranked(chords, "agents", 6));
+        }
         if let Some(hatch) = hatch.as_deref() {
             hints.push(ranked(hatch, "also leaves", 7));
         }
@@ -756,7 +761,7 @@ fn draw_status_bar(frame: &mut Frame<'_>, m: &Model, area: Rect) {
         hints.extend(table.iter().map(|h| ranked(&h.keys, h.label, h.rank)));
     }
 
-    let counts = status_counts(m, &focus, &nav);
+    let counts = status_counts(m, &focus, nav);
     // The counts sit between a space, the right edge's space and the
     // column `justify` keeps between the sides.
     let badge_width = 9 + match line_width(&counts) {
@@ -2190,8 +2195,7 @@ fn draw_peek(frame: &mut Frame<'_>, m: &Model, terminal: Rect) {
         |(_, entry)| sidebar::status_line(m, entry, 0),
     );
     let mut keys = Vec::new();
-    let nav = m.keys.nav().to_string();
-    for hint in keymap::footer(&Situation::of(m), &nav) {
+    for hint in keymap::footer(&Situation::of(m), &Spelling::of(&m.keys)) {
         if !keys.is_empty() {
             keys.push(Span::styled(" · ", dim()));
         }
@@ -2297,9 +2301,8 @@ fn pad(text: &str, width: usize) -> String {
 /// a longer description of that row. Keys that do nothing here aren't
 /// listed.
 fn draw_help(frame: &mut Frame<'_>, m: &Model, state: &HelpState) -> usize {
-    let nav = m.keys.nav().to_string();
     let situation = Situation::of(m);
-    let help = keymap::help(&situation, &nav, &state.filter);
+    let help = keymap::help(&situation, &Spelling::of(&m.keys), &state.filter);
     let area = centred(frame, 78, 26);
     clear_around(frame, area);
     let describe = if area.height >= 12 { 5 } else { 0 };

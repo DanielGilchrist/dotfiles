@@ -1,4 +1,6 @@
 use std::io::{self, Read, Write};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TryRecvError};
 use std::thread;
 
@@ -36,6 +38,16 @@ fn to_io(e: impl std::fmt::Display) -> io::Error {
     io::Error::other(e.to_string())
 }
 
+/// The program's pty no longer takes input, so what was sent is lost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Closed;
+
+impl std::fmt::Display for Closed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("its terminal no longer takes input")
+    }
+}
+
 /// A program running in a pty, rendered through an [`Emulator`]. Reading and
 /// writing happen on background threads so the owner never blocks on the
 /// program. Output is fed to the emulator by [`Terminal::pump`].
@@ -46,7 +58,9 @@ pub struct Terminal<E> {
     pid: u32,
     tail: Vec<u8>,
     input: Sender<Vec<u8>>,
+    write_failed: Arc<AtomicBool>,
     output: Receiver<Vec<u8>>,
+    heard: bool,
     size: TermSize,
     liveness: Liveness,
 }
@@ -80,6 +94,8 @@ impl<E: Emulator> Terminal<E> {
 
         let (input, input_rx) = mpsc::channel::<Vec<u8>>();
         let mut writer = pair.master.take_writer().map_err(to_io)?;
+        let write_failed = Arc::new(AtomicBool::new(false));
+        let failed = Arc::clone(&write_failed);
         thread::spawn(move || {
             for bytes in input_rx {
                 if writer
@@ -87,6 +103,7 @@ impl<E: Emulator> Terminal<E> {
                     .and_then(|()| writer.flush())
                     .is_err()
                 {
+                    failed.store(true, Ordering::Release);
                     break;
                 }
             }
@@ -99,7 +116,9 @@ impl<E: Emulator> Terminal<E> {
             tail: Vec::new(),
             child: Some(child),
             input,
+            write_failed,
             output,
+            heard: false,
             size,
             liveness: Liveness::Running,
         })
@@ -112,6 +131,7 @@ impl<E: Emulator> Terminal<E> {
         while fed < PUMP_BUDGET {
             match self.output.try_recv() {
                 Ok(bytes) => {
+                    self.heard = true;
                     fed += bytes.len();
                     self.emulator.feed(&bytes);
                     if self.emulator.modes().screen == Screen::Alternate {
@@ -144,10 +164,23 @@ impl<E: Emulator> Terminal<E> {
         self.size
     }
 
-    pub fn send(&self, bytes: Vec<u8>) {
-        if !bytes.is_empty() {
-            let _ = self.input.send(bytes);
+    /// Queues `bytes` for the program. A write that failed on the writer
+    /// thread is only known to the next send, which says so, so the bytes
+    /// that failed themselves are lost without a word.
+    pub fn send(&self, bytes: Vec<u8>) -> Result<(), Closed> {
+        if bytes.is_empty() {
+            return Ok(());
         }
+        if self.write_failed.load(Ordering::Acquire) {
+            return Err(Closed);
+        }
+        self.input.send(bytes).map_err(|_| Closed)
+    }
+
+    /// Whether the program has printed anything yet, so the emulator's modes
+    /// are the ones it set and not the defaults.
+    pub fn heard(&self) -> bool {
+        self.heard
     }
 
     pub fn modes(&self) -> Modes {

@@ -857,7 +857,7 @@ fn s_sends_to_an_agent_left_alone_without_a_client() {
 #[test]
 fn the_footer_says_move_here_on_the_banner_row_and_enter_otherwise() {
     let enter = |m: &Model| {
-        crate::keymap::footer(&Situation::of(m), "⌃]")
+        crate::keymap::footer(&Situation::of(m), &crate::keymap::Spelling::default())
             .into_iter()
             .find(|h| h.keys == "⏎")
             .map(|h| h.label)

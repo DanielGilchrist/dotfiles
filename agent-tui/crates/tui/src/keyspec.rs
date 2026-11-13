@@ -3,8 +3,8 @@
 
 use std::fmt;
 
-use agent_core::config::{KeyField, Keys};
-use agent_core::keyspec::{Control, KeySpec, KittyKey};
+use agent_core::config::{Hop, KeyField, Keys};
+use agent_core::keyspec::{Binding, Control, KeySpec, KittyKey};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 /// How the terminal reports keys.
@@ -21,16 +21,20 @@ pub enum Keyboard {
 pub struct Fallback {
     field: KeyField,
     wanted: KeySpec,
-    using: KeySpec,
+    using: Binding,
 }
 
 impl fmt::Display for Fallback {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "keys.{} {} is not available in this terminal, using {}",
-            self.field, self.wanted, self.using
-        )
+            "keys.{} {} is not available in this terminal, ",
+            self.field, self.wanted
+        )?;
+        match self.using {
+            Binding::On(spec) => write!(f, "using {spec}"),
+            Binding::Off | Binding::Taken { .. } => f.write_str("leaving it off"),
+        }
     }
 }
 
@@ -52,18 +56,18 @@ impl Default for Sendable {
 
 impl Sendable {
     pub fn resolve(configured: Keys, keyboard: Keyboard) -> Self {
-        let defaults = Keys::default();
         let mut keys = configured;
         let mut fallbacks = Vec::new();
-        for field in KeyField::ALL {
-            let wanted = configured.spec(field);
+        for field in KeyField::all() {
+            let Binding::On(wanted) = configured.binding(field) else {
+                continue;
+            };
             if wanted.needs_kitty() && keyboard == Keyboard::Legacy {
-                let using = defaults.spec(field);
-                keys = keys.with(field, using);
+                keys = keys.reset(field);
                 fallbacks.push(Fallback {
                     field,
                     wanted,
-                    using,
+                    using: keys.binding(field),
                 });
             }
         }
@@ -74,24 +78,22 @@ impl Sendable {
         }
     }
 
-    pub fn spec(&self, field: KeyField) -> KeySpec {
-        self.keys.spec(field)
-    }
-
     pub fn nav(&self) -> KeySpec {
-        self.spec(KeyField::Nav)
+        self.keys.nav()
     }
 
-    /// A second key that leaves AGENT, for a nav key the terminal or the
-    /// agent may swallow. Only a Ctrl-C0 nav key is sure to arrive, and
-    /// whoever chose one chose it over this one.
+    pub fn hop(&self, hop: Hop) -> Binding {
+        self.keys.hop(hop)
+    }
+
     pub fn escape_hatch(&self) -> Option<KeySpec> {
-        match self.nav() {
-            KeySpec::Ctrl(_) => None,
-            KeySpec::Alt(_) | KeySpec::Function(_) | KeySpec::Kitty(_) => {
-                Some(KeySpec::CTRL_CLOSE_BRACKET)
-            }
-        }
+        self.keys.escape_hatch()
+    }
+
+    pub fn hopped(&self, key: &KeyEvent) -> Option<Hop> {
+        Hop::ALL
+            .into_iter()
+            .find(|hop| self.pressed(KeyField::Hop(*hop), key))
     }
 
     pub fn leaves_agent(&self, key: &KeyEvent) -> bool {
@@ -102,7 +104,10 @@ impl Sendable {
     }
 
     pub fn pressed(&self, field: KeyField, key: &KeyEvent) -> bool {
-        self.matches(self.spec(field), key)
+        self.keys
+            .binding(field)
+            .spec()
+            .is_some_and(|spec| self.matches(spec, key))
     }
 
     fn matches(&self, spec: KeySpec, key: &KeyEvent) -> bool {
@@ -151,9 +156,24 @@ impl Sendable {
         let hatch = self
             .escape_hatch()
             .map(|hatch| format!("{hatch} also leaves AGENT"));
+        let taken = Hop::ALL.into_iter().filter_map(|hop| {
+            let field = KeyField::Hop(hop);
+            match self.keys.binding(field) {
+                Binding::Taken { default, by }
+                    if !self
+                        .fallbacks
+                        .iter()
+                        .any(|fallback| fallback.field == field) =>
+                {
+                    Some(format!("{field} default {default} is taken by {by}, off"))
+                }
+                Binding::Taken { .. } | Binding::Off | Binding::On(_) => None,
+            }
+        });
         self.fallbacks
             .iter()
             .map(ToString::to_string)
+            .chain(taken)
             .chain(hatch)
             .collect()
     }
@@ -225,9 +245,7 @@ mod tests {
     use super::*;
 
     fn keys(nav: &str) -> Keys {
-        let config: agent_core::config::Config =
-            format!("[keys]\nnav = '{nav}'").parse().expect("parses");
-        config.keys
+        Keys::default().with_nav(nav.parse().expect("parses"))
     }
 
     fn terminal(nav: &str, keyboard: Keyboard) -> Sendable {
@@ -544,6 +562,91 @@ mod tests {
         assert!(!nav_pressed(&comma, KeyCode::Char('<'), ALT));
         let caret = terminal("ctrl-^", Keyboard::Disambiguated);
         assert!(!nav_pressed(&caret, KeyCode::Char('6'), CTRL));
+    }
+
+    use crate::fixtures::sendable as configured;
+
+    #[test]
+    fn a_chord_needs_exactly_alt_and_its_unshifted_character_in_every_encoding() {
+        for keyboard in [Keyboard::Legacy, Keyboard::Disambiguated] {
+            let sendable = Sendable::resolve(Keys::default(), keyboard);
+            assert_eq!(sendable.warning(), None);
+            let hop = |code, modifiers| sendable.hopped(&press(code, modifiers));
+            assert_eq!(hop(KeyCode::Char(','), ALT), Some(Hop::Previous));
+            assert_eq!(hop(KeyCode::Char('.'), ALT), Some(Hop::Next));
+            assert_eq!(hop(KeyCode::Char(','), NONE), None, "a comma is typed text");
+            assert_eq!(hop(KeyCode::Char('.'), NONE), None);
+            assert_eq!(hop(KeyCode::Char(','), CTRL | ALT), None);
+            assert_eq!(hop(KeyCode::Char('<'), ALT), None, "alt-shift-comma");
+            assert_eq!(hop(KeyCode::Char(','), ALT | SHIFT), None);
+            assert_eq!(hop(KeyCode::Char('>'), ALT | SHIFT), None);
+        }
+    }
+
+    #[test]
+    fn a_chord_that_is_off_matches_nothing_and_leaves_the_other_alone() {
+        let sendable = configured("prev_agent = 'none'", Keyboard::Legacy);
+        assert_eq!(sendable.hop(Hop::Previous), Binding::Off);
+        assert_eq!(sendable.hopped(&press(KeyCode::Char(','), ALT)), None);
+        assert_eq!(
+            sendable.hopped(&press(KeyCode::Char('.'), ALT)),
+            Some(Hop::Next)
+        );
+        assert_eq!(sendable.warning(), None, "off is a choice, not a fallback");
+    }
+
+    #[test]
+    fn a_chord_that_needs_kitty_on_a_legacy_terminal_falls_back_to_its_default_and_says_which() {
+        let legacy = configured("next_agent = 'super-j'", Keyboard::Legacy);
+        assert_eq!(
+            legacy.hop(Hop::Next),
+            Keys::default().hop(Hop::Next),
+            "back to alt-."
+        );
+        let said = "keys.next_agent ⌘j is not available in this terminal, using ⌥.";
+        assert_eq!(legacy.warning().as_deref(), Some(said));
+        assert!(legacy.notes().contains(&said.to_string()));
+        let kitty = configured("next_agent = 'super-j'", Keyboard::Disambiguated);
+        assert_eq!(kitty.warning(), None);
+        assert_eq!(
+            kitty.hopped(&press(KeyCode::Char('j'), KeyModifiers::SUPER)),
+            Some(Hop::Next)
+        );
+    }
+
+    #[test]
+    fn a_default_the_user_didnt_choose_that_another_key_has_is_listed_as_taken() {
+        let sendable = configured("nav = 'alt-,'", Keyboard::Legacy);
+        assert_eq!(sendable.warning(), None, "nothing is wrong, so no warning");
+        assert!(
+            sendable
+                .notes()
+                .contains(&"prev_agent default ⌥, is taken by nav, off".to_string()),
+            "{:?}",
+            sendable.notes()
+        );
+        assert_eq!(sendable.hopped(&press(KeyCode::Char(','), ALT)), None);
+        assert!(sendable.pressed(KeyField::Nav, &press(KeyCode::Char(','), ALT)));
+    }
+
+    #[test]
+    fn a_fallback_that_would_share_a_key_leaves_the_chord_off_and_says_so() {
+        let sendable = configured(
+            "prev_agent = 'super-j'\nnext_agent = 'f6'\nnav = 'alt-,'",
+            Keyboard::Legacy,
+        );
+        assert!(matches!(sendable.hop(Hop::Previous), Binding::Taken { .. }));
+        assert_eq!(
+            sendable.notes().len(),
+            2,
+            "the fallback, once, and the way out"
+        );
+        assert_eq!(
+            sendable.warning().as_deref(),
+            Some("keys.prev_agent ⌘j is not available in this terminal, leaving it off")
+        );
+        assert!(sendable.pressed(KeyField::Nav, &press(KeyCode::Char(','), ALT)));
+        assert_eq!(sendable.hopped(&press(KeyCode::Char(','), ALT)), None);
     }
 
     #[test]

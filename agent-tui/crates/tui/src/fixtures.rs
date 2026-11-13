@@ -32,7 +32,7 @@ pub fn attach_landings(m: &Model, effects: &[Effect]) -> Vec<crate::model::Landi
                     landing,
                     ..
                 },
-            ) if ticket == waiting => Some(*landing),
+            ) if ticket == waiting => Some(landing.clone()),
             _ => None,
         })
         .collect()
@@ -62,6 +62,12 @@ pub fn arrival_for(
     m.arrival(ticket)
 }
 
+/// The keys a `[keys]` table with these lines resolves to in a terminal.
+pub fn sendable(keys: &str, keyboard: crate::keyspec::Keyboard) -> crate::keyspec::Sendable {
+    let config: agent_core::config::Config = format!("[keys]\n{keys}").parse().expect("parses");
+    crate::keyspec::Sendable::resolve(config.keys, keyboard)
+}
+
 /// The company of an agent whose other window is an nvim tab.
 pub fn in_nvim() -> Company {
     Company::of(vec![Place::Nvim])
@@ -86,23 +92,67 @@ pub fn sighted(m: &mut Model, windows: &[(&str, Company)]) -> Vec<Effect> {
 
 /// A pty running `cat` as the pane's client for `agent`.
 pub fn connect(m: &mut Model, agent: &str, mode: Mode) {
+    connect_with(m, agent, mode, cat());
+}
+
+/// A client for `agent` whose program first prints `escapes` (printf
+/// notation) and then echoes what it is sent, so its modes are set once the
+/// first output has been read.
+pub fn connect_printing(m: &mut Model, agent: &str, mode: Mode, escapes: &str) {
+    connect_with(m, agent, mode, printing(escapes));
+}
+
+fn connect_with(
+    m: &mut Model,
+    agent: &str,
+    mode: Mode,
+    term: agent_term::Terminal<Box<dyn agent_term::Emulator>>,
+) {
     m.pane = Pane::Connected(Connection {
         name: name(agent),
-        term: cat(),
+        term,
         mode,
+        typing: crate::model::Typing::Ready,
         opened: std::time::Instant::now(),
         id: agent_core::ports::ClientId::new(1),
     });
 }
 
 pub fn cat() -> agent_term::Terminal<Box<dyn agent_term::Emulator>> {
+    spawn(&agent_core::process::LaunchSpec::new("cat"))
+}
+
+fn printing(escapes: &str) -> agent_term::Terminal<Box<dyn agent_term::Emulator>> {
+    spawn(
+        &agent_core::process::LaunchSpec::new("sh")
+            .args(["-c", &format!("printf '{escapes}'; exec cat")]),
+    )
+}
+
+fn spawn(
+    spec: &agent_core::process::LaunchSpec,
+) -> agent_term::Terminal<Box<dyn agent_term::Emulator>> {
     let size = agent_term::TermSize::of(ratatui::layout::Rect::new(0, 0, 80, 24)).expect("size");
     agent_term::Terminal::spawn(
-        &agent_core::process::LaunchSpec::new("cat"),
+        spec,
         size,
         Box::new(agent_term::Vt100::new(size)) as Box<dyn agent_term::Emulator>,
     )
     .expect("a pty")
+}
+
+/// Reads the pane's terminal until it has printed something.
+pub fn hear_the_terminal(m: &mut Model) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while let Pane::Connected(c) = &mut m.pane {
+        c.term.pump();
+        if c.term.heard() {
+            return;
+        }
+        assert!(std::time::Instant::now() < deadline, "no output arrived");
+        std::thread::yield_now();
+    }
+    panic!("the pane is not connected");
 }
 
 /// The peek float watching `agent`'s session, which the other window shows

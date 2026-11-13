@@ -3643,13 +3643,17 @@ mod tests {
     fn a_nav_key_that_may_not_arrive_shows_the_way_out_in_the_agent_footer_and_the_help() {
         let mut m = crate::fixtures::fleet(10);
         crate::fixtures::connect(&mut m, "auth-refresh-2", crate::model::Mode::Agent);
-        let config: agent_core::config::Config = "[keys]\nnav = 'alt-,'".parse().expect("parses");
+        let config: agent_core::config::Config = "[keys]\nnav = 'alt-x'".parse().expect("parses");
         m.keys = crate::keyspec::Sendable::resolve(config.keys, crate::keyspec::Keyboard::Legacy);
         let rows = screen(&render(&mut m, (120, 30)));
         let bar = rows.last().expect("a status bar");
         assert!(bar.contains("⌃] also leaves"), "{bar}");
         let (lines, _) = super::super::help_lines(
-            &crate::keymap::help(&crate::keymap::Situation::of(&m), "⌥,", ""),
+            &crate::keymap::help(
+                &crate::keymap::Situation::of(&m),
+                &crate::keymap::Spelling::of(&m.keys),
+                "",
+            ),
             &m.keys.notes(),
             "agents",
             0,
@@ -3660,6 +3664,59 @@ mod tests {
     }
 
     #[test]
+    fn the_agent_footer_names_the_chords_that_are_on_and_the_agent_does_not_get_them() {
+        let bar = |keys: &str| {
+            let mut m = crate::fixtures::fleet(10);
+            crate::fixtures::connect(&mut m, "auth-refresh-2", crate::model::Mode::Agent);
+            let config: agent_core::config::Config =
+                format!("[keys]\n{keys}").parse().expect("parses");
+            m.keys =
+                crate::keyspec::Sendable::resolve(config.keys, crate::keyspec::Keyboard::Legacy);
+            screen(&render(&mut m, (120, 30)))
+                .last()
+                .expect("a status bar")
+                .clone()
+        };
+        assert!(bar("").contains("⌥, ⌥. agents"), "{}", bar(""));
+        assert!(bar("prev_agent = 'none'").contains("⌥. agents"));
+        assert!(!bar("prev_agent = 'none'").contains("⌥,"));
+        assert!(!bar("prev_agent = 'none'\nnext_agent = 'none'").contains("agents"));
+    }
+
+    #[test]
+    fn the_nav_footer_names_the_chords_beside_the_agent_list() {
+        let mut m = crate::fixtures::fleet(10);
+        let rows = screen(&render(&mut m, (160, 30)));
+        let bar = rows.last().expect("a status bar");
+        assert!(bar.contains("⌥, ⌥. agents"), "{bar}");
+    }
+
+    #[test]
+    fn the_help_lists_a_chord_that_fell_back_and_the_chords_row() {
+        let mut m = crate::fixtures::fleet(10);
+        let config: agent_core::config::Config =
+            "[keys]\nnext_agent = 'super-j'".parse().expect("parses");
+        m.keys = crate::keyspec::Sendable::resolve(config.keys, crate::keyspec::Keyboard::Legacy);
+        let (lines, _) = super::super::help_lines(
+            &crate::keymap::help(
+                &crate::keymap::Situation::of(&m),
+                &crate::keymap::Spelling::of(&m.keys),
+                "",
+            ),
+            &m.keys.notes(),
+            "agents",
+            0,
+            100,
+        );
+        let text = texts(&lines).join("\n");
+        assert!(
+            text.contains("keys.next_agent ⌘j is not available in this terminal, using ⌥."),
+            "{text}"
+        );
+        assert!(text.contains("⌥, ⌥."), "{text}");
+    }
+
+    #[test]
     fn the_help_lists_a_fallback_and_the_agent_footer_has_no_way_out_hint_with_a_control_nav_key() {
         let mut m = crate::fixtures::fleet(10);
         crate::fixtures::connect(&mut m, "auth-refresh-2", crate::model::Mode::Agent);
@@ -3667,7 +3724,11 @@ mod tests {
             "[keys]\nnav = 'ctrl-shift-t'".parse().expect("parses");
         m.keys = crate::keyspec::Sendable::resolve(config.keys, crate::keyspec::Keyboard::Legacy);
         let (lines, _) = super::super::help_lines(
-            &crate::keymap::help(&crate::keymap::Situation::of(&m), "⌃]", ""),
+            &crate::keymap::help(
+                &crate::keymap::Situation::of(&m),
+                &crate::keymap::Spelling::of(&m.keys),
+                "",
+            ),
             &m.keys.notes(),
             "agents",
             0,
@@ -5040,8 +5101,8 @@ mod tests {
                 }
             }
             for key in &table {
-                // The nav chord is taken by on_key before nav_or_peek_command sees it.
-                let does = handled.contains(*key) || key.contains("{nav}");
+                // The nav and agent chords are taken by on_key before nav_or_peek_command sees them.
+                let does = handled.contains(*key) || key.contains('{');
                 if !does {
                     wrong.push(format!(
                         "{key} is in the table for {ctx:?} but does nothing"

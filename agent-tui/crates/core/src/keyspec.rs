@@ -6,6 +6,7 @@
 use std::fmt;
 use std::str::FromStr;
 
+use crate::config::KeyField;
 use crate::visible;
 
 const ACCEPTED: &str = "ctrl-<letter>, ctrl-space, ctrl-\\ ctrl-] ctrl-^ ctrl-_, alt-<char>, f1 to f12, or with the kitty keyboard protocol ctrl-shift-<letter>, super-<char>, ctrl-h ctrl-i ctrl-j ctrl-m ctrl-[, alt-[ alt-O";
@@ -94,6 +95,9 @@ impl FunctionKey {
 pub struct Glyph(char);
 
 impl Glyph {
+    pub const COMMA: Self = Self(',');
+    pub const PERIOD: Self = Self('.');
+
     pub fn char(self) -> char {
         self.0
     }
@@ -160,6 +164,48 @@ impl KeySpec {
 
     pub fn needs_kitty(self) -> bool {
         matches!(self, Self::Kitty(_))
+    }
+}
+
+/// A key the user may turn off: `none` or `off` in the config.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Binding {
+    Off,
+    On(KeySpec),
+    /// Left off because `by` has this field's default, which nobody asked
+    /// for. Two keys the user set to one key is an error instead.
+    Taken {
+        default: KeySpec,
+        by: KeyField,
+    },
+}
+
+impl Binding {
+    pub fn spec(self) -> Option<KeySpec> {
+        match self {
+            Self::Off | Self::Taken { .. } => None,
+            Self::On(spec) => Some(spec),
+        }
+    }
+}
+
+impl fmt::Display for Binding {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Off | Self::Taken { .. } => f.write_str("off"),
+            Self::On(spec) => spec.fmt(f),
+        }
+    }
+}
+
+impl FromStr for Binding {
+    type Err = InvalidKeySpec;
+
+    fn from_str(raw: &str) -> Result<Self, InvalidKeySpec> {
+        if is_word(raw.trim(), &["none", "off"]) {
+            return Ok(Self::Off);
+        }
+        raw.parse().map(Self::On)
     }
 }
 
@@ -477,6 +523,27 @@ mod tests {
         assert_eq!(control("ctrl-g").legacy_digit(), None);
         assert_eq!(control("ctrl-space").legacy_digit(), None);
         assert_eq!(control("ctrl-space").char(), ' ');
+    }
+
+    #[test]
+    fn none_and_off_turn_a_binding_off_whatever_their_case() {
+        for text in ["none", "off", " None ", "OFF"] {
+            assert_eq!(text.parse::<Binding>(), Ok(Binding::Off), "{text}");
+        }
+        assert_eq!("alt-,".parse::<Binding>(), Ok(Binding::On(parsed("alt-,"))));
+        assert_eq!(Binding::On(parsed("alt-,")).spec(), Some(parsed("alt-,")));
+        assert_eq!(Binding::Off.spec(), None);
+        assert!("banana".parse::<Binding>().is_err());
+        assert!("".parse::<Binding>().is_err());
+    }
+
+    #[test]
+    fn none_is_not_a_key_spec_so_nav_cannot_be_turned_off() {
+        let err = "[keys]\nnav = 'none'"
+            .parse::<crate::config::Config>()
+            .expect_err("fails")
+            .to_string();
+        assert!(err.starts_with("keys.nav: \"none\" isn't a key"), "{err}");
     }
 
     #[test]
