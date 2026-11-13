@@ -8,7 +8,6 @@ use agent_core::activity::{
     Activity, AgentId, Answer as AskedBy, BackgroundCommands, CommandLine, Hold, Origin as Asker,
     Running as RunningCommand, State, Subagent, TaskId, ToolId,
 };
-use agent_core::config::Keys;
 use agent_core::model::{
     Entry, EntryKind, EntryState, Removable, Repo, RepoKey, Revival, Running, Snapshot, Startable,
     Unstartable,
@@ -29,6 +28,7 @@ use ratatui::layout::Rect;
 
 use crate::cause::Cause;
 use crate::document::{BranchKey, CommitKey, DiffKey, Documents, FolderKey, Hover, Key};
+use crate::keyspec::Sendable;
 use crate::log::Nav;
 use crate::output::OutputWatch;
 use crate::palette::Palette;
@@ -39,6 +39,7 @@ use crate::tree::{self, ChangesScope, ChangesView, Node, TreeRow};
 
 pub const PREVIEW_DEBOUNCE: Duration = Duration::from_millis(150);
 pub const INFO_TTL: Duration = Duration::from_secs(4);
+pub const WARNING_TTL: Duration = Duration::from_secs(30);
 
 /// How long the prompt must be still before the model is asked.
 pub const NAMING_DEBOUNCE: Duration = Duration::from_millis(900);
@@ -1747,6 +1748,8 @@ pub enum Follow {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatusKind {
     Info,
+    /// Stays past keypresses and expires after `WARNING_TTL`.
+    Warning,
     Error,
 }
 
@@ -2079,7 +2082,7 @@ pub struct Model {
     latest_look: Option<Ticket>,
     pub check_health: CheckHealth,
     pub actions: Actions,
-    pub keys: Keys,
+    pub keys: Sendable,
     pub palette: Palette,
     pub name_limit: NameLimit,
     /// `$HOME`, read once at startup to abbreviate paths.
@@ -2169,7 +2172,7 @@ impl Model {
             latest_look: None,
             check_health: CheckHealth::Working,
             actions: Actions::default(),
-            keys: Keys::default(),
+            keys: Sendable::default(),
             palette: Palette::DEFAULT,
             catalogue: Vec::new(),
             catalogue_warnings: Vec::new(),
@@ -4321,6 +4324,14 @@ impl Model {
         self.status = Some(Status {
             text: text.into(),
             kind: StatusKind::Info,
+            at: self.clock.mono,
+        });
+    }
+
+    pub fn warn(&mut self, text: impl Into<String>) {
+        self.status = Some(Status {
+            text: text.into(),
+            kind: StatusKind::Warning,
             at: self.clock.mono,
         });
     }

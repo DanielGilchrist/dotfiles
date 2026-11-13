@@ -1,6 +1,7 @@
 mod cause;
 mod document;
 mod keymap;
+mod keyspec;
 mod log;
 mod model;
 mod output;
@@ -43,6 +44,7 @@ use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
     supports_keyboard_enhancement,
 };
+use keyspec::{Keyboard, Sendable};
 use ratatui::DefaultTerminal;
 use ratatui::layout::Rect;
 
@@ -145,29 +147,18 @@ enum InputCtl {
     Resume,
 }
 
-/// How the terminal reports keys.
-#[derive(Debug, Clone, Copy)]
-enum Keys {
-    /// The kitty keyboard protocol tells `⇧⏎` from `⏎`, and reports the
-    /// shifted character of `⌥⇧` keys, which crossterm puts in the event.
-    Disambiguated,
-    Legacy,
+/// Asks the terminal once. It needs raw mode, and it is asked before
+/// the input thread takes the tty.
+fn detect_keyboard() -> Result<Keyboard> {
+    enable_raw_mode()?;
+    Ok(if supports_keyboard_enhancement().unwrap_or(false) {
+        Keyboard::Disambiguated
+    } else {
+        Keyboard::Legacy
+    })
 }
 
-impl Keys {
-    /// Asks the terminal once. It needs raw mode, and it is asked before
-    /// the input thread takes the tty.
-    fn detect() -> Result<Self> {
-        enable_raw_mode()?;
-        Ok(if supports_keyboard_enhancement().unwrap_or(false) {
-            Self::Disambiguated
-        } else {
-            Self::Legacy
-        })
-    }
-}
-
-fn enter_screen(keys: Keys) -> Result<()> {
+fn enter_screen(keys: Keyboard) -> Result<()> {
     enable_raw_mode()?;
     execute!(
         std::io::stdout(),
@@ -176,7 +167,7 @@ fn enter_screen(keys: Keys) -> Result<()> {
         EnableBracketedPaste,
         EnableFocusChange
     )?;
-    if matches!(keys, Keys::Disambiguated) {
+    if matches!(keys, Keyboard::Disambiguated) {
         execute!(
             std::io::stdout(),
             PushKeyboardEnhancementFlags(
@@ -190,8 +181,8 @@ fn enter_screen(keys: Keys) -> Result<()> {
 
 /// The terminal keeps a keyboard flag stack for each screen, so the flags
 /// pushed on the alternate screen are popped before leaving it.
-fn leave_screen(keys: Keys) {
-    if matches!(keys, Keys::Disambiguated) {
+fn leave_screen(keys: Keyboard) {
+    if matches!(keys, Keyboard::Disambiguated) {
         let _ = execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
     }
     let _ = execute!(
@@ -206,12 +197,12 @@ fn leave_screen(keys: Keys) {
 
 /// Restores the terminal however the TUI exits, including by panic.
 struct ScreenGuard {
-    keys: Keys,
+    keys: Keyboard,
 }
 
 impl ScreenGuard {
     fn enter() -> Result<Self> {
-        let keys = Keys::detect()?;
+        let keys = detect_keyboard()?;
         let previous = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
             leave_screen(keys);
@@ -284,7 +275,7 @@ struct Runtime {
     emulator: EmulatorFactory,
     workers: Workers,
     input: Sender<InputCtl>,
-    keys: Keys,
+    keys: Keyboard,
 }
 
 impl Runtime {
@@ -448,6 +439,7 @@ impl Runtime {
                 match kind {
                     StatusKind::Info => m.info(why),
                     StatusKind::Error => m.error(why),
+                    StatusKind::Warning => m.warn(why),
                 }
                 continue;
             }
@@ -694,12 +686,19 @@ pub fn run(options: Options) -> Result<()> {
     event_loop(&mut terminal, options, label, palette, guard.keys)
 }
 
+fn use_keys(m: &mut Model, keyboard: Keyboard, configured: agent_core::config::Keys) {
+    m.keys = Sendable::resolve(configured, keyboard);
+    if let Some(warning) = m.keys.warning() {
+        m.warn(warning);
+    }
+}
+
 fn event_loop(
     terminal: &mut DefaultTerminal,
     options: Options,
     label: String,
     palette: Palette,
-    keys: Keys,
+    keys: Keyboard,
 ) -> Result<()> {
     let (msgs, inbox) = mpsc::channel();
     let (input, input_ctl) = mpsc::channel();
@@ -734,7 +733,7 @@ fn event_loop(
         .flatten()
         .map(model::Follow::Restored);
     m.actions = options.config.actions;
-    m.keys = options.config.keys;
+    use_keys(&mut m, keys, options.config.keys);
     m.palette = palette;
     let mut last_refresh = Instant::now();
     let mut last_selection = None;
@@ -957,5 +956,30 @@ mod tests {
             super::base64("/w/api/fix ✓".as_bytes()),
             "L3cvYXBpL2ZpeCDinJM="
         );
+    }
+    fn keys_config(nav: &str) -> agent_core::config::Keys {
+        let config: Config = format!("[keys]\nnav = '{nav}'").parse().expect("parses");
+        config.keys
+    }
+
+    #[test]
+    fn the_fallback_warning_reaches_the_status_bar_and_the_default_key_is_in_force() {
+        let mut m = fixtures::fleet(1);
+        use_keys(&mut m, Keyboard::Legacy, keys_config("super-j"));
+        let status = m.status.as_ref().expect("a status");
+        assert_eq!(status.kind, StatusKind::Warning);
+        assert_eq!(
+            status.text,
+            "keys.nav ⌘j is not available in this terminal, using ⌃]"
+        );
+        assert_eq!(m.keys.nav().to_string(), "⌃]");
+    }
+
+    #[test]
+    fn nothing_is_said_when_every_key_is_reachable() {
+        let mut m = fixtures::fleet(1);
+        use_keys(&mut m, Keyboard::Disambiguated, keys_config("super-j"));
+        assert!(m.status.is_none());
+        assert_eq!(m.keys.nav().to_string(), "⌘j");
     }
 }

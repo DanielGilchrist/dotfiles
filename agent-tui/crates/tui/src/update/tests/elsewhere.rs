@@ -18,7 +18,7 @@ fn held_elsewhere_model() -> Model {
 }
 
 fn nav() -> Msg {
-    Msg::Key(KeyEvent::new(KeyCode::Char('\\'), KeyModifiers::CONTROL))
+    Msg::Key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::CONTROL))
 }
 
 fn previewed(m: &mut Model) -> Vec<Effect> {
@@ -853,7 +853,7 @@ fn s_sends_to_an_agent_left_alone_without_a_client() {
 #[test]
 fn the_footer_says_move_here_on_the_banner_row_and_attach_otherwise() {
     let enter = |m: &Model| {
-        crate::keymap::footer(&Situation::of(m), "⌃\\")
+        crate::keymap::footer(&Situation::of(m), "⌃]")
             .into_iter()
             .find(|h| h.keys == "⏎")
             .map(|h| h.label)

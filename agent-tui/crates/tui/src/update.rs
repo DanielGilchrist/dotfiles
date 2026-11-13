@@ -8,7 +8,7 @@ use agent_core::actions::{Action, CommandLine, Context, EventName, Invocation};
 use agent_core::activity::{
     Activity, AgentId, Hold, InterruptSignal, Standing, State, TranscriptRef,
 };
-use agent_core::config::ControlKey;
+use agent_core::config::KeyField;
 use agent_core::model::{Entry, EntryState, RepoKey, Snapshot};
 use agent_core::names::{CarriageReturn, InvalidPrompt, Prompt, SessionName, clean};
 use agent_core::ops::{Approved, Launch, RemovalPlan};
@@ -21,6 +21,7 @@ use ratatui::layout::Position;
 use crate::cause::Cause;
 use crate::document::{Documents, Key};
 use crate::keymap::Situation;
+use crate::keyspec::Sendable;
 use crate::log::{EntryKey, Nav};
 use crate::model::{
     ActivityRow, AfterCheck, Answer, Areas, CheckHealth, Chord, CommentDraft, Company, Confirm,
@@ -28,8 +29,8 @@ use crate::model::{
     HelpState, INFO_TTL, Inspected, Inspection, Intent, Listed, LogKey, Look, Missing, Mode, Model,
     Moment, NamingState, Need, NewAgent, Overlay, Pane, Panel, Peek, Phase, Planning, PromptEdit,
     Query, Reach, Reply, ReplyTo, RepoInput, Screen, StatusKind, Submission, TerminalFocus, Ticket,
-    Unreachable, View, Watch, WatchView, WorkRoom, elsewhere_banner, fuzzy_match, match_rank,
-    repo_matches, unlisted,
+    Unreachable, View, WARNING_TTL, Watch, WatchView, WorkRoom, elsewhere_banner, fuzzy_match,
+    match_rank, repo_matches, unlisted,
 };
 use crate::touched::Baseline;
 use crate::track::{Compose, Found, Probed, Seen};
@@ -189,12 +190,6 @@ pub enum Effect {
         label: String,
         launch: CommandLine,
     },
-}
-
-/// Whether `key` is `control`, in either encoding terminals send.
-pub fn pressed(key: &KeyEvent, control: ControlKey) -> bool {
-    key.modifiers.contains(KeyModifiers::CONTROL)
-        && matches!(key.code, KeyCode::Char(c) if c == control.char() || Some(c) == control.legacy_digit())
 }
 
 fn ctrl(key: &KeyEvent, c: char) -> bool {
@@ -710,7 +705,12 @@ pub fn tick_at(m: &mut Model, now: Moment) -> Vec<Effect> {
 
 fn tick_effects(m: &mut Model) -> Vec<Effect> {
     if m.status.as_ref().is_some_and(|s| {
-        s.kind == StatusKind::Info && m.clock.mono.saturating_duration_since(s.at) > INFO_TTL
+        let lives = match s.kind {
+            StatusKind::Info => INFO_TTL,
+            StatusKind::Warning => WARNING_TTL,
+            StatusKind::Error => return false,
+        };
+        m.clock.mono.saturating_duration_since(s.at) > lives
     }) {
         m.status = None;
     }
@@ -1691,9 +1691,8 @@ fn on_key(m: &mut Model, key: KeyEvent) -> Vec<Effect> {
     if !matches!(m.overlay, Overlay::None) {
         return on_overlay_key(m, key);
     }
-    let nav = m.keys.nav();
     if let Some(c) = m.pane.connection().filter(|c| c.mode == Mode::Agent) {
-        if pressed(&key, nav) {
+        if m.keys.leaves_agent(&key) {
             let name = c.name.clone();
             m.pane.set_nav();
             m.chord = Chord::Armed;
@@ -1711,7 +1710,7 @@ fn on_key(m: &mut Model, key: KeyEvent) -> Vec<Effect> {
     }
     if m.peek.is_none() {
         let armed = std::mem::replace(&mut m.chord, Chord::Idle) == Chord::Armed;
-        if pressed(&key, m.keys.nav()) {
+        if m.keys.pressed(KeyField::Nav, &key) {
             return leave_pane(m, armed);
         }
     }
@@ -2969,11 +2968,11 @@ fn on_sent(m: &mut Model, to: &SessionName, ticket: Ticket, result: Result<(), S
 }
 
 /// Shared query editing for the switcher and picker. Other keys are ignored.
-fn edit_query(query: &mut Query, key: &KeyEvent, len: usize, nav: ControlKey) {
+fn edit_query(query: &mut Query, key: &KeyEvent, len: usize, keys: &Sendable) {
     match key.code {
         KeyCode::Down => query.step(1, len),
         KeyCode::Up => query.step(-1, len),
-        _ if ctrl(key, 'n') || pressed(key, nav) => query.step(1, len),
+        _ if ctrl(key, 'n') || keys.pressed(KeyField::Nav, key) => query.step(1, len),
         _ if ctrl(key, 'p') => query.step(-1, len),
         KeyCode::Backspace => query.pop(),
         KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => query.push(c),
@@ -3300,7 +3299,7 @@ fn on_switcher_key(m: &mut Model, mut query: Query, key: &KeyEvent) -> Vec<Effec
                 return activate(m, &name, Intent::Activate);
             }
         }
-        _ => edit_query(&mut query, key, matches.len(), m.keys.nav()),
+        _ => edit_query(&mut query, key, matches.len(), &m.keys),
     }
     m.overlay = Overlay::Switcher(query);
     Vec::new()
@@ -3322,7 +3321,7 @@ fn on_picker_key(m: &mut Model, mut query: Query, key: &KeyEvent) -> Vec<Effect>
             Some(Pick::Path(path)) => return vec![Effect::Job(Job::ListRepo(path))],
             None => {}
         },
-        _ => edit_query(&mut query, key, rows.len(), m.keys.nav()),
+        _ => edit_query(&mut query, key, rows.len(), &m.keys),
     }
     m.overlay = Overlay::Picker(query);
     Vec::new()
@@ -4047,7 +4046,7 @@ mod tests {
             status.text
         );
 
-        let hints = crate::keymap::footer(&crate::keymap::Situation::of(&m), "⌃\\");
+        let hints = crate::keymap::footer(&crate::keymap::Situation::of(&m), "⌃]");
         assert!(hints.iter().all(|h| h.keys != "⏎"), "no ⏎ hint");
         assert!(hints.iter().any(|h| h.keys == "D"), "D still offered");
     }
@@ -9574,6 +9573,7 @@ mod tests {
     }
     mod command_output;
     mod elsewhere;
+    mod nav_key;
     mod restart;
     mod send_edit;
 }

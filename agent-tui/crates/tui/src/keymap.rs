@@ -1147,7 +1147,7 @@ mod tests {
     }
 
     fn hint(s: &Situation, key: &str) -> Option<&'static str> {
-        footer(s, "⌃\\")
+        footer(s, "⌃]")
             .into_iter()
             .find(|h| h.keys == key)
             .map(|h| h.label)
@@ -1210,7 +1210,7 @@ mod tests {
             enter(&on_an_activity(Some(Jump::File("a.rs".into())))),
             Some("open diff")
         );
-        let help = help(&on_an_activity(None), "⌃\\", "");
+        let help = help(&on_an_activity(None), "⌃]", "");
         let labels: Vec<_> = help.local.iter().chain(&help.global).collect();
         assert!(
             labels
@@ -1232,7 +1232,7 @@ mod tests {
         assert_eq!(hint(&on(Avail::Offered), "r"), Some("restart"));
         assert_eq!(hint(&on(Avail::Absent), "r"), None);
         assert_eq!(hint(&on(Avail::Offered), "R"), None, "R is help only");
-        let listed = help(&on(Avail::Offered), "⌃\\", "");
+        let listed = help(&on(Avail::Offered), "⌃]", "");
         assert!(
             listed
                 .local
@@ -1260,7 +1260,7 @@ mod tests {
         assert_eq!(label(&elsewhere(Ctx::Agents), "⏎"), Some("move here"));
         assert_eq!(label(&elsewhere(Ctx::Peek), "⏎"), Some("leave paused"));
         assert_eq!(label(&elsewhere(Ctx::Main), "i"), None);
-        let help = help(&elsewhere(Ctx::Agents), "⌃\\", "");
+        let help = help(&elsewhere(Ctx::Agents), "⌃]", "");
         assert!(
             help.local
                 .iter()
@@ -1272,7 +1272,7 @@ mod tests {
     #[test]
     fn the_footer_never_repeats_a_hint_in_any_context() {
         for ctx in CTXS {
-            let hints = footer(&situation(ctx), "⌃\\");
+            let hints = footer(&situation(ctx), "⌃]");
             for (i, a) in hints.iter().enumerate() {
                 for b in &hints[i + 1..] {
                     assert!(
@@ -1291,7 +1291,7 @@ mod tests {
     #[test]
     fn the_help_lists_a_panels_own_keys_before_the_global_ones() {
         for ctx in CTXS {
-            let help = help(&situation(ctx), "⌃\\", "");
+            let help = help(&situation(ctx), "⌃]", "");
             assert!(!help.local.is_empty(), "{ctx:?} has keys of its own");
             assert!(!help.global.is_empty(), "{ctx:?}");
             let all: Vec<&str> = (0..help.len())
@@ -1300,24 +1300,42 @@ mod tests {
                 .collect();
             assert_eq!(all.len(), help.local.len() + help.global.len());
         }
-        let detail = help(&situation(Ctx::Activity), "⌃\\", "");
+        let detail = help(&situation(Ctx::Activity), "⌃]", "");
         assert!(detail.local.iter().any(|r| r.label == "open"));
         assert!(detail.local.iter().any(|r| r.label == "edit transcript"));
         assert!(detail.global.iter().all(|r| r.label != "open"));
-        let agents = help(&situation(Ctx::Agents), "⌃\\", "");
+        let agents = help(&situation(Ctx::Agents), "⌃]", "");
         assert!(agents.local.iter().any(|r| r.label == "attach"));
         assert!(agents.local.iter().all(|r| r.label != "edit file"));
     }
 
     #[test]
+    fn the_help_names_the_configured_nav_key_and_no_other() {
+        let s = situation(Ctx::Agents);
+        let listed = help(&s, "⌥,", "");
+        let keys: Vec<_> = listed
+            .local
+            .iter()
+            .chain(&listed.global)
+            .map(|r| r.keys.as_str())
+            .collect();
+        assert!(keys.contains(&"⌥,"), "{keys:?}");
+        assert!(keys.contains(&"⌥, ⌥,"), "{keys:?}");
+        assert!(
+            keys.iter().all(|k| !k.contains("⌃]") && !k.contains("⌃\\")),
+            "{keys:?}"
+        );
+    }
+
+    #[test]
     fn the_filter_matches_keys_and_descriptions_in_any_case() {
         let s = situation(Ctx::Agents);
-        let by_label = help(&s, "⌃\\", "PEEK");
+        let by_label = help(&s, "⌃]", "PEEK");
         assert!(by_label.global.iter().any(|r| r.keys == "v"));
-        let by_key = help(&s, "⌃\\", "pgdn");
+        let by_key = help(&s, "⌃]", "pgdn");
         assert_eq!(by_key.len(), 1);
-        assert_eq!(help(&s, "⌃\\", "zzzz").len(), 0);
-        assert!(help(&s, "⌃\\", "").len() > by_label.len());
+        assert_eq!(help(&s, "⌃]", "zzzz").len(), 0);
+        assert!(help(&s, "⌃]", "").len() > by_label.len());
     }
 
     #[test]

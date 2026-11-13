@@ -3,7 +3,7 @@
 //!
 //! ```toml
 //! [keys]
-//! nav = "ctrl-\\"
+//! nav = "ctrl-]"
 //!
 //! [repos]
 //! dirs = ["~/repos", "~/.config"]
@@ -18,76 +18,67 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 use crate::actions::{Actions, RawAction};
+use crate::keyspec::{InvalidKeySpec, KeySpec};
 use crate::paths::{self, Typed};
 use crate::theme::{RawTheme, Theme, ThemeError};
 
-/// A control chord a terminal can send on its own: Ctrl with a letter or
-/// one of `\ ] ^ _`. Everything else would reach the TUI as plain text or
-/// not at all.
+/// A key of the `[keys]` table. A new field is added here, to `ALL`, to
+/// `Keys::spec` and to `Keys::with`, and each match fails to compile until it is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ControlKey(char);
-
-impl ControlKey {
-    pub const BACKSLASH: Self = Self('\\');
-
-    pub fn char(self) -> char {
-        self.0
-    }
-
-    /// How legacy terminals report it: `Ctrl+\ ] ^ _` arrive as the bytes
-    /// 0x1C-0x1F, which decoders read as `Ctrl+4`-`Ctrl+7`.
-    pub fn legacy_digit(self) -> Option<char> {
-        match self.0 {
-            '\\' => Some('4'),
-            ']' => Some('5'),
-            '^' => Some('6'),
-            '_' => Some('7'),
-            _ => None,
-        }
-    }
+pub enum KeyField {
+    Nav,
 }
 
-impl fmt::Display for ControlKey {
+impl KeyField {
+    pub const ALL: [Self; 1] = [Self::Nav];
+}
+
+impl fmt::Display for KeyField {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "⌃{}", self.0.to_ascii_uppercase())
+        f.write_str(match self {
+            Self::Nav => "nav",
+        })
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("{0:?} isn't a control key (use ctrl- and a letter or one of \\ ] ^ _)")]
-pub struct InvalidControlKey(String);
-
-impl std::str::FromStr for ControlKey {
-    type Err = InvalidControlKey;
-
-    fn from_str(s: &str) -> Result<Self, InvalidControlKey> {
-        let invalid = || InvalidControlKey(s.to_string());
-        let rest = s.strip_prefix("ctrl-").ok_or_else(invalid)?;
-        let mut chars = rest.chars();
-        match (chars.next(), chars.next()) {
-            (Some(c @ ('a'..='z' | '\\' | ']' | '^' | '_')), None) => Ok(Self(c)),
-            _ => Err(invalid()),
-        }
-    }
-}
-
-/// The key that leaves the agent for NAV.
+/// The keys the TUI reserves for itself. Every default is a key any
+/// terminal can send.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Keys {
-    nav: ControlKey,
+    nav: KeySpec,
 }
 
 impl Default for Keys {
     fn default() -> Self {
         Self {
-            nav: ControlKey::BACKSLASH,
+            nav: KeySpec::CTRL_CLOSE_BRACKET,
         }
     }
 }
 
 impl Keys {
-    pub fn nav(&self) -> ControlKey {
-        self.nav
+    pub fn spec(&self, field: KeyField) -> KeySpec {
+        match field {
+            KeyField::Nav => self.nav,
+        }
+    }
+
+    #[must_use]
+    pub fn with(self, field: KeyField, spec: KeySpec) -> Self {
+        match field {
+            KeyField::Nav => Self { nav: spec },
+        }
+    }
+
+    pub fn nav(&self) -> KeySpec {
+        self.spec(KeyField::Nav)
+    }
+
+    pub fn bindings(&self) -> Vec<(KeyField, KeySpec)> {
+        KeyField::ALL
+            .into_iter()
+            .map(|field| (field, self.spec(field)))
+            .collect()
     }
 }
 
@@ -126,9 +117,11 @@ pub enum ConfigError {
     },
     #[error("keys.{field}: {source}")]
     Key {
-        field: &'static str,
-        source: InvalidControlKey,
+        field: KeyField,
+        source: InvalidKeySpec,
     },
+    #[error("keys.{second} is the same key as keys.{first}")]
+    DuplicateKey { first: KeyField, second: KeyField },
     #[error("repos.dirs: {path:?} {reason}")]
     Source { path: String, reason: SourceError },
     #[error(transparent)]
@@ -202,13 +195,31 @@ impl RawKeys {
     fn parse(self) -> Result<Keys, ConfigError> {
         let nav = match self.nav {
             Some(raw) => raw.parse().map_err(|source| ConfigError::Key {
-                field: "nav",
+                field: KeyField::Nav,
                 source,
             })?,
             None => Keys::default().nav,
         };
-        Ok(Keys { nav })
+        let keys = Keys { nav };
+        ensure_distinct(&keys.bindings())
+            .map_err(|(first, second)| ConfigError::DuplicateKey { first, second })?;
+        Ok(keys)
     }
+}
+
+/// The first two fields given one key. Two specs are the same key exactly
+/// when they are equal, because a spec matches one exact set of modifiers
+/// and one key.
+fn ensure_distinct<Field: Copy>(bindings: &[(Field, KeySpec)]) -> Result<(), (Field, Field)> {
+    for (index, (first, spec)) in bindings.iter().enumerate() {
+        if let Some((second, _)) = bindings[index + 1..]
+            .iter()
+            .find(|(_, other)| other == spec)
+        {
+            return Err((*first, *second));
+        }
+    }
+    Ok(())
 }
 
 impl std::str::FromStr for Config {
@@ -230,19 +241,81 @@ mod tests {
     use super::*;
 
     #[test]
-    fn nav_defaults_to_ctrl_backslash() {
+    fn nav_defaults_to_ctrl_close_bracket() {
         let config: Config = "".parse().expect("parses");
+        assert_eq!(config.keys.nav().to_string(), "⌃]");
+    }
+
+    #[test]
+    fn every_default_key_is_one_any_terminal_can_send() {
+        let defaults = Keys::default();
+        for field in KeyField::ALL {
+            assert!(!defaults.spec(field).needs_kitty(), "{field}");
+        }
+    }
+
+    #[test]
+    fn a_config_naming_ctrl_backslash_still_parses() {
+        let config: Config = "[keys]\nnav = 'ctrl-\\'".parse().expect("parses");
         assert_eq!(config.keys.nav().to_string(), "⌃\\");
     }
 
     #[test]
-    fn nav_can_be_changed_but_must_be_sendable() {
+    fn nav_can_be_changed() {
         let config: Config = "[keys]\nnav = 'ctrl-g'".parse().expect("parses");
         assert_eq!(config.keys.nav().to_string(), "⌃G");
+    }
+
+    #[test]
+    fn a_mistake_in_nav_names_the_config_key_and_the_spec() {
         let err = |toml: &str| toml.parse::<Config>().expect_err("fails").to_string();
-        assert!(err("[keys]\nnav = 'ctrl-space'").contains("isn't a control key"));
-        assert!(err("[keys]\nnav = 'alt-x'").contains("isn't a control key"));
-        assert!(err("[keys]\nnav_sustained = 'ctrl-]'").contains("unknown field"));
+        assert!(err("[keys]\nnav = 'esc'").starts_with("keys.nav: \"esc\""));
+        assert!(err("[keys]\nnav = 'banana'").starts_with("keys.nav: \"banana\" isn't a key"));
+    }
+
+    #[test]
+    fn a_key_that_isnt_in_the_table_is_refused() {
+        let err = "[keys]\nnav_sustained = 'ctrl-]'"
+            .parse::<Config>()
+            .expect_err("fails");
+        assert!(err.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn the_first_two_fields_with_one_key_are_reported() {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum Field {
+            Nav,
+            Prev,
+            Next,
+        }
+        let spec: KeySpec = "alt-,".parse().expect("parses");
+        let other: KeySpec = "alt-.".parse().expect("parses");
+        assert_eq!(
+            ensure_distinct(&[
+                (Field::Nav, other),
+                (Field::Prev, spec),
+                (Field::Next, spec)
+            ]),
+            Err((Field::Prev, Field::Next))
+        );
+        assert_eq!(
+            ensure_distinct(&[(Field::Nav, spec), (Field::Prev, other)]),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn with_replaces_only_its_field_and_bindings_lists_every_field() {
+        let spec: KeySpec = "f5".parse().expect("parses");
+        let keys = Keys::default().with(KeyField::Nav, spec);
+        assert_eq!(keys.spec(KeyField::Nav), spec);
+        let fields: Vec<_> = keys
+            .bindings()
+            .into_iter()
+            .map(|(field, _)| field)
+            .collect();
+        assert_eq!(fields, KeyField::ALL);
     }
 
     #[test]

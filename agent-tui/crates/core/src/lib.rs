@@ -2,6 +2,7 @@ pub mod actions;
 pub mod activity;
 pub mod config;
 pub mod discover;
+pub mod keyspec;
 pub mod model;
 pub mod names;
 pub mod naming;

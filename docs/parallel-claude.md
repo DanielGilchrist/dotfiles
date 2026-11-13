@@ -36,7 +36,7 @@ Install or update it with `~/.config/agent-tui/install.sh`, which builds it into
 | `⏎` | With [0] on the branch: open the commit (its files and diffs) or uncommitted file under the cursor, `Esc` goes back |
 | `j` `k` `[` `]` `J` `K` `V` `e` `c` | With [0] on a diff: move a line cursor, jump hunks and files, select a range (`V`), open the file at the line in $EDITOR, and comment on the line or range (`c`). Comments collect in a per-agent draft, marked `✎`, until `s` sends them |
 | `v` | Peek: a read-only float of the agent's terminal. `⏎` or `i` attaches, `s` sends, `Esc` or `v` closes. On an agent open elsewhere the float names the place (`⇄ in nvim`) and is read-only through `zellij watch`, so it never resizes the other window, and `⏎` or `i` in it close it and leave the agent paused (or attach, if the other window has gone). The float closes by itself, saying `peek at X ended` and why when it can, if the session ends. It follows the other window being resized |
-| `⌃\` | Back to NAV from an agent. Twice goes to the previous agent |
+| `⌃]` | The nav key (configurable): back to NAV from an agent. Twice goes to the previous agent |
 | `h` `l`, `⇧Tab` `Tab` | Previous / next left panel ([1], [2], [3]), also from [0] |
 | `1` `2` `3` | Focus the list [1], the activity and Changes panels. Focusing [2] or [3] expands it only as far as its content needs: from the other lower panel's spare rows first, then the list, and only then does the other panel collapse to its title line (at the smallest sizes the collapse can leave it a few blank rows) |
 | `Esc` | Back one level: [0] to its panel, [2] or [3] to [1], and from [1] to the agent you left |
@@ -107,14 +107,16 @@ cwd = "{path}"
 
 Commands run in `cwd` if it's set, otherwise in the directory `agent` was started in.
 
-The key that leaves an agent lives in the same file. It must be `ctrl-` plus a letter or one of `\ ] ^ _`:
+The key that leaves an agent lives in the same file. The default is `ctrl-]`. It was `ctrl-\` before: if you relied on that, `ctrl-\` now goes to the agent, and `nav = "ctrl-\\"` brings the old key back.
 
 ```toml
 [keys]
-nav = "ctrl-\\"
+nav = "ctrl-]"
 ```
 
-Keys are one printable character (`Esc` closes the overlay). The config is checked at startup, and mistakes stop `agent` with the reason.
+Any terminal can send `ctrl-<letter>` (not `h`, `i`, `j` or `m`), `ctrl-space`, `ctrl-\ ctrl-] ctrl-^ ctrl-_`, `alt-<char>` (not `alt-[` or `alt-O`, and the terminal must send Option or Alt as Meta) and `f1` to `f12`. Modifier and key names ignore case, a character keeps its case, so `alt-X` is Alt+Shift+X. Terminals with the kitty keyboard protocol also send `ctrl-shift-<letter>`, `super-<char>` (the Cmd key on macOS, always shown `⌘`), `ctrl-h ctrl-i ctrl-j ctrl-m ctrl-[`, `alt-[` and `alt-O`. When the terminal didn't report the protocol, `agent` uses `ctrl-]` instead and says so in the status bar for 30 seconds and in the `?` help. Ctrl+4 to Ctrl+7 are the same bytes as `ctrl-\ ctrl-] ctrl-^ ctrl-_` and Ctrl+2 as `ctrl-space`, so a terminal without the protocol can't tell them apart. A shift is part of the key, so `alt-<` and `ctrl-^` work on whichever key types them. If `nav` isn't a `ctrl-` key (for example `alt-x` or `f5`), `ctrl-]` also leaves an agent, in case the terminal or the agent swallows your key. With a `ctrl-` nav key, `ctrl-]` goes to the agent. A key with no modifier and `esc esc` are refused, and so are two fields set to one key.
+
+Action keys are one printable character (`Esc` closes the overlay). The config is checked at startup, and mistakes stop `agent` with the reason.
 
 ### Theme
 

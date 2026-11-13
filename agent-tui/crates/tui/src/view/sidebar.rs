@@ -3627,6 +3627,62 @@ mod tests {
     }
 
     #[test]
+    fn the_status_bar_in_agent_names_the_configured_nav_key_and_not_the_default() {
+        let mut m = crate::fixtures::fleet(10);
+        crate::fixtures::connect(&mut m, "auth-refresh-2", crate::model::Mode::Agent);
+        let config: agent_core::config::Config = "[keys]\nnav = 'ctrl-g'".parse().expect("parses");
+        m.keys = crate::keyspec::Sendable::resolve(config.keys, crate::keyspec::Keyboard::Legacy);
+        let rows = screen(&render(&mut m, (120, 30)));
+        let bar = rows.last().expect("a status bar");
+        assert!(bar.contains("⌃G nav"), "{bar}");
+        assert!(bar.contains("⌃G ⌃G previous"), "{bar}");
+        assert!(!bar.contains("⌃]"), "{bar}");
+    }
+
+    #[test]
+    fn a_nav_key_that_may_not_arrive_shows_the_way_out_in_the_agent_footer_and_the_help() {
+        let mut m = crate::fixtures::fleet(10);
+        crate::fixtures::connect(&mut m, "auth-refresh-2", crate::model::Mode::Agent);
+        let config: agent_core::config::Config = "[keys]\nnav = 'alt-,'".parse().expect("parses");
+        m.keys = crate::keyspec::Sendable::resolve(config.keys, crate::keyspec::Keyboard::Legacy);
+        let rows = screen(&render(&mut m, (120, 30)));
+        let bar = rows.last().expect("a status bar");
+        assert!(bar.contains("⌃] also leaves"), "{bar}");
+        let (lines, _) = super::super::help_lines(
+            &crate::keymap::help(&crate::keymap::Situation::of(&m), "⌥,", ""),
+            &m.keys.notes(),
+            "agents",
+            0,
+            80,
+        );
+        let text = texts(&lines).join("\n");
+        assert!(text.contains("⌃] also leaves AGENT"), "{text}");
+    }
+
+    #[test]
+    fn the_help_lists_a_fallback_and_the_agent_footer_has_no_way_out_hint_with_a_control_nav_key() {
+        let mut m = crate::fixtures::fleet(10);
+        crate::fixtures::connect(&mut m, "auth-refresh-2", crate::model::Mode::Agent);
+        let config: agent_core::config::Config =
+            "[keys]\nnav = 'ctrl-shift-t'".parse().expect("parses");
+        m.keys = crate::keyspec::Sendable::resolve(config.keys, crate::keyspec::Keyboard::Legacy);
+        let (lines, _) = super::super::help_lines(
+            &crate::keymap::help(&crate::keymap::Situation::of(&m), "⌃]", ""),
+            &m.keys.notes(),
+            "agents",
+            0,
+            100,
+        );
+        let text = texts(&lines).join("\n");
+        assert!(
+            text.contains("keys.nav ⌃⇧T is not available in this terminal, using ⌃]"),
+            "{text}"
+        );
+        let rows = screen(&render(&mut m, (120, 30)));
+        assert!(!rows.last().expect("a bar").contains("also leaves"));
+    }
+
+    #[test]
     fn a_paused_agents_activity_is_shown_under_one_elsewhere_banner() {
         let mut m = crate::fixtures::elsewhere_on("obs-layout-4");
         assert!(

@@ -726,6 +726,7 @@ fn draw_status_bar(frame: &mut Frame<'_>, m: &Model, area: Rect) {
     let focus = m.focus();
     let nav = m.keys.nav().to_string();
     let twice = format!("{nav} {nav}");
+    let hatch = m.keys.escape_hatch().map(|hatch| hatch.to_string());
     let table = if matches!(focus, Focus::Agent(_) | Focus::Overlay(Overlay::New(_))) {
         Vec::new()
     } else {
@@ -734,6 +735,9 @@ fn draw_status_bar(frame: &mut Frame<'_>, m: &Model, area: Rect) {
     let mut hints: Vec<Hint<'_>> = Vec::new();
     if let Focus::Agent(_) = focus {
         hints.extend([ranked(&nav, "nav", 9), ranked(&twice, "previous", 8)]);
+        if let Some(hatch) = hatch.as_deref() {
+            hints.push(ranked(hatch, "also leaves", 7));
+        }
     } else if let Focus::Overlay(Overlay::New(_)) = focus {
         hints.extend([
             ranked("⌃U", "clear field", 4),
@@ -764,10 +768,10 @@ fn draw_status_bar(frame: &mut Frame<'_>, m: &Model, area: Rect) {
     let room_for_status = width.saturating_sub(badge_width + hints_width(&hints) + 3);
     let mut status = match m.shown_status() {
         Some((text, kind)) if room_for_status > 0 => {
-            let style = if kind == StatusKind::Error {
-                error()
-            } else {
-                Style::new()
+            let style = match kind {
+                StatusKind::Error => error(),
+                StatusKind::Warning => warning(),
+                StatusKind::Info => Style::new(),
             };
             let mut spans = fit(vec![Span::styled(text, style)], room_for_status);
             spans.push(Span::raw(" "));
@@ -2307,7 +2311,13 @@ fn draw_help(frame: &mut Frame<'_>, m: &Model, state: &HelpState) -> usize {
     let inner = block.inner(list_area);
     frame.render_widget(block, list_area);
 
-    let (lines, selected_line) = help_lines(&help, situation.ctx.name(), selected, inner.width);
+    let notes = if state.filter.is_empty() {
+        m.keys.notes()
+    } else {
+        Vec::new()
+    };
+    let (lines, selected_line) =
+        help_lines(&help, &notes, situation.ctx.name(), selected, inner.width);
     let visible = usize::from(inner.height);
     let offset = scroll(state.offset, selected_line, visible, lines.len());
     frame.render_widget(
@@ -2356,6 +2366,7 @@ fn help_block(state: &HelpState, rows: usize, selected: usize) -> Block<'static>
 /// The help's rows under their headers, and the line `selected` is on.
 fn help_lines(
     help: &keymap::Help,
+    notes: &[String],
     context: &str,
     selected: usize,
     width: u16,
@@ -2400,6 +2411,10 @@ fn help_lines(
             }
             index += 1;
         }
+    }
+    if !notes.is_empty() {
+        lines.push(Line::styled(" Keys", bold()));
+        lines.extend(notes.iter().map(|note| Line::raw(format!("  {note}"))));
     }
     if lines.is_empty() {
         lines.push(Line::styled("  no key matches", dim()));
