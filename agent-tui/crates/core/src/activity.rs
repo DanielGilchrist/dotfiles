@@ -29,6 +29,20 @@ impl AgentId {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct TaskId(String);
+
+impl TaskId {
+    pub fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// A tool call's id, as the harness names it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -213,11 +227,13 @@ pub enum MainEvent {
     /// The context was compacted.
     Compacted,
     Prompted(Input),
-    /// The activity ended. `summary` is the agent's last message, and `running`
-    /// the background subagents it's still waiting on.
+    /// The activity ended. `summary` is the agent's last message, `running`
+    /// the background subagents it's still waiting on and `commands` the
+    /// background commands running, which the agent isn't waiting on.
     Finished {
         summary: Option<String>,
         running: Vec<Background>,
+        commands: CommandListing,
     },
     /// The activity ended in an error (rate limited, overloaded…).
     Failed(String),
@@ -323,6 +339,147 @@ pub struct Background {
     pub id: AgentId,
     pub kind: String,
     pub description: Option<String>,
+}
+
+/// A background command's command line, never blank.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String")]
+pub struct CommandLine(String);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("blank command line")]
+pub struct BlankCommandLine;
+
+impl TryFrom<String> for CommandLine {
+    type Error = BlankCommandLine;
+
+    fn try_from(text: String) -> Result<Self, Self::Error> {
+        if text.trim().is_empty() {
+            return Err(BlankCommandLine);
+        }
+        Ok(Self(text))
+    }
+}
+
+impl std::str::FromStr for CommandLine {
+    type Err = BlankCommandLine;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        text.to_string().try_into()
+    }
+}
+
+impl CommandLine {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListedCommand {
+    pub id: TaskId,
+    pub command: CommandLine,
+    pub description: Option<String>,
+}
+
+/// What a harness said about an agent's background commands when it
+/// finished an activity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommandListing {
+    /// The harness couldn't say, so what was tracked stands.
+    Unknown,
+    /// Every command running, none when it says so.
+    Listed(Vec<ListedCommand>),
+}
+
+/// Commands have no start time, so `seen` is the listing that first named
+/// one. It never follows `listed`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct Tracked {
+    command: CommandLine,
+    description: Option<String>,
+    seen: SystemTime,
+}
+
+/// A tracked command as the set that holds it sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Running<'a> {
+    pub id: &'a TaskId,
+    pub command: &'a CommandLine,
+    pub description: Option<&'a str>,
+    /// From the listing that first named it to the latest, so it doesn't
+    /// grow between listings.
+    pub running_at_least: Duration,
+}
+
+/// The background commands the latest listing named, at least one, and when
+/// it was made. Keyed by id, so one can't appear twice, and no command was
+/// seen after the listing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "UncheckedCommands")]
+pub struct BackgroundCommands {
+    listed: SystemTime,
+    by_id: BTreeMap<TaskId, Tracked>,
+}
+
+#[derive(Deserialize)]
+struct UncheckedCommands {
+    listed: SystemTime,
+    by_id: BTreeMap<TaskId, Tracked>,
+}
+
+impl TryFrom<UncheckedCommands> for BackgroundCommands {
+    type Error = String;
+
+    fn try_from(unchecked: UncheckedCommands) -> Result<Self, Self::Error> {
+        let UncheckedCommands { listed, mut by_id } = unchecked;
+        if by_id.is_empty() {
+            return Err("no commands".into());
+        }
+        for tracked in by_id.values_mut() {
+            tracked.seen = tracked.seen.min(listed);
+        }
+        Ok(Self { listed, by_id })
+    }
+}
+
+impl BackgroundCommands {
+    /// What `listed` at `now` leaves tracked: those commands, each keeping
+    /// the `seen` it had in `previous`. Nothing tracked when none are listed.
+    /// When an id is listed twice the first wins.
+    fn listing(
+        listed: Vec<ListedCommand>,
+        previous: Option<&Self>,
+        now: SystemTime,
+    ) -> Option<Self> {
+        let mut by_id = BTreeMap::new();
+        for listed in listed {
+            let seen = previous
+                .and_then(|p| p.by_id.get(&listed.id))
+                .map_or(now, |known| known.seen.min(now));
+            by_id.entry(listed.id).or_insert(Tracked {
+                command: listed.command,
+                description: listed.description,
+                seen,
+            });
+        }
+        (!by_id.is_empty()).then_some(Self { listed: now, by_id })
+    }
+
+    /// The commands, longest running first.
+    pub fn iter(&self) -> impl Iterator<Item = Running<'_>> {
+        let mut commands: Vec<_> = self.by_id.iter().collect();
+        commands.sort_by_key(|(id, tracked)| (tracked.seen, *id));
+        commands.into_iter().map(|(id, tracked)| Running {
+            id,
+            command: &tracked.command,
+            description: tracked.description.as_deref(),
+            running_at_least: self
+                .listed
+                .duration_since(tracked.seen)
+                .unwrap_or_else(|earlier| earlier.duration()),
+        })
+    }
 }
 
 /// What an agent is doing, apart from any questions it's waiting on.
@@ -680,6 +837,9 @@ pub struct Activity {
     /// Open questions, at most one per asker, oldest first.
     pub asks: Vec<Ask>,
     pub subagents: BTreeMap<AgentId, Subagent>,
+    /// Only a listing, a launch, a start or an end changes them: they
+    /// outlive prompts, failures and interrupts.
+    commands: Option<BackgroundCommands>,
     /// Subagents that stopped before anything said they began, when they
     /// stopped. Never drawn or counted, so a stop for one the activity
     /// dropped can't show as a phantom. A later start or launch takes its
@@ -799,6 +959,11 @@ impl Activity {
         self.prompts != before.prompts
     }
 
+    /// The background commands it has running, as of the latest listing.
+    pub fn commands(&self) -> Option<&BackgroundCommands> {
+        self.commands.as_ref()
+    }
+
     /// Whether the user has given the agent a prompt.
     pub fn has_taken_a_prompt(&self) -> bool {
         self.prompts > 0
@@ -816,6 +981,7 @@ impl Activity {
             events: 0,
             asks: Vec::new(),
             subagents: BTreeMap::new(),
+            commands: None,
             stopped_early: BTreeMap::new(),
             session: Session::Live {
                 join: Join::Untraced,
@@ -888,10 +1054,12 @@ impl Activity {
         match event {
             MainEvent::Launched(_) | MainEvent::Started => {
                 self.forget_subagents();
+                self.commands = None;
                 State::Idle
             }
             MainEvent::Ended => {
                 self.forget_subagents();
+                self.commands = None;
                 State::Exited
             }
             MainEvent::Compacted => state,
@@ -904,12 +1072,20 @@ impl Activity {
                 }
                 State::Working { tools: Vec::new() }
             }
-            MainEvent::Finished { summary, running } => {
+            MainEvent::Finished {
+                summary,
+                running,
+                commands,
+            } => {
                 self.asks.retain(|ask| match &ask.asker {
                     Origin::Subagent(id) => running.iter().any(|b| &b.id == id),
                     Origin::Main => false,
                 });
                 self.track_background(&running, now);
+                if let CommandListing::Listed(listed) = commands {
+                    self.commands =
+                        BackgroundCommands::listing(listed, self.commands.as_ref(), now);
+                }
                 if running.is_empty() {
                     State::Done { summary }
                 } else {
@@ -1308,6 +1484,15 @@ impl Activity {
     }
 }
 
+/// The commands in an activity file, or none when the block can't be read,
+/// so a bad one costs the commands and not the activity.
+fn readable_commands<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<BackgroundCommands>, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).ok())
+}
+
 /// An activity file as written by any version, including ones that kept a
 /// single question in the state and ones that spread the session over
 /// `booting`, `launcher` and `launched`.
@@ -1326,6 +1511,8 @@ struct Stored {
     asks: Vec<Ask>,
     #[serde(default)]
     subagents: BTreeMap<AgentId, StoredSubagent>,
+    #[serde(default, deserialize_with = "readable_commands")]
+    commands: Option<BackgroundCommands>,
     #[serde(default)]
     stopped_early: BTreeMap<AgentId, SystemTime>,
     #[serde(default)]
@@ -1356,6 +1543,7 @@ struct Written {
     events: u64,
     asks: Vec<Ask>,
     subagents: BTreeMap<AgentId, Subagent>,
+    commands: Option<BackgroundCommands>,
     stopped_early: BTreeMap<AgentId, SystemTime>,
     session: Session,
     transcript: Option<TranscriptRef>,
@@ -1381,6 +1569,7 @@ impl From<Activity> for Written {
             events: activity.events,
             asks: activity.asks,
             subagents: activity.subagents,
+            commands: activity.commands,
             stopped_early: activity.stopped_early,
             session: activity.session,
             transcript: activity.transcript,
@@ -1501,6 +1690,7 @@ impl From<Stored> for Activity {
             events,
             mut asks,
             subagents,
+            commands,
             stopped_early,
             session,
             transcript,
@@ -1534,6 +1724,7 @@ impl From<Stored> for Activity {
                 .into_iter()
                 .map(|(id, subagent)| (id, subagent.into_subagent(heard)))
                 .collect(),
+            commands,
             stopped_early,
             session: session.unwrap_or_else(|| legacy_session(booting, launcher, launched)),
             transcript,
@@ -1641,8 +1832,58 @@ mod tests {
     }
 
     fn finished(running: &[&str]) -> MainEvent {
+        finished_with(running, &[])
+    }
+
+    fn command(id: &str, line: &str) -> ListedCommand {
+        ListedCommand {
+            id: TaskId::new(id),
+            command: line.parse().expect("not blank"),
+            description: None,
+        }
+    }
+
+    fn listing(commands: Vec<ListedCommand>) -> MainEvent {
         MainEvent::Finished {
             summary: None,
+            running: Vec::new(),
+            commands: CommandListing::Listed(commands),
+        }
+    }
+
+    fn unknown_listing() -> MainEvent {
+        MainEvent::Finished {
+            summary: None,
+            running: Vec::new(),
+            commands: CommandListing::Unknown,
+        }
+    }
+
+    fn running_at_least(activity: &Activity) -> Vec<(&str, Duration)> {
+        activity
+            .commands()
+            .map(|commands| {
+                commands
+                    .iter()
+                    .map(|c| (c.id.as_str(), c.running_at_least))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn tracked(activity: &Activity) -> Vec<&str> {
+        activity
+            .commands()
+            .map(|commands| commands.iter().map(|c| c.id.as_str()).collect())
+            .unwrap_or_default()
+    }
+
+    fn finished_with(running: &[&str], commands: &[&str]) -> MainEvent {
+        MainEvent::Finished {
+            summary: None,
+            commands: CommandListing::Listed(
+                commands.iter().map(|id| command(id, "sleep 9")).collect(),
+            ),
             running: running
                 .iter()
                 .map(|id| Background {
@@ -1731,6 +1972,7 @@ mod tests {
             main(MainEvent::Finished {
                 summary: Some("Fixed.".into()),
                 running: Vec::new(),
+                commands: CommandListing::Unknown,
             }),
             at(50),
         );
@@ -2807,5 +3049,226 @@ mod tests {
                 .transcript,
             None
         );
+    }
+
+    #[test]
+    fn commands_alone_leave_a_finished_activity_done() {
+        let a = run(vec![
+            (1, main(user("go"))),
+            (2, main(finished_with(&[], &["c1"]))),
+        ]);
+        assert!(matches!(a.state, State::Done { .. }));
+        assert_eq!(tracked(&a), ["c1"]);
+    }
+
+    #[test]
+    fn a_listing_replaces_the_commands_and_drops_those_it_omits() {
+        let a = run(vec![
+            (
+                1,
+                main(listing(vec![command("c1", "a"), command("c2", "b")])),
+            ),
+            (
+                2,
+                main(listing(vec![command("c2", "b"), command("c3", "c")])),
+            ),
+        ]);
+        assert_eq!(tracked(&a), ["c2", "c3"]);
+    }
+
+    #[test]
+    fn an_explicit_empty_listing_clears_the_commands() {
+        let a = run(vec![
+            (1, main(listing(vec![command("c1", "a")]))),
+            (2, main(listing(Vec::new()))),
+        ]);
+        assert_eq!(a.commands(), None);
+    }
+
+    #[test]
+    fn a_listing_that_could_not_be_read_keeps_the_commands_and_their_seen() {
+        let a = run(vec![
+            (10, main(listing(vec![command("c1", "a")]))),
+            (50, main(unknown_listing())),
+        ]);
+        assert_eq!(running_at_least(&a), [("c1", Duration::ZERO)]);
+        let b = Activity::next(Some(a), main(listing(vec![command("c1", "a")])), at(70));
+        assert_eq!(running_at_least(&b), [("c1", Duration::from_secs(60))]);
+    }
+
+    #[test]
+    fn when_an_id_is_listed_twice_the_first_command_wins() {
+        let a = run(vec![(
+            1,
+            main(listing(vec![
+                command("c1", "first"),
+                command("c1", "second"),
+            ])),
+        )]);
+        let commands: Vec<_> = a
+            .commands()
+            .expect("tracked")
+            .iter()
+            .map(|c| c.command.as_str())
+            .collect();
+        assert_eq!(commands, ["first"]);
+    }
+
+    #[test]
+    fn seen_is_kept_for_a_command_listed_again_and_set_for_a_new_one() {
+        let a = run(vec![
+            (10, main(listing(vec![command("c1", "a")]))),
+            (
+                70,
+                main(listing(vec![command("c1", "a"), command("c2", "b")])),
+            ),
+        ]);
+        assert_eq!(
+            running_at_least(&a),
+            [("c1", Duration::from_secs(60)), ("c2", Duration::ZERO)]
+        );
+    }
+
+    #[test]
+    fn commands_are_iterated_oldest_first_whatever_their_ids() {
+        let a = run(vec![
+            (10, main(listing(vec![command("z", "a")]))),
+            (
+                20,
+                main(listing(vec![command("z", "a"), command("a", "b")])),
+            ),
+        ]);
+        assert_eq!(tracked(&a), ["z", "a"]);
+    }
+
+    #[test]
+    fn events_other_than_a_listing_do_not_move_the_time_of_the_listing() {
+        let a = run(vec![
+            (10, main(listing(vec![command("c1", "a")]))),
+            (40, main(listing(vec![command("c1", "a")]))),
+            (500, main(MainEvent::Common(start("t", "Bash")))),
+        ]);
+        assert_eq!(running_at_least(&a), [("c1", Duration::from_secs(30))]);
+    }
+
+    #[test]
+    fn a_listing_earlier_than_the_one_before_it_leaves_no_negative_duration() {
+        let a = run(vec![
+            (100, main(listing(vec![command("c1", "a")]))),
+            (50, main(listing(vec![command("c1", "a")]))),
+        ]);
+        assert_eq!(running_at_least(&a), [("c1", Duration::ZERO)]);
+    }
+
+    #[test]
+    fn commands_survive_prompts_failures_compaction_and_other_reports() {
+        let listed = (1, main(listing(vec![command("c1", "a")])));
+        for event in [
+            main(user("again")),
+            main(MainEvent::Prompted(Input::Notification)),
+            main(MainEvent::Failed("overloaded".into())),
+            main(MainEvent::Compacted),
+            main(MainEvent::Common(start("t", "Bash"))),
+            main(MainEvent::Common(asked("ok?"))),
+            sub("a1", started()),
+        ] {
+            let a = run(vec![listed.clone(), (2, event)]);
+            assert_eq!(tracked(&a), ["c1"]);
+        }
+    }
+
+    #[test]
+    fn commands_survive_an_interrupt() {
+        let a = run(vec![
+            (1, main(user("go"))),
+            (2, main(listing(vec![command("c1", "a")]))),
+            (3, main(user("again"))),
+        ]);
+        let going = a.going().expect("working");
+        let interrupted = a.interrupted(going, at(4));
+        assert_eq!(interrupted.state, State::Interrupted);
+        assert_eq!(tracked(&interrupted), ["c1"]);
+        let stopped = interrupted.stopped().expect("interrupted");
+        let resumed = interrupted.resumed(stopped, at(5));
+        assert!(matches!(resumed.state, State::Working { .. }));
+        assert_eq!(tracked(&resumed), ["c1"]);
+    }
+
+    #[test]
+    fn a_launch_a_start_and_an_end_clear_the_commands() {
+        let listed = (1, main(listing(vec![command("c1", "a")])));
+        for event in [untraced(), MainEvent::Started, MainEvent::Ended] {
+            let a = run(vec![listed.clone(), (2, main(event))]);
+            assert_eq!(a.commands(), None);
+        }
+    }
+
+    #[test]
+    fn commands_round_trip_through_the_activity_file() {
+        let a = run(vec![
+            (10, main(listing(vec![command("c1", "a")]))),
+            (
+                20,
+                main(listing(vec![command("c1", "a"), command("c2", "b")])),
+            ),
+        ]);
+        let json = serde_json::to_string(&a).expect("json");
+        assert_eq!(serde_json::from_str::<Activity>(&json).expect("json"), a);
+    }
+
+    #[test]
+    fn a_file_from_before_commands_loads_with_none() {
+        let a = run(vec![(10, main(listing(vec![command("c1", "a")])))]);
+        let mut json: serde_json::Value = serde_json::to_value(&a).expect("json");
+        json.as_object_mut().expect("object").remove("commands");
+        let loaded: Activity = serde_json::from_value(json).expect("a file from before it");
+        assert_eq!(loaded.commands(), None);
+    }
+
+    fn json_with_commands(commands: serde_json::Value) -> serde_json::Value {
+        let a = run(vec![(10, main(user("go")))]);
+        let mut json = serde_json::to_value(&a).expect("json");
+        json.as_object_mut()
+            .expect("object")
+            .insert("commands".into(), commands);
+        json
+    }
+
+    #[test]
+    fn an_empty_commands_map_loads_as_no_commands() {
+        let json = json_with_commands(serde_json::json!({
+            "listed": {"secs_since_epoch": 5, "nanos_since_epoch": 0},
+            "by_id": {}
+        }));
+        let loaded: Activity = serde_json::from_value(json).expect("loads");
+        assert_eq!(loaded.commands(), None);
+    }
+
+    #[test]
+    fn a_malformed_commands_block_drops_only_the_commands() {
+        let time = serde_json::json!({"secs_since_epoch": 5, "nanos_since_epoch": 0});
+        for block in [
+            serde_json::json!({"by_id": {"c1": {"command": "a", "description": null, "seen": time}}}),
+            serde_json::json!({"listed": time, "by_id": {"c1": {"command": "a", "description": null, "seen": "soon"}}}),
+            serde_json::json!({"listed": time, "by_id": {"c1": {"command": "  ", "description": null, "seen": time}}}),
+            serde_json::json!("nonsense"),
+        ] {
+            let loaded: Activity =
+                serde_json::from_value(json_with_commands(block)).expect("still loads");
+            assert_eq!(loaded.commands(), None);
+            assert_eq!(loaded.prompt.as_deref(), Some("go"));
+        }
+    }
+
+    #[test]
+    fn a_stored_command_seen_after_its_listing_is_clamped_to_it() {
+        let listed = serde_json::json!({"secs_since_epoch": 5, "nanos_since_epoch": 0});
+        let later = serde_json::json!({"secs_since_epoch": 9, "nanos_since_epoch": 0});
+        let json = json_with_commands(serde_json::json!({
+            "listed": listed,
+            "by_id": {"c1": {"command": "a", "description": null, "seen": later}}
+        }));
+        let loaded: Activity = serde_json::from_value(json).expect("loads");
+        assert_eq!(running_at_least(&loaded), [("c1", Duration::ZERO)]);
     }
 }

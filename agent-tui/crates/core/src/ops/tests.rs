@@ -928,6 +928,7 @@ fn launching_marks_a_previously_finished_agent_as_booting() {
         Reported::main(MainEvent::Finished {
             summary: None,
             running: Vec::new(),
+            commands: crate::activity::CommandListing::Unknown,
         }),
         long_ago,
     );
@@ -964,6 +965,7 @@ fn finished_long_ago() -> Activity {
         Reported::main(MainEvent::Finished {
             summary: None,
             running: Vec::new(),
+            commands: crate::activity::CommandListing::Unknown,
         }),
         SystemTime::UNIX_EPOCH,
     )

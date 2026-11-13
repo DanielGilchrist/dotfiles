@@ -5,8 +5,8 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use agent_core::activity::{
-    About, AgentId, Background, Common, Input, MainEvent, Reported, SubagentEvent, ToolId,
-    TranscriptRef,
+    About, AgentId, Background, CommandLine, CommandListing, Common, Input, ListedCommand,
+    MainEvent, Reported, SubagentEvent, TaskId, ToolId, TranscriptRef,
 };
 use agent_core::names::Prompt;
 use agent_core::ports::{
@@ -937,6 +937,22 @@ fn hook_settings(report: &Path, session: &str) -> String {
     serde_json::json!({ "hooks": hooks }).to_string()
 }
 
+fn running_tasks(
+    tasks: &[Lenient<BackgroundTask>],
+    kind: TaskKind,
+) -> impl Iterator<Item = &BackgroundTask> {
+    tasks
+        .iter()
+        .filter_map(Lenient::get)
+        .filter(move |task| task.kind == Some(kind))
+        .filter(|task| {
+            matches!(
+                task.status,
+                None | Some(TaskStatus::Running | TaskStatus::Pending)
+            )
+        })
+}
+
 /// The first line of `text`, cut to [`SNIPPET`] characters.
 fn snippet(text: &str) -> String {
     text.lines()
@@ -1146,18 +1162,38 @@ impl ToolResponse {
     }
 }
 
+#[derive(Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum TaskKind {
+    Subagent,
+    Shell,
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum TaskStatus {
+    Running,
+    Pending,
+    #[serde(other)]
+    Settled,
+}
+
 #[derive(Deserialize)]
 struct BackgroundTask {
     #[serde(default)]
     id: Option<NonEmpty>,
     #[serde(default, rename = "type")]
-    kind: Option<String>,
+    kind: Option<TaskKind>,
     #[serde(default)]
-    status: Option<String>,
+    status: Option<TaskStatus>,
     #[serde(default)]
     agent_type: Option<String>,
     #[serde(default)]
     description: Option<String>,
+    #[serde(default)]
+    command: Lenient<String>,
 }
 
 /// Who a hook speaks for: the agent, one of its subagents, or either.
@@ -1239,10 +1275,19 @@ fn claude_event(payload: &str) -> Option<Reported> {
         Hook::Stop {
             last_assistant_message,
             background_tasks,
-        } => Routed::Main(MainEvent::Finished {
-            summary: last_assistant_message.as_deref().map(long),
-            running: background_subagents(background_tasks.get().map_or(&[][..], Vec::as_slice)),
-        }),
+        } => {
+            let commands = match background_tasks.get() {
+                Some(tasks) => CommandListing::Listed(background_commands(tasks)),
+                None => CommandListing::Unknown,
+            };
+            Routed::Main(MainEvent::Finished {
+                summary: last_assistant_message.as_deref().map(long),
+                running: background_subagents(
+                    background_tasks.get().map_or(&[][..], Vec::as_slice),
+                ),
+                commands,
+            })
+        }
         Hook::StopFailure { error } => Routed::Main(MainEvent::Failed(
             error.as_deref().unwrap_or("error").replace('_', " "),
         )),
@@ -1317,14 +1362,10 @@ fn permission_request(tool: String, input: &Lenient<ToolInput>) -> Routed {
 const DEFAULT_SUBAGENT_KIND: &str = "subagent";
 
 /// The subagents a finished activity left running. Other background work
-/// (shells, monitors) doesn't hand anything back to the agent. A task that
-/// can't be read is skipped without hiding the others.
+/// (monitors, workflows) isn't tracked. A task that can't be read is skipped
+/// without hiding the others.
 fn background_subagents(tasks: &[Lenient<BackgroundTask>]) -> Vec<Background> {
-    tasks
-        .iter()
-        .filter_map(Lenient::get)
-        .filter(|task| task.kind.as_deref() == Some("subagent"))
-        .filter(|task| matches!(task.status.as_deref(), None | Some("running" | "pending")))
+    running_tasks(tasks, TaskKind::Subagent)
         .filter_map(|task| {
             Some(Background {
                 id: AgentId::new(task.id.as_ref()?.0.clone()),
@@ -1333,6 +1374,20 @@ fn background_subagents(tasks: &[Lenient<BackgroundTask>]) -> Vec<Background> {
                     .clone()
                     .unwrap_or_else(|| DEFAULT_SUBAGENT_KIND.to_string()),
                 description: task.description.as_deref().map(snippet),
+            })
+        })
+        .collect()
+}
+
+/// The commands a finished activity left running. A task without a command
+/// line is skipped like an unreadable one.
+fn background_commands(tasks: &[Lenient<BackgroundTask>]) -> Vec<ListedCommand> {
+    running_tasks(tasks, TaskKind::Shell)
+        .filter_map(|task| {
+            Some(ListedCommand {
+                id: TaskId::new(task.id.as_ref()?.0.clone()),
+                command: task.command.text()?.parse::<CommandLine>().ok()?,
+                description: task.description.clone(),
             })
         })
         .collect()
@@ -2166,7 +2221,7 @@ mod tests {
         );
         assert_eq!(
             event(
-                r#"{"hook_event_name":"Stop","agent_id":null,"last_assistant_message":"Waiting.","background_tasks":[{"id":"a1","type":"subagent","status":"running","agent_type":"Explore","description":"look"},{"id":"s1","type":"shell","status":"running"},{"id":"a2","type":"subagent","status":"completed"}]}"#
+                r#"{"hook_event_name":"Stop","agent_id":null,"last_assistant_message":"Waiting.","background_tasks":[{"id":"a1","type":"subagent","status":"running","agent_type":"Explore","description":"look"},{"id":"s1","type":"shell","status":"running","command":"cargo test","description":"tests"},{"id":"a2","type":"subagent","status":"completed"}]}"#
             ),
             Some(Reported::main(MainEvent::Finished {
                 summary: Some("Waiting.".into()),
@@ -2174,8 +2229,122 @@ mod tests {
                     id: AgentId::new("a1"),
                     kind: "Explore".into(),
                     description: Some("look".into())
-                }]
+                }],
+                commands: CommandListing::Listed(vec![shell("s1", "cargo test", Some("tests"))])
             }))
+        );
+    }
+
+    fn shell(id: &str, command: &str, description: Option<&str>) -> ListedCommand {
+        ListedCommand {
+            id: TaskId::new(id),
+            command: command.parse().expect("not blank"),
+            description: description.map(Into::into),
+        }
+    }
+
+    fn stop_listing(commands: CommandListing) -> Reported {
+        Reported::main(MainEvent::Finished {
+            summary: None,
+            running: Vec::new(),
+            commands,
+        })
+    }
+
+    #[test]
+    fn a_stop_lists_only_shells_that_are_still_going() {
+        assert_eq!(
+            claude_event(
+                r#"{"hook_event_name":"Stop","background_tasks":[{"id":"s1","type":"shell","status":"completed","command":"ls"},{"id":"s2","type":"shell","command":"make"},{"id":"s3","type":"shell","status":"pending","command":"npm start"},{"id":"s4","type":"shell","status":null,"command":"top"},{"id":"m1","type":"monitor","status":"running","command":"tail"}]}"#
+            ),
+            Some(stop_listing(CommandListing::Listed(vec![
+                shell("s2", "make", None),
+                shell("s3", "npm start", None),
+                shell("s4", "top", None),
+            ])))
+        );
+    }
+
+    #[test]
+    fn an_unreadable_shell_does_not_hide_the_others() {
+        assert_eq!(
+            claude_event(
+                r#"{"hook_event_name":"Stop","background_tasks":[7,{"id":"","type":"shell","command":"a"},{"id":"s0","type":"shell"},{"id":"s1","type":"shell","command":7},{"id":"s5","type":"shell","command":" \n "},{"id":"s2","type":"shell","command":"b"}]}"#
+            ),
+            Some(stop_listing(CommandListing::Listed(vec![shell(
+                "s2", "b", None
+            )])))
+        );
+    }
+
+    #[test]
+    fn a_shells_command_and_description_are_kept_whole() {
+        let long = "x".repeat(SNIPPET + 40);
+        let payload = format!(
+            r#"{{"hook_event_name":"Stop","background_tasks":[{{"id":"s1","type":"shell","command":"{long}\nsecond","description":"first\nsecond"}}]}}"#
+        );
+        assert_eq!(
+            claude_event(&payload),
+            Some(stop_listing(CommandListing::Listed(vec![shell(
+                "s1",
+                &format!("{long}\nsecond"),
+                Some("first\nsecond")
+            )])))
+        );
+    }
+
+    #[test]
+    fn a_stop_without_a_readable_task_list_says_the_commands_are_unknown() {
+        for payload in [
+            r#"{"hook_event_name":"Stop"}"#,
+            r#"{"hook_event_name":"Stop","background_tasks":null}"#,
+            r#"{"hook_event_name":"Stop","background_tasks":"none"}"#,
+            r#"{"hook_event_name":"Stop","background_tasks":{"id":"s1"}}"#,
+        ] {
+            assert_eq!(
+                claude_event(payload),
+                Some(stop_listing(CommandListing::Unknown)),
+                "{payload}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_non_string_command_does_not_drop_a_running_subagent_and_skips_a_shell() {
+        assert_eq!(
+            claude_event(
+                r#"{"hook_event_name":"Stop","background_tasks":[{"id":"a1","type":"subagent","status":"running","command":["x"]},{"id":"s1","type":"shell","command":["x"]}]}"#
+            ),
+            Some(Reported::main(MainEvent::Finished {
+                summary: None,
+                running: vec![Background {
+                    id: AgentId::new("a1"),
+                    kind: "subagent".into(),
+                    description: None
+                }],
+                commands: CommandListing::Listed(Vec::new())
+            }))
+        );
+    }
+
+    #[test]
+    fn a_stop_with_an_empty_task_list_lists_no_commands() {
+        assert_eq!(
+            claude_event(r#"{"hook_event_name":"Stop","background_tasks":[]}"#),
+            Some(stop_listing(CommandListing::Listed(Vec::new())))
+        );
+    }
+
+    #[test]
+    fn a_subagent_stop_carrying_shells_reports_only_the_subagent_stopping() {
+        assert_eq!(
+            claude_event(
+                r#"{"hook_event_name":"SubagentStop","agent_id":"a1","background_tasks":[{"id":"s1","type":"shell","command":"make"}]}"#
+            ),
+            Some(Reported::subagent(
+                AgentId::new("a1"),
+                SubagentEvent::Stopped
+            ))
         );
     }
 
@@ -2237,7 +2406,8 @@ mod tests {
                     id: AgentId::new("a1"),
                     kind: "subagent".into(),
                     description: None
-                }]
+                }],
+                commands: CommandListing::Listed(Vec::new())
             }))
         );
     }

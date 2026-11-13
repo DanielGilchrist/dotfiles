@@ -907,6 +907,7 @@ impl World {
             Doing::Idle => MainEvent::Finished {
                 summary: None,
                 running: Vec::new(),
+                commands: crate::activity::CommandListing::Unknown,
             },
             Doing::Working => MainEvent::Prompted(Input::User("go".into())),
         };
