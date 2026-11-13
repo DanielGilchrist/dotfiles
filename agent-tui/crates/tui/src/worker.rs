@@ -1297,6 +1297,13 @@ mod tests {
         ) -> Result<Vec<agent_core::ports::SessionInfo>, agent_core::ports::HostError> {
             self.0.sessions()
         }
+        fn liveness(
+            &self,
+            within: std::time::Duration,
+        ) -> Result<Vec<(SessionName, agent_core::ports::Liveness)>, agent_core::ports::HostError>
+        {
+            self.0.liveness(within)
+        }
         fn attach(&self, name: &SessionName) -> agent_core::process::LaunchSpec {
             self.0.attach(name)
         }

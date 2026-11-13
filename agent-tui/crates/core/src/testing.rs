@@ -5,7 +5,7 @@ use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use crate::activity::{Activity, Going, Input, MainEvent, Reported, Stopped, TranscriptRef};
 use crate::model::{Head, HostedWorktree, Running, Startable, Worktree};
@@ -13,12 +13,12 @@ use crate::names::{BranchName, HostName, NameLimit, Prompt, PullRequest, Session
 use crate::ops::Services;
 use crate::paths::{AgentWorktree, Layout, RepoRoot};
 use crate::ports::{
-    AgentRecord, BranchLog, BranchState, Change, Checkout, ClientControl, Compared, DiffBase,
-    Fetch, FileDiff, Forge, Harness, HarnessError, HarnessId, Harnesses, Hint, HostError,
-    LaunchCtx, Listing, LocalBranch, Lookup, Observation, PaneCommand, PendingPrompt, Probe,
-    PullRequestHead, RemoteBranch, RepoWorktrees, Seen, SessionHost, SessionInfo, SessionStatus,
-    Stop, Store, StoreError, Survivor, SurvivorState, TranscriptStamp, Unlisting, Vcs,
-    WorktreeFacts, WorktreeStart,
+    AgentRecord, BranchLog, BranchState, Branches, Change, Checkout, ClientControl, Compared,
+    DiffBase, Fetch, FileDiff, Forge, Harness, HarnessError, HarnessId, Harnesses, Hint, HostError,
+    LaunchCtx, Listing, Liveness, LocalBranch, Lookup, Observation, PaneCommand, PendingPrompt,
+    Probe, PullRequestHead, RemoteBranch, RepoWorktrees, Seen, SessionHost, SessionInfo,
+    SessionStatus, Stop, Store, StoreError, Survivor, SurvivorState, TranscriptStamp, Unlisting,
+    Vcs, WorktreeFacts, WorktreeStart,
 };
 use crate::process::{CommandError, LaunchSpec};
 
@@ -69,6 +69,7 @@ pub struct FakeVcs {
     pub offline: Mutex<bool>,
     /// Listing the worktrees fails, as when git can't run.
     pub listing_fails: Mutex<bool>,
+    pub branch_names: Mutex<Branches>,
 }
 
 impl FakeVcs {
@@ -87,6 +88,7 @@ impl FakeVcs {
             pull_requests: Mutex::default(),
             offline: Mutex::default(),
             listing_fails: Mutex::default(),
+            branch_names: Mutex::default(),
         }
     }
 
@@ -191,6 +193,10 @@ impl Vcs for FakeVcs {
 
     fn prune_worktrees(&self, _: &RepoRoot) -> Result<(), CommandError> {
         Ok(())
+    }
+
+    fn branches(&self, _: &RepoRoot) -> Result<Branches, CommandError> {
+        Ok(self.branch_names.lock().expect("lock").clone())
     }
 
     fn local_branch(
@@ -319,6 +325,8 @@ pub struct FakeHost {
     pub kill_fails: Mutex<bool>,
     /// Starting a session detached fails.
     pub start_fails: Mutex<bool>,
+    /// Asking which sessions are alive fails, as when the host can't be reached.
+    pub liveness_fails: Mutex<bool>,
     /// How many listings still show a killed session running.
     pub kill_lag: Mutex<usize>,
     /// How many listings go by before a session started detached shows.
@@ -385,6 +393,26 @@ impl SessionHost for FakeHost {
         }
         lagging.retain(|lag| lag.listings > 0);
         Ok(listed)
+    }
+
+    fn liveness(&self, _: Duration) -> Result<Vec<(SessionName, Liveness)>, HostError> {
+        if *self.liveness_fails.lock().expect("lock") {
+            return Err(HostError::Io {
+                context: "listing sessions".into(),
+                source: std::io::Error::other("host unreachable"),
+            });
+        }
+        Ok(self
+            .sessions()?
+            .into_iter()
+            .map(|s| {
+                let liveness = match s.status {
+                    SessionStatus::Live { .. } => Liveness::Live,
+                    SessionStatus::Exited { .. } => Liveness::Exited,
+                };
+                (s.name, liveness)
+            })
+            .collect())
     }
 
     fn attach(&self, name: &SessionName) -> LaunchSpec {
@@ -572,6 +600,10 @@ impl Store for MemStore {
             .expect("succeeds")
             .insert(name.clone(), record.clone());
         Ok(())
+    }
+
+    fn recorded(&self) -> Result<Vec<SessionName>, StoreError> {
+        Ok(self.records.lock().expect("lock").keys().cloned().collect())
     }
 
     fn forget(&self, name: &SessionName) -> Result<(), StoreError> {

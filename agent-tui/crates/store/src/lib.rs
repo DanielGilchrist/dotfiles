@@ -317,6 +317,27 @@ impl Store for FsStore {
         write_atomic(&self.record_path(name), &json)
     }
 
+    fn recorded(&self) -> Result<Vec<SessionName>, StoreError> {
+        let dir = self.dir.join("records");
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(io_err(&dir)(e)),
+        };
+        let mut names = Vec::new();
+        for entry in entries {
+            let path = entry.map_err(io_err(&dir))?.path();
+            let named = path
+                .file_name()
+                .and_then(|file| file.to_str())
+                .and_then(|file| file.strip_suffix(".json"))
+                .and_then(|stem| stem.parse().ok());
+            names.extend(named);
+        }
+        names.sort();
+        Ok(names)
+    }
+
     fn last_selected(&self) -> Result<Option<SessionName>, StoreError> {
         let path = self.selection_path();
         let Some(contents) = read_optional(&path)? else {
@@ -410,6 +431,19 @@ mod tests {
 
     fn name(s: &str) -> SessionName {
         s.parse().expect("parses")
+    }
+
+    #[test]
+    fn recorded_names_come_from_the_record_files_alone() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let store = FsStore::new(dir.path().to_path_buf());
+        assert_eq!(store.recorded().expect("reads"), Vec::new());
+        let record = AgentRecord::new("claude".parse().expect("parses"), None);
+        store.put_record(&name("b"), &record).expect("puts");
+        store.put_record(&name("a"), &record).expect("puts");
+        std::fs::write(dir.path().join("records/notes.txt"), "x").expect("writes");
+        std::fs::write(dir.path().join("records/bad name.json"), "x").expect("writes");
+        assert_eq!(store.recorded().expect("reads"), [name("a"), name("b")]);
     }
 
     #[test]

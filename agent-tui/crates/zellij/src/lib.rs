@@ -10,8 +10,8 @@ use std::time::{Duration, SystemTime};
 use agent_core::model::Running;
 use agent_core::names::{HostName, NameLimit, SessionName};
 use agent_core::ports::{
-    ClientControl, ClientId, HostError, Observation, PaneCommand, Place, SessionHost, SessionInfo,
-    SessionStatus, TerminalApp, Window,
+    ClientControl, ClientId, HostError, Liveness, Observation, PaneCommand, Place, SessionHost,
+    SessionInfo, SessionStatus, TerminalApp, Window,
 };
 use agent_core::process::{self, CommandError, LaunchSpec, parallel_map};
 use nix::errno::Errno;
@@ -82,9 +82,13 @@ fn parse_sessions(listing: &str) -> Vec<(SessionName, Listed)> {
 }
 
 fn list() -> Result<Vec<(SessionName, Listed)>, HostError> {
+    list_within(process::DEFAULT_TIMEOUT)
+}
+
+fn list_within(timeout: Duration) -> Result<Vec<(SessionName, Listed)>, HostError> {
     let mut cmd = zellij();
     cmd.args(["list-sessions", "--no-formatting"]);
-    let out = process::output(&mut cmd)?;
+    let out = process::output_within(&mut cmd, timeout)?;
     let stdout = String::from_utf8_lossy(&out.stdout);
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
@@ -565,6 +569,19 @@ impl SessionHost for Zellij {
                 status,
             }
         }))
+    }
+
+    fn liveness(&self, within: Duration) -> Result<Vec<(SessionName, Liveness)>, HostError> {
+        Ok(list_within(within)?
+            .into_iter()
+            .map(|(name, listed)| {
+                let liveness = match listed {
+                    Listed::Live => Liveness::Live,
+                    Listed::Exited => Liveness::Exited,
+                };
+                (name, liveness)
+            })
+            .collect())
     }
 
     fn attach(&self, name: &SessionName) -> LaunchSpec {

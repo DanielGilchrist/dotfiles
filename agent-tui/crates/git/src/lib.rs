@@ -10,9 +10,9 @@ use agent_core::model::{Head, Worktree};
 use agent_core::names::{BranchName, NameError, PullRequest};
 use agent_core::paths::{AgentWorktree, RepoRoot};
 use agent_core::ports::{
-    Added, BranchLog, BranchState, Change, ChangeKind, Checkout, Compared, DiffBase, Edit, Fetch,
-    FileDiff, FileState, Forge, Lines, LocalBranch, PullRequestHead, RemoteBranch, RemoteRef,
-    RepoWorktrees, TrackedState, Uncommitted, Vcs, WorktreeFacts, WorktreeStart,
+    Added, BranchLog, BranchState, Branches, Change, ChangeKind, Checkout, Compared, DiffBase,
+    Edit, Fetch, FileDiff, FileState, Forge, Lines, LocalBranch, PullRequestHead, RemoteBranch,
+    RemoteRef, RepoWorktrees, TrackedState, Uncommitted, Vcs, WorktreeFacts, WorktreeStart,
 };
 use agent_core::process::{self, Capped, CommandError};
 
@@ -240,6 +240,20 @@ fn query(cmd: &mut Command) -> Result<bool, CommandError> {
         Some(1) => Ok(false),
         _ => Err(process::failed(cmd, &out)),
     }
+}
+
+fn parse_branches(refs: &str) -> Branches {
+    let mut branches = Branches::default();
+    for line in refs.lines() {
+        if let Some(name) = line.strip_prefix("refs/heads/") {
+            branches.local.extend(name.parse());
+        } else if let Some(name) = line.strip_prefix("refs/remotes/origin/")
+            && name != "HEAD"
+        {
+            branches.on_origin.extend(name.parse());
+        }
+    }
+    branches
 }
 
 fn parse_repo_worktrees(porcelain: &str) -> Result<RepoWorktrees, String> {
@@ -575,6 +589,17 @@ impl Vcs for Git {
 
     fn prune_worktrees(&self, repo: &RepoRoot) -> Result<(), CommandError> {
         process::run(git(repo.path()).args(["worktree", "prune"])).map(drop)
+    }
+
+    fn branches(&self, repo: &RepoRoot) -> Result<Branches, CommandError> {
+        let mut cmd = git(repo.path());
+        cmd.args([
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/heads",
+            "refs/remotes/origin",
+        ]);
+        Ok(parse_branches(&process::run(&mut cmd)?))
     }
 
     fn local_branch(
@@ -1155,6 +1180,30 @@ mod tests {
         );
         let work = tmp.path().join("work");
         (tmp, origin, work)
+    }
+
+    #[test]
+    fn branches_lists_local_and_origin_names_without_origin_head() {
+        let (_tmp, origin, work) = clone_with(&[("a.txt", "one\n")]);
+        run_git(&origin, &["branch", "feature/x"]);
+        run_git(&work, &["fetch", "-q"]);
+        run_git(&work, &["branch", "mine"]);
+        let repo = RepoRoot::new(work).expect("absolute");
+        let branches = Git.branches(&repo).expect("lists");
+        let names = |list: Vec<agent_core::names::BranchName>| -> Vec<String> {
+            list.iter().map(ToString::to_string).collect()
+        };
+        assert_eq!(names(branches.local), ["main", "mine"]);
+        assert_eq!(names(branches.on_origin), ["feature/x", "main"]);
+    }
+
+    #[test]
+    fn parse_branches_skips_names_git_allows_but_branch_names_refuse() {
+        let parsed = parse_branches(
+            "refs/heads/ok\nrefs/heads/a b\nrefs/remotes/origin/HEAD\nrefs/remotes/origin/up\nrefs/tags/t\n",
+        );
+        assert_eq!(parsed.local.len(), 1);
+        assert_eq!(parsed.on_origin.len(), 1);
     }
 
     fn stat(added: usize, removed: usize, files: usize) -> agent_core::ports::DiffStat {

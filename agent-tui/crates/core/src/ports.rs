@@ -476,6 +476,13 @@ impl LocalBranch {
     }
 }
 
+/// The branches a repo's refs name.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Branches {
+    pub local: Vec<BranchName>,
+    pub on_origin: Vec<BranchName>,
+}
+
 /// A branch a [`Vcs`] found on origin. Only `Vcs` implementations should
 /// construct one.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -534,6 +541,9 @@ pub trait Vcs: Send + Sync {
         start: &WorktreeStart,
     ) -> Result<(), CommandError>;
     fn prune_worktrees(&self, repo: &RepoRoot) -> Result<(), CommandError>;
+    /// The names of the repo's local branches and of the branches on origin
+    /// it knows of, from its refs alone: nothing is fetched.
+    fn branches(&self, repo: &RepoRoot) -> Result<Branches, CommandError>;
     fn local_branch(
         &self,
         repo: &RepoRoot,
@@ -628,6 +638,13 @@ pub struct PullRequestHead {
 pub trait Forge: Send + Sync {
     /// The branch a pull request was opened from, and whether from a fork.
     fn pull_request_head(&self, pr: &PullRequest) -> Result<PullRequestHead, CommandError>;
+}
+
+/// Whether a session is running or only resurrectable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Liveness {
+    Live,
+    Exited,
 }
 
 /// Where a live session's terminal is, when the host could tell.
@@ -772,6 +789,10 @@ pub trait SessionHost: Send + Sync {
     /// What the host accepts as a session name.
     fn name_limit(&self) -> NameLimit;
     fn sessions(&self) -> Result<Vec<SessionInfo>, HostError>;
+    /// Which sessions are alive, from the host's own listing alone: no
+    /// session is asked where its terminal is. A host that doesn't answer
+    /// within `within` is an error, so a prompt never waits on it.
+    fn liveness(&self, within: Duration) -> Result<Vec<(SessionName, Liveness)>, HostError>;
     /// Attach to an existing (live or resurrectable) session in the foreground.
     fn attach(&self, name: &SessionName) -> LaunchSpec;
     /// Observe a live session without joining it.
@@ -1511,6 +1532,8 @@ pub trait Store: Send + Sync {
     -> Result<(), StoreError>;
     /// `name`'s transcript shows the activity `proof` was made for carried on.
     fn resume(&self, name: &SessionName, proof: Stopped) -> Result<(), StoreError>;
+    /// The sessions that have a record, without reading the records.
+    fn recorded(&self) -> Result<Vec<SessionName>, StoreError>;
     /// Every agent's latest activity.
     fn activities(&self) -> Result<HashMap<SessionName, Activity>, StoreError>;
     /// The agent last selected in the TUI, to start on next time.

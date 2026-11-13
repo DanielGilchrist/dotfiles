@@ -159,7 +159,7 @@ The `agent-edit` event (`wezterm/agent_edit.lua`) backs the `t` (nvim in tab) an
 
 ## Commands
 
-`agent <cmd> --help` has the details. Fish completions come from `agent completions fish`.
+`agent <cmd> --help` has the details. Completions come from `agent completions <shell>`.
 
 | Command | Description |
 |---|---|
@@ -179,6 +179,7 @@ The `agent-edit` event (`wezterm/agent_edit.lua`) backs the `t` (nvim in tab) an
 | `agent rm --force [<name>]` | Same, discarding work. |
 | `agent rm --all [-f]` | Every agent worktree. Confirms first. |
 | `agent ls` | Agents by repo with their state. |
+| `agent completions <shell>` | Print the shell's completions. `fish`, `bash` and `zsh` also complete the name of `attach`, `rm`, `restart`, `pin`, `unpin`, `dump` and `prompt` (only agents `agent` knows: worktrees, listed repos' sessions and stored records, live ones first and each noted with its state and repo, while `attach` still takes a new name you type), the branches of the repo for `checkout` (the cwd's, or the `--repo` already typed in fish), listed and catalogue repos for `--repo`, and harness ids for `--harness`. Load fish with `agent completions fish \| source`, bash with `source <(agent completions bash)` (bash shows no states, and a repo path containing `:` or `=` is cut at it by COMP_WORDBREAKS), zsh with `source <(agent completions zsh)` (it must be sourced, not autoloaded from `fpath`, which keeps the static completion). Elvish and PowerShell get the static script. A source that takes over a second, such as a hung mount or session host, is left out. |
 | `agent add [<path>]` | Keep the repo holding the path (default: the cwd) listed in the TUI with nothing running in it. |
 | `agent forget [<path>]` | Drop it from the list. It stays while sessions or worktrees belong to it. |
 | `agent merged` | Worktrees whose branch can be removed without losing work. |

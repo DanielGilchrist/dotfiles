@@ -20,6 +20,7 @@ use agent_zellij::Zellij;
 use anyhow::{Context, Result, bail};
 use clap::{ArgGroup, CommandFactory, Parser, Subcommand};
 
+mod completion;
 mod lineage;
 mod restart;
 
@@ -59,10 +60,22 @@ enum Cmd {
         #[arg(long, value_name = "KEY")]
         explain: Option<String>,
     },
-    /// Print shell completions
+    /// Print shell completions (load with `agent completions fish | source`)
     Completions {
         #[arg(value_enum)]
         shell: clap_complete::Shell,
+    },
+    /// List what a shell can offer for a word (used by the completion scripts)
+    #[command(hide = true)]
+    Complete {
+        #[arg(value_enum)]
+        kind: completion::CompleteKind,
+        /// Follow each candidate with a tab and a note
+        #[arg(long)]
+        notes: bool,
+        /// The repo to list branches of (defaults to the one containing the cwd)
+        #[arg(long)]
+        repo: Option<PathBuf>,
     },
     /// Create or attach the agent <name>: its worktree, branch and session
     #[command(group = ArgGroup::new("initial_prompt").args(["prompt", "seed", "no_prompt"]))]
@@ -767,6 +780,40 @@ fn keys(explain: Option<&str>) -> Result<()> {
     }
 }
 
+fn complete(
+    svc: Services<'_>,
+    kind: completion::CompleteKind,
+    notes: bool,
+    repo: Option<&Path>,
+) -> Result<()> {
+    let notes = if notes {
+        agent_core::complete::Notes::Shown
+    } else {
+        agent_core::complete::Notes::Hidden
+    };
+    let sources = match kind {
+        completion::CompleteKind::Repos => config()?.sources,
+        _ => agent_core::config::Sources::default(),
+    };
+    let cwd = cwd()?;
+    let dir = match repo.and_then(Path::to_str) {
+        Some(typed) => match paths::typed_path(typed, &cwd, paths::home().ok().as_deref()) {
+            Some(paths::Typed::Path(path)) => path,
+            _ => cwd.join(typed),
+        },
+        None => cwd,
+    };
+    let found = kind.list(svc, &sources, &dir);
+    for problem in &found.problems {
+        eprintln!("agent complete: {problem}");
+    }
+    let mut out = std::io::stdout().lock();
+    for candidate in &found.candidates {
+        writeln!(out, "{}", candidate.line(notes))?;
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let mut args = std::env::args_os().skip(1);
     if args.next().is_some_and(|first| first == "event") {
@@ -791,9 +838,10 @@ fn main() -> Result<()> {
             repo_session(svc, repo, Frontend::from_flag(headless), harness)
         }
         Cmd::Completions { shell } => {
-            clap_complete::generate(shell, &mut Cli::command(), "agent", &mut std::io::stdout());
+            print!("{}", completion::script(shell, &Cli::command()));
             Ok(())
         }
+        Cmd::Complete { kind, notes, repo } => complete(svc, kind, notes, repo.as_deref()),
         Cmd::Attach {
             name,
             prompt,
