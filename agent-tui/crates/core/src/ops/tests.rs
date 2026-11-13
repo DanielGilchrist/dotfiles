@@ -455,8 +455,45 @@ fn a_prompt_to_a_vanished_worktree_is_refused_before_the_worktree_is_made() {
 fn a_session_with_no_activity_record_is_typed_into() {
     let w = World::new();
     live_fix(&w);
-    inject(w.svc(), &session("fix"), &prompt("hi")).expect("types");
+    inject(w.svc(), &session("fix"), Injection::Message(&prompt("hi"))).expect("types");
     assert_eq!(w.host.written.lock().expect("lock")[0].1, b"hi\r");
+}
+
+#[test]
+fn an_image_paste_types_the_harness_key_not_text() {
+    let w = World::new();
+    live_fix(&w);
+    inject(w.svc(), &session("fix"), Injection::ImagePaste).expect("types");
+    assert_eq!(w.host.written.lock().expect("lock")[0].1, b"<image>");
+}
+
+#[test]
+fn an_image_paste_into_a_harness_without_one_says_so_and_types_nothing() {
+    let w = World::new();
+    live_fix(&w);
+    w.harnesses.0.no_image_paste.store(true, Ordering::SeqCst);
+    let result = inject(w.svc(), &session("fix"), Injection::ImagePaste);
+    assert!(matches!(result, Err(Error::NoImagePaste(_))), "{result:?}");
+    assert!(nothing_typed(&w));
+}
+
+#[test]
+fn an_image_paste_is_held_like_a_message() {
+    let w = World::new();
+    live_fix(&w);
+    let launched = Activity::next(
+        None,
+        Reported::main(MainEvent::Launched(crate::activity::Join::Untraced)),
+        SystemTime::now(),
+    );
+    w.store
+        .activities
+        .lock()
+        .expect("lock")
+        .insert(session("fix"), launched);
+    let result = inject(w.svc(), &session("fix"), Injection::ImagePaste);
+    assert!(matches!(result, Err(Error::Held { .. })), "{result:?}");
+    assert!(nothing_typed(&w));
 }
 
 #[test]
@@ -473,7 +510,7 @@ fn a_launched_session_that_has_not_reported_is_booting() {
         .lock()
         .expect("lock")
         .insert(session("fix"), launched);
-    let result = inject(w.svc(), &session("fix"), &prompt("hi"));
+    let result = inject(w.svc(), &session("fix"), Injection::Message(&prompt("hi")));
     assert!(matches!(
         result,
         Err(Error::Held {

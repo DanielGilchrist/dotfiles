@@ -64,6 +64,8 @@ pub enum Error {
     NotRunning(SessionName),
     #[error("nothing sent: {} · {}", .hold.says(.name), .hold.hint())]
     Held { name: SessionName, hold: Hold },
+    #[error("{0}'s harness has no way to paste an image")]
+    NoImagePaste(SessionName),
     #[error("would lose work: {}", describe_hazards(.0))]
     Hazards(Vec<Hazard>),
     #[error("{0} is the session this runs in. Remove it from somewhere else")]
@@ -533,18 +535,35 @@ fn check_typeable<'a>(svc: Services<'_>, name: &'a SessionName) -> Result<Clear<
     }
 }
 
-/// Types `prompt` into the session `clear` is for, using its harness's input
-/// encoding. Sessions agent didn't start get the default harness's.
-fn type_into(svc: Services<'_>, clear: &Clear<'_>, prompt: &Prompt) -> Result<()> {
+/// What is typed into a running session. Text and a harness's own keys are
+/// different variants, so a control byte never travels as text.
+#[derive(Debug, Clone, Copy)]
+pub enum Injection<'a> {
+    /// A message, submitted.
+    Message(&'a Prompt),
+    /// The harness's key for attaching the image on the clipboard, which the
+    /// harness reads itself.
+    ImagePaste,
+}
+
+/// Types `injection` into the session `clear` is for, using its harness's
+/// input encoding. Sessions agent didn't start get the default harness's.
+fn type_into(svc: Services<'_>, clear: &Clear<'_>, injection: Injection<'_>) -> Result<()> {
     let harness = harness_for(svc, clear.name)?;
-    svc.host.write(clear.name, &harness.submit(prompt))?;
+    let bytes = match injection {
+        Injection::Message(prompt) => harness.submit(prompt),
+        Injection::ImagePaste => harness
+            .paste_image()
+            .ok_or_else(|| Error::NoImagePaste(clear.name.clone()))?,
+    };
+    svc.host.write(clear.name, &bytes)?;
     Ok(())
 }
 
-/// Types `prompt` into a running session unless the store shows a menu
+/// Types `injection` into a running session unless the store shows a menu
 /// could take it.
-pub fn inject(svc: Services<'_>, name: &SessionName, prompt: &Prompt) -> Result<()> {
-    type_into(svc, &check_typeable(svc, name)?, prompt)
+pub fn inject(svc: Services<'_>, name: &SessionName, injection: Injection<'_>) -> Result<()> {
+    type_into(svc, &check_typeable(svc, name)?, injection)
 }
 
 /// The harness `name` runs, or the default one for a session agent didn't
@@ -582,7 +601,7 @@ pub fn probe_interrupt(
 fn deliver(svc: Services<'_>, session: &SessionName, task: Option<&Prompt>) -> Result<Delivery> {
     match task {
         Some(task) => {
-            inject(svc, session, task)?;
+            inject(svc, session, Injection::Message(task))?;
             Ok(Delivery::Injected)
         }
         None => Ok(Delivery::None),
@@ -726,7 +745,7 @@ pub fn execute(
             create_worktree(svc, &repo, &worktree, &WorktreeStart::DefaultBase)?;
             let delivery = match clear.zip(task) {
                 Some((clear, task)) => {
-                    type_into(svc, &clear, task)?;
+                    type_into(svc, &clear, Injection::Message(task))?;
                     Delivery::Injected
                 }
                 None => Delivery::None,

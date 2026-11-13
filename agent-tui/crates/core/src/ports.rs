@@ -956,6 +956,10 @@ pub trait Harness: Send + Sync {
     ) -> Result<Option<Seen>, HarnessError>;
     /// The bytes that type `prompt` into a running agent and submit it.
     fn submit(&self, prompt: &Prompt) -> Vec<u8>;
+    /// The bytes that make a running agent attach the image on the clipboard
+    /// of the machine it runs on to its prompt, which the agent reads itself,
+    /// or `None` for a harness with no such key.
+    fn paste_image(&self) -> Option<Vec<u8>>;
     /// A one-shot, non-interactive answer to `question` from the harness's
     /// quickest model (`claude -p`, `codex exec`, …), or `None` if it can't
     /// answer one-off questions. May take seconds: call it off the UI thread.

@@ -34,10 +34,10 @@ use crate::model::{
     repo_matches, unlisted,
 };
 use crate::touched::Baseline;
-use crate::track::{Compose, Found, Probed, Seen};
+use crate::track::{Compose, Found, ImagePaste, Probed, Seen};
 use crate::tree::ChangesView;
 use crate::typed::{Columns, Message};
-use crate::worker::{Job, Msg, Outcome, OutputRead, OutputRequest, SendError};
+use crate::worker::{ImageError, Job, Msg, Outcome, OutputRead, OutputRequest, SendError};
 use agent_core::config::Hop;
 
 mod restart;
@@ -252,6 +252,10 @@ fn step(m: &mut Model, msg: Msg) -> Vec<Effect> {
             on_sent(m, &to, ticket, result);
             Vec::new()
         }
+        Msg::ImagePasted { to, result } => {
+            on_image_pasted(m, &to, result);
+            Vec::new()
+        }
         Msg::Activities(activities) => on_activities(m, activities),
         Msg::Catalogue { repos, warnings } => {
             on_catalogue(m, repos, warnings);
@@ -461,35 +465,91 @@ fn on_paste(m: &mut Model, text: &str) -> Vec<Effect> {
         }
         Overlay::Talk(to) => {
             let to = to.clone();
-            let room = crate::view::talk_room(m.size);
-            if let Some(Compose::Editing { text: typed, .. }) =
-                m.tracked_mut(&to).and_then(|t| t.compose.as_mut())
-            {
-                typed.insert_str(&clean(text, CarriageReturn::Newline, None));
-                if let Some(room) = room {
-                    typed.reveal(room);
-                }
-            }
+            paste_into_talk(m, &to, text);
         }
         Overlay::Comment(CommentDraft { text: typed, .. }) => {
-            typed.insert_str(&clean(text, CarriageReturn::Newline, None));
+            typed.insert_str(&pasted_text(text));
         }
-        Overlay::None
-        | Overlay::Switcher(_)
+        Overlay::None => {
+            if let Some(forwarded) = forward_paste(m, text) {
+                return forwarded;
+            }
+            paste_in_nav(m, text);
+        }
+        Overlay::Switcher(_)
         | Overlay::Picker(_)
         | Overlay::Confirm(_)
         | Overlay::Help(_)
         | Overlay::Actions(_)
         | Overlay::Planning { .. } => {
-            if let Some(c) = m.pane.connection().filter(|c| c.mode == Mode::Agent) {
-                return vec![Effect::Pty {
-                    to: c.name.clone(),
-                    bytes: paste_bytes(&sanitize_paste(text), c.term.modes()),
-                }];
+            if let Some(forwarded) = forward_paste(m, text) {
+                return forwarded;
             }
+            m.info("paste not taken: Esc closes this first");
         }
     }
     Vec::new()
+}
+
+/// A paste for the agent being typed into, if one is.
+fn forward_paste(m: &Model, text: &str) -> Option<Vec<Effect>> {
+    let c = m.pane.connection().filter(|c| c.mode == Mode::Agent)?;
+    Some(vec![Effect::Pty {
+        to: c.name.clone(),
+        bytes: paste_bytes(&sanitize_paste(text), c.term.modes()),
+    }])
+}
+
+/// Pasted text as the message box takes it: terminal escape sequences gone
+/// whole, other controls dropped, newlines normalised.
+fn pasted_text(text: &str) -> String {
+    clean(
+        &agent_term::strip_escapes(text),
+        CarriageReturn::Newline,
+        None,
+    )
+}
+
+/// Inserts a paste into `to`'s message box at its caret, cleaned like typed
+/// text.
+fn paste_into_talk(m: &mut Model, to: &SessionName, text: &str) {
+    let room = crate::view::talk_room(m.size);
+    if let Some(Compose::Editing { text: typed, .. }) =
+        m.tracked_mut(to).and_then(|t| t.compose.as_mut())
+    {
+        typed.insert_str(&pasted_text(text));
+        if let Some(room) = room {
+            typed.reveal(room);
+        }
+    }
+}
+
+/// A paste in NAV opens the box of the agent `s` would, with the paste in
+/// it and nothing sent, or says why it can't. A held agent's box opens as it
+/// does for `s`, with the reason in its title.
+fn paste_in_nav(m: &mut Model, text: &str) {
+    let pasted = pasted_text(text);
+    if pasted.is_empty() {
+        return;
+    }
+    let Some(name) = talk_target(m) else {
+        return m.info("select an agent to paste into");
+    };
+    match open_talk(m, &name, None) {
+        None => {}
+        Some(Opened::Editing) => paste_into_talk(m, &name, &pasted),
+        Some(Opened::Sending) => {
+            m.overlay = Overlay::None;
+            m.info(format!("paste not taken: still sending to {name}"));
+        }
+    }
+}
+
+/// The agent `s` messages: the peek's, else the selected one.
+fn talk_target(m: &Model) -> Option<SessionName> {
+    m.peek_name()
+        .cloned()
+        .or_else(|| m.selected_entry().map(|e| e.name().clone()))
 }
 
 /// "first (+n more{hint})": a warning list as one status line.
@@ -1976,7 +2036,9 @@ fn peek_command(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
     let name = m.peek_name()?.clone();
     match code {
         KeyCode::Esc | KeyCode::Char('v') => m.peek = None,
-        KeyCode::Char('s') => open_talk(m, &name, None),
+        KeyCode::Char('s') => {
+            open_talk(m, &name, None);
+        }
         KeyCode::Char('t') => m.info(SEND_MOVED),
         KeyCode::Char('i') | KeyCode::Enter => return Some(activate(m, &name, Entering::Enter)),
         _ => return None,
@@ -3047,31 +3109,47 @@ fn request_removal(m: &mut Model) -> Vec<Effect> {
     Vec::new()
 }
 
+/// What the box `open_talk` opened holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Opened {
+    Editing,
+    /// A message with the worker, which can't be edited.
+    Sending,
+}
+
 /// Opens the message box for `name`, showing what was left in it, or says
-/// why it can't be messaged.
-fn open_talk(m: &mut Model, name: &SessionName, quote: Option<crate::log::Quote>) {
-    let Some(entry) = m.snapshot().and_then(|s| s.entry(name)).map(|(_, e)| e) else {
-        return;
-    };
+/// why it can't be messaged and returns `None`.
+fn open_talk(
+    m: &mut Model,
+    name: &SessionName,
+    quote: Option<crate::log::Quote>,
+) -> Option<Opened> {
+    let entry = m.snapshot().and_then(|s| s.entry(name)).map(|(_, e)| e)?;
     let to = match m.reachable(entry) {
         Ok(to) => to.name().clone(),
-        Err(why) => return m.info(unreachable_says(name, why)),
+        Err(why) => {
+            m.info(unreachable_says(name, why));
+            return None;
+        }
     };
-    match &mut m.track(&to).compose {
-        Some(Compose::Sending { .. }) => {}
+    let opened = match &mut m.track(&to).compose {
+        Some(Compose::Sending { .. }) => Opened::Sending,
         Some(Compose::Editing { quote: kept, .. }) => {
             if quote.is_some() {
                 *kept = quote;
             }
+            Opened::Editing
         }
         none @ None => {
             *none = Some(Compose::Editing {
                 quote,
                 text: Message::default(),
             });
+            Opened::Editing
         }
-    }
+    };
     m.overlay = Overlay::Talk(to);
+    Some(opened)
 }
 
 /// Opens the peek float on the selected live agent, which the pane moves to
@@ -3187,6 +3265,10 @@ fn on_sent(m: &mut Model, to: &SessionName, ticket: Ticket, result: Result<(), S
     let Some(tracked) = m.agents.get_mut(to) else {
         return;
     };
+    let unpasted = match std::mem::take(&mut tracked.image) {
+        ImagePaste::Failed(reason) => Some(reason),
+        ImagePaste::Idle | ImagePaste::Pending => None,
+    };
     let answered =
         |c: &mut Compose| matches!(c, Compose::Sending { ticket: t, .. } if *t == ticket);
     let Some(Compose::Sending {
@@ -3203,7 +3285,10 @@ fn on_sent(m: &mut Model, to: &SessionName, ticket: Ticket, result: Result<(), S
             if matches!(&m.overlay, Overlay::Talk(open) if open == to) {
                 m.overlay = Overlay::None;
             }
-            m.info(format!("sent to {to}"));
+            match unpasted {
+                Some(reason) => m.warn(format!("sent to {to} · image not pasted: {reason}")),
+                None => m.info(format!("sent to {to}")),
+            }
         }
         Err(e) => {
             tracked.draft.splice(0..0, comments);
@@ -3478,6 +3563,10 @@ fn on_talk_key(m: &mut Model, to: SessionName, key: &KeyEvent) -> Vec<Effect> {
                 }
                 KeyCode::Enter => return talk(m, to),
                 _ if ctrl(key, 'j') => text.insert('\n'),
+                _ if ctrl(key, 'v') => {
+                    m.overlay = Overlay::Talk(to.clone());
+                    return paste_image(m, to);
+                }
                 _ if ctrl(key, 'e') => {
                     let text = text.as_str().to_string();
                     m.overlay = Overlay::Talk(to.clone());
@@ -3494,6 +3583,40 @@ fn on_talk_key(m: &mut Model, to: SessionName, key: &KeyEvent) -> Vec<Effect> {
         }
         None => Vec::new(),
     }
+}
+
+/// Has the agent attach the clipboard's image now, ahead of the message,
+/// which stays in the box. Held like a message, and one at a time.
+fn paste_image(m: &mut Model, to: SessionName) -> Vec<Effect> {
+    if m.track(&to).image == ImagePaste::Pending {
+        m.info("image paste already pending");
+        return Vec::new();
+    }
+    if let Err(why) = typeable(m, &to) {
+        m.info(format!("image not pasted: {why}"));
+        return Vec::new();
+    }
+    m.track(&to).image = ImagePaste::Pending;
+    vec![Effect::Job(Job::PasteImage { to })]
+}
+
+/// The worker had `to` attach the clipboard's image, or couldn't. A failure
+/// is an error and is kept for the status of the message that follows it.
+fn on_image_pasted(m: &mut Model, to: &SessionName, result: Result<(), ImageError>) {
+    let Some(tracked) = m.agents.get_mut(to) else {
+        return;
+    };
+    let reason = match result {
+        Ok(()) => {
+            tracked.image = ImagePaste::Idle;
+            return m.info(format!("image paste sent to {to}"));
+        }
+        Err(ImageError::Held(hold)) => hold.says(to),
+        Err(ImageError::NoKey) => "this harness can't".to_string(),
+        Err(ImageError::Failed(e)) => format!("couldn't paste into {to}: {e}"),
+    };
+    tracked.image = ImagePaste::Failed(reason.clone());
+    m.error(format!("image not pasted: {reason}"));
 }
 
 /// What editing the message for `to` in the editor came to: the text it
@@ -9845,6 +9968,7 @@ mod tests {
     mod entering;
     mod hop;
     mod nav_key;
+    mod paste;
     mod restart;
     mod send_edit;
 }

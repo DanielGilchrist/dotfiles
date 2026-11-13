@@ -4449,6 +4449,13 @@ mod tests {
         assert!(text.contains("⏎ send") && !text.contains("held"), "{text}");
     }
 
+    #[test]
+    fn the_send_box_footer_offers_the_image_paste() {
+        let mut m = fleet(10);
+        let text = send_box(&mut m);
+        assert!(text.contains("⌃V image"), "{text}");
+    }
+
     fn replying(m: &mut Model, quote: &str, text: &str) -> String {
         use crate::log::{Entry, Quote, Whose};
         talking(m, Quote::of(&Entry::Said(quote), Whose::Activity), text);
@@ -4640,7 +4647,7 @@ mod tests {
         let mut m = fleet(10);
         let text = send_box(&mut m);
         assert!(
-            text.contains("⏎ send  ⌥⏎ newline  ⌃E edit  Esc close"),
+            text.contains("⏎ send  ⌥⏎ newline  ⌃E edit  ⌃V image  Esc close"),
             "{text}"
         );
     }

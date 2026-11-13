@@ -1971,6 +1971,7 @@ fn draw_talk(frame: &mut Frame<'_>, m: &Model, to: &SessionName) {
                 ("⏎", "send"),
                 ("⌥⏎", "newline"),
                 ("⌃E", "edit"),
+                ("⌃V", "image"),
                 ("Esc", "close"),
             ]),
         )

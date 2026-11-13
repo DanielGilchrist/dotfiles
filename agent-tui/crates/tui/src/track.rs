@@ -76,6 +76,18 @@ pub enum Compose {
     },
 }
 
+/// Where the last image paste asked of an agent stands.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum ImagePaste {
+    #[default]
+    Idle,
+    /// With the worker, unanswered.
+    Pending,
+    /// It wasn't pasted, for this reason, which the next message's status
+    /// repeats so a later status can't hide it.
+    Failed(String),
+}
+
 /// Everything the model keeps for one agent, dropped together when the
 /// agent leaves the snapshot.
 #[derive(Default)]
@@ -93,6 +105,7 @@ pub struct Tracked {
     /// What is being written to it, or sent and not yet answered. It stays
     /// across the box closing, and goes once the message is typed.
     pub compose: Option<Compose>,
+    pub image: ImagePaste,
     /// Whether a snapshot has listed it, and when this TUI last started or
     /// resurrected its session.
     pub seen: Seen,

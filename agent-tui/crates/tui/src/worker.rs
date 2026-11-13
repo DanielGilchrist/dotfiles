@@ -87,6 +87,11 @@ pub enum Msg {
         ticket: Ticket,
         result: Result<(), SendError>,
     },
+    /// `to` was asked to attach the clipboard's image, and did or didn't.
+    ImagePasted {
+        to: SessionName,
+        result: Result<(), ImageError>,
+    },
     /// The windows besides this TUI's showing each session that has any,
     /// for the look `ticket` asked for, or why that couldn't be told.
     Elsewhere {
@@ -196,6 +201,17 @@ pub enum SendError {
     Failed(Cause),
 }
 
+/// Why an image wasn't pasted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImageError {
+    /// The store says typing would reach a menu or a session that isn't
+    /// ready.
+    Held(Hold),
+    /// The agent's harness has no key for pasting an image.
+    NoKey,
+    Failed(Cause),
+}
+
 pub enum Job {
     /// Type a message into an agent and submit it, if the store still says
     /// nothing holds it.
@@ -203,6 +219,12 @@ pub enum Job {
         to: SessionName,
         prompt: Prompt,
         ticket: Ticket,
+    },
+    /// Have an agent attach the clipboard's image, if the store still says
+    /// nothing holds it. Runs in order with [`Job::Reply`], so the image's
+    /// key is written before a message queued after it.
+    PasteImage {
+        to: SessionName,
     },
     /// Resurrect an exited session the host replays, marking the launch first.
     Resurrect {
@@ -284,6 +306,7 @@ impl Job {
             | Self::Observe { .. }
             | Self::Acknowledge(_)
             | Self::Reply { .. }
+            | Self::PasteImage { .. }
             | Self::Run { .. } => false,
         }
     }
@@ -857,21 +880,7 @@ pub fn spawn(backend: Arc<Backend>, sources: Sources, msgs: Sender<Msg>) -> Work
     let (restarts, restarts_rx) = mpsc::channel::<Restart>();
     let stopping = Arc::new(AtomicBool::new(false));
     let restarter = spawn_restarter(Arc::clone(&backend), msgs.clone(), restarts_rx, &stopping);
-    let (jobs, rx) = mpsc::channel::<Job>();
-    let after = refresh.clone();
-    let worker = thread::spawn(move || {
-        for job in rx {
-            let mutates = job.mutates();
-            if let Some(msg) = run(&backend, job, &msgs)
-                && msgs.send(msg).is_err()
-            {
-                return;
-            }
-            if mutates {
-                let _ = after.send(());
-            }
-        }
-    });
+    let (jobs, worker) = spawn_job_queue(backend, msgs, refresh.clone());
     Workers {
         jobs,
         restarts,
@@ -888,6 +897,30 @@ pub fn spawn(backend: Arc<Backend>, sources: Sources, msgs: Sender<Msg>) -> Work
         refresh,
         worker: Some(worker),
     }
+}
+
+/// The one queue every [`Job`] goes through: they run one at a time in the
+/// order sent, so what the user did first reaches an agent first.
+fn spawn_job_queue(
+    backend: Arc<Backend>,
+    msgs: Sender<Msg>,
+    after: Sender<()>,
+) -> (Sender<Job>, JoinHandle<()>) {
+    let (jobs, rx) = mpsc::channel::<Job>();
+    let worker = thread::spawn(move || {
+        for job in rx {
+            let mutates = job.mutates();
+            if let Some(msg) = run(&backend, job, &msgs)
+                && msgs.send(msg).is_err()
+            {
+                return;
+            }
+            if mutates {
+                let _ = after.send(());
+            }
+        }
+    });
+    (jobs, worker)
 }
 
 /// Runs restarts in the order they come, each answered with a snapshot and
@@ -1005,6 +1038,21 @@ fn snapshot(backend: &Backend) -> Msg {
     )
 }
 
+fn image_error(result: ops::Result<()>) -> Result<(), ImageError> {
+    result.map_err(|e| match e {
+        ops::Error::Held { hold, .. } => ImageError::Held(hold),
+        ops::Error::NoImagePaste(_) => ImageError::NoKey,
+        e => ImageError::Failed(Cause::of(&e)),
+    })
+}
+
+fn send_error(result: ops::Result<()>) -> Result<(), SendError> {
+    result.map_err(|e| match e {
+        ops::Error::Held { hold, .. } => SendError::Held(hold),
+        e => SendError::Failed(Cause::of(&e)),
+    })
+}
+
 /// Runs `job`, returning its reply. An action replies later from its own
 /// thread instead.
 fn run(backend: &Arc<Backend>, job: Job, msgs: &Sender<Msg>) -> Option<Msg> {
@@ -1050,11 +1098,12 @@ fn run(backend: &Arc<Backend>, job: Job, msgs: &Sender<Msg>) -> Option<Msg> {
             result: launch_session(svc, launch, &harness).map_err(err),
         },
         Job::Reply { to, prompt, ticket } => {
-            let result = ops::inject(svc, &to, &prompt).map_err(|e| match e {
-                ops::Error::Held { hold, .. } => SendError::Held(hold),
-                e => SendError::Failed(Cause::of(&e)),
-            });
+            let result = send_error(ops::inject(svc, &to, ops::Injection::Message(&prompt)));
             Msg::Sent { to, ticket, result }
+        }
+        Job::PasteImage { to } => {
+            let result = image_error(ops::inject(svc, &to, ops::Injection::ImagePaste));
+            Msg::ImagePasted { to, result }
         }
         Job::Observe { name, ticket } => Msg::Observed {
             ticket,
@@ -1235,6 +1284,114 @@ mod tests {
         release.send(()).expect("released");
         let second = replies.recv_timeout(PATIENCE).expect("the refresh answer");
         assert_eq!(ticket_of(&second), slow);
+    }
+
+    struct SharedHost(Arc<agent_core::testing::FakeHost>);
+
+    impl agent_core::ports::SessionHost for SharedHost {
+        fn name_limit(&self) -> agent_core::names::NameLimit {
+            self.0.name_limit()
+        }
+        fn sessions(
+            &self,
+        ) -> Result<Vec<agent_core::ports::SessionInfo>, agent_core::ports::HostError> {
+            self.0.sessions()
+        }
+        fn attach(&self, name: &SessionName) -> agent_core::process::LaunchSpec {
+            self.0.attach(name)
+        }
+        fn observe(
+            &self,
+            name: &SessionName,
+        ) -> Result<agent_core::ports::Observation, agent_core::ports::HostError> {
+            self.0.observe(name)
+        }
+        fn create(
+            &self,
+            name: &agent_core::names::HostName,
+            pane: &agent_core::ports::PaneCommand,
+        ) -> Result<agent_core::process::LaunchSpec, agent_core::ports::HostError> {
+            self.0.create(name, pane)
+        }
+        fn start_detached(&self, name: &SessionName) -> Result<(), agent_core::ports::HostError> {
+            self.0.start_detached(name)
+        }
+        fn kill(&self, session: &Running) -> Result<(), agent_core::ports::HostError> {
+            self.0.kill(session)
+        }
+        fn delete(&self, name: &SessionName) -> Result<(), agent_core::ports::HostError> {
+            self.0.delete(name)
+        }
+        fn write(
+            &self,
+            name: &SessionName,
+            bytes: &[u8],
+        ) -> Result<(), agent_core::ports::HostError> {
+            self.0.write(name, bytes)
+        }
+        fn screen(&self, name: &SessionName) -> Result<String, agent_core::ports::HostError> {
+            self.0.screen(name)
+        }
+        fn clients(&self) -> Option<&dyn agent_core::ports::ClientControl> {
+            self.0.clients()
+        }
+        fn nesting_env(&self) -> &'static [&'static str] {
+            self.0.nesting_env()
+        }
+    }
+
+    #[test]
+    fn an_image_paste_and_a_message_run_on_one_queue_in_the_order_they_were_sent() {
+        use agent_core::ports::SessionHost;
+        use agent_core::testing::{
+            FakeForge, FakeHarness, FakeHarnesses, FakeHost, FakeVcs, Journal, MemStore,
+        };
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let root = dir.path().join("src/api");
+        std::fs::create_dir_all(&root).expect("creates");
+        let host = Arc::new(FakeHost::with(Journal::default()));
+        let backend = Arc::new(Backend {
+            vcs: Box::new(FakeVcs::new(&root)),
+            forge: Box::new(FakeForge::default()),
+            host: Box::new(SharedHost(Arc::clone(&host))),
+            store: Box::new(MemStore::default()),
+            harnesses: Box::new(FakeHarnesses(FakeHarness::default())),
+            layout: agent_core::paths::Layout::new(dir.path().join("w")).expect("absolute"),
+            exe: "/bin/agent".into(),
+            own: None,
+        });
+        let (msgs, replies) = mpsc::channel();
+        let (refresh, _) = mpsc::channel();
+        let (jobs, worker) = spawn_job_queue(backend, msgs, refresh);
+        let to: SessionName = "fix".parse().expect("parses");
+        let mut m = crate::fixtures::fleet(1);
+        jobs.send(Job::PasteImage { to: to.clone() }).expect("sent");
+        jobs.send(Job::Reply {
+            to: to.clone(),
+            prompt: "hi".parse().expect("a prompt"),
+            ticket: m.ticket(),
+        })
+        .expect("sent");
+        drop(jobs);
+        worker.join().expect("the queue drains");
+        let answers: Vec<&str> = replies
+            .try_iter()
+            .map(|msg| match msg {
+                Msg::ImagePasted { .. } => "image",
+                Msg::Sent { .. } => "message",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(answers, ["image", "message"]);
+        let written: Vec<Vec<u8>> = host
+            .written
+            .lock()
+            .expect("lock")
+            .iter()
+            .map(|(_, bytes)| bytes.clone())
+            .collect();
+        assert_eq!(written, [b"<image>".to_vec(), b"hi\r".to_vec()]);
+        let _ = host.name_limit();
     }
 
     #[test]

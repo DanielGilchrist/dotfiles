@@ -697,6 +697,8 @@ pub struct FakeHarness {
     pub stop: Arc<Mutex<Stopping>>,
     /// Looking for a survivor fails, as when its registry can't be read.
     pub lookup_fails: AtomicBool,
+    /// The harness has no key for pasting an image.
+    pub no_image_paste: AtomicBool,
     pub journal: Journal,
 }
 
@@ -715,6 +717,7 @@ impl FakeHarness {
             survivors: Lurkers::default(),
             stop: Arc::new(Mutex::new(Stopping::Works)),
             lookup_fails: AtomicBool::new(false),
+            no_image_paste: AtomicBool::new(false),
             journal,
         }
     }
@@ -774,6 +777,10 @@ impl Harness for FakeHarness {
 
     fn submit(&self, prompt: &Prompt) -> Vec<u8> {
         format!("{prompt}\r").into_bytes()
+    }
+
+    fn paste_image(&self) -> Option<Vec<u8>> {
+        (!self.no_image_paste.load(Ordering::SeqCst)).then(|| b"<image>".to_vec())
     }
 
     fn survivor(&self, workdir: &Path, _: Option<&TranscriptRef>) -> Result<Lookup, HarnessError> {

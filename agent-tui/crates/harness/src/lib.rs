@@ -746,6 +746,11 @@ impl Harness for Claude {
     fn submit(&self, prompt: &Prompt) -> Vec<u8> {
         format!("\x1b[200~{prompt}\x1b[201~\r").into_bytes()
     }
+
+    /// Claude Code reads the clipboard's image itself on ctrl-v.
+    fn paste_image(&self) -> Option<Vec<u8>> {
+        Some(vec![0x16])
+    }
 }
 
 pub struct Registry {
@@ -1524,6 +1529,12 @@ fn background_commands(tasks: &[Lenient<BackgroundTask>]) -> Vec<ListedCommand> 
 mod tests {
     use super::*;
     use agent_core::ports::{CallState, LogEntry};
+
+    #[test]
+    fn claude_pastes_an_image_with_ctrl_v_alone() {
+        let claude = Claude::new(Path::new("/h"));
+        assert_eq!(claude.paste_image(), Some(vec![0x16]));
+    }
 
     #[test]
     fn project_dir_matches_claude_codes_slugs() {
