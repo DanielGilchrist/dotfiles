@@ -1066,7 +1066,14 @@ fn output_rows(m: &Model, name: &SessionName, id: &TaskId, columns: usize) -> Ou
             follows = true;
         }
     }
-    rows.push(note(&format!("as of {} ago", ago(last.at, m.clock.wall))));
+    if let CommandOutput::Tail(tail) = &last.output
+        && let Some(changed) = tail.changed()
+    {
+        rows.push(note(&format!(
+            "last output {} ago",
+            ago(changed, m.clock.wall)
+        )));
+    }
     OutputRows { rows, follows }
 }
 

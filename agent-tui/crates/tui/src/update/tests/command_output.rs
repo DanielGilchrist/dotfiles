@@ -314,3 +314,41 @@ fn what_was_read_of_a_command_is_dropped_once_it_is_unlisted_and_the_cursor_has_
     update(&mut m, Msg::Focus(TerminalFocus::Focused));
     assert!(m.command_output(&name(AGENT), &id("c1")).is_none());
 }
+
+#[test]
+fn switching_to_another_row_and_back_keeps_the_answer_and_does_not_ask_again_before_the_refresh() {
+    let mut m = on_command(&["c1", "c2"]);
+    let (shown, ticket, _) = reads(tick(&mut m)).remove(0);
+    answer(&mut m, AGENT, &shown, ticket, Ok(tail("kept\n")));
+    m.point_at_row(|_, _| 0);
+    let soon = later(&m, Duration::from_secs(1));
+    assert_eq!(
+        reads(tick_at(&mut m, soon)),
+        Vec::new(),
+        "on the activity row"
+    );
+    m.point_at_row(|_, last| last);
+    let back = later(&m, Duration::from_secs(1));
+    assert_eq!(
+        reads(tick_at(&mut m, back)),
+        Vec::new(),
+        "back on the command's row"
+    );
+    assert_eq!(heard(&m, &shown).as_deref(), Some("kept\n"));
+}
+
+#[test]
+fn a_row_shown_again_after_the_refresh_asks_again_and_keeps_the_answer_meanwhile() {
+    let mut m = on_command(&["c1"]);
+    let ticket = reads(tick(&mut m))[0].1;
+    answer(&mut m, AGENT, "c1", ticket, Ok(tail("kept\n")));
+    m.point_at_row(|_, _| 0);
+    m.point_at_row(|_, last| last);
+    let due = later(&m, OUTPUT_REFRESH);
+    assert_eq!(reads(tick_at(&mut m, due)).len(), 1);
+    assert_eq!(
+        heard(&m, "c1").as_deref(),
+        Some("kept\n"),
+        "never back to reading"
+    );
+}

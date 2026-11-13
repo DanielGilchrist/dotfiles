@@ -536,6 +536,7 @@ impl Runtime {
                     }
                 }
                 Effect::EditTask(task) => self.edit_form_task(m, terminal, &task),
+                Effect::EditMessage { to, text } => self.edit_message(m, terminal, &to, &text),
             }
         }
         Ok(Flow::Continue)
@@ -618,6 +619,30 @@ impl Runtime {
             }
             Ok(None) => {}
             Err(e) => m.error(format!("{e:#}")),
+        }
+    }
+
+    fn edit_message(
+        &self,
+        m: &mut Model,
+        terminal: &mut DefaultTerminal,
+        to: &SessionName,
+        text: &str,
+    ) {
+        Self::fill_screen(m, terminal);
+        let edited = self.edit_task(terminal, text);
+        m.clock = Moment::now();
+        let Some(lost) = update::message_edited(m, to, edited.map_err(|e| format!("{e:#}"))) else {
+            return;
+        };
+        match write_transcript(&format!("{to}-message"), &lost) {
+            Ok(path) => m.error(format!(
+                "the edited message was dropped: {to} is gone · kept in {}",
+                path.display()
+            )),
+            Err(e) => m.error(format!(
+                "the edited message was dropped: {to} is gone · {e:#}"
+            )),
         }
     }
 

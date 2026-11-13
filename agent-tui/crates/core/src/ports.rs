@@ -1036,6 +1036,18 @@ impl CommandOutput {
     pub fn of(text: String, cut: Cut) -> Self {
         OutputTail::new(text, cut).map_or(Self::Empty, Self::Tail)
     }
+
+    /// With the time the output last changed, when there is output.
+    #[must_use]
+    pub fn changed_at(self, at: SystemTime) -> Self {
+        match self {
+            Self::Tail(tail) => Self::Tail(OutputTail {
+                changed: Some(at),
+                ..tail
+            }),
+            other => other,
+        }
+    }
 }
 
 /// How much of what a command printed a text is.
@@ -1055,12 +1067,17 @@ pub enum Cut {
 pub struct OutputTail {
     text: String,
     cut: Cut,
+    changed: Option<SystemTime>,
 }
 
 impl OutputTail {
     /// `None` for no text, which is no output.
     pub fn new(text: String, cut: Cut) -> Option<Self> {
-        (!text.is_empty()).then_some(Self { text, cut })
+        (!text.is_empty()).then_some(Self {
+            text,
+            cut,
+            changed: None,
+        })
     }
 
     pub fn text(&self) -> &str {
@@ -1069,6 +1086,11 @@ impl OutputTail {
 
     pub fn cut(&self) -> Cut {
         self.cut
+    }
+
+    /// When the output last changed, if the harness knows.
+    pub fn changed(&self) -> Option<SystemTime> {
+        self.changed
     }
 
     /// Where in the file the text starts.

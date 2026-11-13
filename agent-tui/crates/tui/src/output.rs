@@ -1,6 +1,6 @@
 //! What a background command has printed, as [0]'s command document shows it.
 
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use agent_core::ports::{CommandOutput, Cut};
 
@@ -178,7 +178,6 @@ impl Wrapped {
 /// What the harness said of a command's output and when.
 pub struct Read {
     pub output: CommandOutput,
-    pub at: SystemTime,
     /// Its text as lines, when it has any.
     pub shown: Option<Shown>,
 }
@@ -396,7 +395,7 @@ impl OutputWatch {
             }
             Ok(output) => {
                 self.failure = None;
-                gone = self.replace(output, moment.wall);
+                gone = self.replace(output);
             }
         }
         let moved = match &self.wrapped {
@@ -422,7 +421,7 @@ impl OutputWatch {
 
     /// Keeps `output` as the last, and says how much of the text's front it
     /// took off, in rows.
-    fn replace(&mut self, output: CommandOutput, at: SystemTime) -> DroppedRows {
+    fn replace(&mut self, output: CommandOutput) -> DroppedRows {
         let shown = match &output {
             CommandOutput::Tail(tail) => Some(Shown::of(tail.text())),
             CommandOutput::Unlocated
@@ -430,7 +429,7 @@ impl OutputWatch {
             | CommandOutput::Gone
             | CommandOutput::Empty => None,
         };
-        let new = Read { output, at, shown };
+        let new = Read { output, shown };
         let rows = self.wrapped.as_ref().filter(|wrapped| !wrapped.stale);
         let gone = match (self.last.as_ref().and_then(|old| dropped(old, &new)), rows) {
             (Some(Dropped::Lines(lines)), Some(wrapped)) => {
@@ -487,6 +486,7 @@ impl OutputWatch {
 mod tests {
     use super::*;
     use crate::model::Model;
+    use std::time::SystemTime;
 
     fn shown(text: &str) -> Shown {
         Shown::of(text)
@@ -530,11 +530,7 @@ mod tests {
     fn read(text: &str, cut: Cut) -> Read {
         let output = CommandOutput::of(text.to_string(), cut);
         let shown = Some(Shown::of(text));
-        Read {
-            output,
-            at: SystemTime::now(),
-            shown,
-        }
+        Read { output, shown }
     }
 
     #[test]

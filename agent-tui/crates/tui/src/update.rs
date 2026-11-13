@@ -164,6 +164,11 @@ pub enum Effect {
     Edit(Open),
     /// Suspend the TUI and edit the new-agent task in `$EDITOR`.
     EditTask(String),
+    /// Suspend the TUI and edit the message written for `to` in `$EDITOR`.
+    EditMessage {
+        to: SessionName,
+        text: String,
+    },
     Quit,
     /// Type bytes into `to`'s terminal, if it is still the connected one.
     Pty {
@@ -3217,6 +3222,11 @@ fn on_talk_key(m: &mut Model, to: SessionName, key: &KeyEvent) -> Vec<Effect> {
                 }
                 KeyCode::Enter => return talk(m, to),
                 _ if ctrl(key, 'j') => text.insert('\n'),
+                _ if ctrl(key, 'e') => {
+                    let text = text.as_str().to_string();
+                    m.overlay = Overlay::Talk(to.clone());
+                    return vec![Effect::EditMessage { to, text }];
+                }
                 KeyCode::Backspace if text.is_empty() => *quote = None,
                 _ => edit(text, key, room.map(|r| r.columns)),
             }
@@ -3228,6 +3238,44 @@ fn on_talk_key(m: &mut Model, to: SessionName, key: &KeyEvent) -> Vec<Effect> {
         }
         None => Vec::new(),
     }
+}
+
+/// What editing the message for `to` in the editor came to: the text it
+/// ended with goes back to the box, with the caret at its end and nothing
+/// sent. A cancelled editor and a failed one leave the text as it was. The
+/// quote and the drafted review comments are not part of it. When the box is
+/// gone by the time the editor returns, the status says so and the text is
+/// given back for the caller to keep.
+#[must_use]
+pub fn message_edited(
+    m: &mut Model,
+    to: &SessionName,
+    result: Result<Option<String>, String>,
+) -> Option<String> {
+    let edited = match result {
+        Ok(Some(edited)) => edited,
+        Ok(None) => return None,
+        Err(why) => {
+            m.error(why);
+            return None;
+        }
+    };
+    let room = crate::view::talk_room(m.size);
+    let Some(Compose::Editing { text, .. }) = m
+        .tracked_mut(to)
+        .and_then(|tracked| tracked.compose.as_mut())
+    else {
+        if edited.trim().is_empty() {
+            return None;
+        }
+        m.error(format!("the edited message was dropped: {to} is gone"));
+        return Some(edited);
+    };
+    *text = Message::from(edited.as_str());
+    if let Some(room) = room {
+        text.reveal(room);
+    }
+    None
 }
 
 fn on_comment_key(m: &mut Model, mut draft: CommentDraft, key: &KeyEvent) -> Vec<Effect> {
@@ -7665,7 +7713,7 @@ mod tests {
         type_text(&mut m, "d");
         update(&mut m, key_with(KeyCode::Char('a'), KeyModifiers::CONTROL));
         type_text(&mut m, "^");
-        update(&mut m, key_with(KeyCode::Char('e'), KeyModifiers::CONTROL));
+        update(&mut m, key(KeyCode::End));
         type_text(&mut m, "$");
         assert_eq!(talk_of(&m), Some((None, "^bcd$")));
     }
@@ -9527,4 +9575,5 @@ mod tests {
     mod command_output;
     mod elsewhere;
     mod restart;
+    mod send_edit;
 }

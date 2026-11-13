@@ -144,9 +144,13 @@ impl OutputFile {
     /// The last `window` bytes. Only a file with no bytes is no output: one
     /// whose window holds no whole line shows the window.
     pub(crate) fn tail(mut self, window: u64) -> io::Result<CommandOutput> {
-        let len = self.file.metadata()?.len();
-        let Window { bytes, start } = read_window(&mut self.file, len, window)?;
-        Ok(decode(&bytes, start))
+        let meta = self.file.metadata()?;
+        let Window { bytes, start } = read_window(&mut self.file, meta.len(), window)?;
+        let output = decode(&bytes, start);
+        Ok(match meta.modified() {
+            Ok(modified) => output.changed_at(modified),
+            Err(_) => output,
+        })
     }
 }
 
@@ -202,6 +206,122 @@ fn decode(bytes: &[u8], start: u64) -> CommandOutput {
             from: start + skipped as u64,
         },
     )
+}
+
+/// Where `task`'s output file is, if a session of `project` has one under
+/// `<root>/claude-<uid>/<project>/<session>/tasks/` as a regular file, the
+/// newest when several do. A task id is unique to a command, so no
+/// transcript is needed to find it, and what is found is only a path to be
+/// opened through [`OutputFile`]. It costs one stat per session directory of
+/// the project, and a session directory that can't be read is skipped.
+pub(crate) fn find_in_tasks(
+    root: &Path,
+    me: Uid,
+    project: &std::ffi::OsStr,
+    task: &TaskId,
+) -> io::Result<Option<PathBuf>> {
+    let plain = task
+        .as_str()
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    if !plain {
+        return Ok(None);
+    }
+    let sessions = match std::fs::read_dir(root.join(format!("claude-{me}")).join(project)) {
+        Ok(sessions) => sessions,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let name = format!("{}.output", task.as_str());
+    let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
+    for session in sessions.filter_map(Result::ok) {
+        let candidate = session.path().join("tasks").join(&name);
+        let Ok(meta) = std::fs::symlink_metadata(&candidate) else {
+            continue;
+        };
+        let Ok(modified) = meta.modified() else {
+            continue;
+        };
+        if !meta.file_type().is_file() {
+            continue;
+        }
+        if newest.as_ref().is_none_or(|(at, _)| modified > *at) {
+            newest = Some((modified, candidate));
+        }
+    }
+    Ok(newest.map(|(_, path)| path))
+}
+
+/// Where the output files of commands were found by name, so a command's
+/// project is not listed on every read. A path is only a candidate: it is
+/// opened through [`OutputFile`] every time it is read, and the project is
+/// listed again every [`RELIST_EVERY`] reads, so a newer file of the same
+/// name replaces it.
+#[derive(Default)]
+pub(crate) struct TaskFiles {
+    found: Mutex<HashMap<(std::ffi::OsString, String), Remembered>>,
+}
+
+struct Remembered {
+    path: PathBuf,
+    reads: u32,
+}
+
+/// How many reads of a remembered file go by before its project is listed
+/// again.
+const RELIST_EVERY: u32 = 10;
+
+/// How many commands' files are remembered.
+const REMEMBERED_TASKS: usize = 1024;
+
+impl TaskFiles {
+    /// The file of `task` in `project`, from memory or by looking.
+    pub(crate) fn of(
+        &self,
+        root: &Path,
+        me: Uid,
+        project: &std::ffi::OsStr,
+        task: &TaskId,
+    ) -> io::Result<Option<PathBuf>> {
+        let key = (project.to_os_string(), task.as_str().to_string());
+        {
+            let mut remembered = self.found.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(known) = remembered.get_mut(&key) {
+                known.reads += 1;
+                if known.reads < RELIST_EVERY {
+                    return Ok(Some(known.path.clone()));
+                }
+            }
+        }
+        let found = find_in_tasks(root, me, project, task)?;
+        let mut remembered = self.found.lock().unwrap_or_else(PoisonError::into_inner);
+        match &found {
+            Some(path) => {
+                if remembered.len() >= REMEMBERED_TASKS {
+                    remembered.clear();
+                }
+                remembered.insert(
+                    key,
+                    Remembered {
+                        path: path.clone(),
+                        reads: 0,
+                    },
+                );
+            }
+            None => {
+                remembered.remove(&key);
+            }
+        }
+        Ok(found)
+    }
+
+    /// Forgets `task`'s file, which is no longer to be trusted.
+    pub(crate) fn forget(&self, project: &std::ffi::OsStr, task: &TaskId) {
+        self.found
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&(project.to_os_string(), task.as_str().to_string()));
+    }
 }
 
 /// Where the transcripts read so far say commands write. What each session's
@@ -413,10 +533,27 @@ fn announcement(line: &[u8]) -> Option<(String, PathBuf)> {
         .pointer("/toolUseResult/backgroundTaskId")
         .and_then(Value::as_str);
     result_texts(&record).into_iter().find_map(|text| {
-        let (id, path) = announced_in(&text)?;
-        recorded
-            .is_none_or(|recorded| recorded == id)
-            .then(|| (id.to_string(), PathBuf::from(path)))
+        let (id, path) = match recorded {
+            Some(recorded) => (recorded, written_to(&text, recorded)?),
+            None => announced_in(&text)?,
+        };
+        Some((id.to_string(), PathBuf::from(path)))
+    })
+}
+
+/// The path a tool result's text says `id` writes to, wherever in the text it
+/// says so: a command that printed before it was moved to the background has
+/// its output first. It is the word after `Output is being written to: `, and
+/// it must end in `/<id>.output`, and may be quoted or end a sentence. A path
+/// with spaces in it is not found.
+fn written_to<'a>(text: &'a str, id: &str) -> Option<&'a str> {
+    let name = format!("/{id}.output");
+    text.match_indices(OUTPUT_MARKER).find_map(|(at, _)| {
+        let word = text[at + OUTPUT_MARKER.len()..].split_whitespace().next()?;
+        let path = word
+            .trim_start_matches(['"', '\''])
+            .trim_end_matches(['.', ',', ')', ';', '"', '\'']);
+        path.ends_with(&name).then_some(path)
     })
 }
 
@@ -435,10 +572,7 @@ fn announced_in(text: &str) -> Option<(&str, &str)> {
     if !after.starts_with(ends) {
         return None;
     }
-    let rest = &text[text.find(OUTPUT_MARKER)? + OUTPUT_MARKER.len()..];
-    let name = format!("{id}.output");
-    let end = rest.find(&name)? + name.len();
-    Some((id, &rest[..end]))
+    Some((id, written_to(text, id)?))
 }
 
 /// The id `text` starts with.
@@ -793,6 +927,89 @@ mod tests {
     }
 
     const WHERE_IT_WRITES: &str = "/tmp/claude-501/p/s/tasks/b1.output";
+
+    #[test]
+    fn a_command_that_printed_before_it_was_moved_to_the_background_is_found_by_its_task_id_field()
+    {
+        let text = format!(
+            "warning: build failed\n{TIMED_OUT}120s timeout and was {MOVED}b1). Output is being written to: {WHERE_IT_WRITES}. You will be notified"
+        );
+        let line = result_line(&text, r#","toolUseResult":{"backgroundTaskId":"b1"}"#);
+        let (_dir, file) = transcript(&[line]);
+        assert_eq!(find(&file, "b1"), Some(PathBuf::from(WHERE_IT_WRITES)));
+    }
+
+    #[test]
+    fn a_text_that_names_another_tasks_file_and_then_ours_does_not_yield_a_garbage_path() {
+        let text = "Output is being written to: /x/B.output and then /y/A.output";
+        assert_eq!(written_to(text, "A"), None);
+        assert_eq!(written_to(text, "B"), Some("/x/B.output"));
+    }
+
+    #[test]
+    fn the_path_must_be_the_whole_word_ending_in_a_slash_and_the_name() {
+        assert_eq!(
+            written_to("Output is being written to: /x/xA.output.", "A"),
+            None
+        );
+        assert_eq!(
+            written_to("Output is being written to: A.output.", "A"),
+            None
+        );
+        assert_eq!(
+            written_to("Output is being written to: /x/A.output. You", "A"),
+            Some("/x/A.output")
+        );
+    }
+
+    #[test]
+    fn a_later_text_of_the_same_record_is_tried_when_an_earlier_one_has_no_usable_path() {
+        let first = "Output is being written to: /x/B.output.";
+        let second = "Output is being written to: /tmp/claude-501/p/s/tasks/b1.output. You";
+        let line = format!(
+            r#"{{"type":"user","toolUseResult":{{"backgroundTaskId":"b1"}},"message":{{"content":[{{"type":"tool_result","content":{}}},{{"type":"tool_result","content":{}}}]}}}}"#,
+            serde_json::to_string(first).expect("json"),
+            serde_json::to_string(second).expect("json")
+        );
+        let (_dir, file) = transcript(&[line]);
+        assert_eq!(find(&file, "b1"), Some(PathBuf::from(WHERE_IT_WRITES)));
+    }
+
+    #[test]
+    fn a_quoted_path_or_one_ending_a_sentence_or_a_list_is_taken_without_its_punctuation() {
+        for text in [
+            "Output is being written to: \"/x/A.output\" now",
+            "Output is being written to: '/x/A.output'.",
+            "Output is being written to: /x/A.output, then",
+            "(Output is being written to: /x/A.output)",
+            "Output is being written to: /x/A.output; more",
+        ] {
+            assert_eq!(written_to(text, "A"), Some("/x/A.output"), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_path_with_spaces_is_not_found() {
+        assert_eq!(
+            written_to("Output is being written to: /my dir/A.output.", "A"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_second_marker_in_one_text_is_tried_when_the_first_is_for_another_task() {
+        let text = "Output is being written to: /x/B.output. then Output is being written to: /y/A.output. end";
+        assert_eq!(written_to(text, "A"), Some("/y/A.output"));
+    }
+
+    #[test]
+    fn printed_text_before_the_announcement_is_not_enough_without_the_task_id_field() {
+        let text = format!(
+            "warning: build failed\n{TIMED_OUT}120s timeout and was {MOVED}b1). Output is being written to: {WHERE_IT_WRITES}. You"
+        );
+        let (_dir, file) = transcript(&[result_line(&text, "")]);
+        assert_eq!(find(&file, "b1"), None);
+    }
 
     #[test]
     fn the_task_id_field_and_the_text_together_find_the_path() {

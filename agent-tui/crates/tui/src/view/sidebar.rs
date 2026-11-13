@@ -4522,7 +4522,10 @@ mod tests {
     fn the_send_box_hints_name_the_newline_key() {
         let mut m = fleet(10);
         let text = send_box(&mut m);
-        assert!(text.contains("⏎ send  ⌥⏎ newline  Esc close"), "{text}");
+        assert!(
+            text.contains("⏎ send  ⌥⏎ newline  ⌃E edit  Esc close"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -6346,17 +6349,16 @@ mod tests {
                 assert!(text.contains("permission denied"), "{text}");
             }
 
+            fn changed_minutes_ago(text: &str, minutes: u64, m: &Model) -> CommandOutput {
+                CommandOutput::of(text.into(), Cut::Whole)
+                    .changed_at(m.clock.wall - Duration::from_mins(minutes))
+            }
+
             #[test]
-            fn the_tail_shows_below_the_facts_with_how_old_the_answer_is() {
+            fn the_tail_shows_below_the_facts_with_how_long_ago_the_output_last_changed() {
                 let mut m = showing();
-                hear(
-                    &mut m,
-                    Ok(CommandOutput::of(
-                        "compiling\nfinished\n".into(),
-                        Cut::Whole,
-                    )),
-                );
-                m.clock.wall += Duration::from_secs(5);
+                let output = changed_minutes_ago("compiling\nfinished\n", 4, &m);
+                hear(&mut m, Ok(output));
                 let rows = page(&mut m, SIZE);
                 let at = |needle: &str| rows.iter().position(|row| row.contains(needle));
                 let (facts, heading, first, last, age) = (
@@ -6364,11 +6366,80 @@ mod tests {
                     at("Output"),
                     at("compiling"),
                     at("finished"),
-                    rows.iter().rposition(|row| row.contains("as of 5s ago")),
+                    at("last output 4m ago"),
                 );
                 assert!(
                     facts < heading && heading < first && first < last && last < age,
                     "{rows:#?}"
+                );
+            }
+
+            #[test]
+            fn the_age_counts_from_the_files_time_and_not_from_when_it_was_read() {
+                let mut m = showing();
+                let output = changed_minutes_ago("compiling\n", 4, &m);
+                hear(&mut m, Ok(output.clone()));
+                m.clock.wall += Duration::from_secs(90);
+                hear(&mut m, Ok(output));
+                let text = text(&mut m);
+                assert!(text.contains("last output 5m ago"), "{text}");
+                assert!(!text.contains("1s ago"), "{text}");
+            }
+
+            #[test]
+            fn the_section_has_no_read_time_row() {
+                let mut m = showing();
+                let output = changed_minutes_ago("compiling\n", 4, &m);
+                hear(&mut m, Ok(output));
+                let rows = page(&mut m, SIZE);
+                let heading = rows
+                    .iter()
+                    .position(|r| r.contains("Output"))
+                    .expect("shown");
+                assert!(
+                    rows[heading..].iter().all(|row| !row.contains("as of")),
+                    "{rows:#?}"
+                );
+            }
+
+            #[test]
+            fn output_whose_time_is_unknown_shows_no_age() {
+                let mut m = showing();
+                hear(
+                    &mut m,
+                    Ok(CommandOutput::of("compiling\n".into(), Cut::Whole)),
+                );
+                let text = text(&mut m);
+                assert!(
+                    text.contains("compiling") && !text.contains("last output"),
+                    "{text}"
+                );
+            }
+
+            #[test]
+            fn the_last_answer_stays_on_screen_while_the_read_the_tick_asked_for_is_in_flight() {
+                let mut m = showing();
+                hear(
+                    &mut m,
+                    Ok(CommandOutput::of("kept text\n".into(), Cut::Whole)),
+                );
+                m.point_at_row(|_, _| 0);
+                m.point_at_row(|_, last| last);
+                let later = crate::model::Moment {
+                    wall: m.clock.wall + Duration::from_secs(4),
+                    mono: m.clock.mono + Duration::from_secs(4),
+                };
+                let asked = crate::update::tick_at(&mut m, later);
+                assert!(
+                    asked
+                        .iter()
+                        .any(|e| matches!(e, crate::update::Effect::ReadCommandOutput(_))),
+                    "the row shown again after the refresh asks"
+                );
+                let text = text(&mut m);
+                assert!(
+                    text.contains("kept text") && !text.contains("reading…"),
+                    "{text}"
                 );
             }
 

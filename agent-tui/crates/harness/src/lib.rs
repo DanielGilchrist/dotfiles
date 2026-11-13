@@ -18,7 +18,7 @@ use serde::Deserialize;
 
 use crate::background::{Found, JobId, ProcStart, Survivor};
 use crate::conversation::{Chains, Conversation, SessionId};
-use crate::output::{Located, Locations, OUTPUT_BYTES, OutputFile, Refusal};
+use crate::output::{Located, Locations, OUTPUT_BYTES, OutputFile, Refusal, TaskFiles};
 use crate::stopping::{Patience, Processes};
 
 mod activity;
@@ -91,6 +91,7 @@ pub struct Claude {
     /// directory needs this changed.
     tasks: PathBuf,
     outputs: Locations,
+    task_files: TaskFiles,
     permission_mode: String,
     add_dirs: Vec<PathBuf>,
     chains: Chains,
@@ -115,6 +116,7 @@ impl Claude {
             sessions: home.join(".claude/sessions"),
             tasks: PathBuf::from("/tmp"),
             outputs: Locations::default(),
+            task_files: TaskFiles::default(),
             permission_mode: "auto".into(),
             add_dirs: vec![PathBuf::from("/tmp")],
             chains: Chains::default(),
@@ -149,9 +151,45 @@ impl Claude {
         })
     }
 
+    /// Where a session of `workdir`'s project has the output file of `task`,
+    /// if one does. A task id is unique to a command, and Claude Code names
+    /// its task directory after the session its process started under, which
+    /// a `/clear` or a resume leaves behind, so this finds what no transcript
+    /// of the conversation's chain names. A project that can't be listed has
+    /// no such file as far as this can say.
+    fn task_output_in_project(&self, workdir: &Path, task: &TaskId) -> Option<PathBuf> {
+        let project = self.project_dir(workdir);
+        let slug = project.file_name()?;
+        self.task_files
+            .of(&self.tasks, nix::unistd::getuid(), slug, task)
+            .ok()
+            .flatten()
+    }
+
+    /// What the agent's transcript and its subagents' say of where `task`
+    /// writes.
+    fn output_named_by_transcripts(
+        &self,
+        workdir: &Path,
+        at: Option<&TranscriptRef>,
+        task: &TaskId,
+    ) -> io::Result<Located> {
+        match self.activity_file(workdir, at)? {
+            Some(transcript) => self.outputs.of(&transcript, task),
+            None => Ok(Located::Nowhere),
+        }
+    }
+
     /// Claude Code stores transcripts under the working directory with every
-    /// non-alphanumeric character replaced by `-`.
+    /// non-alphanumeric character replaced by `-`. The directory is named
+    /// from `workdir` resolved through links when it can be, which is how
+    /// the transcripts of the agents seen so far are named. Claude Code's rule
+    /// for a path reached through a link, or one too long to be a directory
+    /// name, is not verified.
     fn project_dir(&self, workdir: &Path) -> PathBuf {
+        let workdir = workdir
+            .canonicalize()
+            .unwrap_or_else(|_| workdir.to_path_buf());
         let slug: String = workdir
             .to_string_lossy()
             .chars()
@@ -636,18 +674,36 @@ impl Harness for Claude {
             context: format!("reading the output of command {}", task.as_str()),
             source,
         };
-        let Some(transcript) = self.activity_file(workdir, at).map_err(context)? else {
-            return Ok(CommandOutput::Unlocated);
+        let me = nix::unistd::getuid();
+        let named = self.task_output_in_project(workdir, task);
+        let refused = match named
+            .as_deref()
+            .map(|path| OutputFile::open(&self.tasks, path, task, me))
+        {
+            Some(Ok(file)) => return file.tail(OUTPUT_BYTES).map_err(context),
+            Some(Err(refusal)) => {
+                if let Some(slug) = self.project_dir(workdir).file_name() {
+                    self.task_files.forget(slug, task);
+                }
+                Some(refusal)
+            }
+            None => None,
         };
-        let claimed = match self.outputs.of(&transcript, task).map_err(context)? {
-            Located::At(claimed) => claimed,
-            Located::Nowhere => return Ok(CommandOutput::Unlocated),
-            Located::Searching => return Ok(CommandOutput::Searching),
+        let claimed = match self.output_named_by_transcripts(workdir, at, task) {
+            Ok(Located::At(claimed)) => claimed,
+            Ok(Located::Nowhere) => {
+                return match refused {
+                    Some(Refusal::Gone) | None => Ok(CommandOutput::Unlocated),
+                    Some(refusal) => Err(context(io::Error::other(refusal.to_string()))),
+                };
+            }
+            Ok(Located::Searching) => return Ok(CommandOutput::Searching),
+            Err(e) => return Err(context(e)),
         };
-        let file = match OutputFile::open(&self.tasks, &claimed, task, nix::unistd::getuid()) {
+        let file = match OutputFile::open(&self.tasks, &claimed, task, me) {
             Ok(file) => file,
             Err(Refusal::Gone) => return Ok(CommandOutput::Gone),
-            Err(refused) => return Err(context(io::Error::other(refused.to_string()))),
+            Err(refusal) => return Err(context(io::Error::other(refusal.to_string()))),
         };
         file.tail(OUTPUT_BYTES).map_err(context)
     }
@@ -2919,9 +2975,12 @@ mod tests {
         fn the_tail_of_the_file_the_transcript_names_is_read() {
             let s = setup(announces);
             std::fs::write(&s.output, "building\ndone\n").expect("writes");
+            let modified = std::fs::metadata(&s.output)
+                .and_then(|m| m.modified())
+                .expect("a time");
             assert_eq!(
                 read(&s),
-                CommandOutput::of("building\ndone\n".into(), Cut::Whole)
+                CommandOutput::of("building\ndone\n".into(), Cut::Whole).changed_at(modified)
             );
         }
 
@@ -2954,6 +3013,353 @@ mod tests {
                 "{said}"
             );
             assert!(!said.contains("secret"));
+        }
+    }
+
+    mod command_output_layout {
+        use super::*;
+        use agent_core::ports::Cut;
+        use std::os::unix::fs::symlink;
+
+        /// A conversation as Claude Code lays it out: the transcript the hooks
+        /// report in session B, the subagent transcript that announced the
+        /// task in session A's `subagents/`, and the output file under a
+        /// session of its own.
+        struct Layout {
+            _home: tempfile::TempDir,
+            tasks: tempfile::TempDir,
+            work: tempfile::TempDir,
+            claude: Claude,
+            main_in_b: TranscriptRef,
+            tasks_of: PathBuf,
+        }
+
+        fn task() -> TaskId {
+            "ba8zzg27b".parse().expect("visible")
+        }
+
+        fn layout() -> Layout {
+            let home = tempfile::tempdir().expect("a temp dir");
+            let tasks = tempfile::tempdir().expect("a temp dir");
+            let work = tempfile::tempdir().expect("a temp dir");
+            let mut claude = Claude::with_program(home.path(), "/usr/bin/true".into());
+            claude.tasks = tasks.path().to_path_buf();
+            let project = claude.project_dir(&work.path().canonicalize().expect("exists"));
+            std::fs::create_dir_all(project.join("session-a/subagents")).expect("creates");
+            let main_in_b = project.join("session-b.jsonl");
+            std::fs::write(&main_in_b, "{}\n").expect("writes");
+            let slug = project.file_name().expect("a slug").to_owned();
+            let tasks_of = tasks
+                .path()
+                .join(format!("claude-{}", nix::unistd::getuid()))
+                .join(slug);
+            Layout {
+                _home: home,
+                tasks,
+                work,
+                claude,
+                main_in_b: TranscriptRef::new(main_in_b.to_string_lossy()),
+                tasks_of,
+            }
+        }
+
+        impl Layout {
+            fn output_in(&self, session: &str) -> PathBuf {
+                let dir = self.tasks_of.join(session).join("tasks");
+                std::fs::create_dir_all(&dir).expect("creates");
+                dir.join("ba8zzg27b.output")
+            }
+
+            /// The subagent transcript of session A that says the task writes
+            /// to `output`, after the output the command printed first.
+            fn announce(&self, session: &str, output: &Path) {
+                let text = format!(
+                    "warning: build failed\nCommand did not complete within its 120s timeout and was moved to the background (ID: ba8zzg27b). Output is being written to: {}. You will be notified",
+                    output.display()
+                );
+                let line = format!(
+                    r#"{{"type":"user","toolUseResult":{{"backgroundTaskId":"ba8zzg27b"}},"message":{{"content":[{{"type":"tool_result","content":{}}}]}}}}"#,
+                    serde_json::to_string(&text).expect("json")
+                );
+                let project = self
+                    .claude
+                    .project_dir(&self.work.path().canonicalize().expect("exists"));
+                std::fs::create_dir_all(project.join(session).join("subagents")).expect("creates");
+                std::fs::write(
+                    project.join(session).join("subagents/agent-1.jsonl"),
+                    line + "\n",
+                )
+                .expect("writes");
+            }
+
+            fn read(&self) -> CommandOutput {
+                self.try_read().expect("reads")
+            }
+
+            fn try_read(&self) -> Result<CommandOutput, HarnessError> {
+                self.claude
+                    .command_output(self.work.path(), Some(&self.main_in_b), &task())
+            }
+        }
+
+        fn text_of(found: &CommandOutput) -> &str {
+            match found {
+                CommandOutput::Tail(tail) => tail.text(),
+                other => panic!("not text: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn a_task_a_subagent_of_an_earlier_session_announced_is_found_whichever_session_holds_its_file()
+         {
+            for holder in [
+                "session-a",
+                "session-b",
+                "session-0-the-process-started-under",
+            ] {
+                let l = layout();
+                let output = l.output_in(holder);
+                std::fs::write(&output, "building\n").expect("writes");
+                l.announce("session-a", &output);
+                assert_eq!(text_of(&l.read()), "building\n", "{holder}");
+            }
+        }
+
+        #[test]
+        fn a_file_that_can_only_be_reached_through_the_announcement_is_found_through_it() {
+            let l = layout();
+            let elsewhere = l
+                .tasks_of
+                .parent()
+                .expect("parent")
+                .join("-another-slug/s/tasks");
+            std::fs::create_dir_all(&elsewhere).expect("creates");
+            let output = elsewhere.join("ba8zzg27b.output");
+            std::fs::write(&output, "by the record\n").expect("writes");
+            assert_eq!(l.read(), CommandOutput::Unlocated, "not in this project");
+            l.announce("session-b", &output);
+            assert_eq!(text_of(&l.read()), "by the record\n");
+        }
+
+        #[test]
+        fn the_announced_file_being_gone_is_gone_and_not_unlocated() {
+            let l = layout();
+            let output = l.output_in("session-a");
+            l.announce("session-b", &output);
+            assert_eq!(l.read(), CommandOutput::Gone);
+        }
+
+        #[test]
+        fn a_task_no_transcript_names_is_found_by_its_file_in_the_project() {
+            let l = layout();
+            std::fs::write(l.output_in("session-0"), "alone\n").expect("writes");
+            assert_eq!(text_of(&l.read()), "alone\n");
+        }
+
+        #[test]
+        fn a_task_with_no_file_and_no_record_is_unlocated() {
+            assert_eq!(layout().read(), CommandOutput::Unlocated);
+        }
+
+        #[test]
+        fn a_task_file_of_another_project_is_not_looked_for() {
+            let l = layout();
+            let dir = l
+                .tasks_of
+                .parent()
+                .expect("parent")
+                .join("-another-project/s/tasks");
+            std::fs::create_dir_all(&dir).expect("creates");
+            std::fs::write(dir.join("ba8zzg27b.output"), "x").expect("writes");
+            assert_eq!(l.read(), CommandOutput::Unlocated);
+        }
+
+        #[test]
+        fn a_link_in_a_newer_session_does_not_hide_the_real_file_of_an_older_one() {
+            let l = layout();
+            std::fs::write(l.output_in("session-old"), "real\n").expect("writes");
+            let secret = l.work.path().join("secret");
+            std::fs::write(&secret, "key").expect("writes");
+            symlink(&secret, l.output_in("session-new")).expect("symlink");
+            assert_eq!(text_of(&l.read()), "real\n");
+        }
+
+        #[test]
+        fn a_link_where_the_task_would_be_is_never_read_and_leaves_it_unlocated() {
+            let l = layout();
+            let secret = l.work.path().join("secret");
+            std::fs::write(&secret, "key").expect("writes");
+            symlink(&secret, l.output_in("session-0")).expect("symlink");
+            assert_eq!(l.read(), CommandOutput::Unlocated);
+        }
+
+        #[test]
+        fn a_task_directory_of_another_user_is_not_served() {
+            let l = layout();
+            let slug = l.tasks_of.file_name().expect("a slug");
+            let dir = l
+                .tasks
+                .path()
+                .join("claude-4294967295")
+                .join(slug)
+                .join("s/tasks");
+            std::fs::create_dir_all(&dir).expect("creates");
+            std::fs::write(dir.join("ba8zzg27b.output"), "not yours\n").expect("writes");
+            assert_eq!(l.read(), CommandOutput::Unlocated);
+        }
+
+        #[test]
+        fn a_project_task_directory_that_cannot_be_listed_falls_back_to_the_transcripts() {
+            let l = layout();
+            std::fs::create_dir_all(l.tasks_of.parent().expect("parent")).expect("creates");
+            std::fs::write(&l.tasks_of, "not a directory").expect("writes");
+            let output = l.tasks.path().join(format!(
+                "claude-{}/-elsewhere/s/tasks",
+                nix::unistd::getuid()
+            ));
+            std::fs::create_dir_all(&output).expect("creates");
+            let output = output.join("ba8zzg27b.output");
+            std::fs::write(&output, "via the record\n").expect("writes");
+            l.announce("session-b", &output);
+            assert_eq!(text_of(&l.read()), "via the record\n");
+        }
+
+        #[test]
+        fn what_was_found_by_name_is_read_again_and_a_file_that_went_is_found_gone() {
+            let l = layout();
+            let output = l.output_in("session-0");
+            std::fs::write(&output, "first\n").expect("writes");
+            assert_eq!(text_of(&l.read()), "first\n");
+            std::fs::write(&output, "second\n").expect("writes");
+            assert_eq!(
+                text_of(&l.read()),
+                "second\n",
+                "the remembered path is read afresh"
+            );
+            std::fs::remove_file(&output).expect("removes");
+            assert_eq!(
+                l.read(),
+                CommandOutput::Unlocated,
+                "nothing left to find or to be named"
+            );
+        }
+
+        #[test]
+        fn a_file_among_hundreds_of_sessions_is_found() {
+            let l = layout();
+            for n in 0..600 {
+                std::fs::create_dir_all(l.tasks_of.join(format!("s{n:04}/tasks")))
+                    .expect("creates");
+            }
+            std::fs::write(l.output_in("s0123"), "among many\n").expect("writes");
+            assert_eq!(text_of(&l.read()), "among many\n");
+        }
+
+        #[test]
+        fn a_remembered_file_swapped_for_a_link_is_refused_once_and_then_forgotten() {
+            let l = layout();
+            let output = l.output_in("session-0");
+            std::fs::write(&output, "real\n").expect("writes");
+            assert_eq!(text_of(&l.read()), "real\n");
+            let secret = l.work.path().join("secret");
+            std::fs::write(&secret, "key").expect("writes");
+            std::fs::remove_file(&output).expect("removes");
+            symlink(&secret, &output).expect("symlink");
+            assert!(
+                l.try_read().is_err(),
+                "refused once, with nothing else to go by"
+            );
+            assert_eq!(
+                l.read(),
+                CommandOutput::Unlocated,
+                "then forgotten, and the link skipped"
+            );
+        }
+
+        #[test]
+        fn a_remembered_file_that_is_refused_falls_back_to_the_record_and_only_fails_without_one() {
+            let l = layout();
+            let output = l.output_in("session-0");
+            std::fs::write(&output, "real\n").expect("writes");
+            assert_eq!(text_of(&l.read()), "real\n");
+            let good = l.tasks.path().join(format!(
+                "claude-{}/-elsewhere/s/tasks",
+                nix::unistd::getuid()
+            ));
+            std::fs::create_dir_all(&good).expect("creates");
+            let good = good.join("ba8zzg27b.output");
+            std::fs::write(&good, "from the record\n").expect("writes");
+            l.announce("session-b", &good);
+            let secret = l.work.path().join("secret");
+            std::fs::write(&secret, "key").expect("writes");
+            std::fs::remove_file(&output).expect("removes");
+            symlink(&secret, &output).expect("symlink");
+            assert_eq!(text_of(&l.read()), "from the record\n");
+        }
+
+        #[test]
+        fn a_remembered_file_that_becomes_unreadable_is_an_error_when_nothing_else_names_one() {
+            use std::os::unix::fs::PermissionsExt;
+            let l = layout();
+            let output = l.output_in("session-0");
+            std::fs::write(&output, "real\n").expect("writes");
+            assert_eq!(text_of(&l.read()), "real\n");
+            std::fs::set_permissions(&output, std::fs::Permissions::from_mode(0o000))
+                .expect("chmod");
+            let failed = l.try_read();
+            std::fs::set_permissions(&output, std::fs::Permissions::from_mode(0o600))
+                .expect("chmod");
+            assert!(failed.is_err(), "{failed:?}");
+            assert_eq!(
+                text_of(&l.read()),
+                "real\n",
+                "and it is found again once readable"
+            );
+        }
+
+        #[test]
+        fn a_newer_file_of_the_same_name_replaces_a_remembered_one_within_a_few_reads() {
+            let l = layout();
+            std::fs::write(l.output_in("session-old"), "old\n").expect("writes");
+            assert_eq!(text_of(&l.read()), "old\n");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            std::fs::write(l.output_in("session-new"), "new\n").expect("writes");
+            let seen: Vec<String> = (0..12).map(|_| text_of(&l.read()).to_string()).collect();
+            assert_eq!(
+                seen.first().map(String::as_str),
+                Some("old\n"),
+                "from memory at first"
+            );
+            assert_eq!(seen.last().map(String::as_str), Some("new\n"), "{seen:?}");
+        }
+
+        #[test]
+        fn the_last_64_kb_of_a_big_file_is_read() {
+            let l = layout();
+            let lines: String = std::iter::repeat_n("0123456789abcdef\n", 20_000).collect();
+            std::fs::write(l.output_in("session-0"), &lines).expect("writes");
+            let CommandOutput::Tail(tail) = l.read() else {
+                panic!("has text")
+            };
+            assert!(matches!(tail.cut(), Cut::Last { bytes: 65536, .. }));
+        }
+
+        #[test]
+        fn the_output_says_when_the_file_last_changed() {
+            let l = layout();
+            let output = l.output_in("session-0");
+            std::fs::write(&output, "x\n").expect("writes");
+            let long_ago = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+            std::fs::File::options()
+                .write(true)
+                .open(&output)
+                .expect("opens")
+                .set_modified(long_ago)
+                .expect("sets");
+            let CommandOutput::Tail(tail) = l.read() else {
+                panic!("has text")
+            };
+            assert_eq!(tail.changed(), Some(long_ago));
         }
     }
 

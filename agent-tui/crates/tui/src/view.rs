@@ -1958,7 +1958,12 @@ fn draw_talk(frame: &mut Frame<'_>, m: &Model, to: &SessionName) {
     } else {
         (
             talk_title(m, to, quote, quote_in_title.then_some(title_room)),
-            hints(&[("⏎", "send"), ("⌥⏎", "newline"), ("Esc", "close")]),
+            hints(&[
+                ("⏎", "send"),
+                ("⌥⏎", "newline"),
+                ("⌃E", "edit"),
+                ("Esc", "close"),
+            ]),
         )
     };
     let block = overlay_block(&title, keys, dim());
