@@ -386,6 +386,15 @@ impl Origin {
 }
 
 impl Panel {
+    pub fn seat(&self) -> Seat {
+        match self {
+            Self::Agents => Seat::Agents,
+            Self::Agent { .. } => Seat::Activity,
+            Self::Changes { .. } => Seat::Changes,
+            Self::Main(..) => Seat::Document,
+        }
+    }
+
     /// [2] with the cursor on the activity, scrolled to the top.
     pub const fn activity() -> Self {
         Self::Agent {
@@ -728,28 +737,34 @@ pub enum Mode {
     Nav,
 }
 
-/// Whether the escape chord was the last key, so pressing it again jumps to
-/// the previous agent.
+/// Whether the nav key that left AGENT was the last thing the user did and
+/// is still recent, so pressing it again selects the previous agent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Chord {
     Idle,
-    Armed,
+    Armed { until: Instant },
+}
+
+/// How long after leaving AGENT a second nav key press counts as the second
+/// half of the chord.
+pub const CHORD_WINDOW: Duration = Duration::from_secs(2);
+
+impl Chord {
+    pub fn armed(now: Instant) -> Self {
+        Self::Armed {
+            until: now + CHORD_WINDOW,
+        }
+    }
+
+    pub fn is_live(self, now: Instant) -> bool {
+        matches!(self, Self::Armed { until } if now < until)
+    }
 }
 
 /// Identifies one request to connect, so a late reply to an abandoned
 /// request can't replace the pane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Ticket(u64);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Intent {
-    /// Show it in the pane. Keys stay in the sidebar.
-    Preview,
-    /// Show it and type into it, leaving any other window open.
-    Activate,
-    /// Show it and type into it, closing the other windows once connected.
-    MoveHere,
-}
 
 /// What `⏎` says on an agent another window shows, and in the peek of one.
 pub const MOVE_HERE: &str = "move here";
@@ -850,19 +865,67 @@ pub struct Look {
     pub need: Need,
 }
 
-/// What the TUI does with a session once its check for other windows is back.
+/// The panel that had the keys when `⏎` or `i` was pressed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AfterCheck {
-    Preview,
-    Activate,
+pub enum Seat {
+    Agents,
+    Activity,
+    Changes,
+    Document,
 }
 
-impl AfterCheck {
-    pub fn intent(self) -> Intent {
-        match self {
-            Self::Preview => Intent::Preview,
-            Self::Activate => Intent::Activate,
+/// What the user asked for from a connection that arrives later: after a
+/// launch, or after a move here. The pane carries it, and `Model::arrival`
+/// is the only way to turn it into what happens, so a request the user has
+/// since moved away from downgrades to `Preview`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Landing {
+    Preview,
+    Enter { from: Seat },
+    MoveHere { from: Seat },
+}
+
+/// What the check for other windows may leave pending. Moving here never
+/// waits for a check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Checked {
+    Preview,
+    Enter { from: Seat },
+}
+
+impl From<Checked> for Landing {
+    fn from(checked: Checked) -> Self {
+        match checked {
+            Checked::Preview => Self::Preview,
+            Checked::Enter { from } => Self::Enter { from },
         }
+    }
+}
+
+/// What `⏎` or `i` can ask for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Entering {
+    Enter,
+    MoveHere,
+}
+
+impl Entering {
+    pub fn from(self, seat: Seat) -> Landing {
+        match self {
+            Self::Enter => Landing::Enter { from: seat },
+            Self::MoveHere => Landing::MoveHere { from: seat },
+        }
+    }
+}
+
+/// What a connection does on arriving. Only `Model::arrival` builds one, so
+/// nothing else can start AGENT mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Arrival(Landing);
+
+impl Arrival {
+    pub fn landing(self) -> Landing {
+        self.0
     }
 }
 
@@ -1012,12 +1075,13 @@ pub enum Pane {
     /// attaching anyway when no answer comes by `until`.
     Checking {
         name: SessionName,
-        then: AfterCheck,
+        then: Checked,
         until: Instant,
     },
     Connecting {
         name: SessionName,
         ticket: Ticket,
+        landing: Landing,
     },
     Connected(Connection),
     /// Another window shows the session, so this TUI holds no client and
@@ -1028,6 +1092,24 @@ pub enum Pane {
 }
 
 impl Pane {
+    /// The latest explicit action on `name` wins over what was asked of it
+    /// before: a pending entry becomes a preview.
+    pub fn downgrade_to_preview(&mut self, name: &SessionName) {
+        match self {
+            Self::Connecting {
+                name: waiting,
+                landing,
+                ..
+            } if waiting == name => *landing = Landing::Preview,
+            Self::Checking {
+                name: waiting,
+                then,
+                ..
+            } if waiting == name => *then = Checked::Preview,
+            _ => {}
+        }
+    }
+
     pub fn connection(&self) -> Option<&Connection> {
         match self {
             Self::Connected(c) => Some(c),
@@ -1072,6 +1154,7 @@ impl Pane {
             Self::Connecting {
                 name,
                 ticket: pending,
+                ..
             } if *pending == ticket => Some(name),
             _ => None,
         }
@@ -1340,7 +1423,7 @@ impl Enter {
     /// What `⏎` says, or nothing when it can't do anything.
     pub fn verb(&self) -> Option<&'static str> {
         match self {
-            Self::Attach => Some("attach"),
+            Self::Attach => Some("enter"),
             Self::Restart(_) | Self::Resurrect => Some("resurrect"),
             Self::Start(_) => Some("start"),
             Self::Refused(_) => None,
@@ -2242,6 +2325,44 @@ impl Model {
         self.snapshot()
             .and_then(|s| s.entry(name))
             .is_some_and(|(_, e)| self.reach(e).is_attach())
+    }
+
+    /// Whether the user is still looking at `name` in NAV with nothing open
+    /// over the list: on its row, no overlay, no peek, and the keys in the
+    /// panel they were in.
+    fn holds(&self, name: &SessionName, from: Seat) -> bool {
+        matches!(self.overlay, Overlay::None)
+            && self.peek.is_none()
+            && self.panel.seat() == from
+            && self.selected_entry().is_some_and(|e| e.name() == name)
+    }
+
+    /// `then` as it stands now that the check for `name` is back.
+    pub fn settled(&self, name: &SessionName, then: Checked) -> Checked {
+        match then {
+            Checked::Enter { from } if self.holds(name, from) => then,
+            Checked::Enter { .. } | Checked::Preview => Checked::Preview,
+        }
+    }
+
+    /// What the connection arriving for `ticket` does: what the pane was
+    /// waiting to do if the user is still where they asked, else `Preview`.
+    pub fn arrival(&self, ticket: Ticket) -> Arrival {
+        let Pane::Connecting {
+            name,
+            ticket: pending,
+            landing,
+        } = &self.pane
+        else {
+            return Arrival(Landing::Preview);
+        };
+        let kept = match *landing {
+            Landing::Enter { from } | Landing::MoveHere { from } => {
+                *pending == ticket && self.holds(name, from)
+            }
+            Landing::Preview => false,
+        };
+        Arrival(if kept { *landing } else { Landing::Preview })
     }
 
     pub fn mru(&self) -> &[SessionName] {
@@ -4493,7 +4614,7 @@ pub enum NameCheck {
     MainCheckout {
         repo: String,
     },
-    /// Running: ⏎ attaches and types the task in.
+    /// Running: ⏎ shows it and types the task in.
     Live {
         name: AgentName,
         repo: String,

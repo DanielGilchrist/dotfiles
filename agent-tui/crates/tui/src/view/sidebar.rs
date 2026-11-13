@@ -4235,13 +4235,13 @@ mod tests {
         let rows = screen(&terminal);
         let title = rows.iter().find(|r| r.contains("╔")).expect("a float");
         assert!(title.contains("obs-layout-4"), "{title}");
-        assert!(title.contains("⏎ attach · s send · Esc close"), "{title}");
+        assert!(title.contains("⏎ enter · s send · Esc close"), "{title}");
         assert_eq!(m.areas.terminal, area, "the pty keeps its size");
         let behind = terminal.backend().buffer()[(0, 5)].modifier;
         assert!(behind.contains(Modifier::DIM), "what's behind is dimmed");
         let footer = rows.last().expect("a footer");
         assert!(
-            footer.contains("PEEK") && footer.contains("s send") && footer.contains("⏎ attach"),
+            footer.contains("PEEK") && footer.contains("s send") && footer.contains("⏎ enter"),
             "{footer}"
         );
     }
@@ -4769,7 +4769,7 @@ mod tests {
             text.contains("PgDn") || text.contains("Description"),
             "{text}"
         );
-        assert!(text.contains("attach next needing you"), "{text}");
+        assert!(text.contains("select next needing you"), "{text}");
         assert!(!text.contains("Local"), "the top scrolled away\n{text}");
         assert!(text.contains("Description"), "{text}");
     }
@@ -4778,7 +4778,7 @@ mod tests {
     fn the_help_shows_every_key_when_filtered_by_each_word() {
         let mut m = open_help(Focused::Agents);
         let text = screen(&render(&mut m, (100, 40))).join("\n");
-        for expected in ["attach", "edit checkout", "send", "peek", "switch", "new"] {
+        for expected in ["enter", "edit checkout", "send", "peek", "switch", "new"] {
             assert!(text.contains(expected), "{expected}\n{text}");
         }
     }

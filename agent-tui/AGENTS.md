@@ -84,6 +84,7 @@ workers ──────┴─▶ Msg ──▶ update(&mut Model) ──▶ V
 - A session is killed only through a `Running`. `Running::new` is private to `agent-core`, so outside it a `Running` comes only from `Entry::running(own)` or a `RemovalPlan`, and the TUI can never kill its own session. A worktree is removed only through an `Approved`, which only `RemovalPlan::approve` or `Hazardous::force` builds. `plan_removal` returns `Planned::Own` for the caller's own session (`Services::own`, read once at startup), which has no `approve`, so `remove` is never handed a removal of the session it runs in.
 - An agent is restarted only through a `Restart`, which only a `RestartApproval::Free` (nothing to stop) or `WouldStop::force` (the user saw what it would stop) builds. What it would stop is a `Stops`: the activity, the background commands the harness runs, or both, never neither, held once by the `WouldStop` and by the `Restart` the user agreed to, so an idle agent with commands is a `WouldStop` too and `Error::WouldStop` carries the same `Stops`. `ops::restart` plans and rechecks with one rule (`would_stop`, over a `Seen` that says where the harness process was looked for, so an exited agent with no process carries no commands) and refuses a restart that would stop more than the user was shown: a new kind of stop, or a command that wasn't listed. Core carries every command (`BackgroundCommands`, so the count is honest); `agent-term`'s `CommandsShown` names the first few that print something once cleaned and counts the rest (`Remainder`), for both the TUI and the CLI. `plan_restart` returns `Planned::Own` for the caller's own session, which has no approval, so a restart never kills the session it runs in. `ops::restart` fixes the order: recheck what it would stop before touching anything, kill the session and wait until the host stops listing it, stop the harness's process and wait until it is gone, then start with the launch marked until the session shows. The restart thread's answer follows a fresh snapshot on the same channel, so the model sees the session before it hears the restart finished.
 - The pane's client is a `Connection { mode, id, .. }`. A read-only view is a `Watcher`, owned by the peek float (`Peek::Watch`, `WatchView::Watched`), so closing the float ends it. A `Peek::Pane` has no name of its own and shows the pane's session, so `Model::set_pane`, the one writer of the pane, closes it when the pane moves to another session or empties. Only a `Connection` takes keys and has a `ClientId`, so a watcher can't be mistaken for the TUI's own client.
+- Only `⏎` and `i` enter AGENT (`update::enter`, reached through `activate`, or through `connected` with an `Arrival` whose `Landing` is `Enter` or `MoveHere`). `Arrival`'s field is private to `model`, and only `Model::arrival` builds one, so no other code can start AGENT mode. Everything else that targets an agent calls `select`, which previews in NAV. What `⏎` or `i` asked for waits in the pane, as a `Checked` (`Preview`, `Enter`) on `Checking` and a `Landing` (`Preview`, `Enter`, `MoveHere`) on `Connecting`, each carrying the `Seat` (the panel that had the keys) it was asked from, and is the only carrier: `Effect::Attach` and `Effect::Connect` hold no intent. `Model::settled` (after the check) and `Model::arrival` (when the client arrives, called by `Runtime::connect`) keep it only while the user is still on that agent's row, in the same `Seat`, with no overlay and no peek, else `Preview`. `Pane::downgrade_to_preview` makes a later `select` of the pending agent win. `activate` takes an `Entering` (`Enter` or `MoveHere`), so a preview can't be passed to it, and `select` and `activate` share `target`, which closes overlays, sets the cursor and refuses a session that is still starting, is this TUI's own or is restarting. The nav chord is `Chord::Armed { until }`, `CHORD_WINDOW` long, armed only when the configured nav key (not the escape hatch) left AGENT and cleared by any key or mouse event.
 - `Model.clock` is the one clock. Whatever delivers a message sets it. Nothing calls `Instant::now` or `SystemTime::now` outside `Moment::now` and tests.
 - `settle` runs after every message and tick, so `view::draw` only reads. `Drawn` is the draw's one write-back, applied by `update::drawn`.
 - The runtime creates resources `update` can't (a `Terminal` spawns a process) and hands them back through an update function: `Runtime::connect` installs the connection only while `Pane::awaiting(ticket)`, then calls `update::connected`.
@@ -154,8 +155,8 @@ pub struct Pane {
 // Good
 pub enum Pane {
     Empty,
-    Checking { name: SessionName, then: AfterCheck, until: Instant },
-    Connecting { name: SessionName, ticket: Ticket },
+    Checking { name: SessionName, then: Checked, until: Instant },
+    Connecting { name: SessionName, ticket: Ticket, landing: Landing },
     Connected(Connection),
     Elsewhere { name: SessionName },
 }
@@ -221,7 +222,7 @@ pub armed: bool,
 pub struct Look { pub urgent: bool, /* ... */ }
 
 // Good
-pub enum Chord { Idle, Armed }
+pub enum Chord { Idle, Armed { until: Instant } }
 pub enum Need { Refresh, Decision }
 ```
 

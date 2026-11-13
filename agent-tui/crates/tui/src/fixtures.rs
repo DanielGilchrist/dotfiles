@@ -20,6 +20,48 @@ use crate::model::{Company, Connection, Cursor, Mode, Model, Pane};
 use crate::update::{Effect, update};
 use crate::worker::Msg;
 
+/// What each attach in `effects` waits to do, as the pane that carries it says.
+pub fn attach_landings(m: &Model, effects: &[Effect]) -> Vec<crate::model::Landing> {
+    effects
+        .iter()
+        .filter_map(|effect| match (effect, &m.pane) {
+            (
+                Effect::Attach { ticket, .. },
+                Pane::Connecting {
+                    ticket: waiting,
+                    landing,
+                    ..
+                },
+            ) if ticket == waiting => Some(*landing),
+            _ => None,
+        })
+        .collect()
+}
+
+/// What the connection the pane is waiting for would do if it arrived now.
+pub fn pending_arrival(m: &Model) -> crate::model::Arrival {
+    match &m.pane {
+        Pane::Connecting { ticket, .. } => m.arrival(*ticket),
+        _ => panic!("the pane is not connecting"),
+    }
+}
+
+/// A pane waiting for `agent` to do `landing`, and what that does now.
+pub fn arrival_for(
+    m: &mut Model,
+    agent: &str,
+    landing: crate::model::Landing,
+) -> crate::model::Arrival {
+    let ticket = m.ticket();
+    m.set_cursor(Cursor::Entry(name(agent)));
+    m.set_pane(Pane::Connecting {
+        name: name(agent),
+        ticket,
+        landing,
+    });
+    m.arrival(ticket)
+}
+
 /// The company of an agent whose other window is an nvim tab.
 pub fn in_nvim() -> Company {
     Company::of(vec![Place::Nvim])

@@ -3,7 +3,7 @@ use crate::cause::Cause;
 use crate::fixtures::sighted;
 use crate::fixtures::{elsewhere_on, watch};
 use crate::model::{
-    AfterCheck, Intent, Need, Peek, WatchView, Windows, elsewhere_banner, elsewhere_note,
+    Checked, Landing, Need, Peek, Seat, WatchView, Windows, elsewhere_banner, elsewhere_note,
 };
 use agent_core::ports::Observation;
 use agent_core::ports::Place;
@@ -59,18 +59,12 @@ fn looks_asked(effects: &[Effect]) -> usize {
         .count()
 }
 
-fn attaches(effects: &[Effect]) -> Vec<Intent> {
-    effects
-        .iter()
-        .filter_map(|e| match e {
-            Effect::Attach { intent, .. } => Some(*intent),
-            _ => None,
-        })
-        .collect()
+fn attaches(m: &Model, effects: &[Effect]) -> Vec<Landing> {
+    crate::fixtures::attach_landings(m, effects)
 }
 
 fn stays_held_elsewhere(m: &Model, effects: &[Effect], agent: &str) {
-    assert_eq!(attaches(effects), []);
+    assert_eq!(attaches(m, effects), []);
     assert_eq!(closed_windows_of(effects), Vec::<String>::new());
     assert_eq!(m.pane.held_elsewhere(), Some(&name(agent)));
     assert!(m.pane.connection().is_none());
@@ -87,7 +81,7 @@ fn a_hovered_agent_is_checked_for_other_windows_before_anything_attaches() {
     m.set_cursor(Cursor::Entry(name(SHARED)));
     let effects = previewed(&mut m);
     assert_eq!(checked_sessions(&m, &effects), [SHARED]);
-    assert_eq!(attaches(&effects), []);
+    assert_eq!(attaches(&m, &effects), []);
     assert!(matches!(m.pane, Pane::Checking { .. }));
 }
 
@@ -97,7 +91,7 @@ fn the_preview_attaches_once_the_check_finds_no_other_window() {
     m.set_cursor(Cursor::Entry(name(SHARED)));
     previewed(&mut m);
     let effects = crate::fixtures::sighted(&mut m, &[]);
-    assert_eq!(attaches(&effects), [Intent::Preview]);
+    assert_eq!(attaches(&m, &effects), [Landing::Preview]);
 }
 
 #[test]
@@ -118,7 +112,7 @@ fn the_pane_attaches_again_once_the_other_window_is_gone() {
     stays_held_elsewhere(&m, &still, SHARED);
     recheck_elsewhere(&mut m);
     let effects = crate::fixtures::sighted(&mut m, &[]);
-    assert_eq!(attaches(&effects), [Intent::Preview]);
+    assert_eq!(attaches(&m, &effects), [Landing::Preview]);
     assert_eq!(closed_windows_of(&effects), Vec::<String>::new());
 }
 
@@ -128,7 +122,7 @@ fn an_answer_that_finds_windows_only_beside_other_agents_leaves_the_held_one_alo
     recheck_elsewhere(&mut m);
     let effects =
         crate::fixtures::sighted(&mut m, &[("auth-refresh-2", crate::fixtures::in_nvim())]);
-    assert_eq!(attaches(&effects), [Intent::Preview]);
+    assert_eq!(attaches(&m, &effects), [Landing::Preview]);
     assert_eq!(
         *m.company(&name("auth-refresh-2")),
         crate::fixtures::in_nvim()
@@ -244,7 +238,7 @@ fn the_nav_key_twice_toward_an_agent_open_elsewhere_lands_in_nav_and_leaves_it_t
     crate::fixtures::connect(&mut m, "auth-refresh-2", Mode::Nav);
     m.touch_mru(&name(SHARED));
     m.touch_mru(&name("auth-refresh-2"));
-    m.chord = Chord::Armed;
+    m.chord = Chord::armed(m.clock.mono);
     let effects = update(&mut m, nav());
     assert_eq!(checked_sessions(&m, &effects), [SHARED]);
     let effects = crate::fixtures::sighted(&mut m, &[(SHARED, crate::fixtures::in_nvim())]);
@@ -261,11 +255,15 @@ fn i_from_another_panel_never_moves_an_agent_held_elsewhere() {
 }
 
 #[test]
-fn enter_zero_and_i_on_the_banner_row_attach_first_and_close_nothing_until_connected() {
-    for code in [KeyCode::Enter, KeyCode::Char('0'), KeyCode::Char('i')] {
+fn enter_and_i_on_the_banner_row_attach_first_and_close_nothing_until_connected() {
+    for code in [KeyCode::Enter, KeyCode::Char('i')] {
         let mut m = held_elsewhere_model();
         let effects = update(&mut m, key(code));
-        assert_eq!(attaches(&effects), [Intent::MoveHere], "{code:?}");
+        assert_eq!(
+            attaches(&m, &effects),
+            [Landing::MoveHere { from: Seat::Agents }],
+            "{code:?}"
+        );
         assert_eq!(closed_windows_of(&effects), Vec::<String>::new());
         assert!(matches!(m.pane, Pane::Connecting { .. }));
     }
@@ -276,8 +274,9 @@ fn the_other_window_closes_only_after_the_connection_exists() {
     let mut m = held_elsewhere_model();
     update(&mut m, key(KeyCode::Enter));
     assert!(m.pane.connection().is_none(), "a failed attach ends here");
+    let arrival = crate::fixtures::pending_arrival(&m);
     crate::fixtures::connect(&mut m, SHARED, Mode::Nav);
-    let effects = connected(&mut m, Intent::MoveHere);
+    let effects = connected(&mut m, arrival);
     assert_eq!(closes_of(&effects), [SHARED]);
     assert!(matches!(m.focus(), Focus::Agent(_)));
 }
@@ -286,8 +285,9 @@ fn the_other_window_closes_only_after_the_connection_exists() {
 fn a_closed_other_window_leaves_the_session_alone_and_a_failed_close_leaves_what_was_known() {
     let mut m = elsewhere_on(SHARED);
     update(&mut m, key(KeyCode::Enter));
+    let arrival = crate::fixtures::pending_arrival(&m);
     crate::fixtures::connect(&mut m, SHARED, Mode::Nav);
-    connected(&mut m, Intent::MoveHere);
+    connected(&mut m, arrival);
     let company = |m: &Model| m.company(&name(SHARED)).clone();
     let closed = |m: &mut Model, closed| {
         update(
@@ -318,8 +318,9 @@ fn a_closed_other_window_leaves_the_session_alone_and_a_failed_close_leaves_what
 fn a_look_from_before_a_close_cannot_bring_the_closed_window_back() {
     let mut m = elsewhere_on(SHARED);
     update(&mut m, key(KeyCode::Enter));
+    let arrival = crate::fixtures::pending_arrival(&m);
     crate::fixtures::connect(&mut m, SHARED, Mode::Nav);
-    connected(&mut m, Intent::MoveHere);
+    connected(&mut m, arrival);
     recheck_elsewhere(&mut m);
     let before = m.current_look().expect("asked");
     update(
@@ -362,9 +363,9 @@ fn a_close_while_the_pane_checks_hands_the_check_to_the_newer_look() {
             found: Ok(HashMap::new()),
         },
     );
-    assert_eq!(attaches(&stale), []);
+    assert_eq!(attaches(&m, &stale), []);
     let effects = crate::fixtures::sighted(&mut m, &[]);
-    assert_eq!(attaches(&effects), [Intent::Preview]);
+    assert_eq!(attaches(&m, &effects), [Landing::Preview]);
 }
 
 #[test]
@@ -391,9 +392,9 @@ fn a_move_here_on_a_session_that_exited_resurrects_it_instead_of_moving() {
     };
     let effects = update(&mut m, key(KeyCode::Enter));
     assert!(
-        attaches(&effects)
+        attaches(&m, &effects)
             .iter()
-            .all(|intent| *intent != Intent::MoveHere)
+            .all(|landing| !matches!(landing, Landing::MoveHere { .. }))
     );
     assert!(m.pane.held_elsewhere().is_none());
 }
@@ -407,8 +408,9 @@ fn moving_here_notes_the_session_alone_once_connected_and_drops_looks_still_on_t
         "still so while attaching"
     );
     let before = m.start_look();
+    let arrival = crate::fixtures::pending_arrival(&m);
     crate::fixtures::connect(&mut m, SHARED, Mode::Nav);
-    connected(&mut m, Intent::MoveHere);
+    connected(&mut m, arrival);
     assert_eq!(*m.company(&name(SHARED)), Company::Alone);
     assert_ne!(m.current_look(), Some(before));
     update(
@@ -445,14 +447,16 @@ fn a_failed_look_on_a_paused_pane_whose_company_is_alone_reattaches() {
             found: Err(Cause::message("ps failed".into())),
         },
     );
-    assert_eq!(attaches(&effects), [Intent::Preview]);
+    assert_eq!(attaches(&m, &effects), [Landing::Preview]);
 }
 
 #[test]
 fn a_plain_visit_connects_without_closing_anything() {
     let mut m = crate::fixtures::fleet(10);
+    let arrival =
+        crate::fixtures::arrival_for(&mut m, SHARED, Landing::Enter { from: Seat::Agents });
     crate::fixtures::connect(&mut m, SHARED, Mode::Nav);
-    let effects = connected(&mut m, Intent::Activate);
+    let effects = connected(&mut m, arrival);
     assert_eq!(closes_of(&effects), Vec::<String>::new());
     assert_eq!(looks_of(&effects), 1, "and watches for newcomers");
 }
@@ -536,7 +540,7 @@ fn view(m: &Model) -> Option<&WatchView> {
 fn peeking_an_agent_open_elsewhere_watches_it_instead_of_attaching_a_client() {
     let mut m = held_elsewhere_model();
     let effects = update(&mut m, key(KeyCode::Char('v')));
-    assert_eq!(attaches(&effects), []);
+    assert_eq!(attaches(&m, &effects), []);
     assert_eq!(observes(&effects), [SHARED]);
     assert!(matches!(view(&m), Some(WatchView::Watching(_))));
     assert_eq!(
@@ -621,7 +625,7 @@ fn enter_in_a_watched_peek_whose_other_window_has_gone_attaches() {
     assert!(matches!(
         m.pane,
         Pane::Checking {
-            then: AfterCheck::Activate,
+            then: Checked::Enter { from: Seat::Agents },
             ..
         }
     ));
@@ -632,7 +636,7 @@ fn the_watcher_goes_back_to_the_pane_and_a_client_attaches_when_the_other_window
     let mut m = watched_model();
     recheck_elsewhere(&mut m);
     let effects = crate::fixtures::sighted(&mut m, &[]);
-    assert_eq!(attaches(&effects), [Intent::Preview]);
+    assert_eq!(attaches(&m, &effects), [Landing::Preview]);
     assert!(matches!(m.peek, Some(Peek::Pane)));
     assert!(m.peeking(), "the float stays open over the new client");
 }
@@ -642,7 +646,7 @@ fn a_watcher_stays_while_the_other_window_is_still_there() {
     let mut m = watched_model();
     recheck_elsewhere(&mut m);
     let effects = crate::fixtures::sighted(&mut m, &[(SHARED, crate::fixtures::in_nvim())]);
-    assert_eq!(attaches(&effects), []);
+    assert_eq!(attaches(&m, &effects), []);
     assert!(matches!(view(&m), Some(WatchView::Watched(_))));
 }
 
@@ -823,7 +827,7 @@ fn a_peek_that_waits_on_the_check_watches_when_it_finds_another_window() {
     update(&mut m, key(KeyCode::Char('v')));
     previewed(&mut m);
     let effects = crate::fixtures::sighted(&mut m, &[(SHARED, crate::fixtures::in_nvim())]);
-    assert_eq!(attaches(&effects), []);
+    assert_eq!(attaches(&m, &effects), []);
     assert_eq!(observes(&effects), [SHARED]);
     assert_eq!(m.pane.held_elsewhere(), Some(&name(SHARED)));
 }
@@ -835,7 +839,7 @@ fn a_peek_of_an_agent_nobody_else_shows_still_attaches_a_client() {
     update(&mut m, key(KeyCode::Char('v')));
     previewed(&mut m);
     let effects = crate::fixtures::sighted(&mut m, &[]);
-    assert_eq!(attaches(&effects), [Intent::Preview]);
+    assert_eq!(attaches(&m, &effects), [Landing::Preview]);
     assert_eq!(observes(&effects), Vec::<String>::new());
 }
 
@@ -851,7 +855,7 @@ fn s_sends_to_an_agent_left_alone_without_a_client() {
 }
 
 #[test]
-fn the_footer_says_move_here_on_the_banner_row_and_attach_otherwise() {
+fn the_footer_says_move_here_on_the_banner_row_and_enter_otherwise() {
     let enter = |m: &Model| {
         crate::keymap::footer(&Situation::of(m), "⌃]")
             .into_iter()
@@ -861,7 +865,7 @@ fn the_footer_says_move_here_on_the_banner_row_and_attach_otherwise() {
     let mut m = held_elsewhere_model();
     assert_eq!(enter(&m), Some("move here"));
     m.pane = Pane::Empty;
-    assert_eq!(enter(&m), Some("attach"));
+    assert_eq!(enter(&m), Some("enter"));
 }
 
 #[test]
@@ -914,7 +918,7 @@ fn a_first_look_that_fails_attaches_anyway_and_says_so() {
             found: Err(Cause::message("ps failed".into())),
         },
     );
-    assert_eq!(attaches(&effects), [Intent::Preview]);
+    assert_eq!(attaches(&m, &effects), [Landing::Preview]);
     assert!(
         m.status
             .as_ref()
@@ -928,10 +932,11 @@ fn a_look_that_takes_too_long_attaches_without_it_and_says_nothing() {
     m.set_cursor(Cursor::Entry(name(SHARED)));
     previewed(&mut m);
     let early = later(&m, CHECK_TIMEOUT.saturating_sub(Duration::from_millis(1)));
-    assert_eq!(attaches(&tick_at(&mut m, early)), []);
+    let early_effects = tick_at(&mut m, early);
+    assert_eq!(attaches(&m, &early_effects), []);
     let due = later(&m, Duration::from_millis(2));
     let effects = tick_at(&mut m, due);
-    assert_eq!(attaches(&effects), [Intent::Preview]);
+    assert_eq!(attaches(&m, &effects), [Landing::Preview]);
     assert!(m.status.is_none());
     assert_eq!(m.check_health, crate::model::CheckHealth::Working);
 }

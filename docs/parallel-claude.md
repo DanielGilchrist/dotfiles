@@ -26,20 +26,20 @@ Install or update it with `~/.config/agent-tui/install.sh`, which builds it into
 
 | Key | Action |
 |---|---|
-| `⏎` | In [1], attach the agent (start or resurrect it if needed) or focus the repo. On an agent that is also open in another window (a terminal tab, an editor, SSH, tmux) it reads `move here`: [0] is paused there, showing the activity under `⇄ in nvim · ⏎ move here` (or `over SSH`, `in tmux`, `in wezterm`, `in 3 windows` when they aren't all in one place, `detached window` for a client its window left behind, `elsewhere` when the place isn't known), and `⏎`, `0` or `i` in [1] on that row attaches, then closes the other window. Nothing else (`Esc`, the nav key twice, `a`, the switcher, `i` from another panel) does. In [2] and [3], open the item in [0] (on a folder in [3], open or close it). In the peek, attach |
-| `i` | Attach the selected agent from any panel (on a paused agent only from [1], where it moves here) |
-| `0` | Same as `⏎` in [1], [2] and [3] |
+| `⏎` | In [1], enter the agent (start or resurrect it if needed, and enter once it is up if you are still on its row in NAV) or focus the repo. Only `⏎` and `i` put your keys in the agent's terminal. On an agent that is also open in another window (a terminal tab, an editor, SSH, tmux) it reads `move here`: [0] is paused there, showing the activity under `⇄ in nvim · ⏎ move here` (or `over SSH`, `in tmux`, `in wezterm`, `in 3 windows` when they aren't all in one place, `detached window` for a client its window left behind, `elsewhere` when the place isn't known), and `⏎` or `i` in [1] on that row attaches, then closes the other window. Nothing else (`0`, the nav key twice, `a`, the switcher, `i` from another panel) does. In [2] and [3], open the item in [0] (on a folder in [3], open or close it). In the peek, enter |
+| `i` | Enter the selected agent from any panel (on a paused agent only from [1], where it moves here) |
+| `0` | In [1], show the selected agent in [0] without entering it. In [2] and [3], open the item in [0] like `⏎` |
 | `s` | Send a message without attaching. It is typed at once, even while the agent works, because Claude Code queues it. It is refused only while typing could land in a menu: the agent is asking (a question or permission prompt is open), booting, or its session ended, and what you typed stays for the next `s` (`Esc` keeps it, `⌃U` clears it). The box wraps and grows with the text: `⌃E` opens the text in $EDITOR and puts what you save back in the box without sending (the quote and review comments stay out of the editor, an empty result empties the box, and a failed editor keeps your text), `⌥⏎`, `⌃J` or `⇧⏎` add a line, `⏎` sends, arrows, `Home` and `End` move the caret, `⌃W` deletes a word. Nothing is sent later (`t` says `send is s now`). A permission prompt the agent hasn't reported yet and menus opened by `/` or `!` commands aren't detected. With review comments drafted for the agent it reads `send review`: the comments go as one message after your typed overview. With the entry cursor on an entry in [0]'s activity or a subagent's log it reads `reply`: the entry's first line shows above the input and goes before your message, only when you typed one (a call quotes its tool and target, a folded phase its heading, a subagent's entry is marked `(subagent …)`). Backspace on empty text drops the quote. Drafted review comments still go after your message |
 | `⏎` | With [0] on the activity: fold the entry under the cursor. On an Agent call that started a subagent it opens that subagent's log, and on an edit call or a touched file it opens the file's diff in [3]. `Esc` goes back to the activity |
 | `[` `]` | With [0] on the activity: jump the entry cursor to the previous / next phase (its first entry), staying put at the ends. In a subagent's log they jump between messages |
 | `y` | With [0] focused: copy to the clipboard through the terminal (OSC 52): `path:line` or the selected lines of a diff, a commit's sha, the agent's message, a subagent's log entry |
 | `⏎` | With [0] on the branch: open the commit (its files and diffs) or uncommitted file under the cursor, `Esc` goes back |
 | `j` `k` `[` `]` `J` `K` `V` `e` `c` | With [0] on a diff: move a line cursor, jump hunks and files, select a range (`V`), open the file at the line in $EDITOR, and comment on the line or range (`c`). Comments collect in a per-agent draft, marked `✎`, until `s` sends them |
-| `v` | Peek: a read-only float of the agent's terminal. `⏎` or `i` attaches, `s` sends, `Esc` or `v` closes. On an agent open elsewhere the float names the place (`⇄ in nvim`) and is read-only through `zellij watch`, so it never resizes the other window, and `⏎` or `i` in it close it and leave the agent paused (or attach, if the other window has gone). The float closes by itself, saying `peek at X ended` and why when it can, if the session ends. It follows the other window being resized |
-| `⌃]` | The nav key (configurable): back to NAV from an agent. Twice goes to the previous agent |
+| `v` | Peek: a read-only float of the agent's terminal. `⏎` or `i` enters, `s` sends, `Esc` or `v` closes. On an agent open elsewhere the float names the place (`⇄ in nvim`) and is read-only through `zellij watch`, so it never resizes the other window, and `⏎` or `i` in it close it and leave the agent paused (or attach, if the other window has gone). The float closes by itself, saying `peek at X ended` and why when it can, if the session ends. It follows the other window being resized |
+| `⌃]` | The nav key (configurable): back to NAV from an agent. Twice within two seconds selects and previews the previous agent in NAV. In NAV it does nothing |
 | `h` `l`, `⇧Tab` `Tab` | Previous / next left panel ([1], [2], [3]), also from [0] |
 | `1` `2` `3` | Focus the list [1], the activity and Changes panels. Focusing [2] or [3] expands it only as far as its content needs: from the other lower panel's spare rows first, then the list, and only then does the other panel collapse to its title line (at the smallest sizes the collapse can leave it a few blank rows) |
-| `Esc` | Back one level: [0] to its panel, [2] or [3] to [1], and from [1] to the agent you left |
+| `Esc` | Back one level: [0] to its panel, [2] or [3] to [1]. In [1] it does nothing |
 | `j k g G`, `↓ ↑ Home End` | Move in the focused panel, or scroll [0] when it has the keys |
 | `J` `K` | Scroll [0] from [2] or [3] without focusing it |
 | `⌃D ⌃U`, `PgDn PgUp` | Half a page / a page in the focused panel |
@@ -47,10 +47,10 @@ Install or update it with `~/.config/agent-tui/install.sh`, which builds it into
 | `{` `}` | Previous / next repo |
 | `+` `_` | [0] full width / back |
 | `.` | In [1], show every checkout / only those with a session |
-| `Space` / `/` | Switcher (fuzzy), `⌃N ⌃P` to move |
+| `Space` / `/` | Switcher (fuzzy), `⌃N ⌃P` to move. `⏎` selects and previews the pick in NAV |
 | `m` | Pin / unpin (pinned agents get their own tab) |
 | `n` | New agent form: prompt (`⌃E` edits it in $EDITOR), name (suggested from the prompt or a Linear/GitHub link), repo (listed, from the catalogue, or a path) |
-| `c` | In [1], [2] and [3]: check out for review: a branch name or a GitHub PR link, name (suggested from it), repo (a PR link picks the repo it names). Fetches the branch if git doesn't know it, asks `gh` for a PR's branch (a fork's PR lands on a `pr/N` branch), and attaches instead if an agent already has the branch checked out |
+| `c` | In [1], [2] and [3]: check out for review: a branch name or a GitHub PR link, name (suggested from it), repo (a PR link picks the repo it names). Fetches the branch if git doesn't know it, asks `gh` for a PR's branch (a fork's PR lands on a `pr/N` branch), and shows that agent instead if it already has the branch checked out |
 | `p` | Repo picker: `⏎` focuses a listed repo, or adds one from the catalogue or by a typed path (`~/code/foo`) |
 | `` ` `` | In [3], switch between the directory tree (default) and the flat file list |
 | `-` `=` | In [3]'s tree, close / open every folder |
@@ -58,7 +58,7 @@ Install or update it with `~/.config/agent-tui/install.sh`, which builds it into
 | `d` / `D` | Kill the session / remove session, worktree and branch (confirms, lists anything that would be lost) |
 | `r` / `R` | Restart the agent / every agent: kill the session, stop the harness process that outlived it so the installed version runs, then start it again resuming its conversation. `r` asks only when it would interrupt the agent, when it has background commands running (which a restart may stop, listed in the box) or when another window shows it. A command or activity that appears after you confirm cancels that restart instead of stopping it unseen. `R` always asks, and `i` in it restarts only the agents that are idle and have no background commands. An exited agent whose harness still runs has it stopped and stays exited. Its card reads `restarting` until the restart finishes |
 | `x` | Run a configured action on the selected agent (see below) |
-| `a` | Attach the agent that needs you most (asking, failed, then finished) |
+| `a` | Select the agent that needs you most (asking, failed, then finished) and preview it in NAV. `⏎` or `i` enters it |
 | `?` | Keybindings: the focused panel's keys first, then the global ones. Type to filter, `⏎` keeps the filter, `Esc` clears it while typing, and `?`, `q` or `Esc` close |
 | `q` | Quit (agents keep running) |
 

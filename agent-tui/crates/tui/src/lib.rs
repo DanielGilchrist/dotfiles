@@ -48,9 +48,7 @@ use keyspec::{Keyboard, Sendable};
 use ratatui::DefaultTerminal;
 use ratatui::layout::Rect;
 
-use model::{
-    Connection, Intent, Mode, Model, Moment, Pane, StatusKind, TerminalFocus, Ticket, Watch,
-};
+use model::{Connection, Mode, Model, Moment, Pane, StatusKind, TerminalFocus, Ticket, Watch};
 use palette::{Colours, Palette};
 use update::{Background, Effect, Open};
 use worker::{Job, Msg, Workers};
@@ -284,7 +282,6 @@ impl Runtime {
         m: &mut Model,
         name: &SessionName,
         spec: LaunchSpec,
-        intent: Intent,
         ticket: Ticket,
     ) -> Result<()> {
         if m.pane.awaiting(ticket).is_none() {
@@ -294,6 +291,7 @@ impl Runtime {
         let term = self
             .start_terminal(spec, size)
             .with_context(|| format!("attaching to {name}"))?;
+        let arrival = m.arrival(ticket);
         m.set_pane(Pane::Connected(Connection {
             name: name.clone(),
             id: ClientId::new(term.pid()),
@@ -302,7 +300,7 @@ impl Runtime {
             opened: m.clock.mono,
         }));
         m.touch_mru(name);
-        for work in update::connected(m, intent) {
+        for work in update::connected(m, arrival) {
             self.dispatch(work)?;
         }
         Ok(())
@@ -476,13 +474,9 @@ impl Runtime {
                     harness,
                     edit,
                 } => self.workers.suggest_name(prompt, harness, edit),
-                Effect::Attach {
-                    name,
-                    intent,
-                    ticket,
-                } => {
+                Effect::Attach { name, ticket } => {
                     let spec = self.backend.host.attach(&name);
-                    let result = self.connect(m, &name, spec, intent, ticket);
+                    let result = self.connect(m, &name, spec, ticket);
                     Self::connect_failed(m, ticket, result);
                 }
                 Effect::Observe {
@@ -493,12 +487,8 @@ impl Runtime {
                         update::observe_failed(m, ticket, Cause::of(e.as_ref()));
                     }
                 }
-                Effect::Connect {
-                    launch,
-                    intent,
-                    ticket,
-                } => {
-                    let result = self.connect(m, &launch.session, launch.spec, intent, ticket);
+                Effect::Connect { launch, ticket } => {
+                    let result = self.connect(m, &launch.session, launch.spec, ticket);
                     Self::connect_failed(m, ticket, result);
                 }
                 Effect::Edit(open) => self.open(m, terminal, &open),

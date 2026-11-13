@@ -98,7 +98,6 @@ pub struct Situation {
     pub changes_row: ChangesRow,
     pub changes_view: ChangesView,
     pub feed: Feed,
-    pub left: Left,
     pub toggle: Toggle,
     /// Where `⏎` takes [0] from the activity's entry under the cursor.
     pub jump: Option<crate::log::Jump>,
@@ -221,12 +220,6 @@ pub enum Fold {
 pub enum Feed {
     Following,
     Paused,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Left {
-    Nobody,
-    Agent,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -362,10 +355,6 @@ impl Situation {
             (Some(_), None) => Selected::Repo,
             (Some(_), Some(entry)) => Selected::Agent(Self::agent_keys(m, entry)),
         };
-        let left = m
-            .pane
-            .connection()
-            .is_some_and(|c| entry.is_none_or(|e| e.name() != &c.name));
         Self {
             ctx,
             selected: selected_keys,
@@ -377,7 +366,6 @@ impl Situation {
             } else {
                 Feed::Following
             },
-            left: if left { Left::Agent } else { Left::Nobody },
             toggle: Self::toggle(m),
             jump: m.activity_jump().cloned(),
             reply: match &m.reply {
@@ -597,9 +585,15 @@ pub const BINDINGS: &[Binding] = &[
             Selected::Agent(keys) => keys.enter,
             Selected::Nothing => None,
         }),
-        "On an agent: attach, so your keys go to its terminal (starts or resurrects the session first if needed). On an agent open in another window: move here, which attaches and then closes that window, from [1] on the banner row only. On a repo: show that repo's agents.",
-    )
-    .with(&["0"]),
+        "On an agent: enter it, so your keys go to its terminal (starts or resurrects the session first if needed, and enters when it is up if you are still on its row). On an agent open in another window: move here, which attaches and then closes that window, from [1] on the banner row only. On a repo: show that repo's agents.",
+    ),
+    Binding::new(
+        &["0"],
+        AGENTS,
+        Hidden,
+        Say("show in [0]"),
+        "Show the selected agent in [0] at once, without entering it. ⏎ or i enters.",
+    ),
     Binding::new(
         &["⏎"],
         LISTS,
@@ -618,10 +612,10 @@ pub const BINDINGS: &[Binding] = &[
         At(9),
         By(|s| match s.window() {
             None => None,
-            Some(Window::Here) => Some("attach"),
+            Some(Window::Here) => Some("enter"),
             Some(Window::Elsewhere | Window::MovesHere) => Some(LEAVE_PAUSED),
         }),
-        "Close the peek and attach, so your keys go to the agent's terminal. On an agent open in another window the peek closes and the agent stays paused, with ⏎ on its row in [1] to move here.",
+        "Close the peek and enter, so your keys go to the agent's terminal. On an agent open in another window the peek closes and the agent stays paused, with ⏎ on its row in [1] to move here.",
     ),
     Binding::new(
         &["J", "K"],
@@ -786,13 +780,6 @@ pub const BINDINGS: &[Binding] = &[
         "Go one level out: a focused document in [0] returns to its panel, or to the activity it was opened from. [2] and [3] return to [1].",
     ),
     Binding::new(
-        &["Esc"],
-        AGENTS,
-        RankBy(|s| (s.left == Left::Agent).then_some(5)),
-        By(|s| (s.left == Left::Agent).then_some("back")),
-        "Attach the agent you left with the nav key.",
-    ),
-    Binding::new(
         &["i"],
         EVERYWHERE,
         RankBy(|s| {
@@ -800,11 +787,11 @@ pub const BINDINGS: &[Binding] = &[
                 .then_some(if s.diff() { 4 } else { 8 })
         }),
         By(|s| match s.window() {
-            Some(Window::Here) => Some("attach"),
+            Some(Window::Here) => Some("enter"),
             Some(Window::MovesHere) => Some(MOVE_HERE),
             Some(Window::Elsewhere) | None => None,
         }),
-        "Attach the selected agent from any panel, so the nav key returns to where you were. On an agent open in another window it moves here from [1] only, where its row says so.",
+        "Enter the selected agent from any panel. On an agent open in another window it moves here from [1] only, where its row says so.",
     ),
     Binding::new(
         &["s"],
@@ -909,7 +896,7 @@ pub const BINDINGS: &[Binding] = &[
         PANELS,
         RankBy(|s| Some(if s.ctx == Ctx::Agents { 6 } else { 4 })),
         Say("switch"),
-        "Fuzzy switcher over every agent. Enter attaches the pick.",
+        "Fuzzy switcher over every agent. Enter selects the pick and shows it in [0]. ⏎ or i then enters it.",
     )
     .with(&["/"]),
     Binding::new(
@@ -979,8 +966,8 @@ pub const BINDINGS: &[Binding] = &[
         &["a"],
         PANELS,
         Hidden,
-        Say("attach next needing you"),
-        "Attach the agent that needs you most: asking, then failed, then finished. The count at the right edge says how many.",
+        Say("select next needing you"),
+        "Select the agent that needs you most, asking, then failed, then finished, and show it in [0]. ⏎ or i enters it. The count at the right edge says how many.",
     ),
     Binding::new(
         &["{", "}"],
@@ -1022,21 +1009,21 @@ pub const BINDINGS: &[Binding] = &[
         PANELS,
         Hidden,
         Say("nav (from an agent)"),
-        "While attached, leave the terminal and go back to NAV on that agent.",
+        "While in an agent's terminal, leave it and go back to NAV on that agent. In NAV it does nothing.",
     ),
     Binding::new(
         &["{nav} {nav}"],
         PANELS,
         Hidden,
         Say("previous agent"),
-        "While attached, jump to the agent you were in before.",
+        "Right after leaving an agent's terminal, select the agent you were in before and show it in [0]. It stays in NAV.",
     ),
     Binding::new(
         &["{nav} a"],
         PANELS,
         Hidden,
-        Say("attach next needing you"),
-        "While attached, jump to the agent that needs you most.",
+        Say("select next needing you"),
+        "Right after leaving an agent's terminal, select the agent that needs you most. It stays in NAV.",
     ),
 ];
 
@@ -1133,7 +1120,7 @@ mod tests {
 
     fn agent_keys() -> AgentKeys {
         AgentKeys {
-            enter: Some("attach"),
+            enter: Some("enter"),
             kill: Avail::Offered,
             remove: Avail::Offered,
             restart: Avail::Offered,
@@ -1161,7 +1148,6 @@ mod tests {
             changes_row: ChangesRow::File,
             changes_view: ChangesView::Tree,
             feed: Feed::Following,
-            left: Left::Agent,
             toggle: Toggle::Worth("show all"),
             jump: None,
             reply: Quoting::No,
@@ -1305,7 +1291,7 @@ mod tests {
         assert!(detail.local.iter().any(|r| r.label == "edit transcript"));
         assert!(detail.global.iter().all(|r| r.label != "open"));
         let agents = help(&situation(Ctx::Agents), "⌃]", "");
-        assert!(agents.local.iter().any(|r| r.label == "attach"));
+        assert!(agents.local.iter().any(|r| r.label == "enter"));
         assert!(agents.local.iter().all(|r| r.label != "edit file"));
     }
 

@@ -1215,12 +1215,12 @@ fn name_message(
                 Submission::Ready(Launchable::Checkout {
                     target: Checkout::Branch(_),
                     ..
-                }) => ("already on that branch · ⏎ attaches".to_string(), yellow),
+                }) => ("already on that branch · ⏎ shows it".to_string(), yellow),
                 Submission::Ready(Launchable::Checkout {
                     target: Checkout::PullRequest(_),
                     ..
                 }) => (
-                    "already an agent · ⏎ attaches if its branch is the PR's".to_string(),
+                    "already an agent · ⏎ shows it if its branch is the PR's".to_string(),
                     yellow,
                 ),
                 Submission::Blocked(Blocked::InAnotherRepo(repo)) => {
@@ -1237,7 +1237,7 @@ fn name_message(
                     yellow,
                 ),
                 Submission::Ready(Launchable::Attach { task: None, .. }) => {
-                    ("already running · ⏎ attaches".to_string(), yellow)
+                    ("already running · ⏎ shows it".to_string(), yellow)
                 }
                 Submission::Ready(Launchable::Resurrect(_)) => {
                     ("exited · ⏎ resurrects it".to_string(), yellow)
