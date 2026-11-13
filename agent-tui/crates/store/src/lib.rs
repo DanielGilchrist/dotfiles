@@ -489,6 +489,23 @@ mod tests {
         );
     }
 
+    fn forgetting_unpins_and_drops_the_record(store: &dyn Store) {
+        let record = AgentRecord::new("claude".parse().expect("parses"), None);
+        store.put_record(&name("a"), &record).expect("succeeds");
+        store.pin(&name("a")).expect("succeeds");
+        store.pin(&name("b")).expect("succeeds");
+        store.forget(&name("a")).expect("succeeds");
+        assert_eq!(store.record(&name("a")).expect("succeeds"), None);
+        assert_eq!(store.pinned().expect("succeeds"), [name("b")]);
+    }
+
+    #[test]
+    fn the_in_memory_store_forgets_like_the_file_store() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        forgetting_unpins_and_drops_the_record(&FsStore::new(dir.path().to_path_buf()));
+        forgetting_unpins_and_drops_the_record(&agent_core::testing::MemStore::default());
+    }
+
     #[test]
     fn a_hint_is_shown_until_it_is_marked() {
         let dir = tempfile::tempdir().expect("a temp dir");

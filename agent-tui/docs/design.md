@@ -233,7 +233,7 @@ NAV. The table in `crates/tui/src/keymap.rs` is the source of truth for the foot
 | `.` | in [1], show every checkout, or only those with a session (the default). The pinned tab always lists every pin |
 | `Space` / `/` | switcher |
 | `p` | repo picker: focus a listed repo, or add one from the catalogue or by path |
-| `m` | pin / unpin |
+| `m` | pin / unpin. Removing an agent inside the tool unpins it. On each TUI refresh a pin that matches no entry, session, discovered repo or catalogue repo is dropped from the store (as when an agent was deleted outside `agent`), so a repo-session pin is kept while its repo is observed, in the catalogue or has a session, and dropped after `agent forget` of an unlisted repo with none of those. A refresh that skipped anything drops nothing: a failed or partial scan, a listed repo or agent worktree whose repo is unreachable, an unreadable catalogue dir (a missing one is fine), or no agent worktree on disk at all. A leftover worktree directory whose repo is reachable but no longer lists it is junk and skipped. The CLI never prunes, and `agent pin` refuses a name that doesn't exist. Known gaps: a name recreated between the pin read and the unpin can lose its pin, `agent pin <repo>` refuses an unlisted catalogue repo although pruning would keep its pin, and a different non-empty `AGENT_WORKTREES` than the pins were made under looks like the agents being gone |
 | `a` | select the next agent that needs you and preview it (see Attention). `⏎` or `i` enters |
 | `n` | new agent form, or start an agent in the selected idle worktree |
 | `c` | check out a branch or a GitHub PR link for review: the new-agent form with the branch in place of the prompt |

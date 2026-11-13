@@ -860,7 +860,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         Cmd::Prompt { name, text, file } => prompt(svc, &name, text, file),
-        Cmd::Pin { name } => Ok(svc.store.pin(&infer_name(svc, name)?)?),
+        Cmd::Pin { name } => Ok(ops::pin(svc, &infer_name(svc, name)?)?),
         Cmd::Unpin { name } => Ok(svc.store.unpin(&infer_name(svc, name)?)?),
         Cmd::Exec { name } => exec(svc, &name),
 

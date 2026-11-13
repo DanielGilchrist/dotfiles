@@ -144,10 +144,18 @@ impl AgentWorktree {
             .find_map(|line| line.strip_prefix("gitdir: "))
             .map(|dir| self.path.join(dir.trim()))
         else {
-            return WorktreeState::Unlinked;
+            return WorktreeState::Unlinked(Unlink::RepoUnreachable);
         };
         if !admin.is_dir() {
-            return WorktreeState::Unlinked;
+            let repo_reachable = admin
+                .parent()
+                .and_then(Path::parent)
+                .is_some_and(Path::is_dir);
+            return WorktreeState::Unlinked(if repo_reachable {
+                Unlink::RepoReachable
+            } else {
+                Unlink::RepoUnreachable
+            });
         }
         // `git worktree add` writes `locked` with this reason into the
         // admin dir while it checks the files out (builtin/worktree.c,
@@ -164,6 +172,17 @@ impl AgentWorktree {
     }
 }
 
+/// Why a worktree's admin dir can't be found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unlink {
+    /// The repo's `.git` is there but has no entry for this worktree: it was
+    /// pruned or half removed, so the directory is leftover junk.
+    RepoReachable,
+    /// The repo's `.git` can't be reached, as when the repo moved or its
+    /// drive isn't mounted, so the agent may be live.
+    RepoUnreachable,
+}
+
 /// What an agent worktree's directory holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorktreeState {
@@ -173,7 +192,7 @@ pub enum WorktreeState {
     Initialising,
     /// A `.git` file whose admin dir is gone: pruned, or the repo moved
     /// without a repair.
-    Unlinked,
+    Unlinked(Unlink),
     /// No `.git`: a directory left behind by a removal.
     Gone,
 }
@@ -257,7 +276,7 @@ impl Layout {
         Ok(self
             .scan_states()?
             .into_iter()
-            .filter(|(_, state)| matches!(state, WorktreeState::Ready | WorktreeState::Unlinked))
+            .filter(|(_, state)| matches!(state, WorktreeState::Ready | WorktreeState::Unlinked(_)))
             .map(|(wt, _)| wt)
             .collect())
     }
@@ -385,7 +404,17 @@ mod tests {
         assert_eq!(layout.scan().expect("scans").len(), 1);
 
         std::fs::remove_dir_all(&admin).expect("removes");
-        assert_eq!(wt.state(), WorktreeState::Unlinked, "the admin dir is gone");
+        assert_eq!(
+            wt.state(),
+            WorktreeState::Unlinked(Unlink::RepoReachable),
+            "the admin dir is gone and the repo isn't"
+        );
+        std::fs::remove_dir_all(tmp.path().join("repo")).expect("removes");
+        assert_eq!(
+            wt.state(),
+            WorktreeState::Unlinked(Unlink::RepoUnreachable),
+            "the repo is gone too"
+        );
         std::fs::remove_file(new.join(".git")).expect("removes");
         assert_eq!(wt.state(), WorktreeState::Gone);
         std::fs::create_dir(new.join(".git")).expect("creates");

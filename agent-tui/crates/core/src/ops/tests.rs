@@ -676,6 +676,247 @@ fn removal_notices_a_branch_switch() {
     assert!(matches!(remove(w.svc(), approved), Err(Error::Changed(_))));
 }
 
+fn approved_removal(w: &World, name: &str) -> Approved {
+    plan_removal(
+        w.svc(),
+        removable(w.svc(), &session(name)).expect("succeeds"),
+    )
+    .expect("succeeds")
+    .elsewhere()
+    .expect("succeeds")
+    .approve()
+    .expect("succeeds")
+}
+
+fn pin_in(w: &World, name: &str) {
+    w.store.pin(&session(name)).expect("succeeds");
+}
+
+fn pins(w: &World) -> Vec<SessionName> {
+    w.store.pinned().expect("succeeds")
+}
+
+#[test]
+fn removing_an_agent_unpins_it() {
+    let w = World::new();
+    w.existing_worktree("fix");
+    w.existing_worktree("other");
+    pin_in(&w, "fix");
+    pin_in(&w, "other");
+    remove(w.svc(), approved_removal(&w, "fix")).expect("succeeds");
+    assert_eq!(pins(&w), [session("other")]);
+}
+
+#[test]
+fn removing_a_session_without_a_worktree_unpins_it() {
+    let w = World::new();
+    w.add_session(
+        "scratch",
+        SessionStatus::Live {
+            cwd: Some(w.vcs.root.path().into()),
+        },
+    );
+    pin_in(&w, "scratch");
+    remove(w.svc(), approved_removal(&w, "scratch")).expect("succeeds");
+    assert_eq!(pins(&w), Vec::<SessionName>::new());
+}
+
+fn tidy(w: &World, catalogue: &discover::Catalogue) -> Refreshed {
+    let refreshed = refresh(w.svc(), catalogue).expect("succeeds");
+    unpin_vanished(w.svc(), &refreshed.vanished);
+    refreshed
+}
+
+fn no_catalogue() -> discover::Catalogue {
+    discover::Catalogue::default()
+}
+
+#[test]
+fn a_pin_for_an_agent_deleted_outside_agent_is_dropped_and_pruned_even_with_a_record() {
+    let w = World::new();
+    w.existing_worktree("fix");
+    w.store
+        .put_record(
+            &session("by-hand"),
+            &AgentRecord::new("claude".parse().expect("parses"), None),
+        )
+        .expect("succeeds");
+    pin_in(&w, "gone");
+    pin_in(&w, "by-hand");
+    pin_in(&w, "fix");
+    let refreshed = tidy(&w, &no_catalogue());
+    assert!(refreshed.snapshot.entry(&session("gone")).is_none());
+    assert_eq!(
+        refreshed
+            .snapshot
+            .pinned()
+            .iter()
+            .map(|(_, e)| e.name().clone())
+            .collect::<Vec<_>>(),
+        [session("fix")]
+    );
+    assert_eq!(pins(&w), [session("fix")]);
+}
+
+#[test]
+fn the_plain_snapshot_never_writes_the_store() {
+    let w = World::new();
+    w.existing_worktree("fix");
+    pin_in(&w, "gone");
+    snapshot(w.svc()).expect("succeeds");
+    assert_eq!(pins(&w), [session("gone")]);
+}
+
+#[test]
+fn pins_survive_exited_sessions_idle_worktrees_and_repo_sessions_listed_or_not() {
+    let w = World::new();
+    w.existing_worktree("exited");
+    w.existing_worktree("idle");
+    w.add_session("exited", SessionStatus::Exited { cwd: None });
+    list_repo(w.svc(), w.vcs.root.path()).expect("succeeds");
+    for name in ["exited", "idle", "api", "elsewhere"] {
+        pin_in(&w, name);
+    }
+    let catalogue = discover::Catalogue {
+        repos: vec![RepoRoot::new("/src/elsewhere".into()).expect("absolute")],
+        warnings: Vec::new(),
+    };
+    let all = [
+        session("exited"),
+        session("idle"),
+        session("api"),
+        session("elsewhere"),
+    ];
+    tidy(&w, &catalogue);
+    assert_eq!(pins(&w), all);
+    unlist_repo(w.svc(), w.vcs.root.path()).expect("succeeds");
+    tidy(&w, &catalogue);
+    assert_eq!(pins(&w), all);
+}
+
+#[test]
+fn a_failed_discovery_prunes_no_pins() {
+    let w = World::new();
+    w.existing_worktree("fix");
+    pin_in(&w, "fix");
+    pin_in(&w, "gone");
+    *w.vcs.listing_fails.lock().expect("lock") = true;
+    let refreshed = tidy(&w, &no_catalogue());
+    assert!(refreshed.snapshot.is_empty());
+    assert!(!refreshed.warnings.is_empty());
+    assert_eq!(pins(&w), [session("fix"), session("gone")]);
+}
+
+#[test]
+fn a_worktree_whose_repo_went_missing_prunes_no_pins() {
+    let w = World::new();
+    let moved = w.existing_worktree("moved");
+    w.existing_worktree("fix");
+    pin_in(&w, "gone");
+    w.vcs
+        .not_repos
+        .lock()
+        .expect("lock")
+        .push(moved.path().to_path_buf());
+    tidy(&w, &no_catalogue());
+    assert_eq!(pins(&w), [session("gone")]);
+}
+
+#[test]
+fn a_leftover_worktree_dir_in_a_reachable_repo_doesnt_withhold_pruning() {
+    let w = World::new();
+    w.existing_worktree("fix");
+    let junk = w.existing_worktree("junk");
+    std::fs::remove_dir_all(w.vcs.root.path().join(".git/worktrees/junk")).expect("removes");
+    w.vcs
+        .not_repos
+        .lock()
+        .expect("lock")
+        .push(junk.path().to_path_buf());
+    pin_in(&w, "gone");
+    let refreshed = tidy(&w, &no_catalogue());
+    assert!(refreshed.warnings.is_empty(), "{:?}", refreshed.warnings);
+    assert_eq!(pins(&w), Vec::<SessionName>::new());
+}
+
+#[test]
+fn a_leftover_worktree_dir_whose_repo_is_unreachable_withholds_pruning() {
+    let w = World::new();
+    w.existing_worktree("fix");
+    let moved = w.existing_worktree("moved");
+    std::fs::remove_dir_all(w.vcs.root.path().join(".git")).expect("removes");
+    w.vcs
+        .not_repos
+        .lock()
+        .expect("lock")
+        .push(moved.path().to_path_buf());
+    pin_in(&w, "gone");
+    let refreshed = tidy(&w, &no_catalogue());
+    assert!(
+        refreshed
+            .warnings
+            .iter()
+            .any(|warning| matches!(warning, Warning::Orphaned { .. }))
+    );
+    assert_eq!(pins(&w), [session("gone")]);
+}
+
+#[test]
+fn a_missing_catalogue_dir_doesnt_withhold_pruning_but_an_unreadable_one_does() {
+    let w = World::new();
+    w.existing_worktree("fix");
+    pin_in(&w, "gone");
+    let unreadable = |kind: io::ErrorKind| discover::Catalogue {
+        repos: Vec::new(),
+        warnings: vec![Warning::Catalogue {
+            dir: "/repos".into(),
+            error: kind.into(),
+        }],
+    };
+    tidy(&w, &unreadable(io::ErrorKind::PermissionDenied));
+    assert_eq!(pins(&w), [session("gone")]);
+    tidy(&w, &unreadable(io::ErrorKind::NotFound));
+    assert_eq!(pins(&w), Vec::<SessionName>::new());
+}
+
+#[test]
+fn a_listed_repo_that_isnt_one_any_more_prunes_no_pins() {
+    let w = World::new();
+    w.existing_worktree("fix");
+    let missing = RepoRoot::new("/mnt/drive/repo".into()).expect("absolute");
+    w.store.list_repo(&missing).expect("succeeds");
+    w.vcs
+        .not_repos
+        .lock()
+        .expect("lock")
+        .push(missing.path().to_path_buf());
+    pin_in(&w, "gone");
+    tidy(&w, &no_catalogue());
+    assert_eq!(pins(&w), [session("gone")]);
+}
+
+#[test]
+fn an_empty_worktrees_root_prunes_no_pins() {
+    let w = World::new();
+    list_repo(w.svc(), w.vcs.root.path()).expect("succeeds");
+    pin_in(&w, "gone");
+    tidy(&w, &no_catalogue());
+    assert_eq!(pins(&w), [session("gone")]);
+}
+
+#[test]
+fn pinning_an_unknown_name_is_refused_and_a_known_one_pinned() {
+    let w = World::new();
+    w.existing_worktree("fix");
+    assert!(matches!(
+        pin(w.svc(), &session("nope")),
+        Err(Error::NotFound(n)) if n == session("nope")
+    ));
+    assert_eq!(pins(&w), Vec::<SessionName>::new());
+    pin(w.svc(), &session("fix")).expect("succeeds");
+    assert_eq!(pins(&w), [session("fix")]);
+}
+
 #[test]
 fn removal_deletes_a_session_started_after_the_plan() {
     let w = World::new();

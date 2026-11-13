@@ -193,13 +193,55 @@ pub fn bootstrap_prompt(task: Option<&Prompt>) -> Prompt {
 }
 
 pub fn snapshot(svc: Services<'_>) -> Result<(Snapshot, Vec<Warning>)> {
+    let refreshed = refresh(svc, &discover::Catalogue::default())?;
+    Ok((refreshed.snapshot, refreshed.warnings))
+}
+
+/// A snapshot and the pins that no longer point at anything. Nothing is
+/// written: [`unpin_vanished`] does that, and only the TUI's refresh calls it.
+pub struct Refreshed {
+    pub snapshot: Snapshot,
+    pub warnings: Vec<Warning>,
+    pub vanished: discover::VanishedPins,
+}
+
+/// Discovers and assembles. `catalogue` names the repos a pin may stand for
+/// beyond the ones discovered, so `vanished` is only trustworthy for the
+/// refresh that has the real one. Callers that don't prune ignore it.
+pub fn refresh(svc: Services<'_>, catalogue: &discover::Catalogue) -> Result<Refreshed> {
     let listed = svc.store.repos()?;
-    let mut obs = discover::observe(svc.vcs, svc.host, svc.layout, &listed)?;
     let pins = svc.store.pinned()?;
-    let (snapshot, mut warnings) =
-        discover::assemble(&obs, svc.layout, &pins, svc.host.name_limit());
+    let mut obs = discover::observe(svc.vcs, svc.host, svc.layout, &listed)?;
+    let assembled =
+        discover::assemble_checked(&obs, svc.layout, &pins, catalogue, svc.host.name_limit());
+    let mut warnings = assembled.warnings;
     warnings.append(&mut obs.warnings);
-    Ok((snapshot, warnings))
+    Ok(Refreshed {
+        snapshot: assembled.snapshot,
+        warnings,
+        vanished: assembled.vanished,
+    })
+}
+
+/// Drops pins [`refresh`] found vanished. A failure is noted in the error
+/// log, and the pin is tried again on the next refresh.
+pub fn unpin_vanished(svc: Services<'_>, vanished: &discover::VanishedPins) {
+    for name in vanished.names() {
+        if let Err(error) = svc.store.unpin(name) {
+            svc.store
+                .note(&format!("unpinning vanished {name}: {error}"));
+        }
+    }
+}
+
+/// Pins an agent or repo session that exists, so a pin never starts out
+/// pointing at nothing.
+pub fn pin(svc: Services<'_>, name: &SessionName) -> Result<()> {
+    let (snapshot, _) = snapshot(svc)?;
+    if snapshot.entry(name).is_none() {
+        return Err(Error::NotFound(name.clone()));
+    }
+    Ok(svc.store.pin(name)?)
 }
 
 pub fn repo_for(svc: Services<'_>, dir: &Path) -> Result<Option<RepoRoot>> {
@@ -271,7 +313,7 @@ fn find_worktree(svc: Services<'_>, name: &AgentName) -> Result<Option<AgentWork
     let mut ready: Vec<AgentWorktree> = Vec::new();
     for (wt, state) in found {
         match state {
-            WorktreeState::Ready | WorktreeState::Unlinked => ready.push(wt),
+            WorktreeState::Ready | WorktreeState::Unlinked(_) => ready.push(wt),
             WorktreeState::Initialising => return Err(Error::Creating(name.clone())),
             WorktreeState::Gone => {}
         }
@@ -809,7 +851,7 @@ pub fn attach_here(
     match worktree.state() {
         WorktreeState::Ready => {}
         WorktreeState::Initialising => return Err(Error::Creating(worktree.name().clone())),
-        WorktreeState::Unlinked | WorktreeState::Gone => {
+        WorktreeState::Unlinked(_) | WorktreeState::Gone => {
             return Err(Error::WorktreeGone {
                 name: worktree.name().session(),
                 path: worktree.path().to_path_buf(),

@@ -7,7 +7,7 @@ use crate::model::{
     Checkout, Entry, EntryKind, HostedRepo, Hosting, Presence, Repo, RepoKey, Snapshot, Worktree,
 };
 use crate::names::{NameError, NameLimit, SessionName};
-use crate::paths::{Layout, RepoRoot};
+use crate::paths::{Layout, RepoRoot, Unlink, WorktreeState};
 use crate::ports::{HostError, RepoWorktrees, SessionHost, SessionInfo, Vcs};
 use crate::process::{CommandError, parallel_map};
 
@@ -36,11 +36,30 @@ pub enum Warning {
     NotARepo {
         path: PathBuf,
     },
+    /// An agent worktree whose repo is gone, as when it moved.
+    Orphaned {
+        path: PathBuf,
+    },
     /// A `[repos] dirs` entry that couldn't be read.
     Catalogue {
         dir: PathBuf,
         error: io::Error,
     },
+}
+
+impl Warning {
+    /// Whether the warning means entries may be missing from the snapshot.
+    fn hides_agents(&self) -> bool {
+        match self {
+            Self::Scan { .. }
+            | Self::Repo { .. }
+            | Self::Unnamed { .. }
+            | Self::NameClash { .. }
+            | Self::NotARepo { .. }
+            | Self::Orphaned { .. } => true,
+            Self::Catalogue { error, .. } => error.kind() != io::ErrorKind::NotFound,
+        }
+    }
 }
 
 impl fmt::Display for Warning {
@@ -60,6 +79,9 @@ impl fmt::Display for Warning {
                     "{} isn't a git repo (agent forget drops it)",
                     path.display()
                 )
+            }
+            Self::Orphaned { path } => {
+                write!(f, "{} isn't in a git repo any more", path.display())
             }
             Self::Catalogue { dir, error } => {
                 write!(f, "repos.dirs {}: {error}", dir.display())
@@ -83,7 +105,9 @@ pub struct Observation {
 enum Candidate {
     /// A listed repo: not in a repo any more is worth a warning.
     Listed,
-    /// A session's cwd or an agent worktree: not in a repo is normal.
+    /// An agent worktree on disk: not in a repo means its repo is gone.
+    Worktree,
+    /// A session's cwd: not in a repo is normal.
     Seen,
 }
 
@@ -106,7 +130,7 @@ pub fn observe(
         Ok(worktrees) => candidates.extend(
             worktrees
                 .iter()
-                .map(|wt| (wt.path().to_path_buf(), Candidate::Seen)),
+                .map(|wt| (wt.path().to_path_buf(), Candidate::Worktree)),
         ),
         Err(error) => warnings.push(Warning::Scan {
             root: layout.root().to_path_buf(),
@@ -130,6 +154,15 @@ pub fn observe(
         match (result, candidate) {
             (Ok(Some(root)), _) => {
                 roots.insert(root);
+            }
+            (Ok(None), Candidate::Worktree) => {
+                let leftover = matches!(
+                    layout.worktree_at(path).map(|wt| wt.state()),
+                    Some(WorktreeState::Unlinked(Unlink::RepoReachable))
+                );
+                if !leftover {
+                    warnings.push(Warning::Orphaned { path: path.clone() });
+                }
             }
             (Ok(None), Candidate::Seen) => {}
             (Ok(None), Candidate::Listed) => {
@@ -268,6 +301,73 @@ pub fn assemble(
         .filter_map(|(key, entries)| Repo::new(key, entries))
         .collect();
     (Snapshot::new(repos), claims.warnings)
+}
+
+/// A snapshot with the pins that provably point at nothing.
+pub struct Assembled {
+    pub snapshot: Snapshot,
+    pub warnings: Vec<Warning>,
+    pub vanished: VanishedPins,
+}
+
+/// Pins whose agent no longer exists, found in the snapshot they came with
+/// from a discovery that skipped nothing. Only [`assemble_checked`] makes one.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct VanishedPins(Vec<SessionName>);
+
+impl VanishedPins {
+    pub fn names(&self) -> &[SessionName] {
+        &self.0
+    }
+}
+
+/// [`assemble`], plus the pins to drop. A pin is dropped only when no entry,
+/// no session and no repo (observed or in the catalogue) has its name, and
+/// only when discovery skipped nothing: no warning that hides agents, an
+/// unreadable catalogue dir, or no agent worktree on disk at all, which is
+/// what a different or missing worktrees root looks like.
+pub fn assemble_checked(
+    obs: &Observation,
+    layout: &Layout,
+    pins: &[SessionName],
+    catalogue: &Catalogue,
+    limit: NameLimit,
+) -> Assembled {
+    let (snapshot, warnings) = assemble(obs, layout, pins, limit);
+    let hidden = obs
+        .warnings
+        .iter()
+        .chain(&warnings)
+        .any(Warning::hides_agents)
+        || catalogue.warnings.iter().any(Warning::hides_agents);
+    let repo_names: HashSet<SessionName> = obs
+        .repos
+        .iter()
+        .map(|(root, _)| root)
+        .chain(&catalogue.repos)
+        .filter_map(|root| HostedRepo::admit(limit, root.clone()).ok())
+        .map(|repo| repo.host().session().clone())
+        .collect();
+    let stale: Vec<SessionName> = pins
+        .iter()
+        .filter(|pin| snapshot.entry(pin).is_none() && !repo_names.contains(*pin))
+        .cloned()
+        .collect();
+    let saw_agents = obs
+        .repos
+        .iter()
+        .flat_map(|(_, worktrees)| &worktrees.linked)
+        .any(|wt| layout.worktree_at(&wt.path).is_some());
+    let vanished = if hidden || !saw_agents {
+        VanishedPins::default()
+    } else {
+        VanishedPins(stale)
+    };
+    Assembled {
+        snapshot,
+        warnings,
+        vanished,
+    }
 }
 
 /// The session names taken so far, and the clashes that hid a checkout.
@@ -624,6 +724,115 @@ mod tests {
                 .as_str(),
             "a"
         );
+    }
+
+    fn checked(obs: &Observation, pins: &[SessionName], catalogue: &Catalogue) -> Assembled {
+        assemble_checked(obs, &layout(), pins, catalogue, NAME_LIMIT)
+    }
+
+    fn vanished(assembled: &Assembled) -> Vec<&str> {
+        assembled
+            .vanished
+            .names()
+            .iter()
+            .map(SessionName::as_str)
+            .collect()
+    }
+
+    fn api_with(agents: &[&str]) -> Observation {
+        let paths: Vec<String> = agents.iter().map(|a| format!("/w/api/{a}")).collect();
+        let paths: Vec<&str> = paths.iter().map(String::as_str).collect();
+        Observation {
+            repos: vec![repo("/src/api", &paths)],
+            ..Observation::default()
+        }
+    }
+
+    #[test]
+    fn a_pin_matching_no_entry_session_or_repo_vanishes() {
+        let obs = api_with(&["a"]);
+        let found = checked(&obs, &[name("gone"), name("a")], &Catalogue::default());
+        assert_eq!(vanished(&found), ["gone"]);
+    }
+
+    #[test]
+    fn pins_naming_a_repo_or_an_entry_never_vanish() {
+        let mut obs = api_with(&["a"]);
+        obs.sessions = vec![exited("sess")];
+        let catalogue = Catalogue {
+            repos: vec![root("/src/unlisted")],
+            warnings: Vec::new(),
+        };
+        let pins = [name("api"), name("unlisted"), name("a"), name("sess")];
+        assert_eq!(vanished(&checked(&obs, &pins, &catalogue)), [] as [&str; 0]);
+    }
+
+    #[test]
+    fn only_warnings_that_hide_agents_withhold_the_pruning() {
+        let pins = [name("gone")];
+        let withheld = |warning: Warning| {
+            let mut obs = api_with(&["a"]);
+            obs.warnings.push(warning);
+            vanished(&checked(&obs, &pins, &Catalogue::default())).is_empty()
+        };
+        assert!(withheld(Warning::Scan {
+            root: "/w".into(),
+            error: io::Error::other("denied"),
+        }));
+        assert!(withheld(Warning::Repo {
+            path: "/w/api/a".into(),
+            error: CommandError::Failed {
+                command: "git".into(),
+                status: "128".into(),
+                stderr: String::new(),
+            },
+        }));
+        assert!(withheld(Warning::Unnamed {
+            root: root("/src/api"),
+            error: "a b".parse::<SessionName>().expect_err("a space"),
+        }));
+        assert!(withheld(Warning::NotARepo { path: "/x".into() }));
+        assert!(withheld(Warning::Orphaned {
+            path: "/w/api/a".into()
+        }));
+        assert!(withheld(Warning::Catalogue {
+            dir: "/c".into(),
+            error: io::Error::other("denied"),
+        }));
+        assert!(!withheld(Warning::Catalogue {
+            dir: "/c".into(),
+            error: io::ErrorKind::NotFound.into(),
+        }));
+    }
+
+    #[test]
+    fn a_name_clash_or_unreadable_catalogue_withholds_the_pruning() {
+        let obs = Observation {
+            repos: vec![repo("/src/api", &["/w/api/api"])],
+            ..Observation::default()
+        };
+        let found = checked(&obs, &[name("gone")], &Catalogue::default());
+        assert!(matches!(
+            found.warnings.as_slice(),
+            [Warning::NameClash { .. }]
+        ));
+        assert_eq!(vanished(&found), [] as [&str; 0]);
+        let unreadable = Catalogue {
+            repos: Vec::new(),
+            warnings: vec![Warning::Catalogue {
+                dir: "/c".into(),
+                error: io::Error::other("denied"),
+            }],
+        };
+        let found = checked(&api_with(&["a"]), &[name("gone")], &unreadable);
+        assert_eq!(vanished(&found), [] as [&str; 0]);
+    }
+
+    #[test]
+    fn no_agent_worktree_on_disk_withholds_the_pruning() {
+        let obs = api_with(&[]);
+        let found = checked(&obs, &[name("gone")], &Catalogue::default());
+        assert_eq!(vanished(&found), [] as [&str; 0]);
     }
 
     #[test]

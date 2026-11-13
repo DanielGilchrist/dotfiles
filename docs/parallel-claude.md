@@ -48,7 +48,7 @@ Install or update it with `~/.config/agent-tui/install.sh`, which builds it into
 | `+` `_` | [0] full width / back |
 | `.` | In [1], show every checkout / only those with a session |
 | `Space` / `/` | Switcher (fuzzy), `⌃N ⌃P` to move. `⏎` selects and previews the pick in NAV |
-| `m` | Pin / unpin (pinned agents get their own tab) |
+| `m` | Pin / unpin (pinned agents get their own tab). Removing an agent unpins it, and a pin for an agent deleted outside `agent` is dropped on the next complete refresh in the TUI. A repo-session pin is kept while its repo is listed, in the catalogue or has a session, and dropped after `agent forget` of an unlisted repo with none. An incomplete scan drops nothing, and `agent pin` refuses unknown names |
 | `n` | New agent form: prompt (`⌃E` edits it in $EDITOR), name (suggested from the prompt or a Linear/GitHub link), repo (listed, from the catalogue, or a path) |
 | `c` | In [1], [2] and [3]: check out for review: a branch name or a GitHub PR link, name (suggested from it), repo (a PR link picks the repo it names). Fetches the branch if git doesn't know it, asks `gh` for a PR's branch (a fork's PR lands on a `pr/N` branch), and shows that agent instead if it already has the branch checked out |
 | `p` | Repo picker: `⏎` focuses a listed repo, or adds one from the catalogue or by a typed path (`~/code/foo`) |

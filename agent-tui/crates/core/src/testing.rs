@@ -67,6 +67,8 @@ pub struct FakeVcs {
     pub pull_requests: Mutex<Vec<u64>>,
     /// Every fetch fails, as with no network.
     pub offline: Mutex<bool>,
+    /// Listing the worktrees fails, as when git can't run.
+    pub listing_fails: Mutex<bool>,
 }
 
 impl FakeVcs {
@@ -84,6 +86,7 @@ impl FakeVcs {
             fetched: Mutex::default(),
             pull_requests: Mutex::default(),
             offline: Mutex::default(),
+            listing_fails: Mutex::default(),
         }
     }
 
@@ -120,6 +123,13 @@ impl Vcs for FakeVcs {
     }
 
     fn worktrees(&self, repo: &RepoRoot) -> Result<RepoWorktrees, CommandError> {
+        if *self.listing_fails.lock().expect("lock") {
+            return Err(CommandError::Failed {
+                command: "git worktree list".into(),
+                status: "exit status: 128".into(),
+                stderr: "fatal".into(),
+            });
+        }
         let heads = self.heads.lock().expect("lock");
         let others = self.other_repos.lock().expect("lock");
         let linked = heads

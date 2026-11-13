@@ -804,14 +804,14 @@ pub fn spawn(backend: Arc<Backend>, sources: Sources, msgs: Sender<Msg>) -> Work
                         if (&catalogue.repos, &warnings) != (&offered.0, &offered.1) {
                             offered = (catalogue.repos.clone(), warnings.clone());
                             let msg = Msg::Catalogue {
-                                repos: catalogue.repos,
+                                repos: catalogue.repos.clone(),
                                 warnings,
                             };
                             if msgs.send(msg).is_err() {
                                 return;
                             }
                         }
-                        snapshot(&backend)
+                        refreshed_snapshot(&backend, &catalogue)
                     }
                     Err(mpsc::RecvTimeoutError::Timeout) => match backend.store.activities() {
                         Ok(activities) if activities != heard => {
@@ -979,6 +979,20 @@ fn run_action(label: &str, launch: &CommandLine, msgs: &Sender<Msg>) -> Result<O
             format!(": {last}")
         }
     )))
+}
+
+fn refreshed_snapshot(backend: &Backend, catalogue: &discover::Catalogue) -> Msg {
+    let svc = backend.services();
+    match ops::refresh(svc, catalogue) {
+        Ok(refreshed) => {
+            ops::unpin_vanished(svc, &refreshed.vanished);
+            Msg::Snapshot(Ok((
+                refreshed.snapshot,
+                refreshed.warnings.iter().map(ToString::to_string).collect(),
+            )))
+        }
+        Err(e) => Msg::Snapshot(Err(Cause::of(&e))),
+    }
 }
 
 fn snapshot(backend: &Backend) -> Msg {
