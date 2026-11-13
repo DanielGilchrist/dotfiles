@@ -164,6 +164,25 @@ pub fn run_commands(
     activities.insert(name(agent), after);
 }
 
+/// The answer `result` to a read of the output of `agent`'s command `task`,
+/// as the worker would give it to the request just made.
+pub fn heard_output(
+    m: &mut Model,
+    agent: &str,
+    task: &str,
+    result: Result<agent_core::ports::CommandOutput, crate::cause::Cause>,
+) {
+    let ticket = m.ticket();
+    let moment = m.clock;
+    let watch = m
+        .track(&name(agent))
+        .command_outputs
+        .entry(task.parse().expect("shows"))
+        .or_default();
+    watch.ask(ticket, crate::model::Presence::Listed, moment.mono);
+    watch.hear(ticket, result, moment);
+}
+
 /// `agent` with a question open.
 pub fn ask(m: &mut Model, agent: &str) {
     m.activities

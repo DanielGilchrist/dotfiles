@@ -10,14 +10,15 @@ use agent_core::activity::{
 };
 use agent_core::names::Prompt;
 use agent_core::ports::{
-    ActivityDetail, Harness, HarnessError, HarnessId, Harnesses, LaunchCtx, Log, Lookup, Outcome,
-    PendingPrompt, Probe, Seen, TranscriptStamp, ends_with_report,
+    ActivityDetail, CommandOutput, Harness, HarnessError, HarnessId, Harnesses, LaunchCtx, Log,
+    Lookup, Outcome, PendingPrompt, Probe, Seen, TranscriptStamp, ends_with_report,
 };
 use agent_core::process::{LaunchSpec, quiet};
 use serde::Deserialize;
 
 use crate::background::{Found, JobId, ProcStart, Survivor};
 use crate::conversation::{Chains, Conversation, SessionId};
+use crate::output::{Located, Locations, OUTPUT_BYTES, OutputFile, Refusal};
 use crate::stopping::{Patience, Processes};
 
 mod activity;
@@ -25,6 +26,7 @@ mod background;
 mod conversation;
 #[cfg(test)]
 mod fixtures;
+mod output;
 mod stopping;
 mod transcript;
 
@@ -84,6 +86,11 @@ pub struct Claude {
     projects: PathBuf,
     /// Where Claude Code registers its live sessions, one JSON per process.
     sessions: PathBuf,
+    /// Where Claude Code keeps background commands' output, in a directory
+    /// per user. Claude Code uses `/tmp`, so a setup that moves its temp
+    /// directory needs this changed.
+    tasks: PathBuf,
+    outputs: Locations,
     permission_mode: String,
     add_dirs: Vec<PathBuf>,
     chains: Chains,
@@ -106,6 +113,8 @@ impl Claude {
             quick_model: "haiku".into(),
             projects: home.join(".claude/projects"),
             sessions: home.join(".claude/sessions"),
+            tasks: PathBuf::from("/tmp"),
+            outputs: Locations::default(),
             permission_mode: "auto".into(),
             add_dirs: vec![PathBuf::from("/tmp")],
             chains: Chains::default(),
@@ -240,12 +249,8 @@ impl Claude {
     /// The transcript file `at` names, if it is one under the projects
     /// directory.
     fn named_file(&self, at: &TranscriptRef) -> Option<PathBuf> {
-        let projects = self.projects.canonicalize().ok()?;
-        at.path()
-            .canonicalize()
-            .ok()
-            .filter(|path| path.extension().is_some_and(|e| e == "jsonl") && path.is_file())
-            .filter(|path| path.starts_with(&projects))
+        let (path, _) = resolved_inside(&self.projects, at.path()).ok().flatten()?;
+        (path.extension().is_some_and(|e| e == "jsonl") && path.is_file()).then_some(path)
     }
 
     /// The transcript of the agent's current conversation: the one the hooks
@@ -621,6 +626,32 @@ impl Harness for Claude {
         activity::read(&file).map_err(context)
     }
 
+    fn command_output(
+        &self,
+        workdir: &Path,
+        at: Option<&TranscriptRef>,
+        task: &TaskId,
+    ) -> Result<CommandOutput, HarnessError> {
+        let context = |source| HarnessError {
+            context: format!("reading the output of command {}", task.as_str()),
+            source,
+        };
+        let Some(transcript) = self.activity_file(workdir, at).map_err(context)? else {
+            return Ok(CommandOutput::Unlocated);
+        };
+        let claimed = match self.outputs.of(&transcript, task).map_err(context)? {
+            Located::At(claimed) => claimed,
+            Located::Nowhere => return Ok(CommandOutput::Unlocated),
+            Located::Searching => return Ok(CommandOutput::Searching),
+        };
+        let file = match OutputFile::open(&self.tasks, &claimed, task, nix::unistd::getuid()) {
+            Ok(file) => file,
+            Err(Refusal::Gone) => return Ok(CommandOutput::Gone),
+            Err(refused) => return Err(context(io::Error::other(refused.to_string()))),
+        };
+        file.tail(OUTPUT_BYTES).map_err(context)
+    }
+
     fn interruption(
         &self,
         at: &TranscriptRef,
@@ -864,6 +895,36 @@ impl Tail {
     }
 }
 
+/// The last `window` bytes of a `len` byte file, and one byte before them
+/// when there is one, so a line starting exactly at the window's edge is known
+/// to start there.
+struct Window {
+    bytes: Vec<u8>,
+    /// Where in the file the last `window` bytes start.
+    start: u64,
+}
+
+fn read_window(file: &mut std::fs::File, len: u64, window: u64) -> io::Result<Window> {
+    let start = len.saturating_sub(window);
+    let back = start.min(1);
+    file.seek(SeekFrom::Start(start - back))?;
+    let mut bytes = Vec::new();
+    file.by_ref().take(window + back).read_to_end(&mut bytes)?;
+    Ok(Window { bytes, start })
+}
+
+/// `path` resolved through links, with where it lies under `root` (resolved
+/// too), or `None` when it isn't under it.
+fn resolved_inside(root: &Path, path: &Path) -> io::Result<Option<(PathBuf, PathBuf)>> {
+    let root = root.canonicalize()?;
+    let path = path.canonicalize()?;
+    Ok(path
+        .strip_prefix(&root)
+        .ok()
+        .map(PathBuf::from)
+        .map(|inside| (path, inside)))
+}
+
 /// The whole records in the last `window` bytes of a `len` byte file,
 /// widening the window fourfold up to `max` while it holds none (one huge
 /// record).
@@ -871,11 +932,7 @@ impl Tail {
 /// is kept, and the partial one before it is dropped.
 fn read_tail(file: &mut std::fs::File, len: u64, mut window: u64, max: u64) -> io::Result<Tail> {
     loop {
-        let start = len.saturating_sub(window);
-        let back = start.min(1);
-        file.seek(SeekFrom::Start(start - back))?;
-        let mut bytes = Vec::new();
-        file.by_ref().take(window + back).read_to_end(&mut bytes)?;
+        let Window { bytes, start } = read_window(file, len, window)?;
         let text = String::from_utf8_lossy(&bytes);
         let whole = match (start, text.find('\n')) {
             (0, _) => Some(&text[..]),
@@ -2798,6 +2855,105 @@ mod tests {
                 Some("from the newest"),
                 "{refused} isn't a transcript to read"
             );
+        }
+    }
+
+    mod command_output {
+        use super::*;
+        use agent_core::ports::Cut;
+
+        struct Setup {
+            _home: tempfile::TempDir,
+            _tasks: tempfile::TempDir,
+            claude: Claude,
+            transcript: TranscriptRef,
+            output: PathBuf,
+        }
+
+        fn task() -> TaskId {
+            "b1".parse().expect("visible")
+        }
+
+        fn setup(announce: impl Fn(&Path) -> String) -> Setup {
+            let home = tempfile::tempdir().expect("a temp dir");
+            let tasks = tempfile::tempdir().expect("a temp dir");
+            let mut claude = Claude::with_program(home.path(), "/usr/bin/true".into());
+            claude.tasks = tasks.path().to_path_buf();
+            let dir = tasks.path().join(format!(
+                "claude-{}/-work/session/tasks",
+                nix::unistd::getuid()
+            ));
+            std::fs::create_dir_all(&dir).expect("creates");
+            let output = dir.join("b1.output");
+            let project = claude.projects.join("proj");
+            std::fs::create_dir_all(&project).expect("creates");
+            let transcript = project.join("session.jsonl");
+            std::fs::write(&transcript, announce(&output) + "\n").expect("writes");
+            Setup {
+                _home: home,
+                _tasks: tasks,
+                claude,
+                transcript: TranscriptRef::new(transcript.to_string_lossy()),
+                output,
+            }
+        }
+
+        fn announces(output: &Path) -> String {
+            let text = format!(
+                "Command running in background with ID: b1. Output is being written to: {}. You will be notified",
+                output.display()
+            );
+            format!(
+                r#"{{"type":"user","toolUseResult":{{"backgroundTaskId":"b1"}},"message":{{"content":[{{"type":"tool_result","content":{}}}]}}}}"#,
+                serde_json::to_string(&text).expect("json")
+            )
+        }
+
+        fn read(s: &Setup) -> CommandOutput {
+            s.claude
+                .command_output(Path::new("/unused"), Some(&s.transcript), &task())
+                .expect("reads")
+        }
+
+        #[test]
+        fn the_tail_of_the_file_the_transcript_names_is_read() {
+            let s = setup(announces);
+            std::fs::write(&s.output, "building\ndone\n").expect("writes");
+            assert_eq!(
+                read(&s),
+                CommandOutput::of("building\ndone\n".into(), Cut::Whole)
+            );
+        }
+
+        #[test]
+        fn a_file_that_has_been_removed_is_gone() {
+            let s = setup(announces);
+            assert_eq!(read(&s), CommandOutput::Gone);
+        }
+
+        #[test]
+        fn a_transcript_that_never_names_the_command_leaves_its_output_unlocated() {
+            let s = setup(|_| "{}".into());
+            std::fs::write(&s.output, "x").expect("writes");
+            assert_eq!(read(&s), CommandOutput::Unlocated);
+        }
+
+        #[test]
+        fn a_path_outside_the_task_directory_is_an_error_and_is_never_read() {
+            let elsewhere = tempfile::tempdir().expect("a temp dir");
+            let secret = elsewhere.path().join("b1.output");
+            std::fs::write(&secret, "secret").expect("writes");
+            let s = setup(|_| announces(&secret));
+            let failed = s
+                .claude
+                .command_output(Path::new("/unused"), Some(&s.transcript), &task())
+                .expect_err("refused");
+            let said = failed.to_string();
+            assert!(
+                said.contains("not under the task output directory"),
+                "{said}"
+            );
+            assert!(!said.contains("secret"));
         }
     }
 

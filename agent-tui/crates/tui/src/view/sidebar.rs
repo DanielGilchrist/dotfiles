@@ -3360,6 +3360,17 @@ mod tests {
                     );
                 }
                 m.palette = palette;
+                for agent in ["docs-sweep-6", "obs-layout-4", "auth-refresh-2"] {
+                    crate::fixtures::heard_output(
+                        &mut m,
+                        agent,
+                        "c1",
+                        Ok(agent_core::ports::CommandOutput::of(
+                            "compiling\n".into(),
+                            agent_core::ports::Cut::Whole,
+                        )),
+                    );
+                }
                 if matches!(
                     &panel,
                     Focused::Agent {
@@ -6241,6 +6252,514 @@ mod tests {
             let text = page(&mut m, (100, 30)).join("\n");
             assert!(text.contains("running at least 4m"), "{text}");
             assert!(text.contains("as of 1m ago"), "{text}");
+        }
+
+        mod output {
+            use agent_core::ports::{CommandOutput, Cut};
+
+            use super::*;
+            use crate::cause::Cause;
+
+            const SIZE: (u16, u16) = (100, 30);
+
+            fn showing() -> Model {
+                let mut m = fleet(10);
+                run_commands(
+                    &mut m,
+                    "obs-layout-4",
+                    &[listed("c1", "cargo test")],
+                    FOUR_MINUTES,
+                );
+                m.set_cursor(Cursor::Entry(name("obs-layout-4")));
+                m.panel = Focused::activity();
+                m.point_at_row(|_, last| last);
+                m
+            }
+
+            fn hear(m: &mut Model, result: Result<CommandOutput, Cause>) {
+                crate::fixtures::heard_output(m, "obs-layout-4", "c1", result);
+            }
+
+            fn text(m: &mut Model) -> String {
+                page(m, SIZE).join("\n")
+            }
+
+            fn numbered(count: usize) -> String {
+                let mut lines = (0..count)
+                    .map(|n| format!("line {n}"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                lines.push('\n');
+                lines
+            }
+
+            #[test]
+            fn a_command_document_says_it_is_reading_the_output_until_an_answer_comes() {
+                let mut m = showing();
+                let text = text(&mut m);
+                assert!(
+                    text.contains("Output") && text.contains("reading…"),
+                    "{text}"
+                );
+            }
+
+            #[test]
+            fn an_empty_file_reads_no_output_yet() {
+                let mut m = showing();
+                hear(&mut m, Ok(CommandOutput::Empty));
+                let text = text(&mut m);
+                assert!(text.contains("no output yet"), "{text}");
+            }
+
+            #[test]
+            fn a_removed_file_reads_output_file_gone() {
+                let mut m = showing();
+                hear(&mut m, Ok(CommandOutput::Gone));
+                let text = text(&mut m);
+                assert!(text.contains("output file gone"), "{text}");
+            }
+
+            #[test]
+            fn a_search_that_is_not_finished_says_it_is_looking() {
+                let mut m = showing();
+                hear(&mut m, Ok(CommandOutput::Searching));
+                let text = text(&mut m);
+                assert!(text.contains("looking for the output…"), "{text}");
+            }
+
+            #[test]
+            fn a_command_whose_output_is_not_located_says_so() {
+                let mut m = showing();
+                hear(&mut m, Ok(CommandOutput::Unlocated));
+                let text = text(&mut m);
+                assert!(text.contains("no output location recorded"), "{text}");
+            }
+
+            #[test]
+            fn a_failed_read_shows_its_cause_in_the_section() {
+                let mut m = showing();
+                hear(
+                    &mut m,
+                    Err(Cause::of(&std::io::Error::other("permission denied"))),
+                );
+                let text = text(&mut m);
+                assert!(text.contains("permission denied"), "{text}");
+            }
+
+            #[test]
+            fn the_tail_shows_below_the_facts_with_how_old_the_answer_is() {
+                let mut m = showing();
+                hear(
+                    &mut m,
+                    Ok(CommandOutput::of(
+                        "compiling\nfinished\n".into(),
+                        Cut::Whole,
+                    )),
+                );
+                m.clock.wall += Duration::from_secs(5);
+                let rows = page(&mut m, SIZE);
+                let at = |needle: &str| rows.iter().position(|row| row.contains(needle));
+                let (facts, heading, first, last, age) = (
+                    at("running at least"),
+                    at("Output"),
+                    at("compiling"),
+                    at("finished"),
+                    rows.iter().rposition(|row| row.contains("as of 5s ago")),
+                );
+                assert!(
+                    facts < heading && heading < first && first < last && last < age,
+                    "{rows:#?}"
+                );
+            }
+
+            #[test]
+            fn the_section_is_dim() {
+                let mut m = showing();
+                m.palette = super::super::SENTINEL;
+                hear(
+                    &mut m,
+                    Ok(CommandOutput::of("compiling\n".into(), Cut::Whole)),
+                );
+                let terminal = render(&mut m, SIZE);
+                let buffer = terminal.backend().buffer();
+                let row = screen(&terminal)
+                    .iter()
+                    .position(|row| row.contains("compiling"))
+                    .expect("shown");
+                let column = screen(&terminal)[row].find("compiling").expect("shown");
+                let cell = &buffer[(
+                    u16::try_from(screen(&terminal)[row][..column].chars().count()).expect("small"),
+                    u16::try_from(row).expect("small"),
+                )];
+                assert_eq!(cell.fg, Color::Rgb(2, 2, 2));
+            }
+
+            #[test]
+            fn a_cut_tail_says_how_much_is_shown() {
+                let mut m = showing();
+                hear(
+                    &mut m,
+                    Ok(CommandOutput::of(
+                        "end\n".into(),
+                        Cut::Last {
+                            bytes: 65536,
+                            from: 0,
+                        },
+                    )),
+                );
+                let text = text(&mut m);
+                assert!(text.contains("showing the last 64 KB"), "{text}");
+            }
+
+            #[test]
+            fn a_whole_tail_does_not_claim_to_be_cut() {
+                let mut m = showing();
+                hear(&mut m, Ok(CommandOutput::of("end\n".into(), Cut::Whole)));
+                let text = text(&mut m);
+                assert!(!text.contains("showing the last"), "{text}");
+            }
+
+            #[test]
+            fn escape_sequences_in_the_output_never_reach_the_screen() {
+                let mut m = showing();
+                let hostile =
+                    "\u{1b}[31mred\u{1b}[0m \u{1b}]0;owned\u{7}ok\u{1b}[2J\u{9b}1;1Hdone\n";
+                hear(&mut m, Ok(CommandOutput::of(hostile.into(), Cut::Whole)));
+                let terminal = render(&mut m, SIZE);
+                let text = screen(&terminal).join("\n");
+                assert!(text.contains("red ok"), "{text}");
+                assert!(text.contains("done"), "{text}");
+                assert!(
+                    !text.contains('\u{1b}') && !text.contains('\u{9b}'),
+                    "{text:?}"
+                );
+                assert!(!text.contains("owned") && !text.contains("[31m"), "{text}");
+            }
+
+            #[test]
+            fn tabs_and_carriage_returns_become_printable_text() {
+                let mut m = showing();
+                hear(
+                    &mut m,
+                    Ok(CommandOutput::of(
+                        "a\tb\n10%\r50%\r100%\n".into(),
+                        Cut::Whole,
+                    )),
+                );
+                let text = text(&mut m);
+                assert!(text.contains("a b"), "{text}");
+                assert!(text.contains("100%") && !text.contains("10%"), "{text}");
+            }
+
+            #[test]
+            fn blank_lines_in_the_output_are_kept() {
+                let mut m = showing();
+                hear(
+                    &mut m,
+                    Ok(CommandOutput::of("one\n\ntwo\n".into(), Cut::Whole)),
+                );
+                let rows = page(&mut m, SIZE);
+                let one = rows.iter().position(|r| r.contains("one")).expect("one");
+                assert!(rows[one + 1].trim().is_empty(), "{rows:#?}");
+                assert!(rows[one + 2].contains("two"), "{rows:#?}");
+            }
+
+            #[test]
+            fn a_long_line_wraps_inside_the_panel() {
+                let mut m = showing();
+                let long = "word ".repeat(60);
+                hear(
+                    &mut m,
+                    Ok(CommandOutput::of(format!("{long}\n"), Cut::Whole)),
+                );
+                let rows = page(&mut m, SIZE);
+                let words = rows.iter().filter(|r| r.contains("word word")).count();
+                assert!(words >= 3, "{rows:#?}");
+            }
+
+            #[test]
+            fn a_long_output_follows_its_end_until_scrolled_up_and_g_resumes() {
+                let mut m = showing();
+                hear(&mut m, Ok(CommandOutput::of(numbered(100), Cut::Whole)));
+                let text = text(&mut m);
+                assert!(
+                    text.contains("line 99") && !text.contains("line 10\n"),
+                    "{text}"
+                );
+                assert!(text.contains("following"), "{text}");
+
+                m.docs.scroll_by(-5);
+                let text = text_after(&mut m);
+                assert!(text.contains("paused "), "{text}");
+                assert!(!text.contains("following"), "{text}");
+
+                m.docs.scroll_to_end();
+                let text = text_after(&mut m);
+                assert!(text.contains("following"), "G resumes\n{text}");
+            }
+
+            fn text_after(m: &mut Model) -> String {
+                screen(&render(m, SIZE)).join("\n")
+            }
+
+            fn slide_to(m: &mut Model, first: usize, count: usize) {
+                let text = numbered_from(first, count);
+                let from: u64 = (0..first).map(|n| format!("line {n}\n").len() as u64).sum();
+                let who = name("obs-layout-4");
+                let ticket = m.ticket();
+                let (moment, id) = (m.clock, "c1".parse().expect("shows"));
+                m.track(&who)
+                    .command_outputs
+                    .entry("c1".parse().expect("shows"))
+                    .or_default()
+                    .ask(ticket, crate::model::Presence::Listed, moment.mono);
+                crate::update::update(
+                    m,
+                    crate::worker::Msg::CommandOutput(crate::worker::OutputRead {
+                        name: who,
+                        id,
+                        ticket,
+                        result: Ok(CommandOutput::of(text, Cut::Last { bytes: 65536, from })),
+                    }),
+                );
+            }
+
+            fn first_line_shown(m: &mut Model) -> String {
+                page(m, SIZE)
+                    .iter()
+                    .find_map(|row| row.trim().strip_prefix("line ").map(str::to_string))
+                    .expect("a line of output")
+            }
+
+            fn numbered_from(first: usize, count: usize) -> String {
+                let mut lines = (first..first + count)
+                    .map(|n| format!("line {n}"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                lines.push('\n');
+                lines
+            }
+
+            #[test]
+            fn a_paused_scroll_stays_on_its_text_when_the_window_drops_old_lines() {
+                let mut m = showing();
+                hear(
+                    &mut m,
+                    Ok(CommandOutput::of(
+                        numbered(100),
+                        Cut::Last {
+                            bytes: 65536,
+                            from: 0,
+                        },
+                    )),
+                );
+                let _ = text(&mut m);
+                m.docs.scroll_by(-30);
+                let before = first_line_shown(&mut m);
+                slide_to(&mut m, 20, 100);
+                assert_eq!(first_line_shown(&mut m), before);
+            }
+
+            #[test]
+            fn a_paused_view_goes_to_the_start_of_the_text_when_nothing_of_the_old_text_is_left() {
+                let mut m = showing();
+                hear(
+                    &mut m,
+                    Ok(CommandOutput::of(
+                        numbered(100),
+                        Cut::Last {
+                            bytes: 65536,
+                            from: 0,
+                        },
+                    )),
+                );
+                let _ = text(&mut m);
+                m.docs.scroll_by(-30);
+                slide_to(&mut m, 5000, 100);
+                assert_eq!(first_line_shown(&mut m), "5000");
+            }
+
+            #[test]
+            fn a_followed_output_stays_at_its_end_when_the_window_drops_old_lines() {
+                let mut m = showing();
+                hear(
+                    &mut m,
+                    Ok(CommandOutput::of(
+                        numbered(100),
+                        Cut::Last {
+                            bytes: 65536,
+                            from: 0,
+                        },
+                    )),
+                );
+                let _ = text(&mut m);
+                slide_to(&mut m, 20, 100);
+                let rows = page(&mut m, SIZE);
+                assert!(rows.iter().any(|row| row.trim() == "line 119"), "{rows:#?}");
+            }
+
+            fn fitted_rows(m: &Model) -> usize {
+                m.command_output(&name("obs-layout-4"), &"c1".parse().expect("shows"))
+                    .and_then(|watch| watch.rows())
+                    .map(|wrapped| wrapped.rows().len())
+                    .expect("fitted")
+            }
+
+            #[test]
+            fn a_file_of_newlines_is_one_blank_row() {
+                let mut m = showing();
+                hear(
+                    &mut m,
+                    Ok(CommandOutput::of(
+                        "\n".repeat(64 * 1024),
+                        Cut::Last {
+                            bytes: 65536,
+                            from: 0,
+                        },
+                    )),
+                );
+                let _ = text(&mut m);
+                assert_eq!(fitted_rows(&m), 1);
+            }
+
+            #[test]
+            fn the_rows_are_wrapped_again_when_the_width_changes() {
+                let mut m = showing();
+                let long = "word ".repeat(60);
+                hear(
+                    &mut m,
+                    Ok(CommandOutput::of(format!("{long}\n"), Cut::Whole)),
+                );
+                let _ = page(&mut m, (140, 30));
+                let wide = fitted_rows(&m);
+                let _ = page(&mut m, (80, 30));
+                assert!(fitted_rows(&m) > wide);
+            }
+
+            fn long_command() -> Model {
+                let mut m = fleet(10);
+                let command = (0..40)
+                    .map(|n| format!("echo step{n}"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                run_commands(
+                    &mut m,
+                    "obs-layout-4",
+                    &[listed("c1", &command)],
+                    FOUR_MINUTES,
+                );
+                m.set_cursor(Cursor::Entry(name("obs-layout-4")));
+                m.panel = Focused::activity();
+                m.point_at_row(|_, last| last);
+                m
+            }
+
+            fn first_row(m: &mut Model) -> String {
+                page(m, SIZE)[0].trim().to_string()
+            }
+
+            #[test]
+            fn a_paused_scroll_follows_the_text_when_the_note_that_it_is_cut_appears() {
+                let mut m = showing();
+                hear(&mut m, Ok(CommandOutput::of(numbered(100), Cut::Whole)));
+                let _ = text(&mut m);
+                m.docs.scroll_by(-30);
+                let before = first_line_shown(&mut m);
+                slide_to(&mut m, 0, 100);
+                assert_eq!(first_line_shown(&mut m), before);
+            }
+
+            #[test]
+            fn a_paused_scroll_follows_the_text_when_a_failure_row_appears_and_clears() {
+                let mut m = showing();
+                hear(&mut m, Ok(CommandOutput::of(numbered(100), Cut::Whole)));
+                let _ = text(&mut m);
+                m.docs.scroll_by(-30);
+                let before = first_line_shown(&mut m);
+                let ticket = m.ticket();
+                let (moment, id) = (m.clock, "c1".parse().expect("shows"));
+                let who = name("obs-layout-4");
+                m.track(&who)
+                    .command_outputs
+                    .entry("c1".parse().expect("shows"))
+                    .or_default()
+                    .ask(ticket, crate::model::Presence::Listed, moment.mono);
+                crate::update::update(
+                    &mut m,
+                    crate::worker::Msg::CommandOutput(crate::worker::OutputRead {
+                        name: who.clone(),
+                        id,
+                        ticket,
+                        result: Err(Cause::of(&std::io::Error::other("busy"))),
+                    }),
+                );
+                assert_eq!(first_line_shown(&mut m), before, "the failure row appeared");
+                slide_to(&mut m, 0, 100);
+                assert_eq!(first_line_shown(&mut m), before, "and cleared");
+            }
+
+            #[test]
+            fn a_paused_scroll_inside_the_facts_stays_put_across_answers() {
+                let mut m = long_command();
+                hear(&mut m, Ok(CommandOutput::of(numbered(100), Cut::Whole)));
+                let _ = text(&mut m);
+                m.docs.scroll_to_start();
+                m.docs.scroll_by(5);
+                let before = first_row(&mut m);
+                assert!(before.starts_with("echo step"), "{before}");
+                slide_to(&mut m, 20, 100);
+                assert_eq!(first_row(&mut m), before);
+                slide_to(&mut m, 40, 100);
+                assert_eq!(first_row(&mut m), before);
+            }
+
+            #[test]
+            fn a_wait_that_has_lasted_reads_taking_long_instead_of_reading() {
+                let mut m = showing();
+                let who = name("obs-layout-4");
+                let (ticket, moment) = (m.ticket(), m.clock);
+                m.track(&who)
+                    .command_outputs
+                    .entry("c1".parse().expect("shows"))
+                    .or_default()
+                    .ask(ticket, crate::model::Presence::Listed, moment.mono);
+                let text = text(&mut m);
+                assert!(text.contains("reading…"), "{text}");
+                m.clock.mono += crate::output::OUTPUT_STALLED;
+                let text = text_after(&mut m);
+                assert!(text.contains("reading is taking long"), "{text}");
+            }
+
+            #[test]
+            fn a_failed_read_shows_beside_the_last_output_without_blanking_it() {
+                let mut m = showing();
+                hear(
+                    &mut m,
+                    Ok(CommandOutput::of("kept text\n".into(), Cut::Whole)),
+                );
+                hear(&mut m, Err(Cause::of(&std::io::Error::other("busy"))));
+                let text = text(&mut m);
+                assert!(text.contains("kept text"), "{text}");
+                assert!(
+                    text.contains("couldn't read it") && text.contains("busy"),
+                    "{text}"
+                );
+            }
+
+            #[test]
+            fn an_ended_command_still_shows_its_last_output_marked_no_longer_listed() {
+                let mut m = showing();
+                m.focus_document();
+                hear(
+                    &mut m,
+                    Ok(CommandOutput::of("last words\n".into(), Cut::Whole)),
+                );
+                run_commands(&mut m, "obs-layout-4", &[], FOUR_MINUTES);
+                m.hold_activity_row();
+                let text = text(&mut m);
+                assert!(text.contains("no longer listed"), "{text}");
+                assert!(text.contains("last words"), "{text}");
+            }
         }
 
         #[test]

@@ -3,12 +3,12 @@ use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 
 use agent_core::actions::CommandLine;
 
-use agent_core::activity::{Activity, AgentId, Hold, Standing, TranscriptRef};
+use agent_core::activity::{Activity, AgentId, Hold, Standing, TaskId, TranscriptRef};
 use agent_core::config::Sources;
 use agent_core::discover;
 use agent_core::model::{Removable, Running, Snapshot, Startable};
@@ -18,8 +18,8 @@ use agent_core::ops::{
 };
 use agent_core::paths::RepoRoot;
 use agent_core::ports::{
-    ActivityDetail, ClientId, FileDiff, HarnessId, HostError, Log, Observation, Place, Probe,
-    TranscriptStamp, Window,
+    ActivityDetail, ClientId, CommandOutput, FileDiff, HarnessId, HostError, Log, Observation,
+    Place, Probe, TranscriptStamp, Window,
 };
 use crossterm::event::{KeyEvent, MouseEvent};
 
@@ -141,6 +141,9 @@ pub enum Msg {
         name: SessionName,
         detail: Result<Option<ActivityDetail>, Cause>,
     },
+    /// What a background command of an agent has printed, read for the request
+    /// `ticket` made.
+    CommandOutput(OutputRead),
     /// What reading an agent's transcript found, for the activity `standing`
     /// proves. What moved the activity is already recorded.
     Probed {
@@ -148,6 +151,24 @@ pub enum Msg {
         standing: Standing,
         result: Result<Probe, Cause>,
     },
+}
+
+/// A request for the end of a background command's output.
+pub struct OutputRequest {
+    pub name: SessionName,
+    pub id: TaskId,
+    pub ticket: Ticket,
+    pub workdir: PathBuf,
+    /// Where its agent's hooks last said the transcript is.
+    pub at: Option<TranscriptRef>,
+}
+
+/// The answer to the [`OutputRequest`] made under `ticket`.
+pub struct OutputRead {
+    pub name: SessionName,
+    pub id: TaskId,
+    pub ticket: Ticket,
+    pub result: Result<CommandOutput, Cause>,
 }
 
 pub enum Outcome {
@@ -275,6 +296,7 @@ pub struct Workers {
     inspector: Arc<Inspector>,
     subagents: Arc<SubagentReader>,
     activities: Arc<ActivityReader>,
+    outputs: Arc<OutputReader>,
     probers: Arc<Prober>,
     documents: Arc<DocumentReader>,
     namer: Arc<Namer>,
@@ -307,6 +329,19 @@ impl Workers {
     /// the transcript its hooks named.
     pub fn read_activity(&self, name: SessionName, workdir: PathBuf, at: Option<TranscriptRef>) {
         self.activities.request(name, (workdir, at));
+    }
+
+    /// Asks what background command `id` of the agent working in `workdir` has
+    /// printed. A request for it still waiting is replaced and never answered.
+    pub fn read_command_output(&self, request: OutputRequest) {
+        let OutputRequest {
+            name,
+            id,
+            ticket,
+            workdir,
+            at,
+        } = request;
+        self.outputs.request((name, id), (workdir, at, ticket));
     }
 
     /// Asks what the transcript at `at` says of the activity `standing` proves,
@@ -385,7 +420,7 @@ impl<K: Clone + Eq + std::hash::Hash, V> Queue<K, V> {
     /// older ones for the same slot from `requested`, which would
     /// otherwise wait forever.
     fn request(&self, key: K, value: V) {
-        let mut queue = self.queue.lock().expect("queue lock");
+        let mut queue = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
         match queue.waiting.iter_mut().find(|(k, _)| *k == key) {
             Some(waiting) => waiting.1 = value,
             None => queue.waiting.push((key, value)),
@@ -395,7 +430,7 @@ impl<K: Clone + Eq + std::hash::Hash, V> Queue<K, V> {
 
     /// The oldest request for a key that isn't being served.
     fn next(&self) -> (K, V) {
-        let mut queue = self.queue.lock().expect("queue lock");
+        let mut queue = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
         loop {
             let free = queue
                 .waiting
@@ -406,12 +441,19 @@ impl<K: Clone + Eq + std::hash::Hash, V> Queue<K, V> {
                 queue.serving.insert(key.clone());
                 return (key, value);
             }
-            queue = self.ready.wait(queue).expect("queue lock");
+            queue = self
+                .ready
+                .wait(queue)
+                .unwrap_or_else(PoisonError::into_inner);
         }
     }
 
     fn done(&self, key: &K) {
-        self.queue.lock().expect("queue lock").serving.remove(key);
+        self.queue
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .serving
+            .remove(key);
         self.ready.notify_all();
     }
 }
@@ -556,6 +598,17 @@ fn spawn_subagent_readers(backend: &Arc<Backend>, msgs: &Sender<Msg>) -> Arc<Sub
     )
 }
 
+/// Reads what the transcripts and the files they name say.
+fn spawn_transcript_readers(
+    backend: &Arc<Backend>,
+    msgs: &Sender<Msg>,
+) -> (Arc<ActivityReader>, Arc<OutputReader>) {
+    (
+        spawn_activity_readers(backend, msgs),
+        spawn_output_readers(backend, msgs),
+    )
+}
+
 fn spawn_activity_readers(backend: &Arc<Backend>, msgs: &Sender<Msg>) -> Arc<ActivityReader> {
     spawn_readers(
         backend,
@@ -568,6 +621,27 @@ fn spawn_activity_readers(backend: &Arc<Backend>, msgs: &Sender<Msg>) -> Arc<Act
                     .and_then(|harness| Ok(harness.activity_detail(&workdir, at.as_ref())?))
                     .map_err(|e| Cause::of(&e)),
             }]
+        },
+    )
+}
+
+/// Reads what background commands have printed.
+type OutputReader = Queue<(SessionName, TaskId), (PathBuf, Option<TranscriptRef>, Ticket)>;
+
+fn spawn_output_readers(backend: &Arc<Backend>, msgs: &Sender<Msg>) -> Arc<OutputReader> {
+    spawn_readers(
+        backend,
+        msgs,
+        SUBAGENT_READERS,
+        |backend, (name, id), (workdir, at, ticket)| {
+            vec![Msg::CommandOutput(OutputRead {
+                name: name.clone(),
+                id: id.clone(),
+                ticket,
+                result: ops::harness_for(backend.services(), name)
+                    .and_then(|harness| Ok(harness.command_output(&workdir, at.as_ref(), id)?))
+                    .map_err(|e| Cause::of(&e)),
+            })]
         },
     )
 }
@@ -755,7 +829,7 @@ pub fn spawn(backend: Arc<Backend>, sources: Sources, msgs: Sender<Msg>) -> Work
 
     let inspector = spawn_inspectors(&backend, &msgs);
     let subagents = spawn_subagent_readers(&backend, &msgs);
-    let activities = spawn_activity_readers(&backend, &msgs);
+    let (activities, outputs) = spawn_transcript_readers(&backend, &msgs);
     let probers = spawn_readers(&backend, &msgs, PROBERS, |backend, name, probing| {
         probe(backend, name, &probing)
     });
@@ -803,6 +877,7 @@ pub fn spawn(backend: Arc<Backend>, sources: Sources, msgs: Sender<Msg>) -> Work
         inspector,
         subagents,
         activities,
+        outputs,
         probers,
         documents,
         namer,

@@ -3,6 +3,7 @@ mod document;
 mod keymap;
 mod log;
 mod model;
+mod output;
 mod palette;
 mod review;
 mod touched;
@@ -471,6 +472,7 @@ impl Runtime {
                 Effect::ReadActivity { name, workdir, at } => {
                     self.workers.read_activity(name, workdir, at);
                 }
+                Effect::ReadCommandOutput(request) => self.workers.read_command_output(request),
                 Effect::ProbeTranscript {
                     name,
                     at,

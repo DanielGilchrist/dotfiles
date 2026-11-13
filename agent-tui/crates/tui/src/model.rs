@@ -30,6 +30,7 @@ use ratatui::layout::Rect;
 use crate::cause::Cause;
 use crate::document::{BranchKey, CommitKey, DiffKey, Documents, FolderKey, Hover, Key};
 use crate::log::Nav;
+use crate::output::OutputWatch;
 use crate::palette::Palette;
 use crate::touched::{self, Roots, TouchedFile};
 use crate::track::{CachedTree, FactsEpoch, FactsRead};
@@ -736,7 +737,7 @@ pub enum Chord {
 
 /// Identifies one request to connect, so a late reply to an abandoned
 /// request can't replace the pane.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Ticket(u64);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2509,6 +2510,11 @@ impl Model {
     /// What is known about `name`'s subagent `id`, if it is being watched.
     pub fn watched(&self, (name, id): &SubagentKey) -> Option<&Watched> {
         self.agents.get(name)?.subagents.get(id)
+    }
+
+    /// What reading the output of `name`'s command `id` has found.
+    pub fn command_output(&self, name: &SessionName, id: &TaskId) -> Option<&OutputWatch> {
+        self.agents.get(name)?.command_outputs.get(id)
     }
 
     /// The log [0] reads, when it reads one.

@@ -35,7 +35,7 @@ use crate::touched::Baseline;
 use crate::track::{Compose, Found, Probed, Seen};
 use crate::tree::ChangesView;
 use crate::typed::{Columns, Message};
-use crate::worker::{Job, Msg, Outcome, SendError};
+use crate::worker::{Job, Msg, Outcome, OutputRead, OutputRequest, SendError};
 
 mod restart;
 
@@ -123,6 +123,9 @@ pub enum Effect {
         /// Where its hooks last said the transcript is.
         at: Option<TranscriptRef>,
     },
+    /// Read what the background command `id` of an agent working in `workdir`
+    /// has printed. The answer carries `ticket`.
+    ReadCommandOutput(OutputRequest),
     /// Read the transcript at `at` for what it says of the activity
     /// `standing` proves.
     ProbeTranscript {
@@ -204,7 +207,7 @@ fn own_client(m: &Model) -> Option<ClientId> {
 
 pub fn update(m: &mut Model, msg: Msg) -> Vec<Effect> {
     let effects = step(m, msg);
-    forget_subagents(m);
+    forget_unlisted(m);
     settle(m);
     effects
 }
@@ -283,6 +286,10 @@ fn step(m: &mut Model, msg: Msg) -> Vec<Effect> {
             on_activity(m, &name, detail);
             Vec::new()
         }
+        Msg::CommandOutput(read) => {
+            on_command_output(m, read);
+            Vec::new()
+        }
         Msg::Probed {
             name,
             standing,
@@ -325,6 +332,36 @@ fn on_activity(m: &mut Model, name: &SessionName, detail: Result<Option<Activity
         watch.watch.nav = Nav::default();
     }
     watch.watch.log = Some(detail);
+}
+
+/// What a background command printed was read. A failure is told once, until
+/// a read succeeds again, and a paused document keeps its place in the text.
+fn on_command_output(m: &mut Model, read: OutputRead) {
+    let OutputRead {
+        name,
+        id,
+        ticket,
+        result,
+    } = read;
+    let moment = m.clock;
+    let Some(heard) = m
+        .agents
+        .get_mut(&name)
+        .and_then(|tracked| tracked.command_outputs.get_mut(&id))
+        .and_then(|watch| watch.hear(ticket, result, moment))
+    else {
+        return;
+    };
+    let shown = matches!(m.hover(), Some(crate::document::Hover::Command(on, task)) if on == name && task == id);
+    if shown && m.docs.paused() {
+        m.docs.scroll = heard.moved.scroll(m.docs.scroll);
+    }
+    if let Some(cause) = heard.new_failure {
+        m.error(format!(
+            "couldn't read a command's output · {}",
+            cause.first_line()
+        ));
+    }
 }
 
 /// A read of `name`'s transcript was answered. What it found is already
@@ -571,6 +608,25 @@ fn settle(m: &mut Model) {
     m.areas.terminal = geometry.terminal;
     m.fit_sidebar(geometry.sidebar);
     m.settle();
+    fit_command_output(m);
+}
+
+/// Wraps what the command [0] shows has printed to [0]'s width.
+fn fit_command_output(m: &mut Model) {
+    let Some(crate::document::Hover::Command(name, id)) = m.hover() else {
+        return;
+    };
+    let width = usize::from(m.areas.terminal.width);
+    let Some(heading) = crate::view::command_heading_row(m, &id, width) else {
+        return;
+    };
+    if let Some(watch) = m
+        .agents
+        .get_mut(&name)
+        .and_then(|tracked| tracked.command_outputs.get_mut(&id))
+    {
+        watch.fit(width, heading, crate::view::wrap);
+    }
 }
 
 /// The terminal is `size` big now.
@@ -662,6 +718,7 @@ fn tick_effects(m: &mut Model) -> Vec<Effect> {
     effects.extend(inspect(m));
     effects.extend(read_subagent(m));
     effects.extend(read_activity(m));
+    effects.extend(read_command_output(m));
     effects.extend(probe_interrupts(m));
     effects.extend(read_document(m));
     effects.extend(check_dir(m));
@@ -1152,21 +1209,30 @@ fn baseline_since(
     Baseline::of(read.filter(|_| current).map(|r| &r.facts))
 }
 
-/// Drops what's known about subagents their agents no longer list.
-fn forget_subagents(m: &mut Model) {
+/// Drops what's known about the subagents and commands their agents no longer
+/// list, unless the cursor is still on one.
+fn forget_unlisted(m: &mut Model) {
     let Some(activities) = &m.activities else {
         return;
     };
-    let cursor = match m.panel.activity_row() {
-        Some(ActivityRow::Subagent { by, id }) => Some((by, id)),
-        _ => None,
+    let (subagent, command) = match m.panel.activity_row() {
+        Some(ActivityRow::Subagent { by, id }) => (Some((by, id)), None),
+        Some(ActivityRow::Command { by, id }) => (None, Some((by, id))),
+        _ => (None, None),
     };
     for (name, tracked) in &mut m.agents {
         tracked.subagents.retain(|id, _| {
-            cursor == Some((name, id))
+            subagent == Some((name, id))
                 || activities
                     .get(name)
                     .is_some_and(|a| a.subagents.contains_key(id))
+        });
+        tracked.command_outputs.retain(|id, _| {
+            command == Some((name, id))
+                || activities
+                    .get(name)
+                    .and_then(Activity::commands)
+                    .is_some_and(|commands| commands.get(id).is_some())
         });
     }
 }
@@ -1213,6 +1279,38 @@ fn read_subagent(m: &mut Model) -> Option<Effect> {
         .watch
         .asked(events, now);
     Some(Effect::ReadSubagent { name, id, workdir })
+}
+
+/// Asks for what the background command [0] shows has printed: when it is
+/// first shown, and every few seconds while it stays shown.
+fn read_command_output(m: &mut Model) -> Option<Effect> {
+    let Some(crate::document::Hover::Command(name, id)) = m.hover() else {
+        return None;
+    };
+    let workdir = selected_root(m)?;
+    let at = m.activity(&name)?.transcript.clone();
+    let presence = m.activity_list().command(&id)?.presence;
+    let now = m.clock.mono;
+    if !m
+        .tracked(&name)
+        .and_then(|t| t.command_outputs.get(&id))
+        .is_none_or(|watch| watch.due(presence, now))
+    {
+        return None;
+    }
+    let ticket = m.ticket();
+    m.track(&name)
+        .command_outputs
+        .entry(id.clone())
+        .or_default()
+        .ask(ticket, presence, now);
+    Some(Effect::ReadCommandOutput(OutputRequest {
+        name,
+        id,
+        ticket,
+        workdir,
+        at,
+    }))
 }
 
 /// Asks for the current activity of the agent whose activity [0] shows: when it is
@@ -9426,6 +9524,7 @@ mod tests {
             assert_eq!(m.listed(&name("auth-refresh-2")), None);
         }
     }
+    mod command_output;
     mod elsewhere;
     mod restart;
 }

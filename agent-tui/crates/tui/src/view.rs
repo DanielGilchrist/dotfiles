@@ -277,6 +277,8 @@ pub struct Geometry {
 /// The panel padding keeps the agent's own full-width rules off our border.
 const PANE_PADDING: Padding = Padding::horizontal(1);
 
+pub(crate) use page::command_heading_row;
+
 pub fn geometry(area: Rect, screen: Screen) -> Geometry {
     let [body, footer] = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(area);
     let borders = 2;
@@ -1035,7 +1037,7 @@ fn highlighted_owned(text: &str, query: &str) -> Vec<Span<'static>> {
 
 /// `text` split into rows of at most `width` columns, breaking at spaces
 /// where it can and keeping its newlines.
-fn wrap(text: &str, width: usize) -> Vec<String> {
+pub(crate) fn wrap(text: &str, width: usize) -> Vec<String> {
     let columns = Columns::new(width).unwrap_or(Columns::ONE);
     Wrapped::of(text, columns)
         .rows()

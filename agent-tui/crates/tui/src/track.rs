@@ -6,12 +6,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
-use agent_core::activity::{AgentId, Standing, Subagent};
+use agent_core::activity::{AgentId, Standing, Subagent, TaskId};
 use agent_core::ports::{ActivityDetail, Log, TranscriptStamp, WorktreeFacts};
 
 use crate::cause::Cause;
 use crate::log::Nav;
 use crate::model::{Company, Inspection, Ticket};
+use crate::output::OutputWatch;
 use crate::touched::Baseline;
 use crate::tree::{ChangesScope, ChangesView, TreeRow};
 use crate::typed::Message;
@@ -99,6 +100,9 @@ pub struct Tracked {
     pub subagents: HashMap<AgentId, Watched>,
     /// The command [2]'s cursor is on, as last listed.
     pub held_command: Option<crate::model::HeldCommand>,
+    /// What the commands [0] has shown have printed, dropped with the row
+    /// that showed them.
+    pub command_outputs: HashMap<TaskId, OutputWatch>,
     /// The other windows showing its session, as the newest look found them.
     pub company: Company,
     /// Its current activity, as [0] last read it.

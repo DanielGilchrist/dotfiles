@@ -8,7 +8,7 @@ pub use commands::{
     CommandsShown, Remainder, ShownCommand, ShownName, command_lines, printable_id,
     skipped_because, truncate_end,
 };
-pub use escapes::{Lines, printable, strip_escapes};
+pub use escapes::{Lines, output_lines, printable, strip_escapes};
 pub use input::{CellPos, encode_key, encode_mouse};
 pub use pty::{Liveness, Terminal};
 pub use vt::Vt100;

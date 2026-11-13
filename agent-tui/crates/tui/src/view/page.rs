@@ -5,7 +5,7 @@ use agent_core::activity::{AgentId, TaskId};
 use agent_core::model::{Head, RepoKey};
 use agent_core::names::{CarriageReturn, SessionName, clean};
 use agent_core::ports::{
-    Added, BranchLog, Change, Compared, Count, Edit, FileDiff, FileState, Lines,
+    Added, BranchLog, Change, CommandOutput, Compared, Count, Cut, Edit, FileDiff, FileState, Lines,
 };
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
@@ -29,6 +29,7 @@ use crate::document::{
 };
 use crate::log::first_printable_line;
 use crate::model::{ActivityFiles, AgentStatus, Asking, LogKey, MainLayout, Model, Presence};
+use crate::output::{OutputWatch, Wrapped};
 use crate::review::{self, DiffView, LineInfo};
 
 /// [0]'s title, what its top border says on the right, its bottom-right
@@ -129,7 +130,7 @@ pub(super) fn page(m: &Model, area: Rect, width: usize, border: Style) -> Option
         Hover::Commit(key) => commit_body(m, key, columns),
         Hover::Activity(name) => activity_body(m, name, columns, height)?,
         Hover::Subagent(name, id) => log_body(m, name, id, columns, budget),
-        Hover::Command(_, id) => command_body(m, id, columns, budget)?,
+        Hover::Command(name, id) => command_body(m, name, id, columns, budget)?,
         Hover::Repo(key) => repo_body(m, key, columns)?,
     };
     let pinned = body.pinned.len().min(height);
@@ -934,7 +935,36 @@ fn empty_activity(columns: usize, height: usize) -> Vec<Line<'static>> {
 
 /// A background command: the whole command line, what the agent said it is
 /// for, how long it has run at least and as of when, and its id.
-fn command_body(m: &Model, id: &TaskId, columns: usize, budget: usize) -> Option<Body> {
+fn command_body(
+    m: &Model,
+    name: &SessionName,
+    id: &TaskId,
+    columns: usize,
+    budget: usize,
+) -> Option<Body> {
+    let (title, mut rows) = command_head(m, id, columns, budget)?;
+    let output = output_rows(m, name, id, columns);
+    rows.extend(output.rows);
+    Some(Body {
+        tails: output.follows,
+        ..Body::built(title, rows)
+    })
+}
+
+/// The document row of a command's `Output` heading, which what comes above
+/// it decides.
+pub(crate) fn command_heading_row(m: &Model, id: &TaskId, columns: usize) -> Option<usize> {
+    command_head(m, id, columns, 0).map(|(_, rows)| rows.len())
+}
+
+/// A command's title and the rows above its `Output` section: the command,
+/// its description and the facts, and a blank row.
+fn command_head(
+    m: &Model,
+    id: &TaskId,
+    columns: usize,
+    budget: usize,
+) -> Option<(Vec<Span<'static>>, Vec<Line<'static>>)> {
     let list = m.activity_list();
     let item = list.command(id)?;
     let named = item
@@ -975,7 +1005,69 @@ fn command_body(m: &Model, id: &TaskId, columns: usize, budget: usize) -> Option
             .into_iter()
             .map(|row| Line::styled(truncate_end(&row, columns), dim())),
     );
-    Some(Body::built(title, rows))
+    rows.push(Line::raw(""));
+    Some((title, rows))
+}
+
+/// The `Output` section of a command's document.
+struct OutputRows {
+    rows: Vec<Line<'static>>,
+    /// It holds the end of what the command printed, which the document
+    /// follows like a log.
+    follows: bool,
+}
+
+/// What a command has printed, as DIM rows: a heading, what the read says
+/// of the file, and how old the answer is. A failed read shows beside the
+/// last output it found. The text is the command's own, so only printable
+/// characters of it reach the screen.
+fn output_rows(m: &Model, name: &SessionName, id: &TaskId, columns: usize) -> OutputRows {
+    let note = |text: &str| Line::styled(truncate_end(text, columns), dim());
+    let mut rows = vec![Line::styled("Output", dim())];
+    let watch = m.command_output(name, id);
+    if let Some(cause) = watch.and_then(OutputWatch::failure) {
+        let told = format!("couldn't read it · {}", cause.first_line());
+        rows.push(Line::styled(truncate_end(&told, columns), error()));
+    }
+    let Some((watch, last)) = watch.and_then(|watch| Some((watch, watch.last()?))) else {
+        let waiting = if watch.is_some_and(|w| w.stalled(m.clock.mono)) {
+            "reading is taking long"
+        } else {
+            "reading…"
+        };
+        if watch.is_none_or(|w| w.failure().is_none()) {
+            rows.push(note(waiting));
+        }
+        return OutputRows {
+            rows,
+            follows: false,
+        };
+    };
+    let mut follows = false;
+    match &last.output {
+        CommandOutput::Unlocated => rows.push(note("no output location recorded")),
+        CommandOutput::Searching => rows.push(note("looking for the output…")),
+        CommandOutput::Gone => rows.push(note("output file gone")),
+        CommandOutput::Empty => rows.push(note("no output yet")),
+        CommandOutput::Tail(tail) => {
+            if let Cut::Last { bytes, .. } = tail.cut() {
+                rows.push(note(&format!(
+                    "showing the last {} KB",
+                    bytes.div_ceil(1024)
+                )));
+            }
+            rows.extend(
+                watch
+                    .rows()
+                    .map_or(&[][..], Wrapped::rows)
+                    .iter()
+                    .map(|row| Line::styled(row.clone(), dim())),
+            );
+            follows = true;
+        }
+    }
+    rows.push(note(&format!("as of {} ago", ago(last.at, m.clock.wall))));
+    OutputRows { rows, follows }
 }
 
 /// `text` as printable lines wrapped to `columns`, keeping its blank lines.

@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
-use crate::activity::{Activity, AgentId, Going, Reported, Stopped, ToolId, TranscriptRef};
+use crate::activity::{Activity, AgentId, Going, Reported, Stopped, TaskId, ToolId, TranscriptRef};
 use crate::model::{Head, Presence, Running, Worktree};
 use crate::names::{BranchName, HostName, NameError, NameLimit, Prompt, PullRequest, SessionName};
 use crate::paths::{AgentWorktree, RepoRoot};
@@ -989,6 +989,19 @@ pub trait Harness: Send + Sync {
         let _ = (workdir, at);
         Ok(None)
     }
+    /// The end of what the background command `task` of the agent working in
+    /// `workdir` has printed. `at` is where the hooks last said the transcript
+    /// is. The default says the harness doesn't know where its commands write.
+    /// Reads files: call it off the UI thread.
+    fn command_output(
+        &self,
+        workdir: &Path,
+        at: Option<&TranscriptRef>,
+        task: &TaskId,
+    ) -> Result<CommandOutput, HarnessError> {
+        let _ = (workdir, at, task);
+        Ok(CommandOutput::Unlocated)
+    }
     /// Whether the user has interrupted the activity, from the end of the
     /// transcript at `at`, for a harness that sends no event when they do.
     /// It reads nothing when `seen` still describes the file. Reads files:
@@ -1001,6 +1014,69 @@ pub trait Harness: Send + Sync {
     ) -> Result<Probe, HarnessError> {
         let _ = (at, after, seen);
         Ok(Probe::NoTranscript)
+    }
+}
+
+/// What a background command has printed, as far as its harness can say.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommandOutput {
+    /// The harness has no record of where the command writes.
+    Unlocated,
+    /// The harness hasn't finished looking for where the command writes, and
+    /// will go on when asked again.
+    Searching,
+    /// Where it writes is known and nothing is there any more.
+    Gone,
+    /// It has written nothing yet.
+    Empty,
+    Tail(OutputTail),
+}
+
+impl CommandOutput {
+    pub fn of(text: String, cut: Cut) -> Self {
+        OutputTail::new(text, cut).map_or(Self::Empty, Self::Tail)
+    }
+}
+
+/// How much of what a command printed a text is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cut {
+    /// All of it.
+    Whole,
+    /// What was read of its last `bytes`, starting at byte `from` of the file.
+    /// The partial line they start with is left out, unless they hold no line
+    /// break before their end.
+    Last { bytes: u64, from: u64 },
+}
+
+/// The end of a command's output. Its bytes are the command's own and may
+/// hold terminal escapes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputTail {
+    text: String,
+    cut: Cut,
+}
+
+impl OutputTail {
+    /// `None` for no text, which is no output.
+    pub fn new(text: String, cut: Cut) -> Option<Self> {
+        (!text.is_empty()).then_some(Self { text, cut })
+    }
+
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    pub fn cut(&self) -> Cut {
+        self.cut
+    }
+
+    /// Where in the file the text starts.
+    pub fn from(&self) -> u64 {
+        match self.cut {
+            Cut::Whole => 0,
+            Cut::Last { from, .. } => from,
+        }
     }
 }
 
