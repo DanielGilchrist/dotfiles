@@ -1007,7 +1007,7 @@ mod tests {
                 crossterm::event::KeyModifiers::ALT,
             ))
         };
-        update::update(&mut m, alt('.'));
+        update::update(&mut m, alt('\''));
         fixtures::sighted(&mut m, &[]);
         let stale = match &m.pane {
             Pane::Connecting { ticket, .. } => *ticket,
@@ -1022,7 +1022,7 @@ mod tests {
                 )),
             );
         }
-        update::update(&mut m, alt('.'));
+        update::update(&mut m, alt('\''));
         assert_eq!(
             m.pane.held_lost().to_string(),
             "dropped 2 keys",
@@ -1043,7 +1043,7 @@ mod tests {
         update::update(
             &mut m,
             worker::Msg::Key(crossterm::event::KeyEvent::new(
-                crossterm::event::KeyCode::Char('.'),
+                crossterm::event::KeyCode::Char('\''),
                 crossterm::event::KeyModifiers::ALT,
             )),
         );

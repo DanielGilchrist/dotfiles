@@ -3677,9 +3677,9 @@ mod tests {
                 .expect("a status bar")
                 .clone()
         };
-        assert!(bar("").contains("⌥, ⌥. agents"), "{}", bar(""));
-        assert!(bar("prev_agent = 'none'").contains("⌥. agents"));
-        assert!(!bar("prev_agent = 'none'").contains("⌥,"));
+        assert!(bar("").contains("⌥; ⌥' agents"), "{}", bar(""));
+        assert!(bar("prev_agent = 'none'").contains("⌥' agents"));
+        assert!(!bar("prev_agent = 'none'").contains("⌥;"));
         assert!(!bar("prev_agent = 'none'\nnext_agent = 'none'").contains("agents"));
     }
 
@@ -3688,7 +3688,7 @@ mod tests {
         let mut m = crate::fixtures::fleet(10);
         let rows = screen(&render(&mut m, (160, 30)));
         let bar = rows.last().expect("a status bar");
-        assert!(bar.contains("⌥, ⌥. agents"), "{bar}");
+        assert!(bar.contains("⌥; ⌥' agents"), "{bar}");
     }
 
     #[test]
@@ -3710,10 +3710,10 @@ mod tests {
         );
         let text = texts(&lines).join("\n");
         assert!(
-            text.contains("keys.next_agent ⌘j is not available in this terminal, using ⌥."),
+            text.contains("keys.next_agent ⌘j is not available in this terminal, using ⌥'"),
             "{text}"
         );
-        assert!(text.contains("⌥, ⌥."), "{text}");
+        assert!(text.contains("⌥; ⌥'"), "{text}");
     }
 
     #[test]

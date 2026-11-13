@@ -108,9 +108,9 @@ fn a_legacy_terminal_is_told_so_and_a_session_of_keys_prints_each_verdict_and_qu
 
     probe.send(b"2");
     probe.wait_for("press the key for prev_agent");
-    probe.send(b"\x1b,");
-    probe.wait_for("bytes 1b 2c");
-    probe.wait_for("prev_agent = \"alt-,\"");
+    probe.send(b"\x1b;");
+    probe.wait_for("bytes 1b 3b");
+    probe.wait_for("prev_agent = \"alt-;\"");
 
     probe.send(b"1");
     probe.wait_for("press the key for nav");

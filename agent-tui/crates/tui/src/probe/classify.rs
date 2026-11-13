@@ -132,7 +132,7 @@ mod tests {
     #[test]
     fn a_key_nobody_is_known_to_use_that_the_terminal_sends_is_usable() {
         for (bytes, text) in [
-            (&b"\x1b,"[..], "alt-,"),
+            (&b"\x1b;"[..], "alt-;"),
             (b"\x1b;", "alt-;"),
             (b"\x1b[24~", "f12"),
             (b"\x1b[15~", "f5"),
@@ -144,7 +144,7 @@ mod tests {
             };
             assert_eq!(expected, spec(text));
         }
-        assert_eq!(verdict(b"\x1b,", LEGACY), usable("alt-,"));
+        assert_eq!(verdict(b"\x1b;", LEGACY), usable("alt-;"));
     }
 
     #[test]

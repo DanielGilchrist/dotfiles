@@ -886,7 +886,7 @@ pub const BINDINGS: &[Binding] = &[
                 "send"
             })
         }),
-        "Compose a message to the selected agent without attaching. It is typed at once, and refused only while the agent is asking, its session is starting, or it ended. The box wraps and grows with the text. alt-Enter, ctrl-J and shift-Enter add a line, Enter sends, and the arrows move the caret. What you typed stays for the next s: Esc keeps it and ctrl-U clears it. With the entry cursor on an entry in [0]'s activity or a subagent's log it reads reply: the entry's first line shows above the input and goes before your message, only when you typed one. Backspace on empty text drops the quote. In a peek it always sends without a quote. Review comments drafted for the agent go after the message. ctrl-V in the box types the agent's image-paste key now, under the same refusals and one at a time. The agent reads the clipboard of the machine it runs on, which over SSH or for a remote agent is not your local clipboard. The key is written before the message, but whether the agent has finished attaching the image by the time the message arrives isn't verified. The box and its text stay. A text paste in NAV opens the box with the pasted text, unsent.",
+        "Compose a message to the selected agent without attaching. It is typed at once, and refused only while the agent is asking, its session is starting, or it ended. The box wraps and grows with the text. alt-Enter, ctrl-J and shift-Enter add a line, Enter sends, and the arrows move the caret. What you typed stays for the next s: Esc keeps it and ctrl-U clears it. With the entry cursor on an entry in [0]'s activity or a subagent's log it reads reply: the entry's first line shows above the input and goes before your message, only when you typed one. Backspace on empty text drops the quote. In a peek it always sends without a quote. Review comments drafted for the agent go after the message. ctrl-V in the box types the agent's image-paste key now (Claude Code documents Ctrl+V as pasting an image from the clipboard), under the same refusals and one at a time. Which machine's clipboard the agent reads isn't documented, and is presumably the one it runs on, which over SSH or for a remote agent is not your local clipboard. The key is written before the message. Its documentation doesn't say whether the attach is asynchronous or whether text typed after it stays with the image. The box and its text stay. A text paste in NAV opens the box with the pasted text, unsent.",
     ),
     Binding::new(
         &["v"],
@@ -1424,14 +1424,14 @@ mod tests {
         let default = Spelling::default();
         assert_eq!(
             in_ctx(Ctx::Agents, &default),
-            Some(("⌥, ⌥.".to_string(), "agents"))
+            Some(("⌥; ⌥'".to_string(), "agents"))
         );
         for ctx in [Ctx::Activity, Ctx::Changes, Ctx::Main, Ctx::Peek] {
             assert_eq!(in_ctx(ctx, &default), None, "{ctx:?}");
         }
         assert_eq!(
             in_ctx(Ctx::Agents, &spelt("prev_agent = 'none'")),
-            Some(("⌥.".to_string(), "agents"))
+            Some(("⌥'".to_string(), "agents"))
         );
         assert_eq!(
             in_ctx(
@@ -1450,7 +1450,7 @@ mod tests {
                 .local
                 .iter()
                 .chain(&listed.global)
-                .any(|r| r.keys == "⌥, ⌥." && r.label == "agents")
+                .any(|r| r.keys == "⌥; ⌥'" && r.label == "agents")
         };
         for ctx in [Ctx::Agents, Ctx::Activity, Ctx::Changes, Ctx::Main] {
             assert!(has(ctx, &Spelling::default()), "{ctx:?}");

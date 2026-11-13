@@ -98,7 +98,7 @@ mod tests {
     fn the_text_names_the_nav_key_the_chords_and_the_command() {
         let shown = text(&Spelling::default());
         assert!(shown.contains("⌃]"), "{shown}");
-        assert!(shown.contains("⌥, ⌥."), "{shown}");
+        assert!(shown.contains("⌥; ⌥'"), "{shown}");
         assert!(shown.contains("`agent keys`"), "{shown}");
     }
 

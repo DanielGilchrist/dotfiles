@@ -276,16 +276,16 @@ mod tests {
     fn a_usable_key_prints_the_bytes_the_event_and_the_line_to_paste_for_the_chosen_field() {
         let mut probe = session(Keyboard::Legacy);
         assert_eq!(press(&mut probe, b"2"), ["press the key for prev_agent"]);
-        let lines = press(&mut probe, b"\x1b,");
+        let lines = press(&mut probe, b"\x1b;");
         assert_eq!(
             lines[..6],
             [
-                "bytes 1b 2c",
-                "event Char(',') with ALT",
+                "bytes 1b 3b",
+                "event Char(';') with ALT",
                 "usable",
                 "add to /cfg/agent/config.toml:",
                 "[keys]",
-                "prev_agent = \"alt-,\"",
+                "prev_agent = \"alt-;\"",
             ]
         );
         assert!(lines[6].starts_with("choose 1)"));
@@ -310,7 +310,7 @@ mod tests {
         let lines = tested(Keyboard::Legacy, b"1", &[0x12]);
         assert!(starts(
             &lines,
-            "collides, known uses (from memory, unchecked):"
+            "collides, known uses (from memory, unchecked, except agents per Claude Code docs):"
         ));
         assert!(has(&lines, "  readline and shells: reverse history search"));
         assert!(has(&lines, "but if you still want it:"));

@@ -1,4 +1,4 @@
-//! A key as the config names it: `ctrl-]`, `alt-,`, `f12`, `super-j`.
+//! A key as the config names it: `ctrl-]`, `alt-;`, `f12`, `super-j`.
 //!
 //! Parsed once into plain data. Core knows no terminal, so the TUI decides
 //! what a spec matches.
@@ -95,8 +95,8 @@ impl FunctionKey {
 pub struct Glyph(char);
 
 impl Glyph {
-    pub const COMMA: Self = Self(',');
-    pub const PERIOD: Self = Self('.');
+    pub const SEMICOLON: Self = Self(';');
+    pub const APOSTROPHE: Self = Self('\'');
 
     pub fn char(self) -> char {
         self.0
@@ -427,7 +427,7 @@ mod tests {
             ("ctrl-_", "⌃_"),
             ("ctrl-g", "⌃G"),
             ("ctrl-space", "⌃Space"),
-            ("alt-,", "⌥,"),
+            ("alt-;", "⌥;"),
             ("alt-x", "⌥x"),
             ("f1", "F1"),
             ("f12", "F12"),
@@ -455,7 +455,7 @@ mod tests {
             "ctrl-_",
             "ctrl-g",
             "ctrl-space",
-            "alt-,",
+            "alt-;",
             "alt-X",
             "f1",
             "f12",
@@ -480,7 +480,7 @@ mod tests {
         assert!(on('5').contains(&parsed("alt-5")));
         assert!(on(' ').contains(&parsed("ctrl-space")));
         assert!(on('J').contains(&parsed("ctrl-shift-j")));
-        assert!(on(',').contains(&parsed("alt-,")));
+        assert!(on(';').contains(&parsed("alt-;")));
         assert_eq!(KeySpec::function(12), Some(parsed("f12")));
         assert_eq!(KeySpec::function(13), None);
     }
@@ -513,7 +513,7 @@ mod tests {
         for text in kitty {
             assert!(parsed(text).needs_kitty(), "{text}");
         }
-        for text in ["ctrl-]", "ctrl-space", "ctrl-g", "alt-,", "alt-o", "f5"] {
+        for text in ["ctrl-]", "ctrl-space", "ctrl-g", "alt-;", "alt-o", "f5"] {
             assert!(!parsed(text).needs_kitty(), "{text}");
         }
     }
@@ -623,8 +623,8 @@ mod tests {
         for text in ["none", "off", " None ", "OFF"] {
             assert_eq!(text.parse::<Binding>(), Ok(Binding::Off), "{text}");
         }
-        assert_eq!("alt-,".parse::<Binding>(), Ok(Binding::On(parsed("alt-,"))));
-        assert_eq!(Binding::On(parsed("alt-,")).spec(), Some(parsed("alt-,")));
+        assert_eq!("alt-;".parse::<Binding>(), Ok(Binding::On(parsed("alt-;"))));
+        assert_eq!(Binding::On(parsed("alt-;")).spec(), Some(parsed("alt-;")));
         assert_eq!(Binding::Off.spec(), None);
         assert!("banana".parse::<Binding>().is_err());
         assert!("".parse::<Binding>().is_err());
@@ -641,7 +641,7 @@ mod tests {
 
     #[test]
     fn display_is_for_reading_and_is_not_config_text() {
-        for text in ["ctrl-]", "alt-,"] {
+        for text in ["ctrl-]", "alt-;"] {
             assert!(
                 parsed(text).to_string().parse::<KeySpec>().is_err(),
                 "{text}"

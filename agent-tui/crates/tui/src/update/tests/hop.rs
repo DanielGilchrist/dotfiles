@@ -10,11 +10,11 @@ const ALT: KeyModifiers = KeyModifiers::ALT;
 const CTRL: KeyModifiers = KeyModifiers::CONTROL;
 
 fn previous() -> Msg {
-    key_with(KeyCode::Char(','), ALT)
+    key_with(KeyCode::Char(';'), ALT)
 }
 
 fn next() -> Msg {
-    key_with(KeyCode::Char('.'), ALT)
+    key_with(KeyCode::Char('\''), ALT)
 }
 
 fn listed(m: &Model) -> Vec<String> {
@@ -239,9 +239,9 @@ fn in_agent_a_chord_is_not_sent_to_the_agent_and_other_keys_still_are() {
     let mut m = typing_into("auth-refresh-2");
     let others = [
         key(KeyCode::Char('x')),
-        key(KeyCode::Char(',')),
+        key(KeyCode::Char(';')),
         key_with(KeyCode::Char('x'), ALT),
-        key_with(KeyCode::Char('.'), ALT | KeyModifiers::SHIFT),
+        key_with(KeyCode::Char('\''), ALT | KeyModifiers::SHIFT),
     ];
     for (index, event) in others.into_iter().enumerate() {
         let effects = update(&mut m, event);
@@ -606,10 +606,10 @@ fn a_chord_set_to_none_is_not_taken_in_either_mode_and_the_other_still_works() {
     let mut m = typing_into("auth-refresh-2");
     m.keys = sendable("next_agent = 'none'", Keyboard::Legacy);
     let effects = update(&mut m, next());
-    assert_eq!(pty_bytes(&effects).len(), 1, "alt-. goes to the agent");
+    assert_eq!(pty_bytes(&effects).len(), 1, "alt-' goes to the agent");
     assert!(in_agent(&m));
     let effects = update(&mut m, previous());
-    assert_eq!(checked_sessions(&m, &effects).len(), 1, "alt-, still hops");
+    assert_eq!(checked_sessions(&m, &effects).len(), 1, "alt-; still hops");
 
     let mut m = on("auth-refresh-2");
     m.keys = sendable("prev_agent = 'off'", Keyboard::Legacy);

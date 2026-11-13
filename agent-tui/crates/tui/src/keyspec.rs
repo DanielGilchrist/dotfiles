@@ -325,12 +325,12 @@ mod tests {
 
     #[test]
     fn alt_needs_exactly_alt_and_its_character_with_its_case() {
-        let nav = terminal("alt-,", Keyboard::Legacy);
-        assert!(nav_pressed(&nav, KeyCode::Char(','), ALT));
-        assert!(!nav_pressed(&nav, KeyCode::Char(','), NONE));
-        assert!(!nav_pressed(&nav, KeyCode::Char('.'), ALT));
-        assert!(!nav_pressed(&nav, KeyCode::Char(','), CTRL | ALT));
-        assert!(!nav_pressed(&nav, KeyCode::Char(','), ALT | SHIFT));
+        let nav = terminal("alt-;", Keyboard::Legacy);
+        assert!(nav_pressed(&nav, KeyCode::Char(';'), ALT));
+        assert!(!nav_pressed(&nav, KeyCode::Char(';'), NONE));
+        assert!(!nav_pressed(&nav, KeyCode::Char('\''), ALT));
+        assert!(!nav_pressed(&nav, KeyCode::Char(';'), CTRL | ALT));
+        assert!(!nav_pressed(&nav, KeyCode::Char(';'), ALT | SHIFT));
     }
 
     #[test]
@@ -444,7 +444,7 @@ mod tests {
 
     #[test]
     fn keys_every_terminal_sends_are_kept_and_never_fall_back() {
-        for nav in ["ctrl-]", "ctrl-space", "alt-,", "f5"] {
+        for nav in ["ctrl-]", "ctrl-space", "alt-;", "f5"] {
             let sendable = terminal(nav, Keyboard::Legacy);
             assert_eq!(sendable.nav(), keys(nav).nav(), "{nav}");
             assert_eq!(sendable.warning(), None, "{nav}");
@@ -556,10 +556,10 @@ mod tests {
     fn the_unshifted_key_does_not_match_a_shifted_symbol_spec_and_the_reverse() {
         let lt = terminal("alt-<", Keyboard::Disambiguated);
         assert!(!nav_pressed(&lt, KeyCode::Char(','), ALT));
-        let comma = terminal("alt-,", Keyboard::Disambiguated);
-        assert!(nav_pressed(&comma, KeyCode::Char(','), ALT));
-        assert!(!nav_pressed(&comma, KeyCode::Char(','), ALT | SHIFT));
-        assert!(!nav_pressed(&comma, KeyCode::Char('<'), ALT));
+        let comma = terminal("alt-;", Keyboard::Disambiguated);
+        assert!(nav_pressed(&comma, KeyCode::Char(';'), ALT));
+        assert!(!nav_pressed(&comma, KeyCode::Char(';'), ALT | SHIFT));
+        assert!(!nav_pressed(&comma, KeyCode::Char(':'), ALT));
         let caret = terminal("ctrl-^", Keyboard::Disambiguated);
         assert!(!nav_pressed(&caret, KeyCode::Char('6'), CTRL));
     }
@@ -572,13 +572,19 @@ mod tests {
             let sendable = Sendable::resolve(Keys::default(), keyboard);
             assert_eq!(sendable.warning(), None);
             let hop = |code, modifiers| sendable.hopped(&press(code, modifiers));
-            assert_eq!(hop(KeyCode::Char(','), ALT), Some(Hop::Previous));
-            assert_eq!(hop(KeyCode::Char('.'), ALT), Some(Hop::Next));
-            assert_eq!(hop(KeyCode::Char(','), NONE), None, "a comma is typed text");
-            assert_eq!(hop(KeyCode::Char('.'), NONE), None);
-            assert_eq!(hop(KeyCode::Char(','), CTRL | ALT), None);
-            assert_eq!(hop(KeyCode::Char('<'), ALT), None, "alt-shift-comma");
-            assert_eq!(hop(KeyCode::Char(','), ALT | SHIFT), None);
+            assert_eq!(hop(KeyCode::Char(';'), ALT), Some(Hop::Previous));
+            assert_eq!(hop(KeyCode::Char('\''), ALT), Some(Hop::Next));
+            assert_eq!(
+                hop(KeyCode::Char(';'), NONE),
+                None,
+                "a semicolon is typed text"
+            );
+            assert_eq!(hop(KeyCode::Char('\''), NONE), None);
+            assert_eq!(hop(KeyCode::Char(';'), CTRL | ALT), None);
+            assert_eq!(hop(KeyCode::Char(':'), ALT), None, "alt-shift-semicolon");
+            assert_eq!(hop(KeyCode::Char(';'), ALT | SHIFT), None);
+            assert_eq!(hop(KeyCode::Char('"'), ALT), None, "alt-shift-apostrophe");
+            assert_eq!(hop(KeyCode::Char('\''), ALT | SHIFT), None);
             assert_eq!(hop(KeyCode::Char('>'), ALT | SHIFT), None);
         }
     }
@@ -587,9 +593,9 @@ mod tests {
     fn a_chord_that_is_off_matches_nothing_and_leaves_the_other_alone() {
         let sendable = configured("prev_agent = 'none'", Keyboard::Legacy);
         assert_eq!(sendable.hop(Hop::Previous), Binding::Off);
-        assert_eq!(sendable.hopped(&press(KeyCode::Char(','), ALT)), None);
+        assert_eq!(sendable.hopped(&press(KeyCode::Char(';'), ALT)), None);
         assert_eq!(
-            sendable.hopped(&press(KeyCode::Char('.'), ALT)),
+            sendable.hopped(&press(KeyCode::Char('\''), ALT)),
             Some(Hop::Next)
         );
         assert_eq!(sendable.warning(), None, "off is a choice, not a fallback");
@@ -601,9 +607,9 @@ mod tests {
         assert_eq!(
             legacy.hop(Hop::Next),
             Keys::default().hop(Hop::Next),
-            "back to alt-."
+            "back to alt-'"
         );
-        let said = "keys.next_agent ⌘j is not available in this terminal, using ⌥.";
+        let said = "keys.next_agent ⌘j is not available in this terminal, using ⌥'";
         assert_eq!(legacy.warning().as_deref(), Some(said));
         assert!(legacy.notes().contains(&said.to_string()));
         let kitty = configured("next_agent = 'super-j'", Keyboard::Disambiguated);
@@ -616,23 +622,23 @@ mod tests {
 
     #[test]
     fn a_default_the_user_didnt_choose_that_another_key_has_is_listed_as_taken() {
-        let sendable = configured("nav = 'alt-,'", Keyboard::Legacy);
+        let sendable = configured("nav = 'alt-;'", Keyboard::Legacy);
         assert_eq!(sendable.warning(), None, "nothing is wrong, so no warning");
         assert!(
             sendable
                 .notes()
-                .contains(&"prev_agent default ⌥, is taken by nav, off".to_string()),
+                .contains(&"prev_agent default ⌥; is taken by nav, off".to_string()),
             "{:?}",
             sendable.notes()
         );
-        assert_eq!(sendable.hopped(&press(KeyCode::Char(','), ALT)), None);
-        assert!(sendable.pressed(KeyField::Nav, &press(KeyCode::Char(','), ALT)));
+        assert_eq!(sendable.hopped(&press(KeyCode::Char(';'), ALT)), None);
+        assert!(sendable.pressed(KeyField::Nav, &press(KeyCode::Char(';'), ALT)));
     }
 
     #[test]
     fn a_fallback_that_would_share_a_key_leaves_the_chord_off_and_says_so() {
         let sendable = configured(
-            "prev_agent = 'super-j'\nnext_agent = 'f6'\nnav = 'alt-,'",
+            "prev_agent = 'super-j'\nnext_agent = 'f6'\nnav = 'alt-;'",
             Keyboard::Legacy,
         );
         assert!(matches!(sendable.hop(Hop::Previous), Binding::Taken { .. }));
@@ -645,8 +651,8 @@ mod tests {
             sendable.warning().as_deref(),
             Some("keys.prev_agent ⌘j is not available in this terminal, leaving it off")
         );
-        assert!(sendable.pressed(KeyField::Nav, &press(KeyCode::Char(','), ALT)));
-        assert_eq!(sendable.hopped(&press(KeyCode::Char(','), ALT)), None);
+        assert!(sendable.pressed(KeyField::Nav, &press(KeyCode::Char(';'), ALT)));
+        assert_eq!(sendable.hopped(&press(KeyCode::Char(';'), ALT)), None);
     }
 
     #[test]

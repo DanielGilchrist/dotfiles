@@ -161,8 +161,8 @@ mod tests {
     #[test]
     fn a_good_spec_says_what_it_means_whether_it_needs_kitty_and_what_is_known_about_it() {
         assert_eq!(
-            explain("ALT-,").expect("parses").to_string(),
-            "alt-, shows as ⌥,\nany terminal can send it\nno known uses (from memory, unchecked)"
+            explain("ALT-;").expect("parses").to_string(),
+            "alt-; shows as ⌥;\nany terminal can send it\nno known uses (from memory, unchecked, except agents per Claude Code docs)"
         );
         let backslash = explain("ctrl-\\").expect("parses").to_string();
         assert!(

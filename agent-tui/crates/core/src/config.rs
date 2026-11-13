@@ -4,7 +4,7 @@
 //! ```toml
 //! [keys]
 //! nav = "ctrl-]"
-//! prev_agent = "alt-,"
+//! prev_agent = "alt-;"
 //! next_agent = "none"
 //!
 //! [repos]
@@ -90,8 +90,8 @@ impl Default for Keys {
     fn default() -> Self {
         Self {
             nav: KeySpec::CTRL_CLOSE_BRACKET,
-            previous: Binding::On(KeySpec::Alt(Glyph::COMMA)),
-            next: Binding::On(KeySpec::Alt(Glyph::PERIOD)),
+            previous: Binding::On(KeySpec::Alt(Glyph::SEMICOLON)),
+            next: Binding::On(KeySpec::Alt(Glyph::APOSTROPHE)),
         }
     }
 }
@@ -415,28 +415,28 @@ mod tests {
     #[test]
     fn the_agent_chords_are_on_by_default_as_alt_comma_and_alt_period() {
         let config: Config = "".parse().expect("parses");
-        assert_eq!(config.keys.hop(Hop::Previous).to_string(), "⌥,");
-        assert_eq!(config.keys.hop(Hop::Next).to_string(), "⌥.");
+        assert_eq!(config.keys.hop(Hop::Previous).to_string(), "⌥;");
+        assert_eq!(config.keys.hop(Hop::Next).to_string(), "⌥'");
         let config: Config = "[keys]\nnav = 'ctrl-g'".parse().expect("parses");
-        assert_eq!(config.keys.hop(Hop::Next).to_string(), "⌥.");
+        assert_eq!(config.keys.hop(Hop::Next).to_string(), "⌥'");
     }
 
     #[test]
     fn a_chord_can_be_changed_and_none_or_off_turns_only_that_one_off() {
         let config: Config = "[keys]\nprev_agent = 'f5'".parse().expect("parses");
         assert_eq!(config.keys.hop(Hop::Previous).to_string(), "F5");
-        assert_eq!(config.keys.hop(Hop::Next).to_string(), "⌥.");
+        assert_eq!(config.keys.hop(Hop::Next).to_string(), "⌥'");
         for word in ["none", "off", "None"] {
             let config: Config = format!("[keys]\nprev_agent = '{word}'")
                 .parse()
                 .expect("parses");
             assert_eq!(config.keys.hop(Hop::Previous), Binding::Off, "{word}");
-            assert_eq!(config.keys.hop(Hop::Next).to_string(), "⌥.", "{word}");
+            assert_eq!(config.keys.hop(Hop::Next).to_string(), "⌥'", "{word}");
             let config: Config = format!("[keys]\nnext_agent = '{word}'")
                 .parse()
                 .expect("parses");
             assert_eq!(config.keys.hop(Hop::Next), Binding::Off, "{word}");
-            assert_eq!(config.keys.hop(Hop::Previous).to_string(), "⌥,", "{word}");
+            assert_eq!(config.keys.hop(Hop::Previous).to_string(), "⌥;", "{word}");
         }
     }
 
@@ -479,11 +479,11 @@ mod tests {
     fn two_keys_the_user_set_to_one_key_are_refused_naming_both() {
         let err = |toml: &str| toml.parse::<Config>().expect_err("fails").to_string();
         assert_eq!(
-            err("[keys]\nnav = 'alt-.'\nnext_agent = 'alt-.'"),
+            err("[keys]\nnav = \"alt-'\"\nnext_agent = \"alt-'\""),
             "keys.next_agent is the same key as keys.nav"
         );
         assert_eq!(
-            err("[keys]\nnav = 'alt-,'\nprev_agent = 'alt-,'"),
+            err("[keys]\nnav = 'alt-;'\nprev_agent = 'alt-;'"),
             "keys.prev_agent is the same key as keys.nav"
         );
         assert_eq!(
@@ -495,10 +495,10 @@ mod tests {
     #[test]
     fn a_default_chord_that_another_key_the_user_set_has_is_left_off_not_an_error() {
         for (toml, hop, by) in [
-            ("[keys]\nnav = 'alt-,'", Hop::Previous, KeyField::Nav),
-            ("[keys]\nnav = 'alt-.'", Hop::Next, KeyField::Nav),
+            ("[keys]\nnav = 'alt-;'", Hop::Previous, KeyField::Nav),
+            ("[keys]\nnav = \"alt-'\"", Hop::Next, KeyField::Nav),
             (
-                "[keys]\nprev_agent = 'alt-.'",
+                "[keys]\nprev_agent = \"alt-'\"",
                 Hop::Next,
                 KeyField::Hop(Hop::Previous),
             ),
@@ -512,16 +512,16 @@ mod tests {
             );
             assert_eq!(config.keys.hop(hop).spec(), None);
         }
-        let config: Config = "[keys]\nnav = 'alt-,'".parse().expect("parses");
-        assert_eq!(config.keys.hop(Hop::Next).to_string(), "⌥.");
+        let config: Config = "[keys]\nnav = 'alt-;'".parse().expect("parses");
+        assert_eq!(config.keys.hop(Hop::Next).to_string(), "⌥'");
     }
 
     #[test]
     fn a_chord_on_none_does_not_clash_with_the_other_keys() {
-        let config: Config = "[keys]\nprev_agent = 'none'\nnext_agent = 'none'\nnav = 'alt-,'"
+        let config: Config = "[keys]\nprev_agent = 'none'\nnext_agent = 'none'\nnav = 'alt-;'"
             .parse()
             .expect("parses");
-        assert_eq!(config.keys.nav().to_string(), "⌥,");
+        assert_eq!(config.keys.nav().to_string(), "⌥;");
     }
 
     #[test]
@@ -554,7 +554,7 @@ mod tests {
 
     #[test]
     fn reset_restores_the_default_or_leaves_a_chord_off_when_another_key_took_it() {
-        let spec: KeySpec = "alt-.".parse().expect("parses");
+        let spec: KeySpec = "alt-'".parse().expect("parses");
         let taken = Keys::default()
             .with_nav(spec)
             .with_hop(Hop::Previous, Binding::On("f5".parse().expect("parses")))
@@ -565,7 +565,7 @@ mod tests {
                 default: spec,
                 by: KeyField::Nav
             },
-            "alt-. is nav's"
+            "alt-' is nav's"
         );
         let free = taken.reset(KeyField::Hop(Hop::Previous));
         assert_eq!(free.hop(Hop::Previous), Keys::default().hop(Hop::Previous));
@@ -607,8 +607,8 @@ mod tests {
             Prev,
             Next,
         }
-        let spec: KeySpec = "alt-,".parse().expect("parses");
-        let other: KeySpec = "alt-.".parse().expect("parses");
+        let spec: KeySpec = "alt-;".parse().expect("parses");
+        let other: KeySpec = "alt-'".parse().expect("parses");
         assert_eq!(
             ensure_distinct(&[
                 (Field::Nav, other),

@@ -1,7 +1,12 @@
 //! Keys other programs commonly use, for `agent keys` to warn about.
 //!
-//! Every claim here is from memory of those programs' defaults and has not
-//! been checked against their documentation. A claim that is wrong costs
+//! The claims on readline, the terminal driver and zellij are from memory of
+//! those programs' defaults and have not been checked against their
+//! documentation. The claims on agents are checked against Claude Code's
+//! interactive mode documentation (<https://code.claude.com/docs/en/interactive-mode>),
+//! which lists Esc, Ctrl+C D G L O R B T S Z J V, Shift+Tab, Alt+P T O,
+//! Alt+B F D Y (Option as Meta on macOS) and Ctrl+X chords, and doesn't list
+//! `ctrl-]`, `alt-;` or `alt-'` as bound. A claim that is wrong costs
 //! the user a warning they can ignore, so the table holds only what changes
 //! a choice and the output says where its claims come from.
 
@@ -9,7 +14,7 @@ use std::sync::LazyLock;
 
 use agent_core::keyspec::KeySpec;
 
-pub const ATTRIBUTION: &str = "from memory, unchecked";
+pub const ATTRIBUTION: &str = "from memory, unchecked, except agents per Claude Code docs";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Program {
@@ -87,12 +92,6 @@ const CLAIMS: &[Claim] = &[
     claim("alt-b", Readline, Common, "back a word"),
     claim("alt-d", Readline, Common, "kill the next word"),
     claim("alt-f", Readline, Common, "forward a word"),
-    claim(
-        "alt-.",
-        Readline,
-        Common,
-        "paste the last argument (the default next_agent takes it on purpose)",
-    ),
     claim("ctrl-c", Terminal, Common, "interrupt"),
     claim("ctrl-d", Terminal, Common, "end of input"),
     claim("ctrl-z", Terminal, Common, "suspend"),
@@ -132,7 +131,6 @@ const CLAIMS: &[Claim] = &[
     claim("ctrl-s", Agents, Common, "stash the prompt"),
     claim("ctrl-t", Agents, Common, "toggle the task list"),
     claim("ctrl-v", Agents, Common, "paste an image"),
-    claim("alt-m", Agents, Common, "cycle the mode"),
     claim("alt-p", Agents, Common, "switch model"),
     claim("alt-t", Agents, Common, "toggle thinking"),
 ];
@@ -197,13 +195,14 @@ mod tests {
     #[test]
     fn a_key_nobody_is_known_to_use_has_no_collision() {
         assert_eq!(claims_on(spec("f12")), None);
-        assert_eq!(claims_on(spec("alt-,")), None);
+        assert_eq!(claims_on(spec("alt-;")), None);
+        assert_eq!(claims_on(spec("alt-'")), None);
     }
 
     #[test]
     fn a_key_only_rarely_used_is_not_common_and_one_with_a_common_use_is() {
         assert!(!claims_on(spec("ctrl-]")).expect("claimed").is_common());
-        assert!(claims_on(spec("alt-.")).expect("claimed").is_common());
+        assert!(claims_on(spec("alt-b")).expect("claimed").is_common());
         assert!(claims_on(spec("ctrl-g")).expect("claimed").is_common());
     }
 }
