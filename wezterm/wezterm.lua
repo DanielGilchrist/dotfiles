@@ -47,7 +47,7 @@ local misc = {
   },
 
   automatically_reload_config = false,
-  enable_kitty_keyboard = true,
+  enable_kitty_keyboard = false,
   window_close_confirmation = "AlwaysPrompt",
   notification_handling = "AlwaysShow",
   exit_behavior = "Close",
