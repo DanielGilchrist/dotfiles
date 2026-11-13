@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use agent_core::activity::AgentId;
+use agent_core::activity::{AgentId, TaskId};
 use agent_core::model::RepoKey;
 use agent_core::names::SessionName;
 use agent_core::ports::{BranchLog, Change, Compared, DiffBase, FileDiff};
@@ -211,6 +211,8 @@ pub enum Hover {
     Activity(SessionName),
     /// A subagent row in [2].
     Subagent(SessionName, AgentId),
+    /// A background command row in [2].
+    Command(SessionName, TaskId),
     /// A repo row in [1]: nothing to read, but a summary to show.
     Repo(RepoKey),
 }
@@ -224,6 +226,7 @@ enum Item {
     Commit(SessionName, String),
     Activity(SessionName),
     Subagent(SessionName, AgentId),
+    Command(SessionName, TaskId),
     Repo(RepoKey),
 }
 
@@ -236,6 +239,7 @@ impl Hover {
             Self::Commit(key) => Item::Commit(key.name.clone(), key.sha.clone()),
             Self::Activity(name) => Item::Activity(name.clone()),
             Self::Subagent(name, id) => Item::Subagent(name.clone(), id.clone()),
+            Self::Command(name, id) => Item::Command(name.clone(), id.clone()),
             Self::Repo(key) => Item::Repo(key.clone()),
         }
     }
@@ -247,7 +251,7 @@ impl Hover {
             Self::Branch(key) => Some(Key::Branch(key.clone())),
             Self::Folder(key) => Some(Key::Folder(key.clone())),
             Self::Commit(key) => Some(Key::Commit(key.clone())),
-            Self::Activity(_) | Self::Subagent(..) | Self::Repo(_) => None,
+            Self::Activity(_) | Self::Subagent(..) | Self::Command(..) | Self::Repo(_) => None,
         }
     }
 }

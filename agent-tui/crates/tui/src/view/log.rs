@@ -1,6 +1,7 @@
 //! A subagent's log as rows: a pinned status row, then the prompt, what it
 //! said and its calls, or for a finished one its report first.
 
+use std::num::NonZeroUsize;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
@@ -15,8 +16,8 @@ use ratatui::text::{Line, Span};
 use super::page::count_spans;
 use super::sidebar::file_marker;
 use super::{
-    SPINNER, accent, ago, bold, dim, error, fit, justify, line_width, success, truncate_end,
-    truncate_start, warning, wrap,
+    COMMAND_GLYPH, SPINNER, accent, ago, bold, dim, error, fit, justify, line_width, success,
+    truncate_end, truncate_start, warning, wrap,
 };
 use crate::log::{
     Entry, EntryKey, EntryRows, Nav, Phase, activity_entries, agent_count, call_count, delegates,
@@ -841,6 +842,8 @@ pub(super) struct ActivityView<'a> {
     pub touched: &'a [TouchedFile],
     /// The ones it lists as rows.
     pub listed: &'a [TouchedFile],
+    /// Background commands it has running.
+    pub commands: Option<NonZeroUsize>,
 }
 
 impl Rows<'_, '_> {
@@ -1264,6 +1267,7 @@ struct ActivityFigures<'a> {
     errors: usize,
     files: usize,
     agents: usize,
+    commands: Option<NonZeroUsize>,
     /// Since the prompt, or since the agent began when that's unknown.
     working: Option<String>,
     ctx: &'a Context<'a>,
@@ -1295,6 +1299,11 @@ impl ActivityFigures<'_> {
 
     fn subagents(&self) -> Option<Span<'static>> {
         (self.agents > 0).then(|| Span::styled(plural(self.agents, "subagent", "subagents"), dim()))
+    }
+
+    fn commands(&self) -> Option<Span<'static>> {
+        self.commands
+            .map(|n| Span::styled(format!("{COMMAND_GLYPH}{n}"), dim()))
     }
 
     fn quiet(&self, standing: Standing) -> Option<Span<'static>> {
@@ -1333,6 +1342,7 @@ fn activity_status(
         errors: error_count(log),
         files: view.touched.len(),
         agents: agent_count(log),
+        commands: view.commands,
         working: since
             .and_then(|from| ctx.now.duration_since(from).ok())
             .map(span),
@@ -1401,6 +1411,7 @@ fn working_activity_row(
             figures.errors(None),
             figures.files(),
             (running > 0 && !narrow).then(|| Span::styled(format!("↳{running}"), dim())),
+            figures.commands().filter(|_| !narrow),
         ],
     )
 }
@@ -1467,6 +1478,7 @@ fn delegating_activity_row(
         vec![
             Some(Span::styled(format!("↳{running}"), dim())),
             (lost > 0).then(|| Span::styled(format!("{lost} lost"), dim())),
+            figures.commands(),
             quiet,
         ],
     )
@@ -1507,6 +1519,7 @@ fn done_activity_row(
             figures.errors(Some(unrecovered_count(log) == 0)),
             figures.files(),
             figures.subagents(),
+            figures.commands(),
         ],
     )
 }

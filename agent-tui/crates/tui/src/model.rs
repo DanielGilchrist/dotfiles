@@ -5,7 +5,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 use agent_core::actions::Actions;
 use agent_core::activity::{
-    Activity, AgentId, Answer as AskedBy, Hold, Origin as Asker, State, Subagent, ToolId,
+    Activity, AgentId, Answer as AskedBy, BackgroundCommands, CommandLine, Hold, Origin as Asker,
+    Running as RunningCommand, State, Subagent, TaskId, ToolId,
 };
 use agent_core::config::Keys;
 use agent_core::model::{
@@ -98,6 +99,307 @@ pub enum ActivityRow {
         by: SessionName,
         id: AgentId,
     },
+    /// A background command of the agent `by`, listed below its subagents.
+    Command {
+        by: SessionName,
+        id: TaskId,
+    },
+}
+
+/// Whether the listing a command came from still names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Presence {
+    Listed,
+    /// The latest listing left it out. It stays only while the cursor is on
+    /// it, as it was.
+    Ended,
+}
+
+/// What a command is called in a row: text that is safe to draw and has
+/// something visible in it. It is only built from such text, so no row or
+/// card can show an empty name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShownName(String);
+
+impl ShownName {
+    /// The command's first line that shows once cleaned, else its id as it
+    /// shows once cleaned, else nothing.
+    pub fn of(id: &TaskId, command: &CommandLine) -> Option<Self> {
+        command_lines(command)
+            .into_iter()
+            .next()
+            .or_else(|| printable_id(id))
+            .map(Self)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// What `command` says as lines that are safe to draw, none of them blank.
+/// Core's rule on what shows is applied to the cleaned text, since what is
+/// drawn is the cleaned text.
+pub fn command_lines(command: &CommandLine) -> Vec<String> {
+    command
+        .visible_lines()
+        .map(|line| agent_term::printable(line, agent_term::Lines::Flatten))
+        .map(|line| line.trim().to_string())
+        .filter(|line| agent_core::visible::has_visible(line))
+        .collect()
+}
+
+/// `id` as text that is safe to draw, when anything of it shows.
+pub fn printable_id(id: &TaskId) -> Option<String> {
+    let cleaned = agent_term::printable(id.as_str(), agent_term::Lines::Flatten);
+    let cleaned = cleaned.trim();
+    agent_core::visible::has_visible(cleaned).then(|| cleaned.to_string())
+}
+
+/// A background command as [2] and [0] show it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandItem<'a> {
+    pub id: &'a TaskId,
+    pub name: ShownName,
+    pub command: &'a CommandLine,
+    pub description: Option<&'a str>,
+    pub running_at_least: Duration,
+    /// When the listing that named it was made.
+    pub listed: SystemTime,
+    pub presence: Presence,
+}
+
+impl<'a> CommandItem<'a> {
+    /// `None` when nothing about the command can be drawn as its name.
+    fn of(running: RunningCommand<'a>, listed: SystemTime) -> Option<Self> {
+        Some(Self {
+            id: running.id,
+            name: ShownName::of(running.id, running.command)?,
+            command: running.command,
+            description: running.description,
+            running_at_least: running.running_at_least,
+            listed,
+            presence: Presence::Listed,
+        })
+    }
+}
+
+/// The command [2]'s cursor is on, as its agent last listed it, kept after
+/// the listing drops it so the row and an open document stay until the
+/// cursor leaves. It is by definition no longer listed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldCommand {
+    id: TaskId,
+    name: ShownName,
+    command: CommandLine,
+    description: Option<String>,
+    running_at_least: Duration,
+    listed: SystemTime,
+    /// Where it stood among the commands, so it keeps its place in the list.
+    slot: usize,
+}
+
+impl HeldCommand {
+    fn of(item: &CommandItem<'_>, slot: usize) -> Self {
+        Self {
+            id: item.id.clone(),
+            name: item.name.clone(),
+            command: item.command.clone(),
+            description: item.description.map(str::to_string),
+            running_at_least: item.running_at_least,
+            listed: item.listed,
+            slot,
+        }
+    }
+
+    fn item(&self) -> CommandItem<'_> {
+        CommandItem {
+            id: &self.id,
+            name: self.name.clone(),
+            command: &self.command,
+            description: self.description.as_deref(),
+            running_at_least: self.running_at_least,
+            listed: self.listed,
+            presence: Presence::Ended,
+        }
+    }
+}
+
+/// An agent's commands in [2], at least one, longest running first. Only
+/// the ones that can be named are here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Commands<'a> {
+    first: CommandItem<'a>,
+    rest: Vec<CommandItem<'a>>,
+}
+
+impl<'a> Commands<'a> {
+    /// What a listing names that can be drawn, or nothing when none can.
+    pub fn listed(commands: &'a BackgroundCommands) -> Option<Self> {
+        let at = commands.listed_at();
+        let mut items = commands
+            .iter()
+            .filter_map(|running| CommandItem::of(running, at));
+        let first = items.next()?;
+        Some(Self {
+            first,
+            rest: items.collect(),
+        })
+    }
+
+    /// With `held` at `slot` among them, unless they name it.
+    fn holding(mut self, held: CommandItem<'a>, slot: usize) -> Self {
+        if self.get(held.id).is_some() {
+            return self;
+        }
+        match slot.checked_sub(1) {
+            None => {
+                let first = std::mem::replace(&mut self.first, held);
+                self.rest.insert(0, first);
+            }
+            Some(after) => self.rest.insert(after.min(self.rest.len()), held),
+        }
+        self
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &CommandItem<'a>> {
+        std::iter::once(&self.first).chain(&self.rest)
+    }
+
+    pub fn get(&self, id: &TaskId) -> Option<&CommandItem<'a>> {
+        self.iter().find(|item| item.id == id)
+    }
+
+    /// The one that has run longest.
+    pub fn longest(&self) -> &CommandItem<'a> {
+        &self.first
+    }
+
+    pub fn count(&self) -> NonZeroUsize {
+        NonZeroUsize::MIN.saturating_add(self.rest.len())
+    }
+}
+
+/// Where [2]'s cursor is, in the list it is on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Spot<'a> {
+    Main,
+    Subagent(&'a AgentId),
+    Command(&'a TaskId),
+}
+
+impl Spot<'_> {
+    /// The stored cursor for this spot in `by`'s list.
+    pub fn row(&self, by: &SessionName) -> ActivityRow {
+        match self {
+            Self::Main => ActivityRow::Main,
+            Self::Subagent(id) => ActivityRow::Subagent {
+                by: by.clone(),
+                id: (*id).clone(),
+            },
+            Self::Command(id) => ActivityRow::Command {
+                by: by.clone(),
+                id: (*id).clone(),
+            },
+        }
+    }
+}
+
+/// [2] for the selected agent: the activity, its subagents, and its
+/// commands under a heading when it has any, with where the cursor is. Every
+/// reader of [2] (drawing, hover, clicks, moves, `n of m`) reads this one
+/// value.
+#[derive(Debug)]
+pub struct ActivityList<'a> {
+    /// Oldest first, including one held after its activity dropped it.
+    pub subagents: Vec<(&'a AgentId, &'a Subagent)>,
+    pub commands: Option<Commands<'a>>,
+    cursor: Spot<'a>,
+    position: usize,
+}
+
+impl<'a> ActivityList<'a> {
+    fn new(subagents: Vec<(&'a AgentId, &'a Subagent)>, commands: Option<Commands<'a>>) -> Self {
+        Self {
+            subagents,
+            commands,
+            cursor: Spot::Main,
+            position: 0,
+        }
+    }
+
+    /// Where the cursor is, with `stored` the cursor kept for `by`. The
+    /// activity when `stored` isn't in the list.
+    fn placed(mut self, stored: Option<&ActivityRow>, by: &SessionName) -> Self {
+        let found = self
+            .spots()
+            .enumerate()
+            .find(|(_, spot)| match (stored, spot) {
+                (Some(ActivityRow::Subagent { by: b, id }), Spot::Subagent(listed)) => {
+                    b == by && id == *listed
+                }
+                (Some(ActivityRow::Command { by: b, id }), Spot::Command(listed)) => {
+                    b == by && id == *listed
+                }
+                _ => false,
+            });
+        if let Some((position, spot)) = found {
+            self.position = position;
+            self.cursor = spot;
+        }
+        self
+    }
+
+    pub fn cursor(&self) -> Spot<'a> {
+        self.cursor
+    }
+
+    /// The cursor's place among the spots, 0 for the activity.
+    pub fn position(&self) -> usize {
+        self.position
+    }
+
+    pub fn count(&self) -> usize {
+        1 + self.subagents.len() + self.commands.as_ref().map_or(0, |c| c.count().get())
+    }
+
+    /// Every spot the cursor can stop on, in the order [2] lists them.
+    pub fn spots(&self) -> impl Iterator<Item = Spot<'a>> + '_ {
+        std::iter::once(Spot::Main)
+            .chain(self.subagents.iter().map(|(id, _)| Spot::Subagent(id)))
+            .chain(
+                self.commands
+                    .iter()
+                    .flat_map(|commands| commands.iter().map(|item| Spot::Command(item.id))),
+            )
+    }
+
+    /// The spot `to` picks from the cursor's place and the last place.
+    pub fn moved(&self, to: impl FnOnce(usize, usize) -> usize) -> Spot<'a> {
+        let below_main: Vec<Spot<'a>> = self.spots().skip(1).collect();
+        let last = below_main.len();
+        match to(self.position, last).min(last).checked_sub(1) {
+            None => Spot::Main,
+            Some(below) => below_main[below],
+        }
+    }
+
+    pub fn command(&self, id: &TaskId) -> Option<&CommandItem<'a>> {
+        self.commands.as_ref()?.get(id)
+    }
+}
+
+/// The first of [2]'s lines drawn at its top. A line counts the `commands`
+/// heading, which no row stands for, so it is not the line of any hit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FirstLine(pub usize);
+
+/// One of [2]'s rows as drawn: which line it is on, and what a click on it
+/// points the cursor at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActivityHit {
+    pub line: usize,
+    pub row: ActivityRow,
 }
 
 /// The list panel the keys act on, whether they're in it or in the document
@@ -1513,7 +1815,9 @@ pub struct Areas {
     /// [2]'s and [3]'s panels as drawn, and the screen row of each of their
     /// list rows with its index, so a click lands on what it points at.
     pub agent_panel: Rect,
-    pub agent_rows: Vec<(u16, usize)>,
+    pub agent_rows: Vec<(u16, ActivityHit)>,
+    /// The line of [2] drawn at its top, when it was drawn.
+    pub agent_first: Option<FirstLine>,
     pub changes_panel: Rect,
     pub change_rows: Vec<(u16, usize)>,
     /// Rows inside the panel the keys go to, as last drawn, so a half-page
@@ -2839,7 +3143,9 @@ impl Model {
             Hover::Branch(key) => Key::Branch(key),
             Hover::Folder(key) => Key::Folder(key),
             Hover::Commit(key) => Key::Commit(key),
-            Hover::Activity(_) | Hover::Subagent(..) | Hover::Repo(_) => return None,
+            Hover::Activity(_) | Hover::Subagent(..) | Hover::Command(..) | Hover::Repo(_) => {
+                return None;
+            }
         };
         Some((key, root))
     }
@@ -2853,7 +3159,10 @@ impl Model {
                 let rows = self.change_rows();
                 Some((file.min(rows.checked_sub(1)?) + 1, rows))
             }
-            Listed::Agent { .. } => Some((self.row_at() + 1, self.subagent_rows().len() + 1)),
+            Listed::Agent { .. } => {
+                let list = self.activity_list();
+                Some((list.position() + 1, list.count()))
+            }
         }
     }
 
@@ -3154,15 +3463,26 @@ impl Model {
             .unwrap_or_else(|| subagent.liveness(now, agent_core::activity::Waiting::Off))
     }
 
+    /// The activity of a live agent. A session that has ended has none to show.
+    fn live_activity(&self, entry: &Entry) -> Option<&Activity> {
+        let EntryState::Live = entry.state() else {
+            return None;
+        };
+        self.activity(entry.name())
+    }
+
+    /// The background commands a live agent has running, as of its latest
+    /// listing.
+    pub fn commands(&self, entry: &Entry) -> Option<Commands<'_>> {
+        Commands::listed(self.live_activity(entry)?.commands()?)
+    }
+
     /// The selected agent's subagents, oldest first, as [2] lists them.
     pub fn subagent_rows(&self) -> Vec<(&AgentId, &Subagent)> {
         let Some(entry) = self.selected_entry() else {
             return Vec::new();
         };
-        let Some(activity) = self
-            .activity(entry.name())
-            .filter(|_| matches!(entry.state(), EntryState::Live))
-        else {
+        let Some(activity) = self.live_activity(entry) else {
             return Vec::new();
         };
         let mut rows: Vec<_> = activity.subagents.iter().collect();
@@ -3181,68 +3501,128 @@ impl Model {
         rows
     }
 
-    /// Keeps the subagent under [2]'s cursor as its agent last listed it,
-    /// marks it finished once the activity drops it, and forgets it when the
-    /// cursor has left its agent or its live session.
+    /// Keeps the subagent or command under [2]'s cursor as its agent last
+    /// listed it, marks it finished once the activity drops it, and forgets
+    /// every held row but that one: the cursor leaving it, its agent or its
+    /// live session ends the hold.
     pub fn hold_activity_row(&mut self) {
-        let Some(ActivityRow::Subagent { by, id }) = self.panel.activity_row() else {
-            return;
-        };
+        let on = self.panel.activity_row().cloned();
         let live = self
             .selected_entry()
-            .is_some_and(|e| e.name() == by && matches!(e.state(), EntryState::Live));
-        let listed = live
-            .then(|| self.activity(by).and_then(|a| a.subagents.get(id)).cloned())
-            .flatten();
-        let now = self.clock.wall;
-        let Some(watched) = self
-            .agents
-            .get_mut(by)
-            .and_then(|t| t.subagents.get_mut(id))
-        else {
-            return;
+            .filter(|e| matches!(e.state(), EntryState::Live))
+            .map(|e| e.name().clone());
+        let held_subagent = match &on {
+            Some(ActivityRow::Subagent { by, id }) if live.as_ref() == Some(by) => {
+                Some(self.activity(by).and_then(|a| a.subagents.get(id)).cloned())
+            }
+            _ => None,
         };
-        match (live, listed) {
-            (false, _) => watched.held = None,
-            (true, Some(subagent)) => watched.held = Some(subagent),
-            (true, None) => {
-                if let Some(held) = &mut watched.held {
-                    held.finish(now);
+        let held_command = match &on {
+            Some(ActivityRow::Command { by, id }) if live.as_ref() == Some(by) => Some(
+                self.activity(by)
+                    .and_then(Activity::commands)
+                    .and_then(Commands::listed)
+                    .and_then(|commands| {
+                        let slot = commands.iter().position(|item| item.id == id)?;
+                        Some(HeldCommand::of(commands.get(id)?, slot))
+                    }),
+            ),
+            _ => None,
+        };
+        let now = self.clock.wall;
+        let command_named = match (&on, &held_command) {
+            (Some(ActivityRow::Command { by, id }), Some(listed)) => {
+                listed.is_some()
+                    || self
+                        .agents
+                        .get(by)
+                        .and_then(|t| t.held_command.as_ref())
+                        .is_some_and(|held| held.id == *id)
+            }
+            _ => false,
+        };
+        for (name, tracked) in &mut self.agents {
+            for (id, watched) in &mut tracked.subagents {
+                match (&on, &held_subagent) {
+                    (Some(ActivityRow::Subagent { by, id: on_id }), Some(listed))
+                        if by == name && on_id == id =>
+                    {
+                        match listed {
+                            Some(subagent) => watched.held = Some(subagent.clone()),
+                            None => {
+                                if let Some(held) = &mut watched.held {
+                                    held.finish(now);
+                                }
+                            }
+                        }
+                    }
+                    _ => watched.held = None,
                 }
             }
+            match (&on, &held_command) {
+                (Some(ActivityRow::Command { by, id }), Some(listed)) if by == name => match listed
+                {
+                    Some(command) => tracked.held_command = Some(command.clone()),
+                    None => {
+                        if tracked.held_command.as_ref().is_some_and(|h| h.id != *id) {
+                            tracked.held_command = None;
+                        }
+                    }
+                },
+                _ => tracked.held_command = None,
+            }
+        }
+        if matches!(on, Some(ActivityRow::Command { .. }))
+            && !command_named
+            && let Some(stored) = self.panel.activity_row_mut()
+        {
+            *stored = ActivityRow::Main;
         }
     }
 
-    /// Where [2]'s cursor is among its rows: 0 is the activity, then the
-    /// subagents. The activity while it points at a subagent that's gone.
-    pub fn row_at(&self) -> usize {
-        let Some(ActivityRow::Subagent { id, .. }) = self.panel.activity_row() else {
-            return 0;
+    /// [2] for the selected agent.
+    pub fn activity_list(&self) -> ActivityList<'_> {
+        let Some(entry) = self.selected_entry() else {
+            return ActivityList::new(Vec::new(), None);
         };
-        self.subagent_rows()
-            .iter()
-            .position(|(row, _)| *row == id)
-            .map_or(0, |at| at + 1)
-    }
-
-    /// Moves [2]'s cursor to the row `to` picks from where it is and the
-    /// last row's index.
-    pub fn point_at_row(&mut self, to: impl FnOnce(usize, usize) -> usize) {
-        let rows = self.subagent_rows();
-        let row = to(self.row_at(), rows.len()).min(rows.len());
-        let pointed = match (row.checked_sub(1), self.selected_entry()) {
-            (Some(at), Some(entry)) => Some((entry.name().clone(), rows[at].0.clone())),
+        let stored = self.panel.activity_row();
+        let held = match stored {
+            Some(ActivityRow::Command { by, .. }) if by == entry.name() => self
+                .live_activity(entry)
+                .and_then(|_| self.agents.get(by)?.held_command.as_ref()),
             _ => None,
         };
-        let Some((by, id)) = pointed else {
-            if let Some(row) = self.panel.activity_row_mut() {
-                *row = ActivityRow::Main;
-            }
-            return;
+        let commands = self.commands(entry);
+        let commands = match (commands, held) {
+            (Some(commands), Some(held)) => Some(commands.holding(held.item(), held.slot)),
+            (None, Some(held)) => Some(Commands {
+                first: held.item(),
+                rest: Vec::new(),
+            }),
+            (commands, None) => commands,
         };
-        self.track(&by).subagents.entry(id.clone()).or_default();
-        if let Some(row) = self.panel.activity_row_mut() {
-            *row = ActivityRow::Subagent { by, id };
+        ActivityList::new(self.subagent_rows(), commands).placed(stored, entry.name())
+    }
+
+    /// Moves [2]'s cursor to the spot `to` picks from its place and the
+    /// last place.
+    pub fn point_at_row(&mut self, to: impl FnOnce(usize, usize) -> usize) {
+        let row = {
+            let list = self.activity_list();
+            let spot = list.moved(to);
+            self.selected_entry()
+                .map_or(ActivityRow::Main, |entry| spot.row(entry.name()))
+        };
+        self.point_at(row);
+    }
+
+    /// Points [2]'s cursor at `row`.
+    pub fn point_at(&mut self, row: ActivityRow) {
+        if let ActivityRow::Subagent { by, id } = &row {
+            self.track(by).subagents.entry(id.clone()).or_default();
+        }
+        if let Some(stored) = self.panel.activity_row_mut() {
+            *stored = row;
         }
         self.hold_activity_row();
     }
@@ -3271,11 +3651,10 @@ impl Model {
 
     /// The subagent [2]'s cursor is on, while [2] is focused.
     pub fn subagent_selected(&self) -> Option<(SessionName, AgentId)> {
-        self.panel.activity_row()?;
-        let name = self.selected_entry()?.name().clone();
-        let rows = self.subagent_rows();
-        let (id, _) = rows.get(self.row_at().checked_sub(1)?)?;
-        Some((name, (*id).clone()))
+        let Spot::Subagent(id) = self.activity_list().cursor() else {
+            return None;
+        };
+        Some((self.selected_entry()?.name().clone(), id.clone()))
     }
 
     /// What the main view reads: the file under [3]'s cursor or the row
@@ -3294,9 +3673,10 @@ impl Model {
                 let entry = self.selected_entry()?;
                 self.activity(entry.name())?;
                 let name = entry.name().clone();
-                Some(match self.subagent_selected() {
-                    Some((_, id)) => Hover::Subagent(name, id),
-                    None => Hover::Activity(name),
+                Some(match self.activity_list().cursor() {
+                    Spot::Subagent(id) => Hover::Subagent(name, id.clone()),
+                    Spot::Command(id) => Hover::Command(name, id.clone()),
+                    Spot::Main => Hover::Activity(name),
                 })
             }
         }
@@ -4856,6 +5236,14 @@ impl Model {
     /// How many subagents are being watched across every agent.
     pub fn watching(&self) -> usize {
         self.agents.values().map(|t| t.subagents.len()).sum()
+    }
+}
+
+#[cfg(test)]
+impl Model {
+    /// Which row [2]'s cursor is on.
+    pub fn row_at(&self) -> usize {
+        self.activity_list().position()
     }
 }
 

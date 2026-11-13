@@ -4,7 +4,8 @@ use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
 use agent_core::activity::{
-    Activity, AgentId, Answer, Ask, Join, Launch, Origin, Session, State, Subagent, Tool, ToolId,
+    Activity, AgentId, Answer, Ask, Join, Launch, ListedCommand, Origin, Session, State, Subagent,
+    Tool, ToolId,
 };
 use agent_core::discover::{Observation, assemble};
 use agent_core::model::{Head, Worktree};
@@ -135,6 +136,32 @@ pub fn asking(question: &str, secs_ago: u64) -> Activity {
         since: activity.since,
     });
     activity
+}
+
+/// A background command as a harness lists it.
+pub fn listed(id: &str, command: &str) -> ListedCommand {
+    ListedCommand {
+        id: id.parse().expect("shows"),
+        command: command.parse().expect("not blank"),
+        description: None,
+    }
+}
+
+/// Lists `commands` as running for `agent`, first named `for_how_long` ago,
+/// leaving everything else about its activity as it was.
+pub fn run_commands(
+    m: &mut Model,
+    agent: &str,
+    commands: &[ListedCommand],
+    for_how_long: Duration,
+) {
+    let activities = m.activities.get_or_insert_default();
+    let before = activities
+        .remove(&name(agent))
+        .unwrap_or_else(|| reported(State::Idle, 1));
+    let after =
+        agent_core::activity::testing::with_commands(before, commands, for_how_long, m.clock.wall);
+    activities.insert(name(agent), after);
 }
 
 /// `agent` with a question open.

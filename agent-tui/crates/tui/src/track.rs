@@ -97,6 +97,8 @@ pub struct Tracked {
     pub seen: Seen,
     /// The subagents being watched, dropped with the agent.
     pub subagents: HashMap<AgentId, Watched>,
+    /// The command [2]'s cursor is on, as last listed.
+    pub held_command: Option<crate::model::HeldCommand>,
     /// The other windows showing its session, as the newest look found them.
     pub company: Company,
     /// Its current activity, as [0] last read it.

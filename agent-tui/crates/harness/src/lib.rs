@@ -995,6 +995,20 @@ impl<'de> Deserialize<'de> for NonEmpty {
     }
 }
 
+/// A background task's id. One with nothing visible in it can't be told
+/// from another or shown, so a task carrying one is skipped.
+struct VisibleId(String);
+
+impl<'de> Deserialize<'de> for VisibleId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        if !agent_core::visible::has_visible(&text) {
+            return Err(serde::de::Error::custom("id with nothing visible"));
+        }
+        Ok(Self(text))
+    }
+}
+
 /// A field of a shape that varies by tool or version: the value if it has
 /// the expected one, and nothing otherwise.
 struct Lenient<T>(Option<T>);
@@ -1183,7 +1197,7 @@ enum TaskStatus {
 #[derive(Deserialize)]
 struct BackgroundTask {
     #[serde(default)]
-    id: Option<NonEmpty>,
+    id: Option<VisibleId>,
     #[serde(default, rename = "type")]
     kind: Option<TaskKind>,
     #[serde(default)]
@@ -1385,7 +1399,7 @@ fn background_commands(tasks: &[Lenient<BackgroundTask>]) -> Vec<ListedCommand> 
     running_tasks(tasks, TaskKind::Shell)
         .filter_map(|task| {
             Some(ListedCommand {
-                id: TaskId::new(task.id.as_ref()?.0.clone()),
+                id: TaskId::try_from(task.id.as_ref()?.0.clone()).ok()?,
                 command: task.command.text()?.parse::<CommandLine>().ok()?,
                 description: task.description.clone(),
             })
@@ -2237,7 +2251,7 @@ mod tests {
 
     fn shell(id: &str, command: &str, description: Option<&str>) -> ListedCommand {
         ListedCommand {
-            id: TaskId::new(id),
+            id: id.parse().expect("shows"),
             command: command.parse().expect("not blank"),
             description: description.map(Into::into),
         }
@@ -2275,6 +2289,22 @@ mod tests {
                 "s2", "b", None
             )])))
         );
+    }
+
+    #[test]
+    fn a_shell_whose_id_shows_nothing_is_skipped_like_one_with_no_id() {
+        for blank in ["", " ", "\\u200b", "\\u0007", "\\ufe0f"] {
+            let payload = format!(
+                r#"{{"hook_event_name":"Stop","background_tasks":[{{"id":"{blank}","type":"shell","command":"a"}},{{"id":"s2","type":"shell","command":"b"}}]}}"#
+            );
+            assert_eq!(
+                claude_event(&payload),
+                Some(stop_listing(CommandListing::Listed(vec![shell(
+                    "s2", "b", None
+                )]))),
+                "{blank}"
+            );
+        }
     }
 
     #[test]

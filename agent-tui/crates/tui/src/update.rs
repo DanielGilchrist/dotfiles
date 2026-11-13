@@ -24,10 +24,10 @@ use crate::keymap::Situation;
 use crate::log::{EntryKey, Nav};
 use crate::model::{
     ActivityRow, AfterCheck, Answer, Areas, CheckHealth, Chord, CommentDraft, Company, Confirm,
-    Cursor, DirCheck, Direction, Drawn, Edge, Enter, Field, Focus, Follow, FormKind, HelpState,
-    INFO_TTL, Inspected, Inspection, Intent, Listed, LogKey, Look, Missing, Mode, Model, Moment,
-    NamingState, Need, NewAgent, Overlay, Pane, Panel, Peek, Phase, Planning, PromptEdit, Query,
-    Reach, Reply, ReplyTo, RepoInput, Screen, StatusKind, Submission, TerminalFocus, Ticket,
+    Cursor, DirCheck, Direction, Drawn, Edge, Enter, Field, FirstLine, Focus, Follow, FormKind,
+    HelpState, INFO_TTL, Inspected, Inspection, Intent, Listed, LogKey, Look, Missing, Mode, Model,
+    Moment, NamingState, Need, NewAgent, Overlay, Pane, Panel, Peek, Phase, Planning, PromptEdit,
+    Query, Reach, Reply, ReplyTo, RepoInput, Screen, StatusKind, Submission, TerminalFocus, Ticket,
     Unreachable, View, Watch, WatchView, WorkRoom, elsewhere_banner, fuzzy_match, match_rank,
     repo_matches, unlisted,
 };
@@ -621,8 +621,8 @@ pub fn drawn(m: &mut Model, drawn: Drawn) {
 fn clamp_panel(m: &mut Model) {
     let list = match m.panel.list() {
         Listed::Agents => return,
-        Listed::Agent { row, .. } => match m.areas.agent_rows.first() {
-            Some(&(_, first)) => Panel::Agent {
+        Listed::Agent { row, .. } => match m.areas.agent_first {
+            Some(FirstLine(first)) => Panel::Agent {
                 offset: first,
                 row: row.clone(),
             },
@@ -3400,6 +3400,13 @@ fn on_confirm_key(m: &mut Model, confirm: Confirm, key: &KeyEvent) -> Vec<Effect
     }
 }
 
+/// The row of `rows` drawn on screen row `y`.
+fn row_at<T: Clone>(rows: &[(u16, T)], y: u16) -> Option<T> {
+    rows.iter()
+        .find(|(at, _)| *at == y)
+        .map(|(_, row)| row.clone())
+}
+
 /// A click over [2] or [3] focuses it with the cursor on the row clicked,
 /// taking the keys back from the agent. The wheel moves the cursor of the
 /// panel already focused and is ignored elsewhere, so it never changes
@@ -3415,7 +3422,6 @@ fn on_lower_panel(
     } else {
         1
     };
-    let row_at = |rows: &[(u16, usize)]| rows.iter().find(|(y, _)| *y == mouse.row).map(|r| r.1);
     let typing = matches!(m.focus(), Focus::Agent(_));
     let over_agent = m.areas.agent_panel.contains(at);
     let over_changes = m.areas.changes_panel.contains(at);
@@ -3435,18 +3441,18 @@ fn on_lower_panel(
     }
     m.pane.set_nav();
     if over_agent {
-        let row = row_at(&m.areas.agent_rows);
+        let row = row_at(&m.areas.agent_rows, mouse.row).map(|hit| hit.row);
         m.panel.leave_document();
         if !matches!(m.panel, Panel::Agent { .. }) {
             m.panel = Panel::activity();
         }
         if let Some(row) = row {
-            m.point_at_row(|_, _| row);
+            m.point_at(row);
         }
         return Some(Vec::new());
     }
     {
-        let row = row_at(&m.areas.change_rows);
+        let row = row_at(&m.areas.change_rows, mouse.row);
         let file = match m.panel.list() {
             Listed::Changes { file } => file,
             Listed::Agents | Listed::Agent { .. } => 0,
@@ -6432,6 +6438,42 @@ mod tests {
     }
 
     #[test]
+    fn g_and_k_walk_the_commands_below_the_subagents_and_enter_opens_one_and_esc_returns_to_its_row()
+     {
+        let mut m = delegating();
+        crate::fixtures::run_commands(
+            &mut m,
+            "obs-layout-4",
+            &[
+                crate::fixtures::listed("c1", "cargo test"),
+                crate::fixtures::listed("c2", "bin/rails s"),
+            ],
+            Duration::from_mins(4),
+        );
+        update(&mut m, key(KeyCode::Char('2')));
+        update(&mut m, key(KeyCode::Char('G')));
+        assert_eq!(m.row_at(), 5, "the activity, three subagents, two commands");
+        assert!(
+            reads(tick(&mut m)).is_empty(),
+            "a command has no transcript to read"
+        );
+        update(&mut m, key(KeyCode::Char('k')));
+        assert!(matches!(
+            m.hover(),
+            Some(crate::document::Hover::Command(_, ref id)) if id.as_str() == "c1"
+        ));
+        update(&mut m, key(KeyCode::Enter));
+        assert!(m.main_focused());
+        assert!(matches!(
+            m.hover(),
+            Some(crate::document::Hover::Command(..))
+        ));
+        update(&mut m, key(KeyCode::Esc));
+        assert!(!m.main_focused());
+        assert_eq!(m.row_at(), 4, "back on the command it opened");
+    }
+
+    #[test]
     fn the_cursor_row_lives_in_the_panel_and_goes_when_the_panel_is_left_and_refocused() {
         let mut m = delegating();
         update(&mut m, key(KeyCode::Char('2')));
@@ -6457,7 +6499,7 @@ mod tests {
         assert_eq!(
             m.panel.activity_row().and_then(|row| match row {
                 ActivityRow::Subagent { id, .. } => Some(id.clone()),
-                ActivityRow::Main => None,
+                ActivityRow::Main | ActivityRow::Command { .. } => None,
             }),
             Some(id),
             "the cursor stays on its row while [0] has the keys"

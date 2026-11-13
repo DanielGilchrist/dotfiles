@@ -2,7 +2,7 @@
 //! (`agent event`), so the TUI can show it and say which agents need you.
 
 use std::collections::BTreeMap;
-use std::num::NonZeroU32;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
@@ -29,15 +29,42 @@ impl AgentId {
     }
 }
 
+/// A background task's id, with something visible in it. It can only be
+/// made through that check, including when read back from a file.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
+#[serde(try_from = "String", into = "String")]
 pub struct TaskId(String);
 
-impl TaskId {
-    pub fn new(id: impl Into<String>) -> Self {
-        Self(id.into())
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("task id with nothing visible")]
+pub struct InvisibleTaskId;
 
+impl TryFrom<String> for TaskId {
+    type Error = InvisibleTaskId;
+
+    fn try_from(id: String) -> Result<Self, Self::Error> {
+        if !crate::visible::has_visible(&id) {
+            return Err(InvisibleTaskId);
+        }
+        Ok(Self(id))
+    }
+}
+
+impl std::str::FromStr for TaskId {
+    type Err = InvisibleTaskId;
+
+    fn from_str(id: &str) -> Result<Self, Self::Err> {
+        id.to_string().try_into()
+    }
+}
+
+impl From<TaskId> for String {
+    fn from(id: TaskId) -> Self {
+        id.0
+    }
+}
+
+impl TaskId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -341,20 +368,20 @@ pub struct Background {
     pub description: Option<String>,
 }
 
-/// A background command's command line, never blank.
+/// A background command's command line, with something visible in it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "String")]
 pub struct CommandLine(String);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[error("blank command line")]
+#[error("command line with nothing visible")]
 pub struct BlankCommandLine;
 
 impl TryFrom<String> for CommandLine {
     type Error = BlankCommandLine;
 
     fn try_from(text: String) -> Result<Self, Self::Error> {
-        if text.trim().is_empty() {
+        if !crate::visible::has_visible(&text) {
             return Err(BlankCommandLine);
         }
         Ok(Self(text))
@@ -372,6 +399,13 @@ impl std::str::FromStr for CommandLine {
 impl CommandLine {
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// The lines with something visible in them, in order.
+    pub fn visible_lines(&self) -> impl Iterator<Item = &str> {
+        self.0
+            .lines()
+            .filter(|line| crate::visible::has_visible(line))
     }
 }
 
@@ -414,18 +448,35 @@ pub struct Running<'a> {
 
 /// The background commands the latest listing named, at least one, and when
 /// it was made. Keyed by id, so one can't appear twice, and no command was
-/// seen after the listing.
+/// seen after the listing. The one running longest is held apart from the
+/// rest, so there is always one to name.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(try_from = "UncheckedCommands")]
+#[serde(try_from = "UncheckedCommands", into = "UncheckedCommands")]
 pub struct BackgroundCommands {
+    listed: SystemTime,
+    longest: (TaskId, Tracked),
+    rest: BTreeMap<TaskId, Tracked>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct UncheckedCommands {
     listed: SystemTime,
     by_id: BTreeMap<TaskId, Tracked>,
 }
 
-#[derive(Deserialize)]
-struct UncheckedCommands {
-    listed: SystemTime,
-    by_id: BTreeMap<TaskId, Tracked>,
+impl From<BackgroundCommands> for UncheckedCommands {
+    fn from(commands: BackgroundCommands) -> Self {
+        let BackgroundCommands {
+            listed,
+            longest: (id, tracked),
+            mut rest,
+        } = commands;
+        rest.insert(id, tracked);
+        Self {
+            listed,
+            by_id: rest,
+        }
+    }
 }
 
 impl TryFrom<UncheckedCommands> for BackgroundCommands {
@@ -433,17 +484,27 @@ impl TryFrom<UncheckedCommands> for BackgroundCommands {
 
     fn try_from(unchecked: UncheckedCommands) -> Result<Self, Self::Error> {
         let UncheckedCommands { listed, mut by_id } = unchecked;
-        if by_id.is_empty() {
-            return Err("no commands".into());
-        }
         for tracked in by_id.values_mut() {
             tracked.seen = tracked.seen.min(listed);
         }
-        Ok(Self { listed, by_id })
+        Self::of(listed, by_id).ok_or_else(|| "no commands".into())
     }
 }
 
 impl BackgroundCommands {
+    /// `by_id` as the set it names, or nothing when it is empty.
+    fn of(listed: SystemTime, by_id: BTreeMap<TaskId, Tracked>) -> Option<Self> {
+        let mut ordered: Vec<_> = by_id.into_iter().collect();
+        ordered.sort_by(|(a_id, a), (b_id, b)| (a.seen, a_id).cmp(&(b.seen, b_id)));
+        let mut ordered = ordered.into_iter();
+        let longest = ordered.next()?;
+        Some(Self {
+            listed,
+            longest,
+            rest: ordered.collect(),
+        })
+    }
+
     /// What `listed` at `now` leaves tracked: those commands, each keeping
     /// the `seen` it had in `previous`. Nothing tracked when none are listed.
     /// When an id is listed twice the first wins.
@@ -455,7 +516,7 @@ impl BackgroundCommands {
         let mut by_id = BTreeMap::new();
         for listed in listed {
             let seen = previous
-                .and_then(|p| p.by_id.get(&listed.id))
+                .and_then(|p| p.tracked(&listed.id))
                 .map_or(now, |known| known.seen.min(now));
             by_id.entry(listed.id).or_insert(Tracked {
                 command: listed.command,
@@ -463,14 +524,19 @@ impl BackgroundCommands {
                 seen,
             });
         }
-        (!by_id.is_empty()).then_some(Self { listed: now, by_id })
+        Self::of(now, by_id)
     }
 
-    /// The commands, longest running first.
-    pub fn iter(&self) -> impl Iterator<Item = Running<'_>> {
-        let mut commands: Vec<_> = self.by_id.iter().collect();
-        commands.sort_by_key(|(id, tracked)| (tracked.seen, *id));
-        commands.into_iter().map(|(id, tracked)| Running {
+    fn tracked(&self, id: &TaskId) -> Option<&Tracked> {
+        let (longest, tracked) = &self.longest;
+        if longest == id {
+            return Some(tracked);
+        }
+        self.rest.get(id)
+    }
+
+    fn running<'a>(&self, id: &'a TaskId, tracked: &'a Tracked) -> Running<'a> {
+        Running {
             id,
             command: &tracked.command,
             description: tracked.description.as_deref(),
@@ -478,7 +544,64 @@ impl BackgroundCommands {
                 .listed
                 .duration_since(tracked.seen)
                 .unwrap_or_else(|earlier| earlier.duration()),
-        })
+        }
+    }
+
+    /// When the listing that names them was made.
+    pub fn listed_at(&self) -> SystemTime {
+        self.listed
+    }
+
+    /// How many there are, which is never none.
+    pub fn count(&self) -> NonZeroUsize {
+        NonZeroUsize::MIN.saturating_add(self.rest.len())
+    }
+
+    /// The one that has run longest.
+    pub fn longest(&self) -> Running<'_> {
+        let (id, tracked) = &self.longest;
+        self.running(id, tracked)
+    }
+
+    /// The command `id`, if the listing names it.
+    pub fn get(&self, id: &TaskId) -> Option<Running<'_>> {
+        let (longest, tracked) = &self.longest;
+        if longest == id {
+            return Some(self.running(longest, tracked));
+        }
+        self.rest
+            .get_key_value(id)
+            .map(|(id, tracked)| self.running(id, tracked))
+    }
+
+    /// The commands, longest running first.
+    pub fn iter(&self) -> impl Iterator<Item = Running<'_>> {
+        let mut rest: Vec<_> = self.rest.iter().collect();
+        rest.sort_by_key(|(id, tracked)| (tracked.seen, *id));
+        std::iter::once(self.longest()).chain(
+            rest.into_iter()
+                .map(|(id, tracked)| self.running(id, tracked)),
+        )
+    }
+}
+
+/// Building activities for tests in other crates, which can't reach the
+/// private fields.
+#[cfg(any(test, feature = "testing"))]
+pub mod testing {
+    use super::{Activity, BackgroundCommands, ListedCommand, SystemTime};
+
+    /// `activity` with `commands` listed as running, as two listings
+    /// `listed_for` apart would leave it. Nothing else about it changes.
+    pub fn with_commands(
+        mut activity: Activity,
+        commands: &[ListedCommand],
+        listed_for: std::time::Duration,
+        now: SystemTime,
+    ) -> Activity {
+        let first = BackgroundCommands::listing(commands.to_vec(), None, now - listed_for);
+        activity.commands = BackgroundCommands::listing(commands.to_vec(), first.as_ref(), now);
+        activity
     }
 }
 
@@ -1837,7 +1960,7 @@ mod tests {
 
     fn command(id: &str, line: &str) -> ListedCommand {
         ListedCommand {
-            id: TaskId::new(id),
+            id: id.parse().expect("shows"),
             command: line.parse().expect("not blank"),
             description: None,
         }
@@ -3077,6 +3200,89 @@ mod tests {
     }
 
     #[test]
+    fn the_commands_know_their_count_their_listing_time_and_each_one_by_id() {
+        let a = run(vec![
+            (
+                10,
+                main(listing(vec![command("c1", "a"), command("c2", "b")])),
+            ),
+            (
+                70,
+                main(listing(vec![command("c1", "a"), command("c2", "b")])),
+            ),
+        ]);
+        let commands = a.commands().expect("two are running");
+        assert_eq!(commands.count().get(), 2);
+        assert_eq!(commands.listed_at(), at(70));
+        let c2 = commands.get(&"c2".parse().expect("shows")).expect("listed");
+        assert_eq!(c2.command.as_str(), "b");
+        assert_eq!(c2.running_at_least, Duration::from_secs(60));
+        assert!(commands.get(&"gone".parse().expect("shows")).is_none());
+    }
+
+    #[test]
+    fn a_command_line_needs_something_visible_in_it() {
+        for blank in [
+            "",
+            "  \t\n",
+            "\u{1b}\u{7}",
+            "\u{200b}\u{feff}",
+            " \u{2060} ",
+        ] {
+            assert!(blank.parse::<CommandLine>().is_err(), "{blank:?}");
+        }
+        assert!("\u{200b}ls".parse::<CommandLine>().is_ok());
+    }
+
+    #[test]
+    fn a_command_line_of_only_invisible_characters_of_any_class_is_refused() {
+        for (class, text) in [
+            ("soft hyphen", "\u{AD}"),
+            ("variation selector", "\u{FE0F}"),
+            ("bidi embedding", "\u{202A}\u{202E}"),
+            ("bidi isolate", "\u{2066}\u{2069}"),
+            ("arabic letter mark", "\u{61C}"),
+            ("combining grapheme joiner", "\u{34F}"),
+            ("hangul filler", "\u{3164}\u{115F}\u{1160}"),
+            ("braille blank", "\u{2800}"),
+            ("invisible operators", "\u{2061}\u{2064}"),
+            ("tag characters", "\u{E0041}\u{E007F}"),
+            ("a lone combining mark", "\u{301}"),
+            ("no break space", "\u{A0}"),
+        ] {
+            assert!(text.parse::<CommandLine>().is_err(), "{class}");
+        }
+    }
+
+    #[test]
+    fn a_command_lines_visible_lines_skip_the_ones_that_show_nothing() {
+        let command: CommandLine = "\u{200b}\n  \n\u{fe0f}\nls\n\u{AD}\ncd"
+            .parse()
+            .expect("shows");
+        assert_eq!(command.visible_lines().collect::<Vec<_>>(), ["ls", "cd"]);
+    }
+
+    #[test]
+    fn the_longest_running_command_is_always_there_to_name() {
+        let a = run(vec![
+            (10, main(listing(vec![command("c2", "b")]))),
+            (
+                20,
+                main(listing(vec![command("c1", "a"), command("c2", "b")])),
+            ),
+        ]);
+        let commands = a.commands().expect("two are running");
+        assert_eq!(commands.longest().id.as_str(), "c2");
+        assert_eq!(
+            commands.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+            ["c2", "c1"]
+        );
+        let json = serde_json::to_string(&a).expect("serialises");
+        let back: Activity = serde_json::from_str(&json).expect("reads");
+        assert_eq!(back.commands(), commands.into());
+    }
+
+    #[test]
     fn an_explicit_empty_listing_clears_the_commands() {
         let a = run(vec![
             (1, main(listing(vec![command("c1", "a")]))),
@@ -3258,6 +3464,23 @@ mod tests {
             assert_eq!(loaded.commands(), None);
             assert_eq!(loaded.prompt.as_deref(), Some("go"));
         }
+    }
+
+    #[test]
+    fn a_stored_task_id_with_nothing_visible_drops_only_the_commands() {
+        let time = serde_json::json!({"secs_since_epoch": 5, "nanos_since_epoch": 0});
+        for id in ["", " ", "\u{200b}", "\u{7}", "\u{fe0f}"] {
+            let block = serde_json::json!({
+                "listed": time,
+                "by_id": {id: {"command": "a", "description": null, "seen": time}}
+            });
+            let loaded: Activity =
+                serde_json::from_value(json_with_commands(block)).expect("still loads");
+            assert_eq!(loaded.commands(), None, "{id:?}");
+            assert_eq!(loaded.prompt.as_deref(), Some("go"));
+        }
+        assert!("\u{200b}".parse::<TaskId>().is_err());
+        assert!("s1".parse::<TaskId>().is_ok());
     }
 
     #[test]

@@ -12,3 +12,4 @@ pub mod process;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
 pub mod theme;
+pub mod visible;

@@ -7,7 +7,7 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use agent_core::activity::{Liveness, Subagent};
+use agent_core::activity::{Liveness, Subagent, TaskId};
 use agent_core::model::{Entry, Head, Repo, RepoKey, Snapshot};
 use agent_core::names::SessionName;
 use agent_core::ports::{Compared, DiffStat, Edit, FileState, WorktreeFacts};
@@ -19,14 +19,15 @@ use ratatui::widgets::Paragraph;
 use unicode_width::UnicodeWidthStr;
 
 use super::{
-    NAME_MIN, accent, ago, bold, dim, error, fit, glyph, justify, line_width, name_style, palette,
-    panel, scroll, sidebar_count, sidebar_focused, sidebar_title, spinner, success, truncate_end,
-    truncate_start, warning,
+    COMMAND_GLYPH, NAME_MIN, accent, ago, at_least, bold, dim, error, fit, glyph, justify,
+    line_width, name_style, palette, panel, scroll, sidebar_count, sidebar_focused, sidebar_title,
+    spinner, success, truncate_end, truncate_start, warning,
 };
 use crate::cause::Cause;
 use crate::model::{
-    ActivityRow, AgentStatus, Cursor, Doing, Drawn, Extent, Failure, Fold, ListScroll, Listed,
-    Model, Panel as Focused, Placement, Pulse, Row, Target, WorkRoom,
+    ActivityHit, ActivityRow, AgentStatus, Commands, Cursor, Doing, Drawn, Extent, Failure,
+    FirstLine, Fold, ListScroll, Listed, Model, Panel as Focused, Placement, Presence, Pulse, Row,
+    Spot, Target, WorkRoom, command_lines,
 };
 use crate::tree::{ChangesScope, Counts, Node, TreeRow};
 
@@ -112,7 +113,8 @@ fn target_text(target: &Target) -> &str {
     }
 }
 
-/// What a card's second line says about an agent that isn't settled.
+/// What a card's second line says. Settled agents (exited, no session,
+/// idle with nothing running in the background) have none.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Gist<'a> {
     Asking(&'a str),
@@ -136,17 +138,24 @@ enum Gist<'a> {
     HandingBack,
     Done(Option<&'a str>),
     Interrupted,
+    /// An idle agent with background commands, which no other gist covers.
+    Commands(Commands<'a>),
 }
 
 const STARTING: &str = "starting";
 const RESTARTING: &str = "restarting";
 
 impl<'a> Gist<'a> {
-    /// Settled agents (idle, exited, no session) have none. `heard` is when
-    /// the agent or any of its subagents last reported.
-    fn of(status: &'a AgentStatus, heard: SystemTime, now: SystemTime) -> Option<Self> {
+    /// `heard` is when the agent or any of its subagents last reported.
+    fn of(
+        status: &'a AgentStatus,
+        heard: SystemTime,
+        now: SystemTime,
+        commands: Option<Commands<'a>>,
+    ) -> Option<Self> {
         match status {
-            AgentStatus::NoSession | AgentStatus::Exited | AgentStatus::Idle => None,
+            AgentStatus::NoSession | AgentStatus::Exited => None,
+            AgentStatus::Idle => commands.map(Self::Commands),
             AgentStatus::Interrupted { .. } => Some(Self::Interrupted),
             AgentStatus::Asking { question, .. } => Some(Self::Asking(question)),
             AgentStatus::Failed { failure, .. } => Some(Self::Failed(failure)),
@@ -218,6 +227,7 @@ impl<'a> Gist<'a> {
             (Self::Done(Some(summary)), _) => gist_of(&without_markdown(summary)),
             (Self::Done(None), _) => ("done".to_string(), Shown::Whole),
             (Self::Interrupted, _) => ("interrupted".to_string(), Shown::Whole),
+            (Self::Commands(commands), form) => commands_line(commands, form, width),
         };
         let fitted = truncate_end(&text, width);
         let shown = if fitted == text { shown } else { Shown::Cut };
@@ -242,9 +252,41 @@ impl<'a> Gist<'a> {
             Self::Done(Some(summary)) => without_markdown(summary),
             Self::Done(None) => "done".to_string(),
             Self::Interrupted => "interrupted".to_string(),
-            Self::Delegating { .. } | Self::Lost { .. } => return None,
+            Self::Delegating { .. } | Self::Lost { .. } | Self::Commands(_) => return None,
         })
     }
+}
+
+/// `⌁ cargo test · 4m+` for one command, `⌁ 2 commands · cargo test` for
+/// several. The short form keeps the first word.
+fn commands_line(commands: &Commands<'_>, form: Form, width: usize) -> (String, Shown) {
+    let longest = commands.longest();
+    let lines = command_lines(longest.command);
+    let full = longest.name.as_str().to_string();
+    let named = match form {
+        Form::Long => full.clone(),
+        Form::Short => full.split_whitespace().next().unwrap_or(&full).to_string(),
+    };
+    let count = commands.count().get();
+    let (text, name) = if count == 1 {
+        let lead = format!("{COMMAND_GLYPH} ");
+        let tail = format!(" · {}", at_least(longest.running_at_least));
+        let room = width.saturating_sub(lead.width() + tail.width());
+        let name = truncate_end(&named, room);
+        (format!("{lead}{name}{tail}"), name)
+    } else {
+        let count = match form {
+            Form::Long => format!("{count} commands"),
+            Form::Short => count.to_string(),
+        };
+        (format!("{COMMAND_GLYPH} {count} · {named}"), named)
+    };
+    let shown = if lines.len() <= 1 && name == full {
+        Shown::Whole
+    } else {
+        Shown::Cut
+    };
+    (text, shown)
 }
 
 /// `{Tool}  {target}`: a path keeps its end, and the short form keeps only
@@ -388,14 +430,19 @@ impl<'m> Deck<'m> {
         let m = self.m;
         let status = m.status(entry);
         let heard = m.activity(entry.name()).map_or(m.clock.wall, |a| a.heard);
-        let gist = Gist::of(&status, heard, m.clock.wall)
+        let commands = m.commands(entry);
+        let gist = Gist::of(&status, heard, m.clock.wall, commands.clone())
             .filter(|_| !matches!(title, Title::Elsewhere(_)) && self.has_line2(entry.name()));
         let subagents = match gist {
             Some(Gist::Delegating { .. }) => None,
             _ => m.subagents(entry),
         };
+        let commands = match gist {
+            Some(Gist::Commands(_)) => None,
+            _ => commands.as_ref().map(Commands::count),
+        };
         let indent = title.indent();
-        let line1 = self.line1(entry, &status, title, subagents, selected);
+        let line1 = self.line1(entry, &status, title, (subagents, commands), selected);
         match gist {
             Some(gist) => {
                 let room = self.content.saturating_sub(indent.width() + 2);
@@ -410,8 +457,8 @@ impl<'m> Deck<'m> {
         }
     }
 
-    /// Glyph and name, then `↳n` while subagents run and line 2 doesn't say
-    /// so. On the right: the repo in a group, the time in state, the pin
+    /// Glyph and name, then `↳n` while subagents run and `⌁n` while commands
+    /// do, each unless line 2 says so. On the right: the repo in a group, the time in state, the pin
     /// and a shared marker. When the name would get fewer than
     /// [`NAME_MIN`] columns, the repo goes first, then a finished agent's
     /// time.
@@ -420,7 +467,7 @@ impl<'m> Deck<'m> {
         entry: &Entry,
         status: &AgentStatus,
         title: Title,
-        subagents: Option<NonZeroUsize>,
+        (subagents, commands): (Option<NonZeroUsize>, Option<NonZeroUsize>),
         selected: bool,
     ) -> Line<'static> {
         let m = self.m;
@@ -451,6 +498,7 @@ impl<'m> Deck<'m> {
             }
         }
         left.extend(subagents.map(|n| Span::styled(format!(" ↳{n}"), dim())));
+        left.extend(commands.map(|n| Span::styled(format!(" {COMMAND_GLYPH}{n}"), dim())));
         let mut time = time_in_state(status, m.clock.wall);
         let mut markers = Vec::new();
         markers.extend(elsewhere_marker(m, entry.name()));
@@ -529,38 +577,82 @@ impl<'m> Deck<'m> {
             .collect()
     }
 
-    /// [2]'s rows: the activity, then one per subagent, and the row the cursor
-    /// is on while [2] has the keys. What they say is [0]'s to show.
+    /// [2]'s lines: the activity, one per subagent, then under a `commands`
+    /// heading one per background command, and the row the cursor is on
+    /// while [2] has the keys. What they say is [0]'s to show.
     fn activity_rows(&self, entry: &Entry) -> ActivityRows {
         let m = self.m;
         let Some(activity) = m.activity(entry.name()) else {
             return ActivityRows::Vacant;
         };
-        let cursor = match m.panel.list() {
-            Listed::Agent { offset, row } => Some(ActivityCursor {
-                at: m.row_at(),
-                offset,
-                row: row.clone(),
-            }),
+        let by = entry.name();
+        let list = m.activity_list();
+        let keys = match m.panel.list() {
+            Listed::Agent { offset, row } => Some((offset, row.clone())),
             Listed::Agents | Listed::Changes { .. } => None,
         };
-        let at = cursor.as_ref().map(|c| c.at);
-        let first = Line::raw(activity_row(
+        let on = keys.as_ref().map(|_| list.cursor());
+        let mut lines = vec![Line::raw(activity_row(
             activity.prompt.as_deref(),
             self.content,
-            at == Some(0),
-        ));
-        let rest = tree(
-            listed(activity, m.clock.wall),
+            on == Some(Spot::Main),
+        ))];
+        let mut hits = vec![ActivityHit {
+            line: 0,
+            row: Spot::Main.row(by),
+        }];
+        let mut cursor_line = 0;
+        let subagents = tree(
+            &list
+                .subagents
+                .iter()
+                .map(|(id, subagent)| (*subagent, m.liveness(by, id, subagent)))
+                .collect::<Vec<_>>(),
             self.form,
             self.content,
             m.clock.wall,
-            at.and_then(|row| row.checked_sub(1)),
+            list.subagents
+                .iter()
+                .position(|(id, _)| on == Some(Spot::Subagent(id))),
         );
+        for ((id, _), line) in list.subagents.iter().zip(subagents) {
+            if on == Some(Spot::Subagent(id)) {
+                cursor_line = lines.len();
+            }
+            hits.push(ActivityHit {
+                line: lines.len(),
+                row: Spot::Subagent(id).row(by),
+            });
+            lines.push(line);
+        }
+        if let Some(commands) = &list.commands {
+            lines.push(commands_heading());
+            let cursor = match on {
+                Some(Spot::Command(id)) => Some(id),
+                Some(Spot::Main | Spot::Subagent(_)) | None => None,
+            };
+            for (item, line) in commands
+                .iter()
+                .zip(command_tree(commands, self.content, cursor))
+            {
+                if cursor == Some(item.id) {
+                    cursor_line = lines.len();
+                }
+                hits.push(ActivityHit {
+                    line: lines.len(),
+                    row: Spot::Command(item.id).row(by),
+                });
+                lines.push(line);
+            }
+        }
         ActivityRows::Listed {
-            first,
-            rest,
-            cursor,
+            lines,
+            hits,
+            cursor: keys.map(|(offset, row)| ActivityCursor {
+                at: cursor_line,
+                offset,
+                row,
+            }),
         }
     }
 }
@@ -568,16 +660,18 @@ impl<'m> Deck<'m> {
 /// What [2] has to show: the activity's rows, or one row saying it has none.
 enum ActivityRows {
     Listed {
-        /// The activity row, then a row per subagent.
-        first: Line<'static>,
-        rest: Vec<Line<'static>>,
+        /// Every line, the activity first.
+        lines: Vec<Line<'static>>,
+        /// What each row a click can land on points the cursor at. The
+        /// `commands` heading has none.
+        hits: Vec<ActivityHit>,
         /// Where [2]'s cursor is, while [2] has the keys.
         cursor: Option<ActivityCursor>,
     },
     Vacant,
 }
 
-/// [2]'s cursor: the row it is on, and the panel's position as the focus
+/// [2]'s cursor: the line it is on, and the panel's position as the focus
 /// has it.
 struct ActivityCursor {
     at: usize,
@@ -588,7 +682,9 @@ struct ActivityCursor {
 impl ActivityRows {
     fn rows(&self) -> NonZeroUsize {
         match self {
-            Self::Listed { rest, .. } => NonZeroUsize::MIN.saturating_add(rest.len()),
+            Self::Listed { lines, .. } => {
+                NonZeroUsize::new(lines.len()).unwrap_or(NonZeroUsize::MIN)
+            }
             Self::Vacant => NonZeroUsize::MIN,
         }
     }
@@ -665,23 +761,23 @@ fn listed(
     activity: &agent_core::activity::Activity,
     now: SystemTime,
 ) -> Vec<(&Subagent, Liveness<'_>)> {
-    activity
+    let mut subagents: Vec<_> = activity
         .subagents
         .iter()
         .filter_map(|(id, s)| Some((s, activity.liveness(id, now)?)))
-        .collect()
+        .collect();
+    subagents.sort_by_key(|(s, _)| s.since);
+    subagents
 }
 
-/// `├ ⠹ description  kind  4m`, oldest first, the last child on `└`.
+/// `├ ⠹ description  kind  4m`, in the order given, the last child on `└`.
 fn tree(
-    mut subagents: Vec<(&Subagent, Liveness<'_>)>,
+    subagents: &[(&Subagent, Liveness<'_>)],
     form: Form,
     width: usize,
     now: SystemTime,
     cursor: Option<usize>,
 ) -> Vec<Line<'static>> {
-    let cursor = cursor.map(|at| at.min(subagents.len().saturating_sub(1)));
-    subagents.sort_by_key(|(s, _)| s.since);
     subagents
         .iter()
         .enumerate()
@@ -724,6 +820,52 @@ fn tree(
                     ),
                 ],
                 vec![Span::styled(right, dim())],
+                width,
+            );
+            if selected {
+                line.spans.insert(0, Span::styled(GUTTER, accent()));
+            }
+            line
+        })
+        .collect()
+}
+
+/// The line above [2]'s commands. Commands outlive prompts, so it keeps
+/// them from being read as this prompt's.
+fn commands_heading() -> Line<'static> {
+    Line::styled("commands", dim())
+}
+
+/// `├ ⌁ cargo test  4m+`, in order, the last on `└`, with the row for
+/// `cursor` marked. One that its listing dropped is DIM.
+fn command_tree(
+    commands: &Commands<'_>,
+    width: usize,
+    cursor: Option<&TaskId>,
+) -> Vec<Line<'static>> {
+    let last = commands.count().get() - 1;
+    commands
+        .iter()
+        .enumerate()
+        .map(|(i, item)| {
+            let branch = if i == last { "└ " } else { "├ " };
+            let selected = cursor == Some(item.id);
+            let name = match (item.presence, selected) {
+                (Presence::Ended, _) => dim(),
+                (Presence::Listed, true) => bold(),
+                (Presence::Listed, false) => Style::new(),
+            };
+            let mut line = justify(
+                vec![
+                    Span::styled(branch, dim()),
+                    Span::styled(COMMAND_GLYPH, dim()),
+                    Span::raw(" "),
+                    Span::styled(item.name.as_str().to_string(), name),
+                ],
+                vec![Span::styled(
+                    format!(" {}", at_least(item.running_at_least)),
+                    dim(),
+                )],
                 width,
             );
             if selected {
@@ -1104,7 +1246,9 @@ struct Laid {
     scroll: ListScroll,
     /// [2], while an agent with an activity is selected.
     agent: Option<Panel>,
-    agent_rows: Vec<(u16, usize)>,
+    agent_rows: Vec<(u16, ActivityHit)>,
+    /// The first line of [2] drawn, when it was.
+    agent_first: Option<FirstLine>,
     change_rows: Vec<(u16, usize)>,
     /// The focused panel, its position clamped to what it shows.
     focus: Focused,
@@ -1166,10 +1310,11 @@ fn lay_out(m: &Model, area: Rect, room: usize) -> Option<Laid> {
         .cloned()
         .zip(list.selected.map(|r| r.start.saturating_sub(offset)));
     let list_height = if lower.is_some() { visible + 2 } else { height };
-    let (agent, agent_rows, changes, change_rows, focus, room) = match lower {
+    let (agent, agent_rows, agent_first, changes, change_rows, focus, room) = match lower {
         Some(lower) => (
             lower.agent,
             lower.agent_rows,
+            lower.agent_first,
             lower.changes,
             lower.change_rows,
             lower.focus,
@@ -1178,6 +1323,7 @@ fn lay_out(m: &Model, area: Rect, room: usize) -> Option<Laid> {
         None => (
             None,
             Vec::new(),
+            None,
             None,
             Vec::new(),
             Focused::Agents,
@@ -1198,6 +1344,7 @@ fn lay_out(m: &Model, area: Rect, room: usize) -> Option<Laid> {
         scroll: ListScroll { offset, anchor },
         agent,
         agent_rows,
+        agent_first,
         focus,
         room,
         changes,
@@ -1339,7 +1486,8 @@ fn work_of<'m>(m: &'m Model, entry: &Entry) -> Work<'m> {
 struct Lower {
     agent: Option<Panel>,
     /// The screen row of each of [2]'s rows shown, with its index.
-    agent_rows: Vec<(u16, usize)>,
+    agent_rows: Vec<(u16, ActivityHit)>,
+    agent_first: Option<FirstLine>,
     changes: Option<(Panel, Changes)>,
     change_rows: Vec<(u16, usize)>,
     focus: Focused,
@@ -1385,9 +1533,9 @@ fn lower_panels(deck: &Deck<'_>, repo: &Repo, entry: &Entry, area: Rect) -> Lowe
     let agent = (activity_height > 0).then(|| activity_panel(detail, at(0, activity_height)));
     let changes = (work_height > 0)
         .then(|| changes_panel(deck, repo, entry, work, at(activity_height, work_height)));
-    let (agent, agent_rows, agent_focus) = match agent {
-        Some(a) => (Some(a.panel), a.rows, a.focus),
-        None => (None, Vec::new(), None),
+    let (agent, agent_rows, agent_first, agent_focus) = match agent {
+        Some(a) => (Some(a.panel), a.rows, a.first, a.focus),
+        None => (None, Vec::new(), None, None),
     };
     let (changes, change_rows, changes_focus) = match changes {
         Some(c) => (Some((c.panel, c.title)), c.rows, c.focus),
@@ -1396,6 +1544,7 @@ fn lower_panels(deck: &Deck<'_>, repo: &Repo, entry: &Entry, area: Rect) -> Lowe
     Lower {
         agent,
         agent_rows,
+        agent_first,
         changes,
         change_rows,
         focus: agent_focus.or(changes_focus).unwrap_or(Focused::Agents),
@@ -1411,7 +1560,9 @@ fn lower_panels(deck: &Deck<'_>, repo: &Repo, entry: &Entry, area: Rect) -> Lowe
 /// index it stands for, and where the focus is when the keys are on it.
 struct ActivityPanel {
     panel: Panel,
-    rows: Vec<(u16, usize)>,
+    rows: Vec<(u16, ActivityHit)>,
+    /// The first line drawn at the top, when there are lines to draw.
+    first: Option<FirstLine>,
     focus: Option<Focused>,
 }
 
@@ -1419,11 +1570,10 @@ fn activity_panel(detail: ActivityRows, area: Rect) -> ActivityPanel {
     let inside = usize::from(area.height).saturating_sub(2);
     match detail {
         ActivityRows::Listed {
-            first: activity,
-            rest,
+            lines,
+            hits,
             cursor,
         } => {
-            let lines: Vec<Line<'static>> = std::iter::once(activity).chain(rest).collect();
             let (first, focus) = match cursor {
                 Some(ActivityCursor { at, offset, row }) => {
                     let first = scroll(offset, at, inside, lines.len());
@@ -1433,18 +1583,22 @@ fn activity_panel(detail: ActivityRows, area: Rect) -> ActivityPanel {
             };
             let lines: Vec<Line<'static>> = lines.into_iter().skip(first).take(inside).collect();
             let top = area.y + 1;
-            let rows = (0..lines.len())
-                .map(|i| (top + u16::try_from(i).unwrap_or(0), first + i))
+            let rows = hits
+                .into_iter()
+                .filter(|hit| (first..first + inside).contains(&hit.line))
+                .map(|hit| (top + u16::try_from(hit.line - first).unwrap_or(0), hit))
                 .collect();
             ActivityPanel {
                 panel: pad(area, lines),
                 rows,
+                first: Some(FirstLine(first)),
                 focus,
             }
         }
         ActivityRows::Vacant => ActivityPanel {
             panel: pad(area, vec![Line::styled("no activity recorded", dim())]),
             rows: Vec::new(),
+            first: None,
             focus: None,
         },
     }
@@ -1635,14 +1789,14 @@ pub(super) fn others_on(m: &Model, name: &SessionName, path: &Path) -> Vec<Strin
 pub(crate) fn activity_message(m: &Model, entry: &Entry) -> Option<String> {
     let status = m.status(entry);
     let heard = m.activity(entry.name()).map_or(m.clock.wall, |a| a.heard);
-    Gist::of(&status, heard, m.clock.wall)?.message()
+    Gist::of(&status, heard, m.clock.wall, m.commands(entry))?.message()
 }
 
 /// The agent's subagents as tree rows, for [0]'s activity document.
 pub(super) fn subagent_rows(m: &Model, entry: &Entry, width: usize) -> Vec<Line<'static>> {
     m.activity(entry.name()).map_or_else(Vec::new, |a| {
         tree(
-            listed(a, m.clock.wall),
+            &listed(a, m.clock.wall),
             Form::Long,
             width,
             m.clock.wall,
@@ -1651,12 +1805,22 @@ pub(super) fn subagent_rows(m: &Model, entry: &Entry, width: usize) -> Vec<Line<
     })
 }
 
+/// The agent's background commands under their heading, for [0]'s activity
+/// document.
+pub(super) fn command_rows(m: &Model, entry: &Entry, width: usize) -> Vec<Line<'static>> {
+    m.commands(entry).map_or_else(Vec::new, |commands| {
+        std::iter::once(commands_heading())
+            .chain(command_tree(&commands, width, None))
+            .collect()
+    })
+}
+
 /// The selected agent's state as one line: its glyph, name, what it's doing
 /// and for how long, cut to `width` by dropping what it's doing first.
 pub(super) fn status_line(m: &Model, entry: &Entry, width: usize) -> Vec<Span<'static>> {
     let status = m.status(entry);
     let heard = m.activity(entry.name()).map_or(m.clock.wall, |a| a.heard);
-    let gist = Gist::of(&status, heard, m.clock.wall);
+    let gist = Gist::of(&status, heard, m.clock.wall, m.commands(entry));
     // A delegating gist already ends in how long it's been quiet.
     let time = match gist {
         Some(Gist::Delegating { .. }) => Vec::new(),
@@ -1769,6 +1933,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, m: &Model, area: Rect, border: Style, 
     out.scroll = Some(laid.scroll);
     out.areas.rows = laid.hits;
     out.areas.agent_rows = laid.agent_rows;
+    out.areas.agent_first = laid.agent_first;
     out.areas.change_rows = laid.change_rows;
 }
 
@@ -2562,7 +2727,7 @@ mod tests {
         );
         let row = |now| {
             let liveness = subagent.liveness(now, Waiting::Off);
-            super::tree(vec![(&subagent, liveness)], Form::Long, 60, now, None)[0].to_string()
+            super::tree(&[(&subagent, liveness)], Form::Long, 60, now, None)[0].to_string()
         };
         let turning = began + Duration::from_millis(100);
         assert!(
@@ -2582,7 +2747,7 @@ mod tests {
     fn a_starting_agent_says_so_on_its_second_line_and_never_thinking() {
         let now = SystemTime::now();
         let status = AgentStatus::Starting { since: now };
-        let gist = Gist::of(&status, now, now).expect("a starting agent has a second line");
+        let gist = Gist::of(&status, now, now, None).expect("a starting agent has a second line");
         assert_eq!(gist.line(Form::Long, 40).0, STARTING);
         assert_eq!(gist.message().as_deref(), Some(STARTING));
     }
@@ -2801,6 +2966,16 @@ mod tests {
 
     type Surface = (Focused, fn(&Model) -> Overlay);
 
+    fn command_row_of_a_delegating_agent() -> Focused {
+        Focused::Agent {
+            offset: 0,
+            row: ActivityRow::Command {
+                by: name("obs-layout-4"),
+                id: "c1".parse().expect("shows"),
+            },
+        }
+    }
+
     use agent_core::ports::SurvivorState;
     use agent_core::testing::{Doing, Lurking};
 
@@ -2944,7 +3119,7 @@ mod tests {
         let palette = SENTINEL;
         let ours = [1, 2, 3, 4, 5].map(|n| Some(Color::Rgb(n, n, n)));
         for size in SIZES {
-            let cases: [Surface; 6] = [
+            let cases: [Surface; 7] = [
                 (Focused::Agents, |_| Overlay::None),
                 (Focused::activity(), |_| Overlay::None),
                 (Focused::Agents, |_| {
@@ -2953,10 +3128,28 @@ mod tests {
                 (Focused::Agents, checkout_of_a_link_to_another_repo),
                 (Focused::Agents, restart_of_a_busy_agent),
                 (Focused::Agents, restart_of_the_fleet),
+                (command_row_of_a_delegating_agent(), |_| Overlay::None),
             ];
             for (panel, overlay) in cases {
                 let mut m = fleet(8);
+                for agent in ["docs-sweep-6", "obs-layout-4", "auth-refresh-2"] {
+                    crate::fixtures::run_commands(
+                        &mut m,
+                        agent,
+                        &[crate::fixtures::listed("c1", "cargo test")],
+                        std::time::Duration::from_mins(4),
+                    );
+                }
                 m.palette = palette;
+                if matches!(
+                    &panel,
+                    Focused::Agent {
+                        row: ActivityRow::Command { .. },
+                        ..
+                    }
+                ) {
+                    m.set_cursor(Cursor::Entry(name("obs-layout-4")));
+                }
                 m.panel = panel;
                 m.overlay = overlay(&m);
                 m.error("failed");
@@ -3681,8 +3874,8 @@ mod tests {
         );
 
         render(&mut m, (100, 30));
-        let (y, row) = m.areas.agent_rows[2];
-        assert_eq!(row, 2);
+        let (y, hit) = m.areas.agent_rows[2].clone();
+        assert!(matches!(hit.row, ActivityRow::Subagent { .. }));
         click(&mut m, 5, y, left());
         assert!(matches!(m.panel, Focused::Agent { .. }));
         assert_eq!(m.row_at(), 2, "the second subagent row");
@@ -4928,6 +5121,958 @@ mod tests {
         assert!(text.contains("▼ docs"), "{text}");
     }
 
+    mod commands {
+        use std::time::Duration;
+
+        use super::detail::page;
+
+        fn text_of(line: &Line<'_>) -> String {
+            text(line)
+        }
+        use super::*;
+        use crate::fixtures::{listed, run_commands};
+
+        const FOUR_MINUTES: Duration = Duration::from_mins(4);
+        const WIDE: (u16, u16) = (200, 50);
+        const NARROW: (u16, u16) = (80, 50);
+        const SHORT: (u16, u16) = (80, 24);
+
+        fn kinds(rows: &[(u16, ActivityHit)]) -> Vec<&'static str> {
+            rows.iter()
+                .map(|(_, hit)| match hit.row {
+                    ActivityRow::Main => "main",
+                    ActivityRow::Subagent { .. } => "subagent",
+                    ActivityRow::Command { .. } => "command",
+                })
+                .collect()
+        }
+
+        fn spot_id(m: &Model) -> String {
+            match m.activity_list().cursor() {
+                Spot::Main => "main".to_string(),
+                Spot::Subagent(id) => id.as_str().to_string(),
+                Spot::Command(id) => id.as_str().to_string(),
+            }
+        }
+
+        /// An agent's name line in [1] and the line under it.
+        fn card(m: &mut Model, agent: &str, size: (u16, u16)) -> Vec<String> {
+            m.set_cursor(Cursor::Entry(name(agent)));
+            let lines = texts(&laid(m, size).list.lines);
+            let at = lines
+                .iter()
+                .position(|line| line.contains(agent))
+                .unwrap_or_else(|| panic!("{agent} in\n{}", lines.join("\n")));
+            lines[at..]
+                .iter()
+                .take(2)
+                .map(|line| line.replacen('▌', " ", 1))
+                .collect()
+        }
+
+        #[test]
+        fn a_done_agent_keeps_its_summary_and_gains_a_count_after_its_name() {
+            let mut m = fleet(10);
+            run_commands(
+                &mut m,
+                "auth-refresh-2",
+                &[listed("c1", "cargo test"), listed("c2", "bin/rails s")],
+                FOUR_MINUTES,
+            );
+            let card = card(&mut m, "auth-refresh-2", WIDE);
+            assert!(card[0].contains("✓ auth-refresh-2 ⌁2"), "{card:?}");
+            assert!(card[1].contains("Added token refresh"), "{card:?}");
+            assert!(!card[1].contains('⌁'), "{card:?}");
+        }
+
+        #[test]
+        fn a_delegating_card_keeps_its_count_on_the_name_line_while_line_2_says_the_subagents() {
+            let mut m = fleet(10);
+            run_commands(
+                &mut m,
+                "obs-layout-4",
+                &[listed("c1", "cargo test")],
+                FOUR_MINUTES,
+            );
+            let delegating = card(&mut m, "obs-layout-4", WIDE);
+            assert!(delegating[0].contains("obs-layout-4 ⌁1"), "{delegating:?}");
+            assert!(!delegating[0].contains('↳'), "{delegating:?}");
+            assert!(
+                delegating[1].contains("↳3 subagents · quiet"),
+                "{delegating:?}"
+            );
+        }
+
+        #[test]
+        fn the_count_stands_beside_the_subagent_count_when_there_is_no_second_line() {
+            let mut m = fleet(40);
+            run_commands(
+                &mut m,
+                "obs-layout-4",
+                &[listed("c1", "cargo test")],
+                FOUR_MINUTES,
+            );
+            let delegating = card(&mut m, "obs-layout-4", SHORT);
+            assert!(
+                !delegating[1].contains("subagents"),
+                "a list this long gives the card no second line\n{delegating:?}"
+            );
+            assert!(
+                delegating[0].contains("obs-layout-4 ↳3 ⌁1"),
+                "{delegating:?}"
+            );
+        }
+
+        #[test]
+        fn a_working_card_keeps_its_line_2_and_gets_the_count_without_a_subagent_count() {
+            let mut m = fleet(10);
+            run_commands(
+                &mut m,
+                "payroll-fix-3",
+                &[listed("c1", "cargo test")],
+                FOUR_MINUTES,
+            );
+            let working = card(&mut m, "payroll-fix-3", WIDE);
+            assert!(working[0].contains("payroll-fix-3 ⌁1"), "{working:?}");
+            assert!(!working[0].contains('↳'), "{working:?}");
+            assert!(working[1].contains("Edit"), "{working:?}");
+        }
+
+        #[test]
+        fn the_count_is_dim() {
+            let mut m = fleet(10);
+            run_commands(
+                &mut m,
+                "auth-refresh-2",
+                &[listed("c1", "cargo test")],
+                FOUR_MINUTES,
+            );
+            m.set_cursor(Cursor::Entry(name("auth-refresh-2")));
+            let list = laid(&mut m, WIDE).list.lines;
+            let line = list
+                .iter()
+                .find(|l| text(l).contains("auth-refresh-2"))
+                .expect("a card");
+            let badges: Vec<_> = line
+                .spans
+                .iter()
+                .filter(|s| s.content.contains('⌁'))
+                .collect();
+            assert!(!badges.is_empty(), "{}", text(line));
+            assert!(badges.iter().all(|s| s.style == dim()), "{badges:?}");
+        }
+
+        #[test]
+        fn a_long_name_never_loses_a_letter_to_the_counts_and_the_count_still_shows() {
+            let mut m = fleet(10);
+            run_commands(
+                &mut m,
+                "obs-layout-4",
+                &[listed("c1", "cargo test")],
+                FOUR_MINUTES,
+            );
+            let card = card(&mut m, "obs-layout-4", (64, 24));
+            assert!(card[0].contains("obs-layout-4"), "{card:?}");
+            assert!(card[0].contains("⌁1"), "{card:?}");
+        }
+
+        #[test]
+        fn an_idle_agent_names_its_command_and_how_long_it_has_run_at_least_on_line_2() {
+            let mut m = fleet(10);
+            run_commands(
+                &mut m,
+                "docs-sweep-6",
+                &[listed("c1", "cargo test --workspace")],
+                FOUR_MINUTES,
+            );
+            let card = card(&mut m, "docs-sweep-6", WIDE);
+            assert!(
+                card[0].contains("● docs-sweep-6") && !card[0].contains('⌁'),
+                "{card:?}"
+            );
+            assert_eq!(card[1].trim(), "⌁ cargo test --workspace · 4m+");
+        }
+
+        #[test]
+        fn several_commands_on_an_idle_agent_say_how_many_then_the_longest_running() {
+            let mut m = fleet(10);
+            run_commands(
+                &mut m,
+                "docs-sweep-6",
+                &[
+                    listed("c1", "cargo test --workspace"),
+                    listed("c2", "bin/rails s"),
+                ],
+                FOUR_MINUTES,
+            );
+            let card = card(&mut m, "docs-sweep-6", WIDE);
+            assert_eq!(card[1].trim(), "⌁ 2 commands · cargo test --workspace");
+            assert!(!card[0].contains('⌁'), "line 2 already says it\n{card:?}");
+        }
+
+        #[test]
+        fn a_long_command_is_cut_with_an_ellipsis_and_keeps_its_duration() {
+            let mut m = fleet(10);
+            let long = "cargo test --workspace --features alpha,beta,gamma,delta -- --nocapture --test-threads=1";
+            run_commands(&mut m, "docs-sweep-6", &[listed("c1", long)], FOUR_MINUTES);
+            let card = card(&mut m, "docs-sweep-6", (150, 50));
+            let line = card[1].trim();
+            assert!(
+                line.starts_with("⌁ cargo test --workspace") && line.contains('…'),
+                "{line}"
+            );
+            assert!(line.ends_with(" · 4m+"), "{line}");
+        }
+
+        #[test]
+        fn a_command_of_several_lines_is_named_by_its_first_line() {
+            let mut m = fleet(10);
+            run_commands(
+                &mut m,
+                "docs-sweep-6",
+                &[listed("c1", "\n  cd app\ncargo test\n")],
+                FOUR_MINUTES,
+            );
+            let card = card(&mut m, "docs-sweep-6", WIDE);
+            assert_eq!(card[1].trim(), "⌁ cd app · 4m+");
+        }
+
+        #[test]
+        fn the_short_form_keeps_a_commands_first_word() {
+            let mut m = fleet(10);
+            run_commands(
+                &mut m,
+                "docs-sweep-6",
+                &[listed("c1", "cargo test --workspace")],
+                FOUR_MINUTES,
+            );
+            let card = card(&mut m, "docs-sweep-6", NARROW);
+            assert_eq!(card[1].trim(), "⌁ cargo · 4m+");
+        }
+
+        #[test]
+        fn an_exited_agent_and_one_without_a_session_show_no_commands() {
+            let mut m = fleet(10);
+            for agent in ["leave-request-7", "triage-flow-8"] {
+                run_commands(&mut m, agent, &[listed("c1", "cargo test")], FOUR_MINUTES);
+            }
+            let list = texts(&laid(&mut m, WIDE).list.lines).join("\n");
+            assert!(!list.contains('⌁'), "{list}");
+            for agent in ["leave-request-7", "triage-flow-8"] {
+                let entry = m
+                    .snapshot()
+                    .and_then(|s| s.entry(&name(agent)))
+                    .map(|(_, e)| e.clone())
+                    .expect("listed");
+                assert!(m.commands(&entry).is_none(), "{agent}");
+            }
+        }
+
+        #[test]
+        fn commands_change_no_agents_state_glyph_or_who_needs_the_user() {
+            let mut m = fleet(10);
+            let entries: Vec<_> = m
+                .snapshot()
+                .expect("loaded")
+                .entries()
+                .map(|(_, e)| e.clone())
+                .collect();
+            let before: Vec<_> = entries.iter().map(|e| m.status(e)).collect();
+            let waiting = m.needs_you();
+            let attention = m.attention();
+            for entry in &entries {
+                run_commands(
+                    &mut m,
+                    entry.name().as_str(),
+                    &[listed("c1", "cargo test")],
+                    FOUR_MINUTES,
+                );
+            }
+            let after: Vec<_> = entries.iter().map(|e| m.status(e)).collect();
+            assert_eq!(before, after);
+            assert_eq!(m.needs_you(), waiting);
+            assert_eq!(m.attention(), attention);
+        }
+
+        #[test]
+        fn the_activity_lists_commands_under_their_own_header_below_the_subagents() {
+            let mut m = fleet(10);
+            run_commands(
+                &mut m,
+                "obs-layout-4",
+                &[listed("c1", "cargo test --workspace")],
+                FOUR_MINUTES,
+            );
+            run_commands(
+                &mut m,
+                "docs-sweep-6",
+                &[
+                    listed("c1", "cargo test --workspace"),
+                    listed("c2", "bin/rails s"),
+                ],
+                FOUR_MINUTES,
+            );
+            m.set_cursor(Cursor::Entry(name("obs-layout-4")));
+            m.panel = Focused::activity();
+            let lines = agent_lines(&laid(&mut m, WIDE));
+            let header = lines
+                .iter()
+                .position(|l| l.trim() == "commands")
+                .unwrap_or_else(|| panic!("{lines:?}"));
+            assert!(
+                lines[header - 1].contains('└'),
+                "the subagents end first\n{lines:?}"
+            );
+            assert!(
+                lines[header + 1].contains("└ ⌁ cargo test --workspace"),
+                "{lines:?}"
+            );
+            assert!(lines[header + 1].trim_end().ends_with("4m+"), "{lines:?}");
+            m.set_cursor(Cursor::Entry(name("docs-sweep-6")));
+            let lines = agent_lines(&laid(&mut m, WIDE));
+            assert!(lines[1].trim() == "commands", "{lines:?}");
+            assert!(lines[2].contains("├ ⌁ cargo test --workspace"), "{lines:?}");
+            assert!(lines[3].contains("└ ⌁ bin/rails s"), "{lines:?}");
+        }
+
+        #[test]
+        fn the_cursor_moves_onto_a_command_row_and_marks_it_not_the_header() {
+            let mut m = fleet(10);
+            run_commands(
+                &mut m,
+                "obs-layout-4",
+                &[
+                    listed("c1", "cargo test --workspace"),
+                    listed("c2", "bin/rails s"),
+                ],
+                FOUR_MINUTES,
+            );
+            m.set_cursor(Cursor::Entry(name("obs-layout-4")));
+            m.panel = Focused::activity();
+            m.point_at_row(|_, _| 4);
+            assert_eq!(m.row_at(), 4, "three subagents, then the first command");
+            let lines = agent_lines(&laid(&mut m, WIDE));
+            let marked: Vec<_> = lines.iter().filter(|l| l.contains('▌')).collect();
+            assert_eq!(marked.len(), 1, "{lines:?}");
+            assert!(marked[0].contains("⌁ cargo test --workspace"), "{lines:?}");
+            assert!(
+                matches!(m.hover(), Some(crate::document::Hover::Command(_, ref id)) if id.as_str() == "c1")
+            );
+            m.point_at_row(|at, last| (at + 1).min(last));
+            assert_eq!(m.row_at(), 5);
+            m.point_at_row(|at, last| (at + 1).min(last));
+            assert_eq!(m.row_at(), 5, "stops on the last command");
+            m.point_at_row(|_, _| 0);
+            assert!(matches!(
+                m.hover(),
+                Some(crate::document::Hover::Activity(_))
+            ));
+        }
+
+        /// obs-layout-4 with its middle subagent held by the cursor after its
+        /// activity dropped it, and one command listed.
+        fn held_subagent_beside_a_command() -> (Model, agent_core::activity::AgentId) {
+            let mut m = fleet(10);
+            run_commands(
+                &mut m,
+                "obs-layout-4",
+                &[listed("c1", "cargo test")],
+                FOUR_MINUTES,
+            );
+            m.set_cursor(Cursor::Entry(name("obs-layout-4")));
+            m.panel = Focused::activity();
+            m.point_at_row(|_, _| 2);
+            let (_, held) = m.subagent_selected().expect("a subagent");
+            m.activities
+                .as_mut()
+                .and_then(|a| a.get_mut(&name("obs-layout-4")))
+                .expect("reports")
+                .subagents
+                .remove(&held);
+            m.hold_activity_row();
+            (m, held)
+        }
+
+        #[test]
+        fn a_held_subagent_beside_commands_keeps_the_highlight_and_the_clicks_on_the_row_drawn() {
+            let (mut m, held) = held_subagent_beside_a_command();
+            let lines = agent_lines(&laid(&mut m, WIDE));
+            assert_eq!(lines.len(), 6, "{lines:?}");
+            let marked: Vec<_> = lines.iter().filter(|l| l.contains('▌')).collect();
+            assert_eq!(marked.len(), 1, "{lines:?}");
+            assert!(
+                lines[2].contains('▌'),
+                "the second row, the held one\n{lines:?}"
+            );
+            let rows = m.areas.agent_rows.clone();
+            assert_eq!(
+                kinds(&rows),
+                ["main", "subagent", "subagent", "subagent", "command"],
+                "{rows:?}"
+            );
+            click(&mut m, 5, rows[2].0, left());
+            assert_eq!(
+                m.subagent_selected().map(|(_, id)| id),
+                Some(held),
+                "a click on the held row picks the held subagent"
+            );
+            click(&mut m, 5, rows[4].0, left());
+            assert!(
+                matches!(m.hover(), Some(crate::document::Hover::Command(_, ref id)) if id.as_str() == "c1"),
+                "{:?}",
+                m.hover()
+            );
+            let lines = agent_lines(&laid(&mut m, WIDE));
+            let marked: Vec<_> = lines.iter().filter(|l| l.contains('▌')).collect();
+            assert!(
+                marked.len() == 1 && marked[0].contains("⌁ cargo test"),
+                "{lines:?}"
+            );
+        }
+
+        #[test]
+        fn clicking_a_command_row_picks_the_command_and_the_heading_is_no_row() {
+            let mut m = fleet(10);
+            run_commands(
+                &mut m,
+                "docs-sweep-6",
+                &[listed("c1", "cargo test"), listed("c2", "bin/rails s")],
+                FOUR_MINUTES,
+            );
+            m.set_cursor(Cursor::Entry(name("docs-sweep-6")));
+            m.panel = Focused::activity();
+            let lines = agent_lines(&laid(&mut m, WIDE));
+            assert_eq!(lines.len(), 4, "the heading takes a line: {lines:?}");
+            let rows = m.areas.agent_rows.clone();
+            assert_eq!(kinds(&rows), ["main", "command", "command"], "{rows:?}");
+            assert_eq!(
+                rows[1].0,
+                rows[0].0 + 2,
+                "the first command is under the heading"
+            );
+            click(&mut m, 5, rows[2].0, left());
+            assert!(
+                matches!(m.hover(), Some(crate::document::Hover::Command(_, ref id)) if id.as_str() == "c2"),
+                "{:?}",
+                m.hover()
+            );
+        }
+
+        #[test]
+        fn a_command_that_ends_under_the_cursor_stays_drawn_dim_and_open_until_the_cursor_leaves() {
+            let mut m = fleet(10);
+            run_commands(
+                &mut m,
+                "obs-layout-4",
+                &[listed("c1", "cargo test")],
+                FOUR_MINUTES,
+            );
+            m.set_cursor(Cursor::Entry(name("obs-layout-4")));
+            m.panel = Focused::activity();
+            m.point_at_row(|_, last| last);
+            m.focus_document();
+            run_commands(&mut m, "obs-layout-4", &[], FOUR_MINUTES);
+            m.hold_activity_row();
+            assert!(
+                matches!(m.hover(), Some(crate::document::Hover::Command(_, ref id)) if id.as_str() == "c1"),
+                "the reader is not swapped out from under them"
+            );
+            assert_eq!(m.row_at(), 4, "the row is still there");
+            let text = page(&mut m, (100, 30)).join("\n");
+            assert!(
+                text.contains("cargo test") && text.contains("no longer listed"),
+                "{text}"
+            );
+            let list = laid(&mut m, WIDE).agent.expect("[2]").lines;
+            let row = list
+                .iter()
+                .find(|l| text_of(l).contains("⌁ cargo test"))
+                .expect("the ended command's row");
+            let name_span = row
+                .spans
+                .iter()
+                .find(|s| s.content.contains("cargo test"))
+                .expect("its name");
+            assert_eq!(name_span.style, dim());
+            m.panel = Focused::activity();
+            m.point_at_row(|_, _| 0);
+            assert!(matches!(
+                m.hover(),
+                Some(crate::document::Hover::Activity(_))
+            ));
+            let lines = agent_lines(&laid(&mut m, WIDE));
+            assert!(
+                lines.iter().all(|l| !l.contains("cargo test")),
+                "gone once the cursor left\n{lines:?}"
+            );
+        }
+
+        #[test]
+        fn a_lower_bound_age_ends_in_a_plus_on_the_card_the_row_and_the_status_line() {
+            let mut m = fleet(10);
+            run_commands(
+                &mut m,
+                "docs-sweep-6",
+                &[listed("c1", "cargo test")],
+                FOUR_MINUTES,
+            );
+            let card = card(&mut m, "docs-sweep-6", WIDE);
+            assert!(card[1].trim().ends_with("· 4m+"), "{card:?}");
+            m.panel = Focused::activity();
+            let lines = agent_lines(&laid(&mut m, WIDE));
+            assert!(
+                lines
+                    .iter()
+                    .any(|l| l.contains("⌁ cargo test") && l.trim_end().ends_with("4m+")),
+                "{lines:?}"
+            );
+            let screen = screen(&render(&mut m, (200, 50)));
+            assert!(screen[0].contains("⌁ cargo test · 4m+"), "{}", screen[0]);
+        }
+
+        /// What [2] shows on a frame, the way the screen has it.
+        fn frame_of_two(m: &mut Model, size: (u16, u16)) -> Vec<String> {
+            let rows = screen(&render(m, size));
+            let area = m.areas.agent_panel;
+            rows.into_iter()
+                .skip(usize::from(area.y) + 1)
+                .take(usize::from(area.height).saturating_sub(2))
+                .map(|row| {
+                    row.chars()
+                        .skip(usize::from(area.x))
+                        .take(usize::from(area.width))
+                        .map(|c| {
+                            if crate::view::SPINNER.iter().any(|s| s.starts_with(c)) {
+                                '*'
+                            } else {
+                                c
+                            }
+                        })
+                        .collect::<String>()
+                })
+                .collect()
+        }
+
+        #[test]
+        fn the_list_never_scrolls_by_itself_even_when_the_heading_is_the_top_line() {
+            let six = [
+                listed("c1", "one"),
+                listed("c2", "two"),
+                listed("c3", "three"),
+                listed("c4", "four"),
+                listed("c5", "five"),
+                listed("c6", "six"),
+            ];
+            let mut heading_on_top = false;
+            for size in [14, 15, 17, 24].map(|height| (100, height)) {
+                let mut m = fleet(10);
+                run_commands(&mut m, "obs-layout-4", &six, FOUR_MINUTES);
+                m.set_cursor(Cursor::Entry(name("obs-layout-4")));
+                m.panel = Focused::activity();
+                for step in 0..m.activity_list().count() {
+                    m.point_at_row(|_, _| step);
+                    let row = m.panel.activity_row().expect("[2] has the keys").clone();
+                    for offset in 0..m.activity_list().count() {
+                        m.panel = Focused::Agent {
+                            offset,
+                            row: row.clone(),
+                        };
+                        let shown = frame_of_two(&mut m, size);
+                        heading_on_top |= shown.first().is_some_and(|l| l.contains("commands"));
+                        crate::update::tick(&mut m);
+                        assert_eq!(
+                            frame_of_two(&mut m, size),
+                            shown,
+                            "{size:?} row {step} from offset {offset}"
+                        );
+                    }
+                }
+            }
+            assert!(heading_on_top, "a size and row put the heading at the top");
+        }
+
+        #[test]
+        fn a_command_dropped_under_the_cursor_keeps_its_place_while_the_cursor_moves_past_it() {
+            let mut m = fleet(10);
+            let three = [
+                listed("c1", "one"),
+                listed("c2", "two"),
+                listed("c3", "three"),
+            ];
+            run_commands(&mut m, "docs-sweep-6", &three, FOUR_MINUTES);
+            m.set_cursor(Cursor::Entry(name("docs-sweep-6")));
+            m.panel = Focused::activity();
+            m.point_at_row(|_, _| 2);
+            assert_eq!(spot_id(&m), "c2");
+            let before = m.activity_list().count();
+            run_commands(
+                &mut m,
+                "docs-sweep-6",
+                &[three[0].clone(), three[2].clone()],
+                FOUR_MINUTES,
+            );
+            m.hold_activity_row();
+            let list = m.activity_list();
+            assert_eq!(list.count(), before, "the count doesn't leap");
+            assert_eq!(list.position(), 2, "it keeps its place between the others");
+            let order: Vec<_> = list
+                .commands
+                .as_ref()
+                .expect("commands")
+                .iter()
+                .map(|item| item.id.as_str().to_string())
+                .collect();
+            assert_eq!(order, ["c1", "c2", "c3"]);
+            m.point_at_row(|at, _| at - 1);
+            assert_eq!(spot_id(&m), "c1");
+            m.point_at_row(|at, last| (at + 1).min(last));
+            assert_eq!(
+                spot_id(&m),
+                "c3",
+                "the held one was dropped when the cursor left it"
+            );
+            assert_eq!(m.activity_list().count(), before - 1);
+        }
+
+        #[test]
+        fn a_stored_command_row_does_not_resolve_against_another_agents_command_of_the_same_id() {
+            let mut m = fleet(10);
+            run_commands(
+                &mut m,
+                "docs-sweep-6",
+                &[listed("c1", "cargo test")],
+                FOUR_MINUTES,
+            );
+            run_commands(
+                &mut m,
+                "obs-layout-4",
+                &[listed("c1", "cargo test")],
+                FOUR_MINUTES,
+            );
+            m.set_cursor(Cursor::Entry(name("docs-sweep-6")));
+            m.panel = Focused::activity();
+            m.point_at_row(|_, last| last);
+            assert!(matches!(
+                m.hover(),
+                Some(crate::document::Hover::Command(..))
+            ));
+            m.set_cursor(Cursor::Entry(name("obs-layout-4")));
+            m.panel = Focused::Agent {
+                offset: 0,
+                row: ActivityRow::Command {
+                    by: name("docs-sweep-6"),
+                    id: "c1".parse().expect("shows"),
+                },
+            };
+            assert!(
+                matches!(m.hover(), Some(crate::document::Hover::Activity(_))),
+                "{:?}",
+                m.hover()
+            );
+            assert_eq!(m.row_at(), 0);
+        }
+
+        #[test]
+        fn a_held_subagent_and_a_held_command_are_both_forgotten_when_the_cursor_leaves() {
+            let (mut m, held) = held_subagent_beside_a_command();
+            let who = name("obs-layout-4");
+            let held_in = |m: &Model| {
+                let tracked = m.tracked(&who).expect("tracked");
+                (
+                    tracked
+                        .subagents
+                        .get(&held)
+                        .is_some_and(|w| w.held.is_some()),
+                    tracked.held_command.is_some(),
+                )
+            };
+            assert_eq!(held_in(&m), (true, false));
+            m.point_at_row(|_, last| last);
+            assert_eq!(
+                held_in(&m),
+                (false, true),
+                "moving to the command lets the subagent go"
+            );
+            m.point_at_row(|_, _| 0);
+            assert_eq!(
+                held_in(&m),
+                (false, false),
+                "moving to the activity lets the command go"
+            );
+        }
+
+        #[test]
+        fn a_command_and_id_that_print_nothing_once_cleaned_are_never_drawn_or_counted() {
+            let mut m = fleet(10);
+            run_commands(
+                &mut m,
+                "docs-sweep-6",
+                &[listed("\u{1b}[m", "\u{1b}[0m"), listed("c2", "cargo test")],
+                FOUR_MINUTES,
+            );
+            let idle = card(&mut m, "docs-sweep-6", WIDE);
+            assert_eq!(idle[1].trim(), "⌁ cargo test · 4m+", "one command, not two");
+            m.panel = Focused::activity();
+            let lines = agent_lines(&laid(&mut m, WIDE));
+            assert_eq!(lines.len(), 3, "{lines:?}");
+            assert!(lines.iter().all(|l| !l.contains('\u{1b}')), "{lines:?}");
+            run_commands(
+                &mut m,
+                "obs-layout-4",
+                &[listed("\u{1b}[m", "\u{1b}[0m")],
+                FOUR_MINUTES,
+            );
+            let delegating = card(&mut m, "obs-layout-4", WIDE);
+            assert!(!delegating[0].contains('⌁'), "{delegating:?}");
+            m.set_cursor(Cursor::Entry(name("obs-layout-4")));
+            let lines = agent_lines(&laid(&mut m, WIDE));
+            assert!(lines.iter().all(|l| !l.contains("commands")), "{lines:?}");
+        }
+
+        #[test]
+        fn a_stored_command_row_neither_names_nor_stays_once_the_listing_and_the_hold_drop_it() {
+            let mut m = fleet(10);
+            run_commands(&mut m, "docs-sweep-6", &[listed("c2", "two")], FOUR_MINUTES);
+            m.set_cursor(Cursor::Entry(name("docs-sweep-6")));
+            m.panel = Focused::Agent {
+                offset: 0,
+                row: ActivityRow::Command {
+                    by: name("docs-sweep-6"),
+                    id: "c1".parse().expect("shows"),
+                },
+            };
+            m.hold_activity_row();
+            assert_eq!(m.panel.activity_row(), Some(&ActivityRow::Main));
+            run_commands(
+                &mut m,
+                "docs-sweep-6",
+                &[listed("c1", "one"), listed("c2", "two")],
+                FOUR_MINUTES,
+            );
+            m.hold_activity_row();
+            assert!(
+                matches!(m.hover(), Some(crate::document::Hover::Activity(_))),
+                "the cursor does not jump back when the command is listed again"
+            );
+        }
+
+        #[test]
+        fn focus_goes_back_to_the_list_when_the_activity_under_it_vanishes() {
+            let mut m = fleet(10);
+            m.set_cursor(Cursor::Entry(name("obs-layout-4")));
+            m.panel = Focused::activity();
+            render(&mut m, WIDE);
+            assert!(matches!(m.panel, Focused::Agent { .. }));
+            m.activities
+                .as_mut()
+                .expect("reports")
+                .remove(&name("obs-layout-4"));
+            crate::update::tick(&mut m);
+            render(&mut m, WIDE);
+            assert_eq!(
+                m.panel,
+                Focused::Agents,
+                "[2] shows no rows to keep the keys in"
+            );
+        }
+
+        #[test]
+        fn commands_that_all_print_nothing_leave_no_trace_anywhere() {
+            let mut m = fleet(10);
+            run_commands(
+                &mut m,
+                "docs-sweep-6",
+                &[
+                    listed("\u{1b}[m", "\u{1b}[0m"),
+                    listed("\u{200b}\u{1b}[m", "\u{1b}[1m"),
+                ],
+                FOUR_MINUTES,
+            );
+            let idle = card(&mut m, "docs-sweep-6", WIDE);
+            assert!(!idle[0].contains('⌁') && !idle[1].contains('⌁'), "{idle:?}");
+            m.panel = Focused::activity();
+            let lines = agent_lines(&laid(&mut m, WIDE));
+            assert!(
+                lines
+                    .iter()
+                    .all(|l| !l.contains("commands") && !l.contains('⌁')),
+                "{lines:?}"
+            );
+            let list = m.activity_list();
+            assert!(list.commands.is_none());
+            assert_eq!((list.position() + 1, list.count()), (1, 1));
+            assert_eq!(m.position(), Some((1, 1)));
+        }
+
+        #[test]
+        fn one_unnameable_command_beside_a_named_one_counts_as_one_everywhere() {
+            let mut m = fleet(10);
+            run_commands(
+                &mut m,
+                "obs-layout-4",
+                &[listed("\u{1b}[m", "\u{1b}[0m"), listed("c2", "cargo test")],
+                FOUR_MINUTES,
+            );
+            let delegating = card(&mut m, "obs-layout-4", WIDE);
+            assert!(delegating[0].contains("obs-layout-4 ⌁1"), "{delegating:?}");
+            m.panel = Focused::activity();
+            let list = m.activity_list();
+            assert_eq!(list.commands.as_ref().map(|c| c.count().get()), Some(1));
+            assert_eq!(list.count(), 1 + 3 + 1);
+            m.point_at_row(|_, last| last);
+            assert_eq!(m.position(), Some((5, 5)));
+            let now = m.clock.wall;
+            m.set_activity(
+                &name("obs-layout-4"),
+                Ok(Some(crate::log::fixtures::activity_at(
+                    now,
+                    crate::log::fixtures::story(now),
+                    None,
+                ))),
+            );
+            let text = page(&mut m, (140, 40)).join("\n");
+            assert!(!text.contains("⌁2"), "{text}");
+            m.point_at_row(|_, _| 0);
+            let text = page(&mut m, (140, 40)).join("\n");
+            assert!(text.contains("delegating · ↳3 · ⌁1"), "{text}");
+        }
+
+        #[test]
+        fn a_command_with_an_invisible_first_line_is_named_by_its_first_line_that_shows() {
+            let mut m = fleet(10);
+            run_commands(
+                &mut m,
+                "docs-sweep-6",
+                &[listed("c1", "\u{200b}\n\u{fe0f}\nls -la")],
+                FOUR_MINUTES,
+            );
+            let card = card(&mut m, "docs-sweep-6", WIDE);
+            assert_eq!(card[1].trim(), "⌁ ls -la · 4m+");
+            m.panel = Focused::activity();
+            let lines = agent_lines(&laid(&mut m, WIDE));
+            assert!(lines.iter().any(|l| l.contains("⌁ ls -la")), "{lines:?}");
+        }
+
+        #[test]
+        fn a_command_that_prints_nothing_once_cleaned_is_named_by_its_id_made_printable() {
+            let mut m = fleet(10);
+            run_commands(
+                &mut m,
+                "docs-sweep-6",
+                &[listed("job\u{1b}[31m7", "\u{1b}[31m")],
+                FOUR_MINUTES,
+            );
+            m.set_cursor(Cursor::Entry(name("docs-sweep-6")));
+            m.panel = Focused::activity();
+            m.point_at_row(|_, last| last);
+            let lines = agent_lines(&laid(&mut m, WIDE));
+            assert!(lines.iter().any(|l| l.contains("⌁ job7")), "{lines:?}");
+            let text = page(&mut m, (100, 30)).join("\n");
+            assert!(
+                text.contains("id job7") && !text.contains('\u{1b}'),
+                "{text}"
+            );
+        }
+
+        #[test]
+        fn a_command_document_shows_the_whole_command_description_age_listing_and_id() {
+            let mut m = fleet(10);
+            let long = "cargo test --workspace --features alpha,beta,gamma,delta -- --nocapture --test-threads=1";
+            let mut command = listed("bash_17", long);
+            command.description = Some("Run the whole suite".into());
+            run_commands(&mut m, "obs-layout-4", &[command], FOUR_MINUTES);
+            m.set_cursor(Cursor::Entry(name("obs-layout-4")));
+            m.panel = Focused::activity();
+            m.point_at_row(|_, last| last);
+            let rows = page(&mut m, (100, 30));
+            let text = rows.join("\n");
+            let screen = screen(&render(&mut m, (100, 30))).join("\n");
+            let wrapped = rows
+                .iter()
+                .filter(|r| {
+                    r.contains("alpha") || r.contains("test-threads") || r.contains("--workspace")
+                })
+                .count();
+            assert!(wrapped >= 2, "the command wraps whole\n{text}");
+            assert!(text.contains("test-threads=1"), "{text}");
+            assert!(text.contains("Run the whole suite"), "{text}");
+            assert!(text.contains("running at least 4m"), "{text}");
+            assert!(text.contains("as of 0s ago"), "{text}");
+            assert!(text.contains("id bash_17"), "{text}");
+            assert!(
+                screen.contains("[0] Run the whole suite · command"),
+                "{screen}"
+            );
+        }
+
+        #[test]
+        fn a_command_documents_age_is_the_listings_not_the_wall_clock() {
+            let mut m = fleet(10);
+            run_commands(
+                &mut m,
+                "obs-layout-4",
+                &[listed("c1", "cargo test")],
+                FOUR_MINUTES,
+            );
+            m.clock.wall += Duration::from_secs(90);
+            m.set_cursor(Cursor::Entry(name("obs-layout-4")));
+            m.panel = Focused::activity();
+            m.point_at_row(|_, last| last);
+            let text = page(&mut m, (100, 30)).join("\n");
+            assert!(text.contains("running at least 4m"), "{text}");
+            assert!(text.contains("as of 1m ago"), "{text}");
+        }
+
+        #[test]
+        fn a_delegating_status_row_counts_subagents_then_commands() {
+            let mut m = fleet(10);
+            let who = name("obs-layout-4");
+            run_commands(
+                &mut m,
+                "obs-layout-4",
+                &[listed("c1", "cargo test")],
+                FOUR_MINUTES,
+            );
+            let now = m.clock.wall;
+            m.set_activity(
+                &who,
+                Ok(Some(crate::log::fixtures::activity_at(
+                    now,
+                    crate::log::fixtures::story(now),
+                    None,
+                ))),
+            );
+            m.set_cursor(Cursor::Entry(who));
+            m.panel = Focused::activity();
+            let text = page(&mut m, (140, 40)).join("\n");
+            assert!(text.contains("delegating · ↳3 · ⌁1"), "{text}");
+        }
+
+        #[test]
+        fn a_working_status_row_counts_commands() {
+            let mut m = fleet(10);
+            super::detail::working(&mut m, "payroll-fix-3");
+            run_commands(
+                &mut m,
+                "payroll-fix-3",
+                &[listed("c1", "cargo test")],
+                FOUR_MINUTES,
+            );
+            m.panel = Focused::activity();
+            let text = page(&mut m, (140, 40)).join("\n");
+            assert!(text.contains("⌁1"), "{text}");
+        }
+
+        #[test]
+        fn the_activity_panel_says_nothing_of_commands_for_an_agent_with_none() {
+            let mut m = fleet(10);
+            m.set_cursor(Cursor::Entry(name("obs-layout-4")));
+            m.panel = Focused::activity();
+            let lines = agent_lines(&laid(&mut m, WIDE));
+            assert!(lines.iter().all(|l| !l.contains("commands")), "{lines:?}");
+        }
+    }
+
     mod detail {
         use std::time::Duration;
 
@@ -4949,7 +6094,7 @@ mod tests {
         }
 
         /// The agent's [0] as rows, after the sidebar, with its bottom border.
-        fn page(m: &mut Model, size: (u16, u16)) -> Vec<String> {
+        pub(super) fn page(m: &mut Model, size: (u16, u16)) -> Vec<String> {
             let terminal = render(m, size);
             let area = m.areas.terminal;
             screen(&terminal)
@@ -4965,7 +6110,7 @@ mod tests {
                 .collect()
         }
 
-        fn working(m: &mut Model, agent: &str) -> SessionName {
+        pub(super) fn working(m: &mut Model, agent: &str) -> SessionName {
             let who = at(m, agent, (140, 40));
             let activity = m
                 .activities

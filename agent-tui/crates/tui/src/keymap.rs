@@ -186,6 +186,8 @@ pub enum Reading {
     /// The activity document, and what kind it is.
     Activity(ActivityDoc),
     Subagent,
+    /// A background command's document, which only scrolls.
+    Command,
     Repo,
 }
 
@@ -431,6 +433,7 @@ impl Situation {
             }
             Some(Hover::Activity(_)) => Reading::Activity(ActivityDoc::Hooks),
             Some(Hover::Subagent(..)) => Reading::Subagent,
+            Some(Hover::Command(..)) => Reading::Command,
             Some(Hover::Repo(_)) => Reading::Repo,
         }
     }

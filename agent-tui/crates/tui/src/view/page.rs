@@ -1,7 +1,7 @@
 //! The main view [0] when it reads a document instead of showing the
 //! terminal.
 
-use agent_core::activity::AgentId;
+use agent_core::activity::{AgentId, TaskId};
 use agent_core::model::{Head, RepoKey};
 use agent_core::names::{CarriageReturn, SessionName, clean};
 use agent_core::ports::{
@@ -16,10 +16,11 @@ use unicode_width::UnicodeWidthChar;
 
 use super::log;
 use super::sidebar::{
-    activity_message, edit_letter, fits_beside, others_on, second_tab, status_line, subagent_rows,
+    activity_message, command_rows, edit_letter, fits_beside, others_on, second_tab, status_line,
+    subagent_rows,
 };
 use super::{
-    accent, bold, dim, error, fit, justify, line_width, spinner, success, truncate_end,
+    accent, age, ago, bold, dim, error, fit, justify, line_width, spinner, success, truncate_end,
     truncate_start, warning, wrap,
 };
 use crate::cause::Cause;
@@ -27,7 +28,9 @@ use crate::document::{
     BranchKey, CommitKey, DiffKey, Doc, FolderDocs, FolderKey, Hover, Key, Laid, Placed, Resolved,
 };
 use crate::log::first_printable_line;
-use crate::model::{ActivityFiles, AgentStatus, Asking, LogKey, MainLayout, Model};
+use crate::model::{
+    ActivityFiles, AgentStatus, Asking, LogKey, MainLayout, Model, Presence, printable_id,
+};
 use crate::review::{self, DiffView, LineInfo};
 
 /// [0]'s title, what its top border says on the right, its bottom-right
@@ -128,6 +131,7 @@ pub(super) fn page(m: &Model, area: Rect, width: usize, border: Style) -> Option
         Hover::Commit(key) => commit_body(m, key, columns),
         Hover::Activity(name) => activity_body(m, name, columns, height)?,
         Hover::Subagent(name, id) => log_body(m, name, id, columns, budget),
+        Hover::Command(_, id) => command_body(m, id, columns, budget)?,
         Hover::Repo(key) => repo_body(m, key, columns)?,
     };
     let pinned = body.pinned.len().min(height);
@@ -785,6 +789,7 @@ fn activity_body(m: &Model, name: &SessionName, columns: usize, height: usize) -
     let closing = m.closing(name);
     let asking = m.asking(name);
     let files = m.activity_files(name);
+    let entry_commands = m.commands(entry).map(|commands| commands.count());
     let view = log::ActivityView {
         state: activity_state(m, activity, asking.as_ref()),
         closing,
@@ -792,6 +797,7 @@ fn activity_body(m: &Model, name: &SessionName, columns: usize, height: usize) -
         height,
         touched: files.map_or(&[], |f| &f.touched),
         listed: files.map_or(&[], ActivityFiles::listed),
+        commands: entry_commands,
     };
     let roots = m.roots(name);
     let nav = watch.map(|w| w.watch.nav.clone()).unwrap_or_default();
@@ -895,9 +901,17 @@ fn plain_activity_body(
         rows.push(Line::raw(""));
     }
     let subagents = subagent_rows(m, entry, columns);
-    if !subagents.is_empty() {
+    let spaced = !subagents.is_empty();
+    if spaced {
         rows.push(Line::styled("Subagents", dim()));
         rows.extend(subagents);
+    }
+    let commands = command_rows(m, entry, columns);
+    if !commands.is_empty() {
+        if spaced {
+            rows.push(Line::raw(""));
+        }
+        rows.extend(commands);
     }
     if rows
         .last()
@@ -918,6 +932,66 @@ fn empty_activity(columns: usize, height: usize) -> Vec<Line<'static>> {
     let mut rows = vec![Line::raw(""); height.saturating_sub(1) / 2];
     rows.push(Line::styled(format!("{}{text}", " ".repeat(pad)), dim()));
     rows
+}
+
+/// A background command: the whole command line, what the agent said it is
+/// for, how long it has run at least and as of when, and its id.
+fn command_body(m: &Model, id: &TaskId, columns: usize, budget: usize) -> Option<Body> {
+    let list = m.activity_list();
+    let item = list.command(id)?;
+    let named = item
+        .description
+        .and_then(first_printable_line)
+        .unwrap_or_else(|| item.name.as_str().to_string());
+    let mut title = vec![
+        Span::raw("[0] "),
+        Span::styled(truncate_end(&named, budget.saturating_sub(4)), bold()),
+    ];
+    let kind = " · command";
+    if line_width(&title) + kind.chars().count() <= budget {
+        title.push(Span::styled(kind, dim()));
+    }
+    let mut rows: Vec<Line<'static>> = wrapped_lines(item.command.as_str(), columns)
+        .into_iter()
+        .map(Line::raw)
+        .collect();
+    if let Some(description) = item.description {
+        rows.push(Line::raw(""));
+        rows.extend(
+            wrapped_lines(description, columns)
+                .into_iter()
+                .map(|row| Line::styled(row, dim())),
+        );
+    }
+    rows.push(Line::raw(""));
+    let mut facts = vec![
+        format!("running at least {}", age(item.running_at_least)),
+        format!("as of {} ago", ago(item.listed, m.clock.wall)),
+    ];
+    facts.extend(printable_id(item.id).map(|id| format!("id {id}")));
+    if item.presence == Presence::Ended {
+        facts.insert(0, "no longer listed".to_string());
+    }
+    rows.extend(
+        facts
+            .into_iter()
+            .map(|row| Line::styled(truncate_end(&row, columns), dim())),
+    );
+    Some(Body::built(title, rows))
+}
+
+/// `text` as printable lines wrapped to `columns`, keeping its blank lines.
+fn wrapped_lines(text: &str, columns: usize) -> Vec<String> {
+    agent_term::printable(text, agent_term::Lines::Keep)
+        .lines()
+        .flat_map(|line| {
+            if line.trim().is_empty() {
+                vec![String::new()]
+            } else {
+                wrap(line, columns)
+            }
+        })
+        .collect()
 }
 
 /// A subagent's log: its status, what it was told, a row per call and what

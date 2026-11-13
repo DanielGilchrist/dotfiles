@@ -2,7 +2,7 @@ use std::cell::Cell;
 use std::fmt::Write as _;
 use std::num::NonZeroUsize;
 use std::path::Path;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use agent_core::actions::Kind;
 use agent_core::model::{Entry, EntryKind, Head};
@@ -84,6 +84,10 @@ fn success() -> Style {
 fn bold() -> Style {
     Style::new().add_modifier(Modifier::BOLD)
 }
+
+/// Marks background commands: after a name as `⌁n`, on a card's second line,
+/// before each of [2]'s command rows and in the activity's status row.
+const COMMAND_GLYPH: &str = "⌁";
 
 /// Truncate keeping the start, measured in display width.
 fn truncate_end(text: &str, width: usize) -> String {
@@ -212,15 +216,26 @@ fn name_style(status: &AgentStatus, selected: bool) -> Style {
     }
 }
 
-/// `38s`, `4m`, `2h`, `3d`.
 fn ago(since: SystemTime, now: SystemTime) -> String {
-    let secs = now.duration_since(since).unwrap_or_default().as_secs();
+    age(now.duration_since(since).unwrap_or_default())
+}
+
+/// `38s`, `4m`, `2h`, `3d`.
+fn age(elapsed: Duration) -> String {
+    let secs = elapsed.as_secs();
     match secs {
         0..60 => format!("{secs}s"),
         60..3600 => format!("{}m", secs / 60),
         3600..86_400 => format!("{}h", secs / 3600),
         _ => format!("{}d", secs / 86_400),
     }
+}
+
+/// `4m+`: how long a background command has run at least, as of the latest
+/// listing of it. An agent that has gone idle isn't listed again, so it may
+/// have ended since.
+fn at_least(elapsed: Duration) -> String {
+    format!("{}+", age(elapsed))
 }
 
 fn hint<'a>(key: &'a str, desc: &'a str) -> [Span<'a>; 3] {
