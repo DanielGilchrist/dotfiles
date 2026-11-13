@@ -11,7 +11,7 @@ const NOW: Patience = Patience {
     every: Duration::ZERO,
 };
 
-fn plan(w: &World, at: &Startable) -> RestartPlan {
+fn plan(w: &World, at: &Startable) -> RestartApproval {
     plan_restart(w.svc(), at.clone())
         .expect("plans")
         .elsewhere()
@@ -19,7 +19,17 @@ fn plan(w: &World, at: &Startable) -> RestartPlan {
 }
 
 fn go(w: &World, at: &Startable) -> Restart {
-    plan(w, at).approve().expect("idle")
+    match plan(w, at) {
+        RestartApproval::Free(go) => go,
+        RestartApproval::Needs(would_stop) => panic!("it would stop {:?}", would_stop.stops()),
+    }
+}
+
+fn would_stop(w: &World, at: &Startable) -> WouldStop {
+    match plan(w, at) {
+        RestartApproval::Needs(would_stop) => would_stop,
+        RestartApproval::Free(_) => panic!("nothing to stop"),
+    }
 }
 
 fn run(w: &World, go: Restart) -> Result<Restarted> {
@@ -55,13 +65,13 @@ fn a_session_agent_did_not_start_has_no_record_to_restart() {
 fn an_idle_agent_is_approved_and_a_busy_one_must_be_forced() {
     let w = World::new();
     let idle = w.agent("idle", Doing::Idle);
-    assert!(plan(&w, &idle).approve().is_ok());
+    assert!(matches!(plan(&w, &idle), RestartApproval::Free(_)));
 
     let busy = w.agent("busy", Doing::Working);
-    let interrupting = plan(&w, &busy).approve().expect_err("working");
+    let interrupting = would_stop(&w, &busy);
     assert_eq!(
-        interrupting.interrupts(),
-        Interrupts::Session(Busy::Working)
+        interrupting.stops().activity(),
+        Some(Interrupts::Session(Busy::Working))
     );
     assert_eq!(interrupting.plan().name(), session("busy"));
     run(&w, interrupting.force()).expect("forced");
@@ -102,10 +112,7 @@ fn an_agent_that_became_busy_since_it_was_approved_idle_is_left_alone() {
         .insert(session("fix"), working);
     assert!(matches!(
         run(&w, approved),
-        Err(Error::Busy {
-            interrupts: Interrupts::Session(Busy::Working),
-            ..
-        })
+        Err(Error::WouldStop { stops, .. }) if stops.activity() == Some(Interrupts::Session(Busy::Working))
     ));
     assert_eq!(steps(&w), vec![], "not even killed");
 }
@@ -115,18 +122,15 @@ fn a_live_agent_whose_process_is_mid_task_must_be_forced_and_is_never_killed_whe
     let w = World::new();
     let at = w.agent("fix", Doing::Idle);
     lurk(&w, &at, Lurking::Survivor(SurvivorState::Busy));
-    let interrupting = plan(&w, &at).approve().expect_err("its process is busy");
-    assert_eq!(interrupting.interrupts(), Interrupts::Survivor);
+    let interrupting = would_stop(&w, &at);
+    assert_eq!(interrupting.stops().activity(), Some(Interrupts::Survivor));
 
     lurk(&w, &at, Lurking::Survivor(SurvivorState::Idle));
     let approved = go(&w, &at);
     lurk(&w, &at, Lurking::Survivor(SurvivorState::Busy));
     assert!(matches!(
         run(&w, approved),
-        Err(Error::Busy {
-            interrupts: Interrupts::Survivor,
-            ..
-        })
+        Err(Error::WouldStop { stops, .. }) if stops.activity() == Some(Interrupts::Survivor)
     ));
     assert_eq!(steps(&w), vec![], "a refusal leaves the session running");
 }
@@ -218,10 +222,8 @@ fn a_process_still_in_its_terminal_times_out_and_nothing_starts() {
 fn an_exited_agent_with_a_busy_process_needs_forcing_and_is_started_by_a_restart_of_it() {
     let w = World::new();
     let at = w.ghost("fix", Lurking::Survivor(SurvivorState::Busy));
-    let interrupting = plan(&w, &at)
-        .approve()
-        .expect_err("its process is mid-task");
-    assert_eq!(interrupting.interrupts(), Interrupts::Survivor);
+    let interrupting = would_stop(&w, &at);
+    assert_eq!(interrupting.stops().activity(), Some(Interrupts::Survivor));
     let done = run(&w, interrupting.force()).expect("restarts");
     assert_eq!(done.end, End::Started);
     assert!(!steps(&w).contains(&Step::Kill(session("fix"))));
@@ -234,7 +236,7 @@ fn an_exited_agents_process_that_became_busy_since_approval_is_left_alone() {
     let at = w.ghost("fix", Lurking::Survivor(SurvivorState::Idle));
     let approved = go(&w, &at);
     lurk(&w, &at, Lurking::Survivor(SurvivorState::Busy));
-    assert!(matches!(run(&w, approved), Err(Error::Busy { .. })));
+    assert!(matches!(run(&w, approved), Err(Error::WouldStop { .. })));
     assert_eq!(steps(&w), vec![]);
 }
 
@@ -248,7 +250,7 @@ fn the_callers_own_session_has_a_plan_that_cant_be_approved() {
         planned,
         Planned::Own(ref own)
             if own.name() == session("fix")
-                && own.plan().interrupts() == Some(Interrupts::Session(Busy::Working))
+                && own.plan().stops().and_then(Stops::activity) == Some(Interrupts::Session(Busy::Working))
     ));
     assert!(matches!(planned.elsewhere(), Err(Error::OwnSession(_))));
 }
@@ -343,7 +345,7 @@ fn a_fleet_splits_idle_from_busy_sets_own_aside_and_skips_what_is_not_agents() {
     );
     assert_eq!(
         fleet
-            .busy()
+            .would_stop()
             .iter()
             .map(|b| b.plan().name())
             .collect::<Vec<_>>(),
@@ -365,7 +367,7 @@ fn a_fleet_stops_exited_agents_processes_and_leaves_them_exited() {
         "the exited one with no process is skipped"
     );
     assert_eq!(fleet.idle()[0].plan().end(), End::LeftExited);
-    let approvals = fleet.approve(Interrupt::Skip);
+    let approvals = fleet.approve(StopPolicy::Skip);
     let done = run(&w, approvals.restarts.into_iter().next().expect("one")).expect("stops");
     assert_eq!(done.end, End::LeftExited);
     assert_eq!(
@@ -381,11 +383,11 @@ fn a_fleet_approval_skips_busy_agents_or_forces_them() {
     w.agent("busy", Doing::Working);
     let skipped = plan_restarts(w.svc())
         .expect("plans")
-        .approve(Interrupt::Skip);
+        .approve(StopPolicy::Skip);
     assert_eq!((skipped.restarts.len(), skipped.skipped.len()), (1, 1));
     let forced = plan_restarts(w.svc())
         .expect("plans")
-        .approve(Interrupt::Allow);
+        .approve(StopPolicy::Allow);
     assert_eq!((forced.restarts.len(), forced.skipped.len()), (2, 0));
 }
 
@@ -435,17 +437,254 @@ fn a_live_agents_process_still_in_its_terminal_says_nothing_about_what_it_interr
     let at = w.agent("fix", Doing::Idle);
     lurk(&w, &at, Lurking::Interactive(SurvivorState::Busy));
     let plan = plan(&w, &at);
-    assert_eq!(
-        plan.interrupts(),
-        None,
-        "the session's activity says it is idle"
-    );
+    assert_eq!(plan.stops(), None, "the session's activity says it is idle");
 
     let busy = w.agent("busy", Doing::Working);
     lurk(&w, &busy, Lurking::Interactive(SurvivorState::Busy));
     assert_eq!(
-        self::plan(&w, &busy).interrupts(),
+        self::plan(&w, &busy).stops().and_then(Stops::activity),
         Some(Interrupts::Session(Busy::Working)),
         "never working in the background"
     );
+}
+
+const BUILD: (&str, &str) = ("b1", "cargo test --workspace");
+const SERVER: (&str, &str) = ("b2", "npm run dev");
+
+#[test]
+fn an_idle_agent_running_commands_must_be_forced_and_the_commands_are_what_it_proves() {
+    let w = World::new();
+    let at = w.agent("fix", Doing::Idle);
+    w.runs_commands("fix", &[BUILD, SERVER]);
+    let interrupting = would_stop(&w, &at);
+    let stops = interrupting.stops();
+    assert_eq!(stops.activity(), None);
+    assert_eq!(stops.commands().map(|c| c.count().get()), Some(2));
+    assert_eq!(stops.label(), "running 2 background commands");
+    run(&w, interrupting.force()).expect("forced");
+    assert_eq!(steps(&w).first(), Some(&Step::Kill(session("fix"))));
+}
+
+#[test]
+fn a_busy_agent_running_commands_names_both() {
+    let w = World::new();
+    let at = w.agent("fix", Doing::Working);
+    w.runs_commands("fix", &[BUILD]);
+    let interrupting = would_stop(&w, &at);
+    assert_eq!(
+        interrupting.stops().label(),
+        "working and running 1 background command"
+    );
+}
+
+#[test]
+fn commands_that_appear_between_the_plan_and_the_restart_are_not_dropped() {
+    let w = World::new();
+    let at = w.agent("fix", Doing::Idle);
+    let approved = go(&w, &at);
+    w.runs_commands("fix", &[BUILD]);
+    assert!(matches!(
+        run(&w, approved),
+        Err(Error::WouldStop { stops, .. }) if stops.commands().is_some() && stops.activity().is_none()
+    ));
+    assert_eq!(steps(&w), vec![], "not even killed");
+}
+
+#[test]
+fn an_exited_agent_with_no_process_has_no_commands_to_lose() {
+    let w = World::new();
+    let at = w.exited("fix");
+    w.runs_commands("fix", &[BUILD]);
+    assert!(matches!(plan(&w, &at), RestartApproval::Free(_)));
+}
+
+#[test]
+fn an_exited_agents_process_that_may_hold_commands_needs_forcing() {
+    let w = World::new();
+    let at = w.ghost("fix", Lurking::Survivor(SurvivorState::Idle));
+    w.runs_commands("fix", &[BUILD]);
+    let interrupting = would_stop(&w, &at);
+    assert_eq!(interrupting.stops().activity(), None);
+    assert_eq!(
+        interrupting.stops().commands().map(|c| c.count().get()),
+        Some(1)
+    );
+}
+
+#[test]
+fn the_callers_own_session_reports_its_commands_too() {
+    let mut w = World::new();
+    w.own = Some(session("fix"));
+    let at = w.agent("fix", Doing::Idle);
+    w.runs_commands("fix", &[BUILD]);
+    let Planned::Own(own) = plan_restart(w.svc(), at).expect("plans") else {
+        panic!("own session")
+    };
+    assert_eq!(
+        own.plan().stops().map(Stops::label).as_deref(),
+        Some("running 1 background command")
+    );
+}
+
+#[test]
+fn a_fleet_idle_only_skips_idle_agents_running_commands_and_forcing_restarts_them() {
+    let w = World::new();
+    w.agent("quiet", Doing::Idle);
+    w.agent("serving", Doing::Idle);
+    w.runs_commands("serving", &[SERVER]);
+    let fleet = plan_restarts(w.svc()).expect("plans");
+    assert_eq!(
+        fleet
+            .would_stop()
+            .iter()
+            .map(|b| b.plan().name())
+            .collect::<Vec<_>>(),
+        vec![session("serving")]
+    );
+    assert_eq!(fleet.summary(), "restart 2 · 1 busy");
+
+    let skipped = fleet.approve(StopPolicy::Skip);
+    assert_eq!(
+        skipped
+            .restarts
+            .iter()
+            .map(Restart::name)
+            .collect::<Vec<_>>(),
+        vec![session("quiet")]
+    );
+    assert_eq!(
+        skipped
+            .skipped
+            .iter()
+            .map(|w| (w.plan().name(), w.stops().label()))
+            .collect::<Vec<_>>(),
+        vec![(
+            session("serving"),
+            "running 1 background command".to_string()
+        )]
+    );
+
+    let forced = plan_restarts(w.svc())
+        .expect("plans")
+        .approve(StopPolicy::Allow);
+    assert_eq!(forced.restarts.len(), 2);
+}
+
+#[test]
+fn a_restart_confirmed_on_the_activity_is_refused_when_commands_appear_after() {
+    let w = World::new();
+    let at = w.agent("fix", Doing::Working);
+    let forced = would_stop(&w, &at).force();
+    w.runs_commands("fix", &[BUILD]);
+    assert!(matches!(
+        run(&w, forced),
+        Err(Error::WouldStop { stops, .. }) if stops.commands().is_some()
+    ));
+    assert_eq!(steps(&w), vec![], "not even killed");
+}
+
+#[test]
+fn a_restart_confirmed_on_commands_is_refused_when_the_agent_starts_working_after() {
+    let w = World::new();
+    let at = w.agent("fix", Doing::Idle);
+    w.runs_commands("fix", &[BUILD]);
+    let forced = would_stop(&w, &at).force();
+    w.prompts("fix");
+    assert!(matches!(
+        run(&w, forced),
+        Err(Error::WouldStop { stops, .. }) if stops.activity().is_some()
+    ));
+    assert_eq!(steps(&w), vec![], "not even killed");
+}
+
+#[test]
+fn a_restart_confirmed_on_commands_goes_ahead_when_they_are_the_same_or_fewer() {
+    let w = World::new();
+    let at = w.agent("fix", Doing::Idle);
+    w.runs_commands("fix", &[BUILD, SERVER]);
+    let forced = would_stop(&w, &at).force();
+    w.runs_commands("fix", &[BUILD]);
+    run(&w, forced).expect("what it would stop was all shown");
+    assert_eq!(steps(&w).first(), Some(&Step::Kill(session("fix"))));
+}
+
+#[test]
+fn a_restart_confirmed_on_commands_is_refused_when_a_different_one_appears() {
+    let w = World::new();
+    let at = w.agent("fix", Doing::Idle);
+    w.runs_commands("fix", &[BUILD]);
+    let forced = would_stop(&w, &at).force();
+    w.runs_commands("fix", &[BUILD, SERVER]);
+    assert!(matches!(run(&w, forced), Err(Error::WouldStop { .. })));
+    assert_eq!(steps(&w), vec![]);
+}
+
+#[test]
+fn what_an_agent_became_names_its_commands_and_its_activity() {
+    let w = World::new();
+    let at = w.agent("fix", Doing::Idle);
+    w.runs_commands("fix", &[BUILD, SERVER]);
+    let commands = would_stop(&w, &at);
+    assert_eq!(
+        commands.stops().became(),
+        "started running 2 background commands"
+    );
+
+    let busy = w.agent("busy", Doing::Working);
+    w.runs_commands("busy", &[BUILD]);
+    let both = would_stop(&w, &busy);
+    assert_eq!(
+        both.stops().became(),
+        "started working and started running 1 background command"
+    );
+}
+
+fn command_ids(stops: &Stops) -> Vec<String> {
+    stops
+        .commands()
+        .map(|commands| commands.iter().map(|c| c.id.as_str().to_string()).collect())
+        .unwrap_or_default()
+}
+
+#[test]
+fn a_skip_after_working_with_a_known_command_names_only_the_new_command() {
+    let w = World::new();
+    let at = w.agent("fix", Doing::Working);
+    w.runs_commands("fix", &[BUILD]);
+    let forced = would_stop(&w, &at).force();
+    w.runs_commands("fix", &[BUILD, SERVER]);
+    let Err(Error::WouldStop { stops, .. }) = run(&w, forced) else {
+        panic!("a new command is refused");
+    };
+    assert_eq!(stops.activity(), None, "it was already working");
+    assert_eq!(command_ids(&stops), [SERVER.0], "only the one not shown");
+}
+
+#[test]
+fn a_skip_after_commands_were_swapped_names_the_new_one_not_the_old() {
+    let w = World::new();
+    let at = w.agent("fix", Doing::Idle);
+    w.runs_commands("fix", &[BUILD]);
+    let forced = would_stop(&w, &at).force();
+    w.runs_commands("fix", &[SERVER]);
+    let Err(Error::WouldStop { stops, .. }) = run(&w, forced) else {
+        panic!("a new command is refused");
+    };
+    assert_eq!(command_ids(&stops), [SERVER.0]);
+    assert_eq!(stops.became(), "started running 1 background command");
+}
+
+#[test]
+fn a_restart_confirmed_on_working_goes_ahead_when_the_agent_is_asking_by_then() {
+    let w = World::new();
+    let at = w.agent("fix", Doing::Working);
+    let forced = would_stop(&w, &at).force();
+    w.asks("fix");
+    assert_eq!(
+        plan(&w, &at).stops().and_then(Stops::activity),
+        Some(Interrupts::Session(Busy::Asking)),
+        "it really is asking now"
+    );
+    run(&w, forced).expect("the activity was shown, whatever it became");
+    assert_eq!(steps(&w).first(), Some(&Step::Kill(session("fix"))));
 }

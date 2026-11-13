@@ -2,7 +2,10 @@ use std::io::Write;
 
 use agent_core::model::{Startable, Unstartable};
 use agent_core::names::SessionName;
-use agent_core::ops::{self, Error, Fleet, Interrupt, Interrupting, Planned, Restart, Services};
+use agent_core::ops::{
+    self, Error, Fleet, Planned, Restart, RestartApproval, Services, StopPolicy, Stops, WouldStop,
+};
+use agent_term::{CommandsShown, skipped_because};
 use anyhow::{Context, Result, bail};
 
 /// Whether a person can answer a question.
@@ -12,16 +15,16 @@ pub enum Terminal {
     Absent,
 }
 
-/// What restarting one agent does when it is busy.
+/// What restarting one agent does when it would stop something.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum OnBusy {
+pub enum OnStops {
     /// Ask first, or refuse where nobody can answer.
     Ask,
     /// Interrupt it.
     Force,
 }
 
-/// What restarting every agent does with the busy ones.
+/// What restarting every agent does with the ones that would stop something.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Policy {
     Ask,
@@ -33,7 +36,7 @@ pub enum Policy {
 /// What `agent restart` was asked to restart.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Target {
-    One(Option<SessionName>, OnBusy),
+    One(Option<SessionName>, OnStops),
     All(Policy),
 }
 
@@ -45,8 +48,8 @@ impl Target {
             (true, true, _) => Self::All(Policy::Force),
             (true, false, true) => Self::All(Policy::IdleOnly),
             (true, false, false) => Self::All(Policy::Ask),
-            (false, true, _) => Self::One(name, OnBusy::Force),
-            (false, false, _) => Self::One(name, OnBusy::Ask),
+            (false, true, _) => Self::One(name, OnStops::Force),
+            (false, false, _) => Self::One(name, OnStops::Ask),
         }
     }
 }
@@ -60,6 +63,19 @@ pub struct Console<'a> {
     pub ask: &'a mut dyn FnMut(&str) -> bool,
     /// Restarts the caller's own session from a process that outlives it.
     pub hand_over: &'a mut dyn FnMut(&SessionName) -> Result<()>,
+}
+
+/// What a restart would stop, naming the first few commands and counting
+/// the rest, so the total is right even when a command has no name to show.
+fn describe(stops: &Stops) -> String {
+    let label = stops.label();
+    let Some(commands) = stops.commands() else {
+        return label;
+    };
+    match CommandsShown::of(commands).list() {
+        Some(names) => format!("{label}, which a restart may stop: {names}"),
+        None => format!("{label}, which a restart may stop"),
+    }
 }
 
 fn startable(svc: Services<'_>, name: &SessionName) -> Result<Startable> {
@@ -86,16 +102,16 @@ fn handed_over(out: &mut dyn Write, name: &SessionName) -> Result<()> {
 pub fn one(
     svc: Services<'_>,
     name: &SessionName,
-    on_busy: OnBusy,
+    on_stops: OnStops,
     console: &mut Console<'_>,
 ) -> Result<()> {
-    let plan = match ops::plan_restart(svc, startable(svc, name)?)? {
+    let approval = match ops::plan_restart(svc, startable(svc, name)?)? {
         Planned::Own(own) => {
-            if let (OnBusy::Ask, Terminal::Attached, Some(interrupts)) =
-                (on_busy, console.terminal, own.plan().interrupts())
+            if let (OnStops::Ask, Terminal::Attached, Some(stops)) =
+                (on_stops, console.terminal, own.plan().stops())
                 && !(console.ask)(&format!(
                     "{name} is {}. Restart it? [y/N] ",
-                    interrupts.label()
+                    describe(stops)
                 ))
             {
                 bail!("not restarting {name}");
@@ -103,12 +119,12 @@ pub fn one(
             (console.hand_over)(name)?;
             return handed_over(console.out, name);
         }
-        Planned::Elsewhere(plan) => plan,
+        Planned::Elsewhere(approval) => approval,
     };
-    let go = match plan.approve() {
-        Ok(go) => go,
-        Err(interrupting) => {
-            interrupt(name, &interrupting, on_busy, console).map(|()| interrupting.force())?
+    let go = match approval {
+        RestartApproval::Free(go) => go,
+        RestartApproval::Needs(would_stop) => {
+            confirm_stops(name, &would_stop, on_stops, console).map(|()| would_stop.force())?
         }
     };
     let label = go.plan().label();
@@ -121,34 +137,34 @@ pub fn one(
     Ok(())
 }
 
-/// Whether `interrupting` may go ahead, asking where somebody can answer.
-fn interrupt(
+/// Whether `would_stop` may go ahead, asking where somebody can answer.
+fn confirm_stops(
     name: &SessionName,
-    interrupting: &Interrupting,
-    on_busy: OnBusy,
+    would_stop: &WouldStop,
+    on_stops: OnStops,
     console: &mut Console<'_>,
 ) -> Result<()> {
-    let busy = interrupting.interrupts().label();
-    match (on_busy, console.terminal) {
-        (OnBusy::Force, _) => Ok(()),
-        (OnBusy::Ask, Terminal::Attached) => {
-            if (console.ask)(&format!("{name} is {busy}. Restart it? [y/N] ")) {
+    let stops = describe(would_stop.stops());
+    match (on_stops, console.terminal) {
+        (OnStops::Force, _) => Ok(()),
+        (OnStops::Ask, Terminal::Attached) => {
+            if (console.ask)(&format!("{name} is {stops}. Restart it? [y/N] ")) {
                 Ok(())
             } else {
                 bail!("not restarting {name}")
             }
         }
-        (OnBusy::Ask, Terminal::Absent) => {
-            bail!("not restarting {name}: it is {busy} (re-run with --force to interrupt it)")
+        (OnStops::Ask, Terminal::Absent) => {
+            bail!("not restarting {name}: it is {stops} (re-run with --force to interrupt it)")
         }
     }
 }
 
-fn busy_list(fleet: &Fleet) -> Vec<String> {
+fn stops_list(fleet: &Fleet) -> Vec<String> {
     fleet
-        .busy()
+        .would_stop()
         .iter()
-        .map(|b| format!("  {}: {}", b.plan().name(), b.interrupts().label()))
+        .map(|b| format!("  {}: {}", b.plan().name(), describe(b.stops())))
         .collect()
 }
 
@@ -172,45 +188,50 @@ pub fn all(svc: Services<'_>, policy: Policy, console: &mut Console<'_>) -> Resu
         writeln!(console.out, "agent restart: nothing to restart")?;
         return Ok(());
     }
-    let own = fleet.own().map(|own| (own.name(), own.plan().interrupts()));
-    let interrupt = match (policy, console.terminal, fleet.busy().is_empty()) {
-        (Policy::Force, ..) | (Policy::Ask, Terminal::Absent, true) => Interrupt::Allow,
-        (Policy::IdleOnly, ..) => Interrupt::Skip,
+    let own = fleet
+        .own()
+        .map(|own| (own.name(), own.plan().stops().cloned()));
+    let policy_for_stops = match (policy, console.terminal, fleet.would_stop().is_empty()) {
+        (Policy::Force, ..) | (Policy::Ask, Terminal::Absent, true) => StopPolicy::Allow,
+        (Policy::IdleOnly, ..) => StopPolicy::Skip,
         (Policy::Ask, Terminal::Attached, _) => {
             writeln!(
                 console.out,
                 "agent restart: {}",
                 said(&fleet, own.is_some())
             )?;
-            for line in busy_list(&fleet) {
+            for line in stops_list(&fleet) {
                 writeln!(console.out, "{line}")?;
+            }
+            if let Some((name, Some(stops))) = &own {
+                writeln!(console.out, "  {name} (this session): {}", describe(stops))?;
             }
             if !(console.ask)(&format!("{}? [y/N] ", said(&fleet, own.is_some()))) {
                 bail!("aborted");
             }
-            Interrupt::Allow
+            StopPolicy::Allow
         }
         (Policy::Ask, Terminal::Absent, false) => bail!(
-            "not restarting, these are busy:\n{}\nre-run with --force to interrupt them or --idle to leave them out",
-            busy_list(&fleet).join("\n")
+            "not restarting, these would stop something:\n{}\nre-run with --force to interrupt them or --idle to leave them out",
+            stops_list(&fleet).join("\n")
         ),
     };
-    let approvals = fleet.approve(interrupt);
+    let approvals = fleet.approve(policy_for_stops);
     for skipped in &approvals.skipped {
         writeln!(
             console.out,
             "agent restart: skipped {}: {}",
             skipped.plan().name(),
-            skipped.interrupts().label()
+            describe(skipped.stops())
         )?;
     }
     let failed = restart_each(svc, approvals.restarts, console)?;
-    if let Some((name, interrupts)) = own {
-        if let (Policy::IdleOnly, Some(interrupts)) = (policy, interrupts) {
+    if let Some((name, stops)) = own {
+        if let (Policy::IdleOnly, Some(stops)) = (policy, stops) {
             writeln!(
                 console.out,
                 "agent restart: skipped {name}: {}",
-                interrupts.label()
+                describe(&stops)
             )?;
         } else {
             (console.hand_over)(&name)?;
@@ -241,11 +262,11 @@ fn restart_each(
                     restarted.end.says(&name, label)
                 )?;
             }
-            Err(Error::Busy { name, interrupts }) => {
+            Err(Error::WouldStop { name, stops }) => {
                 writeln!(
                     console.out,
                     "agent restart: skipped {name}: {}",
-                    interrupts.became()
+                    skipped_because(&stops)
                 )?;
             }
             Err(e) => {
@@ -310,9 +331,9 @@ mod tests {
         }
     }
 
-    fn one_of(w: &World, name: &str, on_busy: OnBusy, terminal: Terminal, answer: bool) -> Run {
+    fn one_of(w: &World, name: &str, on_stops: OnStops, terminal: Terminal, answer: bool) -> Run {
         run(terminal, answer, |c| {
-            one(w.svc(), &session(name), on_busy, c)
+            one(w.svc(), &session(name), on_stops, c)
         })
     }
 
@@ -320,7 +341,7 @@ mod tests {
     fn an_idle_agent_restarts_without_asking_and_exits_ok() {
         let w = World::new();
         w.agent("fix", Doing::Idle);
-        let r = one_of(&w, "fix", OnBusy::Ask, Terminal::Absent, false);
+        let r = one_of(&w, "fix", OnStops::Ask, Terminal::Absent, false);
         assert!(r.result.is_ok(), "{:?}", r.result);
         assert_eq!(r.out, "agent restart: restarted fix\n");
         assert_eq!(r.asked.len(), 0);
@@ -331,13 +352,13 @@ mod tests {
     fn a_busy_agent_without_a_terminal_is_refused_unless_forced() {
         let w = World::new();
         w.agent("fix", Doing::Working);
-        let refused = one_of(&w, "fix", OnBusy::Ask, Terminal::Absent, true);
+        let refused = one_of(&w, "fix", OnStops::Ask, Terminal::Absent, true);
         assert_eq!(
             refused.result.expect_err("refused").to_string(),
             "not restarting fix: it is working (re-run with --force to interrupt it)"
         );
         assert_eq!(w.host.killed().len(), 0);
-        let forced = one_of(&w, "fix", OnBusy::Force, Terminal::Absent, false);
+        let forced = one_of(&w, "fix", OnStops::Force, Terminal::Absent, false);
         assert!(forced.result.is_ok());
         assert_eq!(w.host.killed().len(), 1);
     }
@@ -346,11 +367,11 @@ mod tests {
     fn a_busy_agent_at_a_terminal_restarts_only_on_a_yes() {
         let w = World::new();
         w.agent("fix", Doing::Working);
-        let no = one_of(&w, "fix", OnBusy::Ask, Terminal::Attached, false);
+        let no = one_of(&w, "fix", OnStops::Ask, Terminal::Attached, false);
         assert_eq!(no.asked, ["fix is working. Restart it? [y/N] "]);
         assert!(no.result.is_err());
         assert_eq!(w.host.killed().len(), 0);
-        let yes = one_of(&w, "fix", OnBusy::Ask, Terminal::Attached, true);
+        let yes = one_of(&w, "fix", OnStops::Ask, Terminal::Attached, true);
         assert!(yes.result.is_ok());
     }
 
@@ -363,7 +384,7 @@ mod tests {
             Lurking::Survivor(agent_core::ports::SurvivorState::Idle),
         );
         *w.harnesses.0.stop.lock().expect("lock") = Stopping::Fails;
-        let r = one_of(&w, "fix", OnBusy::Ask, Terminal::Absent, false);
+        let r = one_of(&w, "fix", OnStops::Ask, Terminal::Absent, false);
         assert!(r.result.is_err());
         assert_eq!(r.out, "");
     }
@@ -373,7 +394,7 @@ mod tests {
         let mut w = World::new();
         w.own = Some(session("me"));
         w.agent("me", Doing::Working);
-        let r = one_of(&w, "me", OnBusy::Ask, Terminal::Absent, false);
+        let r = one_of(&w, "me", OnStops::Ask, Terminal::Absent, false);
         assert!(r.result.is_ok());
         assert_eq!(r.handed, [session("me")]);
         assert_eq!(w.host.killed().len(), 0);
@@ -384,7 +405,7 @@ mod tests {
         let w = World::new();
         w.agent("fix", Doing::Idle);
         w.store.records.lock().expect("lock").clear();
-        let r = one_of(&w, "fix", OnBusy::Ask, Terminal::Absent, false);
+        let r = one_of(&w, "fix", OnStops::Ask, Terminal::Absent, false);
         assert!(r.result.is_err());
     }
 
@@ -479,15 +500,15 @@ mod tests {
         let mut w = World::new();
         w.own = Some(session("me"));
         w.agent("me", Doing::Working);
-        let declined = one_of(&w, "me", OnBusy::Ask, Terminal::Attached, false);
+        let declined = one_of(&w, "me", OnStops::Ask, Terminal::Attached, false);
         assert_eq!(declined.asked, ["me is working. Restart it? [y/N] "]);
         assert!(declined.result.is_err());
         assert_eq!(declined.handed.len(), 0);
-        let yes = one_of(&w, "me", OnBusy::Ask, Terminal::Attached, true);
+        let yes = one_of(&w, "me", OnStops::Ask, Terminal::Attached, true);
         assert_eq!(yes.handed, [session("me")]);
-        let forced = one_of(&w, "me", OnBusy::Force, Terminal::Attached, false);
+        let forced = one_of(&w, "me", OnStops::Force, Terminal::Attached, false);
         assert_eq!((forced.asked.len(), forced.handed.len()), (0, 1));
-        let unattended = one_of(&w, "me", OnBusy::Ask, Terminal::Absent, false);
+        let unattended = one_of(&w, "me", OnStops::Ask, Terminal::Absent, false);
         assert_eq!((unattended.asked.len(), unattended.handed.len()), (0, 1));
     }
 
@@ -511,15 +532,171 @@ mod tests {
     }
 
     #[test]
+    fn an_idle_agent_running_commands_without_a_terminal_is_refused_naming_them_unless_forced() {
+        let w = World::new();
+        w.agent("fix", Doing::Idle);
+        w.runs_commands(
+            "fix",
+            &[("b1", "cargo test --workspace"), ("b2", "npm run dev")],
+        );
+        let refused = one_of(&w, "fix", OnStops::Ask, Terminal::Absent, true);
+        assert_eq!(
+            refused.result.expect_err("refused").to_string(),
+            "not restarting fix: it is running 2 background commands, which a restart may stop: cargo test --workspace, npm run dev (re-run with --force to interrupt it)"
+        );
+        assert_eq!(w.host.killed().len(), 0);
+        let forced = one_of(&w, "fix", OnStops::Force, Terminal::Absent, false);
+        assert!(forced.result.is_ok());
+        assert_eq!(w.host.killed().len(), 1);
+    }
+
+    #[test]
+    fn commands_past_the_few_named_are_summed_up_as_more() {
+        let w = World::new();
+        w.agent("fix", Doing::Idle);
+        w.runs_commands(
+            "fix",
+            &[
+                ("b1", "one"),
+                ("b2", "two"),
+                ("b3", "three"),
+                ("b4", "four"),
+                ("b5", "five"),
+            ],
+        );
+        let refused = one_of(&w, "fix", OnStops::Ask, Terminal::Absent, true);
+        let error = refused.result.expect_err("refused").to_string();
+        assert!(
+            error.contains(
+                "running 5 background commands, which a restart may stop: one, two, three, and 2 more"
+            ),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_long_command_is_cut_to_the_width_the_tui_cuts_to() {
+        let w = World::new();
+        w.agent("fix", Doing::Idle);
+        let long = format!("cargo test {}", "x".repeat(100));
+        w.runs_commands("fix", &[("b1", &long)]);
+        let refused = one_of(&w, "fix", OnStops::Ask, Terminal::Absent, true);
+        let error = refused.result.expect_err("refused").to_string();
+        assert!(!error.contains(&long), "{error}");
+        assert!(error.contains("cargo test xxxx"), "{error}");
+        assert!(error.contains("…"), "{error}");
+    }
+
+    #[test]
+    fn all_at_a_terminal_lists_the_own_sessions_commands_in_the_ask() {
+        let mut w = World::new();
+        w.own = Some(session("me"));
+        w.agent("me", Doing::Idle);
+        w.runs_commands("me", &[("b1", "npm run dev")]);
+        let r = all_of(&w, Policy::Ask, Terminal::Attached, false);
+        assert!(r.result.is_err());
+        assert!(
+            r.out.contains(
+                "me (this session): running 1 background command, which a restart may stop: npm run dev"
+            ),
+            "{}",
+            r.out
+        );
+        assert_eq!(r.handed.len(), 0, "declined");
+    }
+
+    #[test]
+    fn all_without_a_terminal_hands_over_the_own_session_even_when_it_runs_commands() {
+        let mut w = World::new();
+        w.own = Some(session("me"));
+        w.agent("me", Doing::Idle);
+        w.runs_commands("me", &[("b1", "npm run dev")]);
+        let r = all_of(&w, Policy::Ask, Terminal::Absent, false);
+        assert!(r.result.is_ok(), "{:?}", r.result);
+        assert_eq!(r.handed, [session("me")]);
+        assert_eq!(r.asked.len(), 0);
+    }
+
+    #[test]
+    fn an_idle_agent_running_commands_at_a_terminal_restarts_only_on_a_yes() {
+        let w = World::new();
+        w.agent("fix", Doing::Idle);
+        w.runs_commands("fix", &[("b1", "cargo test")]);
+        let no = one_of(&w, "fix", OnStops::Ask, Terminal::Attached, false);
+        assert_eq!(
+            no.asked,
+            [
+                "fix is running 1 background command, which a restart may stop: cargo test. Restart it? [y/N] "
+            ]
+        );
+        assert!(no.result.is_err());
+        assert_eq!(w.host.killed().len(), 0);
+        let yes = one_of(&w, "fix", OnStops::Ask, Terminal::Attached, true);
+        assert!(yes.result.is_ok());
+        assert_eq!(w.host.killed().len(), 1);
+    }
+
+    #[test]
+    fn all_idle_leaves_out_an_idle_agent_running_commands_and_says_so() {
+        let w = World::new();
+        w.agent("quiet", Doing::Idle);
+        w.agent("serving", Doing::Idle);
+        w.runs_commands("serving", &[("b1", "npm run dev")]);
+        let idle = all_of(&w, Policy::IdleOnly, Terminal::Absent, false);
+        assert!(idle.result.is_ok());
+        assert!(
+            idle.out.contains(
+                "skipped serving: running 1 background command, which a restart may stop: npm run dev"
+            ),
+            "{}",
+            idle.out
+        );
+        assert!(idle.out.contains("restarted quiet"), "{}", idle.out);
+        assert_eq!(w.host.killed().len(), 1);
+    }
+
+    #[test]
+    fn all_without_a_terminal_refuses_an_idle_agent_running_commands_unless_forced() {
+        let w = World::new();
+        w.agent("serving", Doing::Idle);
+        w.runs_commands("serving", &[("b1", "npm run dev")]);
+        let refused = all_of(&w, Policy::Ask, Terminal::Absent, false);
+        let error = refused.result.expect_err("refused").to_string();
+        assert!(
+            error.contains("serving: running 1 background command"),
+            "{error}"
+        );
+        assert_eq!(w.host.killed().len(), 0);
+        let forced = all_of(&w, Policy::Force, Terminal::Absent, false);
+        assert!(forced.result.is_ok());
+        assert_eq!(w.host.killed().len(), 1);
+    }
+
+    #[test]
+    fn all_idle_leaves_the_own_session_alone_when_it_runs_commands() {
+        let mut w = World::new();
+        w.own = Some(session("me"));
+        w.agent("me", Doing::Idle);
+        w.runs_commands("me", &[("b1", "npm run dev")]);
+        let r = all_of(&w, Policy::IdleOnly, Terminal::Absent, false);
+        assert_eq!(r.handed.len(), 0);
+        assert!(
+            r.out.contains("skipped me: running 1 background command"),
+            "{}",
+            r.out
+        );
+    }
+
+    #[test]
     fn the_arguments_become_one_target() {
         let name = Some(session("fix"));
         assert_eq!(
             Target::from_args(name.clone(), false, false, false),
-            Target::One(name.clone(), OnBusy::Ask)
+            Target::One(name.clone(), OnStops::Ask)
         );
         assert_eq!(
             Target::from_args(name.clone(), true, false, false),
-            Target::One(name, OnBusy::Force)
+            Target::One(name, OnStops::Force)
         );
         assert_eq!(
             Target::from_args(None, false, true, false),

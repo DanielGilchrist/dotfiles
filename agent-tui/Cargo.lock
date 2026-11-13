@@ -72,6 +72,7 @@ dependencies = [
  "portable-pty",
  "ratatui",
  "tui-term",
+ "unicode-width",
  "vt100",
 ]
 

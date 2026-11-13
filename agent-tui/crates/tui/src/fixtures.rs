@@ -438,12 +438,12 @@ pub fn booting() -> Session {
     }
 }
 
-/// A restart plan for `agent`, which `world` gets doing `doing`.
-pub fn restart_plan(
+/// What restarting `agent` comes to, which `world` gets, which `world` gets doing `doing`.
+pub fn restart_approval(
     world: &agent_core::testing::World,
     agent: &str,
     doing: agent_core::testing::Doing,
-) -> agent_core::ops::RestartPlan {
+) -> agent_core::ops::RestartApproval {
     let at = world.agent(agent, doing);
     agent_core::ops::plan_restart(world.svc(), at)
         .expect("plans")

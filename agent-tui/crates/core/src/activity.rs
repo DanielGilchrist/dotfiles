@@ -368,6 +368,14 @@ pub struct Background {
     pub description: Option<String>,
 }
 
+/// `1 background command`, `2 background commands`.
+pub fn counted_commands(count: usize) -> String {
+    match count {
+        1 => "1 background command".to_string(),
+        count => format!("{count} background commands"),
+    }
+}
+
 /// A background command's command line, with something visible in it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "String")]
@@ -545,6 +553,17 @@ impl BackgroundCommands {
                 .duration_since(tracked.seen)
                 .unwrap_or_else(|earlier| earlier.duration()),
         }
+    }
+
+    /// The commands `known` doesn't name, if any.
+    pub fn not_in(&self, known: &Self) -> Option<Self> {
+        let (longest, tracked) = &self.longest;
+        let by_id = std::iter::once((longest, tracked))
+            .chain(&self.rest)
+            .filter(|(id, _)| known.tracked(id).is_none())
+            .map(|(id, tracked)| (id.clone(), tracked.clone()))
+            .collect();
+        Self::of(self.listed, by_id)
     }
 
     /// When the listing that names them was made.

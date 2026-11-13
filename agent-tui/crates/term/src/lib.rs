@@ -1,8 +1,13 @@
+mod commands;
 mod escapes;
 mod input;
 mod pty;
 mod vt;
 
+pub use commands::{
+    CommandsShown, Remainder, ShownCommand, ShownName, command_lines, printable_id,
+    skipped_because, truncate_end,
+};
 pub use escapes::{Lines, printable, strip_escapes};
 pub use input::{CellPos, encode_key, encode_mouse};
 pub use pty::{Liveness, Terminal};

@@ -9,7 +9,11 @@ crossterm.workspace = true
 portable-pty.workspace = true
 ratatui.workspace = true
 tui-term.workspace = true
+unicode-width.workspace = true
 vt100.workspace = true
+
+[dev-dependencies]
+agent-core = { workspace = true, features = ["testing"] }
 
 [lints]
 workspace = true

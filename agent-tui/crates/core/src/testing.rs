@@ -918,6 +918,60 @@ impl World {
         Startable::worktree(HostedWorktree::admit(NAME_LIMIT, wt).expect("admitted"))
     }
 
+    /// `name` has background commands running, as `(id, command line)`, each
+    /// listed a minute ago and still.
+    pub fn runs_commands(&self, name: &str, commands: &[(&str, &str)]) {
+        let listed: Vec<_> = commands
+            .iter()
+            .map(|(id, line)| crate::activity::ListedCommand {
+                id: id.parse().expect("a visible id"),
+                command: line.parse().expect("a visible command"),
+                description: None,
+            })
+            .collect();
+        let session: SessionName = name.parse().expect("parses");
+        let mut activities = self.store.activities.lock().expect("lock");
+        let activity = activities.remove(&session).expect("an agent with activity");
+        activities.insert(
+            session,
+            crate::activity::testing::with_commands(
+                activity,
+                &listed,
+                std::time::Duration::from_secs(240),
+                SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000),
+            ),
+        );
+    }
+
+    /// `name` is given a prompt and starts working.
+    pub fn prompts(&self, name: &str) {
+        let session: SessionName = name.parse().expect("parses");
+        let mut activities = self.store.activities.lock().expect("lock");
+        let previous = activities.remove(&session).expect("an agent with activity");
+        let next = Activity::next(
+            Some(previous),
+            Reported::main(MainEvent::Prompted(Input::User("again".into()))),
+            SystemTime::UNIX_EPOCH,
+        );
+        activities.insert(session, next);
+    }
+
+    /// `name` asks the user a question.
+    pub fn asks(&self, name: &str) {
+        let session: SessionName = name.parse().expect("parses");
+        let mut activities = self.store.activities.lock().expect("lock");
+        let previous = activities.remove(&session).expect("an agent with activity");
+        let next = Activity::next(
+            Some(previous),
+            Reported::main(MainEvent::Common(crate::activity::Common::Asked {
+                question: "which one".into(),
+                about: crate::activity::About::Unknown,
+            })),
+            SystemTime::UNIX_EPOCH,
+        );
+        activities.insert(session, next);
+    }
+
     /// An agent whose session exited.
     pub fn exited(&self, name: &str) -> Startable {
         let at = self.agent(name, Doing::Idle);

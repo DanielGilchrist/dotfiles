@@ -17,14 +17,14 @@ use agent_core::names::{
     AgentName, BranchName, Checkout, NameError, NameLimit, Prompt, SessionName,
 };
 use agent_core::ops::{
-    Approved, End, Fleet, Hazardous, Interrupting, Interrupts, RemovalPlan, Restart, RestartPlan,
+    Approved, End, Fleet, Hazardous, RemovalPlan, Restart, RestartApproval, RestartPlan, Stops,
 };
 use agent_core::paths::{RepoRoot, Typed, typed_path};
 use agent_core::ports::{
     ActivityDetail, CallKind, Change, ClientId, FileState, HarnessId, Observation, Place, Progress,
     Readiness, Uncommitted, WorktreeFacts,
 };
-use agent_term::{Emulator, Terminal};
+use agent_term::{Emulator, ShownCommand, ShownName, Terminal};
 use ratatui::layout::Rect;
 
 use crate::cause::Cause;
@@ -115,47 +115,6 @@ pub enum Presence {
     Ended,
 }
 
-/// What a command is called in a row: text that is safe to draw and has
-/// something visible in it. It is only built from such text, so no row or
-/// card can show an empty name.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ShownName(String);
-
-impl ShownName {
-    /// The command's first line that shows once cleaned, else its id as it
-    /// shows once cleaned, else nothing.
-    pub fn of(id: &TaskId, command: &CommandLine) -> Option<Self> {
-        command_lines(command)
-            .into_iter()
-            .next()
-            .or_else(|| printable_id(id))
-            .map(Self)
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-/// What `command` says as lines that are safe to draw, none of them blank.
-/// Core's rule on what shows is applied to the cleaned text, since what is
-/// drawn is the cleaned text.
-pub fn command_lines(command: &CommandLine) -> Vec<String> {
-    command
-        .visible_lines()
-        .map(|line| agent_term::printable(line, agent_term::Lines::Flatten))
-        .map(|line| line.trim().to_string())
-        .filter(|line| agent_core::visible::has_visible(line))
-        .collect()
-}
-
-/// `id` as text that is safe to draw, when anything of it shows.
-pub fn printable_id(id: &TaskId) -> Option<String> {
-    let cleaned = agent_term::printable(id.as_str(), agent_term::Lines::Flatten);
-    let cleaned = cleaned.trim();
-    agent_core::visible::has_visible(cleaned).then(|| cleaned.to_string())
-}
-
 /// A background command as [2] and [0] show it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandItem<'a> {
@@ -172,12 +131,16 @@ pub struct CommandItem<'a> {
 impl<'a> CommandItem<'a> {
     /// `None` when nothing about the command can be drawn as its name.
     fn of(running: RunningCommand<'a>, listed: SystemTime) -> Option<Self> {
+        let ShownCommand {
+            name,
+            running_at_least,
+        } = ShownCommand::of(running)?;
         Some(Self {
             id: running.id,
-            name: ShownName::of(running.id, running.command)?,
+            name,
             command: running.command,
             description: running.description,
-            running_at_least: running.running_at_least,
+            running_at_least,
             listed,
             presence: Presence::Listed,
         })
@@ -1445,20 +1408,21 @@ pub enum Confirm {
 /// A restart that needs the user's word, because it would interrupt the
 /// agent or close the window another place shows it in.
 pub struct RestartAsk {
-    pub go: Result<Restart, Interrupting>,
+    pub go: RestartApproval,
     pub windows: Option<Windows>,
 }
 
 impl RestartAsk {
     pub fn plan(&self) -> &RestartPlan {
-        match &self.go {
-            Ok(go) => go.plan(),
-            Err(interrupting) => interrupting.plan(),
-        }
+        self.go.plan()
+    }
+
+    pub fn stops(&self) -> Option<&Stops> {
+        self.go.stops()
     }
 
     pub fn go(self) -> Restart {
-        self.go.unwrap_or_else(Interrupting::force)
+        self.go.proceed()
     }
 }
 
@@ -1483,8 +1447,9 @@ pub enum Finish {
         end: End,
         label: &'static str,
     },
-    /// It became busy after the user agreed, so it was left alone.
-    Skipped(Interrupts),
+    /// What the restart would stop that the user wasn't shown, found when
+    /// it ran, so it was left alone.
+    Skipped(Stops),
     Failed(Cause),
 }
 
@@ -1552,8 +1517,11 @@ impl Batch {
                     end: End::LeftExited,
                     ..
                 } => stopped += 1,
-                Finish::Skipped(interrupts) => {
-                    skipped.push(format!("skipped {name}: {}", interrupts.became()));
+                Finish::Skipped(stops) => {
+                    skipped.push(format!(
+                        "skipped {name}: {}",
+                        agent_term::skipped_because(stops)
+                    ));
                 }
                 Finish::Failed(cause) => failures.push(format!("{name}: {}", cause.first_line())),
             }

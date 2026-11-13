@@ -28,9 +28,7 @@ use crate::document::{
     BranchKey, CommitKey, DiffKey, Doc, FolderDocs, FolderKey, Hover, Key, Laid, Placed, Resolved,
 };
 use crate::log::first_printable_line;
-use crate::model::{
-    ActivityFiles, AgentStatus, Asking, LogKey, MainLayout, Model, Presence, printable_id,
-};
+use crate::model::{ActivityFiles, AgentStatus, Asking, LogKey, MainLayout, Model, Presence};
 use crate::review::{self, DiffView, LineInfo};
 
 /// [0]'s title, what its top border says on the right, its bottom-right
@@ -968,7 +966,7 @@ fn command_body(m: &Model, id: &TaskId, columns: usize, budget: usize) -> Option
         format!("running at least {}", age(item.running_at_least)),
         format!("as of {} ago", ago(item.listed, m.clock.wall)),
     ];
-    facts.extend(printable_id(item.id).map(|id| format!("id {id}")));
+    facts.extend(agent_term::printable_id(item.id).map(|id| format!("id {id}")));
     if item.presence == Presence::Ended {
         facts.insert(0, "no longer listed".to_string());
     }

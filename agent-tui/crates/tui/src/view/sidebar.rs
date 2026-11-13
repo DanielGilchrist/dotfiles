@@ -27,7 +27,7 @@ use crate::cause::Cause;
 use crate::model::{
     ActivityHit, ActivityRow, AgentStatus, Commands, Cursor, Doing, Drawn, Extent, Failure,
     FirstLine, Fold, ListScroll, Listed, Model, Panel as Focused, Placement, Presence, Pulse, Row,
-    Spot, Target, WorkRoom, command_lines,
+    Spot, Target, WorkRoom,
 };
 use crate::tree::{ChangesScope, Counts, Node, TreeRow};
 
@@ -261,7 +261,7 @@ impl<'a> Gist<'a> {
 /// several. The short form keeps the first word.
 fn commands_line(commands: &Commands<'_>, form: Form, width: usize) -> (String, Shown) {
     let longest = commands.longest();
-    let lines = command_lines(longest.command);
+    let lines = agent_term::command_lines(longest.command);
     let full = longest.name.as_str().to_string();
     let named = match form {
         Form::Long => full.clone(),
@@ -2981,17 +2981,14 @@ mod tests {
 
     fn restart_of_a_busy_agent(m: &Model) -> Overlay {
         let world = agent_core::testing::World::new();
-        let plan = crate::fixtures::restart_plan(&world, "payroll-fix", Doing::Working);
+        let plan = crate::fixtures::restart_approval(&world, "payroll-fix", Doing::Working);
         let windows = m
             .company(&name("payroll-fix"))
             .windows()
             .cloned()
             .or_else(|| Some(crate::model::Windows::unknown()));
         Overlay::Confirm(crate::model::Confirm::Restart(Box::new(
-            crate::model::RestartAsk {
-                go: plan.approve(),
-                windows,
-            },
+            crate::model::RestartAsk { go: plan, windows },
         )))
     }
 
@@ -3050,6 +3047,227 @@ mod tests {
                 assert!(all.contains(wanted), "{wanted:?} at {size:?}\n{all}");
             }
         }
+    }
+
+    fn restart_of_an_idle_agent_running(commands: &[(&str, &str)]) -> Overlay {
+        let world = agent_core::testing::World::new();
+        let at = world.agent("payroll-fix", Doing::Idle);
+        world.runs_commands("payroll-fix", commands);
+        let plan = agent_core::ops::plan_restart(world.svc(), at)
+            .expect("plans")
+            .elsewhere()
+            .expect("not own");
+        Overlay::Confirm(crate::model::Confirm::Restart(Box::new(
+            crate::model::RestartAsk {
+                go: plan,
+                windows: None,
+            },
+        )))
+    }
+
+    fn restart_of_an_idle_agent_with_commands(_: &Model) -> Overlay {
+        restart_of_an_idle_agent_running(&[
+            ("b1", "cargo test"),
+            ("b2", "two"),
+            ("b3", "three"),
+            ("b4", "four"),
+        ])
+    }
+
+    fn screen_of(overlay: Overlay, size: (u16, u16)) -> String {
+        let mut m = fleet(8);
+        m.overlay = overlay;
+        let terminal = render(&mut m, size);
+        screen(&terminal).join("\n")
+    }
+
+    #[test]
+    fn an_idle_agent_with_a_command_says_the_restart_may_stop_it_in_yellow() {
+        for size in SIZES {
+            let overlay = restart_of_an_idle_agent_running(&[("b1", "cargo test --workspace")]);
+            let shown = screen_of(overlay, size);
+            for wanted in [
+                "Restart payroll-fix?",
+                "may stop ⌁ cargo test --workspace · 4m+",
+                "y/⏎ restart",
+            ] {
+                assert!(shown.contains(wanted), "{wanted:?} at {size:?}\n{shown}");
+            }
+            assert!(!shown.contains("The activity stops"), "{shown}");
+        }
+    }
+
+    #[test]
+    fn the_command_lines_of_the_confirm_box_are_warning_coloured() {
+        let mut m = fleet(8);
+        m.overlay = restart_of_an_idle_agent_running(&[("b1", "cargo test")]);
+        let terminal = render(&mut m, (120, 40));
+        let buffer = terminal.backend().buffer();
+        let wanted = "may stop ⌁ cargo test · 4m+";
+        let (y, column) = (0..buffer.area.height)
+            .find_map(|y| {
+                let row: String = (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect();
+                Some((y, row.find(wanted).map(|at| row[..at].chars().count())?))
+            })
+            .unwrap_or_else(|| panic!("{wanted:?}\n{}", screen(&terminal).join("\n")));
+        let column = u16::try_from(column).expect("fits");
+        let width = u16::try_from(wanted.chars().count()).expect("fits");
+        assert!(
+            (column..column + width).all(|x| buffer[(x, y)].fg == m.palette.warning),
+            "{}",
+            screen(&terminal).join("\n")
+        );
+    }
+
+    fn lines_for(commands: &[(&str, &str)]) -> Vec<String> {
+        let listed: Vec<_> = commands
+            .iter()
+            .map(|(id, line)| agent_core::activity::ListedCommand {
+                id: id.parse().expect("visible"),
+                command: line.parse().expect("visible"),
+                description: None,
+            })
+            .collect();
+        let now = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
+        let activity = agent_core::activity::testing::with_commands(
+            agent_core::activity::Activity::fresh(now),
+            &listed,
+            std::time::Duration::from_secs(240),
+            now,
+        );
+        super::super::may_stop_lines(activity.commands().expect("listed"))
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn commands_past_the_few_named_are_counted_as_more() {
+        let lines = lines_for(&[
+            ("b1", "one"),
+            ("b2", "two"),
+            ("b3", "three"),
+            ("b4", "four"),
+            ("b5", "five"),
+        ]);
+        assert_eq!(lines.last().map(String::as_str), Some("… and 2 more"));
+    }
+
+    #[test]
+    fn unnameable_commands_beside_a_named_one_are_all_counted_as_more() {
+        let lines = lines_for(&[
+            ("b1", "cargo test"),
+            ("\u{1b}[m", "\u{1b}[0m"),
+            ("\u{200b}\u{1b}[m", "\u{1b}[1m"),
+        ]);
+        assert_eq!(
+            lines,
+            ["may stop ⌁ cargo test · 4m+", "… and 2 more"],
+            "two have no name, so the count is two"
+        );
+    }
+
+    #[test]
+    fn commands_that_all_print_nothing_are_counted_without_a_name() {
+        let lines = lines_for(&[("\u{1b}[m", "\u{1b}[0m"), ("\u{200b}\u{1b}[m", "\u{1b}[1m")]);
+        assert_eq!(lines, ["may stop ⌁ 2 background commands"]);
+        let one = lines_for(&[("\u{1b}[m", "\u{1b}[0m")]);
+        assert_eq!(one, ["may stop ⌁ 1 background command"]);
+    }
+
+    fn fleet_warning_of(setup: impl FnOnce(&agent_core::testing::World)) -> &'static str {
+        let world = agent_core::testing::World::new();
+        setup(&world);
+        super::super::fleet_warning(&crate::fixtures::restart_fleet(&world))
+    }
+
+    #[test]
+    fn the_fleet_warning_says_what_the_agents_would_stop() {
+        assert_eq!(
+            fleet_warning_of(|w| {
+                w.agent("a", Doing::Working);
+            }),
+            "Busy ones stop mid-activity. Conversations resume."
+        );
+        assert_eq!(
+            fleet_warning_of(|w| {
+                w.agent("a", Doing::Idle);
+                w.runs_commands("a", &[("b1", "npm run dev")]);
+            }),
+            "Busy ones may stop their commands. Conversations resume."
+        );
+        assert_eq!(
+            fleet_warning_of(|w| {
+                w.agent("a", Doing::Working);
+                w.agent("b", Doing::Idle);
+                w.runs_commands("b", &[("b1", "npm run dev")]);
+            }),
+            "Busy ones stop mid-activity and may stop their commands. Conversations resume."
+        );
+        assert_eq!(
+            fleet_warning_of(|w| {
+                w.agent("a", Doing::Idle);
+            }),
+            "Conversations resume."
+        );
+    }
+
+    #[test]
+    fn an_exited_agent_whose_process_is_idle_but_has_commands_says_so_in_the_fleet_box() {
+        let world = agent_core::testing::World::new();
+        world.ghost("ghost-1", Lurking::Survivor(SurvivorState::Idle));
+        world.runs_commands("ghost-1", &[("b1", "npm run dev")]);
+        let overlay = Overlay::Confirm(crate::model::Confirm::Restarts(Box::new(
+            crate::model::FleetAsk {
+                fleet: crate::fixtures::restart_fleet(&world),
+                elsewhere: 0,
+            },
+        )));
+        let shown = screen_of(overlay, (120, 40));
+        assert!(
+            shown.contains("ghost-1  running 1 background command, stays exited"),
+            "{shown}"
+        );
+        assert!(!shown.contains("fake working"), "{shown}");
+    }
+
+    #[test]
+    fn the_fleet_box_lists_an_idle_agent_running_commands_as_busy() {
+        let world = agent_core::testing::World::new();
+        world.agent("quiet", Doing::Idle);
+        world.agent("serving", Doing::Idle);
+        world.runs_commands("serving", &[("b1", "npm run dev"), ("b2", "cargo test")]);
+        let overlay = Overlay::Confirm(crate::model::Confirm::Restarts(Box::new(
+            crate::model::FleetAsk {
+                fleet: crate::fixtures::restart_fleet(&world),
+                elsewhere: 0,
+            },
+        )));
+        let shown = screen_of(overlay, (120, 40));
+        for wanted in [
+            "Restart 2 · 1 busy",
+            "⌁ serving  running 2 background commands",
+            "may stop their commands",
+            "i idle only (1)",
+        ] {
+            assert!(shown.contains(wanted), "{wanted:?}\n{shown}");
+        }
+    }
+
+    #[test]
+    fn a_long_command_is_cut_so_the_box_fits_the_smallest_screen() {
+        let long = format!("cargo test {}", "x".repeat(150));
+        let shown = screen_of(restart_of_an_idle_agent_running(&[("b1", &long)]), (80, 24));
+        assert!(shown.contains("may stop ⌁ cargo test x"), "{shown}");
+        assert!(shown.contains("… · 4m+"), "{shown}");
+        assert!(shown.contains("y/⏎ restart"), "{shown}");
     }
 
     fn checkout_of_a_link_to_another_repo(m: &Model) -> Overlay {
@@ -3119,7 +3337,7 @@ mod tests {
         let palette = SENTINEL;
         let ours = [1, 2, 3, 4, 5].map(|n| Some(Color::Rgb(n, n, n)));
         for size in SIZES {
-            let cases: [Surface; 7] = [
+            let cases: [Surface; 8] = [
                 (Focused::Agents, |_| Overlay::None),
                 (Focused::activity(), |_| Overlay::None),
                 (Focused::Agents, |_| {
@@ -3128,6 +3346,7 @@ mod tests {
                 (Focused::Agents, checkout_of_a_link_to_another_repo),
                 (Focused::Agents, restart_of_a_busy_agent),
                 (Focused::Agents, restart_of_the_fleet),
+                (Focused::Agents, restart_of_an_idle_agent_with_commands),
                 (command_row_of_a_delegating_agent(), |_| Overlay::None),
             ];
             for (panel, overlay) in cases {
@@ -5679,7 +5898,8 @@ mod tests {
                         };
                         let shown = frame_of_two(&mut m, size);
                         heading_on_top |= shown.first().is_some_and(|l| l.contains("commands"));
-                        crate::update::tick(&mut m);
+                        let clock = m.clock;
+                        crate::update::tick_at(&mut m, clock);
                         assert_eq!(
                             frame_of_two(&mut m, size),
                             shown,

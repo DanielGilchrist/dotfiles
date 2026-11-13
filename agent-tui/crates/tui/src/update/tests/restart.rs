@@ -1,8 +1,8 @@
 use super::*;
-use crate::fixtures::{fleet, in_nvim, restart_fleet, restart_plan};
+use crate::fixtures::{fleet, in_nvim, restart_approval, restart_fleet};
 use crate::model::{AgentStatus, Finish, Planning, Reach, StatusKind, Unsent};
 use agent_core::activity::Busy;
-use agent_core::ops::{End, Interrupts};
+use agent_core::ops::{End, Interrupts, Stops};
 use agent_core::ports::SurvivorState;
 use agent_core::ports::{SessionInfo, SessionStatus};
 use agent_core::testing::{Doing, Lurking, World};
@@ -43,7 +43,7 @@ fn planned(m: &mut Model, fakes: &World, doing: Doing) -> Vec<Effect> {
         m,
         Msg::RestartPlanned {
             ticket,
-            result: Ok(restart_plan(fakes, AGENT, doing)),
+            result: Ok(restart_approval(fakes, AGENT, doing)),
         },
     )
 }
@@ -90,7 +90,7 @@ fn a_busy_agent_is_confirmed_and_n_leaves_it_alone() {
     assert!(planned(&mut m, &fakes, Doing::Working).is_empty());
     assert!(matches!(
         &m.overlay,
-        Overlay::Confirm(Confirm::Restart(ask)) if ask.plan().interrupts() == Some(Interrupts::Session(Busy::Working))
+        Overlay::Confirm(Confirm::Restart(ask)) if ask.stops().and_then(Stops::activity) == Some(Interrupts::Session(Busy::Working))
     ));
     assert!(update(&mut m, key(KeyCode::Char('x'))).is_empty());
     assert!(
@@ -126,7 +126,7 @@ fn an_idle_agent_another_window_shows_is_still_confirmed() {
     let Overlay::Confirm(Confirm::Restart(ask)) = &m.overlay else {
         panic!("a confirmation");
     };
-    assert!(ask.plan().interrupts().is_none() && ask.windows.is_some());
+    assert!(ask.stops().is_none() && ask.windows.is_some());
     assert_eq!(restarts_in(&press(&mut m, 'y')), [AGENT]);
 }
 
@@ -140,7 +140,7 @@ fn a_plan_answering_a_cancelled_or_replaced_request_is_ignored() {
         &mut m,
         Msg::RestartPlanned {
             ticket: cancelled,
-            result: Ok(restart_plan(&World::new(), AGENT, Doing::Idle)),
+            result: Ok(restart_approval(&World::new(), AGENT, Doing::Idle)),
         },
     );
     assert!(late.is_empty());
@@ -153,7 +153,7 @@ fn a_plan_answering_a_cancelled_or_replaced_request_is_ignored() {
         &mut m,
         Msg::RestartPlanned {
             ticket: cancelled,
-            result: Ok(restart_plan(&World::new(), AGENT, Doing::Idle)),
+            result: Ok(restart_approval(&World::new(), AGENT, Doing::Idle)),
         },
     );
     assert!(stale.is_empty() && m.restarts.is_none());
@@ -352,7 +352,7 @@ fn failures_and_skips_are_in_the_summary_and_a_failure_makes_it_an_error() {
     restarted(
         &mut m,
         "two",
-        Finish::Skipped(Interrupts::Session(Busy::Working)),
+        Finish::Skipped(Stops::Activity(Interrupts::Session(Busy::Working))),
     );
     restarted(
         &mut m,
@@ -479,7 +479,7 @@ fn quitting_while_restarts_are_queued_asks_and_one_in_flight_does_not() {
 #[test]
 fn a_skipped_or_failed_restart_still_previews_the_selected_agent() {
     for finish in [
-        Finish::Skipped(Interrupts::Session(Busy::Working)),
+        Finish::Skipped(Stops::Activity(Interrupts::Session(Busy::Working))),
         Finish::Failed(Cause::message("still running".into())),
     ] {
         let mut m = selected();
@@ -541,5 +541,86 @@ fn a_session_agent_did_not_start_says_so_and_plans_nothing() {
     assert_eq!(
         m.status.as_ref().map(|s| s.text.as_str()),
         Some("can't restart stray: agent didn't start it")
+    );
+}
+
+fn plan_with_commands(m: &mut Model, commands: &[(&str, &str)]) -> Vec<Effect> {
+    let fakes = World::new();
+    let at = fakes.agent(AGENT, Doing::Idle);
+    fakes.runs_commands(AGENT, commands);
+    let plan = agent_core::ops::plan_restart(fakes.svc(), at)
+        .expect("plans")
+        .elsewhere()
+        .expect("not own");
+    let ticket = planning_ticket(m, &Planning::Restart(name(AGENT)));
+    update(
+        m,
+        Msg::RestartPlanned {
+            ticket,
+            result: Ok(plan),
+        },
+    )
+}
+
+#[test]
+fn an_idle_agent_running_commands_is_confirmed_instead_of_restarted_at_once() {
+    let mut m = selected();
+    press(&mut m, 'r');
+    assert!(plan_with_commands(&mut m, &[("b1", "cargo test")]).is_empty());
+    let Overlay::Confirm(Confirm::Restart(ask)) = &m.overlay else {
+        panic!("a confirmation");
+    };
+    assert_eq!(ask.stops().and_then(Stops::activity), None);
+    assert_eq!(
+        ask.stops()
+            .and_then(Stops::commands)
+            .map(|c| c.count().get()),
+        Some(1)
+    );
+    assert!(
+        m.restarts.is_none(),
+        "nothing restarts before the user says"
+    );
+    assert_eq!(restarts_in(&press(&mut m, 'y')), [AGENT]);
+}
+
+#[test]
+fn a_fleet_idle_only_leaves_out_an_idle_agent_running_commands() {
+    let mut m = selected();
+    let fakes = World::new();
+    fakes.agent("quiet", Doing::Idle);
+    fakes.agent("serving", Doing::Idle);
+    fakes.runs_commands("serving", &[("b1", "npm run dev")]);
+    press(&mut m, 'R');
+    let ticket = planning_ticket(&m, &Planning::Restarts);
+    update(
+        &mut m,
+        Msg::FleetPlanned {
+            ticket,
+            result: Ok(restart_fleet(&fakes)),
+        },
+    );
+    assert_eq!(restarts_in(&press(&mut m, 'i')), ["quiet"]);
+}
+
+#[test]
+fn a_restart_skipped_for_a_new_command_says_which_one() {
+    let fakes = World::new();
+    let at = fakes.agent("two", Doing::Idle);
+    fakes.runs_commands("two", &[("b1", "npm run dev")]);
+    let stops = agent_core::ops::plan_restart(fakes.svc(), at)
+        .expect("plans")
+        .elsewhere()
+        .expect("not own")
+        .stops()
+        .cloned()
+        .expect("it would stop its command");
+    let mut batch = crate::model::Batch::default();
+    batch.add([name("two")]);
+    batch.answer(&name("two"), Finish::Skipped(stops));
+    let m = selected();
+    assert_eq!(
+        batch.summary(m.clock.mono).text,
+        "skipped two: started running 1 background command: npm run dev"
     );
 }

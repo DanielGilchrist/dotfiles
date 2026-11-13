@@ -70,10 +70,10 @@ pub enum Error {
     OwnSession(SessionName),
     #[error("{0} changed since the removal was confirmed. Check it again")]
     Changed(SessionName),
-    #[error("{name} {}", .interrupts.became())]
-    Busy {
+    #[error("{name} {}", .stops.became())]
+    WouldStop {
         name: SessionName,
-        interrupts: Interrupts,
+        stops: Box<Stops>,
     },
     #[error("{label} is still running for {name} after it was stopped")]
     Survives {
@@ -1499,8 +1499,9 @@ pub fn merged(svc: Services<'_>) -> Result<Vec<(AgentWorktree, Option<BranchName
 
 mod restart;
 pub use restart::{
-    Approvals, End, Fleet, Interrupt, Interrupting, Interrupts, OnExited, OwnRestart, Patience,
-    Restart, RestartPlan, Restarted, plan_restart, plan_restarts, restart, restart_within,
+    Approvals, End, Fleet, Interrupts, OnExited, OwnRestart, Patience, Restart, RestartApproval,
+    RestartPlan, Restarted, StopPolicy, Stops, WouldStop, plan_restart, plan_restarts, restart,
+    restart_within,
 };
 
 #[cfg(test)]

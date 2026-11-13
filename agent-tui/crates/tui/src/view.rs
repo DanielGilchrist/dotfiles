@@ -17,8 +17,9 @@ use ratatui::{Frame, Terminal};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use agent_core::activity::Busy;
-use agent_core::ops::{End, Fleet, Interrupts, Restart};
+use agent_core::activity::{BackgroundCommands, Busy, counted_commands};
+use agent_core::ops::{End, Fleet, Interrupts, Restart, Stops, WouldStop};
+use agent_term::{CommandsShown, Remainder, truncate_end};
 
 use crate::cause::Cause;
 use crate::keymap::{self, Situation};
@@ -88,28 +89,6 @@ fn bold() -> Style {
 /// Marks background commands: after a name as `⌁n`, on a card's second line,
 /// before each of [2]'s command rows and in the activity's status row.
 const COMMAND_GLYPH: &str = "⌁";
-
-/// Truncate keeping the start, measured in display width.
-fn truncate_end(text: &str, width: usize) -> String {
-    if text.width() <= width {
-        return text.to_string();
-    }
-    if width == 0 {
-        return String::new();
-    }
-    let mut out = String::new();
-    let mut used = 0;
-    for c in text.chars() {
-        let w = c.width().unwrap_or(0);
-        if used + w + 1 > width {
-            break;
-        }
-        used += w;
-        out.push(c);
-    }
-    out.push('…');
-    out
-}
 
 /// Truncate keeping the end, for paths.
 fn truncate_start(text: &str, width: usize) -> String {
@@ -1647,15 +1626,16 @@ fn confirm_card(confirm: &Confirm, now: SystemTime) -> ConfirmCard {
     }
 }
 
-fn interrupt_glyph(interrupts: Interrupts, now: SystemTime) -> Span<'static> {
-    match interrupts {
-        Interrupts::Session(Busy::Asking) => {
+fn interrupt_glyph(stops: &Stops, now: SystemTime) -> Span<'static> {
+    match stops.activity() {
+        Some(Interrupts::Session(Busy::Asking)) => {
             Span::styled("◆", warning().add_modifier(Modifier::BOLD))
         }
-        Interrupts::Session(Busy::Delegating) => Span::raw("↳"),
-        Interrupts::Session(Busy::Working | Busy::Booting) | Interrupts::Survivor => {
+        Some(Interrupts::Session(Busy::Delegating)) => Span::raw("↳"),
+        Some(Interrupts::Session(Busy::Working | Busy::Booting) | Interrupts::Survivor) => {
             Span::raw(spinner(now))
         }
+        None => Span::raw(COMMAND_GLYPH),
     }
 }
 
@@ -1671,13 +1651,37 @@ fn go_ahead(key: &'static str, what: &str) -> Vec<Span<'static>> {
     ]
 }
 
+/// What a restart may stop of the commands: a line for each that can be
+/// named, and the rest counted so the total is never understated.
+fn may_stop_lines(commands: &BackgroundCommands) -> Vec<Line<'static>> {
+    let shown = CommandsShown::of(commands);
+    let named = shown.named.iter().map(|command| {
+        format!(
+            "may stop {COMMAND_GLYPH} {} · {}",
+            command.label(),
+            at_least(command.running_at_least)
+        )
+    });
+    let remainder = shown.remainder().map(|remainder| match remainder {
+        Remainder::More(count) => format!("… and {count} more"),
+        Remainder::Unnamed(count) => {
+            format!("may stop {COMMAND_GLYPH} {}", counted_commands(count))
+        }
+    });
+    named
+        .chain(remainder)
+        .map(|text| Line::styled(text, warning()))
+        .collect()
+}
+
 fn restart_card(ask: &RestartAsk, now: SystemTime) -> Card {
     let plan = ask.plan();
+    let stops = ask.stops();
     let mut body = Vec::new();
-    match plan.interrupts() {
-        Some(interrupts) => {
+    match stops.and_then(|stops| Some((stops, stops.activity()?))) {
+        Some((stops, interrupts)) => {
             body.push(Line::from(vec![
-                interrupt_glyph(interrupts, now),
+                interrupt_glyph(stops, now),
                 Span::raw(format!(" {}", interrupts.label())),
             ]));
             body.push(Line::raw("The activity stops. The conversation resumes."));
@@ -1686,6 +1690,9 @@ fn restart_card(ask: &RestartAsk, now: SystemTime) -> Card {
             "Restarts {}. The conversation resumes.",
             plan.label()
         ))),
+    }
+    if let Some(commands) = stops.and_then(Stops::commands) {
+        body.extend(may_stop_lines(commands));
     }
     if let Some(windows) = &ask.windows {
         body.push(Line::styled(
@@ -1702,24 +1709,28 @@ const BUSY_LISTED: usize = 5;
 /// One row per busy agent, up to [`BUSY_LISTED`].
 fn busy_rows(fleet: &Fleet, now: SystemTime) -> Vec<Line<'static>> {
     let mut rows: Vec<Line<'static>> = fleet
-        .busy()
+        .would_stop()
         .iter()
         .take(BUSY_LISTED)
         .map(|b| {
             let plan = b.plan();
+            let stops = b.stops();
             let what = match plan.end() {
-                End::Started => b.interrupts().label().to_string(),
-                End::LeftExited => format!("{} working, stays exited", plan.label()),
+                End::Started => stops.label(),
+                End::LeftExited => format!(
+                    "{}, stays exited",
+                    stops.label_naming(|_| format!("{} working", plan.label()))
+                ),
             };
             Line::from(vec![
-                interrupt_glyph(b.interrupts(), now),
+                interrupt_glyph(b.stops(), now),
                 Span::raw(format!(" {}  {what}", plan.name())),
             ])
         })
         .collect();
-    if fleet.busy().len() > BUSY_LISTED {
+    if fleet.would_stop().len() > BUSY_LISTED {
         rows.push(Line::styled(
-            format!("+{} more busy", fleet.busy().len() - BUSY_LISTED),
+            format!("+{} more busy", fleet.would_stop().len() - BUSY_LISTED),
             dim(),
         ));
     }
@@ -1765,20 +1776,30 @@ fn fleet_summary(ask: &FleetAsk) -> Option<String> {
     (!parts.is_empty()).then(|| format!("{}.", parts.join(". ")))
 }
 
+/// What stopping the agents that would stop something costs, by what they
+/// would stop, and that conversations resume.
+fn fleet_warning(fleet: &Fleet) -> &'static str {
+    let stops = || fleet.would_stop().iter().map(WouldStop::stops);
+    match (
+        stops().any(|stops| stops.activity().is_some()),
+        stops().any(|stops| stops.commands().is_some()),
+    ) {
+        (false, false) => "Conversations resume.",
+        (true, false) => "Busy ones stop mid-activity. Conversations resume.",
+        (false, true) => "Busy ones may stop their commands. Conversations resume.",
+        (true, true) => {
+            "Busy ones stop mid-activity and may stop their commands. Conversations resume."
+        }
+    }
+}
+
 fn restarts_card(ask: &FleetAsk, now: SystemTime) -> Card {
     let fleet = &ask.fleet;
     let mut body = busy_rows(fleet, now);
     body.extend(fleet_summary(ask).map(Line::raw));
-    body.push(Line::styled(
-        if fleet.busy().is_empty() {
-            "Conversations resume."
-        } else {
-            "Busy ones stop mid-activity. Conversations resume."
-        },
-        dim(),
-    ));
+    body.push(Line::styled(fleet_warning(fleet), dim()));
     let mut keys = go_ahead("y", &format!("restart {}", fleet.total()));
-    if !fleet.busy().is_empty() {
+    if !fleet.would_stop().is_empty() {
         keys.push(Span::raw("i"));
         keys.push(Span::styled(
             format!(" idle only ({})", fleet.idle().len()),

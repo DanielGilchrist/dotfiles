@@ -1,5 +1,5 @@
 use agent_core::names::SessionName;
-use agent_core::ops::{Fleet, Interrupt, Restart, RestartPlan};
+use agent_core::ops::{Fleet, Restart, RestartApproval, StopPolicy};
 
 use super::{Effect, Job, drop_connection_to, waiting_on};
 use crate::cause::Cause;
@@ -56,22 +56,22 @@ pub(super) fn request_restarts(m: &mut Model) -> Vec<Effect> {
 pub(super) fn on_restart_planned(
     m: &mut Model,
     ticket: Ticket,
-    result: Result<RestartPlan, Cause>,
+    result: Result<RestartApproval, Cause>,
 ) -> Vec<Effect> {
     if !waiting_on(m, ticket, |p| matches!(p, Planning::Restart(_))) {
         return Vec::new();
     }
     m.overlay = Overlay::None;
-    let plan = match result {
-        Ok(plan) => plan,
+    let approval = match result {
+        Ok(approval) => approval,
         Err(e) => {
             m.error(e);
             return Vec::new();
         }
     };
-    let windows = m.company(&plan.name()).windows().cloned();
-    match (plan.approve(), windows) {
-        (Ok(go), None) => begin(m, vec![go]),
+    let windows = m.company(&approval.plan().name()).windows().cloned();
+    match (approval, windows) {
+        (RestartApproval::Free(go), None) => begin(m, vec![go]),
         (go, windows) => {
             m.overlay = Overlay::Confirm(Confirm::Restart(Box::new(RestartAsk { go, windows })));
             Vec::new()
@@ -106,7 +106,7 @@ pub(super) fn on_fleet_planned(
         .idle()
         .iter()
         .map(Restart::name)
-        .chain(fleet.busy().iter().map(|b| b.plan().name()))
+        .chain(fleet.would_stop().iter().map(|b| b.plan().name()))
         .filter(|name| m.company(name).is_elsewhere())
         .count();
     m.overlay = Overlay::Confirm(Confirm::Restarts(Box::new(FleetAsk { fleet, elsewhere })));
@@ -124,11 +124,11 @@ pub(super) fn on_restart_key(
     match (confirm, key) {
         (Confirm::Restart(ask), Char('y') | Enter) => begin(m, vec![ask.go()]),
         (Confirm::Restarts(ask), Char('y') | Enter) => {
-            let approvals = ask.fleet.approve(Interrupt::Allow);
+            let approvals = ask.fleet.approve(StopPolicy::Allow);
             begin(m, approvals.restarts)
         }
-        (Confirm::Restarts(ask), Char('i')) if !ask.fleet.busy().is_empty() => {
-            let approvals = ask.fleet.approve(Interrupt::Skip);
+        (Confirm::Restarts(ask), Char('i')) if !ask.fleet.would_stop().is_empty() => {
+            let approvals = ask.fleet.approve(StopPolicy::Skip);
             begin(m, approvals.restarts)
         }
         (confirm, _) => {

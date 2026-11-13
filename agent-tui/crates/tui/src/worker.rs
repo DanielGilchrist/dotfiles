@@ -14,7 +14,7 @@ use agent_core::discover;
 use agent_core::model::{Removable, Running, Snapshot, Startable};
 use agent_core::names::{AgentName, Prompt, SessionName};
 use agent_core::ops::{
-    self, Approved, Backend, Fleet, Launch, RemovalPlan, Removed, Restart, RestartPlan,
+    self, Approved, Backend, Fleet, Launch, RemovalPlan, Removed, Restart, RestartApproval,
 };
 use agent_core::paths::RepoRoot;
 use agent_core::ports::{
@@ -68,7 +68,7 @@ pub enum Msg {
     },
     RestartPlanned {
         ticket: Ticket,
-        result: Result<RestartPlan, Cause>,
+        result: Result<RestartApproval, Cause>,
     },
     FleetPlanned {
         ticket: Ticket,
@@ -834,7 +834,7 @@ fn spawn_restarter(
                     end: restarted.end,
                     label: restarted.label,
                 },
-                Err(ops::Error::Busy { interrupts, .. }) => Finish::Skipped(interrupts),
+                Err(ops::Error::WouldStop { stops, .. }) => Finish::Skipped(*stops),
                 Err(e) => Finish::Failed(Cause::of(&e)),
             };
             let restarted = Msg::Restarted { name, finish };
