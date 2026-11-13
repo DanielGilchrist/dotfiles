@@ -57,6 +57,16 @@ impl KeyField {
     }
 }
 
+impl KeyField {
+    /// The line that sets this field to `spec` in a `[keys]` table.
+    pub fn assignment(self, spec: KeySpec) -> String {
+        format!(
+            "{self} = {}",
+            toml::Value::String(spec.written().to_string())
+        )
+    }
+}
+
 impl fmt::Display for KeyField {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
@@ -190,10 +200,20 @@ impl Sources {
     }
 }
 
+/// Whether the config file has a `[keys]` table, so the first-run hint can
+/// tell a user who never chose keys from one who did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum KeysTable {
+    #[default]
+    Absent,
+    Present,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Config {
     pub actions: Actions,
     pub keys: Keys,
+    pub keys_table: KeysTable,
     pub sources: Sources,
     pub theme: Theme,
 }
@@ -243,8 +263,7 @@ pub enum SourceError {
 struct RawConfig {
     #[serde(default)]
     action: Vec<RawAction>,
-    #[serde(default)]
-    keys: RawKeys,
+    keys: Option<RawKeys>,
     #[serde(default)]
     repos: RawRepos,
     #[serde(default)]
@@ -359,9 +378,15 @@ impl std::str::FromStr for Config {
 
     fn from_str(s: &str) -> Result<Self, ConfigError> {
         let raw: RawConfig = toml::from_str(s)?;
+        let keys_table = if raw.keys.is_some() {
+            KeysTable::Present
+        } else {
+            KeysTable::Absent
+        };
         Ok(Self {
             actions: Actions::parse(raw.action)?,
-            keys: raw.keys.parse()?,
+            keys: raw.keys.unwrap_or_default().parse()?,
+            keys_table,
             sources: raw.repos.parse()?,
             theme: raw.theme.parse()?,
         })
@@ -427,6 +452,27 @@ mod tests {
                 .starts_with("keys.next_agent: \"x\" is a key on its own")
         );
         assert!(err("[keys]\nnext_agent = ''").starts_with("keys.next_agent: is empty"));
+    }
+
+    #[test]
+    fn a_config_knows_whether_it_has_a_keys_table() {
+        let config: Config = "".parse().expect("parses");
+        assert_eq!(config.keys_table, KeysTable::Absent);
+        let config: Config = "[theme]\naccent = 'red'".parse().expect("parses");
+        assert_eq!(config.keys_table, KeysTable::Absent);
+        let config: Config = "[keys]".parse().expect("parses");
+        assert_eq!(config.keys_table, KeysTable::Present);
+        assert_eq!(config.keys, Keys::default());
+    }
+
+    #[test]
+    fn an_assignment_quotes_the_spec_so_the_config_reads_back_a_key_with_a_quote_or_backslash() {
+        for text in ["ctrl-\\", "alt-\"", "alt-'"] {
+            let spec: KeySpec = text.parse().expect("parses");
+            let line = KeyField::Hop(Hop::Next).assignment(spec);
+            let config: Config = format!("[keys]\n{line}\n").parse().expect("parses");
+            assert_eq!(config.keys.hop(Hop::Next), Binding::On(spec), "{line}");
+        }
     }
 
     #[test]

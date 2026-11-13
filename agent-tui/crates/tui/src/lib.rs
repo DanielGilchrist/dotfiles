@@ -1,11 +1,13 @@
 mod cause;
 mod document;
+mod hint;
 mod keymap;
 mod keyspec;
 mod log;
 mod model;
 mod output;
 mod palette;
+pub mod probe;
 mod review;
 mod touched;
 mod track;
@@ -145,9 +147,15 @@ enum InputCtl {
     Resume,
 }
 
+/// What the TUI asks a kitty-protocol terminal to report, and `agent keys`
+/// asks for the same so it hears what the TUI would.
+pub(crate) const REPORTED_KEYS: KeyboardEnhancementFlags =
+    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+        .union(KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS);
+
 /// Asks the terminal once. It needs raw mode, and it is asked before
-/// the input thread takes the tty.
-fn detect_keyboard() -> Result<Keyboard> {
+/// the input thread takes the tty. Keys typed while it waits are eaten.
+pub(crate) fn detect_keyboard() -> Result<Keyboard> {
     enable_raw_mode()?;
     Ok(if supports_keyboard_enhancement().unwrap_or(false) {
         Keyboard::Disambiguated
@@ -168,10 +176,7 @@ fn enter_screen(keys: Keyboard) -> Result<()> {
     if matches!(keys, Keyboard::Disambiguated) {
         execute!(
             std::io::stdout(),
-            PushKeyboardEnhancementFlags(
-                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                    | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
-            )
+            PushKeyboardEnhancementFlags(REPORTED_KEYS)
         )?;
     }
     Ok(())
@@ -193,6 +198,16 @@ fn leave_screen(keys: Keyboard) {
     let _ = disable_raw_mode();
 }
 
+/// Runs `restore` before the panic message, so the message isn't printed
+/// onto a screen the terminal is still holding.
+pub(crate) fn restore_on_panic(restore: impl Fn() + Send + Sync + 'static) {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        restore();
+        previous(info);
+    }));
+}
+
 /// Restores the terminal however the TUI exits, including by panic.
 struct ScreenGuard {
     keys: Keyboard,
@@ -201,11 +216,7 @@ struct ScreenGuard {
 impl ScreenGuard {
     fn enter() -> Result<Self> {
         let keys = detect_keyboard()?;
-        let previous = std::panic::take_hook();
-        std::panic::set_hook(Box::new(move |info| {
-            leave_screen(keys);
-            previous(info);
-        }));
+        restore_on_panic(move || leave_screen(keys));
         let guard = Self { keys };
         enter_screen(keys)?;
         Ok(guard)
@@ -351,6 +362,17 @@ impl Runtime {
                 .send(go)
                 .ok()
                 .context("the restart worker stopped")?;
+        }
+        Ok(())
+    }
+
+    fn start_keys(&self, m: &mut Model, keyboard: Keyboard, config: &Config) -> Result<()> {
+        use_keys(m, keyboard, config.keys);
+        let hint = hint::KeysHint::at_startup(config.keys_table, &*self.backend.store);
+        for effect in hint::announce(m, hint) {
+            if let Effect::Job(job) = effect {
+                self.send(job)?;
+            }
         }
         Ok(())
     }
@@ -728,8 +750,8 @@ fn event_loop(
         .ok()
         .flatten()
         .map(model::Follow::Restored);
+    rt.start_keys(&mut m, keys, &options.config)?;
     m.actions = options.config.actions;
-    use_keys(&mut m, keys, options.config.keys);
     m.palette = palette;
     let mut last_refresh = Instant::now();
     let mut last_selection = None;

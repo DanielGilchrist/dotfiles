@@ -7,7 +7,7 @@ use std::time::SystemTime;
 use agent_core::activity::{Activity, Going, Reported, Stopped};
 use agent_core::names::SessionName;
 use agent_core::paths::{PathError, RepoRoot, home};
-use agent_core::ports::{AgentRecord, Listing, Store, StoreError, Unlisting};
+use agent_core::ports::{AgentRecord, Hint, Listing, Store, StoreError, Unlisting};
 use nix::fcntl::{Flock, FlockArg};
 
 /// Pins and agent records under `$XDG_STATE_HOME/agent`. Read-modify-write
@@ -58,6 +58,10 @@ impl FsStore {
 
     fn repos_path(&self) -> PathBuf {
         self.dir.join("repos")
+    }
+
+    fn hint_path(&self, hint: Hint) -> PathBuf {
+        self.dir.join("hints").join(hint.name())
     }
 
     fn selection_path(&self) -> PathBuf {
@@ -239,6 +243,15 @@ impl FsStore {
 }
 
 impl Store for FsStore {
+    fn hint_shown(&self, hint: Hint) -> Result<bool, StoreError> {
+        let path = self.hint_path(hint);
+        path.try_exists().map_err(io_err(&path))
+    }
+
+    fn mark_hint_shown(&self, hint: Hint) -> Result<(), StoreError> {
+        write_atomic(&self.hint_path(hint), b"")
+    }
+
     fn note(&self, message: &str) {
         self.log(message);
     }
@@ -474,6 +487,17 @@ mod tests {
             store.pinned().expect("succeeds"),
             [] as [agent_core::names::SessionName; 0]
         );
+    }
+
+    #[test]
+    fn a_hint_is_shown_until_it_is_marked() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let store = FsStore::new(dir.path().to_path_buf());
+        assert!(!store.hint_shown(Hint::Keys).expect("succeeds"));
+        store.mark_hint_shown(Hint::Keys).expect("succeeds");
+        assert!(store.hint_shown(Hint::Keys).expect("succeeds"));
+        let again = FsStore::new(dir.path().to_path_buf());
+        assert!(again.hint_shown(Hint::Keys).expect("succeeds"));
     }
 
     #[test]

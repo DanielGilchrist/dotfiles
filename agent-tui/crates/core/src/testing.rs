@@ -14,11 +14,11 @@ use crate::ops::Services;
 use crate::paths::{AgentWorktree, Layout, RepoRoot};
 use crate::ports::{
     AgentRecord, BranchLog, BranchState, Change, Checkout, ClientControl, Compared, DiffBase,
-    Fetch, FileDiff, Forge, Harness, HarnessError, HarnessId, Harnesses, HostError, LaunchCtx,
-    Listing, LocalBranch, Lookup, Observation, PaneCommand, PendingPrompt, Probe, PullRequestHead,
-    RemoteBranch, RepoWorktrees, Seen, SessionHost, SessionInfo, SessionStatus, Stop, Store,
-    StoreError, Survivor, SurvivorState, TranscriptStamp, Unlisting, Vcs, WorktreeFacts,
-    WorktreeStart,
+    Fetch, FileDiff, Forge, Harness, HarnessError, HarnessId, Harnesses, Hint, HostError,
+    LaunchCtx, Listing, LocalBranch, Lookup, Observation, PaneCommand, PendingPrompt, Probe,
+    PullRequestHead, RemoteBranch, RepoWorktrees, Seen, SessionHost, SessionInfo, SessionStatus,
+    Stop, Store, StoreError, Survivor, SurvivorState, TranscriptStamp, Unlisting, Vcs,
+    WorktreeFacts, WorktreeStart,
 };
 use crate::process::{CommandError, LaunchSpec};
 
@@ -505,6 +505,7 @@ pub struct MemStore {
     pub last_selected: Mutex<Option<SessionName>>,
     pub activities: Mutex<HashMap<SessionName, Activity>>,
     pub repos: Mutex<Vec<RepoRoot>>,
+    pub hints_shown: Mutex<Vec<Hint>>,
     /// Applying a report fails, as when the state directory can't be written.
     pub report_fails: Mutex<bool>,
     pub notes: Mutex<Vec<String>>,
@@ -521,6 +522,15 @@ impl MemStore {
 }
 
 impl Store for MemStore {
+    fn hint_shown(&self, hint: Hint) -> Result<bool, StoreError> {
+        Ok(self.hints_shown.lock().expect("lock").contains(&hint))
+    }
+
+    fn mark_hint_shown(&self, hint: Hint) -> Result<(), StoreError> {
+        self.hints_shown.lock().expect("lock").push(hint);
+        Ok(())
+    }
+
     fn note(&self, message: &str) {
         self.notes.lock().expect("lock").push(message.to_string());
     }

@@ -1465,7 +1465,26 @@ pub enum StoreError {
     Corrupt { path: PathBuf, detail: String },
 }
 
+/// A one-time message to the user, shown once per state directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Hint {
+    /// Where to choose the leave key and the agent chords.
+    Keys,
+}
+
+impl Hint {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Keys => "keys",
+        }
+    }
+}
+
 pub trait Store: Send + Sync {
+    /// Whether `hint` was shown before.
+    fn hint_shown(&self, hint: Hint) -> Result<bool, StoreError>;
+    /// Records that `hint` was shown.
+    fn mark_hint_shown(&self, hint: Hint) -> Result<(), StoreError>;
     /// Pinned sessions in pin order.
     fn pinned(&self) -> Result<Vec<SessionName>, StoreError>;
     /// Pins `name` last. Already pinned is fine.

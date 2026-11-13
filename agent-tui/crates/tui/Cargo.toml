@@ -17,6 +17,7 @@ unicode-width.workspace = true
 
 [dev-dependencies]
 agent-core = { workspace = true, features = ["testing"] }
+portable-pty.workspace = true
 
 [lints]
 workspace = true

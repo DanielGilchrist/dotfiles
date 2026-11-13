@@ -52,6 +52,13 @@ enum Cmd {
         #[arg(long)]
         headless: bool,
     },
+    /// Press a key to see whether it works as the leave key or an agent chord in this
+    /// terminal, and what to put in the config for it
+    Keys {
+        /// Say what a config key means and what collides with it, without a terminal
+        #[arg(long, value_name = "KEY")]
+        explain: Option<String>,
+    },
     /// Print shell completions
     Completions {
         #[arg(value_enum)]
@@ -202,9 +209,9 @@ fn backend() -> Result<Backend> {
     })
 }
 
-/// `$XDG_CONFIG_HOME/agent/config.toml` (default `~/.config`), or the
-/// defaults if there's no file.
-fn config() -> Result<Config> {
+/// `$XDG_CONFIG_HOME/agent/config.toml`, where `$XDG_CONFIG_HOME` defaults
+/// to `~/.config`.
+fn config_path() -> Result<PathBuf> {
     let dir = match std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .filter(|d| d.is_absolute())
@@ -212,7 +219,12 @@ fn config() -> Result<Config> {
         Some(dir) => dir,
         None => paths::home()?.join(".config"),
     };
-    let path = dir.join("agent").join("config.toml");
+    Ok(dir.join("agent").join("config.toml"))
+}
+
+/// The config file's contents, or the defaults if there's no file.
+fn config() -> Result<Config> {
+    let path = config_path()?;
     match std::fs::read_to_string(&path) {
         Ok(text) => text
             .parse()
@@ -743,6 +755,18 @@ fn prompt(
     Ok(())
 }
 
+fn keys(explain: Option<&str>) -> Result<()> {
+    match explain {
+        Some(key) => {
+            println!("{}", agent_tui::probe::explain(key)?);
+            Ok(())
+        }
+        None => agent_tui::probe::run(agent_tui::probe::Options {
+            config_path: config_path()?,
+        }),
+    }
+}
+
 fn main() -> Result<()> {
     let mut args = std::env::args_os().skip(1);
     if args.next().is_some_and(|first| first == "event") {
@@ -762,6 +786,7 @@ fn main() -> Result<()> {
             emulator: agent_term::vt100,
             backend: Arc::new(backend),
         }),
+        Cmd::Keys { explain } => keys(explain.as_deref()),
         Cmd::Repo { repo, headless } => {
             repo_session(svc, repo, Frontend::from_flag(headless), harness)
         }

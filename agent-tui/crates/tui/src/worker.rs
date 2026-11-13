@@ -18,8 +18,8 @@ use agent_core::ops::{
 };
 use agent_core::paths::RepoRoot;
 use agent_core::ports::{
-    ActivityDetail, ClientId, CommandOutput, FileDiff, HarnessId, HostError, Log, Observation,
-    Place, Probe, TranscriptStamp, Window,
+    ActivityDetail, ClientId, CommandOutput, FileDiff, HarnessId, Hint, HostError, Log,
+    Observation, Place, Probe, TranscriptStamp, Window,
 };
 use crossterm::event::{KeyEvent, MouseEvent};
 
@@ -244,6 +244,8 @@ pub enum Job {
     ListRepo(PathBuf),
     /// Remember the selection for the next start.
     Select(SessionName),
+    /// Record that a one-time hint was shown.
+    MarkHint(Hint),
     /// Look at the filesystem for a typed repo path.
     CheckDir(PathBuf),
     /// Close the other windows showing `name`, which moves it here.
@@ -276,6 +278,7 @@ impl Job {
             | Self::PlanRestart { .. }
             | Self::PlanRestarts { .. }
             | Self::Select(_)
+            | Self::MarkHint(_)
             | Self::CheckDir(_)
             | Self::CloseElsewhere { .. }
             | Self::Observe { .. }
@@ -1071,6 +1074,7 @@ fn run(backend: &Arc<Backend>, job: Job, msgs: &Sender<Msg>) -> Option<Msg> {
         },
         Job::Acknowledge(name) => return report_failure(svc.store.acknowledge(&name)),
         Job::Select(name) => return report_failure(svc.store.set_last_selected(&name)),
+        Job::MarkHint(hint) => return report_failure(svc.store.mark_hint_shown(hint)),
         Job::Pin(name) => Msg::Done(
             svc.store
                 .pin(&name)

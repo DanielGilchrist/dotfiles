@@ -165,6 +165,60 @@ impl KeySpec {
     pub fn needs_kitty(self) -> bool {
         matches!(self, Self::Kitty(_))
     }
+
+    pub fn written(self) -> Written {
+        Written(self)
+    }
+
+    /// Every spec a key press that types `c` could be: the ones named with
+    /// it, and the control keys a legacy terminal reports as it (`ctrl-]`
+    /// arrives as `Ctrl+5`). Which one a terminal would match is the
+    /// caller's to say.
+    pub fn on_character(c: char) -> Vec<Self> {
+        let text = c.to_string();
+        let control = if c == ' ' { "space" } else { text.as_str() };
+        let legacy = match c {
+            '4' => Some("\\"),
+            '5' => Some("]"),
+            '6' => Some("^"),
+            '7' => Some("_"),
+            _ => None,
+        };
+        let lower = c.to_ascii_lowercase();
+        let mut specs: Vec<Self> = Vec::new();
+        specs.extend(ctrl(control, control).ok());
+        specs.extend(legacy.and_then(|legacy| ctrl(legacy, legacy).ok()));
+        specs.extend(alt(&text, &text).ok());
+        specs.extend(glyph(&text).map(|glyph| Self::Kitty(KittyKey::Super(glyph))));
+        if lower.is_ascii_lowercase() {
+            specs.push(Self::Kitty(KittyKey::CtrlShift(Letter(lower))));
+        }
+        specs
+    }
+
+    pub fn function(number: u8) -> Option<Self> {
+        function(&number.to_string()).map(Self::Function)
+    }
+}
+
+/// A spec as the config writes it, which parses back to the same spec.
+pub struct Written(KeySpec);
+
+impl fmt::Display for Written {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            KeySpec::Ctrl(Control::Space) => f.write_str("ctrl-space"),
+            KeySpec::Ctrl(control) => write!(f, "ctrl-{}", control.char()),
+            KeySpec::Alt(glyph) => write!(f, "alt-{}", glyph.char()),
+            KeySpec::Function(function) => write!(f, "f{}", function.number()),
+            KeySpec::Kitty(KittyKey::CtrlShift(letter)) => {
+                write!(f, "ctrl-shift-{}", letter.char())
+            }
+            KeySpec::Kitty(KittyKey::Super(glyph)) => write!(f, "super-{}", glyph.char()),
+            KeySpec::Kitty(KittyKey::Ctrl(shadowed)) => write!(f, "ctrl-{}", shadowed.char()),
+            KeySpec::Kitty(KittyKey::Alt(starter)) => write!(f, "alt-{}", starter.char()),
+        }
+    }
 }
 
 /// A key the user may turn off: `none` or `off` in the config.
@@ -390,6 +444,45 @@ mod tests {
         for (text, expected) in table {
             assert_eq!(parsed(text).to_string(), expected, "{text}");
         }
+    }
+
+    #[test]
+    fn a_spec_is_written_in_the_form_that_parses_back_to_it() {
+        for text in [
+            "ctrl-]",
+            "ctrl-\\",
+            "ctrl-^",
+            "ctrl-_",
+            "ctrl-g",
+            "ctrl-space",
+            "alt-,",
+            "alt-X",
+            "f1",
+            "f12",
+            "ctrl-shift-j",
+            "super-k",
+            "ctrl-h",
+            "ctrl-i",
+            "ctrl-j",
+            "ctrl-m",
+            "ctrl-[",
+            "alt-[",
+            "alt-O",
+        ] {
+            assert_eq!(parsed(text).written().to_string(), text);
+        }
+    }
+
+    #[test]
+    fn the_specs_on_a_character_include_the_legacy_control_keys_that_arrive_as_it() {
+        let on = |c| KeySpec::on_character(c);
+        assert!(on('5').contains(&KeySpec::CTRL_CLOSE_BRACKET));
+        assert!(on('5').contains(&parsed("alt-5")));
+        assert!(on(' ').contains(&parsed("ctrl-space")));
+        assert!(on('J').contains(&parsed("ctrl-shift-j")));
+        assert!(on(',').contains(&parsed("alt-,")));
+        assert_eq!(KeySpec::function(12), Some(parsed("f12")));
+        assert_eq!(KeySpec::function(13), None);
     }
 
     #[test]

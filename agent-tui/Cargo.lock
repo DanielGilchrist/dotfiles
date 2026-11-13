@@ -86,6 +86,7 @@ dependencies = [
  "anyhow",
  "crossterm",
  "nix 0.31.3",
+ "portable-pty",
  "ratatui",
  "shell-words",
  "tempfile",

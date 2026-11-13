@@ -216,7 +216,7 @@ const SHIFTED: [(char, char); 21] = [
 /// `ctrl-shift-j` and `ctrl-j` can't be confused and `alt-<` matches
 /// whichever one the terminal sends. Shift on a key with no shifted form
 /// stays, and matches no spec.
-fn typed(key: &KeyEvent) -> (KeyCode, KeyModifiers) {
+pub(crate) fn typed(key: &KeyEvent) -> (KeyCode, KeyModifiers) {
     let KeyCode::Char(c) = key.code else {
         return (key.code, key.modifiers);
     };
