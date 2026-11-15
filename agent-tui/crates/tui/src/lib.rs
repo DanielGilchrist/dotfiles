@@ -28,12 +28,13 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TryR
 use std::thread;
 use std::time::{Duration, Instant};
 
-use agent_core::config::Config;
+use agent_core::config::{Config, Sources};
+use agent_core::editor::{Editor, EditorError, Target};
 use agent_core::names::{CarriageReturn, SessionName, clean};
 use agent_core::ops::Backend;
 use agent_core::ports::{ClientId, HarnessId, Observation};
 use agent_core::process::LaunchSpec;
-use agent_term::{Emulator, EmulatorFactory, Liveness, TermSize, Terminal};
+use agent_term::{Emulator, EmulatorFactory, Ended, Liveness, TermSize, Terminal, hand_over};
 use anyhow::{Context, Result};
 use cause::Cause;
 use crossterm::event::{
@@ -69,6 +70,9 @@ pub struct Options {
     pub start_dir: PathBuf,
     pub home: Option<PathBuf>,
     pub emulator: EmulatorFactory,
+    /// Read once at startup. An unusable `$EDITOR` is reported when an
+    /// edit asks for it, not at startup.
+    pub editor: Result<Editor, EditorError>,
 }
 
 fn base64(bytes: &[u8]) -> String {
@@ -285,9 +289,35 @@ struct Runtime {
     workers: Workers,
     input: Sender<InputCtl>,
     keys: Keyboard,
+    editor: Result<Editor, EditorError>,
 }
 
 impl Runtime {
+    /// Starts the input thread and the workers, and asks for the first
+    /// refresh. Their messages arrive on the returned receiver.
+    fn start(
+        backend: Arc<Backend>,
+        emulator: EmulatorFactory,
+        editor: Result<Editor, EditorError>,
+        sources: Sources,
+        keys: Keyboard,
+    ) -> (Self, Receiver<Msg>) {
+        let (msgs, inbox) = mpsc::channel();
+        let (input, input_ctl) = mpsc::channel();
+        spawn_input(msgs.clone(), input_ctl);
+        let workers = worker::spawn(Arc::clone(&backend), sources, msgs);
+        let _ = workers.refresh.send(());
+        let rt = Self {
+            backend,
+            emulator,
+            workers,
+            input,
+            keys,
+            editor,
+        };
+        (rt, inbox)
+    }
+
     fn connect(
         &self,
         m: &mut Model,
@@ -385,30 +415,19 @@ impl Runtime {
             .context("the background worker stopped")
     }
 
-    /// Runs `$EDITOR` with `arg` in `cwd`, handing it the terminal. Reports
-    /// whether it exited successfully (`:cq` doesn't).
+    /// Runs `$EDITOR` on `target` in `cwd`, handing it the terminal.
+    /// Reports whether it exited successfully (`:cq` doesn't).
     fn edit(
         &self,
         terminal: &mut DefaultTerminal,
         cwd: &Path,
-        arg: Option<&Path>,
-        line: Option<std::num::NonZeroUsize>,
+        target: &Target<'_>,
     ) -> Result<Edited> {
-        let editor = std::env::var("EDITOR").unwrap_or_else(|_| "nvim".into());
-        let argv =
-            shell_words::split(&editor).with_context(|| format!("parsing $EDITOR ({editor})"))?;
-        let (program, args) = argv.split_first().context("$EDITOR is empty")?;
-
-        let mut command = std::process::Command::new(program);
-        command
-            .args(args)
-            .args(line.map(|l| format!("+{l}")))
-            .args(arg)
-            .current_dir(cwd);
-        let status = self
-            .suspended(terminal, &mut command)
-            .with_context(|| format!("running {program}"))?;
-        Ok(if status.success() {
+        let editor = self.editor.as_ref().map_err(|e| anyhow::anyhow!("{e}"))?;
+        let ended = self
+            .suspended(terminal, &mut editor.open(cwd, target))
+            .with_context(|| format!("running {}", editor.program()))?;
+        Ok(if ended.success() {
             Edited::Saved
         } else {
             Edited::Cancelled
@@ -420,19 +439,19 @@ impl Runtime {
         &self,
         terminal: &mut DefaultTerminal,
         command: &mut std::process::Command,
-    ) -> Result<std::process::ExitStatus> {
+    ) -> Result<Ended> {
         let (ack, parked) = mpsc::sync_channel(1);
         self.input
             .send(InputCtl::Pause(ack))
             .context("input thread is gone")?;
         parked.recv().context("input thread is gone")?;
         leave_screen(self.keys);
-        let status = command.status();
+        let ended = hand_over(command);
         let resumed = enter_screen(self.keys);
         let _ = self.input.send(InputCtl::Resume);
         forget_screen(terminal);
         resumed?;
-        Ok(status?)
+        Ok(ended?)
     }
 
     /// The session host sizes a session to its smallest client, so while the editor
@@ -554,28 +573,20 @@ impl Runtime {
 
     fn open(&self, m: &mut Model, terminal: &mut DefaultTerminal, open: &Open) {
         Self::fill_screen(m, terminal);
-        let mut line = None;
-        let mut transcript = None;
-        let (cwd, file) = match open {
-            Open::Checkout(dir) => (dir, None),
-            Open::File { root, file } => (root, Some(file.as_path())),
-            Open::At {
-                root,
-                file,
-                line: at,
-            } => {
-                line = Some(*at);
-                (root, Some(file.as_path()))
-            }
+        let transcript: PathBuf;
+        let (cwd, target) = match open {
+            Open::Checkout(dir) => (dir, Target::Dir),
+            Open::File { root, file } => (root, Target::File(file)),
+            Open::At { root, file, line } => (root, Target::Line(file, *line)),
             Open::Transcript {
                 root,
                 name,
                 text,
-                line: at,
+                line,
             } => match write_transcript(name, text) {
                 Ok(path) => {
-                    line = Some(*at);
-                    (root, transcript.insert(path).as_path().into())
+                    transcript = path;
+                    (root, Target::Line(&transcript, *line))
                 }
                 Err(e) => {
                     m.error(format!("{e:#}"));
@@ -583,7 +594,7 @@ impl Runtime {
                 }
             },
         };
-        let edited = self.edit(terminal, cwd, file, line).map(drop);
+        let edited = self.edit(terminal, cwd, &target).map(drop);
         m.clock = Moment::now();
         if let Err(e) = edited {
             m.error(format!("{e:#}"));
@@ -607,8 +618,8 @@ impl Runtime {
         let ran = self.suspended(terminal, &mut command);
         m.clock = Moment::now();
         match ran {
-            Ok(status) if status.success() => {}
-            Ok(status) => m.error(format!("{label} exited with {status}")),
+            Ok(ended) if ended.success() => {}
+            Ok(ended) => m.error(format!("{label} exited with {ended}")),
             Err(e) => m.error(format!("{label}: {e:#}")),
         }
         m.schedule_preview();
@@ -670,7 +681,7 @@ impl Runtime {
             .path()
             .parent()
             .map_or_else(std::env::temp_dir, Path::to_path_buf);
-        if let Edited::Cancelled = self.edit(terminal, &dir, Some(file.path()), None)? {
+        if let Edited::Cancelled = self.edit(terminal, &dir, &Target::File(file.path()))? {
             return Ok(None);
         }
         let edited = std::fs::read_to_string(file.path())
@@ -718,22 +729,13 @@ fn event_loop(
     palette: Palette,
     keys: Keyboard,
 ) -> Result<()> {
-    let (msgs, inbox) = mpsc::channel();
-    let (input, input_ctl) = mpsc::channel();
-    spawn_input(msgs.clone(), input_ctl);
-    let workers = worker::spawn(
-        Arc::clone(&options.backend),
+    let (rt, inbox) = Runtime::start(
+        options.backend,
+        options.emulator,
+        options.editor,
         options.config.sources.clone(),
-        msgs,
-    );
-    let _ = workers.refresh.send(());
-    let rt = Runtime {
-        backend: options.backend,
-        emulator: options.emulator,
-        workers,
-        input,
         keys,
-    };
+    );
 
     let mut m = Model::new(
         options.start_dir,

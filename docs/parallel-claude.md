@@ -87,7 +87,7 @@ The Agents tab opens with a **Needs you** group, the status bar and terminal tit
 Actions live in `~/.config/agent/config.toml`. They see the agent only through the `{name}`, `{path}` (its checkout) and `{repo}` (main checkout) placeholders in their arguments, and `{{`/`}}` are literal braces. Each one does one of these:
 
 - `run`: starts a command (an argv with no shell) detached, with failures shown in the status bar.
-- `interactive`: hands the TUI's terminal to a command until it exits.
+- `interactive`: hands the TUI's terminal to a command until it exits. The command runs in a process group of its own, so Ctrl-Z in it resumes it at once instead of freezing the TUI.
 - `terminal_event`: sends the terminal a user variable (`OSC 1337 SetUserVar`) for its config to handle.
 
 

@@ -1,5 +1,6 @@
 mod commands;
 mod escapes;
+mod handoff;
 mod input;
 mod pty;
 mod vt;
@@ -9,6 +10,7 @@ pub use commands::{
     skipped_because, truncate_end,
 };
 pub use escapes::{Lines, output_lines, printable, strip_escapes};
+pub use handoff::{Ended, hand_over};
 pub use input::{CellPos, encode_key, encode_mouse};
 pub use pty::{Closed, Liveness, Terminal};
 pub use vt::Vt100;

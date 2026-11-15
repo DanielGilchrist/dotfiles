@@ -6,6 +6,7 @@ use std::process::Command;
 use std::sync::Arc;
 
 use agent_core::config::Config;
+use agent_core::editor::{Editor, EditorError, Target};
 use agent_core::model::Presence;
 use agent_core::names::{AgentName, BranchName, Prompt, SessionName};
 use agent_core::ops::{
@@ -190,17 +191,22 @@ enum Seed {
     Text(Prompt),
     File(PathBuf),
     /// Ask in $EDITOR when a new worktree is created interactively.
-    Editor,
+    Editor(Result<Editor, EditorError>),
     None,
 }
 
 impl Seed {
-    fn from_args(prompt: Option<Prompt>, seed: Option<PathBuf>, no_prompt: bool) -> Self {
+    fn from_args(
+        prompt: Option<Prompt>,
+        seed: Option<PathBuf>,
+        no_prompt: bool,
+        editor: Result<Editor, EditorError>,
+    ) -> Self {
         match (prompt, seed, no_prompt) {
             (Some(prompt), _, _) => Self::Text(prompt),
             (None, Some(file), _) => Self::File(file),
             (None, None, true) => Self::None,
-            (None, None, false) => Self::Editor,
+            (None, None, false) => Self::Editor(editor),
         }
     }
 }
@@ -347,21 +353,14 @@ fn read_prompt(file: &Path) -> Result<Prompt> {
         .with_context(|| format!("{} is empty", file.display()))
 }
 
-fn edit_prompt(name: &AgentName) -> Result<Option<Prompt>> {
+fn edit_prompt(name: &AgentName, editor: &Editor) -> Result<Option<Prompt>> {
     let file = tempfile::Builder::new()
         .prefix(&format!("agent-{name}-"))
         .suffix(".md")
         .tempfile()?;
-    let editor = std::env::var("EDITOR").unwrap_or_else(|_| "nvim".into());
-    let argv =
-        shell_words::split(&editor).with_context(|| format!("parsing $EDITOR ({editor})"))?;
-    let (program, args) = argv.split_first().context("$EDITOR is empty")?;
-    let status = Command::new(program)
-        .args(args)
-        .arg(file.path())
-        .status()
-        .with_context(|| format!("running {program}"))?;
-    if !status.success() {
+    let ended = agent_term::hand_over(&mut editor.open(&cwd()?, &Target::File(file.path())))
+        .with_context(|| format!("running {}", editor.program()))?;
+    if !ended.success() {
         return Ok(None);
     }
     Ok(std::fs::read_to_string(file.path())?.parse().ok())
@@ -403,13 +402,10 @@ fn finish(svc: Services<'_>, launch: &Launch, frontend: Frontend) -> Result<()> 
             Ok(())
         }
         Frontend::Foreground => {
-            let status = launch
-                .spec
-                .command()
-                .status()
+            let ended = agent_term::hand_over(&mut launch.spec.command())
                 .with_context(|| format!("running {}", launch.spec.program().display()))?;
-            if !status.success() {
-                bail!("{} exited with {status}", launch.spec.program().display());
+            if !ended.success() {
+                bail!("{} exited with {ended}", launch.spec.program().display());
             }
             Ok(())
         }
@@ -440,14 +436,14 @@ fn attach(
     let task = match (seed, frontend, plan.new_worktree()) {
         (Seed::Text(prompt), ..) => Some(prompt),
         (Seed::File(file), ..) => Some(read_prompt(&file)?),
-        (Seed::Editor, Frontend::Foreground, Some(_)) => {
-            let Some(prompt) = edit_prompt(name)? else {
+        (Seed::Editor(editor), Frontend::Foreground, Some(_)) => {
+            let Some(prompt) = edit_prompt(name, &editor?)? else {
                 println!("agent: cancelled (empty prompt)");
                 return Ok(());
             };
             Some(prompt)
         }
-        (Seed::Editor | Seed::None, ..) => None,
+        (Seed::Editor(_) | Seed::None, ..) => None,
     };
     let launch = ops::execute(svc, plan, task.as_ref(), harness)?;
     finish(svc, &launch, frontend)
@@ -821,6 +817,7 @@ fn main() -> Result<()> {
     }
     let cli = Cli::parse();
     let home = paths::home().ok();
+    let editor = Editor::from_env();
     let backend = backend()?;
     let svc = backend.services();
     let harness = chosen_harness(svc, cli.harness.as_ref())?;
@@ -831,6 +828,7 @@ fn main() -> Result<()> {
             start_dir: cwd()?,
             harness: harness.id().clone(),
             emulator: agent_term::vt100,
+            editor,
             backend: Arc::new(backend),
         }),
         Cmd::Keys { explain } => keys(explain.as_deref()),
@@ -855,7 +853,7 @@ fn main() -> Result<()> {
             attach(
                 svc,
                 &name,
-                Seed::from_args(prompt, seed, no_prompt),
+                Seed::from_args(prompt, seed, no_prompt, editor),
                 repo.as_ref(),
                 Frontend::from_flag(headless),
                 harness,

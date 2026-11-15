@@ -18,7 +18,6 @@ agent-zellij.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 clap_complete.workspace = true
-shell-words.workspace = true
 sysinfo.workspace = true
 tempfile.workspace = true
 

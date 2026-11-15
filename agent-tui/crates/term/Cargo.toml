@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 agent-core.workspace = true
 crossterm.workspace = true
+nix = { workspace = true, features = ["process", "term"] }
 portable-pty.workspace = true
 ratatui.workspace = true
 tui-term.workspace = true

@@ -17,7 +17,6 @@ dependencies = [
  "clap",
  "clap_complete",
  "portable-pty",
- "shell-words",
  "sysinfo",
  "tempfile",
  "vt100",
@@ -29,6 +28,7 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "shell-words",
  "tempfile",
  "thiserror 2.0.21",
  "toml",
@@ -70,6 +70,7 @@ version = "0.1.0"
 dependencies = [
  "agent-core",
  "crossterm",
+ "nix 0.31.3",
  "portable-pty",
  "ratatui",
  "tui-term",
@@ -88,7 +89,6 @@ dependencies = [
  "nix 0.31.3",
  "portable-pty",
  "ratatui",
- "shell-words",
  "tempfile",
  "unicode-segmentation",
  "unicode-width",
