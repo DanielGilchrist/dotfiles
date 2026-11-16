@@ -280,6 +280,13 @@ impl Running {
     pub fn name(&self) -> &SessionName {
         &self.0
     }
+
+    /// For tests of a host outside this crate, which can't see a session
+    /// the way discovery does.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn for_testing(name: SessionName) -> Self {
+        Self(name)
+    }
 }
 
 impl Entry {

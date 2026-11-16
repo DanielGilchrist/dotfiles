@@ -815,6 +815,13 @@ pub const BINDINGS: &[Binding] = &[
         "Open the agent's checkout (or the repo's) in $EDITOR.",
     ),
     Binding::new(
+        &["E"],
+        Ctxs::of(&[Ctx::Agents, Ctx::Activity, Ctx::Changes, Ctx::Main]),
+        Hidden,
+        By(|s| (!matches!(s.selected, Selected::Nothing)).then_some("scrollback")),
+        "Open what the selected agent's terminal shows and has scrolled off, as text in $EDITOR at the end.",
+    ),
+    Binding::new(
         &["[", "]"],
         AGENTS,
         RankBy(|_| Some(6)),

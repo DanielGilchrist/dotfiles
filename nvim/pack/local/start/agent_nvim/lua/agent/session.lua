@@ -69,15 +69,15 @@ local function worktree_cwd(name)
   return nil
 end
 
----Best-effort lookup of the on-disk cwd for a given zellij session name.
+---Best-effort lookup of the on-disk cwd for a given session name.
 ---For a worktree agent the session name is the branch and the cwd is
 ---`~/worktrees/<repo>/<branch>`. Repo sessions (`<leader>as`, named after
----the repo basename) have no worktree, so fall back to the cwd zellij
+---the repo basename) have no worktree, so fall back to the cwd the host
 ---reports for the session's own pane. Nil if neither resolves.
 ---@param name string
 ---@return string|nil
 function M.session_cwd(name)
-  return worktree_cwd(name) or require("agent.zellij").session_cwd(name)
+  return worktree_cwd(name) or require("agent.host").session_cwd(name)
 end
 
 return M

@@ -13,17 +13,23 @@ use agent_core::ops::{
     self, Backend, Consent, Delivery, Hazard, Launch, Planned, Removed, Services,
 };
 use agent_core::paths::{self, Layout, RepoRoot, WorktreeState};
-use agent_core::ports::{Harness, HarnessId, Listing, Unlisting};
+use agent_core::ports::{
+    Attachment, Extent, Harness, HarnessId, Listing, Liveness, Rendering, SessionHost,
+    SessionStatus, Unlisting,
+};
 use agent_git::{Git, GitHub};
 use agent_harness::Registry;
+use agent_native::{Hosts, Native};
+use agent_session::RuntimeDir;
 use agent_store::FsStore;
 use agent_zellij::Zellij;
 use anyhow::{Context, Result, bail};
-use clap::{ArgGroup, CommandFactory, Parser, Subcommand};
+use clap::{ArgGroup, Args, CommandFactory, Parser, Subcommand};
 
 mod completion;
 mod lineage;
 mod restart;
+mod session;
 
 #[derive(Parser)]
 #[command(
@@ -151,11 +157,17 @@ enum Cmd {
         verbose: bool,
     },
     /// Print an agent's screen with ANSI styling
-    Dump { name: SessionName },
+    Dump {
+        name: SessionName,
+        #[command(flatten)]
+        reading: Reading,
+    },
     /// Type a prompt into a running agent
     #[command(group = ArgGroup::new("input").args(["text", "file"]).required(true))]
     Prompt {
         name: SessionName,
+        /// The message, which may start with a hyphen
+        #[arg(allow_hyphen_values = true)]
         text: Option<Prompt>,
         #[arg(long)]
         file: Option<PathBuf>,
@@ -167,10 +179,113 @@ enum Cmd {
     /// Run the harness for a session's pane (used in session layouts)
     #[command(hide = true)]
     Exec { name: SessionName },
+    /// The native session host and its client, not used by anything yet
+    #[command(hide = true)]
+    Session {
+        #[command(subcommand)]
+        command: session::SessionCmd,
+    },
+
+    /// What editor plugins ask of the hosts
+    #[command(hide = true)]
+    Plugin {
+        #[command(subcommand)]
+        command: PluginCmd,
+    },
 
     /// Finish deleting removed worktrees
     #[command(hide = true)]
     Sweep { worktrees: Vec<PathBuf> },
+}
+
+/// What a dump reads of the terminal, as the flags that ask for it.
+#[derive(Args)]
+struct Reading {
+    /// Include what scrolled off the top
+    #[arg(long)]
+    scrollback: bool,
+    /// Print text only, with no styling
+    #[arg(long)]
+    plain: bool,
+}
+
+impl Reading {
+    fn extent(&self) -> Extent {
+        if self.scrollback {
+            Extent::Scrollback
+        } else {
+            Extent::Visible
+        }
+    }
+
+    fn rendering(&self) -> Rendering {
+        if self.plain {
+            Rendering::Plain
+        } else {
+            Rendering::Styled
+        }
+    }
+}
+
+#[derive(Subcommand)]
+enum PluginCmd {
+    /// The name of every live session, one per line, and with `--cwd` a tab
+    /// and its directory when known
+    Live {
+        /// Ask each host where its sessions are, which is slower
+        #[arg(long)]
+        cwd: bool,
+    },
+    /// The command that attaches this terminal to a session, one argument per line
+    Argv { name: SessionName },
+    /// Answer a menu in a session with its numbered choice
+    Choice {
+        name: SessionName,
+        #[arg(value_parser = clap::value_parser!(u8).range(1..=9))]
+        number: u8,
+    },
+}
+
+/// How long a host has to say which of its sessions are live.
+const LIVE_WITHIN: std::time::Duration = std::time::Duration::from_secs(2);
+
+fn plugin_command(svc: Services<'_>, command: PluginCmd) -> Result<()> {
+    match command {
+        PluginCmd::Live { cwd: false } => {
+            for (name, liveness) in svc.host.liveness(LIVE_WITHIN)? {
+                if liveness == Liveness::Live {
+                    println!("{name}");
+                }
+            }
+        }
+        PluginCmd::Live { cwd: true } => {
+            for session in svc.host.sessions()? {
+                if let SessionStatus::Live { cwd } = session.status {
+                    let cwd = cwd.map(|cwd| cwd.display().to_string()).unwrap_or_default();
+                    println!("{}\t{cwd}", session.name);
+                }
+            }
+        }
+        PluginCmd::Argv { name } => {
+            for arg in svc.host.attach(&name, Attachment::Window).argv() {
+                println!("{}", arg.to_string_lossy());
+            }
+        }
+        PluginCmd::Choice { name, number } => {
+            svc.host.write(&name, format!("{number}\r").as_bytes())?;
+        }
+    }
+    Ok(())
+}
+
+fn dump(svc: Services<'_>, name: &SessionName, reading: &Reading) -> Result<()> {
+    let rendering = reading.rendering();
+    let screen = svc.host.screen(name, reading.extent(), rendering)?;
+    match rendering {
+        Rendering::Styled => print!("{screen}"),
+        Rendering::Plain => println!("{}", screen.replace("\r\n", "\n")),
+    }
+    Ok(())
 }
 
 /// Whether `agent <args>` opens the TUI, by the grammar above, so a new
@@ -211,11 +326,27 @@ impl Seed {
     }
 }
 
-fn backend() -> Result<Backend> {
+fn backend(attachment: Attachment) -> Result<Backend> {
     let layout = Layout::from_env()?;
     let store = FsStore::from_env()?;
-    let host = Zellij::new(store.dir().join("layouts"), runs_tui);
     let exe = std::env::current_exe().context("locating the agent binary")?;
+    let exe = exe.canonicalize().unwrap_or(exe);
+    let config = config()?;
+    let settings = config.host;
+    let detach = config.detach;
+    let host = Hosts::new(
+        Box::new(Zellij::new(store.dir().join("layouts"), runs_tui)),
+        Box::new(Native::new(
+            store.dir().to_path_buf(),
+            RuntimeDir::from_env()?,
+            exe.clone(),
+            settings.osc52,
+            detach,
+            runs_tui,
+        )),
+        settings.kind,
+    );
+    let own = host.own_session(&|name| std::env::var(name).ok());
     Ok(Backend {
         vcs: Box::new(Git),
         forge: Box::new(GitHub),
@@ -223,8 +354,9 @@ fn backend() -> Result<Backend> {
         harnesses: Box::new(Registry::new(&paths::home()?)),
         store: Box::new(store),
         layout,
-        exe: exe.canonicalize().unwrap_or(exe),
-        own: own_session(),
+        exe,
+        own,
+        attachment,
     })
 }
 
@@ -395,10 +527,7 @@ fn finish(svc: Services<'_>, launch: &Launch, frontend: Frontend) -> Result<()> 
         Frontend::Headless => headless(launch),
         Frontend::Detached => {
             svc.host.start_detached(&launch.session)?;
-            println!(
-                "agent: {} is running. Attach with `zellij attach {}`",
-                launch.session, launch.session
-            );
+            println!("{}", detached_message(&launch.session));
             Ok(())
         }
         Frontend::Foreground => {
@@ -410,6 +539,12 @@ fn finish(svc: Services<'_>, launch: &Launch, frontend: Frontend) -> Result<()> 
             Ok(())
         }
     }
+}
+
+/// Names the command, not the host's argv, which is quoted for one shell and
+/// differs between hosts.
+fn detached_message(session: &SessionName) -> String {
+    format!("agent: {session} is running. Attach with `agent attach {session}`")
 }
 
 fn headless(launch: &Launch) -> Result<()> {
@@ -447,12 +582,6 @@ fn attach(
     };
     let launch = ops::execute(svc, plan, task.as_ref(), harness)?;
     finish(svc, &launch, frontend)
-}
-
-fn own_session() -> Option<SessionName> {
-    std::env::var("ZELLIJ_SESSION_NAME")
-        .ok()
-        .and_then(|s| s.parse().ok())
 }
 
 fn consent(force: bool) -> Consent {
@@ -680,7 +809,7 @@ fn hook_event(name: Option<&std::ffi::OsString>) -> ! {
     let name = name
         .and_then(|n| n.to_str())
         .and_then(|n| n.parse::<SessionName>().ok());
-    if let (Some(name), Ok(backend)) = (name, backend()) {
+    if let (Some(name), Ok(backend)) = (name, backend(Attachment::Window)) {
         event(backend.services(), &name);
     }
     std::process::exit(0)
@@ -810,6 +939,29 @@ fn complete(
     Ok(())
 }
 
+fn checkout_command(
+    svc: Services<'_>,
+    branch: &BranchName,
+    name: Option<AgentName>,
+    repo: Option<PathBuf>,
+    frontend: Frontend,
+    harness: &dyn Harness,
+) -> Result<()> {
+    let repo = repo_arg(svc, repo)?.ok_or(ops::Error::NoRepo)?;
+    let name = ops::checkout(svc, &repo, branch, name)?;
+    attach(svc, &name, Seed::None, Some(&repo), frontend, harness)
+}
+
+/// The TUI embeds sessions in its own pane, everything else attaches the
+/// terminal it runs in.
+fn attachment_for(args: &[String]) -> Attachment {
+    if runs_tui(args) {
+        Attachment::Preview
+    } else {
+        Attachment::Window
+    }
+}
+
 fn main() -> Result<()> {
     let mut args = std::env::args_os().skip(1);
     if args.next().is_some_and(|first| first == "event") {
@@ -818,7 +970,8 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let home = paths::home().ok();
     let editor = Editor::from_env();
-    let backend = backend()?;
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let backend = backend(attachment_for(&argv))?;
     let svc = backend.services();
     let harness = chosen_harness(svc, cli.harness.as_ref())?;
     match cli.command.unwrap_or(Cmd::Tui) {
@@ -865,18 +1018,14 @@ fn main() -> Result<()> {
             repo,
             headless,
             no_focus: _,
-        } => {
-            let repo = repo_arg(svc, repo)?.ok_or(ops::Error::NoRepo)?;
-            let name = ops::checkout(svc, &repo, &branch, name)?;
-            attach(
-                svc,
-                &name,
-                Seed::None,
-                Some(&repo),
-                Frontend::from_flag(headless),
-                harness,
-            )
-        }
+        } => checkout_command(
+            svc,
+            &branch,
+            name,
+            repo,
+            Frontend::from_flag(headless),
+            harness,
+        ),
         Cmd::Rm {
             name: _,
             force,
@@ -901,15 +1050,13 @@ fn main() -> Result<()> {
         Cmd::Add { path } => add(svc, path),
         Cmd::Forget { path } => forget(svc, path),
         Cmd::Merged { verbose } => merged(svc, verbose),
-        Cmd::Dump { name } => {
-            print!("{}", svc.host.screen(&name)?);
-            Ok(())
-        }
+        Cmd::Dump { name, reading } => dump(svc, &name, &reading),
+        Cmd::Plugin { command } => plugin_command(svc, command),
         Cmd::Prompt { name, text, file } => prompt(svc, &name, text, file),
         Cmd::Pin { name } => Ok(ops::pin(svc, &infer_name(svc, name)?)?),
         Cmd::Unpin { name } => Ok(svc.store.unpin(&infer_name(svc, name)?)?),
         Cmd::Exec { name } => exec(svc, &name),
-
+        Cmd::Session { command } => session::run(command),
         Cmd::Sweep { worktrees } => sweep(svc, &worktrees),
     }
 }
@@ -920,6 +1067,23 @@ mod tests {
 
     fn args(line: &str) -> Vec<String> {
         line.split_whitespace().map(String::from).collect()
+    }
+
+    #[test]
+    fn the_tui_embeds_its_sessions_as_a_preview_and_every_other_command_attaches_a_window() {
+        assert_eq!(attachment_for(&args("")), Attachment::Preview);
+        assert_eq!(attachment_for(&args("tui")), Attachment::Preview);
+        assert_eq!(attachment_for(&args("attach fix")), Attachment::Window);
+        assert_eq!(attachment_for(&args("repo")), Attachment::Window);
+    }
+
+    #[test]
+    fn the_detached_message_names_a_command_that_works_in_every_shell() {
+        let session: SessionName = "fix".parse().expect("a name");
+        assert_eq!(
+            detached_message(&session),
+            "agent: fix is running. Attach with `agent attach fix`"
+        );
     }
 
     #[test]

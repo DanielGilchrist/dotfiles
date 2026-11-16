@@ -40,6 +40,14 @@ pub enum Warning {
     Orphaned {
         path: PathBuf,
     },
+    /// Two session hosts each run a session of this name.
+    Doubled {
+        name: SessionName,
+    },
+    /// A session host that couldn't be read, so its sessions are missing.
+    HostSkipped {
+        error: HostError,
+    },
     /// A `[repos] dirs` entry that couldn't be read.
     Catalogue {
         dir: PathBuf,
@@ -56,7 +64,9 @@ impl Warning {
             | Self::Unnamed { .. }
             | Self::NameClash { .. }
             | Self::NotARepo { .. }
-            | Self::Orphaned { .. } => true,
+            | Self::Orphaned { .. }
+            | Self::HostSkipped { .. } => true,
+            Self::Doubled { .. } => false,
             Self::Catalogue { error, .. } => error.kind() != io::ErrorKind::NotFound,
         }
     }
@@ -83,6 +93,13 @@ impl fmt::Display for Warning {
             Self::Orphaned { path } => {
                 write!(f, "{} isn't in a git repo any more", path.display())
             }
+            Self::Doubled { name } => {
+                write!(
+                    f,
+                    "{name} is run by two session hosts, restart it to stop both"
+                )
+            }
+            Self::HostSkipped { error } => write!(f, "a session host was skipped: {error}"),
             Self::Catalogue { dir, error } => {
                 write!(f, "repos.dirs {}: {error}", dir.display())
             }
@@ -119,8 +136,19 @@ pub fn observe(
     layout: &Layout,
     listed: &[RepoRoot],
 ) -> Result<Observation, HostError> {
-    let sessions = host.sessions()?;
-    let mut warnings = Vec::new();
+    let listing = host.listing()?;
+    let sessions = listing.sessions;
+    let mut warnings: Vec<Warning> = listing
+        .doubled
+        .into_iter()
+        .map(|name| Warning::Doubled { name })
+        .chain(
+            listing
+                .skipped
+                .into_iter()
+                .map(|error| Warning::HostSkipped { error }),
+        )
+        .collect();
 
     let mut candidates: Vec<(PathBuf, Candidate)> = sessions
         .iter()
@@ -570,6 +598,30 @@ mod tests {
             panic!("idle should be startable")
         };
         assert_eq!(at.cwd(), std::path::Path::new("/w/api/idle"));
+    }
+
+    #[test]
+    fn a_name_two_hosts_run_is_a_warning_that_hides_nothing_and_says_what_to_do() {
+        let host = crate::testing::FakeHost::default();
+        host.doubled.lock().expect("lock").push(name("fix"));
+        let found = observe(
+            &crate::testing::FakeVcs::new(std::path::Path::new("/src")),
+            &host,
+            &layout(),
+            &[],
+        )
+        .expect("observes");
+        let doubled: Vec<&Warning> = found
+            .warnings
+            .iter()
+            .filter(|w| matches!(w, Warning::Doubled { .. }))
+            .collect();
+        assert_eq!(doubled.len(), 1);
+        assert!(!doubled[0].hides_agents());
+        assert_eq!(
+            doubled[0].to_string(),
+            "fix is run by two session hosts, restart it to stop both"
+        );
     }
 
     #[test]

@@ -13,9 +13,9 @@ use crate::names::{
 };
 use crate::paths::{AgentWorktree, Layout, PathError, RepoRoot, TrashSlot, WorktreeState};
 use crate::ports::{
-    AgentRecord, BranchState, Fetch, Forge, Harness, HarnessError, HarnessId, Harnesses, HostError,
-    LaunchCtx, Listing, PaneCommand, Probe, SessionHost, SessionInfo, SessionStatus, Store,
-    StoreError, TranscriptStamp, Unlisting, Vcs, WorktreeStart,
+    AgentRecord, Attachment, BranchState, Fetch, Forge, Harness, HarnessError, HarnessId,
+    Harnesses, HostError, LaunchCtx, Listing, PaneCommand, Probe, SessionHost, SessionInfo,
+    SessionStatus, Store, StoreError, TranscriptStamp, Unlisting, Vcs, WorktreeStart,
 };
 use crate::process::{CommandError, LaunchSpec};
 
@@ -141,6 +141,8 @@ pub struct Backend {
     pub exe: PathBuf,
     /// The session this process runs in, read once at startup.
     pub own: Option<SessionName>,
+    /// What the attach commands this process returns are for.
+    pub attachment: Attachment,
 }
 
 impl Backend {
@@ -154,6 +156,7 @@ impl Backend {
             layout: &self.layout,
             exe: &self.exe,
             own: self.own.as_ref(),
+            attachment: self.attachment,
         }
     }
 }
@@ -169,6 +172,7 @@ pub struct Services<'a> {
     pub layout: &'a Layout,
     pub exe: &'a Path,
     pub own: Option<&'a SessionName>,
+    pub attachment: Attachment,
 }
 
 impl Services<'_> {
@@ -671,7 +675,7 @@ pub fn join(svc: Services<'_>, session: &SessionName, task: Option<&Prompt>) -> 
     let delivery = deliver(svc, session, task)?;
     Ok(Launch {
         session: session.clone(),
-        spec: svc.host.attach(session),
+        spec: svc.host.attach(session, svc.attachment),
         delivery,
     })
 }
@@ -751,7 +755,10 @@ pub fn execute(
                 None => Delivery::None,
             };
             Ok(Launch {
-                spec: svc.host.attach(&session).cwd(worktree.at().path()),
+                spec: svc
+                    .host
+                    .attach(&session, svc.attachment)
+                    .cwd(worktree.at().path()),
                 session,
                 delivery,
             })
@@ -766,7 +773,7 @@ pub fn execute(
 }
 
 fn attach_spec(svc: Services<'_>, session: &SessionName, cwd: Option<PathBuf>) -> LaunchSpec {
-    let spec = svc.host.attach(session);
+    let spec = svc.host.attach(session, svc.attachment);
     match cwd {
         Some(cwd) => spec.cwd(cwd),
         None => spec,
@@ -826,7 +833,7 @@ fn start_then(
     let mark = mark_launch(svc, &name)?;
     let created = svc
         .host
-        .create(at.host_name(), &pane)
+        .create(at.host_name(), &pane, svc.attachment)
         .map_err(Error::from)
         .and_then(|spec| {
             svc.store.put_record(&name, &record)?;
@@ -849,7 +856,7 @@ pub fn open_repo(svc: Services<'_>, repo: &RepoRoot, harness: &dyn Harness) -> R
     let name = at.name();
     let launch = match find_session(svc, &name)?.map(|s| s.status) {
         Some(SessionStatus::Live { .. }) => Launch {
-            spec: svc.host.attach(&name).cwd(repo.path()),
+            spec: svc.host.attach(&name, svc.attachment).cwd(repo.path()),
             session: name,
             delivery: Delivery::None,
         },

@@ -6,12 +6,17 @@
 //! nav = "ctrl-]"
 //! prev_agent = "alt-;"
 //! next_agent = "none"
+//! detach = "ctrl-\\"
 //!
 //! [repos]
 //! dirs = ["~/repos", "~/.config"]
 //!
 //! [theme]
 //! accent = "#89b4fa"
+//!
+//! [host]
+//! kind = "native"
+//! osc52 = "owner"
 //! ```
 
 use std::fmt;
@@ -20,7 +25,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 use crate::actions::{Actions, RawAction};
-use crate::keyspec::{Binding, Glyph, InvalidKeySpec, KeySpec};
+use crate::keyspec::{Binding, Control, Detachable, FunctionKey, Glyph, InvalidKeySpec, KeySpec};
 use crate::paths::{self, Typed};
 use crate::theme::{RawTheme, Theme, ThemeError};
 
@@ -200,6 +205,146 @@ impl Sources {
     }
 }
 
+/// Whether a session host passes a program's OSC 52 clipboard writes to the
+/// terminal of the client that owns the session. Reads are never passed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "String")]
+pub enum Osc52 {
+    #[default]
+    Off,
+    Owner,
+}
+
+impl Osc52 {
+    /// The word the config and `agent session host --osc52` spell it with.
+    pub const fn word(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Owner => "owner",
+        }
+    }
+}
+
+impl TryFrom<String> for Osc52 {
+    type Error = String;
+
+    fn try_from(text: String) -> Result<Self, String> {
+        text.parse()
+    }
+}
+
+impl std::str::FromStr for Osc52 {
+    type Err = String;
+
+    fn from_str(text: &str) -> Result<Self, String> {
+        [Self::Off, Self::Owner]
+            .into_iter()
+            .find(|osc52| osc52.word() == text)
+            .ok_or_else(|| format!("{text:?} isn't off or owner"))
+    }
+}
+
+/// Which session host new sessions are made under. Sessions that already
+/// exist stay with the host that runs them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Deserialize)]
+#[serde(try_from = "String")]
+pub enum HostKind {
+    Zellij,
+    #[default]
+    Native,
+}
+
+impl HostKind {
+    pub const fn word(self) -> &'static str {
+        match self {
+            Self::Zellij => "zellij",
+            Self::Native => "native",
+        }
+    }
+}
+
+impl TryFrom<String> for HostKind {
+    type Error = String;
+
+    fn try_from(text: String) -> Result<Self, String> {
+        text.parse()
+    }
+}
+
+impl std::str::FromStr for HostKind {
+    type Err = String;
+
+    fn from_str(text: &str) -> Result<Self, String> {
+        [Self::Zellij, Self::Native]
+            .into_iter()
+            .find(|kind| kind.word() == text)
+            .ok_or_else(|| format!("{text:?} isn't zellij or native"))
+    }
+}
+
+/// The key `agent attach` leaves a session with, `[keys] detach`. A person's
+/// terminal has it and the TUI's pane never does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Detach {
+    Off,
+    On(Detachable),
+}
+
+impl Default for Detach {
+    fn default() -> Self {
+        Self::On(Detachable::Ctrl(Control::Backslash))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum DetachError {
+    #[error(transparent)]
+    Key(#[from] InvalidKeySpec),
+    #[error("f{} can't be the detach key, use a ctrl or alt key or none", .0.number())]
+    Function(FunctionKey),
+}
+
+impl std::str::FromStr for Detach {
+    type Err = DetachError;
+
+    fn from_str(text: &str) -> Result<Self, DetachError> {
+        if text == "none" {
+            return Ok(Self::Off);
+        }
+        let spec: KeySpec = text.parse()?;
+        Detachable::try_from(spec)
+            .map(Self::On)
+            .map_err(DetachError::Function)
+    }
+}
+
+impl fmt::Display for Detach {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Off => f.write_str("none"),
+            Self::On(key) => write!(f, "{}", KeySpec::from(*key).written()),
+        }
+    }
+}
+
+/// The `[host]` table: which host makes new sessions, and what the native
+/// session host lets a program's output do. The host never reads the config
+/// itself, whoever starts it passes these on its command line.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HostSettings {
+    pub kind: HostKind,
+    pub osc52: Osc52,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct RawHost {
+    #[serde(default)]
+    kind: HostKind,
+    #[serde(default)]
+    osc52: Osc52,
+}
+
 /// Whether the config file has a `[keys]` table, so the first-run hint can
 /// tell a user who never chose keys from one who did.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -216,6 +361,8 @@ pub struct Config {
     pub keys_table: KeysTable,
     pub sources: Sources,
     pub theme: Theme,
+    pub host: HostSettings,
+    pub detach: Detach,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -233,6 +380,8 @@ pub enum ConfigError {
         field: KeyField,
         source: InvalidKeySpec,
     },
+    #[error("keys.detach: {0}")]
+    Detach(#[from] DetachError),
     #[error("keys.{second} is the same key as keys.{first}")]
     DuplicateKey { first: KeyField, second: KeyField },
     #[error("keys.{field} is {hatch}, which also leaves AGENT while keys.nav is {nav}")]
@@ -268,6 +417,8 @@ struct RawConfig {
     repos: RawRepos,
     #[serde(default)]
     theme: RawTheme,
+    #[serde(default)]
+    host: RawHost,
 }
 
 #[derive(Deserialize, Default)]
@@ -309,6 +460,7 @@ struct RawKeys {
     nav: Option<String>,
     prev_agent: Option<String>,
     next_agent: Option<String>,
+    detach: Option<String>,
 }
 
 impl RawKeys {
@@ -383,19 +535,75 @@ impl std::str::FromStr for Config {
         } else {
             KeysTable::Absent
         };
+        let detach = match raw.keys.as_ref().and_then(|keys| keys.detach.as_deref()) {
+            Some(text) => text.parse()?,
+            None => Detach::default(),
+        };
         Ok(Self {
             actions: Actions::parse(raw.action)?,
+            detach,
             keys: raw.keys.unwrap_or_default().parse()?,
             keys_table,
             sources: raw.repos.parse()?,
             theme: raw.theme.parse()?,
+            host: HostSettings {
+                kind: raw.host.kind,
+                osc52: raw.host.osc52,
+            },
         })
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_detach_key_defaults_to_ctrl_backslash_and_can_be_off_or_chosen() {
+        let config: Config = "".parse().expect("parses");
+        assert_eq!(config.detach.to_string(), "ctrl-\\");
+        let config: Config = "[keys]\ndetach = 'none'".parse().expect("parses");
+        assert_eq!(config.detach, Detach::Off);
+        let config: Config = "[keys]\ndetach = 'alt-q'".parse().expect("parses");
+        assert_eq!(config.detach.to_string(), "alt-q");
+        for bad in ["f5", "q", ""] {
+            let text = format!("[keys]\ndetach = '{bad}'");
+            assert!(text.parse::<Config>().is_err(), "{bad}");
+        }
+    }
+
     use super::*;
+
+    #[test]
+    fn new_sessions_go_to_zellij_unless_the_config_says_native() {
+        let kind = |text: &str| text.parse::<Config>().expect("parses").host.kind;
+        assert_eq!(kind(""), HostKind::Native);
+        assert_eq!(kind("[host]\nkind = 'zellij'"), HostKind::Zellij);
+        assert_eq!(kind("[host]\nkind = 'native'"), HostKind::Native);
+        assert_eq!(kind("[host]\nosc52 = 'owner'"), HostKind::Native);
+        for bad in [
+            "[host]\nkind = 'tmux'",
+            "[host]\nkind = 1",
+            "[host]\nkind = ''",
+        ] {
+            assert!(bad.parse::<Config>().is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_hosts_clipboard_writes_are_off_unless_the_config_says_owner() {
+        let config: Config = "".parse().expect("parses");
+        assert_eq!(config.host.osc52, Osc52::Off);
+        let config: Config = "[host]\nosc52 = 'owner'".parse().expect("parses");
+        assert_eq!(config.host.osc52, Osc52::Owner);
+        let config: Config = "[host]\nosc52 = 'off'".parse().expect("parses");
+        assert_eq!(config.host.osc52, Osc52::Off);
+        for bad in [
+            "[host]\nosc52 = 'everyone'",
+            "[host]\nosc52 = true",
+            "[host]\nkind = 'x'",
+        ] {
+            assert!(bad.parse::<Config>().is_err(), "{bad}");
+        }
+    }
 
     #[test]
     fn nav_defaults_to_ctrl_close_bracket() {

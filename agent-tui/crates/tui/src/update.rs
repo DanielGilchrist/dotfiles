@@ -37,7 +37,9 @@ use crate::touched::Baseline;
 use crate::track::{Compose, Found, ImagePaste, Probed, Seen};
 use crate::tree::ChangesView;
 use crate::typed::{Columns, Message};
-use crate::worker::{ImageError, Job, Msg, Outcome, OutputRead, OutputRequest, SendError};
+use crate::worker::{
+    ImageError, Job, Msg, Outcome, OutputRead, OutputRequest, ScrollbackRead, SendError,
+};
 use agent_core::config::Hop;
 
 mod restart;
@@ -70,13 +72,30 @@ pub enum Open {
         file: PathBuf,
         line: NonZeroUsize,
     },
-    /// A subagent's transcript as Markdown, at `line`.
+    /// A document written to a temporary file, opened at `line`.
     Transcript {
         root: PathBuf,
         name: String,
         text: String,
         line: NonZeroUsize,
+        kind: Document,
     },
+}
+
+/// What a temporary document is, which the editor reads from its extension.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Document {
+    Markdown,
+    Text,
+}
+
+impl Document {
+    pub fn extension(self) -> &'static str {
+        match self {
+            Self::Markdown => ".md",
+            Self::Text => ".txt",
+        }
+    }
 }
 
 impl Open {
@@ -235,10 +254,7 @@ fn step(m: &mut Model, msg: Msg) -> Vec<Effect> {
             m.error(e);
             Vec::new()
         }
-        Msg::RemovalPlanned { ticket, result } => {
-            on_removal_planned(m, ticket, result);
-            Vec::new()
-        }
+        Msg::RemovalPlanned { ticket, result } => on_removal_planned(m, ticket, result),
         Msg::RestartPlanned { ticket, result } => restart::on_restart_planned(m, ticket, result),
         Msg::FleetPlanned { ticket, result } => restart::on_fleet_planned(m, ticket, result),
         Msg::Restarted { name, finish } => restart::on_restarted(m, &name, finish),
@@ -248,6 +264,7 @@ fn step(m: &mut Model, msg: Msg) -> Vec<Effect> {
             report(m, outcome);
             Vec::new()
         }
+        Msg::ScrollbackRead(read) => on_scrollback_read(m, read),
         Msg::Sent { to, ticket, result } => {
             on_sent(m, &to, ticket, result);
             Vec::new()
@@ -567,15 +584,20 @@ fn waiting_on(m: &Model, ticket: Ticket, wanted: fn(&Planning) -> bool) -> bool 
     matches!(&m.overlay, Overlay::Planning { ticket: t, planning } if *t == ticket && wanted(planning))
 }
 
-fn on_removal_planned(m: &mut Model, ticket: Ticket, result: Result<RemovalPlan, Cause>) {
+fn on_removal_planned(
+    m: &mut Model,
+    ticket: Ticket,
+    result: Result<RemovalPlan, Cause>,
+) -> Vec<Effect> {
     if !waiting_on(m, ticket, |p| matches!(p, Planning::Removal(_))) {
-        return;
+        return Vec::new();
     }
     m.overlay = Overlay::None;
     match result {
         Ok(plan) => m.overlay = Overlay::Confirm(Confirm::Remove(plan.into())),
         Err(e) => m.error(e),
     }
+    Vec::new()
 }
 
 fn on_snapshot(m: &mut Model, snapshot: Snapshot, warnings: Vec<String>) {
@@ -842,6 +864,53 @@ fn starting(m: &mut Model, name: &SessionName) -> Ticket {
     let now = m.clock.wall;
     m.track(name).launched(now);
     ticket
+}
+
+/// Reads what the selected agent's terminal shows and has scrolled off. The
+/// editor opens when the read comes back, and only the newest read counts.
+fn read_scrollback(m: &mut Model, selected: Option<&Entry>) -> Vec<Effect> {
+    let Some(entry) = selected else {
+        m.info("select an agent to read its scrollback");
+        return Vec::new();
+    };
+    let name = entry.name().clone();
+    let Some(root) = entry.path().map(Path::to_path_buf) else {
+        m.info(format!("{name} has no checkout to open its scrollback in"));
+        return Vec::new();
+    };
+    let ticket = m.start_scrollback();
+    m.info(format!("reading the scrollback of {name}"));
+    vec![Effect::Job(Job::ReadScrollback { name, root, ticket })]
+}
+
+/// Opens the scrollback at its last line, unless a newer read replaced it.
+fn on_scrollback_read(m: &mut Model, read: ScrollbackRead) -> Vec<Effect> {
+    let ScrollbackRead {
+        ticket,
+        name,
+        root,
+        result,
+    } = read;
+    if !m.is_latest_scrollback(ticket) {
+        return Vec::new();
+    }
+    match result {
+        Ok(screen) => {
+            let text = format!("{}\n", screen.trim_end());
+            let line = NonZeroUsize::new(text.lines().count()).unwrap_or(NonZeroUsize::MIN);
+            vec![Effect::Edit(Open::Transcript {
+                root,
+                name: format!("{name}-scrollback"),
+                text,
+                line,
+                kind: Document::Text,
+            })]
+        }
+        Err(why) => {
+            m.error(format!("couldn't read the scrollback of {name}: {why}"));
+            Vec::new()
+        }
+    }
 }
 
 /// Turns a float over the pane's paused session into a watch of it, since
@@ -2569,6 +2638,7 @@ fn edit_log(
         name,
         text,
         line,
+        kind: Document::Markdown,
     })]
 }
 
@@ -2981,6 +3051,7 @@ fn action_key(m: &mut Model, key: &KeyEvent, selected: Option<Entry>) -> Option<
                 return Some(vec![Effect::Edit(Open::Checkout(path))]);
             }
         }
+        KeyCode::Char('E') => return Some(read_scrollback(m, selected.as_ref())),
         KeyCode::Char('d') => kill_selected(m, selected),
         KeyCode::Char('D') => return Some(request_removal(m)),
         KeyCode::Char('r') => return Some(restart::request_restart(m)),
@@ -5238,6 +5309,108 @@ mod tests {
         assert!(
             !effects.iter().any(|e| matches!(e, Effect::Edit(_))),
             "with nothing under the cursor, ⏎ enters as in [1]"
+        );
+    }
+
+    fn scrollback_read(effects: &[Effect]) -> (SessionName, PathBuf, Ticket) {
+        let [Effect::Job(Job::ReadScrollback { name, root, ticket })] = effects else {
+            panic!("one scrollback read, got {} effects", effects.len())
+        };
+        (name.clone(), root.clone(), *ticket)
+    }
+
+    #[test]
+    fn capital_e_asks_a_worker_to_read_the_selected_agents_scrollback_and_opens_nothing_yet() {
+        let mut m = model(&[]);
+        let (name, root, _) = scrollback_read(&update(&mut m, key(KeyCode::Char('E'))));
+        assert_eq!(name.as_str(), "fix");
+        assert!(root.ends_with("w/api/fix"));
+    }
+
+    #[test]
+    fn capital_e_works_from_the_activity_panel_too() {
+        let mut m = model(&[]);
+        update(&mut m, key(KeyCode::Char('2')));
+        let effects = update(&mut m, key(KeyCode::Char('E')));
+        assert_eq!(scrollback_read(&effects).0.as_str(), "fix");
+    }
+
+    #[test]
+    fn the_scrollback_opens_as_text_at_its_last_line_when_the_read_returns() {
+        let mut m = model(&[]);
+        let (name, root, ticket) = scrollback_read(&update(&mut m, key(KeyCode::Char('E'))));
+        let effects = update(
+            &mut m,
+            Msg::ScrollbackRead(ScrollbackRead {
+                ticket,
+                name,
+                root,
+                result: Ok("one\ntwo  \nthree\n\n".into()),
+            }),
+        );
+        let [
+            Effect::Edit(Open::Transcript {
+                text,
+                line,
+                name,
+                kind,
+                ..
+            }),
+        ] = effects.as_slice()
+        else {
+            panic!("one document to open")
+        };
+        assert_eq!(text, "one\ntwo  \nthree\n");
+        assert_eq!(line.get(), 3);
+        assert_eq!(name, "fix-scrollback");
+        assert_eq!(*kind, Document::Text);
+    }
+
+    #[test]
+    fn a_scrollback_read_that_a_newer_one_replaced_opens_nothing() {
+        let mut m = model(&[]);
+        let (name, root, stale) = scrollback_read(&update(&mut m, key(KeyCode::Char('E'))));
+        update(&mut m, key(KeyCode::Char('E')));
+        let effects = update(
+            &mut m,
+            Msg::ScrollbackRead(ScrollbackRead {
+                ticket: stale,
+                name,
+                root,
+                result: Ok("late".into()),
+            }),
+        );
+        assert!(effects.is_empty());
+    }
+
+    #[test]
+    fn a_failed_scrollback_read_says_why_and_opens_nothing() {
+        let mut m = model(&[]);
+        let (name, root, ticket) = scrollback_read(&update(&mut m, key(KeyCode::Char('E'))));
+        let effects = update(
+            &mut m,
+            Msg::ScrollbackRead(ScrollbackRead {
+                ticket,
+                name,
+                root,
+                result: Err(Cause::of(&std::io::Error::other("no host"))),
+            }),
+        );
+        assert!(effects.is_empty());
+        let said = m.status.as_ref().expect("a status");
+        assert!(said.text.contains("couldn't read the scrollback of fix"));
+        assert!(said.text.contains("no host"));
+    }
+
+    #[test]
+    fn capital_e_with_nothing_selected_says_to_select_an_agent() {
+        let mut m = model(&[]);
+        m.load = crate::model::Load::Pending;
+        let effects = update(&mut m, key(KeyCode::Char('E')));
+        assert!(effects.is_empty());
+        assert_eq!(
+            m.status.as_ref().map(|s| s.text.as_str()),
+            Some("select an agent to read its scrollback")
         );
     }
 

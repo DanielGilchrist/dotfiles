@@ -4,7 +4,6 @@ local io = require("io")
 local wezterm = require("wezterm")
 local key_utils = require("utils.key")
 local os_utils = require("utils.os")
-local process_utils = require("utils.process")
 local agents_tab = require("agents_tab")
 local dev_tabs = require("dev_tabs")
 local commands = require("commands")
@@ -107,31 +106,6 @@ config.keys = {
     end
 
     window:perform_action(wezterm.action({ ClearScrollback = "ScrollbackAndViewport" }), pane)
-  end)),
-
-  -- One "give me this text in a vim buffer" key. Wezterm copy mode copies
-  -- the rendered screen, so over zellij it grabs pane borders and both
-  -- columns; dispatch by what the pane is running instead.
-  keybind(combine(keys.CTRL, keys.SHIFT), "x", wezterm.action_callback(function(window, pane)
-    local process_name = pane:get_foreground_process_name() or ""
-    -- zellij may run under a shell or the `agent` TUI, so look through the
-    -- foreground process's children too.
-    if process_name:find("zellij") or process_utils.any(pane:get_foreground_process_info(), function(p)
-      return (p.name or ""):find("zellij", 1, true) ~= nil
-    end) then
-      -- Ctrl+s then e: scroll mode → EditScrollback (zellij/config.kdl).
-      window:perform_action(wezterm.action.Multiple({
-        wezterm.action.SendKey({ key = "s", mods = keys.CTRL }),
-        wezterm.action.SendKey({ key = "e" }),
-      }), pane)
-      return
-    end
-    if process_name:find("nvim") then
-      -- CSI u for Ctrl+Shift+x; nvim decodes it as <C-S-x> and decides.
-      window:perform_action(wezterm.action.SendString("\x1b[120;6u"), pane)
-      return
-    end
-    window:perform_action(wezterm.action.ActivateCopyMode, pane)
   end)),
 
   keybind(keys.COMMAND, "w", wezterm.action({ CloseCurrentPane = { confirm = false } })),

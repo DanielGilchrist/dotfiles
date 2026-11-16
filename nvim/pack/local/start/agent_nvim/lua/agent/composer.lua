@@ -118,7 +118,7 @@ function M.submit(opts)
     if close then M.cancel() end
     return
   end
-  local sent = require("agent").send_text(text, true)
+  local sent = require("agent").send_text(text)
   if not sent then return end
   clear()
   if close then M.hide() end

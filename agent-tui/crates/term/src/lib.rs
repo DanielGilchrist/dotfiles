@@ -1,6 +1,7 @@
 mod commands;
 mod escapes;
 mod handoff;
+mod hosted;
 mod input;
 mod pty;
 mod vt;
@@ -11,6 +12,7 @@ pub use commands::{
 };
 pub use escapes::{Lines, output_lines, printable, strip_escapes};
 pub use handoff::{Ended, hand_over};
+pub use hosted::{Hosted, HostedChild, HostedCommand, HostedExit, HostedPty, spawn_hosted};
 pub use input::{CellPos, encode_key, encode_mouse};
 pub use pty::{Closed, Liveness, Terminal};
 pub use vt::Vt100;
@@ -20,20 +22,13 @@ use std::num::NonZeroU16;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 
-/// A terminal size with no zero dimension.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TermSize {
-    pub rows: NonZeroU16,
-    pub cols: NonZeroU16,
-}
+pub use agent_core::size::TermSize;
 
-impl TermSize {
-    pub fn of(area: Rect) -> Option<Self> {
-        Some(Self {
-            rows: NonZeroU16::new(area.height)?,
-            cols: NonZeroU16::new(area.width)?,
-        })
-    }
+pub fn area_size(area: Rect) -> Option<TermSize> {
+    Some(TermSize {
+        rows: NonZeroU16::new(area.height)?,
+        cols: NonZeroU16::new(area.width)?,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

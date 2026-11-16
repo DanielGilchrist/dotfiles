@@ -132,7 +132,7 @@ fn printing(escapes: &str) -> agent_term::Terminal<Box<dyn agent_term::Emulator>
 fn spawn(
     spec: &agent_core::process::LaunchSpec,
 ) -> agent_term::Terminal<Box<dyn agent_term::Emulator>> {
-    let size = agent_term::TermSize::of(ratatui::layout::Rect::new(0, 0, 80, 24)).expect("size");
+    let size = agent_term::area_size(ratatui::layout::Rect::new(0, 0, 80, 24)).expect("size");
     agent_term::Terminal::spawn(
         spec,
         size,
@@ -159,12 +159,16 @@ pub fn hear_the_terminal(m: &mut Model) {
 /// at 200 by 50.
 pub fn watch(m: &mut Model, agent: &str) {
     let size = |n| std::num::NonZeroU16::new(n).expect("nonzero");
+    let seen = agent_term::TermSize {
+        cols: size(200),
+        rows: size(50),
+    };
     m.peek = Some(crate::model::Peek::Watch(crate::model::Watch {
         name: name(agent),
         view: crate::model::WatchView::Watched(crate::model::Watcher {
             term: cat(),
             opened: std::time::Instant::now(),
-            seen: (size(200), size(50)),
+            seen,
             measure: crate::model::Measure::Idle,
         }),
     }));

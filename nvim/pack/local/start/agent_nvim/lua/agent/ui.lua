@@ -1,4 +1,4 @@
-local zellij = require("agent.zellij")
+local host = require("agent.host")
 local is = require("utils.is")
 
 ---@class AgentUI
@@ -168,7 +168,7 @@ end
 
 ---@param opts {include_new?: boolean, on_pick: fun(name: string|nil, is_new: boolean)}
 function M.pick_session(opts)
-  local sessions = zellij.list_sessions()
+  local sessions = host.list_sessions()
   if #sessions == 0 and not opts.include_new then
     opts.on_pick(nil, false)
     return
@@ -195,7 +195,7 @@ end
 
 ---@param opts {current?: string, on_pick: fun(name?: string)}
 function M.pick_kill(opts)
-  local sessions = zellij.list_sessions()
+  local sessions = host.list_sessions()
   if #sessions == 0 then opts.on_pick(nil) return end
 
   ---@type {text: string, name: string}[]

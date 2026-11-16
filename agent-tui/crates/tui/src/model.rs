@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::num::{NonZeroU16, NonZeroUsize};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -25,7 +25,7 @@ use agent_core::ports::{
     ActivityDetail, CallKind, Change, ClientId, FileState, HarnessId, Observation, Place, Progress,
     Readiness, Uncommitted, WorktreeFacts,
 };
-use agent_term::{Emulator, ShownCommand, ShownName, Terminal};
+use agent_term::{Emulator, ShownCommand, ShownName, TermSize, Terminal};
 use crossterm::event::KeyEvent;
 use ratatui::layout::Rect;
 
@@ -1150,7 +1150,7 @@ pub struct Watcher {
     pub opened: Instant,
     /// The size the session host reported when it started, which a later look
     /// compares to follow the other window being resized.
-    pub seen: (NonZeroU16, NonZeroU16),
+    pub seen: TermSize,
     pub measure: Measure,
 }
 
@@ -1200,7 +1200,7 @@ impl Watch {
             (WatchView::Watching(t), Ok(found)) if *t == ticket => Reply::Spawn(found),
             (WatchView::Watching(t), Err(why)) if *t == ticket => Reply::Failed(why),
             (WatchView::Watched(w), Ok(found))
-                if w.measure == Measure::Asked(ticket) && w.seen != (found.cols, found.rows) =>
+                if w.measure == Measure::Asked(ticket) && w.seen != found.size =>
             {
                 Reply::Spawn(found)
             }
@@ -1213,12 +1213,7 @@ impl Watch {
     }
 
     /// Shows `term`. A restart keeps the time the watch first opened.
-    pub fn install(
-        &mut self,
-        term: Terminal<Box<dyn Emulator>>,
-        seen: (NonZeroU16, NonZeroU16),
-        now: Instant,
-    ) {
+    pub fn install(&mut self, term: Terminal<Box<dyn Emulator>>, seen: TermSize, now: Instant) {
         match &mut self.view {
             WatchView::Watching(_) => {
                 self.view = WatchView::Watched(Watcher {
@@ -2391,6 +2386,7 @@ pub struct Model {
     next_ticket: u64,
     /// The newest look for other windows, the only one whose answer counts.
     latest_look: Option<Ticket>,
+    latest_scrollback: Option<Ticket>,
     pub check_health: CheckHealth,
     pub actions: Actions,
     pub keys: Sendable,
@@ -2481,6 +2477,7 @@ impl Model {
             displaced: None,
             next_ticket: 0,
             latest_look: None,
+            latest_scrollback: None,
             check_health: CheckHealth::Working,
             actions: Actions::default(),
             keys: Sendable::default(),
@@ -2536,6 +2533,18 @@ impl Model {
         let ticket = self.ticket();
         self.latest_look = Some(ticket);
         ticket
+    }
+
+    /// A ticket for a new scrollback read. Only the newest read opens the
+    /// editor.
+    pub fn start_scrollback(&mut self) -> Ticket {
+        let ticket = self.ticket();
+        self.latest_scrollback = Some(ticket);
+        ticket
+    }
+
+    pub fn is_latest_scrollback(&self, ticket: Ticket) -> bool {
+        self.latest_scrollback == Some(ticket)
     }
 
     pub fn is_latest_look(&self, ticket: Ticket) -> bool {

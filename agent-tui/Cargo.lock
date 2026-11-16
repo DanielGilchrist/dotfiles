@@ -9,6 +9,9 @@ dependencies = [
  "agent-core",
  "agent-git",
  "agent-harness",
+ "agent-host",
+ "agent-native",
+ "agent-session",
  "agent-store",
  "agent-term",
  "agent-tui",
@@ -16,6 +19,7 @@ dependencies = [
  "anyhow",
  "clap",
  "clap_complete",
+ "nix 0.31.3",
  "portable-pty",
  "sysinfo",
  "tempfile",
@@ -52,6 +56,54 @@ dependencies = [
  "serde_json",
  "shell-words",
  "tempfile",
+]
+
+[[package]]
+name = "agent-host"
+version = "0.1.0"
+dependencies = [
+ "agent-core",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "agent-native"
+version = "0.1.0"
+dependencies = [
+ "agent-core",
+ "agent-host",
+ "agent-places",
+ "agent-session",
+ "tempfile",
+]
+
+[[package]]
+name = "agent-places"
+version = "0.1.0"
+dependencies = [
+ "agent-core",
+ "agent-places",
+ "sysinfo",
+]
+
+[[package]]
+name = "agent-session"
+version = "0.1.0"
+dependencies = [
+ "agent-core",
+ "agent-host",
+ "agent-session",
+ "agent-term",
+ "crossterm",
+ "nix 0.31.3",
+ "portable-pty",
+ "serde",
+ "serde_json",
+ "signal-hook",
+ "tempfile",
+ "thiserror 2.0.21",
+ "vt100",
+ "vte",
 ]
 
 [[package]]
@@ -99,9 +151,9 @@ name = "agent-zellij"
 version = "0.1.0"
 dependencies = [
  "agent-core",
+ "agent-places",
  "nix 0.31.3",
  "serde_json",
- "sysinfo",
  "tempfile",
 ]
 

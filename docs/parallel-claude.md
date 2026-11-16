@@ -17,7 +17,8 @@ Install or update it with `~/.config/agent-tui/install.sh`, which builds it into
   [repos]
   dirs = ["~/repos", "~/.config"]
   ```
-- **Names** are ≤20 chars of `[A-Za-z0-9._-]` (the session host's limit: zellij's socket path budget on macOS). `agents` is reserved. A worktree already named longer than the limit is still listed and can be removed, and `⏎` on it says why it can't start.
+- **Names** are ≤20 chars of `[A-Za-z0-9._-]` (the session host's limit: zellij's socket path budget on macOS), or ≤48 with `[host] kind = "native"` (less if `AGENT_RUNTIME_DIR` is long). `agents` is reserved. A worktree already named longer than the limit is still listed and can be removed, and `⏎` on it says why it can't start.
+- **Session host.** `[host] kind = "native"` (the default) or `"zellij"` in `config.toml` picks the host new sessions are made under. A session stays with the host that runs it, so zellij agents keep running after the switch and `r` (or `R`) restarts one under the configured host. `kind = "zellij"` again is the way back. With the native host there is no multiplexer between your terminal and the agent, so every key reaches it. Attach from any terminal, an ssh login or a phone with `agent attach <name>`: it takes the session over from another window, which keeps watching and can press a key to take it back. `[keys] detach` (default `ctrl-\`, `none` turns it off) leaves the session again, and applies to a terminal only, never to the TUI's pane. `agent dump <name> --scrollback` prints what the agent's terminal has scrolled off (`--plain` drops the styling), the host keeps the last 32 MiB (about 1M cells), and `E` in the TUI's list opens it in `$EDITOR` at the end. A read-only view for a phone is `agent session attach <name> --as watch`, which the TUI doesn't count as another window. Leave the default alone until the verification step has run.
 - **State** lives in `~/.local/state/agent`: per-agent records (harness, undelivered first prompt), pins, zellij layouts and the TUI's last selection.
 
 ## The TUI
@@ -55,6 +56,7 @@ Install or update it with `~/.config/agent-tui/install.sh`, which builds it into
 | `` ` `` | In [3], switch between the directory tree (default) and the flat file list |
 | `-` `=` | In [3]'s tree, close / open every folder |
 | `e` | Edit: the agent's checkout in $EDITOR, in [3] the file (or folder) under the cursor, in [2] a subagent's transcript, and in [0] on a subagent's log or the activity, the transcript as Markdown at the entry under the cursor |
+| `E` | Open the agent's scrollback (what its terminal shows and has scrolled off) as text in $EDITOR, at the end |
 | `d` / `D` | Kill the session / remove session, worktree and branch (confirms, lists anything that would be lost) |
 | `r` / `R` | Restart the agent / every agent: kill the session, stop the harness process that outlived it so the installed version runs, then start it again resuming its conversation. `r` asks only when it would interrupt the agent, when it has background commands running (which a restart may stop, listed in the box: Claude Code cleans up background tasks when it exits, except those of a session moved to the background, which carry over to its next process, so whether they survive depends on that) or when another window shows it. A command or activity that appears after you confirm cancels that restart instead of stopping it unseen. `R` always asks, and `i` in it restarts only the agents that are idle and have no background commands. An exited agent whose harness still runs has it stopped and stays exited. Its card reads `restarting` until the restart finishes |
 | `x` | Run a configured action on the selected agent (see below) |
@@ -118,6 +120,7 @@ The key that leaves an agent lives in the same file. The default is `ctrl-]`. It
 nav = "ctrl-]"
 prev_agent = "alt-;"
 next_agent = "alt-'"
+detach = "ctrl-\\"
 ```
 
 `prev_agent` and `next_agent` are on by default. In NAV they select and preview the previous or next agent in the list. Pressed while you are typing into an agent they are not sent to the agent: they switch to the neighbouring agent and keep you in its terminal. The order is the list in [1], wrapping at the ends, and nothing happens with fewer than two agents. Typing in the agent you hop to right away is safe: keys and pastes typed before its terminal has printed are held and sent to it with that terminal's own modes (up to 4 KiB, and none of it if you type more than that, or if it prints nothing within 3 seconds). The status bar says `dropped 3 keys and a paste` when something is dropped. From an agent the chord skips agents that aren't running, are starting or restarting, or are open in another window, and says `no other agent to hop to` if none can take the keys. The nav key cancels a hop that hasn't connected. They do nothing while the send box, a form, the switcher or the peek is open. Set `prev_agent = "none"` (or `"off"`) to turn one off. A legacy terminal sends any Alt chord as Esc followed by the key, so Esc followed quickly by `;` or `'` (leaving insert mode in an agent's vim mode, then typing one of them) arrives as Alt+`;` or Alt+`'` and triggers the chord too. The defaults avoid keys used by readline, zellij's defaults and Claude Code's documented keys, but not by every program: a window manager may claim an Alt chord globally before the terminal sees it (AeroSpace's own default config binds `alt-comma` and `alt-slash`, which is why these aren't the defaults). `agent keys` can't see that: if a chord does nothing, check the window manager and pick another with `agent keys`. `nav` can't be turned off.
@@ -193,7 +196,7 @@ The `agent-edit` event (`wezterm/agent_edit.lua`) backs the `t` (nvim in tab) an
 | `agent forget [<path>]` | Drop it from the list. It stays while sessions or worktrees belong to it. |
 | `agent merged` | Worktrees whose branch can be removed without losing work. |
 | `agent prompt <name> <text>` / `--file` | Type a prompt into a running agent and submit it. Exits non-zero with nothing sent while the agent is asking, booting or ended. |
-| `agent dump <name>` | Print an agent's screen with ANSI styling. |
+| `agent dump <name> [--scrollback] [--plain]` | Print an agent's screen with ANSI styling. `--scrollback` adds what scrolled off the top and `--plain` prints text only. |
 | `agent pin [<name>]` / `agent unpin` | Pin to the top of the TUI. |
 | `agent --harness <id> …` | Harness for new agents (default `claude`, and `$AGENT_CLAUDE` overrides its program). |
 
@@ -208,7 +211,7 @@ The `agent-edit` event (`wezterm/agent_edit.lua`) backs the `t` (nvim in tab) an
 
 ## Neovim keybinds (`agent_nvim` plugin, `<leader>a`)
 
-The neovim plugin runs the `agent` binary for spawning, removing and previews, and attaches to the zellij sessions directly.
+The neovim plugin runs the `agent` binary for spawning, removing and previews, and attaches through `agent plugin argv <name>` (hidden), so a session attaches under whichever host runs it.
 
 | Key | Action |
 |---|---|
@@ -232,9 +235,10 @@ The neovim plugin runs the `agent` binary for spawning, removing and previews, a
 | `<leader>ard` | Delete the comment under the cursor. |
 | `<leader>ars` | Page through the pending comments (`]`/`[`), then `<C-s>` to send all to the active agent. Sending ends the review. |
 | `]r` / `[r` | Jump to the next / previous change in the inline diff (review mode). |
+| `<leader>ab` | Open the current agent's scrollback in a scratch tab (`agent dump <name> --scrollback --plain`), at its end. It replaces zellij's `Ctrl+s e`. `<C-S-x>` in a terminal buffer does the same where the terminal can send it (kitty keyboard protocol only, which wezterm has off) |
 | `<C-.>` (n/i/t/x) | Toggle between the agent tab and wherever you were. |
 
-Each agent opens in its own nvim tab page with `tcd` set to the worktree cwd, a Snacks dashboard on the left, and the zellij attach terminal on the right. Your main work tab is unaffected. Switch between tabs with `gt`/`gT` or the `<leader><Tab>` group (`l` for a picker, `r` to rename, `n`/`p`/`x`/`t`/`o` for next/prev/close/new/only).
+Each agent opens in its own nvim tab page with `tcd` set to the worktree cwd, a Snacks dashboard on the left, and the `agent` attach terminal on the right. Your main work tab is unaffected. Switch between tabs with `gt`/`gT` or the `<leader><Tab>` group (`l` for a picker, `r` to rename, `n`/`p`/`x`/`t`/`o` for next/prev/close/new/only).
 
 ## Reviewing an agent's work
 

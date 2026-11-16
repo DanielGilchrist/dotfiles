@@ -34,7 +34,9 @@ use agent_core::names::{CarriageReturn, SessionName, clean};
 use agent_core::ops::Backend;
 use agent_core::ports::{ClientId, HarnessId, Observation};
 use agent_core::process::LaunchSpec;
-use agent_term::{Emulator, EmulatorFactory, Ended, Liveness, TermSize, Terminal, hand_over};
+use agent_term::{
+    Emulator, EmulatorFactory, Ended, Liveness, TermSize, Terminal, area_size, hand_over,
+};
 use anyhow::{Context, Result};
 use cause::Cause;
 use crossterm::event::{
@@ -53,7 +55,7 @@ use ratatui::layout::Rect;
 
 use model::{Connection, Mode, Model, Moment, Pane, StatusKind, TerminalFocus, Ticket, Watch};
 use palette::{Colours, Palette};
-use update::{Background, Effect, Open};
+use update::{Background, Document, Effect, Open};
 use worker::{Job, Msg, Workers};
 
 const FRAME: Duration = Duration::from_millis(16);
@@ -328,7 +330,7 @@ impl Runtime {
         if m.pane.awaiting(ticket).is_none() {
             return Ok(());
         }
-        let size = TermSize::of(m.areas.terminal).context("the terminal pane has no size")?;
+        let size = area_size(m.areas.terminal).context("the terminal pane has no size")?;
         let term = self
             .start_terminal(spec, size)
             .with_context(|| format!("attaching to {name}"))?;
@@ -355,10 +357,10 @@ impl Runtime {
         let Some(watch) = m.watch_mut().filter(|w| w.awaiting(ticket).is_some()) else {
             return Ok(());
         };
-        let seen = (observation.cols, observation.rows);
+        let seen = observation.size;
         let size = TermSize {
-            cols: observation.cols.min(OBSERVED_MAX.cols),
-            rows: observation.rows.min(OBSERVED_MAX.rows),
+            cols: seen.cols.min(OBSERVED_MAX.cols),
+            rows: seen.rows.min(OBSERVED_MAX.rows),
         };
         let term = self.start_terminal(observation.spec, size)?;
         watch.install(term, seen, now);
@@ -370,7 +372,7 @@ impl Runtime {
         spec: LaunchSpec,
         size: TermSize,
     ) -> std::io::Result<Terminal<Box<dyn Emulator>>> {
-        let spec = spec.env_remove(self.backend.host.nesting_env().iter().copied());
+        let spec = spec.env_remove(self.backend.host.nesting_env());
         Terminal::spawn(&spec, size, (self.emulator)(size))
     }
 
@@ -462,7 +464,7 @@ impl Runtime {
         let full = terminal
             .size()
             .ok()
-            .and_then(|s| TermSize::of(Rect::new(0, 0, s.width, s.height)));
+            .and_then(|s| area_size(Rect::new(0, 0, s.width, s.height)));
         if let (Pane::Connected(c), Some(full)) = (&mut m.pane, full) {
             let _ = c.term.resize(full);
         }
@@ -517,7 +519,7 @@ impl Runtime {
                     edit,
                 } => self.workers.suggest_name(prompt, harness, edit),
                 Effect::Attach { name, ticket } => {
-                    let spec = self.backend.host.attach(&name);
+                    let spec = self.backend.host.attach(&name, self.backend.attachment);
                     let result = self.connect(m, &name, spec, ticket);
                     Self::connect_failed(m, ticket, result);
                 }
@@ -583,7 +585,8 @@ impl Runtime {
                 name,
                 text,
                 line,
-            } => match write_transcript(name, text) {
+                kind,
+            } => match write_transcript(name, text, *kind) {
                 Ok(path) => {
                     transcript = path;
                     (root, Target::Line(&transcript, *line))
@@ -656,7 +659,7 @@ impl Runtime {
         let Some(lost) = update::message_edited(m, to, edited.map_err(|e| format!("{e:#}"))) else {
             return;
         };
-        match write_transcript(&format!("{to}-message"), &lost) {
+        match write_transcript(&format!("{to}-message"), &lost, Document::Markdown) {
             Ok(path) => m.error(format!(
                 "the edited message was dropped: {to} is gone · kept in {}",
                 path.display()
@@ -774,7 +777,7 @@ fn event_loop(
         if size != m.size {
             update::resized(&mut m, size);
         }
-        if let (Pane::Connected(c), Some(size)) = (&mut m.pane, TermSize::of(m.areas.terminal))
+        if let (Pane::Connected(c), Some(size)) = (&mut m.pane, area_size(m.areas.terminal))
             && let Err(e) = c.term.resize(size)
         {
             m.error(format!("resizing the pane: {e}"));
@@ -878,7 +881,7 @@ fn clear_stale_transcripts(dir: &Path, kept: Duration) {
 /// that can't be a link planted in advance) under the temp dir and returns
 /// its path. The editor may detach and read it later, so it is left for
 /// [`clear_stale_transcripts`].
-fn write_transcript(name: &str, text: &str) -> Result<std::path::PathBuf> {
+fn write_transcript(name: &str, text: &str, kind: Document) -> Result<std::path::PathBuf> {
     let safe: String = name
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
@@ -886,7 +889,7 @@ fn write_transcript(name: &str, text: &str) -> Result<std::path::PathBuf> {
         .collect();
     let mut file = tempfile::Builder::new()
         .prefix(&format!("{TRANSCRIPT_PREFIX}{safe}-"))
-        .suffix(".md")
+        .suffix(kind.extension())
         .tempfile()
         .context("creating a transcript file")?;
     std::io::Write::write_all(&mut file, text.as_bytes())
@@ -951,8 +954,8 @@ mod tests {
 
     #[test]
     fn transcripts_get_their_own_private_file_each_time() {
-        let a = super::write_transcript("a.b/c", "one").expect("written");
-        let b = super::write_transcript("a_b/c", "two").expect("written");
+        let a = super::write_transcript("a.b/c", "one", Document::Markdown).expect("written");
+        let b = super::write_transcript("a_b/c", "two", Document::Markdown).expect("written");
         assert_ne!(a, b, "names that sanitise alike don't share a file");
         assert_eq!(std::fs::read_to_string(&a).expect("reads"), "one");
         assert_eq!(std::fs::read_to_string(&b).expect("reads"), "two");

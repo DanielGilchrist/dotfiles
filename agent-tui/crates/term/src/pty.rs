@@ -5,11 +5,12 @@ use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TryRecvError};
 use std::thread;
 
 use agent_core::process::LaunchSpec;
-use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
+use portable_pty::{Child, CommandBuilder, MasterPty, native_pty_system};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 
 use crate::escapes::{Sequence, consume};
+use crate::hosted::{pty_size, to_io};
 use crate::{Emulator, Modes, Screen, TermSize};
 
 /// Output chunks buffered before the reader waits for the UI to catch up.
@@ -23,19 +24,6 @@ const PUMP_BUDGET: usize = 256 * 1024;
 pub enum Liveness {
     Running,
     Exited,
-}
-
-fn pty_size(size: TermSize) -> PtySize {
-    PtySize {
-        rows: size.rows.get(),
-        cols: size.cols.get(),
-        pixel_width: 0,
-        pixel_height: 0,
-    }
-}
-
-fn to_io(e: impl std::fmt::Display) -> io::Error {
-    io::Error::other(e.to_string())
 }
 
 /// The program's pty no longer takes input, so what was sent is lost.

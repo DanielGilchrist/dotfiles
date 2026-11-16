@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io::Write;
 use std::num::{NonZeroU16, NonZeroUsize};
@@ -7,17 +6,19 @@ use std::process::Command;
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime};
 
+use agent_core::config::HostKind;
 use agent_core::model::Running;
 use agent_core::names::{HostName, NameLimit, SessionName};
 use agent_core::ports::{
-    ClientControl, ClientId, HostError, Liveness, Observation, PaneCommand, Place, SessionHost,
-    SessionInfo, SessionStatus, TerminalApp, Window,
+    Attachment, ClientControl, ClientId, Extent, HostError, Liveness, Observation, PaneCommand,
+    Rendering, SessionHost, SessionInfo, SessionStatus, Window, WindowHandle,
 };
 use agent_core::process::{self, CommandError, LaunchSpec, parallel_map};
+use agent_core::size::TermSize;
+use agent_places::{Processes, program_is};
 use nix::errno::Errno;
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
-use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
 const NESTING_ENV: &[&str] = &["ZELLIJ", "ZELLIJ_SESSION_NAME", "ZELLIJ_PANE_ID"];
 /// A pane query for one session. A hung session shouldn't stall a refresh.
@@ -126,7 +127,7 @@ fn terminal_panes(panes: &[serde_json::Value]) -> impl Iterator<Item = &serde_js
 
 /// The size zellij draws a session at, from the display area of the active
 /// tab, else the first.
-fn display_size(tabs: &[serde_json::Value]) -> Option<(NonZeroU16, NonZeroU16)> {
+fn display_size(tabs: &[serde_json::Value]) -> Option<TermSize> {
     let tab = tabs
         .iter()
         .find(|t| t["active"] == true)
@@ -136,13 +137,13 @@ fn display_size(tabs: &[serde_json::Value]) -> Option<(NonZeroU16, NonZeroU16)> 
             .ok()
             .and_then(NonZeroU16::new)
     };
-    Some((
-        dimension("display_area_columns")?,
-        dimension("display_area_rows")?,
-    ))
+    Some(TermSize {
+        cols: dimension("display_area_columns")?,
+        rows: dimension("display_area_rows")?,
+    })
 }
 
-fn session_size(name: &SessionName) -> Result<(NonZeroU16, NonZeroU16), HostError> {
+fn session_size(name: &SessionName) -> Result<TermSize, HostError> {
     let mut cmd = session_cmd(name);
     cmd.args(["action", "list-tabs", "--json"]);
     let out = process::output_within(&mut cmd, PANE_QUERY_TIMEOUT)?;
@@ -364,188 +365,50 @@ fn attached_session<'a>(args: &'a [&'a str]) -> Option<&'a str> {
     }
 }
 
-fn program_is(argv: &[String], program: &str) -> bool {
-    argv.first()
-        .and_then(|exe| Path::new(exe).file_name())
-        .is_some_and(|n| n == program)
-}
-
-/// What the scan keeps of a process: its parent, the program it was started
-/// as, the kernel's name for it (cut short on Linux), and the argv of the
-/// programs that matter to it.
-struct Process {
-    parent: Option<u32>,
-    program: String,
-    comm: String,
-    argv: Vec<String>,
-}
-
-/// The program an argv[0] names: its basename, cut at the `:` some daemons
-/// retitle themselves with (`sshd: user@pts/0`).
-fn program_name(argv0: &str) -> &str {
-    let head = argv0.split(':').next().unwrap_or(argv0);
-    head.rsplit('/')
-        .next()
-        .unwrap_or(head)
-        .trim_start_matches('-')
-}
-
-/// Every process, for walking up from a client.
-struct Processes {
-    all: HashMap<u32, Process>,
-}
-
-impl Processes {
-    fn scan() -> Self {
-        let mut system = System::new();
-        system.refresh_processes_specifics(
-            ProcessesToUpdate::All,
-            true,
-            ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always),
-        );
-        let all = system
-            .processes()
-            .iter()
-            .map(|(pid, p)| {
-                let argv: Vec<String> = p
-                    .cmd()
-                    .iter()
-                    .map(|a| a.to_string_lossy().into_owned())
-                    .collect();
-                let keeps = program_is(&argv, "zellij") || program_is(&argv, "agent");
-                let comm = program_name(&p.name().to_string_lossy()).to_string();
-                let process = Process {
-                    parent: p.parent().map(sysinfo::Pid::as_u32),
-                    program: argv
-                        .first()
-                        .map_or_else(|| comm.clone(), |a| program_name(a).to_string()),
-                    comm,
-                    argv: if keeps { argv } else { Vec::new() },
-                };
-                (pid.as_u32(), process)
-            })
-            .collect();
-        Self { all }
-    }
-
-    /// `pid` and its ancestors, nearest first.
-    fn lineage(&self, mut pid: u32) -> Vec<u32> {
-        let mut lineage = vec![pid];
-        for _ in 0..64 {
-            match self.all.get(&pid).and_then(|p| p.parent) {
-                Some(parent) if parent != pid => {
-                    lineage.push(parent);
-                    pid = parent;
-                }
-                _ => break,
+/// Every window showing a session: zellij clients that are neither `own`'s
+/// nor under a process `is_tui` recognises, whose previews are not a window
+/// of someone else's.
+fn shown_windows(
+    procs: &Processes,
+    own: Option<ClientId>,
+    is_tui: fn(&[String]) -> bool,
+) -> Vec<Window> {
+    let mut windows: Vec<Window> = procs
+        .iter()
+        .filter_map(|(pid, process)| {
+            if !program_is(process.argv(), "zellij") {
+                return None;
             }
-        }
-        lineage
-    }
-
-    fn argv(&self, pid: u32) -> &[String] {
-        self.all.get(&pid).map_or(&[], |p| &p.argv)
-    }
-
-    /// Every window showing a session: zellij clients that are neither
-    /// `own`'s nor under a process `is_tui` recognises, whose previews are
-    /// not a window of someone else's.
-    fn windows(&self, own: Option<ClientId>, is_tui: fn(&[String]) -> bool) -> Vec<Window> {
-        let runs_tui = |pid: u32| {
-            let argv = self.argv(pid);
-            program_is(argv, "agent") && is_tui(&argv[1..])
-        };
-        let mut windows: Vec<Window> = self
-            .all
-            .iter()
-            .filter_map(|(pid, process)| {
-                if !program_is(&process.argv, "zellij") {
-                    return None;
-                }
-                let rest: Vec<&str> = process.argv.iter().skip(1).map(String::as_str).collect();
-                let session = NAME_LIMIT
-                    .admit(attached_session(&rest)?.parse().ok()?)
-                    .ok()?
-                    .into_session();
-                let lineage = self.lineage(*pid);
-                let ours = own.is_some_and(|own| lineage.contains(&own.get()));
-                (!ours && !lineage.iter().any(|p| runs_tui(*p))).then(|| Window {
-                    client: ClientId::new(*pid),
-                    session,
-                    place: self.place_of(*pid),
-                })
+            let rest: Vec<&str> = process.argv().iter().skip(1).map(String::as_str).collect();
+            let session = NAME_LIMIT
+                .admit(attached_session(&rest)?.parse().ok()?)
+                .ok()?
+                .into_session();
+            let lineage = procs.lineage(pid);
+            let ours = own.is_some_and(|own| lineage.contains(&own.get()));
+            (!ours && !procs.under_tui(&lineage, is_tui)).then(|| Window {
+                client: ClientId::new(pid),
+                session,
+                place: procs.place_of(pid),
+                handle: WindowHandle::new(HostKind::Zellij, pid),
             })
-            .collect();
-        windows.sort_by_key(|w| w.client.get());
-        windows
-    }
-
-    /// The nearest ancestor of `client` that names a place. With none, a
-    /// client that has no shell above it either was left behind by a window
-    /// that went away.
-    fn place_of(&self, client: u32) -> Place {
-        let above: Vec<&Process> = self
-            .lineage(client)
-            .into_iter()
-            .skip(1)
-            .filter_map(|pid| self.all.get(&pid))
-            .collect();
-        above
-            .iter()
-            .find_map(|p| place_named(&p.program).or_else(|| place_named(&p.comm)))
-            .unwrap_or_else(|| {
-                if above.iter().any(|p| SHELLS.contains(&p.program.as_str())) {
-                    Place::Unknown
-                } else {
-                    Place::Detached
-                }
-            })
-    }
+        })
+        .collect();
+    windows.sort_by_key(|w| w.client.get());
+    windows
 }
 
-const SHELLS: &[&str] = &[
-    "fish", "bash", "zsh", "sh", "dash", "ksh", "tcsh", "csh", "nu", "pwsh", "elvish", "xonsh",
-    "login",
-];
-
-/// How a program name has to match a terminal's.
-enum Matching {
-    Exactly,
-    Prefix,
-}
-
-/// Terminal programs by program name, and what to call them.
-const TERMINALS: &[(&str, Matching, &str)] = &[
-    ("wezterm-gui", Matching::Exactly, "wezterm"),
-    ("wezterm-mux-server", Matching::Exactly, "wezterm"),
-    ("ghostty", Matching::Exactly, "ghostty"),
-    ("iTerm2", Matching::Exactly, "iTerm"),
-    ("iTermServer", Matching::Prefix, "iTerm"),
-    ("Terminal", Matching::Exactly, "Terminal"),
-    ("alacritty", Matching::Exactly, "alacritty"),
-    ("kitty", Matching::Exactly, "kitty"),
-    ("Hyper", Matching::Exactly, "Hyper"),
-    ("konsole", Matching::Exactly, "konsole"),
-    ("xterm", Matching::Exactly, "xterm"),
-    ("foot", Matching::Exactly, "foot"),
-];
-
-/// The place a program of this name is, if it is one. Shells, `agent` and
-/// `zellij` name none, so the walk goes on past them.
-fn place_named(program: &str) -> Option<Place> {
-    match program {
-        "nvim" | "vim" => Some(Place::Nvim),
-        "mosh-server" => Some(Place::Ssh),
-        "tmux" => Some(Place::Tmux),
-        _ if program.starts_with("sshd") => Some(Place::Ssh),
-        _ => TERMINALS
-            .iter()
-            .find(|(name, matching, _)| match matching {
-                Matching::Exactly => program == *name,
-                Matching::Prefix => program.starts_with(name),
-            })
-            .map(|(_, _, app)| Place::Terminal(TerminalApp::new(*app))),
+fn dump_screen_args(pane: &str, extent: Extent, rendering: Rendering) -> Vec<String> {
+    let mut args: Vec<String> = ["action", "dump-screen", "--pane-id", pane]
+        .map(String::from)
+        .to_vec();
+    if rendering == Rendering::Styled {
+        args.push("--ansi".into());
     }
+    if extent == Extent::Scrollback {
+        args.push("--full".into());
+    }
+    args
 }
 
 impl SessionHost for Zellij {
@@ -584,20 +447,23 @@ impl SessionHost for Zellij {
             .collect())
     }
 
-    fn attach(&self, name: &SessionName) -> LaunchSpec {
+    fn attach(&self, name: &SessionName, _: Attachment) -> LaunchSpec {
         LaunchSpec::new("zellij").args(["attach", name.as_str()])
     }
 
     fn observe(&self, name: &SessionName) -> Result<Observation, HostError> {
-        let (cols, rows) = session_size(name)?;
         Ok(Observation {
             spec: LaunchSpec::new("zellij").args(["watch", name.as_str()]),
-            cols,
-            rows,
+            size: session_size(name)?,
         })
     }
 
-    fn create(&self, name: &HostName, pane: &PaneCommand) -> Result<LaunchSpec, HostError> {
+    fn create(
+        &self,
+        name: &HostName,
+        pane: &PaneCommand,
+        _: Attachment,
+    ) -> Result<LaunchSpec, HostError> {
         // `NameLimit::new` is public, so a name admitted against a larger limit
         // can reach here. Zellij would fail on its socket path.
         name.within(NAME_LIMIT)?;
@@ -694,10 +560,15 @@ impl SessionHost for Zellij {
         Ok(())
     }
 
-    fn screen(&self, name: &SessionName) -> Result<String, HostError> {
+    fn screen(
+        &self,
+        name: &SessionName,
+        extent: Extent,
+        rendering: Rendering,
+    ) -> Result<String, HostError> {
         let pane = harness_pane(&panes(name)?)?;
         let mut cmd = session_cmd(name);
-        cmd.args(["action", "dump-screen", "--ansi", "--pane-id", &pane]);
+        cmd.args(dump_screen_args(&pane, extent, rendering));
         Ok(process::run(&mut cmd)?)
     }
 
@@ -705,8 +576,12 @@ impl SessionHost for Zellij {
         Some(self)
     }
 
-    fn nesting_env(&self) -> &'static [&'static str] {
-        NESTING_ENV
+    fn own_session(&self, var: &dyn Fn(&str) -> Option<String>) -> Option<SessionName> {
+        var("ZELLIJ_SESSION_NAME")?.parse().ok()
+    }
+
+    fn nesting_env(&self) -> Vec<&'static str> {
+        NESTING_ENV.to_vec()
     }
 }
 
@@ -714,15 +589,16 @@ impl ClientControl for Zellij {
     fn windows(&self, own: Option<ClientId>) -> Result<Vec<Window>, HostError> {
         // `own` is the one client the caller is sure of whatever its binary
         // is called, which the TUI predicate can't promise.
-        Ok(Processes::scan().windows(own, self.is_tui))
+        Ok(shown_windows(&Processes::scan_shared(), own, self.is_tui))
     }
 
     /// SIGHUP is what a closing terminal sends, so the session just loses a
     /// viewer. A stopped client acts on no signal until continued, so it is
     /// continued first.
-    fn detach(&self, clients: &[ClientId]) -> Result<(), HostError> {
-        for &client in clients {
-            let pid = i32::try_from(client.get()).map_err(|e| HostError::Detach {
+    fn detach(&self, windows: &[Window]) -> Result<(), HostError> {
+        for window in windows {
+            let client = window.client;
+            let pid = i32::try_from(window.handle.key()).map_err(|e| HostError::Detach {
                 client,
                 reason: e.to_string(),
             })?;
@@ -742,7 +618,32 @@ impl ClientControl for Zellij {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_dump_asks_zellij_for_the_scrollback_and_the_styling_only_when_wanted() {
+        let words = |extent, rendering| dump_screen_args("terminal_3", extent, rendering);
+        assert_eq!(
+            words(Extent::Visible, Rendering::Styled),
+            ["action", "dump-screen", "--pane-id", "terminal_3", "--ansi"]
+        );
+        assert_eq!(
+            words(Extent::Scrollback, Rendering::Plain),
+            ["action", "dump-screen", "--pane-id", "terminal_3", "--full"]
+        );
+        assert_eq!(
+            words(Extent::Scrollback, Rendering::Styled),
+            [
+                "action",
+                "dump-screen",
+                "--pane-id",
+                "terminal_3",
+                "--ansi",
+                "--full"
+            ]
+        );
+    }
+
     use super::*;
+    use agent_core::ports::{Place, TerminalApp};
 
     #[test]
     fn session_listing_parses_names_and_presence_and_skips_invalid() {
@@ -778,7 +679,7 @@ mod tests {
             cwd: PathBuf::from("/"),
         };
         assert!(matches!(
-            host.create(&name, &pane),
+            host.create(&name, &pane, Attachment::Window),
             Err(HostError::Name(agent_core::names::NameError::TooLong {
                 limit: 20,
                 ..
@@ -827,10 +728,6 @@ mod tests {
         assert!(kdl.contains("args \"exec\" \"fix\""));
     }
 
-    fn argv(line: &str) -> Vec<String> {
-        line.split_whitespace().map(String::from).collect()
-    }
-
     fn client(args: &str, name: &str) -> bool {
         attached_session(&args.split_whitespace().collect::<Vec<_>>()) == Some(name)
     }
@@ -858,8 +755,8 @@ mod tests {
                 {"active":true,"display_area_columns":200,"display_area_rows":50}]"#,
         )
         .expect("succeeds");
-        let (cols, rows) = display_size(&tabs).expect("a size");
-        assert_eq!((cols.get(), rows.get()), (200, 50));
+        let size = display_size(&tabs).expect("a size");
+        assert_eq!((size.cols.get(), size.rows.get()), (200, 50));
     }
 
     #[test]
@@ -923,29 +820,12 @@ mod tests {
     }
 
     fn table(rows: &[(u32, u32, &str)]) -> Processes {
-        Processes {
-            all: rows
-                .iter()
-                .map(|(pid, parent, line)| {
-                    (*pid, {
-                        let argv = argv(line);
-                        let program = argv.first().map_or("", |a| program_name(a)).to_string();
-                        Process {
-                            parent: Some(*parent),
-                            comm: program.clone(),
-                            program,
-                            argv,
-                        }
-                    })
-                })
-                .collect(),
-        }
+        Processes::from_lines(rows)
     }
 
     fn windows_of_fix(procs: &Processes, own: Option<ClientId>) -> Vec<Window> {
         let fix: SessionName = "fix".parse().expect("a name");
-        procs
-            .windows(own, agent_runs_a_tui)
+        shown_windows(procs, own, agent_runs_a_tui)
             .into_iter()
             .filter(|w| w.session == fix)
             .collect()
@@ -1138,8 +1018,7 @@ mod tests {
             (41, 40, "zellij attach other"),
         ]);
         assert_eq!(places_of(&procs), [Place::Ssh, Place::Nvim, Place::Nvim]);
-        let other = procs
-            .windows(None, agent_runs_a_tui)
+        let other = shown_windows(&procs, None, agent_runs_a_tui)
             .into_iter()
             .filter(|w| w.session.as_str() == "other")
             .map(|w| w.place)
@@ -1159,7 +1038,7 @@ mod tests {
             (11, 10, "fish"),
             (12, 11, "zellij attach fix"),
         ]);
-        procs.all.get_mut(&10).expect("a process").comm = "wezterm-mux-ser".into();
+        procs.retitle(10, None, "wezterm-mux-ser");
         assert_eq!(places_of(&procs), [terminal("wezterm")]);
     }
 
@@ -1171,8 +1050,7 @@ mod tests {
             (11, 10, "zellij attach fix"),
         ]);
         assert_eq!(places_of(&procs), [Place::Ssh]);
-        procs.all.get_mut(&10).expect("a process").program = "unrelated".into();
-        procs.all.get_mut(&10).expect("a process").comm = "sshd-session".into();
+        procs.retitle(10, Some("unrelated"), "sshd-session");
         assert_eq!(places_of(&procs), [Place::Ssh]);
     }
 
@@ -1191,15 +1069,10 @@ mod tests {
     #[test]
     fn the_client_the_tui_spawned_is_no_window() {
         let procs = table(&[(10, 1, "nvim"), (11, 10, "zellij attach fix")]);
-        assert_eq!(procs.windows(Some(ClientId::new(11)), agent_runs_a_tui), []);
-    }
-
-    #[test]
-    fn a_real_scan_names_processes_by_program_and_links_them_to_their_parents() {
-        let procs = Processes::scan();
-        let me = procs.all.get(&std::process::id()).expect("this process");
-        assert_ne!(me.program, "");
-        assert!(procs.lineage(std::process::id()).len() > 1);
+        assert_eq!(
+            shown_windows(&procs, Some(ClientId::new(11)), agent_runs_a_tui),
+            []
+        );
     }
 
     #[test]
@@ -1238,15 +1111,24 @@ mod tests {
         assert_eq!(places_of(&procs), [Place::Tmux]);
     }
 
+    fn window_of(pid: u32) -> Window {
+        Window {
+            client: ClientId::new(pid),
+            session: "fix".parse().expect("a name"),
+            place: Place::Detached,
+            handle: WindowHandle::new(HostKind::Zellij, pid),
+        }
+    }
+
     #[test]
     fn detaching_a_stopped_client_still_closes_it() {
         let mut child = std::process::Command::new("sleep")
             .arg("60")
             .spawn()
             .expect("sleep starts");
-        let client = ClientId::new(child.id());
+        let client = window_of(child.id());
         kill(
-            Pid::from_raw(i32::try_from(client.get()).expect("a pid")),
+            Pid::from_raw(i32::try_from(child.id()).expect("a pid")),
             Signal::SIGSTOP,
         )
         .expect("stops");
@@ -1264,13 +1146,13 @@ mod tests {
         let mut gone = std::process::Command::new("true")
             .spawn()
             .expect("true starts");
-        let left = ClientId::new(gone.id());
+        let left = window_of(gone.id());
         gone.wait().expect("exits");
         let mut child = std::process::Command::new("sleep")
             .arg("60")
             .spawn()
             .expect("sleep starts");
-        let staying = ClientId::new(child.id());
+        let staying = window_of(child.id());
         let zellij = Zellij::new(PathBuf::new(), |_| false);
         zellij.detach(&[left, staying]).expect("signals");
         let status = child.wait().expect("exits");

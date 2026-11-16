@@ -17,11 +17,9 @@ function M.register(prefix)
 
   vim.keymap.set({ "n", "i", "t", "x" }, "<C-.>", function() agent().toggle() end, { desc = "agent: toggle active", silent = true })
 
-  -- Wezterm forwards Ctrl+Shift+X to nvim; in a terminal (zellij underneath)
-  -- hand it on as Ctrl+s e so zellij opens the pane's scrollback in an editor.
-  vim.keymap.set("t", "<C-S-x>", function()
-    vim.api.nvim_chan_send(vim.bo.channel, "\19e")
-  end, { desc = "agent: edit pane scrollback", silent = true })
+  -- Only a kitty-protocol terminal can send Ctrl+Shift+X, which wezterm has
+  -- off. <leader>ab is the key that works everywhere.
+  vim.keymap.set("t", "<C-S-x>", function() agent().edit_scrollback() end, { desc = "agent: edit scrollback", silent = true })
 
   map("n", function() agent().new_agent() end, "new (worktree)")
   map("N", function() agent().new_agent_no_prompt() end, "new (worktree, no prompt)")
@@ -32,6 +30,7 @@ function M.register(prefix)
   map("p", function() agent().send_prompt() end, "prompt")
   map("k", function() agent().kill_agent() end, "kill agent")
   map("d", function() agent().spawn_dev() end, "spawn dev server")
+  map("b", function() agent().edit_scrollback() end, "scrollback in a buffer")
 
   local function rmap(suffix, fn, desc, mode)
     vim.keymap.set(mode or "n", prefix .. "r" .. suffix, fn, { desc = desc, silent = true })

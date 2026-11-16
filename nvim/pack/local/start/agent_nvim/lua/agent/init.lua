@@ -1,6 +1,6 @@
 local config = require("agent.config")
 local session = require("agent.session")
-local zellij = require("agent.zellij")
+local host = require("agent.host")
 local ui = require("agent.ui")
 local composer = require("agent.composer")
 local cmd_utils = require("utils.cmd")
@@ -51,25 +51,24 @@ local function require_target(target)
     notify.warn("no agent to send to — attach one with <leader>ao or spawn with <leader>an")
     return nil
   end
-  if not zellij.session_exists(target) then
+  if not host.session_exists(target) then
     notify.warn("session not running: " .. target)
     return nil
   end
   return target
 end
 
----Send arbitrary text to the active agent. Returns true if delivered.
+---Send a message to the active agent and submit it. Returns true if delivered.
 ---@param text string
----@param submit boolean
 ---@return boolean
-function M.send_text(text, submit)
+function M.send_text(text)
   local resolved = require_target(nil)
   if not resolved then return false end
-  if not zellij.write_chars(resolved, text) then
-    notify.error("zellij write failed")
+  local ok, why = host.send(resolved, text)
+  if not ok then
+    notify.error("couldn't send to " .. resolved .. ": " .. (why or ""))
     return false
   end
-  if submit then zellij.submit(resolved) end
   return true
 end
 
@@ -97,10 +96,16 @@ function M.send_prompt()
   composer.show()
 end
 
----Send a single-digit choice (1-9) + submit to the active agent. Covers
----claude's Yes/No and broader multi-choice prompts uniformly.
+---Send a single-digit choice (1-9) + enter to the active agent. Covers
+---claude's Yes/No and broader multi-choice prompts uniformly, and goes
+---through even while the agent asks, which is when a choice is wanted.
 ---@param n integer
-function M.send_choice(n) M.send_text(tostring(n), true) end
+function M.send_choice(n)
+  local resolved = require_target(nil)
+  if not resolved then return end
+  local ok, why = host.choose(resolved, n)
+  if not ok then notify.error("couldn't answer " .. resolved .. ": " .. (why or "")) end
+end
 
 ---Spawn a dev-server tab in wezterm for the current tab's cwd. Wezterm
 ---pops a region picker and runs the same `[REGION] Open work tabs` flow as
@@ -138,7 +143,9 @@ end
 ---@param name string
 ---@return string[]
 local function build_attach_cmd(name)
-  return { "zellij", "attach", name }
+  local argv, why = host.attach_cmd(name)
+  if not argv then notify.error(("can't attach %s: %s"):format(name, why or "")) end
+  return argv
 end
 
 ---Tab pages opened by `attach_in_terminal` just for an agent, as opposed to
@@ -146,7 +153,7 @@ end
 ---@type table<integer, true>
 M.agent_tabs = {}
 
----Forget a terminal whose zellij client exited (session ended, detached, or
+---Forget a terminal whose client exited (session ended, detached, or
 ---moved to another window by the `agent` TUI) and close what was opened for
 ---it, so the next attach starts fresh instead of reusing a dead buffer. A
 ---failed attach keeps its buffer so the error stays readable.
@@ -168,7 +175,7 @@ local function forget_terminal(name, buf, status)
   end
   if M.last_attached == name then M.last_attached = nil end
   if status ~= 0 then
-    notify.warn(("zellij attach %s exited with %d"):format(name, status))
+    notify.warn(("attach %s exited with %d"):format(name, status))
     return
   end
   if vim.api.nvim_buf_is_valid(buf) then pcall(vim.api.nvim_buf_delete, buf, { force = true }) end
@@ -210,7 +217,7 @@ local function open_agent_terminal(name, cmd)
 end
 
 ---Open a tab page for the named agent: tab-local cwd, dashboard on the left,
----zellij attach terminal on the right. Idempotent — if a tab already exists
+---attach terminal on the right. Idempotent — if a tab already exists
 ---for this agent, jump to it.
 ---@param name string
 ---@param opts? {cwd?: string, attach_cmd?: string[]}
@@ -233,6 +240,7 @@ function M.attach_in_terminal(name, opts)
   local needs_new_tab = cwd ~= nil and cwd ~= current_cwd
 
   local cmd = opts.attach_cmd or build_attach_cmd(name)
+  if not cmd then return end
 
   if not needs_new_tab then
     M.last_attached = name
@@ -299,7 +307,7 @@ function M.toggle()
       vim.api.nvim_set_current_tabpage(tab)
       return
     end
-    if zellij.session_exists(M.last_attached) then
+    if host.session_exists(M.last_attached) then
       M.attach_in_terminal(M.last_attached)
       return
     end
@@ -308,9 +316,9 @@ function M.toggle()
 end
 
 function M.open_or_pick()
-  local sessions = zellij.list_sessions()
+  local sessions = host.list_sessions()
   if #sessions == 0 then
-    notify.warn("no zellij sessions running — <leader>an for a worktree agent, <leader>as for a repo session")
+    notify.warn("no sessions running — <leader>an for a worktree agent, <leader>as for a repo session")
     return
   end
 
@@ -322,7 +330,7 @@ function M.open_or_pick()
     and (tab_for_agent(resolved) == vim.api.nvim_get_current_tabpage()
       or M.tab_agents[vim.api.nvim_get_current_tabpage()] == resolved
       or vim.fn.getcwd() == session.session_cwd(resolved))
-  if resolved and not already_here and zellij.session_exists(resolved) then
+  if resolved and not already_here and host.session_exists(resolved) then
     M.attach_in_terminal(resolved)
     return
   end
@@ -443,8 +451,34 @@ local function tear_down(name)
   end)
 end
 
+---Open what the current agent's terminal shows and has scrolled off in a
+---scratch buffer, at its end. Reuses the buffer an earlier call made.
+function M.edit_scrollback()
+  local name = current_agent() or M.last_attached
+  if not name then
+    notify.warn("no agent to read the scrollback of")
+    return
+  end
+  host.scrollback(name, function(lines, why)
+    if not lines then
+      notify.error(("couldn't read the scrollback of %s: %s"):format(name, why or ""))
+      return
+    end
+    local title = ("agent-scrollback://%s"):format(name)
+    local stale = vim.fn.bufnr(title)
+    if stale ~= -1 then pcall(vim.api.nvim_buf_delete, stale, { force = true }) end
+    vim.cmd("tabnew")
+    local buf = vim.api.nvim_get_current_buf()
+    vim.bo[buf].buftype = "nofile"
+    vim.bo[buf].bufhidden = "wipe"
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+    vim.api.nvim_buf_set_name(buf, title)
+    vim.cmd("normal! G")
+  end)
+end
+
 function M.kill_agent()
-  local sessions = zellij.list_sessions()
+  local sessions = host.list_sessions()
   if #sessions == 0 then
     notify.warn("no agent sessions to kill")
     return

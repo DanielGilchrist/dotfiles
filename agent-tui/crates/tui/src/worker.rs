@@ -18,8 +18,8 @@ use agent_core::ops::{
 };
 use agent_core::paths::RepoRoot;
 use agent_core::ports::{
-    ActivityDetail, ClientId, CommandOutput, FileDiff, HarnessId, Hint, HostError, Log,
-    Observation, Place, Probe, TranscriptStamp, Window,
+    ActivityDetail, ClientId, CommandOutput, Extent, FileDiff, HarnessId, Hint, HostError, Log,
+    Observation, Place, Probe, Rendering, TranscriptStamp, Window,
 };
 use crossterm::event::{KeyEvent, MouseEvent};
 
@@ -57,6 +57,8 @@ pub enum Msg {
         ticket: Ticket,
         result: Result<Launch, Cause>,
     },
+    /// The text of a session's terminal, as `Job::ReadScrollback` asked.
+    ScrollbackRead(ScrollbackRead),
     /// A session can be observed at this size, or why it can't.
     Observed {
         ticket: Ticket,
@@ -247,6 +249,13 @@ pub enum Job {
         name: SessionName,
         ticket: Ticket,
     },
+    /// Read everything a session's terminal shows and has scrolled off, as
+    /// plain text.
+    ReadScrollback {
+        name: SessionName,
+        root: PathBuf,
+        ticket: Ticket,
+    },
     Kill(Running),
     PlanRemoval {
         target: Removable,
@@ -304,12 +313,39 @@ impl Job {
             | Self::CheckDir(_)
             | Self::CloseElsewhere { .. }
             | Self::Observe { .. }
+            | Self::ReadScrollback { .. }
             | Self::Acknowledge(_)
             | Self::Reply { .. }
             | Self::PasteImage { .. }
             | Self::Run { .. } => false,
         }
     }
+}
+
+/// What `Job::ReadScrollback` found, with what the editor needs to open it.
+pub struct ScrollbackRead {
+    pub ticket: Ticket,
+    pub name: SessionName,
+    pub root: PathBuf,
+    pub result: Result<String, Cause>,
+}
+
+fn read_scrollback(
+    svc: agent_core::ops::Services<'_>,
+    name: SessionName,
+    root: PathBuf,
+    ticket: Ticket,
+) -> Msg {
+    let result = svc
+        .host
+        .screen(&name, Extent::Scrollback, Rendering::Plain)
+        .map_err(|e| Cause::of(&e));
+    Msg::ScrollbackRead(ScrollbackRead {
+        ticket,
+        name,
+        root,
+        result,
+    })
 }
 
 pub struct Workers {
@@ -1109,6 +1145,7 @@ fn run(backend: &Arc<Backend>, job: Job, msgs: &Sender<Msg>) -> Option<Msg> {
             ticket,
             result: svc.host.observe(&name).map_err(|e| Cause::of(&e)),
         },
+        Job::ReadScrollback { name, root, ticket } => read_scrollback(svc, name, root, ticket),
         Job::Kill(running) => Msg::Done(
             ops::kill(svc, &running)
                 .map(|()| Outcome::Killed(running.name().clone()))
@@ -1219,11 +1256,10 @@ fn close_elsewhere(
     let Some(clients) = svc.host.clients() else {
         return Ok(0);
     };
-    let others: Vec<ClientId> = clients
+    let others: Vec<Window> = clients
         .windows(own)?
         .into_iter()
         .filter(|w| w.session == *name)
-        .map(|w| w.client)
         .collect();
     clients.detach(&others)?;
     Ok(others.len())
@@ -1304,8 +1340,12 @@ mod tests {
         {
             self.0.liveness(within)
         }
-        fn attach(&self, name: &SessionName) -> agent_core::process::LaunchSpec {
-            self.0.attach(name)
+        fn attach(
+            &self,
+            name: &SessionName,
+            how: agent_core::ports::Attachment,
+        ) -> agent_core::process::LaunchSpec {
+            self.0.attach(name, how)
         }
         fn observe(
             &self,
@@ -1317,8 +1357,9 @@ mod tests {
             &self,
             name: &agent_core::names::HostName,
             pane: &agent_core::ports::PaneCommand,
+            how: agent_core::ports::Attachment,
         ) -> Result<agent_core::process::LaunchSpec, agent_core::ports::HostError> {
-            self.0.create(name, pane)
+            self.0.create(name, pane, how)
         }
         fn start_detached(&self, name: &SessionName) -> Result<(), agent_core::ports::HostError> {
             self.0.start_detached(name)
@@ -1336,13 +1377,21 @@ mod tests {
         ) -> Result<(), agent_core::ports::HostError> {
             self.0.write(name, bytes)
         }
-        fn screen(&self, name: &SessionName) -> Result<String, agent_core::ports::HostError> {
-            self.0.screen(name)
+        fn screen(
+            &self,
+            name: &SessionName,
+            extent: agent_core::ports::Extent,
+            rendering: agent_core::ports::Rendering,
+        ) -> Result<String, agent_core::ports::HostError> {
+            self.0.screen(name, extent, rendering)
         }
         fn clients(&self) -> Option<&dyn agent_core::ports::ClientControl> {
             self.0.clients()
         }
-        fn nesting_env(&self) -> &'static [&'static str] {
+        fn own_session(&self, var: &dyn Fn(&str) -> Option<String>) -> Option<SessionName> {
+            self.0.own_session(var)
+        }
+        fn nesting_env(&self) -> Vec<&'static str> {
             self.0.nesting_env()
         }
     }
@@ -1366,6 +1415,7 @@ mod tests {
             layout: agent_core::paths::Layout::new(dir.path().join("w")).expect("absolute"),
             exe: "/bin/agent".into(),
             own: None,
+            attachment: agent_core::ports::Attachment::Window,
         });
         let (msgs, replies) = mpsc::channel();
         let (refresh, _) = mpsc::channel();
@@ -1407,6 +1457,10 @@ mod tests {
             client: ClientId::new(client),
             session: session.parse().expect("a name"),
             place,
+            handle: agent_core::ports::WindowHandle::new(
+                agent_core::config::HostKind::Zellij,
+                client,
+            ),
         };
         let found = companies(vec![
             window(3, "fix", Place::Ssh),

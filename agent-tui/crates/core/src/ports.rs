@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fmt;
 use std::io;
-use std::num::{NonZeroU16, NonZeroUsize};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::{Duration, SystemTime};
@@ -10,10 +10,12 @@ use std::time::{Duration, SystemTime};
 use serde::{Deserialize, Serialize};
 
 use crate::activity::{Activity, AgentId, Going, Reported, Stopped, TaskId, ToolId, TranscriptRef};
+use crate::config::HostKind;
 use crate::model::{Head, Presence, Running, Worktree};
 use crate::names::{BranchName, HostName, NameError, NameLimit, Prompt, PullRequest, SessionName};
 use crate::paths::{AgentWorktree, RepoRoot};
 use crate::process::{CommandError, LaunchSpec};
+use crate::size::TermSize;
 
 /// A repository's worktrees: the main checkout and the linked ones.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -717,6 +719,8 @@ pub enum HostError {
     Detach { client: ClientId, reason: String },
     #[error(transparent)]
     Name(#[from] NameError),
+    #[error("{name} is already running under {}, stop it there first", .under.word())]
+    RunningElsewhere { name: SessionName, under: HostKind },
 }
 
 /// A terminal application, by the short name it goes by (`wezterm`, `iTerm`).
@@ -755,6 +759,30 @@ pub struct Window {
     pub client: ClientId,
     pub session: SessionName,
     pub place: Place,
+    pub handle: WindowHandle,
+}
+
+/// Names a window to the host that listed it, so closing it goes to that
+/// host and that client and never to whoever has the same pid. Only the
+/// adapter that builds one reads its key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct WindowHandle {
+    host: HostKind,
+    key: u32,
+}
+
+impl WindowHandle {
+    pub fn new(host: HostKind, key: u32) -> Self {
+        Self { host, key }
+    }
+
+    pub fn host(self) -> HostKind {
+        self.host
+    }
+
+    pub fn key(self) -> u32 {
+        self.key
+    }
 }
 
 /// Hosts whose sessions accept several clients can report and detach them.
@@ -763,7 +791,8 @@ pub trait ClientControl: Send + Sync {
     /// spawned are not windows, nor are the previews of any TUI. Closing
     /// them (`detach`) is what moving the session here does.
     fn windows(&self, own: Option<ClientId>) -> Result<Vec<Window>, HostError>;
-    fn detach(&self, clients: &[ClientId]) -> Result<(), HostError>;
+    /// Closes the windows through the hosts that listed them.
+    fn detach(&self, windows: &[Window]) -> Result<(), HostError>;
 }
 
 /// The command a new session's pane runs. Hosts store it to re-run when a
@@ -781,25 +810,48 @@ pub struct PaneCommand {
 #[derive(Debug, Clone)]
 pub struct Observation {
     pub spec: LaunchSpec,
-    pub cols: NonZeroU16,
-    pub rows: NonZeroU16,
+    pub size: TermSize,
+}
+
+/// What a host lists: its sessions, the names it lists once but finds run
+/// by more than one host behind it, and the hosts behind it that couldn't
+/// answer, whose sessions are missing from `sessions`.
+#[derive(Debug, Default)]
+pub struct HostListing {
+    pub sessions: Vec<SessionInfo>,
+    pub doubled: Vec<SessionName>,
+    pub skipped: Vec<HostError>,
 }
 
 pub trait SessionHost: Send + Sync {
     /// What the host accepts as a session name.
     fn name_limit(&self) -> NameLimit;
     fn sessions(&self) -> Result<Vec<SessionInfo>, HostError>;
+    /// `sessions`, with the names that more than one host runs. Only a host
+    /// made of several has any.
+    fn listing(&self) -> Result<HostListing, HostError> {
+        Ok(HostListing {
+            sessions: self.sessions()?,
+            doubled: Vec::new(),
+            skipped: Vec::new(),
+        })
+    }
     /// Which sessions are alive, from the host's own listing alone: no
     /// session is asked where its terminal is. A host that doesn't answer
     /// within `within` is an error, so a prompt never waits on it.
     fn liveness(&self, within: Duration) -> Result<Vec<(SessionName, Liveness)>, HostError>;
     /// Attach to an existing (live or resurrectable) session in the foreground.
-    fn attach(&self, name: &SessionName) -> LaunchSpec;
+    fn attach(&self, name: &SessionName, how: Attachment) -> LaunchSpec;
     /// Observe a live session without joining it.
     fn observe(&self, name: &SessionName) -> Result<Observation, HostError>;
     /// Create `name` running `pane`, replacing a dead session of the same
     /// name, and attach in the foreground.
-    fn create(&self, name: &HostName, pane: &PaneCommand) -> Result<LaunchSpec, HostError>;
+    fn create(
+        &self,
+        name: &HostName,
+        pane: &PaneCommand,
+        how: Attachment,
+    ) -> Result<LaunchSpec, HostError>;
     /// Run `name` with no client attached. A live session is left alone.
     /// Otherwise it starts with the pane its last `create` set up.
     fn start_detached(&self, name: &SessionName) -> Result<(), HostError>;
@@ -809,10 +861,46 @@ pub trait SessionHost: Send + Sync {
     fn delete(&self, name: &SessionName) -> Result<(), HostError>;
     /// Raw input for the session's focused pane.
     fn write(&self, name: &SessionName, bytes: &[u8]) -> Result<(), HostError>;
-    fn screen(&self, name: &SessionName) -> Result<String, HostError>;
+    fn screen(
+        &self,
+        name: &SessionName,
+        extent: Extent,
+        rendering: Rendering,
+    ) -> Result<String, HostError>;
     fn clients(&self) -> Option<&dyn ClientControl>;
+    /// The session this host runs the caller in, read from the environment
+    /// variable the host sets for its programs. `var` reads one variable.
+    fn own_session(&self, var: &dyn Fn(&str) -> Option<String>) -> Option<SessionName>;
     /// Environment variables to drop so a client can run inside the host.
-    fn nesting_env(&self) -> &'static [&'static str];
+    fn nesting_env(&self) -> Vec<&'static str>;
+}
+
+/// What an attach is for, which decides who owns the session's size and
+/// whether the program's own keys are ever taken.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Attachment {
+    /// A person's terminal: takes the session over and can leave with the
+    /// configured detach key.
+    Window,
+    /// This process's own pane. It owns the session only while no window
+    /// does, and passes every key through.
+    Preview,
+}
+
+/// How much of a session's terminal a read returns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Extent {
+    Visible,
+    /// What has scrolled off, then the visible screen.
+    Scrollback,
+}
+
+/// Whether a read of a session's terminal carries styling. Plain text keeps
+/// the gaps between words that a program drew with cursor moves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rendering {
+    Styled,
+    Plain,
 }
 
 /// Names a harness in the registry and in agent records.

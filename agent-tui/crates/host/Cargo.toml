@@ -1,0 +1,11 @@
+[package]
+name = "agent-host"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+agent-core.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

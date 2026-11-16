@@ -13,12 +13,12 @@ use crate::names::{BranchName, HostName, NameLimit, Prompt, PullRequest, Session
 use crate::ops::Services;
 use crate::paths::{AgentWorktree, Layout, RepoRoot};
 use crate::ports::{
-    AgentRecord, BranchLog, BranchState, Branches, Change, Checkout, ClientControl, Compared,
-    DiffBase, Fetch, FileDiff, Forge, Harness, HarnessError, HarnessId, Harnesses, Hint, HostError,
-    LaunchCtx, Listing, Liveness, LocalBranch, Lookup, Observation, PaneCommand, PendingPrompt,
-    Probe, PullRequestHead, RemoteBranch, RepoWorktrees, Seen, SessionHost, SessionInfo,
-    SessionStatus, Stop, Store, StoreError, Survivor, SurvivorState, TranscriptStamp, Unlisting,
-    Vcs, WorktreeFacts, WorktreeStart,
+    AgentRecord, Attachment, BranchLog, BranchState, Branches, Change, Checkout, ClientControl,
+    Compared, DiffBase, Extent, Fetch, FileDiff, Forge, Harness, HarnessError, HarnessId,
+    Harnesses, Hint, HostError, LaunchCtx, Listing, Liveness, LocalBranch, Lookup, Observation,
+    PaneCommand, PendingPrompt, Probe, PullRequestHead, RemoteBranch, Rendering, RepoWorktrees,
+    Seen, SessionHost, SessionInfo, SessionStatus, Stop, Store, StoreError, Survivor,
+    SurvivorState, TranscriptStamp, Unlisting, Vcs, WorktreeFacts, WorktreeStart,
 };
 use crate::process::{CommandError, LaunchSpec};
 
@@ -315,6 +315,8 @@ impl Forge for FakeForge {
 #[derive(Default)]
 pub struct FakeHost {
     pub sessions: Mutex<Vec<SessionInfo>>,
+    /// Names the listing reports as run by two hosts.
+    pub doubled: Mutex<Vec<SessionName>>,
     /// The panes sessions were created with. The journal says when.
     pub created: Mutex<Vec<(SessionName, PaneCommand)>>,
     pub deleted: Mutex<Vec<SessionName>>,
@@ -325,6 +327,8 @@ pub struct FakeHost {
     pub kill_fails: Mutex<bool>,
     /// Starting a session detached fails.
     pub start_fails: Mutex<bool>,
+    /// Listing the sessions fails.
+    pub list_fails: Mutex<bool>,
     /// Asking which sessions are alive fails, as when the host can't be reached.
     pub liveness_fails: Mutex<bool>,
     /// How many listings still show a killed session running.
@@ -379,6 +383,12 @@ impl SessionHost for FakeHost {
     }
 
     fn sessions(&self) -> Result<Vec<SessionInfo>, HostError> {
+        if *self.list_fails.lock().expect("lock") {
+            return Err(HostError::Io {
+                context: "listing sessions".into(),
+                source: std::io::Error::other("host unreadable"),
+            });
+        }
         let mut listed = self.sessions.lock().expect("lock").clone();
         let mut lagging = self.lagging.lock().expect("lock");
         for lag in lagging.iter_mut().filter(|lag| lag.listings > 0) {
@@ -415,19 +425,26 @@ impl SessionHost for FakeHost {
             .collect())
     }
 
-    fn attach(&self, name: &SessionName) -> LaunchSpec {
+    fn attach(&self, name: &SessionName, _: Attachment) -> LaunchSpec {
         LaunchSpec::new("attach").arg(name.as_str())
     }
 
     fn observe(&self, name: &SessionName) -> Result<Observation, HostError> {
         Ok(Observation {
             spec: LaunchSpec::new("observe").arg(name.as_str()),
-            cols: std::num::NonZeroU16::new(80).expect("nonzero"),
-            rows: std::num::NonZeroU16::new(24).expect("nonzero"),
+            size: crate::size::TermSize {
+                cols: std::num::NonZeroU16::new(80).expect("nonzero"),
+                rows: std::num::NonZeroU16::new(24).expect("nonzero"),
+            },
         })
     }
 
-    fn create(&self, name: &HostName, pane: &PaneCommand) -> Result<LaunchSpec, HostError> {
+    fn create(
+        &self,
+        name: &HostName,
+        pane: &PaneCommand,
+        _: Attachment,
+    ) -> Result<LaunchSpec, HostError> {
         name.within(NAME_LIMIT)?;
         if *self.create_fails.lock().expect("lock") {
             return Err(HostError::Io {
@@ -523,7 +540,7 @@ impl SessionHost for FakeHost {
         Ok(())
     }
 
-    fn screen(&self, _: &SessionName) -> Result<String, HostError> {
+    fn screen(&self, _: &SessionName, _: Extent, _: Rendering) -> Result<String, HostError> {
         Ok(String::new())
     }
 
@@ -531,8 +548,20 @@ impl SessionHost for FakeHost {
         None
     }
 
-    fn nesting_env(&self) -> &'static [&'static str] {
-        &[]
+    fn own_session(&self, _: &dyn Fn(&str) -> Option<String>) -> Option<SessionName> {
+        None
+    }
+
+    fn nesting_env(&self) -> Vec<&'static str> {
+        Vec::new()
+    }
+
+    fn listing(&self) -> Result<crate::ports::HostListing, HostError> {
+        Ok(crate::ports::HostListing {
+            sessions: self.sessions()?,
+            doubled: self.doubled.lock().expect("lock").clone(),
+            skipped: Vec::new(),
+        })
     }
 }
 
@@ -923,6 +952,7 @@ impl World {
             layout: &self.layout,
             exe: &self.exe,
             own: self.own.as_ref(),
+            attachment: Attachment::Window,
         }
     }
 

@@ -1,0 +1,17 @@
+[package]
+name = "agent-places"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+agent-core.workspace = true
+sysinfo.workspace = true
+
+[features]
+testing = []
+
+[dev-dependencies]
+agent-places = { path = ".", features = ["testing"] }
+
+[lints]
+workspace = true

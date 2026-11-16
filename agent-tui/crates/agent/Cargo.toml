@@ -11,6 +11,9 @@ path = "src/main.rs"
 agent-core.workspace = true
 agent-git.workspace = true
 agent-harness.workspace = true
+agent-host.workspace = true
+agent-native.workspace = true
+agent-session.workspace = true
 agent-store.workspace = true
 agent-term.workspace = true
 agent-tui.workspace = true
@@ -23,6 +26,8 @@ tempfile.workspace = true
 
 [dev-dependencies]
 agent-core = { workspace = true, features = ["testing"] }
+agent-session = { workspace = true, features = ["testing"] }
+nix = { workspace = true, features = ["process", "signal"] }
 portable-pty.workspace = true
 vt100.workspace = true
 

@@ -201,6 +201,39 @@ impl KeySpec {
     }
 }
 
+/// A key a terminal sends as bytes a program in a session could also be
+/// sent, so a function key, which it sends as a sequence a client can't
+/// tell from the program's own, is left out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Detachable {
+    Ctrl(Control),
+    Alt(Glyph),
+    Kitty(KittyKey),
+}
+
+impl TryFrom<KeySpec> for Detachable {
+    type Error = FunctionKey;
+
+    fn try_from(spec: KeySpec) -> Result<Self, FunctionKey> {
+        match spec {
+            KeySpec::Ctrl(control) => Ok(Self::Ctrl(control)),
+            KeySpec::Alt(glyph) => Ok(Self::Alt(glyph)),
+            KeySpec::Kitty(key) => Ok(Self::Kitty(key)),
+            KeySpec::Function(function) => Err(function),
+        }
+    }
+}
+
+impl From<Detachable> for KeySpec {
+    fn from(key: Detachable) -> Self {
+        match key {
+            Detachable::Ctrl(control) => Self::Ctrl(control),
+            Detachable::Alt(glyph) => Self::Alt(glyph),
+            Detachable::Kitty(key) => Self::Kitty(key),
+        }
+    }
+}
+
 /// A spec as the config writes it, which parses back to the same spec.
 pub struct Written(KeySpec);
 

@@ -891,7 +891,7 @@ local function deliver(md, count)
   local cfg = rcfg()
 
   if cfg.delivery == "inline" then
-    if agent.send_text(md, true) then
+    if agent.send_text(md) then
       notify.info(("sent %d comment(s) inline"):format(count))
       M.reset()
     end
@@ -905,7 +905,7 @@ local function deliver(md, count)
   add_local_exclude(root, fname)
 
   local msg = ("Read `%s` in the repo root. It lists my review comments on your recent changes. Work through each one, then delete the file."):format(fname)
-  if agent.send_text(msg, true) then
+  if agent.send_text(msg) then
     notify.info(("sent %d comment(s) → %s"):format(count, fname))
     M.reset()
   end

@@ -504,11 +504,17 @@ fn observes(effects: &[Effect]) -> Vec<String> {
         .collect()
 }
 
+fn size_of(cols: u16, rows: u16) -> agent_term::TermSize {
+    agent_term::TermSize {
+        cols: NonZeroU16::new(cols).expect("nonzero"),
+        rows: NonZeroU16::new(rows).expect("nonzero"),
+    }
+}
+
 fn session_of(cols: u16, rows: u16) -> Observation {
     Observation {
         spec: agent_core::process::LaunchSpec::new("cat"),
-        cols: NonZeroU16::new(cols).expect("nonzero"),
-        rows: NonZeroU16::new(rows).expect("nonzero"),
+        size: size_of(cols, rows),
     }
 }
 
@@ -558,7 +564,7 @@ fn the_size_found_for_a_peek_starts_a_watcher_at_that_size() {
     assert!(matches!(
         effects.as_slice(),
         [Effect::Observe { observation, .. }]
-            if observation.cols.get() == 200 && observation.rows.get() == 50
+            if observation.size.cols.get() == 200 && observation.size.rows.get() == 50
     ));
 }
 
@@ -691,16 +697,15 @@ fn a_restarted_watcher_keeps_the_time_the_watch_first_opened() {
         .expect("watched");
     let later = later(&m, Duration::from_secs(60));
     m.clock = later;
-    let size = |n| NonZeroU16::new(n).expect("nonzero");
     let term = crate::fixtures::cat();
     if let Some(watch) = m.watch_mut() {
-        watch.install(term, (size(120), size(40)), later.mono);
+        watch.install(term, size_of(120, 40), later.mono);
     }
     let after = view(&m).and_then(|v| match v {
         WatchView::Watched(w) => Some((w.opened, w.seen)),
         WatchView::Watching(_) => None,
     });
-    assert_eq!(after, Some((before, (size(120), size(40)))));
+    assert_eq!(after, Some((before, size_of(120, 40))));
 }
 
 #[test]
