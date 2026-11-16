@@ -9,6 +9,11 @@ local is = require("utils.is")
 ---@class MdLayout
 ---@field height integer content height in CSS px
 ---@field headings integer[] top of each heading in CSS px
+---@field links MdLink[]
+
+---@class MdLink
+---@field href string
+---@field rects { left: number, top: number, right: number, bottom: number }[] page CSS px, one per line box
 
 ---@class MdChrome
 ---@field binary string

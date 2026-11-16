@@ -114,7 +114,8 @@ local function write_template()
     "}",
     "window.__render=async(src)=>{content.innerHTML=marked.parse(src);await renderMermaid();",
     "const headings=[...content.querySelectorAll('h1,h2,h3,h4,h5,h6')].map(h=>Math.round(h.getBoundingClientRect().top+window.scrollY));",
-    "return JSON.stringify({height:content.offsetHeight,headings})};",
+    "const links=[...content.querySelectorAll('a[href]')].map(a=>({href:a.href,rects:[...a.getClientRects()].map(r=>({left:r.left+window.scrollX,top:r.top+window.scrollY,right:r.right+window.scrollX,bottom:r.bottom+window.scrollY}))}));",
+    "return JSON.stringify({height:content.offsetHeight,headings,links})};",
     "</script></body></html>",
   }))
 end
@@ -328,6 +329,39 @@ function M.scroll_to(where)
   refresh()
 end
 
+---The link under the mouse: the pointer's cell inside the preview window
+---mapped back to page CSS px (the float's border pushes the image one
+---cell down and right of the window's content origin), matched by overlap since a link's line box
+---rarely lines up with the cell grid.
+---@return string|nil href
+local function link_under_mouse()
+  if not state or not state.layout then return nil end
+  local mouse = vim.fn.getmousepos()
+  if mouse.winid ~= state.preview_win then return nil end
+  local size = Snacks.image.terminal.size()
+  local view = viewport()
+  local cell_width = size.cell_width / view.scale
+  local border = state.float and 1 or 0
+  local left = (mouse.wincol - 1 - border) * cell_width
+  local top = state.offset + (mouse.winrow - 1 - border) * view.css_cell_height
+  local right, bottom = left + cell_width, top + view.css_cell_height
+  for _, link in ipairs(state.layout.links or {}) do
+    for _, rect in ipairs(link.rects) do
+      if left < rect.right and right > rect.left and top < rect.bottom and bottom > rect.top then
+        return link.href
+      end
+    end
+  end
+  return nil
+end
+
+local function open_link_under_mouse()
+  local href = link_under_mouse()
+  if not href then return end
+  local _, err = vim.ui.open(href)
+  if err then notify.error("could not open " .. href .. ": " .. err) end
+end
+
 ---@param buf integer
 local function map_scroll_keys(buf)
   local function map(lhs, rhs)
@@ -350,6 +384,8 @@ local function map_scroll_keys(buf)
   map("G", function() M.scroll_to("bottom") end)
   map("<ScrollWheelDown>", function() M.scroll(3) end)
   map("<ScrollWheelUp>", function() M.scroll(-3) end)
+  map("<LeftMouse>", function() end)
+  map("<LeftRelease>", open_link_under_mouse)
   map("q", M.close)
   map("<Esc>", M.close)
 end
