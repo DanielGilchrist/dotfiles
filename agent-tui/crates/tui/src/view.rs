@@ -1363,6 +1363,11 @@ fn task_lines(
     } else {
         wrap(&form.task, field_width)
     };
+    if let Some(last) = rows.last_mut() {
+        let typed = form.task.len() - form.task.trim_end_matches(' ').len();
+        let room = field_width.saturating_sub(last.width());
+        last.push_str(&" ".repeat(typed.min(room)));
+    }
     let hidden = rows.len().saturating_sub(task_rows);
     rows.drain(..hidden);
     let (label, placeholder) = match form.kind {
@@ -2449,6 +2454,20 @@ fn draw_description(frame: &mut Frame<'_>, area: Rect, state: &HelpState, text: 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_space_typed_at_the_end_of_the_prompt_moves_the_caret() {
+        use super::*;
+        let mut form = NewAgent::new(FormKind::New, None);
+        let shown = |form: &NewAgent| {
+            let lines = task_lines(form, &Fields::of(form), "Claude", 40, 4);
+            lines.last().expect("a row").to_string()
+        };
+        form.task = "can do for this".to_string();
+        let before = shown(&form);
+        form.task.push(' ');
+        assert_eq!(shown(&form).len(), before.len() + 1);
+    }
+
     #[test]
     fn the_spinner_turns_with_the_clock_it_is_given() {
         use std::time::{Duration, UNIX_EPOCH};
