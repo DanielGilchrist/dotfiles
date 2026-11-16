@@ -1,4 +1,4 @@
-//! What a pressed key is worth as a leave key or an agent chord.
+//! What a pressed key is worth as a leave key or an always-on chord.
 
 use agent_core::config::{KeyField, Keys};
 use agent_core::keyspec::KeySpec;

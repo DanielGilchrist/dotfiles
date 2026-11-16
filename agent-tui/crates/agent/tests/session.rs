@@ -781,3 +781,25 @@ fn piped_input_holding_the_detach_byte_reaches_the_program_and_does_not_detach()
     let _ = client.kill();
     let _ = client.wait();
 }
+
+#[test]
+fn a_host_starts_whatever_the_users_config_file_says() {
+    let scratch = Scratch::new();
+    let config = scratch.path("h/.config/agent");
+    std::fs::create_dir_all(&config).expect("creates the config dir");
+    std::fs::write(
+        config.join("config.toml"),
+        "[keys]\nprev_agent = \"alt-;\"\nnot toml at all {",
+    )
+    .expect("writes the config");
+    let started = scratch.host("broken", "echo marker; sleep 1; exit 0");
+    assert!(
+        started.status.success(),
+        "{}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    assert_eq!(
+        probe(&scratch.record("broken")).expect("probes"),
+        Liveness::Live
+    );
+}

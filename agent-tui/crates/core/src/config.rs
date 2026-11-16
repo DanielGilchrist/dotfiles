@@ -4,8 +4,9 @@
 //! ```toml
 //! [keys]
 //! nav = "ctrl-]"
-//! prev_agent = "alt-;"
-//! next_agent = "none"
+//! focus_left = "alt-h"
+//! focus_right = "alt-l"
+//! actions = "alt-x"
 //! detach = "ctrl-\\"
 //!
 //! [repos]
@@ -25,44 +26,31 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 use crate::actions::{Actions, RawAction};
-use crate::keyspec::{Binding, Control, Detachable, FunctionKey, Glyph, InvalidKeySpec, KeySpec};
+use crate::keyspec::{Binding, Control, Detachable, FunctionKey, InvalidKeySpec, KeySpec};
 use crate::paths::{self, Typed};
 use crate::theme::{RawTheme, Theme, ThemeError};
 
-/// Which neighbour in [1] an always-on chord moves to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Hop {
-    Previous,
-    Next,
-}
-
-impl Hop {
-    pub const ALL: [Self; 2] = [Self::Previous, Self::Next];
-
-    pub fn delta(self) -> isize {
-        match self {
-            Self::Previous => -1,
-            Self::Next => 1,
-        }
-    }
-}
-
-/// A key of the `[keys]` table. A new field is added here, to `all`, to
-/// `Keys::binding`, `Keys::with_hop` and `Keys::reset`, and each match fails
-/// to compile until it is.
+/// A key of the `[keys]` table. A new field is added to `ALL`, to
+/// `Keys::binding`, `Keys::with`, `Display` and the parse in `RawKeys`, and
+/// each match fails to compile until it is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyField {
     Nav,
-    Hop(Hop),
+    /// Moves from [0] or an agent's terminal to the left panels.
+    FocusLeft,
+    /// Moves from a left panel to [0], entering the agent when [0] shows its
+    /// terminal.
+    FocusRight,
+    /// Opens the actions menu for the agent the user is looking at.
+    Actions,
 }
 
 impl KeyField {
-    pub fn all() -> impl Iterator<Item = Self> {
-        std::iter::once(Self::Nav).chain(Hop::ALL.into_iter().map(Self::Hop))
-    }
-}
+    pub const ALL: [Self; 4] = [Self::Nav, Self::FocusLeft, Self::FocusRight, Self::Actions];
 
-impl KeyField {
+    /// The always-on chords: every field but nav, which always has a key.
+    pub const CHORDS: [Self; 3] = [Self::FocusLeft, Self::FocusRight, Self::Actions];
+
     /// The line that sets this field to `spec` in a `[keys]` table.
     pub fn assignment(self, spec: KeySpec) -> String {
         format!(
@@ -76,27 +64,31 @@ impl fmt::Display for KeyField {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::Nav => "nav",
-            Self::Hop(Hop::Previous) => "prev_agent",
-            Self::Hop(Hop::Next) => "next_agent",
+            Self::FocusLeft => "focus_left",
+            Self::FocusRight => "focus_right",
+            Self::Actions => "actions",
         })
     }
 }
 
 /// The keys the TUI reserves for itself. Every default is a key any
-/// terminal can send. Nav always has a key, the agent chords may be off.
+/// terminal can send. Nav always has a key. The chords default to off,
+/// because window managers bind the usual alt chords globally.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Keys {
     nav: KeySpec,
-    previous: Binding,
-    next: Binding,
+    focus_left: Binding,
+    focus_right: Binding,
+    actions: Binding,
 }
 
 impl Default for Keys {
     fn default() -> Self {
         Self {
             nav: KeySpec::CTRL_CLOSE_BRACKET,
-            previous: Binding::On(KeySpec::Alt(Glyph::SEMICOLON)),
-            next: Binding::On(KeySpec::Alt(Glyph::APOSTROPHE)),
+            focus_left: Binding::Off,
+            focus_right: Binding::Off,
+            actions: Binding::Off,
         }
     }
 }
@@ -105,7 +97,9 @@ impl Keys {
     pub fn binding(&self, field: KeyField) -> Binding {
         match field {
             KeyField::Nav => Binding::On(self.nav),
-            KeyField::Hop(hop) => self.hop(hop),
+            KeyField::FocusLeft => self.focus_left,
+            KeyField::FocusRight => self.focus_right,
+            KeyField::Actions => self.actions,
         }
     }
 
@@ -113,42 +107,15 @@ impl Keys {
         self.nav
     }
 
-    pub fn hop(&self, hop: Hop) -> Binding {
-        match hop {
-            Hop::Previous => self.previous,
-            Hop::Next => self.next,
-        }
-    }
-
-    /// `field` back at its default, or `Taken` when another key already has
-    /// that default, so a fallback never makes two fields share a key. Nav
-    /// can't meet that: a nav key that needs a fallback also has the escape
-    /// hatch `ctrl-]`, which no chord may be.
+    /// `field` back at its default.
     #[must_use]
     pub fn reset(self, field: KeyField) -> Self {
         let defaults = Self::default();
         match field {
-            KeyField::Nav => Self {
-                nav: defaults.nav,
-                ..self
-            },
-            KeyField::Hop(hop) => {
-                self.with_hop(hop, self.default_or_taken(field, defaults.hop(hop)))
+            KeyField::Nav => self.with_nav(defaults.nav),
+            KeyField::FocusLeft | KeyField::FocusRight | KeyField::Actions => {
+                self.with(field, Binding::Off)
             }
-        }
-    }
-
-    fn default_or_taken(&self, field: KeyField, default: Binding) -> Binding {
-        let Some(spec) = default.spec() else {
-            return default;
-        };
-        match self
-            .bound()
-            .into_iter()
-            .find(|(other, bound)| *other != field && *bound == spec)
-        {
-            Some((by, _)) => Binding::Taken { default: spec, by },
-            None => default,
         }
     }
 
@@ -157,22 +124,30 @@ impl Keys {
         Self { nav, ..self }
     }
 
+    /// `binding` for a chord. Nav always has a key, so it is set with
+    /// `with_nav` and this leaves it alone.
     #[must_use]
-    pub fn with_hop(self, hop: Hop, binding: Binding) -> Self {
-        match hop {
-            Hop::Previous => Self {
-                previous: binding,
+    pub fn with(self, field: KeyField, binding: Binding) -> Self {
+        match field {
+            KeyField::Nav => self,
+            KeyField::FocusLeft => Self {
+                focus_left: binding,
                 ..self
             },
-            Hop::Next => Self {
-                next: binding,
+            KeyField::FocusRight => Self {
+                focus_right: binding,
+                ..self
+            },
+            KeyField::Actions => Self {
+                actions: binding,
                 ..self
             },
         }
     }
 
     pub fn bound(&self) -> Vec<(KeyField, KeySpec)> {
-        KeyField::all()
+        KeyField::ALL
+            .into_iter()
             .filter_map(|field| Some((field, self.binding(field).spec()?)))
             .collect()
     }
@@ -380,6 +355,8 @@ pub enum ConfigError {
         field: KeyField,
         source: InvalidKeySpec,
     },
+    #[error("keys.{0} was removed; prev_agent and next_agent became focus_left and focus_right")]
+    RemovedKey(&'static str),
     #[error("keys.detach: {0}")]
     Detach(#[from] DetachError),
     #[error("keys.{second} is the same key as keys.{first}")]
@@ -458,13 +435,24 @@ impl RawRepos {
 #[serde(deny_unknown_fields)]
 struct RawKeys {
     nav: Option<String>,
-    prev_agent: Option<String>,
-    next_agent: Option<String>,
+    focus_left: Option<String>,
+    focus_right: Option<String>,
+    actions: Option<String>,
     detach: Option<String>,
+    prev_agent: Option<toml::Value>,
+    next_agent: Option<toml::Value>,
 }
 
 impl RawKeys {
     fn parse(self) -> Result<Keys, ConfigError> {
+        for (key, removed) in [
+            ("prev_agent", &self.prev_agent),
+            ("next_agent", &self.next_agent),
+        ] {
+            if removed.is_some() {
+                return Err(ConfigError::RemovedKey(key));
+            }
+        }
         let defaults = Keys::default();
         let nav = match self.nav {
             Some(raw) => raw.parse().map_err(|source| ConfigError::Key {
@@ -473,20 +461,27 @@ impl RawKeys {
             })?,
             None => defaults.nav(),
         };
-        let chosen = |hop: Hop, raw: Option<String>| match raw {
-            Some(raw) => raw.parse().map(Some).map_err(|source| ConfigError::Key {
-                field: KeyField::Hop(hop),
-                source,
-            }),
+        let chosen = |field: KeyField, raw: Option<String>| match raw {
+            Some(raw) => raw
+                .parse::<Binding>()
+                .map(Some)
+                .map_err(|source| ConfigError::Key { field, source }),
             None => Ok(None),
         };
-        let chosen_hops = [
-            (Hop::Previous, chosen(Hop::Previous, self.prev_agent)?),
-            (Hop::Next, chosen(Hop::Next, self.next_agent)?),
+        let chosen_chords = [
+            (
+                KeyField::FocusLeft,
+                chosen(KeyField::FocusLeft, self.focus_left)?,
+            ),
+            (
+                KeyField::FocusRight,
+                chosen(KeyField::FocusRight, self.focus_right)?,
+            ),
+            (KeyField::Actions, chosen(KeyField::Actions, self.actions)?),
         ];
         let mut keys = Keys::default().with_nav(nav);
-        for (hop, binding) in chosen_hops {
-            keys = keys.with_hop(hop, binding.unwrap_or(Binding::Off));
+        for (field, binding) in chosen_chords {
+            keys = keys.with(field, binding.unwrap_or(Binding::Off));
         }
         let explicit = keys.bound();
         ensure_distinct(&explicit)
@@ -499,12 +494,6 @@ impl RawKeys {
                 hatch,
                 nav: keys.nav(),
             });
-        }
-        for (hop, binding) in chosen_hops {
-            if binding.is_none() {
-                let field = KeyField::Hop(hop);
-                keys = keys.with_hop(hop, keys.default_or_taken(field, defaults.hop(hop)));
-            }
         }
         Ok(keys)
     }
@@ -606,6 +595,84 @@ mod tests {
     }
 
     #[test]
+    fn every_chord_is_off_unless_the_config_sets_it() {
+        let config: Config = "".parse().expect("parses");
+        for field in KeyField::CHORDS {
+            assert_eq!(config.keys.binding(field), Binding::Off, "{field}");
+        }
+        let config: Config =
+            "[keys]\nfocus_left = 'alt-h'\nfocus_right = 'alt-l'\nactions = 'alt-x'"
+                .parse()
+                .expect("parses");
+        let spelt: Vec<_> = KeyField::CHORDS
+            .into_iter()
+            .map(|field| config.keys.binding(field).to_string())
+            .collect();
+        assert_eq!(spelt, ["⌥h", "⌥l", "⌥x"]);
+    }
+
+    #[test]
+    fn none_or_off_turns_only_that_chord_off() {
+        for field in KeyField::CHORDS {
+            for word in ["none", "off", "None"] {
+                let config: Config = format!("[keys]\n{field} = '{word}'")
+                    .parse()
+                    .expect("parses");
+                assert_eq!(config.keys.binding(field), Binding::Off, "{field} {word}");
+            }
+        }
+        let config: Config = "[keys]\nfocus_left = 'f5'".parse().expect("parses");
+        assert_eq!(config.keys.binding(KeyField::FocusLeft).to_string(), "F5");
+        assert_eq!(config.keys.binding(KeyField::FocusRight), Binding::Off);
+    }
+
+    #[test]
+    fn a_chord_may_not_share_a_key_with_nav_or_another_chord() {
+        for (toml, first, second) in [
+            (
+                "[keys]\nactions = 'ctrl-]'",
+                KeyField::Nav,
+                KeyField::Actions,
+            ),
+            (
+                "[keys]\nfocus_left = 'alt-h'\nfocus_right = 'alt-h'",
+                KeyField::FocusLeft,
+                KeyField::FocusRight,
+            ),
+            (
+                "[keys]\nactions = 'alt-x'\nfocus_right = 'alt-x'",
+                KeyField::FocusRight,
+                KeyField::Actions,
+            ),
+        ] {
+            match toml.parse::<Config>() {
+                Err(ConfigError::DuplicateKey {
+                    first: a,
+                    second: b,
+                }) => assert_eq!((a, b), (first, second), "{toml}"),
+                other => panic!("{toml}: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn the_actions_chord_may_not_be_the_escape_hatch_of_a_non_ctrl_nav() {
+        let error = "[keys]\nnav = 'alt-x'\nactions = 'ctrl-]'"
+            .parse::<Config>()
+            .expect_err("rejected");
+        assert!(
+            matches!(
+                error,
+                ConfigError::EscapeHatchTaken {
+                    field: KeyField::Actions,
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[test]
     fn nav_defaults_to_ctrl_close_bracket() {
         let config: Config = "".parse().expect("parses");
         assert_eq!(config.keys.nav().to_string(), "⌃]");
@@ -614,37 +681,19 @@ mod tests {
     #[test]
     fn every_default_key_is_one_any_terminal_can_send() {
         let defaults = Keys::default();
-        for field in KeyField::all() {
-            let spec = defaults.binding(field).spec().expect("on by default");
-            assert!(!spec.needs_kitty(), "{field}");
-        }
+        assert!(!defaults.nav().needs_kitty());
+        assert!(matches!(Detach::default(), Detach::On(Detachable::Ctrl(_))));
     }
 
     #[test]
-    fn the_agent_chords_are_on_by_default_as_alt_comma_and_alt_period() {
-        let config: Config = "".parse().expect("parses");
-        assert_eq!(config.keys.hop(Hop::Previous).to_string(), "⌥;");
-        assert_eq!(config.keys.hop(Hop::Next).to_string(), "⌥'");
-        let config: Config = "[keys]\nnav = 'ctrl-g'".parse().expect("parses");
-        assert_eq!(config.keys.hop(Hop::Next).to_string(), "⌥'");
-    }
-
-    #[test]
-    fn a_chord_can_be_changed_and_none_or_off_turns_only_that_one_off() {
-        let config: Config = "[keys]\nprev_agent = 'f5'".parse().expect("parses");
-        assert_eq!(config.keys.hop(Hop::Previous).to_string(), "F5");
-        assert_eq!(config.keys.hop(Hop::Next).to_string(), "⌥'");
-        for word in ["none", "off", "None"] {
-            let config: Config = format!("[keys]\nprev_agent = '{word}'")
-                .parse()
-                .expect("parses");
-            assert_eq!(config.keys.hop(Hop::Previous), Binding::Off, "{word}");
-            assert_eq!(config.keys.hop(Hop::Next).to_string(), "⌥'", "{word}");
-            let config: Config = format!("[keys]\nnext_agent = '{word}'")
-                .parse()
-                .expect("parses");
-            assert_eq!(config.keys.hop(Hop::Next), Binding::Off, "{word}");
-            assert_eq!(config.keys.hop(Hop::Previous).to_string(), "⌥;", "{word}");
+    fn the_removed_agent_hop_keys_are_refused_naming_the_key_and_replacements() {
+        for key in ["prev_agent", "next_agent"] {
+            let error = format!("[keys]\n{key} = 'alt-;'")
+                .parse::<Config>()
+                .expect_err("rejected")
+                .to_string();
+            assert!(error.contains(key), "{error}");
+            assert!(error.contains("focus_left and focus_right"), "{error}");
         }
     }
 
@@ -652,14 +701,15 @@ mod tests {
     fn a_mistake_in_a_chord_names_the_config_key_and_the_spec() {
         let err = |toml: &str| toml.parse::<Config>().expect_err("fails").to_string();
         assert!(
-            err("[keys]\nprev_agent = 'banana'")
-                .starts_with("keys.prev_agent: \"banana\" isn't a key")
+            err("[keys]\nfocus_left = 'banana'")
+                .starts_with("keys.focus_left: \"banana\" isn't a key")
         );
         assert!(
-            err("[keys]\nnext_agent = 'x'")
-                .starts_with("keys.next_agent: \"x\" is a key on its own")
+            err("[keys]\nfocus_right = 'x'")
+                .starts_with("keys.focus_right: \"x\" is a key on its own")
         );
-        assert!(err("[keys]\nnext_agent = ''").starts_with("keys.next_agent: is empty"));
+        assert!(err("[keys]\nactions = ''").starts_with("keys.actions: is empty"));
+        assert!(err("[keys]\nactions = 'alt-xx'").starts_with("keys.actions: "));
     }
 
     #[test]
@@ -675,11 +725,15 @@ mod tests {
 
     #[test]
     fn an_assignment_quotes_the_spec_so_the_config_reads_back_a_key_with_a_quote_or_backslash() {
-        for text in ["ctrl-\\", "alt-\"", "alt-'"] {
-            let spec: KeySpec = text.parse().expect("parses");
-            let line = KeyField::Hop(Hop::Next).assignment(spec);
-            let config: Config = format!("[keys]\n{line}\n").parse().expect("parses");
-            assert_eq!(config.keys.hop(Hop::Next), Binding::On(spec), "{line}");
+        for written in ["ctrl-\\", "alt-\"", "alt-'"] {
+            let spec: KeySpec = written.parse().expect("parses");
+            let line = KeyField::FocusRight.assignment(spec);
+            let config: Config = format!("[keys]\n{line}").parse().expect("parses");
+            assert_eq!(
+                config.keys.binding(KeyField::FocusRight),
+                Binding::On(spec),
+                "{line}"
+            );
         }
     }
 
@@ -687,55 +741,40 @@ mod tests {
     fn two_keys_the_user_set_to_one_key_are_refused_naming_both() {
         let err = |toml: &str| toml.parse::<Config>().expect_err("fails").to_string();
         assert_eq!(
-            err("[keys]\nnav = \"alt-'\"\nnext_agent = \"alt-'\""),
-            "keys.next_agent is the same key as keys.nav"
+            err("[keys]\nnav = \"alt-'\"\nfocus_right = \"alt-'\""),
+            "keys.focus_right is the same key as keys.nav"
         );
         assert_eq!(
-            err("[keys]\nnav = 'alt-;'\nprev_agent = 'alt-;'"),
-            "keys.prev_agent is the same key as keys.nav"
+            err("[keys]\nnav = 'alt-;'\nfocus_left = 'alt-;'"),
+            "keys.focus_left is the same key as keys.nav"
         );
         assert_eq!(
-            err("[keys]\nprev_agent = 'f5'\nnext_agent = 'f5'"),
-            "keys.next_agent is the same key as keys.prev_agent"
+            err("[keys]\nfocus_left = 'f5'\nfocus_right = 'f5'"),
+            "keys.focus_right is the same key as keys.focus_left"
         );
     }
 
     #[test]
-    fn a_default_chord_that_another_key_the_user_set_has_is_left_off_not_an_error() {
-        for (toml, hop, by) in [
-            ("[keys]\nnav = 'alt-;'", Hop::Previous, KeyField::Nav),
-            ("[keys]\nnav = \"alt-'\"", Hop::Next, KeyField::Nav),
-            (
-                "[keys]\nprev_agent = \"alt-'\"",
-                Hop::Next,
-                KeyField::Hop(Hop::Previous),
-            ),
-        ] {
-            let config: Config = toml.parse().expect("an existing config still parses");
-            let default = Keys::default().hop(hop).spec().expect("on by default");
-            assert_eq!(
-                config.keys.hop(hop),
-                Binding::Taken { default, by },
-                "{toml}"
-            );
-            assert_eq!(config.keys.hop(hop).spec(), None);
+    fn a_chord_the_config_leaves_out_is_off_whatever_the_other_keys_are() {
+        let config: Config = "[keys]\nnav = 'alt-h'".parse().expect("parses");
+        for field in KeyField::CHORDS {
+            assert_eq!(config.keys.binding(field), Binding::Off, "{field}");
         }
-        let config: Config = "[keys]\nnav = 'alt-;'".parse().expect("parses");
-        assert_eq!(config.keys.hop(Hop::Next).to_string(), "⌥'");
     }
 
     #[test]
     fn a_chord_on_none_does_not_clash_with_the_other_keys() {
-        let config: Config = "[keys]\nprev_agent = 'none'\nnext_agent = 'none'\nnav = 'alt-;'"
-            .parse()
-            .expect("parses");
+        let config: Config =
+            "[keys]\nfocus_left = 'none'\nfocus_right = 'none'\nactions = 'none'\nnav = 'alt-;'"
+                .parse()
+                .expect("parses");
         assert_eq!(config.keys.nav().to_string(), "⌥;");
     }
 
     #[test]
     fn a_nav_key_that_may_need_a_fallback_never_shares_ctrl_close_bracket_with_a_chord() {
         for nav in ["ctrl-shift-t", "super-j", "alt-x", "f5", "ctrl-h"] {
-            let err = format!("[keys]\nnav = '{nav}'\nprev_agent = 'ctrl-]'")
+            let err = format!("[keys]\nnav = '{nav}'\nfocus_left = 'ctrl-]'")
                 .parse::<Config>()
                 .expect_err("fails")
                 .to_string();
@@ -747,37 +786,33 @@ mod tests {
     fn a_chord_cannot_be_the_second_way_out_of_agent_while_nav_is_not_a_control_key() {
         let err = |toml: &str| toml.parse::<Config>().expect_err("fails").to_string();
         assert_eq!(
-            err("[keys]\nnav = 'alt-x'\nnext_agent = 'ctrl-]'"),
-            "keys.next_agent is ⌃], which also leaves AGENT while keys.nav is ⌥x"
+            err("[keys]\nnav = 'alt-x'\nfocus_right = 'ctrl-]'"),
+            "keys.focus_right is ⌃], which also leaves AGENT while keys.nav is ⌥x"
         );
         assert_eq!(
-            err("[keys]\nnav = 'f5'\nprev_agent = 'ctrl-]'"),
-            "keys.prev_agent is ⌃], which also leaves AGENT while keys.nav is F5"
+            err("[keys]\nnav = 'f5'\nactions = 'ctrl-]'"),
+            "keys.actions is ⌃], which also leaves AGENT while keys.nav is F5"
         );
-        let config: Config = "[keys]\nnav = 'ctrl-g'\nnext_agent = 'ctrl-]'"
+        let config: Config = "[keys]\nnav = 'ctrl-g'\nfocus_left = 'ctrl-]'"
             .parse()
             .expect("a control nav key has no second way out");
-        assert_eq!(config.keys.hop(Hop::Next).to_string(), "⌃]");
+        assert_eq!(config.keys.binding(KeyField::FocusLeft).to_string(), "⌃]");
     }
 
     #[test]
-    fn reset_restores_the_default_or_leaves_a_chord_off_when_another_key_took_it() {
-        let spec: KeySpec = "alt-'".parse().expect("parses");
-        let taken = Keys::default()
-            .with_nav(spec)
-            .with_hop(Hop::Previous, Binding::On("f5".parse().expect("parses")))
-            .with_hop(Hop::Next, Binding::On("f6".parse().expect("parses")));
+    fn reset_puts_a_chord_back_off_and_nav_back_on_ctrl_close_bracket() {
+        let chosen = Keys::default()
+            .with_nav("alt-'".parse().expect("parses"))
+            .with(
+                KeyField::FocusLeft,
+                Binding::On("f5".parse().expect("parses")),
+            );
+        let reset = chosen.reset(KeyField::FocusLeft);
+        assert_eq!(reset.binding(KeyField::FocusLeft), Binding::Off);
         assert_eq!(
-            taken.reset(KeyField::Hop(Hop::Next)).hop(Hop::Next),
-            Binding::Taken {
-                default: spec,
-                by: KeyField::Nav
-            },
-            "alt-' is nav's"
+            reset.reset(KeyField::Nav).nav(),
+            KeySpec::CTRL_CLOSE_BRACKET
         );
-        let free = taken.reset(KeyField::Hop(Hop::Previous));
-        assert_eq!(free.hop(Hop::Previous), Keys::default().hop(Hop::Previous));
-        assert_eq!(free.reset(KeyField::Nav).nav(), KeySpec::CTRL_CLOSE_BRACKET);
     }
 
     #[test]
@@ -834,14 +869,21 @@ mod tests {
     #[test]
     fn with_replaces_only_its_field_and_bound_lists_every_field_that_has_a_key() {
         let spec: KeySpec = "f5".parse().expect("parses");
-        let keys = Keys::default().with_nav(spec);
+        let on = |text: &str| Binding::On(text.parse().expect("parses"));
+        let keys = Keys::default()
+            .with_nav(spec)
+            .with(KeyField::FocusLeft, on("f6"))
+            .with(KeyField::FocusRight, on("f7"))
+            .with(KeyField::Actions, on("f8"));
         assert_eq!(keys.nav(), spec);
-        assert_eq!(keys.hop(Hop::Next), Keys::default().hop(Hop::Next));
         let fields: Vec<_> = keys.bound().into_iter().map(|(field, _)| field).collect();
-        assert_eq!(fields, KeyField::all().collect::<Vec<_>>());
-        let off = keys.with_hop(Hop::Next, Binding::Off);
+        assert_eq!(fields, KeyField::ALL);
+        let off = keys.with(KeyField::FocusRight, Binding::Off);
         let fields: Vec<_> = off.bound().into_iter().map(|(field, _)| field).collect();
-        assert_eq!(fields, [KeyField::Nav, KeyField::Hop(Hop::Previous)]);
+        assert_eq!(
+            fields,
+            [KeyField::Nav, KeyField::FocusLeft, KeyField::Actions]
+        );
     }
 
     #[test]

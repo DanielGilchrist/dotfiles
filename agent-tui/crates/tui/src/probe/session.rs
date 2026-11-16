@@ -16,7 +16,7 @@ use crate::keyspec::Keyboard;
 
 /// The digit that picks each field.
 fn numbered() -> Vec<(u8, KeyField)> {
-    (b'1'..).zip(KeyField::all()).collect()
+    (b'1'..).zip(KeyField::ALL).collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -223,8 +223,6 @@ fn shown(event: &KeyEvent) -> String {
 
 #[cfg(test)]
 mod tests {
-    use agent_core::config::Hop;
-
     use super::super::decode;
     use super::*;
 
@@ -263,7 +261,7 @@ mod tests {
         assert_eq!(legacy[0], "legacy key reporting");
         assert_eq!(
             legacy[1],
-            "choose 1) nav  2) prev_agent  3) next_agent. Esc Esc or Ctrl-C twice quits"
+            "choose 1) nav  2) focus_left  3) focus_right  4) actions. Esc Esc or Ctrl-C twice quits"
         );
         let kitty = session(Keyboard::Disambiguated).opening();
         assert_eq!(
@@ -275,7 +273,7 @@ mod tests {
     #[test]
     fn a_usable_key_prints_the_bytes_the_event_and_the_line_to_paste_for_the_chosen_field() {
         let mut probe = session(Keyboard::Legacy);
-        assert_eq!(press(&mut probe, b"2"), ["press the key for prev_agent"]);
+        assert_eq!(press(&mut probe, b"2"), ["press the key for focus_left"]);
         let lines = press(&mut probe, b"\x1b;");
         assert_eq!(
             lines[..6],
@@ -285,7 +283,7 @@ mod tests {
                 "usable",
                 "add to /cfg/agent/config.toml:",
                 "[keys]",
-                "prev_agent = \"alt-;\"",
+                "focus_left = \"alt-;\"",
             ]
         );
         assert!(lines[6].starts_with("choose 1)"));
@@ -336,10 +334,10 @@ mod tests {
     #[test]
     fn a_line_the_config_would_refuse_is_replaced_by_the_configs_error() {
         let probe = session(Keyboard::Legacy);
-        let lines = probe.assignment(KeyField::Hop(Hop::Next), "ctrl-]".parse().expect("parses"));
+        let lines = probe.assignment(KeyField::FocusRight, "ctrl-]".parse().expect("parses"));
         assert_eq!(
             lines,
-            ["the config would refuse it: keys.next_agent is the same key as keys.nav"]
+            ["the config would refuse it: keys.focus_right is the same key as keys.nav"]
         );
     }
 

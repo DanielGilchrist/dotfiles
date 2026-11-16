@@ -340,7 +340,6 @@ impl Runtime {
             id: ClientId::new(term.pid()),
             term,
             mode: Mode::Nav,
-            typing: model::Typing::Ready,
             opened: m.clock.mono,
         }));
         m.touch_mru(name);
@@ -695,8 +694,8 @@ impl Runtime {
 
     fn connect_failed(m: &mut Model, ticket: Ticket, result: Result<()>) {
         let Err(e) = result else { return };
-        let lost = m.abandon(ticket);
-        m.error(format!("{e:#}{}", lost.suffix()));
+        m.abandon(ticket);
+        m.error(format!("{e:#}"));
     }
 }
 
@@ -999,74 +998,20 @@ mod tests {
     }
 
     #[test]
-    fn a_stale_failed_connect_does_not_claim_keys_still_held_for_another_hop_were_dropped() {
+    fn a_failed_connect_says_why_and_stops_waiting_for_its_client() {
         let mut m = fixtures::fleet(10);
-        m.visibility = model::Visibility::All;
-        m.set_cursor(model::Cursor::Entry(fixtures::name("auth-refresh-2")));
-        fixtures::connect(&mut m, "auth-refresh-2", Mode::Agent);
-        let alt = |c| {
-            worker::Msg::Key(crossterm::event::KeyEvent::new(
-                crossterm::event::KeyCode::Char(c),
-                crossterm::event::KeyModifiers::ALT,
-            ))
+        let ticket = m.ticket();
+        m.pane = Pane::Connecting {
+            name: fixtures::name("auth-refresh-2"),
+            ticket,
+            landing: model::Landing::Preview,
         };
-        update::update(&mut m, alt('\''));
-        fixtures::sighted(&mut m, &[]);
-        let stale = match &m.pane {
-            Pane::Connecting { ticket, .. } => *ticket,
-            _ => panic!("the pane is not connecting"),
-        };
-        for c in "ab".chars() {
-            update::update(
-                &mut m,
-                worker::Msg::Key(crossterm::event::KeyEvent::new(
-                    crossterm::event::KeyCode::Char(c),
-                    crossterm::event::KeyModifiers::NONE,
-                )),
-            );
-        }
-        update::update(&mut m, alt('\''));
-        assert_eq!(
-            m.pane.held_lost().to_string(),
-            "dropped 2 keys",
-            "still held"
-        );
-        Runtime::connect_failed(&mut m, stale, Err(anyhow::anyhow!("attaching failed")));
-        let said = m.status.as_ref().expect("a status").text.clone();
-        assert_eq!(said, "attaching failed");
-        assert_eq!(m.pane.held_lost().to_string(), "dropped 2 keys");
-    }
-
-    #[test]
-    fn a_failed_connect_for_the_hop_the_pane_waits_on_says_what_it_dropped() {
-        let mut m = fixtures::fleet(10);
-        m.visibility = model::Visibility::All;
-        m.set_cursor(model::Cursor::Entry(fixtures::name("auth-refresh-2")));
-        fixtures::connect(&mut m, "auth-refresh-2", Mode::Agent);
-        update::update(
-            &mut m,
-            worker::Msg::Key(crossterm::event::KeyEvent::new(
-                crossterm::event::KeyCode::Char('\''),
-                crossterm::event::KeyModifiers::ALT,
-            )),
-        );
-        fixtures::sighted(&mut m, &[]);
-        let ticket = match &m.pane {
-            Pane::Connecting { ticket, .. } => *ticket,
-            _ => panic!("the pane is not connecting"),
-        };
-        update::update(
-            &mut m,
-            worker::Msg::Key(crossterm::event::KeyEvent::new(
-                crossterm::event::KeyCode::Char('a'),
-                crossterm::event::KeyModifiers::NONE,
-            )),
-        );
         Runtime::connect_failed(&mut m, ticket, Err(anyhow::anyhow!("attaching failed")));
         assert_eq!(
             m.status.as_ref().map(|s| s.text.as_str()),
-            Some("attaching failed · dropped 1 key")
+            Some("attaching failed")
         );
+        assert!(matches!(m.pane, Pane::Empty));
     }
 
     #[test]

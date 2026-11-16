@@ -1,5 +1,5 @@
 //! `agent keys`: press a key and learn whether it works as the leave key or
-//! an agent chord in this terminal, and what to write in the config for it.
+//! an always-on chord in this terminal, and what to write in the config for it.
 
 mod classify;
 mod decode;

@@ -24,14 +24,13 @@ use crate::keymap::Situation;
 use crate::keyspec::Sendable;
 use crate::log::{EntryKey, Nav};
 use crate::model::{
-    ActivityRow, Answer, Areas, Arrival, CheckHealth, Checked, Chord, CommentDraft, Company,
-    Confirm, Cursor, DirCheck, Direction, Drawn, Edge, Enter, Entering, Field, FirstLine, Focus,
-    Follow, FormKind, Held, HelpState, INFO_TTL, Input, Inspected, Inspection, Landing, Listed,
-    LogKey, Look, Lost, Missing, Mode, Model, Moment, NamingState, Need, NewAgent, Overlay, Pane,
-    Panel, Peek, Phase, Planning, PromptEdit, Query, Reach, Reply, ReplyTo, RepoInput,
-    SETTLE_TIMEOUT, Screen, StatusKind, Submission, TerminalFocus, Ticket, Typing, Unreachable,
-    View, WARNING_TTL, Watch, WatchView, WorkRoom, elsewhere_banner, fuzzy_match, match_rank,
-    repo_matches, unlisted,
+    ActivityRow, Answer, Areas, Arrival, CheckHealth, Checked, CommentDraft, Company, Confirm,
+    Cursor, DirCheck, Direction, Drawn, Edge, Enter, Entering, Field, FirstLine, Focus, Follow,
+    FormKind, HelpState, INFO_TTL, Inspected, Inspection, Landing, Listed, LogKey, Look, Missing,
+    Mode, Model, Moment, NamingState, Need, NewAgent, Overlay, Pane, Panel, Peek, Phase, Planning,
+    PromptEdit, Query, Reach, Reply, ReplyTo, RepoInput, Screen, StatusKind, Submission,
+    TerminalFocus, Ticket, Unreachable, View, WARNING_TTL, Watch, WatchView, WorkRoom,
+    elsewhere_banner, fuzzy_match, match_rank, repo_matches, unlisted,
 };
 use crate::touched::Baseline;
 use crate::track::{Compose, Found, ImagePaste, Probed, Seen};
@@ -40,7 +39,6 @@ use crate::typed::{Columns, Message};
 use crate::worker::{
     ImageError, Job, Msg, Outcome, OutputRead, OutputRequest, ScrollbackRead, SendError,
 };
-use agent_core::config::Hop;
 
 mod restart;
 
@@ -468,10 +466,6 @@ fn paste_bytes(text: &str, modes: agent_term::Modes) -> Vec<u8> {
 }
 
 fn on_paste(m: &mut Model, text: &str) -> Vec<Effect> {
-    if let Some((_, held)) = m.pane.hop_held() {
-        held.push(Input::Paste(sanitize_paste(text)));
-        return Vec::new();
-    }
     match &mut m.overlay {
         Overlay::New(_) => {
             edit_form(m, |form| {
@@ -499,9 +493,6 @@ fn on_paste(m: &mut Model, text: &str) -> Vec<Effect> {
         | Overlay::Help(_)
         | Overlay::Actions(_)
         | Overlay::Planning { .. } => {
-            if let Some(forwarded) = forward_paste(m, text) {
-                return forwarded;
-            }
             m.info("paste not taken: Esc closes this first");
         }
     }
@@ -803,8 +794,7 @@ fn tick_effects(m: &mut Model) -> Vec<Effect> {
     }) {
         m.status = None;
     }
-    let mut effects = settle_hop(m);
-    effects.extend(check_timed_out(m));
+    let mut effects = check_timed_out(m);
     effects.extend(ask_for_name(m));
     effects.extend(bell(m));
     effects.extend(recheck_elsewhere_when_due(m));
@@ -1127,9 +1117,7 @@ fn checked(m: &mut Model, name: SessionName, then: Checked) -> Vec<Effect> {
             m.set_pane(Pane::Elsewhere { name });
             start_watching(m)
         }
-        (Company::Elsewhere(_), Checked::Enter { .. } | Checked::Hop { .. }) => {
-            stay_elsewhere(m, &name)
-        }
+        (Company::Elsewhere(_), Checked::Enter { .. }) => stay_elsewhere(m, &name),
     }
 }
 
@@ -1143,7 +1131,6 @@ fn pause_if_elsewhere(m: &mut Model) {
 
 /// Leaves `name`, selected, to its other window and says how to take it.
 fn stay_elsewhere(m: &mut Model, name: &SessionName) -> Vec<Effect> {
-    let lost = m.pane.held_lost();
     m.set_pane(Pane::Elsewhere { name: name.clone() });
     if m.cursor().and_then(Cursor::entry_name) != Some(name) {
         m.set_cursor(Cursor::Entry(name.clone()));
@@ -1151,7 +1138,7 @@ fn stay_elsewhere(m: &mut Model, name: &SessionName) -> Vec<Effect> {
     m.preview_at = None;
     m.peek = None;
     if let Some(windows) = m.company(name).windows() {
-        let said = format!("{name}: {}{}", elsewhere_banner(windows), lost.suffix());
+        let said = format!("{name}: {}", elsewhere_banner(windows));
         m.info(said);
     }
     Vec::new()
@@ -1733,25 +1720,11 @@ fn enter(m: &mut Model, others: Others) -> Vec<Job> {
 }
 
 /// What a new connection starts: the AGENT mode the user asked for, the
-/// closing of other windows once it exists, and the look for newcomers. A
-/// hop also starts waiting for the terminal's first output before what was
-/// typed for it is sent.
+/// closing of other windows once it exists, and the look for newcomers.
 pub fn connected(m: &mut Model, arrival: Arrival) -> Vec<Background> {
-    let (landing, dropped) = arrival.into_parts();
-    if !dropped.is_nothing() {
-        m.info(dropped.to_string());
-    }
-    let (jobs, looks) = match landing {
+    let (jobs, looks) = match arrival.into_landing() {
         Landing::Preview => (Vec::new(), true),
         Landing::Enter { .. } => (enter(m, Others::Keep), true),
-        Landing::Hop { held, .. } => {
-            let jobs = enter(m, Others::Keep);
-            let until = m.clock.mono + SETTLE_TIMEOUT;
-            if let Some(c) = m.pane.connection_mut() {
-                c.typing = Typing::Settling { held, until };
-            }
-            (jobs, true)
-        }
         Landing::MoveHere { .. } => {
             let jobs = enter(m, Others::Close);
             moved_here(m);
@@ -1763,49 +1736,6 @@ pub fn connected(m: &mut Model, arrival: Arrival) -> Vec<Background> {
         .map(Background::Job)
         .chain(look.map(Background::Look))
         .collect()
-}
-
-/// Sends what was typed during a hop once the new terminal has printed,
-/// encoded with the modes it has set by then, or gives it up when nothing
-/// came in time.
-fn settle_hop(m: &mut Model) -> Vec<Effect> {
-    let now = m.clock.mono;
-    let Pane::Connected(c) = &mut m.pane else {
-        return Vec::new();
-    };
-    let Typing::Settling { until, .. } = &c.typing else {
-        return Vec::new();
-    };
-    let heard = c.term.heard();
-    if !heard && now < *until {
-        return Vec::new();
-    }
-    let Typing::Settling { held, .. } = std::mem::replace(&mut c.typing, Typing::Ready) else {
-        return Vec::new();
-    };
-    let to = c.name.clone();
-    let modes = c.term.modes();
-    let (bytes, lost) = match (heard, held.deliverable()) {
-        (true, Some(inputs)) => (
-            inputs
-                .iter()
-                .flat_map(|input| match input {
-                    Input::Key(key) => encode_key(*key, modes),
-                    Input::Paste(text) => paste_bytes(text, modes),
-                })
-                .collect(),
-            Lost::default(),
-        ),
-        (true, None) | (false, _) => (Vec::new(), held.lost()),
-    };
-    if !lost.is_nothing() {
-        m.info(lost.to_string());
-    }
-    if bytes.is_empty() {
-        Vec::new()
-    } else {
-        vec![Effect::Pty { to, bytes }]
-    }
 }
 
 /// The other windows are being closed, so the session is alone now. Looks
@@ -1958,128 +1888,19 @@ fn activate(m: &mut Model, name: &SessionName, entering: Entering) -> Vec<Effect
     }
 }
 
-/// Proof that keys can land in this session once it connects: it is live,
-/// not this TUI's own, not starting or restarting, and no other window shows
-/// it. A hop is built from one only, so it can't start or resurrect.
-struct Attachable(SessionName);
-
-fn attachable(m: &Model, name: &SessionName) -> Option<Attachable> {
-    let reach = reach_of(m, name).ok()?;
-    match admit(m, name, reach).ok()? {
-        Enter::Attach if !m.company(name).is_elsewhere() => Some(Attachable(name.clone())),
-        Enter::Attach
-        | Enter::Restart(_)
-        | Enter::Resurrect
-        | Enter::Start(_)
-        | Enter::Refused(_) => None,
-    }
-}
-
-const NO_HOP: &str = "no other agent to hop to";
-
-/// The first agent from `from` in the direction of `hop` that keys can land
-/// in, skipping the ones that can't. Says so when there is another agent and
-/// none of them can.
-fn hop_target(m: &mut Model, hop: Hop, from: Option<&SessionName>) -> Option<Attachable> {
-    let candidates = m.candidates(hop, from);
-    let found = candidates.iter().find_map(|name| attachable(m, name));
-    if found.is_none() && !candidates.is_empty() {
-        m.info(NO_HOP);
-    }
-    found
-}
-
-/// Moves the keys to `target`: they go to it as soon as it connects, with
-/// what is typed meanwhile in `held`.
-fn hop_to(m: &mut Model, target: Attachable, held: Held) -> Vec<Effect> {
-    let Attachable(name) = target;
-    focus_on(m, &name);
-    let from = m.panel.seat();
-    vec![check_first(m, &name, Checked::Hop { from, held })]
-}
-
-/// An always-on chord outside a hop. In AGENT, or while an entry is still
-/// connecting, the keys go to the neighbouring agent and stay in AGENT:
-/// pressing it is the request, which is why it's the one thing besides `⏎`
-/// and `i` that enters. In NAV it moves the selection and previews.
-fn hop_agents(m: &mut Model, hop: Hop) -> Vec<Effect> {
-    m.chord = Chord::Idle;
-    let Some(from) = m.inhabited().cloned() else {
-        let next = m.candidates(hop, None).into_iter().next();
-        return next.map_or_else(Vec::new, |name| select(m, &name));
-    };
-    match hop_target(m, hop, Some(&from)) {
-        Some(target) => hop_to(m, target, Held::default()),
-        None => Vec::new(),
-    }
-}
-
-/// Keys while a hop connects: the nav key or the escape hatch gives the hop
-/// up, a chord goes on to the next agent, and everything else is held for
-/// the agent that is coming.
-fn hopping_key(m: &mut Model, key: KeyEvent) -> Vec<Effect> {
-    let Some((name, _)) = m.pane.hop_held() else {
-        return Vec::new();
-    };
-    let name = name.clone();
-    if m.keys.leaves_agent(&key) {
-        m.chord = Chord::Idle;
-        if let Pane::Connected(c) = &mut m.pane {
-            let held = std::mem::replace(&mut c.typing, Typing::Ready);
-            if let Typing::Settling { held, .. } = held {
-                let lost = held.lost();
-                if !lost.is_nothing() {
-                    m.info(lost.to_string());
-                }
-            }
-            return on_key(m, key);
-        }
-        m.downgrade_pending(&name);
-        return Vec::new();
-    }
-    if let Some(hop) = m.keys.hopped(&key) {
-        m.chord = Chord::Idle;
-        let Some(target) = hop_target(m, hop, Some(&name)) else {
-            return Vec::new();
-        };
-        let held = m
-            .pane
-            .hop_held()
-            .map(|(_, held)| std::mem::take(held))
-            .unwrap_or_default();
-        return hop_to(m, target, held);
-    }
-    if let Some((_, held)) = m.pane.hop_held() {
-        held.push(Input::Key(key));
-    }
-    Vec::new()
-}
-
 fn on_key(m: &mut Model, key: KeyEvent) -> Vec<Effect> {
-    if m.pane.hop_held().is_some() {
-        return hopping_key(m, key);
-    }
     if !matches!(m.overlay, Overlay::None) {
         return on_overlay_key(m, key);
     }
     if m.peek.is_none()
-        && let Some(chord) = m.keys.hopped(&key)
+        && let Some(chord) = chord_pressed(m, &key)
     {
-        return hop_agents(m, chord);
+        return chord;
     }
     if let Some(c) = m.pane.connection().filter(|c| c.mode == Mode::Agent) {
         if m.keys.leaves_agent(&key) {
             let name = c.name.clone();
-            m.pane.set_nav();
-            m.chord = if m.keys.pressed(KeyField::Nav, &key) {
-                Chord::armed(m.clock.mono)
-            } else {
-                Chord::Idle
-            };
-            if m.selected_entry().is_none_or(|e| e.name() != &name) {
-                m.set_cursor(Cursor::Entry(name));
-                m.preview_at = None;
-            }
+            back_to_nav(m, name);
         } else {
             return vec![Effect::Pty {
                 to: c.name.clone(),
@@ -2088,11 +1909,8 @@ fn on_key(m: &mut Model, key: KeyEvent) -> Vec<Effect> {
         }
         return Vec::new();
     }
-    if m.peek.is_none() {
-        let chord = std::mem::replace(&mut m.chord, Chord::Idle);
-        if m.keys.pressed(KeyField::Nav, &key) {
-            return leave_pane(m, chord);
-        }
+    if m.peek.is_none() && m.keys.pressed(KeyField::Nav, &key) {
+        return enter_selected(m);
     }
     nav_or_peek_command(m, &key).unwrap_or_default()
 }
@@ -2904,21 +2722,14 @@ fn nav_command(m: &mut Model, key: &KeyEvent) -> Option<Vec<Effect>> {
         .or_else(|| action_key(m, key, selected))
 }
 
-/// The nav key in NAV does nothing, except right after it left AGENT, when
-/// it selects the agent used before that one.
-fn leave_pane(m: &mut Model, chord: Chord) -> Vec<Effect> {
-    if !chord.is_live(m.clock.mono) {
+/// The nav key in NAV enters the selected agent: the request `⏎` makes, so
+/// every check and refusal is `⏎`'s. A repo row or no selection does nothing.
+fn enter_selected(m: &mut Model) -> Vec<Effect> {
+    let Some(name) = m.selected_entry().map(|entry| entry.name().clone()) else {
         return Vec::new();
-    }
-    let current = m.pane.session().cloned();
-    let previous = m
-        .mru()
-        .iter()
-        .find(|n| {
-            Some(*n) != current.as_ref() && m.snapshot().is_some_and(|s| s.entry(n).is_some())
-        })
-        .cloned();
-    previous.map_or_else(Vec::new, |name| select(m, &name))
+    };
+    let intent = enter_intent(m, &name);
+    activate(m, &name, intent)
 }
 
 fn scroll_key(m: &mut Model, key: &KeyEvent) -> Option<Vec<Effect>> {
@@ -2989,20 +2800,103 @@ fn overlay_key(m: &mut Model, key: &KeyEvent, selected: Option<&Entry>) -> Optio
         }
         KeyCode::Char('t') => m.info(SEND_MOVED),
         KeyCode::Char('v') => return Some(open_peek(m)),
-        KeyCode::Char('x') => match selected {
-            Some(entry) if matches!(m.reach(entry), Reach::Restarting) => {
-                m.info(format!("{} is restarting", entry.name()));
-            }
-            _ if m.actions.is_empty() => m.info(format!(
-                "no actions · add [[action]] to {}",
-                crate::CONFIG_HINT
-            )),
-            Some(entry) => m.overlay = Overlay::Actions(entry.name().clone()),
-            None => m.info("select an agent to run an action on"),
-        },
+        KeyCode::Char('x') => open_actions(m, selected),
         _ => return None,
     }
     Some(Vec::new())
+}
+
+/// Opens the actions menu for `target`, or says why it can't.
+fn open_actions(m: &mut Model, target: Option<&Entry>) {
+    match target {
+        Some(entry) if matches!(m.reach(entry), Reach::Restarting) => {
+            m.info(format!("{} is restarting", entry.name()));
+        }
+        _ if m.actions.is_empty() => m.info(format!(
+            "no actions · add [[action]] to {}",
+            crate::CONFIG_HINT
+        )),
+        Some(entry) => m.overlay = Overlay::Actions(entry.name().clone()),
+        None => m.info("select an agent to run an action on"),
+    }
+}
+
+/// What an always-on chord does, or `None` when `key` isn't one that is on.
+fn chord_pressed(m: &mut Model, key: &KeyEvent) -> Option<Vec<Effect>> {
+    let field = KeyField::CHORDS
+        .into_iter()
+        .find(|field| m.keys.pressed(*field, key))?;
+    Some(match field {
+        KeyField::FocusLeft => focus_left(m),
+        KeyField::FocusRight => focus_right(m),
+        KeyField::Actions => actions_chord(m),
+        KeyField::Nav => return None,
+    })
+}
+
+/// Keys back in NAV with the agent's row selected, in the panel they were
+/// entered from.
+fn back_to_nav(m: &mut Model, name: SessionName) {
+    m.pane.set_nav();
+    if m.selected_entry().is_none_or(|e| e.name() != &name) {
+        m.set_cursor(Cursor::Entry(name));
+        m.preview_at = None;
+    }
+}
+
+/// From an agent's terminal, back to NAV in the panel it was entered from.
+/// From a document in [0], back to the list panel it came from. Nothing
+/// from a list panel.
+fn focus_left(m: &mut Model) -> Vec<Effect> {
+    if let Some(name) = m
+        .pane
+        .connection()
+        .filter(|c| c.mode == Mode::Agent)
+        .map(|c| c.name.clone())
+    {
+        back_to_nav(m, name);
+        return Vec::new();
+    }
+    m.panel.leave_document();
+    Vec::new()
+}
+
+/// From a list panel to [0]. On an agent in [1] that is entering it, the
+/// same request `⏎` makes, so every check and refusal is `⏎`'s. On [2] and
+/// [3] it opens their document. Nothing in AGENT or in [0].
+fn focus_right(m: &mut Model) -> Vec<Effect> {
+    if m.pane
+        .connection()
+        .is_some_and(|connection| connection.mode == Mode::Agent)
+    {
+        return Vec::new();
+    }
+    match &m.panel {
+        Panel::Agents => enter_selected(m),
+        Panel::Agent { .. } | Panel::Changes { .. } if m.hover().is_some() => open_document(m),
+        Panel::Agent { .. } | Panel::Changes { .. } | Panel::Main(..) => Vec::new(),
+    }
+}
+
+/// The actions chord: the menu opens over the pane for the agent being
+/// typed into, or the selected one in NAV. It enters nothing and sends
+/// nothing, so closing the menu leaves the mode and the connection as they
+/// were.
+fn actions_chord(m: &mut Model) -> Vec<Effect> {
+    let typing_into = m
+        .pane
+        .connection()
+        .filter(|c| c.mode == Mode::Agent)
+        .map(|c| c.name.clone());
+    let target = match typing_into {
+        Some(name) => m
+            .snapshot()
+            .and_then(|s| s.entry(&name))
+            .map(|(_, e)| e.clone()),
+        None => m.selected_entry().cloned(),
+    };
+    open_actions(m, target.as_ref());
+    Vec::new()
 }
 
 /// Keys that act on the selected agent's session, or quit.
@@ -3015,12 +2909,7 @@ fn action_key(m: &mut Model, key: &KeyEvent, selected: Option<Entry>) -> Option<
             }
             m.overlay = Overlay::Confirm(Confirm::Quit(unsent));
         }
-        KeyCode::Char('i') => {
-            if let Some(entry) = selected {
-                let intent = enter_intent(m, entry.name());
-                return Some(activate(m, entry.name(), intent));
-            }
-        }
+        KeyCode::Char('i') => return Some(enter_selected(m)),
         KeyCode::Enter => match (m.cursor().cloned(), selected) {
             (Some(Cursor::Repo(key)), _) => {
                 m.view = View::Focus;
@@ -4062,7 +3951,6 @@ fn on_lower_panel(
 }
 
 fn on_mouse(m: &mut Model, mouse: MouseEvent) -> Vec<Effect> {
-    m.chord = Chord::Idle;
     let at = Position::new(mouse.column, mouse.row);
     let clicked = matches!(mouse.kind, MouseEventKind::Down(_));
     if let Focus::Overlay(_) = m.focus() {
@@ -4091,7 +3979,6 @@ fn on_mouse(m: &mut Model, mouse: MouseEvent) -> Vec<Effect> {
             Focus::Nav(_) | Focus::Overlay(_) => None,
         };
         return forward
-            .filter(|c| matches!(c.typing, Typing::Ready))
             .and_then(|c| {
                 let bytes = encode_mouse(mouse.kind, cell, c.term.modes())?;
                 Some(Effect::Pty {
@@ -10136,11 +10023,13 @@ mod tests {
             assert_eq!(m.listed(&name("auth-refresh-2")), None);
         }
     }
+    mod actions_chord;
     mod command_output;
     mod elsewhere;
     mod entering;
-    mod hop;
+    mod focus_chords;
     mod nav_key;
+    mod nav_toggle;
     mod paste;
     mod restart;
     mod send_edit;

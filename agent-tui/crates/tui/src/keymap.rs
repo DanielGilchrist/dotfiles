@@ -3,14 +3,15 @@
 //! `update` still do the dispatching.
 //! `nav_keys_do_something_exactly_where_the_keymap_table_says`, in the
 //! `view/sidebar.rs` tests, presses every key in every context and fails
-//! when a handler and this table disagree. The `{nav}`, `{prev_agent}` and
-//! `{next_agent}` placeholders in a key are the configured keys.
+//! when a handler and this table disagree. The `{nav}`, `{focus_left}`,
+//! `{focus_right}` and `{actions}` placeholders in a key are the configured
+//! keys.
 
 use crate::document::Hover;
 use crate::keyspec::Sendable;
 use crate::model::{LEAVE_PAUSED, MOVE_HERE, Model, Panel, Reach, View, Visibility};
 use crate::tree::{ChangesScope, ChangesView, Node};
-use agent_core::config::{Hop, KeyField};
+use agent_core::config::KeyField;
 use agent_core::model::Entry;
 use agent_core::ports::Compared;
 
@@ -84,6 +85,8 @@ const EVERYWHERE: Ctxs = Ctxs::of(&[
     Ctx::Peek,
 ]);
 const AGENTS: Ctxs = Ctxs::of(&[Ctx::Agents]);
+const MAIN: Ctxs = Ctxs::of(&[Ctx::Main]);
+const LEFT_PANELS: Ctxs = Ctxs::of(&[Ctx::Agents, Ctx::Activity, Ctx::Changes]);
 const LISTS: Ctxs = Ctxs::of(&[Ctx::Activity, Ctx::Changes]);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -570,7 +573,7 @@ impl Binding {
 }
 
 /// A word of a table key: text as it is, or the configured key of a field,
-/// written `{nav}`, `{prev_agent}` and so on after the field's name.
+/// written `{nav}`, `{focus_left}` and so on after the field's name.
 enum KeyText<'a> {
     Plain(&'a str),
     Field(KeyField),
@@ -578,7 +581,8 @@ enum KeyText<'a> {
 
 impl<'a> KeyText<'a> {
     fn of(word: &'a str) -> Self {
-        KeyField::all()
+        KeyField::ALL
+            .into_iter()
             .find(|field| word == format!("{{{field}}}"))
             .map_or(Self::Plain(word), Self::Field)
     }
@@ -589,7 +593,7 @@ impl<'a> KeyText<'a> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Spelling {
     nav: String,
-    hops: Vec<(Hop, Option<String>)>,
+    chords: Vec<(KeyField, Option<String>)>,
 }
 
 impl Default for Spelling {
@@ -602,9 +606,12 @@ impl Spelling {
     pub fn of(keys: &Sendable) -> Self {
         Self {
             nav: keys.nav().to_string(),
-            hops: Hop::ALL
+            chords: KeyField::CHORDS
                 .into_iter()
-                .map(|hop| (hop, keys.hop(hop).spec().map(|spec| spec.to_string())))
+                .map(|field| {
+                    let spelt = keys.binding(field).spec().map(|spec| spec.to_string());
+                    (field, spelt)
+                })
                 .collect(),
         }
     }
@@ -612,10 +619,10 @@ impl Spelling {
     fn spelt(&self, field: KeyField) -> Option<&str> {
         match field {
             KeyField::Nav => Some(&self.nav),
-            KeyField::Hop(hop) => self
-                .hops
+            KeyField::FocusLeft | KeyField::FocusRight | KeyField::Actions => self
+                .chords
                 .iter()
-                .find(|(of, _)| *of == hop)
+                .find(|(of, _)| *of == field)
                 .and_then(|(_, spelt)| spelt.as_deref()),
         }
     }
@@ -624,13 +631,9 @@ impl Spelling {
         &self.nav
     }
 
-    /// The chords that are on, as one hint.
-    pub fn chords(&self) -> Option<String> {
-        let on: Vec<&str> = Hop::ALL
-            .into_iter()
-            .filter_map(|hop| self.spelt(KeyField::Hop(hop)))
-            .collect();
-        (!on.is_empty()).then(|| on.join(" "))
+    /// The chord's key, or `None` when it is off.
+    pub fn chord(&self, field: KeyField) -> Option<&str> {
+        self.spelt(field)
     }
 
     /// `key` with its fields spelt. A field that is off is dropped, and a
@@ -665,8 +668,9 @@ pub const BINDINGS: &[Binding] = &[
             Selected::Agent(keys) => keys.enter,
             Selected::Nothing => None,
         }),
-        "On an agent: enter it, so your keys go to its terminal (starts or resurrects the session first if needed, and enters when it is up if you are still on its row). On an agent open in another window: move here, which attaches and then closes that window, from [1] on the banner row only. On a repo: show that repo's agents.",
-    ),
+        "On an agent: enter it (the nav key does the same, and leaves an agent's terminal again), so your keys go to its terminal (starts or resurrects the session first if needed, and enters when it is up if you are still on its row). On an agent open in another window: move here, which attaches and then closes that window, from [1] on the banner row only. On a repo: show that repo's agents.",
+    )
+    .with(&["{nav}"]),
     Binding::new(
         &["0"],
         AGENTS,
@@ -1043,11 +1047,11 @@ pub const BINDINGS: &[Binding] = &[
         "Restart every agent's harness, resuming each conversation. It lists the agents it would interrupt and asks first. An exited agent whose harness still runs has it stopped and stays exited.",
     ),
     Binding::new(
-        &["x"],
+        &["x", "{actions}"],
         PANELS,
         RankBy(|s| s.can(|a| a.actions).then_some(0)),
         By(|s| s.on_agent().then_some("actions")),
-        "Run one of the actions from config.toml on the agent.",
+        "Run one of the actions from config.toml on the agent. The actions chord from [keys], when set, opens the same menu from any panel and from an agent's terminal without sending the chord to the agent, and Esc returns to where you were.",
     ),
     Binding::new(
         &["a"],
@@ -1093,31 +1097,24 @@ pub const BINDINGS: &[Binding] = &[
     ),
     Binding::new(
         &["{nav}"],
-        PANELS,
+        Ctxs::of(&[Ctx::Activity, Ctx::Changes, Ctx::Main]),
         Hidden,
-        Say("nav (from an agent)"),
-        "While in an agent's terminal, leave it and go back to NAV on that agent. In NAV it does nothing.",
+        Say("enter"),
+        "In NAV on an agent, enter it: the request ⏎ makes, with the same checks and refusals. In an agent's terminal, leave it and go back to NAV on that agent. On a repo or with no agent selected it does nothing.",
     ),
     Binding::new(
-        &["{nav} {nav}"],
-        PANELS,
-        Hidden,
-        Say("previous agent"),
-        "Right after leaving an agent's terminal, select the agent you were in before and show it in [0]. It stays in NAV.",
+        &["{focus_left}"],
+        MAIN,
+        At(4),
+        Say("panels"),
+        "From [0] on a document, back to the panel you were last in. From an agent's terminal, leave it for that panel without sending the chord to the agent. In [1], [2] and [3] it does nothing. Off unless [keys] focus_left is set.",
     ),
     Binding::new(
-        &["{nav} a"],
-        PANELS,
-        Hidden,
-        Say("select next needing you"),
-        "Right after leaving an agent's terminal, select the agent that needs you most. It stays in NAV.",
-    ),
-    Binding::new(
-        &["{prev_agent} {next_agent}"],
-        PANELS,
-        RankBy(|s| (s.ctx == Ctx::Agents).then_some(3)),
-        Say("agents"),
-        "Previous and next agent in [1]'s order, wrapping at the ends. In NAV they select and show it in [0]. In an agent's terminal they are not sent to the agent: they switch to the neighbouring agent and keep the keys in its terminal. In a terminal where Option isn't Alt they send nothing until it is. A key set to none in [keys] is off.",
+        &["{focus_right}"],
+        LEFT_PANELS,
+        At(4),
+        Say("to [0]"),
+        "Focus [0]. When [0] shows the agent's terminal it enters the agent exactly as ⏎ does, including moving here from another window. In [0] and in an agent's terminal it does nothing. Off unless [keys] focus_right is set.",
     ),
 ];
 
@@ -1407,8 +1404,7 @@ mod tests {
             .chain(&listed.global)
             .map(|r| r.keys.as_str())
             .collect();
-        assert!(keys.contains(&"⌥x"), "{keys:?}");
-        assert!(keys.contains(&"⌥x ⌥x"), "{keys:?}");
+        assert!(keys.iter().any(|k| k.contains("⌥x")), "{keys:?}");
         assert!(
             keys.iter().all(|k| !k.contains("⌃]") && !k.contains("⌃\\")),
             "{keys:?}"
@@ -1420,57 +1416,85 @@ mod tests {
         Spelling::of(&Sendable::resolve(config.keys, Keyboard::Legacy))
     }
 
-    #[test]
-    fn the_agent_chords_are_a_footer_hint_where_agents_are_listed_and_nowhere_else() {
-        let in_ctx = |ctx, spelling: &Spelling| {
-            footer(&situation(ctx), spelling)
-                .into_iter()
-                .find(|h| h.keys.contains('⌥'))
-                .map(|h| (h.keys, h.label))
-        };
-        let default = Spelling::default();
-        assert_eq!(
-            in_ctx(Ctx::Agents, &default),
-            Some(("⌥; ⌥'".to_string(), "agents"))
-        );
-        for ctx in [Ctx::Activity, Ctx::Changes, Ctx::Main, Ctx::Peek] {
-            assert_eq!(in_ctx(ctx, &default), None, "{ctx:?}");
-        }
-        assert_eq!(
-            in_ctx(Ctx::Agents, &spelt("prev_agent = 'none'")),
-            Some(("⌥'".to_string(), "agents"))
-        );
-        assert_eq!(
-            in_ctx(
-                Ctx::Agents,
-                &spelt("prev_agent = 'none'\nnext_agent = 'off'")
-            ),
-            None
-        );
+    const ALL_CHORDS: &str = "focus_left = 'alt-h'\nfocus_right = 'alt-l'\nactions = 'alt-x'";
+
+    fn chord_hints(ctx: Ctx, spelling: &Spelling) -> Vec<(String, &'static str)> {
+        footer(&situation(ctx), spelling)
+            .into_iter()
+            .filter(|h| h.keys.contains('⌥'))
+            .map(|h| (h.keys, h.label))
+            .collect()
     }
 
     #[test]
-    fn the_help_lists_the_chords_in_every_panel_and_not_when_both_are_off() {
-        let has = |ctx, spelling: &Spelling| {
-            let listed = help(&situation(ctx), spelling, "");
+    fn no_chord_is_in_the_footer_or_the_help_while_the_config_leaves_them_off() {
+        let off = Spelling::default();
+        for ctx in [
+            Ctx::Agents,
+            Ctx::Activity,
+            Ctx::Changes,
+            Ctx::Main,
+            Ctx::Peek,
+        ] {
+            assert_eq!(chord_hints(ctx, &off), Vec::new(), "{ctx:?}");
+            let listed = help(&situation(ctx), &off, "");
+            assert!(
+                listed
+                    .local
+                    .iter()
+                    .chain(&listed.global)
+                    .all(|r| !r.keys.contains('⌥')),
+                "{ctx:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_focus_chords_are_a_footer_hint_only_where_they_do_something() {
+        let on = spelt(ALL_CHORDS);
+        let hint = |keys: &str, label: &'static str| (keys.to_string(), label);
+        for ctx in [Ctx::Agents, Ctx::Activity, Ctx::Changes] {
+            assert!(
+                chord_hints(ctx, &on).contains(&hint("⌥l", "to [0]")),
+                "{ctx:?}"
+            );
+            assert!(
+                !chord_hints(ctx, &on).contains(&hint("⌥h", "panels")),
+                "{ctx:?}"
+            );
+        }
+        assert!(chord_hints(Ctx::Main, &on).contains(&hint("⌥h", "panels")));
+        assert!(!chord_hints(Ctx::Main, &on).contains(&hint("⌥l", "to [0]")));
+        assert_eq!(chord_hints(Ctx::Peek, &on), Vec::new());
+        let only_left = spelt("focus_left = 'alt-h'");
+        assert_eq!(chord_hints(Ctx::Agents, &only_left), Vec::new());
+    }
+
+    #[test]
+    fn the_help_lists_each_chord_where_it_applies_and_never_in_the_peek() {
+        let on = spelt(ALL_CHORDS);
+        let has = |ctx, keys: &str| {
+            let listed = help(&situation(ctx), &on, "");
             listed
                 .local
                 .iter()
                 .chain(&listed.global)
-                .any(|r| r.keys == "⌥; ⌥'" && r.label == "agents")
+                .any(|r| r.keys.contains(keys))
         };
-        for ctx in [Ctx::Agents, Ctx::Activity, Ctx::Changes, Ctx::Main] {
-            assert!(has(ctx, &Spelling::default()), "{ctx:?}");
+        for ctx in [Ctx::Agents, Ctx::Activity, Ctx::Changes] {
+            assert!(has(ctx, "⌥l"), "{ctx:?}");
+            assert!(!has(ctx, "⌥h"), "{ctx:?}");
         }
-        assert!(!has(Ctx::Peek, &Spelling::default()));
-        let off = spelt("prev_agent = 'none'\nnext_agent = 'none'");
-        assert!(!has(Ctx::Agents, &off));
-        assert_eq!(off.chords(), None);
+        assert!(has(Ctx::Main, "⌥h"));
+        assert!(!has(Ctx::Main, "⌥l"));
+        for key in ["⌥h", "⌥l", "⌥x"] {
+            assert!(!has(Ctx::Peek, key), "{key}");
+        }
     }
 
     #[test]
     fn the_table_names_every_configurable_key_and_every_placeholder_is_a_key() {
-        for field in KeyField::all() {
+        for field in KeyField::ALL {
             let placeholder = format!("{{{field}}}");
             assert!(
                 BINDINGS
@@ -1480,7 +1504,7 @@ mod tests {
                 "{placeholder}"
             );
         }
-        let spelling = Spelling::default();
+        let spelling = spelt(ALL_CHORDS);
         for key in BINDINGS.iter().flat_map(Binding::all_keys) {
             let spelt = spelling.key(key).expect("every default key is on");
             let unresolved = spelt

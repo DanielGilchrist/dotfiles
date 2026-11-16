@@ -6,7 +6,6 @@
 use std::fmt;
 use std::str::FromStr;
 
-use crate::config::KeyField;
 use crate::visible;
 
 const ACCEPTED: &str = "ctrl-<letter>, ctrl-space, ctrl-\\ ctrl-] ctrl-^ ctrl-_, alt-<char>, f1 to f12, or with the kitty keyboard protocol ctrl-shift-<letter>, super-<char>, ctrl-h ctrl-i ctrl-j ctrl-m ctrl-[, alt-[ alt-O";
@@ -259,18 +258,12 @@ impl fmt::Display for Written {
 pub enum Binding {
     Off,
     On(KeySpec),
-    /// Left off because `by` has this field's default, which nobody asked
-    /// for. Two keys the user set to one key is an error instead.
-    Taken {
-        default: KeySpec,
-        by: KeyField,
-    },
 }
 
 impl Binding {
     pub fn spec(self) -> Option<KeySpec> {
         match self {
-            Self::Off | Self::Taken { .. } => None,
+            Self::Off => None,
             Self::On(spec) => Some(spec),
         }
     }
@@ -279,7 +272,7 @@ impl Binding {
 impl fmt::Display for Binding {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Off | Self::Taken { .. } => f.write_str("off"),
+            Self::Off => f.write_str("off"),
             Self::On(spec) => spec.fmt(f),
         }
     }

@@ -47,25 +47,18 @@ pub fn announce(m: &mut Model, hint: KeysHint) -> Vec<Effect> {
 }
 
 fn text(spelling: &Spelling) -> String {
-    let switch = spelling
-        .chords()
-        .map(|chords| format!(" · {chords} switch agent"))
-        .unwrap_or_default();
     format!(
-        "keys: {} leaves an agent{switch} · `agent keys` to change them",
+        "keys: {} leaves an agent · `agent keys` to change them",
         spelling.nav()
     )
 }
 
 #[cfg(test)]
 mod tests {
-    use agent_core::config::{Hop, Keys};
-    use agent_core::keyspec::Binding;
     use agent_core::testing::MemStore;
 
     use super::*;
     use crate::fixtures;
-    use crate::keyspec::{Keyboard, Sendable};
 
     fn status(m: &Model) -> Option<&str> {
         m.status.as_ref().map(|status| status.text.as_str())
@@ -95,10 +88,9 @@ mod tests {
     }
 
     #[test]
-    fn the_text_names_the_nav_key_the_chords_and_the_command() {
+    fn the_text_names_the_nav_key_and_the_command() {
         let shown = text(&Spelling::default());
         assert!(shown.contains("⌃]"), "{shown}");
-        assert!(shown.contains("⌥; ⌥'"), "{shown}");
         assert!(shown.contains("`agent keys`"), "{shown}");
     }
 
@@ -122,14 +114,5 @@ mod tests {
             KeysHint::at_startup(KeysTable::Present, &store),
             KeysHint::NotDue
         );
-    }
-
-    #[test]
-    fn chords_that_are_off_are_left_out_of_the_text() {
-        let keys = Keys::default()
-            .with_hop(Hop::Previous, Binding::Off)
-            .with_hop(Hop::Next, Binding::Off);
-        let sendable = Sendable::resolve(keys, Keyboard::Legacy);
-        assert!(!text(&Spelling::of(&sendable)).contains("switch agent"));
     }
 }

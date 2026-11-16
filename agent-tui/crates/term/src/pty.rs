@@ -48,7 +48,6 @@ pub struct Terminal<E> {
     input: Sender<Vec<u8>>,
     write_failed: Arc<AtomicBool>,
     output: Receiver<Vec<u8>>,
-    heard: bool,
     size: TermSize,
     liveness: Liveness,
 }
@@ -106,7 +105,6 @@ impl<E: Emulator> Terminal<E> {
             input,
             write_failed,
             output,
-            heard: false,
             size,
             liveness: Liveness::Running,
         })
@@ -119,7 +117,6 @@ impl<E: Emulator> Terminal<E> {
         while fed < PUMP_BUDGET {
             match self.output.try_recv() {
                 Ok(bytes) => {
-                    self.heard = true;
                     fed += bytes.len();
                     self.emulator.feed(&bytes);
                     if self.emulator.modes().screen == Screen::Alternate {
@@ -163,12 +160,6 @@ impl<E: Emulator> Terminal<E> {
             return Err(Closed);
         }
         self.input.send(bytes).map_err(|_| Closed)
-    }
-
-    /// Whether the program has printed anything yet, so the emulator's modes
-    /// are the ones it set and not the defaults.
-    pub fn heard(&self) -> bool {
-        self.heard
     }
 
     pub fn modes(&self) -> Modes {

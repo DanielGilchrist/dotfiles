@@ -479,6 +479,8 @@ fn the_attach_command_starts_an_exited_session_from_its_record() {
         .args(argv)
         .env("AGENT_RUNTIME_DIR", f.dir.path().join("r"))
         .env("XDG_STATE_HOME", f.dir.path().join("s"))
+        .env("HOME", f.dir.path().join("h"))
+        .env("XDG_CONFIG_HOME", f.dir.path().join("c"))
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());

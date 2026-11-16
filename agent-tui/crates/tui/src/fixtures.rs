@@ -95,13 +95,6 @@ pub fn connect(m: &mut Model, agent: &str, mode: Mode) {
     connect_with(m, agent, mode, cat());
 }
 
-/// A client for `agent` whose program first prints `escapes` (printf
-/// notation) and then echoes what it is sent, so its modes are set once the
-/// first output has been read.
-pub fn connect_printing(m: &mut Model, agent: &str, mode: Mode, escapes: &str) {
-    connect_with(m, agent, mode, printing(escapes));
-}
-
 fn connect_with(
     m: &mut Model,
     agent: &str,
@@ -112,7 +105,6 @@ fn connect_with(
         name: name(agent),
         term,
         mode,
-        typing: crate::model::Typing::Ready,
         opened: std::time::Instant::now(),
         id: agent_core::ports::ClientId::new(1),
     });
@@ -120,13 +112,6 @@ fn connect_with(
 
 pub fn cat() -> agent_term::Terminal<Box<dyn agent_term::Emulator>> {
     spawn(&agent_core::process::LaunchSpec::new("cat"))
-}
-
-fn printing(escapes: &str) -> agent_term::Terminal<Box<dyn agent_term::Emulator>> {
-    spawn(
-        &agent_core::process::LaunchSpec::new("sh")
-            .args(["-c", &format!("printf '{escapes}'; exec cat")]),
-    )
 }
 
 fn spawn(
@@ -139,20 +124,6 @@ fn spawn(
         Box::new(agent_term::Vt100::new(size)) as Box<dyn agent_term::Emulator>,
     )
     .expect("a pty")
-}
-
-/// Reads the pane's terminal until it has printed something.
-pub fn hear_the_terminal(m: &mut Model) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while let Pane::Connected(c) = &mut m.pane {
-        c.term.pump();
-        if c.term.heard() {
-            return;
-        }
-        assert!(std::time::Instant::now() < deadline, "no output arrived");
-        std::thread::yield_now();
-    }
-    panic!("the pane is not connected");
 }
 
 /// The peek float watching `agent`'s session, which the other window shows

@@ -1581,7 +1581,7 @@ pub enum StoreError {
 /// A one-time message to the user, shown once per state directory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Hint {
-    /// Where to choose the leave key and the agent chords.
+    /// Where to choose the leave key and the always-on chords.
     Keys,
 }
 

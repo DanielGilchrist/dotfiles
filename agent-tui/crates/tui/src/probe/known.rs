@@ -2,11 +2,12 @@
 //!
 //! The claims on readline, the terminal driver and zellij are from memory of
 //! those programs' defaults and have not been checked against their
-//! documentation. The claims on agents are checked against Claude Code's
+//! documentation. Zellij's Alt claims are `Rare`: it is being replaced, and the
+//! chords are the user's own choice. The claims on agents are checked against Claude Code's
 //! interactive mode documentation (<https://code.claude.com/docs/en/interactive-mode>),
 //! which lists Esc, Ctrl+C D G L O R B T S Z J V, Shift+Tab, Alt+P T O,
 //! Alt+B F D Y (Option as Meta on macOS) and Ctrl+X chords, and doesn't list
-//! `ctrl-]`, `alt-;` or `alt-'` as bound. A claim that is wrong costs
+//! or `ctrl-]` as bound. A claim that is wrong costs
 //! the user a warning they can ignore, so the table holds only what changes
 //! a choice and the output says where its claims come from.
 
@@ -112,19 +113,19 @@ const CLAIMS: &[Claim] = &[
     claim("ctrl-o", Zellij, Common, "session mode"),
     claim("ctrl-h", Zellij, Common, "move mode"),
     claim("ctrl-b", Zellij, Common, "tmux mode"),
-    claim("alt-h", Zellij, Common, "focus left"),
-    claim("alt-j", Zellij, Common, "focus down"),
-    claim("alt-k", Zellij, Common, "focus up"),
-    claim("alt-l", Zellij, Common, "focus right"),
-    claim("alt-n", Zellij, Common, "new pane"),
-    claim("alt-f", Zellij, Common, "toggle floating panes"),
-    claim("alt-i", Zellij, Common, "move tab left"),
-    claim("alt-o", Zellij, Common, "move tab right"),
-    claim("alt-[", Zellij, Common, "previous layout"),
-    claim("alt-]", Zellij, Common, "next layout"),
-    claim("alt-+", Zellij, Common, "resize up"),
-    claim("alt--", Zellij, Common, "resize down"),
-    claim("alt-=", Zellij, Common, "resize up"),
+    claim("alt-h", Zellij, Rare, "focus left"),
+    claim("alt-j", Zellij, Rare, "focus down"),
+    claim("alt-k", Zellij, Rare, "focus up"),
+    claim("alt-l", Zellij, Rare, "focus right"),
+    claim("alt-n", Zellij, Rare, "new pane"),
+    claim("alt-f", Zellij, Rare, "toggle floating panes"),
+    claim("alt-i", Zellij, Rare, "move tab left"),
+    claim("alt-o", Zellij, Rare, "move tab right"),
+    claim("alt-[", Zellij, Rare, "previous layout"),
+    claim("alt-]", Zellij, Rare, "next layout"),
+    claim("alt-+", Zellij, Rare, "resize up"),
+    claim("alt--", Zellij, Rare, "resize down"),
+    claim("alt-=", Zellij, Rare, "resize up"),
     claim("ctrl-b", Agents, Common, "run in the background"),
     claim("ctrl-g", Agents, Common, "edit the prompt in $EDITOR"),
     claim("ctrl-o", Agents, Common, "toggle the transcript"),
@@ -195,14 +196,13 @@ mod tests {
     #[test]
     fn a_key_nobody_is_known_to_use_has_no_collision() {
         assert_eq!(claims_on(spec("f12")), None);
-        assert_eq!(claims_on(spec("alt-;")), None);
-        assert_eq!(claims_on(spec("alt-'")), None);
     }
 
     #[test]
     fn a_key_only_rarely_used_is_not_common_and_one_with_a_common_use_is() {
         assert!(!claims_on(spec("ctrl-]")).expect("claimed").is_common());
         assert!(claims_on(spec("alt-b")).expect("claimed").is_common());
+        assert!(!claims_on(spec("alt-h")).expect("claimed").is_common());
         assert!(claims_on(spec("ctrl-g")).expect("claimed").is_common());
     }
 }

@@ -232,13 +232,10 @@ fn the_a_key_never_moves_an_agent_held_elsewhere() {
 }
 
 #[test]
-fn the_nav_key_twice_toward_an_agent_open_elsewhere_lands_in_nav_and_leaves_it_to_its_other_window()
-{
+fn the_nav_key_toward_an_agent_open_elsewhere_lands_in_nav_and_leaves_it_to_its_other_window() {
     let mut m = crate::fixtures::fleet(10);
     crate::fixtures::connect(&mut m, "auth-refresh-2", Mode::Nav);
-    m.touch_mru(&name(SHARED));
-    m.touch_mru(&name("auth-refresh-2"));
-    m.chord = Chord::armed(m.clock.mono);
+    m.set_cursor(Cursor::Entry(name(SHARED)));
     let effects = update(&mut m, nav());
     assert_eq!(checked_sessions(&m, &effects), [SHARED]);
     let effects = crate::fixtures::sighted(&mut m, &[(SHARED, crate::fixtures::in_nvim())]);

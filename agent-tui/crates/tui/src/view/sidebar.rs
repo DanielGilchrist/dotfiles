@@ -3635,7 +3635,6 @@ mod tests {
         let rows = screen(&render(&mut m, (120, 30)));
         let bar = rows.last().expect("a status bar");
         assert!(bar.contains("⌃G nav"), "{bar}");
-        assert!(bar.contains("⌃G ⌃G previous"), "{bar}");
         assert!(!bar.contains("⌃]"), "{bar}");
     }
 
@@ -3668,35 +3667,44 @@ mod tests {
         let bar = |keys: &str| {
             let mut m = crate::fixtures::fleet(10);
             crate::fixtures::connect(&mut m, "auth-refresh-2", crate::model::Mode::Agent);
-            let config: agent_core::config::Config =
-                format!("[keys]\n{keys}").parse().expect("parses");
-            m.keys =
-                crate::keyspec::Sendable::resolve(config.keys, crate::keyspec::Keyboard::Legacy);
+            m.keys = crate::fixtures::sendable(keys, crate::keyspec::Keyboard::Legacy);
             screen(&render(&mut m, (120, 30)))
                 .last()
                 .expect("a status bar")
                 .clone()
         };
-        assert!(bar("").contains("⌥; ⌥' agents"), "{}", bar(""));
-        assert!(bar("prev_agent = 'none'").contains("⌥' agents"));
-        assert!(!bar("prev_agent = 'none'").contains("⌥;"));
-        assert!(!bar("prev_agent = 'none'\nnext_agent = 'none'").contains("agents"));
+        let on = bar("focus_left = 'alt-h'\nfocus_right = 'alt-l'\nactions = 'alt-x'");
+        assert!(on.contains("⌥h panels"), "{on}");
+        assert!(on.contains("⌥x actions"), "{on}");
+        assert!(
+            !on.contains("⌥l"),
+            "focus_right does nothing in AGENT: {on}"
+        );
+        let off = bar("");
+        assert!(!off.contains('⌥'), "{off}");
+        assert!(!bar("actions = 'alt-x'").contains("⌥h"));
     }
 
     #[test]
-    fn the_nav_footer_names_the_chords_beside_the_agent_list() {
-        let mut m = crate::fixtures::fleet(10);
-        let rows = screen(&render(&mut m, (160, 30)));
-        let bar = rows.last().expect("a status bar");
-        assert!(bar.contains("⌥; ⌥' agents"), "{bar}");
+    fn the_nav_footer_names_a_chord_only_when_it_is_on() {
+        let bar = |keys: &str| {
+            let mut m = crate::fixtures::fleet(10);
+            m.keys = crate::fixtures::sendable(keys, crate::keyspec::Keyboard::Legacy);
+            screen(&render(&mut m, (160, 30)))
+                .last()
+                .expect("a status bar")
+                .clone()
+        };
+        let on = bar("focus_right = 'alt-l'");
+        assert!(on.contains("⌥l to [0]"), "{on}");
+        assert!(!bar("").contains('⌥'));
     }
 
     #[test]
-    fn the_help_lists_a_chord_that_fell_back_and_the_chords_row() {
+    fn the_help_lists_a_chord_that_fell_back_to_off() {
         let mut m = crate::fixtures::fleet(10);
-        let config: agent_core::config::Config =
-            "[keys]\nnext_agent = 'super-j'".parse().expect("parses");
-        m.keys = crate::keyspec::Sendable::resolve(config.keys, crate::keyspec::Keyboard::Legacy);
+        m.keys =
+            crate::fixtures::sendable("focus_right = 'super-j'", crate::keyspec::Keyboard::Legacy);
         let (lines, _) = super::super::help_lines(
             &crate::keymap::help(
                 &crate::keymap::Situation::of(&m),
@@ -3710,10 +3718,9 @@ mod tests {
         );
         let text = texts(&lines).join("\n");
         assert!(
-            text.contains("keys.next_agent ⌘j is not available in this terminal, using ⌥'"),
+            text.contains("keys.focus_right ⌘j is not available in this terminal, leaving it off"),
             "{text}"
         );
-        assert!(text.contains("⌥; ⌥'"), "{text}");
     }
 
     #[test]
@@ -5108,7 +5115,7 @@ mod tests {
                 }
             }
             for key in &table {
-                // The nav and agent chords are taken by on_key before nav_or_peek_command sees them.
+                // The nav key and the chords are taken by on_key before nav_or_peek_command sees them.
                 let does = handled.contains(*key) || key.contains('{');
                 if !does {
                     wrong.push(format!(

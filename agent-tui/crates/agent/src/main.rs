@@ -60,7 +60,7 @@ enum Cmd {
         #[arg(long)]
         headless: bool,
     },
-    /// Press a key to see whether it works as the leave key or an agent chord in this
+    /// Press a key to see whether it works as the leave key or an always-on chord in this
     /// terminal, and what to put in the config for it
     Keys {
         /// Say what a config key means and what collides with it, without a terminal
@@ -968,6 +968,9 @@ fn main() -> Result<()> {
         hook_event(args.next().as_ref());
     }
     let cli = Cli::parse();
+    if let Some(Cmd::Session { command }) = cli.command {
+        return session::run(command);
+    }
     let home = paths::home().ok();
     let editor = Editor::from_env();
     let argv: Vec<String> = std::env::args().skip(1).collect();
@@ -1056,7 +1059,7 @@ fn main() -> Result<()> {
         Cmd::Pin { name } => Ok(ops::pin(svc, &infer_name(svc, name)?)?),
         Cmd::Unpin { name } => Ok(svc.store.unpin(&infer_name(svc, name)?)?),
         Cmd::Exec { name } => exec(svc, &name),
-        Cmd::Session { command } => session::run(command),
+        Cmd::Session { .. } => unreachable!("dispatched before the backend is built"),
         Cmd::Sweep { worktrees } => sweep(svc, &worktrees),
     }
 }

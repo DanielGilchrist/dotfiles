@@ -5,6 +5,7 @@ use std::path::Path;
 use std::time::{Duration, SystemTime};
 
 use agent_core::actions::Kind;
+use agent_core::config::KeyField;
 use agent_core::model::{Entry, EntryKind, Head};
 use agent_core::names::{Checkout, NameLimit, SessionName};
 use agent_core::ops::Deletes;
@@ -726,9 +727,7 @@ fn draw_status_bar(frame: &mut Frame<'_>, m: &Model, area: Rect) {
     let focus = m.focus();
     let spelling = Spelling::of(&m.keys);
     let nav = spelling.nav();
-    let twice = format!("{nav} {nav}");
     let hatch = m.keys.escape_hatch().map(|hatch| hatch.to_string());
-    let chords = spelling.chords();
     let table = if matches!(focus, Focus::Agent(_) | Focus::Overlay(Overlay::New(_))) {
         Vec::new()
     } else {
@@ -736,9 +735,12 @@ fn draw_status_bar(frame: &mut Frame<'_>, m: &Model, area: Rect) {
     };
     let mut hints: Vec<Hint<'_>> = Vec::new();
     if let Focus::Agent(_) = focus {
-        hints.extend([ranked(nav, "nav", 9), ranked(&twice, "previous", 8)]);
-        if let Some(chords) = chords.as_deref() {
-            hints.push(ranked(chords, "agents", 6));
+        hints.push(ranked(nav, "nav", 9));
+        if let Some(left) = spelling.chord(KeyField::FocusLeft) {
+            hints.push(ranked(left, "panels", 6));
+        }
+        if let Some(actions) = spelling.chord(KeyField::Actions) {
+            hints.push(ranked(actions, "actions", 5));
         }
         if let Some(hatch) = hatch.as_deref() {
             hints.push(ranked(hatch, "also leaves", 7));

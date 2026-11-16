@@ -4,8 +4,13 @@
 # in the TUI's terminal (`interactive`), or asks the terminal to handle an
 # event (`terminal_event`, an OSC 1337 user var). `cwd` sets where commands run.
 #
-# [keys]
-# nav = "ctrl-\\"  # leaves the agent for NAV (default)
+# Keys: `nav` leaves the agent for NAV (default ctrl-]). The chords work
+# while you type in an agent: alt-h leaves it, alt-l enters it, alt-x opens
+# the actions menu.
+[keys]
+focus_left = "alt-h"
+focus_right = "alt-l"
+actions = "alt-x"
 
 [[action]]
 key = "d"

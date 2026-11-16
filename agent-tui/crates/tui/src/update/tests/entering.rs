@@ -1,6 +1,6 @@
 use super::*;
 use crate::fixtures::{attach_landings, connect, fleet, sighted};
-use crate::model::{CHORD_WINDOW, Landing, Mode, Seat};
+use crate::model::{Landing, Mode, Seat};
 use agent_core::ops::{Delivery, Launch};
 use agent_core::process::LaunchSpec;
 
@@ -9,11 +9,7 @@ const OTHER: &str = "obs-layout-4";
 const ENTER_FROM_LIST: Landing = Landing::Enter { from: Seat::Agents };
 
 fn arrives(m: &Model, ticket: Ticket) -> Landing {
-    m.arrival(ticket).into_parts().0
-}
-
-fn nav() -> Msg {
-    Msg::Key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::CONTROL))
+    m.arrival(ticket).into_landing()
 }
 
 fn click() -> Msg {
@@ -160,70 +156,6 @@ fn escape_in_the_agent_list_does_nothing() {
     assert!(effects.is_empty());
     assert!(!in_agent(&m));
     assert_eq!(m.panel, Panel::Agents);
-}
-
-fn leave_agent(m: &mut Model) {
-    m.touch_mru(&name(OTHER));
-    m.touch_mru(&name(SHOWN));
-    update(m, key(KeyCode::Enter));
-    assert!(in_agent(m));
-    update(m, nav());
-    assert!(!in_agent(m));
-}
-
-#[test]
-fn the_nav_key_in_nav_with_no_nav_key_before_it_does_nothing() {
-    let mut m = shown_in_nav(SHOWN);
-    m.touch_mru(&name(OTHER));
-    m.touch_mru(&name(SHOWN));
-    let effects = update(&mut m, nav());
-    assert!(effects.is_empty());
-    assert_eq!(m.cursor().and_then(Cursor::entry_name), Some(&name(SHOWN)));
-}
-
-#[test]
-fn the_nav_key_after_another_key_following_the_one_that_left_does_nothing() {
-    let mut m = shown_in_nav(SHOWN);
-    leave_agent(&mut m);
-    update(&mut m, key(KeyCode::Char('j')));
-    let after_j = m.cursor().cloned();
-    let effects = update(&mut m, nav());
-    assert!(effects.is_empty());
-    assert_eq!(m.cursor().cloned(), after_j);
-}
-
-#[test]
-fn the_nav_key_twice_selects_and_previews_the_previous_agent_and_a_third_does_nothing() {
-    let mut m = shown_in_nav(SHOWN);
-    leave_agent(&mut m);
-    let soon = later(&m, CHORD_WINDOW / 2);
-    tick_at(&mut m, soon);
-    let asked = update(&mut m, nav());
-    assert_eq!(m.cursor().and_then(Cursor::entry_name), Some(&name(OTHER)));
-    previews_once_checked(&mut m, &asked, OTHER);
-    assert!(!in_agent(&m));
-    assert!(update(&mut m, nav()).is_empty());
-}
-
-#[test]
-fn a_click_between_the_two_nav_key_presses_cancels_the_chord() {
-    let mut m = shown_in_nav(SHOWN);
-    leave_agent(&mut m);
-    update(&mut m, click());
-    let effects = update(&mut m, nav());
-    assert!(effects.is_empty());
-    assert_eq!(m.cursor().and_then(Cursor::entry_name), Some(&name(SHOWN)));
-}
-
-#[test]
-fn a_second_nav_key_press_after_the_window_has_passed_does_nothing() {
-    let mut m = shown_in_nav(SHOWN);
-    leave_agent(&mut m);
-    let late = later(&m, CHORD_WINDOW + Duration::from_millis(1));
-    tick_at(&mut m, late);
-    let effects = update(&mut m, nav());
-    assert!(effects.is_empty());
-    assert_eq!(m.cursor().and_then(Cursor::entry_name), Some(&name(SHOWN)));
 }
 
 #[test]
@@ -443,47 +375,6 @@ fn enter_then_moving_the_keys_to_the_activity_before_the_check_is_back_only_prev
     m.panel = Panel::activity();
     previews_once_checked(&mut m, &asked, OTHER);
     assert!(!in_agent(&m));
-}
-
-fn attached_with_nav(nav: &str) -> Model {
-    let mut m = shown_in_nav(SHOWN);
-    let config: agent_core::config::Config =
-        format!("[keys]\nnav = '{nav}'").parse().expect("parses");
-    m.keys =
-        crate::keyspec::Sendable::resolve(config.keys, crate::keyspec::Keyboard::Disambiguated);
-    m.touch_mru(&name(OTHER));
-    m.touch_mru(&name(SHOWN));
-    update(&mut m, key(KeyCode::Enter));
-    m
-}
-
-#[test]
-fn leaving_through_the_escape_hatch_does_not_arm_the_nav_key_chord() {
-    let mut m = attached_with_nav("alt-x");
-    update(&mut m, key_with(KeyCode::Char(']'), KeyModifiers::CONTROL));
-    assert!(!in_agent(&m));
-    assert_eq!(m.chord, crate::model::Chord::Idle);
-}
-
-#[test]
-fn leaving_with_the_configured_nav_key_arms_the_chord() {
-    let mut m = attached_with_nav("alt-x");
-    update(&mut m, key_with(KeyCode::Char('x'), KeyModifiers::ALT));
-    assert!(!in_agent(&m));
-    assert!(m.chord.is_live(m.clock.mono));
-}
-
-#[test]
-fn the_nav_key_twice_skips_a_previous_agent_that_no_longer_exists() {
-    let mut m = shown_in_nav(SHOWN);
-    m.touch_mru(&name(OTHER));
-    m.touch_mru(&name("deleted-agent"));
-    m.touch_mru(&name(SHOWN));
-    update(&mut m, key(KeyCode::Enter));
-    update(&mut m, nav());
-    let asked = update(&mut m, nav());
-    assert_eq!(m.cursor().and_then(Cursor::entry_name), Some(&name(OTHER)));
-    previews_once_checked(&mut m, &asked, OTHER);
 }
 
 #[test]
