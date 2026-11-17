@@ -34,4 +34,15 @@ function M.each_client(filter, callback)
   end
 end
 
+---The clients attached to a buffer, keyed by name
+---@param bufnr integer
+---@return table<string, vim.lsp.Client>
+function M.clients_by_name(bufnr)
+  local by_name = {}
+  M.each_client({ bufnr = bufnr }, function(client)
+    by_name[client.name] = client
+  end)
+  return by_name
+end
+
 return M

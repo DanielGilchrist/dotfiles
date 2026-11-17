@@ -34,15 +34,6 @@ local function add_ruby_deps_command(client, bufnr)
   })
 end
 
-local function disable_features_present_in_sorbet(client, bufnr)
-  lsp_utils.each_client({ bufnr = bufnr }, function(c)
-    if c.name == "sorbet" then
-      client.server_capabilities.documentSymbolProvider = false
-      return true
-    end
-  end)
-end
-
 local function open_file(command, _ctx)
   local args = command.arguments[1]
   if args and args[1] then
@@ -70,6 +61,5 @@ return {
   on_attach = function(client, bufnr)
     client.commands["rubyLsp.openFile"] = open_file
     add_ruby_deps_command(client, bufnr)
-    disable_features_present_in_sorbet(client, bufnr)
   end,
 }
