@@ -2569,7 +2569,9 @@ fn focus_key(m: &mut Model, code: KeyCode) -> Option<Vec<Effect>> {
             m.info("no activity recorded · r restarts it through agent");
         }
         (KeyCode::Char('2'), _) => m.panel = Panel::activity(),
-        (KeyCode::Char('3'), _) if m.change_rows() == 0 => m.info("no files to move to"),
+        (KeyCode::Char('3'), _) if m.selected_entry().is_none() => {
+            m.info("select an agent to see its changes");
+        }
         (KeyCode::Char('3'), _) if m.require_room().is_err() => {
             m.info(Missing::Room.to_string());
         }
@@ -5039,7 +5041,14 @@ mod tests {
         assert_eq!(m.panel, Panel::Agents);
         with_changes(&mut m, 0);
         update(&mut m, key(KeyCode::Char('3')));
-        assert_eq!(m.panel, Panel::Agents, "nothing to show in [3]");
+        assert_eq!(
+            m.panel,
+            Panel::Changes { file: 0 },
+            "[3] takes focus even with nothing to list"
+        );
+        update(&mut m, key(KeyCode::Char('j')));
+        update(&mut m, key(KeyCode::Char('k')));
+        assert_eq!(m.panel, Panel::Changes { file: 0 });
     }
 
     #[test]
