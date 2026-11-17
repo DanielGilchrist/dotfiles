@@ -44,7 +44,7 @@ Install or update it with `~/.config/agent-tui/install.sh`, which builds it into
 | `Esc` | Back one level: [0] to its panel, [2] or [3] to [1]. In [1] it does nothing |
 | `j k g G`, `↓ ↑ Home End` | Move in the focused panel, or scroll [0] when it has the keys |
 | `J` `K` | Scroll [0] from [2] or [3] without focusing it |
-| `⌃D ⌃U`, `PgDn PgUp` | Half a page / a page in the focused panel |
+| `⌃D ⌃U`, `PgDn PgUp` | Half a page / a page in the focused panel. In [1] with an agent shown in [0], `⌃D ⌃U` scroll that agent without entering it: they send it half a screen of mouse wheel notches, so it only works for an agent that reports the mouse (Claude Code does in fullscreen), and otherwise they page the list |
 | `[` `]` | Previous / next tab of the focused panel: [1] (agents, repo, pinned, opens on agents) or [3] (`Uncommitted`, then `Branch` or `Unpushed`, opens on uncommitted) |
 | `{` `}` | Previous / next repo |
 | `+` `_` | [0] full width / back |

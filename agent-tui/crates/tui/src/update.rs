@@ -56,6 +56,8 @@ const REINSPECT_AFTER: Duration = Duration::from_secs(3);
 const SLOW_REFRESH: Duration = Duration::from_secs(30);
 /// Rows `J` and `K` scroll the main view by.
 const SCROLL: isize = 2;
+/// Lines an agent's own scrolling moves per wheel notch.
+const WHEEL_LINES: usize = 3;
 
 /// What `$EDITOR` opens.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2732,7 +2734,46 @@ fn enter_selected(m: &mut Model) -> Vec<Effect> {
     activate(m, &name, intent)
 }
 
+/// Wheel notches that scroll the previewed agent by half its screen, sent
+/// as the mouse would: only a program that asked for mouse reports hears
+/// them.
+fn scroll_preview(m: &Model, direction: Direction) -> Vec<Effect> {
+    let Focus::Nav(Some(connection)) = m.focus() else {
+        return Vec::new();
+    };
+    let area = m.areas.terminal;
+    let Some(at) = CellPos::within(
+        area,
+        Position::new(area.x + area.width / 2, area.y + area.height / 2),
+    ) else {
+        return Vec::new();
+    };
+    let kind = match direction {
+        Direction::Forward => MouseEventKind::ScrollDown,
+        Direction::Back => MouseEventKind::ScrollUp,
+    };
+    let Some(notch) = encode_mouse(kind, at, connection.term.modes()) else {
+        return Vec::new();
+    };
+    let notches = (usize::from(area.height) / 2 / WHEEL_LINES).max(1);
+    vec![Effect::Pty {
+        to: connection.name.clone(),
+        bytes: notch.repeat(notches),
+    }]
+}
+
 fn scroll_key(m: &mut Model, key: &KeyEvent) -> Option<Vec<Effect>> {
+    if m.panel == Panel::Agents && !m.shows_document() {
+        let direction = match key.code {
+            KeyCode::Char('d') if ctrl(key, 'd') => Some(Direction::Forward),
+            KeyCode::Char('u') if ctrl(key, 'u') => Some(Direction::Back),
+            _ => None,
+        };
+        let effects = direction.map(|direction| scroll_preview(m, direction));
+        if let Some(effects) = effects.filter(|effects| !effects.is_empty()) {
+            return Some(effects);
+        }
+    }
     match key.code {
         KeyCode::Char('d') if ctrl(key, 'd') => half_page(m, Direction::Forward),
         KeyCode::Char('u') if ctrl(key, 'u') => half_page(m, Direction::Back),
@@ -10031,6 +10072,7 @@ mod tests {
     mod nav_key;
     mod nav_toggle;
     mod paste;
+    mod preview_scroll;
     mod restart;
     mod send_edit;
 }

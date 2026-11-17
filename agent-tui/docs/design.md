@@ -229,7 +229,7 @@ NAV. The table in `crates/tui/src/keymap.rs` is the source of truth for the foot
 | `Esc` | back one level: a focused document in [0] to its panel, [2] or [3] to [1]. In [1] it does nothing |
 | `j`/`k`, `↓`/`↑`, `g`/`G`, `Home`/`End` | move the selection in [1], the cursor over [2]'s rows or [3]'s rows. With [0] focused, scroll it and jump to its top and bottom (`G` reads `follow` while a transcript is paused). With [0] on a subagent's log, `j`/`k` move the entry cursor |
 | `J`/`K` | from [2] or [3], scroll [0] two rows without focusing it |
-| `⌃D`/`⌃U` | half a page of the list, or of [0] from [2] or [3] |
+| `⌃D`/`⌃U` | half a page of the list, or of [0] from [2] or [3]. In [1] with an agent's terminal shown in [0] they send it wheel notches (half its height at 3 lines a notch) when it asked for mouse reports, else they page the list |
 | `PgDn`/`PgUp` | a page of the focused panel as last drawn |
 | `[` / `]` | previous / next tab of [1] (agents, repo, pinned). With [0] on the activity, the entry cursor jumps to the first entry of the previous / next phase (folded or open), stays put at the first and last, and going back from inside a phase goes to its start. In a subagent's log, which has no folded phases, the footer reads `message` and the same keys go to the previous / next message (or the first call of the log, or the first call after a queued message or a compaction). In [3] and on a diff they keep their own meaning (tabs, hunks). Elsewhere the status bar says the panel has no tabs. The footer's `]` hint names the next tab |
 | `{` / `}` | previous / next repo |

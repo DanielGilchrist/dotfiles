@@ -973,7 +973,7 @@ pub const BINDINGS: &[Binding] = &[
         PANELS,
         Hidden,
         Say("half page"),
-        "Half a page of the list, or of [0] from [2] and [3].",
+        "Half a page of the list, or of [0] from [2] and [3]. In [1] with an agent shown in [0], scroll it (wheel notches, if it reports the mouse).",
     ),
     Binding::new(
         &["PgDn", "PgUp"],

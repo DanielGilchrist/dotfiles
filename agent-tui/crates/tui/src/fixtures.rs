@@ -110,6 +110,27 @@ fn connect_with(
     });
 }
 
+/// A terminal whose program has asked for SGR mouse reports.
+pub fn mouse_cat() -> agent_term::Terminal<Box<dyn agent_term::Emulator>> {
+    let mut term = spawn(
+        &agent_core::process::LaunchSpec::new("sh")
+            .arg("-c")
+            .arg("printf '\\033[?1000h\\033[?1006h'; exec sleep 30"),
+    );
+    for _ in 0..200 {
+        term.pump();
+        if term.modes().mouse == agent_term::MouseReporting::Sgr {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    term
+}
+
+pub fn connect_mouse(m: &mut Model, agent: &str, mode: Mode) {
+    connect_with(m, agent, mode, mouse_cat());
+}
+
 pub fn cat() -> agent_term::Terminal<Box<dyn agent_term::Emulator>> {
     spawn(&agent_core::process::LaunchSpec::new("cat"))
 }
