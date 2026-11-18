@@ -465,6 +465,20 @@ pub(crate) fn plan_attach(facts: &AttachFacts<'_>) -> Result<AttachPlan> {
     Ok(AttachPlan(plan))
 }
 
+/// How to reach a session that is no agent worktree, such as a repo's own
+/// session. Nothing is created: it is attached or it isn't there.
+pub fn plan_session(svc: Services<'_>, name: &SessionName) -> Result<AttachPlan> {
+    let session = find_session(svc, name)?.ok_or_else(|| Error::NotFound(name.clone()))?;
+    let cwd = match &session.status {
+        SessionStatus::Live { cwd } | SessionStatus::Exited { cwd } => cwd.clone(),
+    };
+    Ok(AttachPlan(Plan::Attach {
+        session: session.name.clone(),
+        presence: session.status.presence(),
+        cwd,
+    }))
+}
+
 /// What happened to the task passed to [`execute`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Delivery {

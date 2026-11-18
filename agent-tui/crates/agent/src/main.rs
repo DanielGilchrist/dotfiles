@@ -87,7 +87,7 @@ enum Cmd {
     /// Create or attach the agent <name>: its worktree, branch and session
     #[command(group = ArgGroup::new("initial_prompt").args(["prompt", "seed", "no_prompt"]))]
     Attach {
-        name: AgentName,
+        name: Attachable,
         /// First prompt for a new agent, or typed into a running one
         #[arg(short = 'e', long)]
         prompt: Option<Prompt>,
@@ -559,20 +559,45 @@ fn headless(launch: &Launch) -> Result<()> {
     Ok(())
 }
 
+/// What `agent attach` is given: an agent, or a session that isn't one (a
+/// repo's own, such as `.config`), which can only be reached, never created.
+#[derive(Debug, Clone)]
+enum Attachable {
+    Agent(AgentName),
+    Session(SessionName),
+}
+
+impl std::str::FromStr for Attachable {
+    type Err = agent_core::names::NameError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.parse::<AgentName>() {
+            Ok(name) => Ok(Self::Agent(name)),
+            Err(agent_error) => s
+                .parse::<SessionName>()
+                .map(Self::Session)
+                .map_err(|_| agent_error),
+        }
+    }
+}
+
 fn attach(
     svc: Services<'_>,
-    name: &AgentName,
+    name: &Attachable,
     seed: Seed,
     repo: Option<&RepoRoot>,
     frontend: Frontend,
     harness: &dyn Harness,
 ) -> Result<()> {
-    let plan = ops::plan(svc, name, repo)?;
+    let plan = match name {
+        Attachable::Agent(agent) => ops::plan(svc, agent, repo)?,
+        Attachable::Session(session) => ops::plan_session(svc, session)?,
+    };
     let task = match (seed, frontend, plan.new_worktree()) {
         (Seed::Text(prompt), ..) => Some(prompt),
         (Seed::File(file), ..) => Some(read_prompt(&file)?),
-        (Seed::Editor(editor), Frontend::Foreground, Some(_)) => {
-            let Some(prompt) = edit_prompt(name, &editor?)? else {
+        (Seed::Editor(editor), Frontend::Foreground, Some(worktree)) => {
+            let Some(prompt) = edit_prompt(worktree.name(), &editor?)? else {
                 println!("agent: cancelled (empty prompt)");
                 return Ok(());
             };
@@ -949,7 +974,14 @@ fn checkout_command(
 ) -> Result<()> {
     let repo = repo_arg(svc, repo)?.ok_or(ops::Error::NoRepo)?;
     let name = ops::checkout(svc, &repo, branch, name)?;
-    attach(svc, &name, Seed::None, Some(&repo), frontend, harness)
+    attach(
+        svc,
+        &Attachable::Agent(name),
+        Seed::None,
+        Some(&repo),
+        frontend,
+        harness,
+    )
 }
 
 /// The TUI embeds sessions in its own pane, everything else attaches the
@@ -1156,5 +1188,13 @@ mod tests {
         assert!(parse(&["--seed", "f"]).is_ok());
         assert!(parse(&["--prompt", "hi"]).is_ok());
         assert!(parse(&["--prompt", "hi", "--seed", "f"]).is_err());
+    }
+
+    #[test]
+    fn attach_takes_a_repo_session_name_that_no_agent_could_have() {
+        assert!(matches!(".config".parse(), Ok(Attachable::Session(_))));
+        assert!(matches!("fix-login".parse(), Ok(Attachable::Agent(_))));
+        assert!("-x".parse::<Attachable>().is_err());
+        assert!("a b".parse::<Attachable>().is_err());
     }
 }
