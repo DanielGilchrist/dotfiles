@@ -763,6 +763,7 @@ fn draw_status_bar(frame: &mut Frame<'_>, m: &Model, area: Rect) {
         hints.extend(table.iter().map(|h| ranked(&h.keys, h.label, h.rank)));
     }
 
+    hints.sort_by_key(|hint| hint.spans[0].content == "?");
     let counts = status_counts(m, &focus, nav);
     // The counts sit between a space, the right edge's space and the
     // column `justify` keeps between the sides.

@@ -3697,6 +3697,10 @@ mod tests {
         };
         let on = bar("focus_right = 'alt-l'");
         assert!(on.contains("⌥l to [0]"), "{on}");
+        assert!(
+            on.contains("⌥l to [0]  ? keys"),
+            "help comes last, after the chord: {on}"
+        );
         assert!(!bar("").contains('⌥'));
     }
 
