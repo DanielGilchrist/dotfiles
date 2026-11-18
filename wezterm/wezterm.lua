@@ -13,6 +13,7 @@ local misc = {
   front_end = "WebGpu",
   webgpu_power_preference = "HighPerformance",
   max_fps = 144,
+  enable_wayland = os_utils.system() ~= "linux",
 
   color_scheme = "Catppuccin Mocha",
   colors = {
