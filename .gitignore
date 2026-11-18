@@ -38,9 +38,14 @@ opencode/AGENTS_LOCAL.md
 conversations/
 prompts/
 
-# KDE/Plasma
+# KDE/Plasma (settings we care about are applied by install-linux.sh)
 kde*
 plasma*
+k*rc
+kwin*
+kconf_updaterc
+spectaclerc
+mimeapps.list
 Trolltech.conf
 baloofilerc
 powermanagementprofilesrc

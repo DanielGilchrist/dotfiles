@@ -77,6 +77,7 @@ install_package wezterm
 install_package neovim nvim
 install_package wl-clipboard wl-copy
 install_package github-cli gh
+gh extension list 2>/dev/null | grep -q dlvhdr/gh-dash || gh extension install dlvhdr/gh-dash
 install_package asdf-vm asdf
 install_package ttf-jetbrains-mono-nerd
 install_package claude-code claude
@@ -104,6 +105,7 @@ install_package tree-sitter-cli tree-sitter
 install_package mmdr-bin mmdr
 
 if command_exists mmdr && ! command_exists mmdc; then
+  mkdir -p "$HOME/.local/bin"
   ln -sf "$(command -v mmdr)" "$HOME/.local/bin/mmdc"
 fi
 
@@ -114,6 +116,18 @@ fi
 install_asdf_plugin ruby https://github.com/asdf-vm/asdf-ruby.git
 install_asdf_plugin crystal https://github.com/asdf-community/asdf-crystal.git
 install_asdf_plugin nodejs https://github.com/asdf-vm/asdf-nodejs.git
+install_asdf_plugin golang https://github.com/asdf-community/asdf-golang.git
+
+# heucristic (Crystal LSP) needs llvm-config to build its semantic helper
+if pacman -Qq llvm >/dev/null 2>&1; then
+  echo "llvm is already installed."
+else
+  echo "Installing llvm..."
+  paru -S --noconfirm llvm
+fi
+
+echo "Installing heucristic..."
+fish -c heucristic_install
 
 if ! command_exists rustup; then
   echo "Installing rustup..."
@@ -122,7 +136,8 @@ if ! command_exists rustup; then
   echo "Installing Rust stable..."
   rustup default stable
 else
-  echo "rustup is already installed."
+  echo "rustup is already installed, updating stable toolchain..."
+  rustup update stable
 fi
 
 if ! command_exists tree-sitter; then
@@ -142,6 +157,27 @@ fi
 echo "Installing agent..."
 "$CONFIG_DIR/agent-tui/install.sh"
 
+if command_exists kwriteconfig6; then
+  echo "Applying KDE settings..."
+  # Fast key repeat (macOS-like) for vim motions
+  kwriteconfig6 --notify --file kcminputrc --group Keyboard --key KeyRepeat repeat
+  kwriteconfig6 --notify --file kcminputrc --group Keyboard --key RepeatDelay 200
+  kwriteconfig6 --notify --file kcminputrc --group Keyboard --key RepeatRate 50
+
+  # macOS-style screenshots: auto-save + copy to clipboard, capture on mouse release
+  mkdir -p "$HOME/Pictures/Screenshots"
+  kwriteconfig6 --file spectaclerc --group General --key autoSaveImage true
+  kwriteconfig6 --file spectaclerc --group General --key clipboardGroup PostScreenshotCopyImage
+  kwriteconfig6 --file spectaclerc --group General --key useReleaseToCapture true
+  kwriteconfig6 --file spectaclerc --group General --key launchAction UseLastUsedCapturemode
+  kwriteconfig6 --file spectaclerc --group ImageSave --key imageSaveLocation "file://$HOME/Pictures/Screenshots"
+  # Meta+Shift+3 full screen, Meta+Shift+4 region (Shift+3/4 can register as #/$, so bind both)
+  kwriteconfig6 --file kglobalshortcutsrc --group services --group org.kde.spectacle.desktop \
+    --key FullScreenScreenShot $'Shift+Print\tMeta+Shift+3\tMeta+#'
+  kwriteconfig6 --file kglobalshortcutsrc --group services --group org.kde.spectacle.desktop \
+    --key RectangularRegionScreenShot $'Meta+Shift+S\tMeta+Shift+4\tMeta+$'
+fi
+
 if ! grep -q fish /etc/shells; then
   echo "Adding fish to /etc/shells..."
   echo "$(which fish)" | sudo tee -a /etc/shells
@@ -155,7 +191,7 @@ fi
 if [ ! -L "$HOME/.claude" ]; then
   if [ -d "$HOME/.claude" ]; then
     echo "Moving existing ~/.claude contents to $CONFIG_DIR/claude..."
-    cp -rn "$HOME/.claude/"* "$CONFIG_DIR/claude/" 2>/dev/null
+    cp -rn "$HOME/.claude/." "$CONFIG_DIR/claude/" 2>/dev/null
     rm -rf "$HOME/.claude"
   fi
   echo "Symlinking ~/.claude -> $CONFIG_DIR/claude..."

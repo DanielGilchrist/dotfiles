@@ -167,7 +167,8 @@ if ! command_exists rustup; then
   echo "Installing Rust..."
   rustup default stable
 else
-  echo "rustup is already installed."
+  echo "rustup is already installed, updating stable toolchain..."
+  rustup update stable
 fi
 
 if ! command_exists tree-sitter; then
@@ -202,7 +203,7 @@ fi
 if [ ! -L "$HOME/.claude" ]; then
   if [ -d "$HOME/.claude" ]; then
     echo "Moving existing ~/.claude contents to $CONFIG_DIR/claude..."
-    cp -rn "$HOME/.claude/"* "$CONFIG_DIR/claude/" 2>/dev/null
+    cp -rn "$HOME/.claude/." "$CONFIG_DIR/claude/" 2>/dev/null
     rm -rf "$HOME/.claude"
   fi
   echo "Symlinking ~/.claude -> $CONFIG_DIR/claude..."
