@@ -3674,15 +3674,15 @@ mod tests {
                 .clone()
         };
         let on = bar("focus_left = 'alt-h'\nfocus_right = 'alt-l'\nactions = 'alt-x'");
-        assert!(on.contains("⌥h panels"), "{on}");
-        assert!(on.contains("⌥x actions"), "{on}");
+        assert!(on.contains("alt-h panels"), "{on}");
+        assert!(on.contains("alt-x actions"), "{on}");
         assert!(
-            !on.contains("⌥l"),
+            !on.contains("alt-l"),
             "focus_right does nothing in AGENT: {on}"
         );
         let off = bar("");
-        assert!(!off.contains('⌥'), "{off}");
-        assert!(!bar("actions = 'alt-x'").contains("⌥h"));
+        assert!(!off.contains("alt-"), "{off}");
+        assert!(!bar("actions = 'alt-x'").contains("alt-h"));
     }
 
     #[test]
@@ -3696,12 +3696,12 @@ mod tests {
                 .clone()
         };
         let on = bar("focus_right = 'alt-l'");
-        assert!(on.contains("⌥l to [0]"), "{on}");
+        assert!(on.contains("alt-l to [0]"), "{on}");
         assert!(
-            on.contains("⌥l to [0]  ? keys"),
+            on.contains("alt-l to [0]  ? keys"),
             "help comes last, after the chord: {on}"
         );
-        assert!(!bar("").contains('⌥'));
+        assert!(!bar("").contains("alt-"));
     }
 
     #[test]
@@ -4658,7 +4658,7 @@ mod tests {
         let mut m = fleet(10);
         let text = send_box(&mut m);
         assert!(
-            text.contains("⏎ send  ⌥⏎ newline  ⌃E edit  ⌃V image  Esc close"),
+            text.contains("⏎ send  alt-⏎ newline  ⌃E edit  ⌃V image  Esc close"),
             "{text}"
         );
     }

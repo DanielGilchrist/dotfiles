@@ -608,7 +608,7 @@ mod tests {
             .into_iter()
             .map(|field| config.keys.binding(field).to_string())
             .collect();
-        assert_eq!(spelt, ["⌥h", "⌥l", "⌥x"]);
+        assert_eq!(spelt, ["alt-h", "alt-l", "alt-x"]);
     }
 
     #[test]
@@ -768,7 +768,7 @@ mod tests {
             "[keys]\nfocus_left = 'none'\nfocus_right = 'none'\nactions = 'none'\nnav = 'alt-;'"
                 .parse()
                 .expect("parses");
-        assert_eq!(config.keys.nav().to_string(), "⌥;");
+        assert_eq!(config.keys.nav().to_string(), "alt-;");
     }
 
     #[test]
@@ -787,7 +787,7 @@ mod tests {
         let err = |toml: &str| toml.parse::<Config>().expect_err("fails").to_string();
         assert_eq!(
             err("[keys]\nnav = 'alt-x'\nfocus_right = 'ctrl-]'"),
-            "keys.focus_right is ⌃], which also leaves AGENT while keys.nav is ⌥x"
+            "keys.focus_right is ⌃], which also leaves AGENT while keys.nav is alt-x"
         );
         assert_eq!(
             err("[keys]\nnav = 'f5'\nactions = 'ctrl-]'"),

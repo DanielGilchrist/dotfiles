@@ -1404,7 +1404,7 @@ mod tests {
             .chain(&listed.global)
             .map(|r| r.keys.as_str())
             .collect();
-        assert!(keys.iter().any(|k| k.contains("⌥x")), "{keys:?}");
+        assert!(keys.iter().any(|k| k.contains("alt-x")), "{keys:?}");
         assert!(
             keys.iter().all(|k| !k.contains("⌃]") && !k.contains("⌃\\")),
             "{keys:?}"
@@ -1421,7 +1421,7 @@ mod tests {
     fn chord_hints(ctx: Ctx, spelling: &Spelling) -> Vec<(String, &'static str)> {
         footer(&situation(ctx), spelling)
             .into_iter()
-            .filter(|h| h.keys.contains('⌥'))
+            .filter(|h| h.keys.contains("alt-"))
             .map(|h| (h.keys, h.label))
             .collect()
     }
@@ -1443,7 +1443,7 @@ mod tests {
                     .local
                     .iter()
                     .chain(&listed.global)
-                    .all(|r| !r.keys.contains('⌥')),
+                    .all(|r| !r.keys.contains("alt-")),
                 "{ctx:?}"
             );
         }
@@ -1455,16 +1455,16 @@ mod tests {
         let hint = |keys: &str, label: &'static str| (keys.to_string(), label);
         for ctx in [Ctx::Agents, Ctx::Activity, Ctx::Changes] {
             assert!(
-                chord_hints(ctx, &on).contains(&hint("⌥l", "to [0]")),
+                chord_hints(ctx, &on).contains(&hint("alt-l", "to [0]")),
                 "{ctx:?}"
             );
             assert!(
-                !chord_hints(ctx, &on).contains(&hint("⌥h", "panels")),
+                !chord_hints(ctx, &on).contains(&hint("alt-h", "panels")),
                 "{ctx:?}"
             );
         }
-        assert!(chord_hints(Ctx::Main, &on).contains(&hint("⌥h", "panels")));
-        assert!(!chord_hints(Ctx::Main, &on).contains(&hint("⌥l", "to [0]")));
+        assert!(chord_hints(Ctx::Main, &on).contains(&hint("alt-h", "panels")));
+        assert!(!chord_hints(Ctx::Main, &on).contains(&hint("alt-l", "to [0]")));
         assert_eq!(chord_hints(Ctx::Peek, &on), Vec::new());
         let only_left = spelt("focus_left = 'alt-h'");
         assert_eq!(chord_hints(Ctx::Agents, &only_left), Vec::new());
@@ -1482,12 +1482,12 @@ mod tests {
                 .any(|r| r.keys.contains(keys))
         };
         for ctx in [Ctx::Agents, Ctx::Activity, Ctx::Changes] {
-            assert!(has(ctx, "⌥l"), "{ctx:?}");
-            assert!(!has(ctx, "⌥h"), "{ctx:?}");
+            assert!(has(ctx, "alt-l"), "{ctx:?}");
+            assert!(!has(ctx, "alt-h"), "{ctx:?}");
         }
-        assert!(has(Ctx::Main, "⌥h"));
-        assert!(!has(Ctx::Main, "⌥l"));
-        for key in ["⌥h", "⌥l", "⌥x"] {
+        assert!(has(Ctx::Main, "alt-h"));
+        assert!(!has(Ctx::Main, "alt-l"));
+        for key in ["alt-h", "alt-l", "alt-x"] {
             assert!(!has(Ctx::Peek, key), "{key}");
         }
     }

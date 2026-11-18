@@ -11,7 +11,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Keyboard {
     /// The kitty keyboard protocol tells `⇧⏎` from `⏎`, and reports the
-    /// shifted character of `⌥⇧` keys, which crossterm puts in the event.
+    /// shifted character of `alt-⇧` keys, which crossterm puts in the event.
     Disambiguated,
     Legacy,
 }

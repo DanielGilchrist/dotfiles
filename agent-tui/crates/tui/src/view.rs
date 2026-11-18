@@ -1977,7 +1977,7 @@ fn draw_talk(frame: &mut Frame<'_>, m: &Model, to: &SessionName) {
             talk_title(m, to, quote, quote_in_title.then_some(title_room)),
             hints(&[
                 ("⏎", "send"),
-                ("⌥⏎", "newline"),
+                ("alt-⏎", "newline"),
                 ("⌃E", "edit"),
                 ("⌃V", "image"),
                 ("Esc", "close"),

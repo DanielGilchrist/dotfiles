@@ -296,7 +296,7 @@ impl fmt::Display for KeySpec {
         match self {
             Self::Ctrl(Control::Space) => f.write_str("⌃Space"),
             Self::Ctrl(control) => write!(f, "⌃{}", control.char().to_ascii_uppercase()),
-            Self::Alt(glyph) => write!(f, "⌥{}", glyph.char()),
+            Self::Alt(glyph) => write!(f, "alt-{}", glyph.char()),
             Self::Function(function) => write!(f, "F{}", function.number()),
             Self::Kitty(KittyKey::CtrlShift(letter)) => {
                 write!(f, "⌃⇧{}", letter.char().to_ascii_uppercase())
@@ -305,7 +305,7 @@ impl fmt::Display for KeySpec {
             Self::Kitty(KittyKey::Ctrl(shadowed)) => {
                 write!(f, "⌃{}", shadowed.char().to_ascii_uppercase())
             }
-            Self::Kitty(KittyKey::Alt(starter)) => write!(f, "⌥{}", starter.char()),
+            Self::Kitty(KittyKey::Alt(starter)) => write!(f, "alt-{}", starter.char()),
         }
     }
 }
@@ -453,8 +453,8 @@ mod tests {
             ("ctrl-_", "⌃_"),
             ("ctrl-g", "⌃G"),
             ("ctrl-space", "⌃Space"),
-            ("alt-;", "⌥;"),
-            ("alt-x", "⌥x"),
+            ("alt-;", "alt-;"),
+            ("alt-x", "alt-x"),
             ("f1", "F1"),
             ("f12", "F12"),
             ("ctrl-shift-j", "⌃⇧J"),
@@ -464,8 +464,8 @@ mod tests {
             ("ctrl-j", "⌃J"),
             ("ctrl-m", "⌃M"),
             ("ctrl-[", "⌃["),
-            ("alt-[", "⌥["),
-            ("alt-O", "⌥O"),
+            ("alt-[", "alt-["),
+            ("alt-O", "alt-O"),
         ];
         for (text, expected) in table {
             assert_eq!(parsed(text).to_string(), expected, "{text}");
@@ -517,7 +517,7 @@ mod tests {
         assert_eq!(parsed("F12"), parsed("f12"));
         assert_eq!(parsed("Ctrl-Space"), parsed("ctrl-space"));
         assert_eq!(parsed("Ctrl-Shift-J"), parsed("ctrl-shift-j"));
-        assert_eq!(parsed("Alt-X").to_string(), "⌥X");
+        assert_eq!(parsed("Alt-X").to_string(), "alt-X");
         assert_ne!(parsed("alt-X"), parsed("alt-x"));
         assert_eq!(parsed("SUPER-K").to_string(), "⌘K");
         assert_eq!(parsed("ctrl-]"), KeySpec::CTRL_CLOSE_BRACKET);
@@ -666,12 +666,8 @@ mod tests {
     }
 
     #[test]
-    fn display_is_for_reading_and_is_not_config_text() {
-        for text in ["ctrl-]", "alt-;"] {
-            assert!(
-                parsed(text).to_string().parse::<KeySpec>().is_err(),
-                "{text}"
-            );
-        }
+    fn a_ctrl_key_displays_as_a_glyph_and_an_alt_key_as_its_config_text() {
+        assert!(parsed("ctrl-]").to_string().parse::<KeySpec>().is_err());
+        assert_eq!(parsed("alt-;").to_string(), "alt-;");
     }
 }
