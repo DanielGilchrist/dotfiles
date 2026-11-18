@@ -8,6 +8,7 @@ end
 alias nproc="sysctl -n hw.logicalcpu"
 
 set -gx HOMEBREW_NO_AUTO_UPDATE 1
+set -gx RUBY_CONFIGURE_OPTS --with-openssl-dir=/opt/homebrew/opt/openssl@3
 set -gx ANDROID_HOME $HOME/Library/Android/sdk
 
 set -gx PATH $PATH $ANDROID_HOME/emulator
