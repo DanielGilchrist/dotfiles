@@ -148,6 +148,10 @@ enum Event {
 enum Posture {
     Owning,
     Demoted,
+    /// A preview another window displaced: it draws nothing more, since what
+    /// the new owner's size makes the program repaint would show for as long
+    /// as it takes the TUI to learn the agent is open elsewhere.
+    Displaced,
     Waiting,
     Watching,
 }
@@ -166,9 +170,13 @@ impl Posture {
     fn demoted(role: Role) -> Self {
         match role {
             Role::Window { .. } => Self::Demoted,
-            Role::Preview { .. } => Self::Waiting,
+            Role::Preview { .. } => Self::Displaced,
             Role::Watch { .. } | Role::Control => Self::Watching,
         }
+    }
+
+    fn draws(self) -> bool {
+        self != Self::Displaced
     }
 }
 
@@ -426,6 +434,7 @@ impl Client {
 
     fn host(&mut self, frame: HostFrame) -> Result<Option<Ended>, ClientError> {
         match frame {
+            HostFrame::Output(_) | HostFrame::Resync if !self.posture.draws() => {}
             HostFrame::Output(bytes) => self
                 .outer
                 .show(bytes.as_slice())
@@ -463,7 +472,7 @@ impl Client {
                 self.send(&Command::Claim(self.size));
                 self.posture = Posture::Owning;
             }
-            Posture::Waiting | Posture::Watching => {}
+            Posture::Waiting | Posture::Displaced | Posture::Watching => {}
         }
     }
 
@@ -498,7 +507,9 @@ mod tests {
             Posture::at_welcome(preview, Standing::Watcher),
             Posture::Waiting
         );
-        assert_eq!(Posture::demoted(preview), Posture::Waiting);
+        assert_eq!(Posture::demoted(preview), Posture::Displaced);
+        assert!(!Posture::Displaced.draws());
+        assert!(Posture::Waiting.draws());
         let watch = Role::Watch {
             purpose: Purpose::Window,
         };
