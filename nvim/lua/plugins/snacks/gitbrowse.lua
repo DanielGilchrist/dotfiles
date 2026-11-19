@@ -3,20 +3,20 @@ local notify = require("utils.notify")
 return {
   opts = {
     notify = true,
-    what = "permalink",
+    what = "permalink"
   },
   keys = {
     {
       "<leader>gB",
-      function() Snacks.gitbrowse() end,
+      function () Snacks.gitbrowse() end,
       desc = "Git Browse",
       mode = { "n", "x" }
     },
     {
       "<leader>gY",
-      function()
+      function ()
         Snacks.gitbrowse({
-          open = function(url)
+          open = function (url)
             vim.fn.setreg("+", url)
             notify.info(url)
           end,
@@ -25,6 +25,6 @@ return {
       end,
       desc = "Git Browse (Copy)",
       mode = { "n", "x" }
-    },
-  },
+    }
+  }
 }

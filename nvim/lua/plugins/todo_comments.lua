@@ -1,5 +1,1 @@
-return {
-  "folke/todo-comments.nvim",
-  event = "BufReadPost",
-  opts = {},
-}
+return { "folke/todo-comments.nvim", event = "BufReadPost", opts = {} }

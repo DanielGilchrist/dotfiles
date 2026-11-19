@@ -30,8 +30,9 @@ local function open_files_in_new_tab(files)
     table.insert(file_args, item.file)
   end
 
-  local command =
-      string.format("wezterm cli spawn --cwd=%s -- nvim %s", vim.fn.shellescape(cwd), table.concat(file_args, " "))
+  local command = string.format(
+    "wezterm cli spawn --cwd=%s -- nvim %s", vim.fn.shellescape(cwd), table.concat(file_args, " ")
+  )
 
   vim.fn.system(command)
   notify.info(string.format("Opened %d files in new tab", #files))
@@ -40,7 +41,7 @@ end
 local function run_srb_tc()
   notify.info("Running bundle exec srb tc...", {
     id = notify_id,
-    timeout = false,
+    timeout = false
   })
 
   local output = ""
@@ -77,10 +78,8 @@ local function run_srb_tc()
     stderr_buffered = true,
     on_stdout = on_stdout,
     on_stderr = on_stderr,
-    on_exit = on_exit,
+    on_exit = on_exit
   })
 end
 
-return {
-  run = run_srb_tc,
-}
+return { run = run_srb_tc }

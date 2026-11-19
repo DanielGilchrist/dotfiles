@@ -20,9 +20,9 @@ function M.tab_label(tabnr)
   return "[" .. tabnr .. "]"
 end
 
----Abbreviate a path the way fish's default `fish_title` does
----(`prompt_pwd -d 1 -D 1`): `~`-relative, every segment but the last cut to
----its first character. `~/worktrees/payaus/foo` → `~/w/p/foo`.
+--- Abbreviate a path the way fish's default `fish_title` does
+--- (`prompt_pwd -d 1 -D 1`): `~`-relative, every segment but the last cut to
+--- its first character. `~/worktrees/payaus/foo` → `~/w/p/foo`.
 ---@param dir string
 ---@return string
 local function abbreviate(dir)
@@ -37,9 +37,9 @@ local function abbreviate(dir)
   return table.concat(segments, "/")
 end
 
----Terminal title for the current tab page. An explicit tab name (agent
----tabs set one) wins so the wezterm tab reads `nvim <agent>` rather than
----the cwd of whichever tab nvim was started from.
+--- Terminal title for the current tab page. An explicit tab name (agent
+--- tabs set one) wins so the wezterm tab reads `nvim <agent>` rather than
+--- the cwd of whichever tab nvim was started from.
 ---@return string
 function M.title()
   local explicit = vim.t.tabname
@@ -53,17 +53,17 @@ function M.refresh_title()
   vim.o.titlestring = M.title()
 end
 
----Build the items shown by the tab picker, one per tab page.
----@return {label: string, tabnr: integer}[]
+--- Build the items shown by the tab picker, one per tab page.
+---@return { label: string, tabnr: integer } []
 local function tab_items()
-  ---@type {label: string, tabnr: integer}[]
+  ---@type { label: string, tabnr: integer } []
   local items = {}
   local current = vim.fn.tabpagenr()
   for i = 1, vim.fn.tabpagenr("$") do
     local marker = (i == current) and "▶" or " "
     table.insert(items, {
       label = string.format("%s %d  %s", marker, i, M.tab_label(i)),
-      tabnr = i,
+      tabnr = i
     })
   end
   return items
@@ -71,19 +71,23 @@ end
 
 function M.pick()
   local items = tab_items()
-  vim.ui.select(items, {
-    prompt = "tabs",
-    format_item = function(item) return item.label end,
-  }, function(choice)
-    if not choice then return end
-    vim.cmd(("tabnext %d"):format(choice.tabnr))
-  end)
+  vim.ui.select(
+    items,
+    {
+      prompt = "tabs",
+      format_item = function (item) return item.label end
+    },
+    function (choice)
+      if not choice then return end
+      vim.cmd(("tabnext %d"):format(choice.tabnr))
+    end
+  )
 end
 
 function M.rename()
   local current = vim.fn.tabpagenr()
   local existing = vim.t.tabname or ""
-  vim.ui.input({ prompt = ("rename tab %d: "):format(current), default = existing }, function(input)
+  vim.ui.input({ prompt = ("rename tab %d: "):format(current), default = existing }, function (input)
     if input == nil then return end
     input = vim.trim(input)
     vim.t.tabname = is.not_empty(input) and input or nil
@@ -92,8 +96,8 @@ function M.rename()
   end)
 end
 
----Register keymaps under `<leader><Tab>` and a `t` ('mnemonic for tab')
----suffix where it doesn't clash with the existing Test/Toggle group.
+--- Register keymaps under `<leader><Tab>` and a `t` ('mnemonic for tab')
+--- suffix where it doesn't clash with the existing Test/Toggle group.
 function M.setup()
   local prefix = "<leader><Tab>"
   local function map(suffix, fn, desc)
@@ -113,7 +117,7 @@ function M.setup()
   M.refresh_title()
   vim.api.nvim_create_autocmd({ "VimEnter", "TabEnter", "DirChanged" }, {
     group = vim.api.nvim_create_augroup("config_tabs_title", { clear = true }),
-    callback = M.refresh_title,
+    callback = M.refresh_title
   })
 end
 

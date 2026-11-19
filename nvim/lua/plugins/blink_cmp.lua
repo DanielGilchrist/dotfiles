@@ -11,18 +11,18 @@ return {
       ["<Up>"] = { "fallback" },
       ["<Down>"] = { "fallback" },
       ["<Left>"] = { "fallback" },
-      ["<Right>"] = { "fallback" },
+      ["<Right>"] = { "fallback" }
     },
     completion = {
       list = {
         selection = {
           preselect = false,
-          auto_insert = false,
-        },
+          auto_insert = false
+        }
       },
       trigger = {
-        show_on_insert_on_trigger_character = false,
-      },
-    },
-  },
+        show_on_insert_on_trigger_character = false
+      }
+    }
+  }
 }

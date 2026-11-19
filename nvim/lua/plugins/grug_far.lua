@@ -4,26 +4,26 @@ return {
     startInInsertMode = false,
     prefills = {
       flags = "--hidden",
-      filesFilter = "!.git",
-    },
+      filesFilter = "!.git"
+    }
   },
   keys = {
     {
       "<leader>sr",
-      function() require("grug-far").open({ transient = true }) end,
+      function () require("grug-far").open({ transient = true }) end,
       mode = { "n", "x" },
-      desc = "Search and Replace",
+      desc = "Search and Replace"
     },
     {
       "<leader>br",
-      function()
+      function ()
         require("grug-far").with_visual_selection({
           startCursorRow = 2,
-          prefills = { paths = vim.fn.expand("%") },
+          prefills = { paths = vim.fn.expand("%") }
         })
       end,
       mode = "v",
-      desc = "Search and replace (Current file)",
-    },
-  },
+      desc = "Search and replace (Current file)"
+    }
+  }
 }

@@ -1,5 +1,1 @@
-return {
-  "rachartier/tiny-inline-diagnostic.nvim",
-  event = "VeryLazy",
-  opts = {},
-}
+return { "rachartier/tiny-inline-diagnostic.nvim", event = "VeryLazy", opts = {} }

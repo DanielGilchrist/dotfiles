@@ -102,7 +102,7 @@ function TargetPath:__parse_test_to_file_fallback_path(path)
 end
 
 return {
-  open_test = function()
+  open_test = function ()
     local current_file_path = vim.fn.expand("%:p")
     local target_path = TargetPath.new(current_file_path)
     local target_file = target_path:file()

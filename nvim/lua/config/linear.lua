@@ -7,12 +7,12 @@ local theme_path = vim.fs.normalize(vim.fn.stdpath("cache") .. "/linear-tui-them
 local dirty = true
 
 vim.api.nvim_create_autocmd("ColorScheme", {
-  callback = function()
+  callback = function ()
     dirty = true
-  end,
+  end
 })
 
----@type table<string, { groups: string[], attr?: "fg"|"bg" }>
+---@type table<string, { groups: string[], attr?: "fg" | "bg" }>
 local slots = {
   accent = { groups = { "MatchParen" } },
   dim = { groups = { "Comment" } },
@@ -34,7 +34,7 @@ local slots = {
   state_started = { groups = { "DiagnosticWarn" } },
   state_completed = { groups = { "DiagnosticOk", "String" } },
   state_cancelled = { groups = { "DiagnosticError" } },
-  state_triage = { groups = { "@keyword", "Statement" } },
+  state_triage = { groups = { "@keyword", "Statement" } }
 }
 
 local function resolve(slot)

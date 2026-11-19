@@ -4,13 +4,10 @@ local notify = require("utils.notify")
 local function default_options(opts)
   opts = opts == nil and {} or opts
 
-  return vim.tbl_extend(
-    "force",
-    {
-      on_stdout = cmd.default_handler(notify.info),
-      on_stderr = cmd.default_handler(notify.error),
-    },
-    opts
+  return vim.tbl_extend("force", {
+    on_stdout = cmd.default_handler(notify.info),
+    on_stderr = cmd.default_handler(notify.error)
+  }, opts
   )
 end
 
@@ -43,8 +40,8 @@ local function time_worked_display()
       border = "rounded",
       bo = {
         modifiable = false,
-        readonly = true,
-      },
+        readonly = true
+      }
     })
   end
 
@@ -60,5 +57,5 @@ return {
   clock_break_finish = clock_break_finish,
   clock_out = clock_out,
   time_worked = time_worked,
-  time_worked_display = time_worked_display,
+  time_worked_display = time_worked_display
 }

@@ -7,13 +7,10 @@ local scratchpads_dir = vim.fn.expand("~/.local/share/scratchpads/")
 local function scratch_search(_title, opts)
   opts = opts == nil and {} or opts
 
-  local args = {
-    dirs = { scratchpads_dir },
-    hidden = false,
-  }
+  local args = { dirs = { scratchpads_dir }, hidden = false }
 
   if opts.confirm then
-    args.confirm = function(picker, item)
+    args.confirm = function (picker, item)
       picker:close()
 
       if opts.multiselect then
@@ -62,26 +59,27 @@ end
 
 local function new_scratchpad()
   vim.ui.select({
-    { lang = "Ruby",       ext = ".rb" },
-    { lang = "Crystal",    ext = ".cr" },
+    { lang = "Ruby", ext = ".rb" },
+    { lang = "Crystal", ext = ".cr" },
     { lang = "JavaScript", ext = ".js" },
-    { lang = "Markdown",   ext = ".md" },
-    { lang = "SQL",        ext = ".sql" },
-    { lang = "Text",       ext = ".txt" },
-    { lang = "Bash",       ext = ".sh" },
-    { lang = "Fish",       ext = ".fish" },
-    { lang = "JSON",       ext = ".json" },
-    { lang = "JSONC",      ext = ".jsonc" }
-  }, {
-    prompt = "Select a language",
-    format_item = function(item)
-      return item.lang
-    end,
-  }, function(choice)
-    if choice then
-      create_scratchpad(choice.ext)
-    end
-  end)
+    { lang = "Markdown", ext = ".md" },
+    { lang = "SQL", ext = ".sql" },
+    { lang = "Text", ext = ".txt" },
+    { lang = "Bash", ext = ".sh" },
+    { lang = "Fish", ext = ".fish" },
+    { lang = "JSON", ext = ".json" },
+    { lang = "JSONC", ext = ".jsonc" }
+  },
+    {
+      prompt = "Select a language",
+      format_item = function (item)
+        return item.lang
+      end
+    }, function (choice)
+      if choice then
+        create_scratchpad(choice.ext)
+      end
+    end)
 end
 
 local function open_scratchpad()
@@ -106,17 +104,18 @@ local function rename_scratchpad()
 
   vim.ui.input({
     prompt = "New name: ",
-    default = vim.fn.fnamemodify(old_filename, ":t"),
-  }, function(new_name)
-    if new_name then
-      local new_filename = scratchpads_dir .. new_name
+    default = vim.fn.fnamemodify(old_filename, ":t")
+  },
+    function (new_name)
+      if new_name then
+        local new_filename = scratchpads_dir .. new_name
 
-      vim.fn.rename(old_filename, new_filename)
-      vim.cmd("bd!")
-      vim.cmd("edit " .. new_filename)
-      notify.info("Scratchpad renamed from " .. old_filename .. " to " .. new_filename)
-    end
-  end)
+        vim.fn.rename(old_filename, new_filename)
+        vim.cmd("bd!")
+        vim.cmd("edit " .. new_filename)
+        notify.info("Scratchpad renamed from " .. old_filename .. " to " .. new_filename)
+      end
+    end)
 end
 
 local function remove_scratchpad()
@@ -131,34 +130,26 @@ local function remove_scratchpad()
       files_to_delete[i] = file.text
     end
 
-    ui.confirm(
-      "Remove selected scratchpads?",
-      function(choice)
-        if choice == "Ok" then
-          for _, file in ipairs(files_to_delete) do
-            local success, err = os.remove(file)
-            if not success then
-              notify.error(string.format("Failed to remove %s: %s", file, err))
-            else
-              notify.info(string.format("Removed %s", file))
-            end
+    ui.confirm("Remove selected scratchpads?", function (choice)
+      if choice == "Ok" then
+        for _, file in ipairs(files_to_delete) do
+          local success, err = os.remove(file)
+          if not success then
+            notify.error(string.format("Failed to remove %s: %s", file, err))
+          else
+            notify.info(string.format("Removed %s", file))
           end
-        else
-          notify.warn("Action to remove scratchpads cancelled.")
         end
+      else
+        notify.warn("Action to remove scratchpads cancelled.")
       end
-    )
+    end)
   end
 
   scratch_search("Delete Scratchpad", {
     multiselect = true,
-    confirm = delete_scratchpads,
+    confirm = delete_scratchpads
   })
 end
 
-return {
-  new = new_scratchpad,
-  open = open_scratchpad,
-  rename = rename_scratchpad,
-  remove = remove_scratchpad,
-}
+return { new = new_scratchpad, open = open_scratchpad, rename = rename_scratchpad, remove = remove_scratchpad }

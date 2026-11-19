@@ -9,10 +9,10 @@ return {
       jump_next_field_end = { "<Tab>", mode = { "n", "v" } },
       jump_prev_field_end = { "<S-Tab>", mode = { "n", "v" } },
       jump_next_row = { "<Enter>", mode = { "n", "v" } },
-      jump_prev_row = { "<S-Enter>", mode = { "n", "v" } },
+      jump_prev_row = { "<S-Enter>", mode = { "n", "v" } }
     },
     view = {
-      display_mode = "border",
-    },
-  },
+      display_mode = "border"
+    }
+  }
 }

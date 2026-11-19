@@ -47,16 +47,11 @@ local function session_buffers()
   local items = {}
 
   for i = 1, math.min(limit, #buffers) do
-    items[#items + 1] = {
-      file = buffers[i],
-      icon = "file",
-    }
+    items[#items + 1] = { file = buffers[i], icon = "file" }
   end
 
   if #buffers > limit then
-    items[#items + 1] = {
-      text = { { "+" .. (#buffers - limit) .. " more buffers", hl = "special" } },
-    }
+    items[#items + 1] = { text = { { "+" .. (#buffers - limit) .. " more buffers", hl = "special" } } }
   end
 
   return items
@@ -67,15 +62,23 @@ return {
     enabled = true,
     width = 60,
     preset = {
-      header = header,
+      header = header
     },
     sections = {
       { section = "header", padding = 0 },
       { key = "q", action = ":qa", hidden = true },
       { key = "l", action = ":Lazy", hidden = true },
-      { icon = "󰍛", title = "Last Session", key = "s", action = ":lua require('persistence').load()", indent = 2, padding = 1, session_buffers },
+      {
+        icon = "󰍛",
+        title = "Last Session",
+        key = "s",
+        action = ":lua require('persistence').load()",
+        indent = 2,
+        padding = 1,
+        session_buffers
+      },
       { icon = "", title = "Projects", section = "projects", indent = 2, padding = 1, limit = 5 },
-      function()
+      function ()
         local stats = require("lazy").stats()
         local ms = (math.floor(stats.startuptime * 100 + 0.5) / 100)
         return {
@@ -84,10 +87,10 @@ return {
             { "⚡ Neovim loaded ", hl = "footer" },
             { stats.loaded .. "/" .. stats.count, hl = "special" },
             { " plugins in ", hl = "footer" },
-            { ms .. "ms", hl = "special" },
-          },
+            { ms .. "ms", hl = "special" }
+          }
         }
-      end,
-    },
-  },
+      end
+    }
+  }
 }

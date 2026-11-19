@@ -46,7 +46,7 @@ local function toggle_terminal_zoom()
       snacks.opts.width = 0.9
     end
 
-    vim.schedule(function()
+    vim.schedule(function ()
       snacks:show()
     end)
   end
@@ -56,7 +56,7 @@ return {
   keys = {
     {
       "<leader>fT",
-      function()
+      function ()
         open_terminal()
       end,
       desc = "Terminal (cwd)",
@@ -64,7 +64,7 @@ return {
     },
     {
       "<leader>ft",
-      function()
+      function ()
         open_terminal({ cwd = path.root() })
       end,
       desc = "Terminal (Root Dir)",
@@ -72,7 +72,7 @@ return {
     },
     {
       "<c-/>",
-      function()
+      function ()
         Snacks.terminal.toggle(nil, { cwd = path.root() })
       end,
       desc = "Terminal (Root Dir)",
@@ -82,7 +82,7 @@ return {
       "<c-,>",
       toggle_terminal_zoom,
       desc = "Toggle Terminal Zoom",
-      mode = { "n", "t", "i", "x" },
-    },
-  },
+      mode = { "n", "t", "i", "x" }
+    }
+  }
 }

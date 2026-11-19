@@ -1,7 +1,8 @@
-local shoo = function()
+local shoo = function ()
   return require("shoo")
 end
 
-vim.api.nvim_create_user_command("GHPurgeForce", function()
+vim.api.nvim_create_user_command("GHPurgeForce", function ()
   shoo().purge(true)
-end, {})
+end, {}
+)

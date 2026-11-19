@@ -1,21 +1,21 @@
 local M = { compiler = nil, macros = {} }
 
 local function redraw()
-  vim.schedule(function()
+  vim.schedule(function ()
     vim.cmd.redrawstatus()
   end)
 end
 
 function M.handlers()
   return {
-    ["$/heucristic/compiler"] = function(_, params)
+    ["$/heucristic/compiler"] = function (_, params)
       M.compiler = params
       redraw()
     end,
-    ["$/heucristic/macros"] = function(_, params)
+    ["$/heucristic/macros"] = function (_, params)
       M.macros[params.target or "main"] = params
       redraw()
-    end,
+    end
   }
 end
 

@@ -8,6 +8,4 @@ local function disable_lint()
   end
 end
 
-return {
-  disable_lint = disable_lint
-}
+return { disable_lint = disable_lint }

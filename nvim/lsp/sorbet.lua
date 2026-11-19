@@ -2,7 +2,7 @@ return {
   cmd = { "bundle", "exec", "srb", "tc", "--lsp" },
   filetypes = { "ruby" },
   workspace_required = true,
-  root_dir = function(bufnr, on_dir)
+  root_dir = function (bufnr, on_dir)
     local start = vim.api.nvim_buf_get_name(bufnr)
     if start == "" then start = vim.fn.getcwd() end
     for dir in vim.fs.parents(start) do
@@ -11,5 +11,5 @@ return {
         return
       end
     end
-  end,
+  end
 }

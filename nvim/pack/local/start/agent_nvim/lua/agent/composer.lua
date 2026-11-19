@@ -7,8 +7,8 @@ local is = require("utils.is")
 local M = {}
 
 local state = {
-  buf = nil, ---@type integer|nil
-  win = nil, ---@type integer|nil
+  buf = nil, ---@type integer | nil
+  win = nil  ---@type integer | nil
 }
 
 ---@return integer
@@ -31,10 +31,10 @@ local function ensure_buf()
   -- `:w` the user can keep typing in the now-empty composer.
   vim.api.nvim_create_autocmd("BufWriteCmd", {
     buffer = buf,
-    callback = function()
+    callback = function ()
       vim.bo[buf].modified = false
       M.submit({ close = false })
-    end,
+    end
   })
 
   return buf
@@ -45,7 +45,7 @@ function M.is_visible()
   return state.win ~= nil and vim.api.nvim_win_is_valid(state.win)
 end
 
----Close any existing composer window across all tabs.
+--- Close any existing composer window across all tabs.
 local function close_all_windows()
   if not state.buf then return end
   for _, win in ipairs(vim.fn.win_findbuf(state.buf)) do
@@ -77,7 +77,11 @@ function M.hide()
 end
 
 function M.toggle()
-  if M.is_visible() then M.hide() else M.show() end
+  if M.is_visible() then
+    M.hide()
+  else
+    M.show()
+  end
 end
 
 local function clear()
@@ -93,12 +97,17 @@ function M.append(text)
   local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
   local has_content = false
   for _, l in ipairs(lines) do
-    if is.not_empty(vim.trim(l)) then has_content = true; break end
+    if is.not_empty(vim.trim(l)) then
+      has_content = true
+      break
+    end
   end
   local new_lines = vim.split(text, "\n", { plain = true })
   if has_content then
     table.insert(lines, "")
-    for _, l in ipairs(new_lines) do table.insert(lines, l) end
+    for _, l in ipairs(new_lines) do
+      table.insert(lines, l)
+    end
     table.insert(lines, "")
   else
     lines = new_lines
@@ -107,7 +116,7 @@ function M.append(text)
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
 end
 
----@param opts? {close?: boolean}
+---@param opts? { close?: boolean }
 function M.submit(opts)
   opts = opts or {}
   local close = opts.close ~= false

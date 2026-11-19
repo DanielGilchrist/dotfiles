@@ -13,7 +13,7 @@ return {
     "echasnovski/mini.statusline",
     opts = {
       content = {
-        active = function()
+        active = function ()
           local S = require("mini.statusline")
           local mode, mode_hl = S.section_mode({ trunc_width = 120 })
           local git = S.section_git({ trunc_width = 40 })
@@ -24,9 +24,9 @@ return {
           local fileinfo = S.section_fileinfo({ trunc_width = 120 })
           local location = S.section_location({ trunc_width = 75 })
           local search = S.section_searchcount({ trunc_width = 75 })
-          local ok, review = pcall(function() return require("agent.review").status() end)
+          local ok, review = pcall(function () return require("agent.review").status() end)
           review = (ok and review) or ""
-          local has_heucristic, heucristic = pcall(function() return require("heucristic.status").status() end)
+          local has_heucristic, heucristic = pcall(function () return require("heucristic.status").status() end)
           heucristic = (has_heucristic and heucristic) or ""
 
           return S.combine_groups({
@@ -37,11 +37,11 @@ return {
             "%=",
             { hl = "MiniStatuslineDevinfo", strings = { heucristic, review } },
             { hl = "MiniStatuslineFileinfo", strings = { fileinfo } },
-            { hl = mode_hl, strings = { search, location } },
+            { hl = mode_hl, strings = { search, location } }
           })
-        end,
-      },
-    },
+        end
+      }
+    }
   },
   {
     "echasnovski/mini.tabline",
@@ -49,10 +49,10 @@ return {
     -- the buffer tabline so multiple vim tabs are visible at a glance
     -- (e.g. when agent_nvim opens an agent in its own tab page).
     opts = { tabpage_section = "right" },
-    config = function(_, opts)
+    config = function (_, opts)
       require("mini.tabline").setup(opts)
       set_tabline_highlights()
       vim.api.nvim_create_autocmd("ColorScheme", { callback = set_tabline_highlights })
-    end,
-  },
+    end
+  }
 }

@@ -8,7 +8,10 @@ local function fence_at_cursor(buf, lang)
   local start
   for i = cur, 1, -1 do
     local line = vim.api.nvim_buf_get_lines(buf, i - 1, i, false)[1] or ""
-    if line:match(open_pat) then start = i break end
+    if line:match(open_pat) then
+      start = i
+      break
+    end
     if line:match("^```") and i ~= cur then return nil end
   end
   if not start then return nil end
@@ -49,24 +52,24 @@ local function preview_mermaid()
     title = " mermaid preview ",
     title_pos = "center",
     keys = { q = "close", ["<esc>"] = "close" },
-    bo = { buftype = "nofile", bufhidden = "wipe" },
+    bo = { buftype = "nofile", bufhidden = "wipe" }
   })
 
   local placement = Snacks.image.placement.new(win.buf, png, {
     inline = false,
     max_width = max_w,
     max_height = max_h,
-    on_update_pre = function(self)
+    on_update_pre = function (self)
       if not win:valid() then return end
       local loc = self:state().loc
       win.opts.width = loc.width
       win.opts.height = loc.height
       win:update()
-    end,
+    end
   })
 
   local group = vim.api.nvim_create_augroup("mermaid_preview_" .. win.buf, { clear = true })
-  local reflow = Snacks.util.debounce(function()
+  local reflow = Snacks.util.debounce(function ()
     if not win:valid() then return end
     local w, h = bounds()
     placement.opts.max_width = w
@@ -79,10 +82,10 @@ local function preview_mermaid()
   end, { ms = 150 })
   vim.api.nvim_create_autocmd({ "VimResized" }, {
     group = group,
-    callback = function()
+    callback = function ()
       if not win:valid() then return true end
       reflow()
-    end,
+    end
   })
 end
 
@@ -92,9 +95,9 @@ return {
   ft = { "markdown" },
   keys = {
     { "<leader>umr", "<cmd>RenderMarkdown buf_toggle<cr>", desc = "Toggle Markdown Render" },
-    { "<leader>umd", preview_mermaid, ft = "markdown", desc = "Preview mermaid fence at cursor" },
+    { "<leader>umd", preview_mermaid, ft = "markdown", desc = "Preview mermaid fence at cursor" }
   },
   opts = {
-    enabled = false,
-  },
+    enabled = false
+  }
 }

@@ -7,21 +7,21 @@ return {
     opts = {
       theme = {
         variant = "winter",
-        accent = "green",
+        accent = "green"
       },
       editor = {
         transparent_background = false,
         sign = { color = "none" },
         float = {
           color = "mantle",
-          solid_border = false,
+          solid_border = false
         },
         completion = {
-          color = "surface0",
-        },
-      },
+          color = "surface0"
+        }
+      }
     },
-    config = function(_, opts)
+    config = function (_, opts)
       require("evergarden").setup(opts)
 
       local function diff_hl()
@@ -30,11 +30,11 @@ return {
       end
       vim.api.nvim_create_autocmd("ColorScheme", {
         group = vim.api.nvim_create_augroup("snacks_diff_hl", { clear = true }),
-        callback = diff_hl,
+        callback = diff_hl
       })
 
       vim.cmd.colorscheme("evergarden")
       diff_hl()
-    end,
-  },
+    end
+  }
 }

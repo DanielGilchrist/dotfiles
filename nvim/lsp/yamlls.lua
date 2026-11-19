@@ -5,8 +5,8 @@ return {
   settings = {
     yaml = {
       format = {
-        enable = false,
-      },
-    },
-  },
+        enable = false
+      }
+    }
+  }
 }

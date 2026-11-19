@@ -1,5 +1,5 @@
 return {
   opts = {
-    configure = true,
-  },
+    configure = true
+  }
 }

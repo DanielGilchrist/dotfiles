@@ -2,7 +2,7 @@ return {
   "folke/persistence.nvim",
   event = "VeryLazy",
   opts = {},
-  init = function()
+  init = function ()
     -- persistence.nvim wraps `:mks!`, which saves whatever is in
     -- `sessionoptions`. The default includes `terminal`, which saves
     -- transient `:terminal …` buffers (Snacks terminals, lazygit, the
@@ -17,14 +17,14 @@ return {
     vim.api.nvim_create_autocmd("User", {
       pattern = "PersistenceSavePre",
       desc = "Drop transient /tmp prompt buffers before persistence saves the session",
-      callback = function()
+      callback = function ()
         for _, buf in ipairs(vim.api.nvim_list_bufs()) do
           local name = vim.api.nvim_buf_get_name(buf)
           if name:match("^/tmp/agent%-prompt%-") or name:match("^/private/tmp/agent%-prompt%-") then
             pcall(vim.api.nvim_buf_delete, buf, { force = true })
           end
         end
-      end,
+      end
     })
-  end,
+  end
 }

@@ -1,5 +1,1 @@
-return {
-  "nvim-mini/mini.surround",
-  event = "BufReadPost",
-  opts = {},
-}
+return { "nvim-mini/mini.surround", event = "BufReadPost", opts = {} }

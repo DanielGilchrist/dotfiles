@@ -1,3 +1,1 @@
-return {
-  opts = {},
-}
+return { opts = {} }

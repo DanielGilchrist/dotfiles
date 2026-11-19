@@ -3,7 +3,7 @@ return {
   -- snacks_image style is editor-relative. See snacks/image/placement.lua render_fallback.
   opts = {
     snacks_image = {
-      relative = "editor",
-    },
-  },
+      relative = "editor"
+    }
+  }
 }

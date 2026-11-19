@@ -1,7 +1,7 @@
 return {
   opts = {
     doc = {
-      enabled = false,
-    },
-  },
+      enabled = false
+    }
+  }
 }

@@ -5,31 +5,31 @@ return {
     keymaps = {
       ["q"] = { "actions.close", mode = "n" },
       ["<C-d>"] = { "actions.preview_scroll_down", mode = "n" },
-      ["<C-u>"] = { "actions.preview_scroll_up", mode = "n" },
+      ["<C-u>"] = { "actions.preview_scroll_up", mode = "n" }
     },
     float = {
       border = "rounded",
       padding = 3,
-      preview = { vertical = true },
+      preview = { vertical = true }
     },
     preview_win = {
-      preview_method = "load",
+      preview_method = "load"
     },
     view_options = {
-      show_hidden = true,
-    },
+      show_hidden = true
+    }
   },
   keys = {
     {
       "<leader>e",
-      function()
+      function ()
         local oil = require("oil")
         if vim.w.is_oil_win then
           return oil.close()
         end
         oil.open_float(nil, { preview = { vertical = true } })
       end,
-      desc = "Explore Files (Oil)",
-    },
-  },
+      desc = "Explore Files (Oil)"
+    }
+  }
 }

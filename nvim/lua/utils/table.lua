@@ -1,11 +1,11 @@
 local M = {}
 
----Removes a value from a table by key and returns the value.
+--- Removes a value from a table by key and returns the value.
 ---@generic T
 ---@param table table<string, T>
----@param key string
+---@param key   string
 ---@return T?
-M.remove = function(table, key)
+M.remove = function (table, key)
   local value = table[key]
   table[key] = nil
 

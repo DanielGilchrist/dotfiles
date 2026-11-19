@@ -3,7 +3,7 @@ local loader = require("utils.plugin_loader")
 local opts = {}
 local keys = {}
 
-loader.each_config("plugins/snacks", function(config, name)
+loader.each_config("plugins/snacks", function (config, name)
   if config.opts then
     opts[name] = config.opts
   end
@@ -12,10 +12,4 @@ loader.each_config("plugins/snacks", function(config, name)
   end
 end)
 
-return {
-  "folke/snacks.nvim",
-  priority = 1000,
-  lazy = false,
-  opts = opts,
-  keys = keys,
-}
+return { "folke/snacks.nvim", priority = 1000, lazy = false, opts = opts, keys = keys }

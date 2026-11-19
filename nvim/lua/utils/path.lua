@@ -4,19 +4,19 @@ return {
   lua_path = lua_path,
   ---@param relative_path string
   ---@return string
-  absolute_path = function(relative_path)
+  absolute_path = function (relative_path)
     return lua_path .. relative_path
   end,
   ---Find the project root by walking up from the current buffer
   ---@param markers? string[] File/dir names that identify a project root (default: { ".git" })
   ---@return string # Project root path, falls back to cwd
-  root = function(markers)
+  root = function (markers)
     return vim.fs.root(0, markers or { ".git" }) or vim.uv.cwd() or error("FAAAAAAAAAAH")
   end,
   ---Last path segment, ignoring a trailing slash
   ---@param path string
   ---@return string
-  basename = function(path)
+  basename = function (path)
     return vim.fs.basename((path:gsub("/+$", ""))) or ""
-  end,
+  end
 }

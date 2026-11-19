@@ -9,6 +9,4 @@ local function open_test()
   end
 end
 
-return {
-  open_test = open_test
-}
+return { open_test = open_test }

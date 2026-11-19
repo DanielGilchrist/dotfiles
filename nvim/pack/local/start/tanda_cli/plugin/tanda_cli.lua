@@ -1,27 +1,33 @@
-local tanda_cli = function()
+local tanda_cli = function ()
   return require("tanda_cli")
 end
 
-vim.api.nvim_create_user_command("ClockIn", function()
+vim.api.nvim_create_user_command("ClockIn", function ()
   tanda_cli().clock_in()
-end, {})
+end, {}
+)
 
-vim.api.nvim_create_user_command("ClockBreakStart", function()
+vim.api.nvim_create_user_command("ClockBreakStart", function ()
   tanda_cli().clock_break_start()
-end, {})
+end, {}
+)
 
-vim.api.nvim_create_user_command("ClockBreakFinish", function()
+vim.api.nvim_create_user_command("ClockBreakFinish", function ()
   tanda_cli().clock_break_finish()
-end, {})
+end, {}
+)
 
-vim.api.nvim_create_user_command("ClockOut", function()
+vim.api.nvim_create_user_command("ClockOut", function ()
   tanda_cli().clock_out()
-end, {})
+end, {}
+)
 
-vim.api.nvim_create_user_command("TimeWorked", function()
+vim.api.nvim_create_user_command("TimeWorked", function ()
   tanda_cli().time_worked()
-end, {})
+end, {}
+)
 
-vim.api.nvim_create_user_command("TimeWorkedDisplay", function()
+vim.api.nvim_create_user_command("TimeWorkedDisplay", function ()
   tanda_cli().time_worked_display()
-end, {})
+end, {}
+)

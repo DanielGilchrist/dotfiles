@@ -3,7 +3,7 @@ local notify = require("utils.notify")
 local is = require("utils.is")
 
 local map = vim.keymap.set
-local leader = function(keys) return "<leader>" .. keys end
+local leader = function (keys) return "<leader>" .. keys end
 
 -- Better up/down with wrapped lines
 map({ "n", "x" }, "j", "v:count == 0 ? 'gj' : 'j'", { expr = true, silent = true })
@@ -35,9 +35,9 @@ map("n", "<S-l>", "<cmd>bnext<cr>", { desc = "Next Buffer" })
 map("n", "[b", "<cmd>bprevious<cr>", { desc = "Prev Buffer" })
 map("n", "]b", "<cmd>bnext<cr>", { desc = "Next Buffer" })
 
-map("n", leader("bd"), function() Snacks.bufdelete() end, { desc = "Delete Buffer" })
-map("n", leader("bD"), function() Snacks.bufdelete.all() end, { desc = "Delete All Buffers" })
-map("n", leader("bo"), function() Snacks.bufdelete.other() end, { desc = "Delete Other Buffers" })
+map("n", leader("bd"), function () Snacks.bufdelete() end, { desc = "Delete Buffer" })
+map("n", leader("bD"), function () Snacks.bufdelete.all() end, { desc = "Delete All Buffers" })
+map("n", leader("bo"), function () Snacks.bufdelete.other() end, { desc = "Delete Other Buffers" })
 
 -- Clear search highlight
 map("n", "<Esc>", "<cmd>nohlsearch<cr><Esc>", { desc = "Clear Search Highlight" })
@@ -60,7 +60,7 @@ map("t", "<Esc><Esc>", "<C-\\><C-n>", { desc = "Exit Terminal Mode" })
 map("n", leader("to"), "<cmd>TestOpen<cr>", { desc = "Switch to/from test file" })
 
 -- Debug trace
-map("n", leader("wtf"), function()
+map("n", leader("wtf"), function ()
   local ft = vim.bo.filetype
   if ft == "ruby" or ft == "crystal" then
     vim.cmd('normal! oputs "#" * 90')
@@ -89,20 +89,22 @@ map("n", leader("wtf"), function()
   else
     print("No <leader>wtf definition for '" .. ft .. "'")
   end
-end, { desc = "fuck?" })
+end, { desc = "fuck?" }
+)
 
 -- Copy file path
-map("n", leader("bc"), function()
+map("n", leader("bc"), function ()
   local path = vim.fn.expand("%:.")
   vim.fn.setreg("+", path)
   notify.info("Copied " .. path .. " to clipboard")
-end, { desc = "Copy relative file path" })
+end, { desc = "Copy relative file path" }
+)
 
 -- Spotify
 local function playback(flag)
   vim.fn.jobstart({ "spotatui", "playback", flag }, {
     stderr_buffered = true,
-    on_stderr = function(_, data)
+    on_stderr = function (_, data)
       local error_message = table.concat(data)
       if is.empty(error_message) then return end
       if string.find(error_message, "no") and string.find(error_message, "playback") then
@@ -110,22 +112,22 @@ local function playback(flag)
       else
         notify.error(string.format("Unhandled error: \"%s\"", error_message))
       end
-    end,
+    end
   })
 end
 
-map("n", leader("mo"), function() Snacks.terminal.toggle("spotify") end, { desc = "Open spotify" })
-map("n", leader("mn"), function() playback("--next") end, { desc = "Next song" })
-map("n", leader("mp"), function() playback("--previous") end, { desc = "Previous song" })
-map("n", leader("mt"), function() playback("play-pause") end, { desc = "Toggle play/pause" })
-map("n", leader("mf"), function() playback({ "seek", "10000" }) end, { desc = "Fast-forward 10s" })
-map("n", leader("mb"), function() playback({ "seek", "--", "-10000" }) end, { desc = "Rewind 10s" })
+map("n", leader("mo"), function () Snacks.terminal.toggle("spotify") end, { desc = "Open spotify" })
+map("n", leader("mn"), function () playback("--next") end, { desc = "Next song" })
+map("n", leader("mp"), function () playback("--previous") end, { desc = "Previous song" })
+map("n", leader("mt"), function () playback("play-pause") end, { desc = "Toggle play/pause" })
+map("n", leader("mf"), function () playback({ "seek", "10000" }) end, { desc = "Fast-forward 10s" })
+map("n", leader("mb"), function () playback({ "seek", "--", "-10000" }) end, { desc = "Rewind 10s" })
 
 -- Toggle zoom + focus on any terminal window in the current tab. From any
 -- window: jump to the first terminal, max it, drop into insert mode. Press
 -- again: rebalance the splits and restore focus to where you came from.
-local term_zoom_state = nil ---@type {prev_win: integer}|nil
-vim.keymap.set({ "n", "i", "t", "x" }, "<C-,>", function()
+local term_zoom_state = nil ---@type { prev_win: integer } | nil
+vim.keymap.set({ "n", "i", "t", "x" }, "<C-,>", function ()
   if term_zoom_state then
     vim.cmd("stopinsert")
     vim.cmd("wincmd =")
@@ -150,11 +152,12 @@ vim.keymap.set({ "n", "i", "t", "x" }, "<C-,>", function()
   vim.cmd("resize")
   vim.cmd("vertical resize")
   vim.cmd("startinsert")
-end, { desc = "Toggle terminal zoom + focus", silent = true })
+end, { desc = "Toggle terminal zoom + focus", silent = true }
+)
 
 local terminal_state = { last = nil }
 
-map("t", "<C-;>", function()
+map("t", "<C-;>", function ()
   local buf = vim.api.nvim_get_current_buf()
   for _, terminal in pairs(Snacks.terminal.list()) do
     if terminal.buf == buf then
@@ -163,42 +166,44 @@ map("t", "<C-;>", function()
       return
     end
   end
-end, { desc = "Toggle Terminal" })
+end, { desc = "Toggle Terminal" }
+)
 
-map("n", "<C-;>", function()
+map("n", "<C-;>", function ()
   local terminal = terminal_state.last
   if terminal then
     terminal:show()
   end
-end, { desc = "Toggle Terminal" })
+end, { desc = "Toggle Terminal" }
+)
 
-map("n", leader("gg"), function()
+map("n", leader("gg"), function ()
   Snacks.lazygit({
     cwd = require("utils.path").root(),
     config = {
       os = {
         -- lazygit's nvim-remote preset uses --remote-tab, which opens files in a new tab page. --remote opens in the current window instead.
         edit = 'nvim --server "$NVIM" --remote-send "q" && nvim --server "$NVIM" --remote {{filename}}',
-        editAtLine =
-        'nvim --server "$NVIM" --remote-send "q" && nvim --server "$NVIM" --remote {{filename}} && nvim --server "$NVIM" --remote-send ":{{line}}<CR>"',
-      },
-    },
+        editAtLine = 'nvim --server "$NVIM" --remote-send "q" && nvim --server "$NVIM" --remote {{filename}} && nvim --server "$NVIM" --remote-send ":{{line}}<CR>"'
+      }
+    }
   })
-end, { desc = "Lazygit" })
-map("n", leader("ts"), function() Snacks.terminal.toggle("tetrigo") end, { desc = "Launch Tetris" })
+end, { desc = "Lazygit" }
+)
+map("n", leader("ts"), function () Snacks.terminal.toggle("tetrigo") end, { desc = "Launch Tetris" })
 
 -- Rendered via snacks image (kitty graphics protocol) because nvim's terminal
 -- emulator strips sixel sequences, so img2sixel in a terminal buffer shows nothing.
-map("n", leader("tp"), function()
+map("n", leader("tp"), function ()
   cmd.tanda_cli({ "clockin", "photo", "list", "-f", "valid" }, {
-    on_stdout = cmd.default_handler(function(data)
-      local photos = vim.tbl_filter(function(line) return vim.startswith(line, "/") end, data)
+    on_stdout = cmd.default_handler(function (data)
+      local photos = vim.tbl_filter(function (line) return vim.startswith(line, "/") end, data)
       if #photos == 0 then
         notify.warn("No clockin photos found")
         return
       end
 
-      local random_photo = function() return photos[math.random(#photos)] end
+      local random_photo = function () return photos[math.random(#photos)] end
       local advance ---@type fun()
 
       local win = Snacks.win({
@@ -207,9 +212,9 @@ map("n", leader("tp"), function()
         border = "rounded",
         keys = {
           q = "close",
-          n = { "n", function() advance() end, desc = "Next photo" },
+          n = { "n", function () advance() end, desc = "Next photo" }
         },
-        bo = { buftype = "nofile", bufhidden = "wipe" },
+        bo = { buftype = "nofile", bufhidden = "wipe" }
       })
 
       local function photo_size_in_cells(photo)
@@ -232,7 +237,7 @@ map("n", leader("tp"), function()
           width = width,
           height = height,
           row = math.floor((vim.o.lines - height) / 2),
-          col = math.floor((vim.o.columns - width) / 2),
+          col = math.floor((vim.o.columns - width) / 2)
         })
       end
 
@@ -247,20 +252,20 @@ map("n", leader("tp"), function()
 
         Snacks.image.buf.attach(win.buf, {
           src = photo,
-          on_update = vim.schedule_wrap(function(placement)
+          on_update = vim.schedule_wrap(function (placement)
             if not win:valid() then
               return
             end
 
             local loc = placement:state().loc
             set_window_size(loc.width, loc.height)
-          end),
+          end)
         })
       end
 
       local timer = vim.uv.new_timer()
 
-      local tick = vim.schedule_wrap(function()
+      local tick = vim.schedule_wrap(function ()
         if not win:valid() then
           timer:stop()
           timer:close()
@@ -270,7 +275,7 @@ map("n", leader("tp"), function()
         show(random_photo())
       end)
 
-      advance = function()
+      advance = function ()
         timer:stop()
         show(random_photo())
         timer:start(2000, 2000, tick)
@@ -278,8 +283,9 @@ map("n", leader("tp"), function()
 
       show(random_photo())
       timer:start(2000, 2000, tick)
-    end),
+    end)
   })
-end, { desc = "Clockin photo slideshow" })
-map("n", leader("bt"), function() Snacks.terminal.toggle("btop") end, { desc = "Launch btop" })
-map("n", leader("l"), function() require("config.linear").toggle() end, { desc = "Launch Linear" })
+end, { desc = "Clockin photo slideshow" }
+)
+map("n", leader("bt"), function () Snacks.terminal.toggle("btop") end, { desc = "Launch btop" })
+map("n", leader("l"), function () require("config.linear").toggle() end, { desc = "Launch Linear" })

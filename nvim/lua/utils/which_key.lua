@@ -8,8 +8,8 @@ local M = {}
 -- `timeoutlen`. Re-creating the trigger moves it back to the head of the
 -- list, where `nowait` wins again. Call this after adding buffer-local
 -- mappings that share a prefix with a which-key trigger.
-M.refresh_triggers = function(buf)
-  vim.schedule(function()
+M.refresh_triggers = function (buf)
+  vim.schedule(function ()
     if not vim.api.nvim_buf_is_valid(buf) then
       return
     end

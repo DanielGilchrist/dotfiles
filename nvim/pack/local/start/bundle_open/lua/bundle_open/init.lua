@@ -8,7 +8,7 @@ local function fetch_gem_list(callback)
 
   notify.info("Fetching gem list for " .. vim.fn.fnamemodify(vim.fn.getcwd(), ":t") .. "...", {
     id = notify_gem_list_id,
-    timeout = false,
+    timeout = false
   })
 
   local function on_stdout(_, data)
@@ -55,19 +55,15 @@ local function open_gem()
     if item then
       local cwd = vim.fn.getcwd()
       local cmd = string.format(
-        "wezterm cli spawn --cwd=%s -- bundle open %s",
-        vim.fn.shellescape(cwd),
-        vim.fn.shellescape(item.text)
+        "wezterm cli spawn --cwd=%s -- bundle open %s", vim.fn.shellescape(cwd), vim.fn.shellescape(item.text)
       )
       vim.fn.system(cmd)
     end
   end
 
-  fetch_gem_list(function(gems)
-    local items = vim.tbl_map(function(gem)
-      return {
-        text = gem,
-      }
+  fetch_gem_list(function (gems)
+    local items = vim.tbl_map(function (gem)
+      return { text = gem }
     end, gems)
 
     Snacks.picker.pick({
@@ -83,6 +79,4 @@ local function open_gem()
   end)
 end
 
-return {
-  open = open_gem,
-}
+return { open = open_gem }

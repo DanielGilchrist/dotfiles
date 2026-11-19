@@ -21,8 +21,8 @@ return {
       { "<leader>/", icon = { icon = "󱈇", color = "blue" } },
       { "<leader>|", icon = { icon = "󰤼", color = "blue" } },
       { "]", group = "Next" },
-      { "[", group = "Previous" },
+      { "[", group = "Previous" }
     },
-    preset = "helix",
-  },
+    preset = "helix"
+  }
 }

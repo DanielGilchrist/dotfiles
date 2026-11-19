@@ -1,11 +1,11 @@
 local lsp_utils = require("lsp.utils")
 
 local function add_ruby_deps_command(client, bufnr)
-  local show_ruby_deps = function(opts)
+  local show_ruby_deps = function (opts)
     local params = vim.lsp.util.make_text_document_params()
     local showAll = opts.args == "all"
 
-    client:request("rubyLsp/workspace/dependencies", params, function(error, result)
+    client:request("rubyLsp/workspace/dependencies", params, function (error, result)
       if error then
         print("Error showing deps: " .. error)
         return
@@ -23,12 +23,13 @@ local function add_ruby_deps_command(client, bufnr)
 
       vim.fn.setqflist(qf_list)
       vim.cmd("copen")
-    end, bufnr)
+    end, bufnr
+    )
   end
 
   vim.api.nvim_buf_create_user_command(bufnr, "ShowRubyDeps", show_ruby_deps, {
     nargs = "?",
-    complete = function()
+    complete = function ()
       return { "all" }
     end
   })
@@ -47,19 +48,19 @@ return {
   root_markers = { "Gemfile", ".git" },
   workspace_required = true,
   cmd_env = {
-    RAILS_ENV = "test",
+    RAILS_ENV = "test"
   },
   init_options = {
     formatter = "none",
     linters = {},
     addonSettings = {
       ["Ruby LSP Rails"] = {
-        enablePendingMigrationsPrompt = false,
-      },
-    },
+        enablePendingMigrationsPrompt = false
+      }
+    }
   },
-  on_attach = function(client, bufnr)
+  on_attach = function (client, bufnr)
     client.commands["rubyLsp.openFile"] = open_file
     add_ruby_deps_command(client, bufnr)
-  end,
+  end
 }

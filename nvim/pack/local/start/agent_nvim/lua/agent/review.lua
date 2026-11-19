@@ -7,32 +7,32 @@ local ns = vim.api.nvim_create_namespace("agent_review")
 local edit_ns = vim.api.nvim_create_namespace("agent_review_editing")
 
 ---@class ReviewComment
----@field id integer
----@field bufnr integer|nil
----@field file string
----@field relpath string
----@field ft string
----@field lnum integer
----@field nlines integer
----@field code string[]
----@field text string
----@field file_level boolean|nil
+---@field id         integer
+---@field bufnr      integer | nil
+---@field file       string
+---@field relpath    string
+---@field ft         string
+---@field lnum       integer
+---@field nlines     integer
+---@field code       string[]
+---@field text       string
+---@field file_level boolean | nil
 
 ---@type ReviewComment[]
 M.comments = {}
 M._next_id = 1
-M._base = nil ---@type string|nil
+M._base = nil ---@type string | nil
 M._active = false
-M._root = nil ---@type string|nil
-M._message = nil ---@type string|nil
+M._root = nil ---@type string | nil
+M._message = nil ---@type string | nil
 ---@class ChangedFile
----@field text string
----@field file string
+---@field text      string
+---@field file      string
 ---@field untracked boolean
----@field add integer
----@field del integer
+---@field add       integer
+---@field del       integer
 
----@type ChangedFile[]|nil
+---@type ChangedFile[] | nil
 M._changed = nil
 ---@type table<string, boolean>
 M.reviewed = {}
@@ -44,14 +44,16 @@ local path_utils = require("utils.path")
 local ui_utils = require("utils.ui")
 local notify = require("utils.notify").with_title("agent review")
 
-local function rcfg() return config.review or {} end
+local function rcfg()
+  return config.review or {}
+end
 
 ---@return boolean
 local function has_message()
   return M._message ~= nil and is.not_empty(vim.trim(M._message))
 end
 
----@param text string
+---@param text  string
 ---@param width integer
 ---@return string[]
 local function wrap_text(text, width)
@@ -78,9 +80,9 @@ local function wrap_text(text, width)
   return out
 end
 
----@param dir string
+---@param dir  string
 ---@param args string[]
----@return string|nil
+---@return string | nil
 local function git(dir, args)
   local cmd = { "git", "-C", dir }
   vim.list_extend(cmd, args)
@@ -89,8 +91,8 @@ local function git(dir, args)
   return vim.trim(res.stdout or "")
 end
 
----@param path string|nil
----@return string|nil
+---@param path string | nil
+---@return string | nil
 local function repo_root(path)
   local dir = is.not_empty(path) and vim.fn.fnamemodify(path, ":h") or vim.fn.getcwd()
   if is.not_directory(dir) then dir = vim.fn.getcwd() end
@@ -102,7 +104,7 @@ end
 local function remotes(root)
   local out = git(root, { "remote" })
   local names = out and vim.split(out, "\n", { trimempty = true }) or {}
-  table.sort(names, function(a, b)
+  table.sort(names, function (a, b)
     if a == "origin" or b == "origin" then return a == "origin" end
     return a < b
   end)
@@ -151,21 +153,23 @@ local function resolve_base(root)
   return fork_point(root)
 end
 
----@return string|nil
+---@return string | nil
 local function current_base()
   return M._base
 end
 
----@param root string
----@param tracked string
+---@param root      string
+---@param tracked   string
 ---@param untracked string
----@param numstat string
+---@param numstat   string
 ---@return ChangedFile[]
 local function parse_changed(root, tracked, untracked, numstat)
   local stat = {}
   for line in numstat:gmatch("[^\n]+") do
     local a, d, rel = line:match("^(%S+)\t(%S+)\t(.+)$")
-    if rel then stat[vim.trim(rel)] = { add = tonumber(a) or 0, del = tonumber(d) or 0 } end
+    if rel then
+      stat[vim.trim(rel)] = { add = tonumber(a) or 0, del = tonumber(d) or 0 }
+    end
   end
   local seen, items = {}, {}
   local function add(rel, is_untracked)
@@ -182,27 +186,31 @@ local function parse_changed(root, tracked, untracked, numstat)
     end
     items[#items + 1] = { text = rel, file = root .. "/" .. rel, untracked = is_untracked, add = adds, del = dels }
   end
-  for line in tracked:gmatch("[^\n]+") do add(line, false) end
-  for line in untracked:gmatch("[^\n]+") do add(line, true) end
+  for line in tracked:gmatch("[^\n]+") do
+    add(line, false)
+  end
+  for line in untracked:gmatch("[^\n]+") do
+    add(line, true)
+  end
   return items
 end
 
 ---@param root string
 ---@param base string
----@param cb fun(items: ChangedFile[])
+---@param cb   fun(items: ChangedFile[])
 local function list_changed(root, base, cb)
   local commands = {
     tracked = { "diff", "--name-only", base },
     untracked = { "ls-files", "--others", "--exclude-standard" },
-    numstat = { "diff", "--numstat", "--no-renames", base },
+    numstat = { "diff", "--numstat", "--no-renames", base }
   }
   local outputs, pending = {}, vim.tbl_count(commands)
   for key, args in pairs(commands) do
-    vim.system(vim.list_extend({ "git", "-C", root }, args), { text = true }, function(res)
+    vim.system(vim.list_extend({ "git", "-C", root }, args), { text = true }, function (res)
       outputs[key] = cmd_utils.success(res.code) and res.stdout or ""
       pending = pending - 1
       if pending > 0 then return end
-      vim.schedule(function() cb(parse_changed(root, outputs.tracked, outputs.untracked, outputs.numstat)) end)
+      vim.schedule(function () cb(parse_changed(root, outputs.tracked, outputs.untracked, outputs.numstat)) end)
     end)
   end
 end
@@ -211,7 +219,7 @@ end
 local function refresh_changed(on_done)
   local root, base, session = M._root, current_base(), M._session
   if not (M._active and root and base) then return end
-  list_changed(root, base, function(items)
+  list_changed(root, base, function (items)
     if not (M._active and M._session == session) then return end
     M._changed = items
     if on_done then on_done(items) end
@@ -225,7 +233,7 @@ local function state_path(root)
 end
 
 ---@param root string
----@return table|nil
+---@return table | nil
 local function read_state(root)
   local raw = file_utils.read(state_path(root))
   if not raw then return nil end
@@ -240,15 +248,15 @@ local function clear_state(root)
 end
 
 ---@param buf integer
----@param s integer
----@param e integer
+---@param s   integer
+---@param e   integer
 local function highlight_range(buf, s, e)
   local last = vim.api.nvim_buf_line_count(buf) - 1
   for l = s, e do
     local row = math.min(l - 1, last)
     pcall(vim.api.nvim_buf_set_extmark, buf, edit_ns, row, 0, {
       line_hl_group = rcfg().editing_hl or "Visual",
-      priority = 20000,
+      priority = 20000
     })
   end
 end
@@ -280,7 +288,7 @@ local function watch(buf)
       return
     end
     running = true
-    require("unified.utils.async").run(function()
+    require("unified.utils.async").run(function ()
       pcall(require("unified.git").show_git_diff_against_commit, current_base() or "HEAD", buf)
       running = false
       if pending then
@@ -293,13 +301,13 @@ local function watch(buf)
   vim.api.nvim_create_autocmd({ "TextChanged", "InsertLeave", "BufWritePost", "FileChangedShellPost" }, {
     group = refresh_aug,
     buffer = buf,
-    callback = function()
+    callback = function ()
       tick = tick + 1
       local scheduled = tick
-      vim.defer_fn(function()
+      vim.defer_fn(function ()
         if scheduled == tick then run() end
       end, 300)
-    end,
+    end
   })
 end
 
@@ -319,7 +327,7 @@ local function ensure_diff(buf)
 end
 
 ---@param file string
----@param base string|nil
+---@param base string | nil
 ---@param pos? integer[]
 local function open_in_diff(file, base, pos)
   vim.cmd("edit " .. vim.fn.fnameescape(file))
@@ -343,7 +351,9 @@ end
 function M.status()
   if not M.is_active() then return "" end
   local done = 0
-  for _ in pairs(M.reviewed) do done = done + 1 end
+  for _ in pairs(M.reviewed) do
+    done = done + 1
+  end
   local s = ("review %d/%d"):format(done, M._changed and #M._changed or 0)
   if #M.comments > 0 then s = s .. (" · %d✎"):format(#M.comments) end
   return s
@@ -357,8 +367,8 @@ function M.prev_hunk()
   if M.is_active() then require("unified.navigation").previous_hunk() end
 end
 
----@param root string
----@param base string
+---@param root  string
+---@param base  string
 ---@param label string
 local function open_review(root, base, label)
   M._active = true
@@ -373,14 +383,16 @@ local function open_review(root, base, label)
 end
 
 ---@param root string
----@param cb fun(sha: string)
+---@param cb   fun(sha: string)
 function M.pick_commit(root, cb)
   local log = git(root, { "log", "--oneline", "-n", "100", "--no-decorate" }) or ""
-  ---@type {text: string, sha: string}[]
+  ---@type { text: string, sha: string } []
   local items = {}
   for line in log:gmatch("[^\n]+") do
     local sha = line:match("^(%S+)")
-    if sha then items[#items + 1] = { text = line, sha = sha } end
+    if sha then
+      items[#items + 1] = { text = line, sha = sha }
+    end
   end
   if #items == 0 then return notify.info("no commits to pick") end
 
@@ -388,14 +400,14 @@ function M.pick_commit(root, cb)
     source = "agent_review_commits",
     title = "review since commit",
     items = items,
-    format = function(item) return { { item.text } } end,
-    preview = function(ctx)
+    format = function (item) return { { item.text } } end,
+    preview = function (ctx)
       return Snacks.picker.preview.cmd({ "git", "-C", root, "show", "--stat", ctx.item.sha }, ctx, { ft = "git" })
     end,
-    confirm = function(picker, item)
+    confirm = function (picker, item)
       picker:close()
       if item then vim.schedule(function() cb(item.sha) end) end
-    end,
+    end
   })
 end
 
@@ -407,18 +419,19 @@ function M.pick_mode(root)
 
   local working = {
     text = "Working tree (uncommitted changes)",
-    run = function() open_review(root, "HEAD", "working tree") end,
+    run = function () open_review(root, "HEAD", "working tree") end
   }
-  local branch = has_branch and {
-    text = ("Branch (all commits since %s)"):format(fork_label),
-    run = function() open_review(root, fork, fork_label) end,
-  } or nil
+  local branch = has_branch
+    and {
+      text = ("Branch (all commits since %s)"):format(fork_label),
+      run = function () open_review(root, fork, fork_label) end
+    } or nil
   local commit = {
     text = "Since a commit…",
-    run = function() M.pick_commit(root, function(sha) open_review(root, sha, sha:sub(1, 8)) end) end,
+    run = function () M.pick_commit(root, function (sha) open_review(root, sha, sha:sub(1, 8)) end) end
   }
 
-  ---@type {text: string, run: fun()}[]
+  ---@type { text: string, run: fun() } []
   local options
   if branch and rcfg().base ~= "head" then
     options = { branch, working, commit }
@@ -428,18 +441,22 @@ function M.pick_mode(root)
     table.insert(options, commit)
   end
 
-  vim.ui.select(options, {
-    prompt = "Review mode:",
-    format_item = function(item) return item.text end,
-  }, function(choice)
-    if choice then choice.run() end
-  end)
+  vim.ui.select(
+    options,
+    {
+      prompt = "Review mode:",
+      format_item = function (item) return item.text end
+    },
+    function (choice)
+      if choice then choice.run() end
+    end
+  )
 end
 
 function M.start()
   if M.is_active() then
     if #M.comments > 0 then
-      ui_utils.confirm(("Exit review? %d pending comment(s) will be discarded."):format(#M.comments), function(choice)
+      ui_utils.confirm(("Exit review? %d pending comment(s) will be discarded."):format(#M.comments), function (choice)
         if choice == "Ok" then M.reset() end
       end)
     else
@@ -453,86 +470,101 @@ function M.start()
 
   local saved = read_state(root)
   if saved then
-    vim.ui.select({ "resume", "start fresh" }, {
-      prompt = ("Resume review? %d comment(s), %d file(s) marked"):format(#(saved.comments or {}), #(saved.reviewed or {})),
-    }, function(choice)
-      if choice == "resume" then
-        M.resume(root, saved)
-      elseif choice == "start fresh" then
-        clear_state(root)
-        M.pick_mode(root)
+    vim.ui.select(
+      { "resume", "start fresh" },
+      {
+        prompt = ("Resume review? %d comment(s), %d file(s) marked"):format(
+          #(saved.comments or {}), #(saved.reviewed or {})
+        )
+      },
+      function (choice)
+        if choice == "resume" then
+          M.resume(root, saved)
+        elseif choice == "start fresh" then
+          clear_state(root)
+          M.pick_mode(root)
+        end
       end
-    end)
+    )
     return
   end
 
   M.pick_mode(root)
 end
 
----@param root string|nil
----@param base string|nil
+---@param root  string | nil
+---@param base  string | nil
 ---@param items ChangedFile[]
 ---@return ChangedFile[]
 local function unreviewed_first(items)
   local ordered = {}
-  for _, it in ipairs(items) do if not M.reviewed[it.file] then ordered[#ordered + 1] = it end end
-  for _, it in ipairs(items) do if M.reviewed[it.file] then ordered[#ordered + 1] = it end end
+  for _, it in ipairs(items) do
+    if not M.reviewed[it.file] then ordered[#ordered + 1] = it end
+  end
+  for _, it in ipairs(items) do
+    if M.reviewed[it.file] then ordered[#ordered + 1] = it end
+  end
   return ordered
 end
 
----@param base string
+---@param base  string
 ---@param items ChangedFile[]
 ---@return string
 local function changed_title(base, items)
   local adds, dels = 0, 0
-  for _, it in ipairs(items) do adds, dels = adds + it.add, dels + it.del end
+  for _, it in ipairs(items) do
+    adds, dels = adds + it.add, dels + it.del
+  end
   return ("changed vs %s   +%d -%d"):format(base:sub(1, 8), adds, dels)
 end
 
----@param root string
----@param base string
+---@param root  string
+---@param base  string
 ---@param items ChangedFile[]
 ---@return snacks.Picker
 local function pick_changed(root, base, items)
   return Snacks.picker.pick({
     source = "agent_review_files",
     title = changed_title(base, items),
-    finder = function() return unreviewed_first(M._changed or items) end,
-    format = function(item)
-      local segs = M.reviewed[item.file]
-        and { { "✓ ", "DiagnosticOk" }, { item.text, "Comment" } }
+    finder = function () return unreviewed_first(M._changed or items) end,
+    format = function (item)
+      local segs = M.reviewed[item.file] and { { "✓ ", "DiagnosticOk" }, { item.text, "Comment" } }
         or { { "  " }, { item.text, "SnacksPickerFile" } }
       segs[#segs + 1] = { "  +" .. item.add, "Added" }
       segs[#segs + 1] = { " -" .. item.del, "Removed" }
       return segs
     end,
-    preview = function(ctx)
+    preview = function (ctx)
       local cmd
       if ctx.item.untracked then
-        cmd = { "sh", "-c", ("git -C %s diff --no-index -- /dev/null %s || true"):format(
-          vim.fn.shellescape(root), vim.fn.shellescape(ctx.item.text)) }
+        cmd = {
+          "sh", "-c",
+          ("git -C %s diff --no-index -- /dev/null %s || true"):format(
+            vim.fn.shellescape(root), vim.fn.shellescape(ctx.item.text)
+          )
+        }
       else
         cmd = { "git", "-C", root, "diff", base, "--", ctx.item.text }
       end
       return Snacks.picker.preview.cmd(cmd, ctx, { ft = "diff" })
     end,
-    confirm = function(picker, item)
+    confirm = function (picker, item)
       picker:close()
       if item then vim.schedule(function() open_in_diff(item.file, base) end) end
     end,
     actions = {
-      agent_toggle_reviewed = function(picker, item)
+      agent_toggle_reviewed = function (picker, item)
         if not item then return end
         local now = not M.reviewed[item.file]
         M.reviewed[item.file] = now or nil
         picker:refresh()
         if now then picker.list:move(1) end
-      end,
+      end
     },
     win = {
       input = { keys = { ["<a-m>"] = { "agent_toggle_reviewed", mode = { "i", "n" } } } },
-      list = { keys = { ["m"] = "agent_toggle_reviewed" } },
-    },
+      list = { keys = { ["m"] = "agent_toggle_reviewed" } }
+    }
   })
 end
 
@@ -543,7 +575,7 @@ function M.changed_files()
 
   local cached = M._changed
   if not cached then
-    return refresh_changed(function(items)
+    return refresh_changed(function (items)
       if #items == 0 then return notify.info("no changes vs " .. base:sub(1, 8)) end
       pick_changed(root, base, items)
     end)
@@ -551,7 +583,7 @@ function M.changed_files()
 
   if #cached == 0 then notify.info("no changes vs " .. base:sub(1, 8)) end
   local picker = #cached > 0 and pick_changed(root, base, cached) or nil
-  refresh_changed(function(items)
+  refresh_changed(function (items)
     if picker and not picker.closed then
       picker.title = changed_title(base, items)
       picker:update_titles()
@@ -572,10 +604,11 @@ function M.toggle_reviewed()
 
   local root = M._root
   local done = 0
-  for _ in pairs(M.reviewed) do done = done + 1 end
+  for _ in pairs(M.reviewed) do
+    done = done + 1
+  end
   local total = M._changed and tostring(#M._changed) or "?"
-  local rel = (root and vim.startswith(file, root .. "/")) and file:sub(#root + 2)
-    or path_utils.basename(file)
+  local rel = (root and vim.startswith(file, root .. "/")) and file:sub(#root + 2) or path_utils.basename(file)
   notify.info(("%s %s (%d/%s reviewed)"):format(M.reviewed[file] and "✓ marked" or "○ unmarked", rel, done, total))
 end
 
@@ -584,7 +617,9 @@ local function target_range()
   local mode = vim.fn.mode()
   if mode:match("^[vV\022]") then
     local s, e = vim.fn.line("v"), vim.fn.line(".")
-    if s > e then s, e = e, s end
+    if s > e then
+      s, e = e, s
+    end
     vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<Esc>", true, false, true), "nx", false)
     return s, e
   end
@@ -593,7 +628,7 @@ local function target_range()
 end
 
 ---@param c ReviewComment
----@return integer[]|nil
+---@return integer[] | nil
 local function extmark_pos(c)
   if not (c.bufnr and vim.api.nvim_buf_is_valid(c.bufnr)) then return nil end
   local pos = vim.api.nvim_buf_get_extmark_by_id(c.bufnr, ns, c.id, {})
@@ -639,7 +674,7 @@ function M._render(c)
       sign_text = cfg.sign or "▌",
       sign_hl_group = cfg.sign_hl or "DiagnosticInfo",
       virt_lines = virt,
-      virt_lines_above = true,
+      virt_lines_above = true
     })
     return
   end
@@ -653,11 +688,11 @@ function M._render(c)
     virt_lines = virt,
     virt_lines_above = false,
     end_row = math.min(c.lnum - 1 + (c.nlines - 1), last),
-    hl_group = cfg.range_hl,
+    hl_group = cfg.range_hl
   })
 end
 
----@param opts? {range?: integer[], file_level?: boolean}
+---@param opts? { range?: integer[], file_level?: boolean }
 function M.add_comment(opts)
   if not require_active() then return end
   opts = opts or {}
@@ -681,7 +716,9 @@ function M.add_comment(opts)
   else
     if opts.range then
       s, e = opts.range[1], opts.range[2]
-      if s > e then s, e = e, s end
+      if s > e then
+        s, e = e, s
+      end
     else
       s, e = target_range()
     end
@@ -691,7 +728,7 @@ function M.add_comment(opts)
     highlight_range(buf, s, e)
   end
 
-  ui.new_prompt(function(text)
+  ui.new_prompt(function (text)
     text = vim.trim(text)
     if is.empty(text) then return end
     ---@type ReviewComment
@@ -705,17 +742,18 @@ function M.add_comment(opts)
       nlines = e - s + 1,
       code = code,
       text = text,
-      file_level = file_level or nil,
+      file_level = file_level or nil
     }
     M._next_id = M._next_id + 1
     M.comments[#M.comments + 1] = c
     M._render(c)
     notify.info(("comment added (%d pending)"):format(#M.comments))
-  end, {
-    title = (" review: %s   (<C-s> submit, q cancel) "):format(loc),
-    split = true,
-    on_close = function() if not file_level then clear_highlight(buf) end end,
-  })
+  end,
+    {
+      title = (" review: %s   (<C-s> submit, q cancel) "):format(loc),
+      split = true,
+      on_close = function () if not file_level then clear_highlight(buf) end end
+    })
 end
 
 function M.add_file_comment()
@@ -724,14 +762,15 @@ end
 
 function M.set_message()
   if not require_active() then return end
-  ui.new_prompt(function(text)
+  ui.new_prompt(function (text)
     M._message = vim.trim(text)
     notify.info(is.not_empty(M._message) and "review message set" or "review message cleared")
-  end, {
-    title = " review message   (<C-s> save, q cancel) ",
-    initial = M._message or "",
-    split = true,
-  })
+  end,
+    {
+      title = " review message   (<C-s> save, q cancel) ",
+      initial = M._message or "",
+      split = true
+    })
 end
 
 ---@param c ReviewComment
@@ -767,18 +806,19 @@ function M.edit_comment()
       local s = current_lnum(c)
       if line >= s and line <= s + c.nlines - 1 then
         highlight_range(buf, s, s + c.nlines - 1)
-        ui.new_prompt(function(text)
+        ui.new_prompt(function (text)
           text = vim.trim(text)
           if is.empty(text) then return end
           c.text = text
           M._render(c)
           notify.info("comment updated")
-        end, {
-          title = (" edit comment: %s   (<C-s> save, q cancel) "):format(c.relpath),
-          initial = c.text,
-          split = true,
-          on_close = function() clear_highlight(buf) end,
-        })
+        end,
+          {
+            title = (" edit comment: %s   (<C-s> save, q cancel) "):format(c.relpath),
+            initial = c.text,
+            split = true,
+            on_close = function () clear_highlight(buf) end
+          })
         return
       end
     end
@@ -787,7 +827,9 @@ function M.edit_comment()
 end
 
 function M.clear()
-  for _, c in ipairs(M.comments) do forget(c) end
+  for _, c in ipairs(M.comments) do
+    forget(c)
+  end
   M.comments = {}
 end
 
@@ -800,26 +842,19 @@ function M.list()
   for _, c in ipairs(M.comments) do
     local ln = current_lnum(c)
     local first = vim.split(c.text, "\n", { plain = true })[1]
-    local label = c.file_level
-      and ("%s (file)  %s"):format(c.relpath, first)
+    local label = c.file_level and ("%s (file)  %s"):format(c.relpath, first)
       or ("%s:%d  %s"):format(c.relpath, ln, first)
-    items[#items + 1] = {
-      text = label,
-      file = c.file,
-      pos = { ln, 0 },
-      comment = c,
-    }
+    items[#items + 1] = { text = label, file = c.file, pos = { ln, 0 }, comment = c }
   end
 
   Snacks.picker.pick({
     source = "agent_review_comments",
     title = ("review comments (%d)"):format(#M.comments),
     items = items,
-    format = function(item) return { { item.text } } end,
-    preview = function(ctx)
+    format = function (item) return { { item.text } } end,
+    preview = function (ctx)
       local c = ctx.item.comment
-      local lines = c.file_level
-        and { "# " .. c.relpath .. " (whole file)", "" }
+      local lines = c.file_level and { "# " .. c.relpath .. " (whole file)", "" }
         or { "# " .. c.relpath .. ":" .. current_lnum(c), "" }
       if not c.file_level then
         vim.list_extend(lines, c.code)
@@ -830,10 +865,10 @@ function M.list()
       ctx.preview:set_lines(lines)
       ctx.preview:set_title(c.relpath)
     end,
-    confirm = function(picker, item)
+    confirm = function (picker, item)
       picker:close()
       if item then vim.schedule(function() open_in_diff(item.file, current_base(), item.pos) end) end
-    end,
+    end
   })
 end
 
@@ -856,8 +891,7 @@ local function build_markdown()
       out[#out + 1] = ""
     else
       local ln = current_lnum(c)
-      local loc = c.nlines > 1
-        and ("%s:%d-%d"):format(c.relpath, ln, ln + c.nlines - 1)
+      local loc = c.nlines > 1 and ("%s:%d-%d"):format(c.relpath, ln, ln + c.nlines - 1)
         or ("%s:%d"):format(c.relpath, ln)
       out[#out + 1] = ("## %d. %s"):format(i, loc)
       out[#out + 1] = ""
@@ -872,7 +906,7 @@ local function build_markdown()
   return table.concat(out, "\n")
 end
 
----@param root string
+---@param root  string
 ---@param entry string
 local function add_local_exclude(root, entry)
   local rel = git(root, { "rev-parse", "--git-path", "info/exclude" })
@@ -884,7 +918,7 @@ local function add_local_exclude(root, entry)
   file_utils.append(path, "\n" .. entry .. "\n")
 end
 
----@param md string
+---@param md    string
 ---@param count integer
 local function deliver(md, count)
   local agent = require("agent")
@@ -904,7 +938,9 @@ local function deliver(md, count)
   if not file_utils.write(path, md) then return notify.error("could not write " .. path) end
   add_local_exclude(root, fname)
 
-  local msg = ("Read `%s` in the repo root. It lists my review comments on your recent changes. Work through each one, then delete the file."):format(fname)
+  local msg = ("Read `%s` in the repo root. It lists my review comments on your recent changes. Work through each one, then delete the file."):format(
+    fname
+  )
   if agent.send_text(msg) then
     notify.info(("sent %d comment(s) → %s"):format(count, fname))
     M.reset()
@@ -927,8 +963,7 @@ local function preview_send(count)
       vim.list_extend(lines, vim.split(c.text, "\n", { plain = true }))
     else
       local ln = current_lnum(c)
-      local loc = c.nlines > 1
-        and ("%s:%d-%d"):format(c.relpath, ln, ln + c.nlines - 1)
+      local loc = c.nlines > 1 and ("%s:%d-%d"):format(c.relpath, ln, ln + c.nlines - 1)
         or ("%s:%d"):format(c.relpath, ln)
       lines = { "## " .. loc, "", "```" .. (c.ft or "") }
       vim.list_extend(lines, c.code)
@@ -957,7 +992,7 @@ local function preview_send(count)
       style = "minimal",
       border = "rounded",
       title = title,
-      title_pos = "center",
+      title_pos = "center"
     }
   end
 
@@ -972,8 +1007,10 @@ local function preview_send(count)
     vim.api.nvim_buf_set_lines(buf, 0, -1, false, pages[idx])
     vim.bo[buf].modifiable = false
     if win and vim.api.nvim_win_is_valid(win) then
-      pcall(vim.api.nvim_win_set_config, win,
-        float_cfg((" review %d/%d: ]/[ nav, <C-s> send all, q cancel "):format(idx, total)))
+      pcall(
+        vim.api.nvim_win_set_config, win,
+        float_cfg((" review %d/%d: ]/[ nav, <C-s> send all, q cancel "):format(idx, total))
+      )
       pcall(vim.api.nvim_win_set_cursor, win, { 1, 0 })
     end
   end
@@ -992,10 +1029,10 @@ local function preview_send(count)
   end
 
   local kopts = { buffer = buf, nowait = true, silent = true }
-  vim.keymap.set("n", "]", function() nav(1) end, kopts)
-  vim.keymap.set("n", "[", function() nav(-1) end, kopts)
-  vim.keymap.set("n", "<Tab>", function() nav(1) end, kopts)
-  vim.keymap.set("n", "<S-Tab>", function() nav(-1) end, kopts)
+  vim.keymap.set("n", "]", function () nav(1) end, kopts)
+  vim.keymap.set("n", "[", function () nav(-1) end, kopts)
+  vim.keymap.set("n", "<Tab>", function () nav(1) end, kopts)
+  vim.keymap.set("n", "<S-Tab>", function () nav(-1) end, kopts)
   vim.keymap.set("n", "<C-s>", send, kopts)
   vim.keymap.set("n", "q", close, kopts)
   vim.keymap.set("n", "<Esc>", close, kopts)
@@ -1023,13 +1060,26 @@ function M._save_state()
   local comments = {}
   for _, c in ipairs(M.comments) do
     comments[#comments + 1] = {
-      relpath = c.relpath, ft = c.ft, lnum = current_lnum(c),
-      nlines = c.nlines, code = c.code, text = c.text, file_level = c.file_level,
+      relpath = c.relpath,
+      ft = c.ft,
+      lnum = current_lnum(c),
+      nlines = c.nlines,
+      code = c.code,
+      text = c.text,
+      file_level = c.file_level
     }
   end
   local path = state_path(M._root)
   vim.fn.mkdir(vim.fn.fnamemodify(path, ":h"), "p")
-  file_utils.write(path, vim.json.encode({ base = M._base, reviewed = reviewed, comments = comments, message = M._message }))
+  file_utils.write(
+    path,
+    vim.json.encode({
+      base = M._base,
+      reviewed = reviewed,
+      comments = comments,
+      message = M._message
+    })
+  )
 end
 
 ---@param root string
@@ -1042,7 +1092,9 @@ function M.resume(root, data)
   M._changed = nil
   refresh_changed()
   M.reviewed = {}
-  for _, rel in ipairs(data.reviewed or {}) do M.reviewed[root .. "/" .. rel] = true end
+  for _, rel in ipairs(data.reviewed or {}) do
+    M.reviewed[root .. "/" .. rel] = true
+  end
   M._message = data.message
   M.comments = {}
   for _, s in ipairs(data.comments or {}) do
@@ -1055,7 +1107,7 @@ function M.resume(root, data)
       nlines = s.nlines,
       code = s.code,
       text = s.text,
-      file_level = s.file_level,
+      file_level = s.file_level
     }
     M._next_id = M._next_id + 1
   end
@@ -1088,7 +1140,7 @@ end
 local aug = vim.api.nvim_create_augroup("agent_review", { clear = true })
 vim.api.nvim_create_autocmd("BufWinEnter", {
   group = aug,
-  callback = function(args)
+  callback = function (args)
     local file = vim.api.nvim_buf_get_name(args.buf)
     if is.empty(file) then return end
     ensure_diff(args.buf)
@@ -1098,21 +1150,21 @@ vim.api.nvim_create_autocmd("BufWinEnter", {
         M._render(c)
       end
     end
-  end,
+  end
 })
 
 vim.api.nvim_create_autocmd("BufUnload", {
   group = aug,
-  callback = function(args)
+  callback = function (args)
     for _, c in ipairs(M.comments) do
       if c.bufnr == args.buf then c.lnum = current_lnum(c) end
     end
-  end,
+  end
 })
 
 vim.api.nvim_create_autocmd("VimLeavePre", {
   group = aug,
-  callback = function() M._save_state() end,
+  callback = function () M._save_state() end
 })
 
 return M

@@ -20,7 +20,7 @@ local function restart()
   end
   for _, buf in ipairs(vim.api.nvim_list_bufs()) do
     if vim.api.nvim_buf_is_loaded(buf) and vim.bo[buf].filetype == "crystal" and not vim.bo[buf].modified then
-      vim.api.nvim_buf_call(buf, function()
+      vim.api.nvim_buf_call(buf, function ()
         vim.cmd("edit")
       end)
     end
@@ -40,18 +40,21 @@ function M.ensure()
       return
     end
     if #output == 0 then
-      vim.schedule(function()
+      vim.schedule(function ()
         vim.notify("heucristic: building in the background")
       end)
     end
     table.insert(output, data)
   end
-  vim.system({ "script/install", "--if-changed" }, { cwd = repo, text = true, stdout = collect }, function(result)
-    vim.schedule(function()
+  vim.system({ "script/install", "--if-changed" }, { cwd = repo, text = true, stdout = collect }, function (result)
+    vim.schedule(function ()
       building = false
       if result.code ~= 0 then
         local lines = vim.split(vim.trim(result.stderr ~= "" and result.stderr or table.concat(output)), "\n")
-        vim.notify("heucristic: build failed\n" .. table.concat(vim.list_slice(lines, math.max(1, #lines - 10)), "\n"), vim.log.levels.ERROR)
+        vim.notify(
+          "heucristic: build failed\n" .. table.concat(vim.list_slice(lines, math.max(1, #lines - 10)), "\n"),
+          vim.log.levels.ERROR
+        )
         return
       end
       local after = installed()

@@ -1,19 +1,23 @@
-local scratchpads = function()
+local scratchpads = function ()
   return require("scratchpads")
 end
 
-vim.api.nvim_create_user_command("ScratchNew", function()
+vim.api.nvim_create_user_command("ScratchNew", function ()
   scratchpads().new()
-end, {})
+end, {}
+)
 
-vim.api.nvim_create_user_command("ScratchOpen", function()
+vim.api.nvim_create_user_command("ScratchOpen", function ()
   scratchpads().open()
-end, {})
+end, {}
+)
 
-vim.api.nvim_create_user_command("ScratchRename", function()
+vim.api.nvim_create_user_command("ScratchRename", function ()
   scratchpads().rename()
-end, {})
+end, {}
+)
 
-vim.api.nvim_create_user_command("ScratchRemove", function()
+vim.api.nvim_create_user_command("ScratchRemove", function ()
   scratchpads().remove()
-end, {})
+end, {}
+)

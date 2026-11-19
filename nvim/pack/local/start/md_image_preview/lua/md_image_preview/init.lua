@@ -11,32 +11,32 @@ local file_utils = require("utils.file")
 local is = require("utils.is")
 local notify = require("utils.notify").with_title("md preview")
 
----@alias MdPreviewMode "float"|"split"
+---@alias MdPreviewMode "float" | "split"
 
 ---@class MdPreviewState
----@field mode MdPreviewMode
----@field src_buf integer
----@field src_win integer
----@field preview_win integer
----@field preview_buf integer
----@field float? snacks.win
----@field augroup integer
----@field placement? snacks.image.Placement
----@field content_hash? string hash of the markdown currently in the page
----@field viewport_key? string "WxH@scale" currently set in Chrome
----@field layout? MdLayout layout of the page content (CSS px)
----@field heading_lines integer[] source line of each heading
----@field offset integer scroll offset in CSS px
----@field frames string[] frame PNGs on disk, oldest first
----@field busy boolean a Chrome round-trip is in flight
----@field dirty boolean another refresh was requested while busy
+---@field mode          MdPreviewMode
+---@field src_buf       integer
+---@field src_win       integer
+---@field preview_win   integer
+---@field preview_buf   integer
+---@field float?        snacks.win
+---@field augroup       integer
+---@field placement?    snacks.image.Placement
+---@field content_hash? string                 hash of the markdown currently in the page
+---@field viewport_key? string                 "WxH@scale" currently set in Chrome
+---@field layout?       MdLayout               layout of the page content (CSS px)
+---@field heading_lines integer[]              source line of each heading
+---@field offset        integer                scroll offset in CSS px
+---@field frames        string[]               frame PNGs on disk, oldest first
+---@field busy          boolean                a Chrome round-trip is in flight
+---@field dirty         boolean                another refresh was requested while busy
 
 ---@class MdImagePreview
----@field open fun(mode?: MdPreviewMode)
----@field close fun()
----@field toggle fun(mode?: MdPreviewMode)
----@field scroll fun(lines: number)
----@field scroll_to fun(where: "top"|"bottom")
+---@field open      fun(mode?: MdPreviewMode)
+---@field close     fun()
+---@field toggle    fun(mode?: MdPreviewMode)
+---@field scroll    fun(lines: number)
+---@field scroll_to fun(where: "top" | "bottom")
 local M = {}
 
 local CACHE_DIR = vim.fn.stdpath("cache") .. "/md_image_preview"
@@ -46,7 +46,7 @@ local BACKGROUND = "#0d1117"
 local ASSETS = {
   ["marked.min.js"] = "https://cdn.jsdelivr.net/npm/marked@15/marked.min.js",
   ["github-markdown-dark.css"] = "https://cdn.jsdelivr.net/npm/github-markdown-css@5/github-markdown-dark.css",
-  ["mermaid.min.js"] = "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js",
+  ["mermaid.min.js"] = "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"
 }
 local MAX_BODY_WIDTH = 1012
 local PADDING_X = 40
@@ -56,15 +56,15 @@ local CURSOR_ANCHOR = 1 / 3
 local EDIT_DEBOUNCE_MS = 150
 local FOLLOW_DEBOUNCE_MS = 30
 
----@type MdPreviewState|nil
+---@type MdPreviewState | nil
 local state
----@type MdChrome|nil
+---@type MdChrome | nil
 local browser
----Monotonic across opens: snacks caches image objects by file path, so a
----reused frame name would redisplay the previously transmitted image.
+--- Monotonic across opens: snacks caches image objects by file path, so a
+--- reused frame name would redisplay the previously transmitted image.
 local frame_sequence = 0
 
----Set `vim.g.md_image_preview_debug = true` to trace renders in :messages.
+--- Set `vim.g.md_image_preview_debug = true` to trace renders in :messages.
 local function log(...)
   if vim.g.md_image_preview_debug then
     print(("md preview %6.0fms:"):format(vim.uv.hrtime() / 1e6 % 100000), ...)
@@ -87,40 +87,43 @@ local function ensure_assets()
   return true
 end
 
----The page that stays loaded in Chrome. `__render` swaps the markdown and
----returns the layout; `__setWidth` matches the body to the preview width.
+--- The page that stays loaded in Chrome. `__render` swaps the markdown and
+--- returns the layout; `__setWidth` matches the body to the preview width.
 local function write_template()
-  file_utils.write(TEMPLATE, table.concat({
-    "<!doctype html><html><head><meta charset=\"utf-8\">",
-    ("<link rel=\"stylesheet\" href=\"file://%s/github-markdown-dark.css\">"):format(CACHE_DIR),
-    ("<style>body{margin:0;background:%s}.markdown-body{box-sizing:border-box;max-width:%dpx;margin:0 auto;padding:%dpx %dpx}</style>"):format(
-      BACKGROUND, MAX_BODY_WIDTH, PADDING_Y, PADDING_X
-    ),
-    "</head><body><div class=\"markdown-body\" id=\"content\"></div>",
-    ("<script src=\"file://%s/marked.min.js\"></script>"):format(CACHE_DIR),
-    ("<script src=\"file://%s/mermaid.min.js\"></script>"):format(CACHE_DIR),
-    "<script>",
-    "const content=document.getElementById('content');",
-    "mermaid.initialize({startOnLoad:false,theme:'dark',securityLevel:'loose'});",
-    "window.__setWidth=(px)=>{document.body.style.width=px+'px'};",
-    "async function renderMermaid(){",
-    "  const blocks=[...content.querySelectorAll('pre > code.language-mermaid')];",
-    "  for(const code of blocks){",
-    "    const pre=code.parentElement;const source=code.textContent;",
-    "    const holder=document.createElement('pre');holder.className='mermaid';holder.textContent=source;",
-    "    pre.replaceWith(holder);",
-    "    try{await mermaid.run({nodes:[holder]})}catch(error){holder.textContent=source+'\\n\\n'+(error?.str||error?.message||JSON.stringify(error))}",
-    "  }",
-    "}",
-    "window.__render=async(src)=>{content.innerHTML=marked.parse(src);await renderMermaid();",
-    "const headings=[...content.querySelectorAll('h1,h2,h3,h4,h5,h6')].map(h=>Math.round(h.getBoundingClientRect().top+window.scrollY));",
-    "const links=[...content.querySelectorAll('a[href]')].map(a=>({href:a.href,rects:[...a.getClientRects()].map(r=>({left:r.left+window.scrollX,top:r.top+window.scrollY,right:r.right+window.scrollX,bottom:r.bottom+window.scrollY}))}));",
-    "return JSON.stringify({height:content.offsetHeight,headings,links})};",
-    "</script></body></html>",
-  }))
+  file_utils.write(
+    TEMPLATE,
+    table.concat({
+      "<!doctype html><html><head><meta charset=\"utf-8\">",
+      ("<link rel=\"stylesheet\" href=\"file://%s/github-markdown-dark.css\">"):format(CACHE_DIR),
+      ("<style>body{margin:0;background:%s}.markdown-body{box-sizing:border-box;max-width:%dpx;margin:0 auto;padding:%dpx %dpx}</style>"):format(
+        BACKGROUND, MAX_BODY_WIDTH, PADDING_Y, PADDING_X
+      ),
+      "</head><body><div class=\"markdown-body\" id=\"content\"></div>",
+      ("<script src=\"file://%s/marked.min.js\"></script>"):format(CACHE_DIR),
+      ("<script src=\"file://%s/mermaid.min.js\"></script>"):format(CACHE_DIR),
+      "<script>",
+      "const content=document.getElementById('content');",
+      "mermaid.initialize({startOnLoad:false,theme:'dark',securityLevel:'loose'});",
+      "window.__setWidth=(px)=>{document.body.style.width=px+'px'};",
+      "async function renderMermaid(){",
+      "  const blocks=[...content.querySelectorAll('pre > code.language-mermaid')];",
+      "  for(const code of blocks){",
+      "    const pre=code.parentElement;const source=code.textContent;",
+      "    const holder=document.createElement('pre');holder.className='mermaid';holder.textContent=source;",
+      "    pre.replaceWith(holder);",
+      "    try{await mermaid.run({nodes:[holder]})}catch(error){holder.textContent=source+'\\n\\n'+(error?.str||error?.message||JSON.stringify(error))}",
+      "  }",
+      "}",
+      "window.__render=async(src)=>{content.innerHTML=marked.parse(src);await renderMermaid();",
+      "const headings=[...content.querySelectorAll('h1,h2,h3,h4,h5,h6')].map(h=>Math.round(h.getBoundingClientRect().top+window.scrollY));",
+      "const links=[...content.querySelectorAll('a[href]')].map(a=>({href:a.href,rects:[...a.getClientRects()].map(r=>({left:r.left+window.scrollX,top:r.top+window.scrollY,right:r.right+window.scrollX,bottom:r.bottom+window.scrollY}))}));",
+      "return JSON.stringify({height:content.offsetHeight,headings,links})};",
+      "</script></body></html>"
+    })
+  )
 end
 
----Heading line numbers (1-based), ignoring headings inside fenced code.
+--- Heading line numbers (1-based), ignoring headings inside fenced code.
 ---@param lines string[]
 ---@return integer[]
 local function heading_lines(lines)
@@ -137,7 +140,7 @@ local function heading_lines(lines)
   return headings
 end
 
----Preview window geometry. CSS px = image px / scale.
+--- Preview window geometry. CSS px = image px / scale.
 ---@return { cols: integer, rows: integer, scale: integer, css_width: integer, css_height: integer, css_cell_height: number }
 local function viewport()
   local size = Snacks.image.terminal.size()
@@ -150,12 +153,12 @@ local function viewport()
     scale = scale,
     css_width = math.floor(cols * size.cell_width / scale),
     css_height = math.floor(rows * size.cell_height / scale),
-    css_cell_height = size.cell_height / scale,
+    css_cell_height = size.cell_height / scale
   }
 end
 
----Place a new frame, then drop the previous placement once the new one has
----drawn so the image never blanks between frames.
+--- Place a new frame, then drop the previous placement once the new one has
+--- drawn so the image never blanks between frames.
 ---@param png string
 local function place(png)
   if not state or not vim.api.nvim_win_is_valid(state.preview_win) then return end
@@ -166,11 +169,11 @@ local function place(png)
     inline = false,
     max_width = view.cols,
     max_height = view.rows,
-    on_update = function()
+    on_update = function ()
       if swapped or not previous then return end
       swapped = true
-      vim.schedule(function() previous:close() end)
-    end,
+      vim.schedule(function () previous:close() end)
+    end
   })
 end
 
@@ -194,8 +197,8 @@ local function max_offset()
   return math.max(0, state.layout.height - viewport().css_height)
 end
 
----Screenshot the slice at `state.offset` and place it. Serialised: a
----request while one is in flight marks the state dirty and runs after.
+--- Screenshot the slice at `state.offset` and place it. Serialised: a
+--- request while one is in flight marks the state dirty and runs after.
 local function refresh()
   if not state or not state.layout or not browser then return end
   if state.busy then
@@ -208,7 +211,7 @@ local function refresh()
   state.offset = math.max(0, math.min(state.offset, max_offset()))
 
   log("capture", state.offset)
-  browser:capture(state.offset, function(png, err)
+  browser:capture(state.offset, function (png, err)
     if not state then return end
     state.busy = false
     if not png then
@@ -224,9 +227,9 @@ local function refresh()
   end)
 end
 
----CSS px position of source line <row>, interpolated between the nearest
----headings whose positions Chrome reported.
----@param row integer
+--- CSS px position of source line <row>, interpolated between the nearest
+--- headings whose positions Chrome reported.
+---@param row         integer
 ---@param total_lines integer
 ---@return integer
 local function line_to_px(row, total_lines)
@@ -251,7 +254,7 @@ local function line_to_px(row, total_lines)
   return math.floor(from_px + (row - from_line) / span * (to_px - from_px))
 end
 
----Keep the cursor's position in the top third of the preview.
+--- Keep the cursor's position in the top third of the preview.
 local function follow_cursor()
   if not state or not state.layout or not vim.api.nvim_win_is_valid(state.src_win) then return end
   local row = vim.api.nvim_win_get_cursor(state.src_win)[1]
@@ -264,7 +267,7 @@ local function follow_cursor()
   refresh()
 end
 
----Push the buffer's markdown into the page if it changed, then refresh.
+--- Push the buffer's markdown into the page if it changed, then refresh.
 local function render()
   if not state or not browser then return end
   local lines = vim.api.nvim_buf_get_lines(state.src_buf, 0, -1, false)
@@ -275,12 +278,12 @@ local function render()
   log("render", hash:sub(1, 8), "cached", hash == state.content_hash)
   if hash == state.content_hash then return refresh() end
 
-  browser:when_ready(function()
+  browser:when_ready(function ()
     if not state then return end
     local function with_viewport(cb)
       if state.viewport_key == viewport_key then return cb() end
       log("set_viewport", viewport_key)
-      browser:set_viewport(view.css_width, view.css_height, view.scale, function(err)
+      browser:set_viewport(view.css_width, view.css_height, view.scale, function (err)
         if not state then return end
         if err then
           notify.error("viewport failed: " .. err)
@@ -290,8 +293,8 @@ local function render()
         cb()
       end)
     end
-    with_viewport(function()
-      browser:set_content(markdown, function(layout, err)
+    with_viewport(function ()
+      browser:set_content(markdown, function (layout, err)
         if not state then return end
         if not layout then
           notify.error("render failed: " .. (err or "unknown"))
@@ -322,18 +325,18 @@ function M.scroll(lines)
   refresh()
 end
 
----@param where "top"|"bottom"
+---@param where "top" | "bottom"
 function M.scroll_to(where)
   if not state or not state.layout then return end
   state.offset = where == "top" and 0 or max_offset()
   refresh()
 end
 
----The link under the mouse: the pointer's cell inside the preview window
----mapped back to page CSS px (the float's border pushes the image one
----cell down and right of the window's content origin), matched by overlap since a link's line box
----rarely lines up with the cell grid.
----@return string|nil href
+--- The link under the mouse: the pointer's cell inside the preview window
+--- mapped back to page CSS px (the float's border pushes the image one
+--- cell down and right of the window's content origin), matched by overlap since a link's line box
+--- rarely lines up with the cell grid.
+---@return string | nil href
 local function link_under_mouse()
   if not state or not state.layout then return nil end
   local mouse = vim.fn.getmousepos()
@@ -367,24 +370,24 @@ local function map_scroll_keys(buf)
   local function map(lhs, rhs)
     vim.keymap.set("n", lhs, rhs, { buffer = buf, nowait = true, silent = true })
   end
-  local half = function() return math.floor(viewport().rows / 2) end
-  local page = function() return viewport().rows end
-  map("j", function() M.scroll(3) end)
-  map("k", function() M.scroll(-3) end)
-  map("<Down>", function() M.scroll(3) end)
-  map("<Up>", function() M.scroll(-3) end)
-  map("<C-e>", function() M.scroll(1) end)
-  map("<C-y>", function() M.scroll(-1) end)
-  map("<C-d>", function() M.scroll(half()) end)
-  map("<C-u>", function() M.scroll(-half()) end)
-  map("<C-f>", function() M.scroll(page()) end)
-  map("<C-b>", function() M.scroll(-page()) end)
-  map("<Space>", function() M.scroll(page()) end)
-  map("gg", function() M.scroll_to("top") end)
-  map("G", function() M.scroll_to("bottom") end)
-  map("<ScrollWheelDown>", function() M.scroll(3) end)
-  map("<ScrollWheelUp>", function() M.scroll(-3) end)
-  map("<LeftMouse>", function() end)
+  local half = function () return math.floor(viewport().rows / 2) end
+  local page = function () return viewport().rows end
+  map("j", function () M.scroll(3) end)
+  map("k", function () M.scroll(-3) end)
+  map("<Down>", function () M.scroll(3) end)
+  map("<Up>", function () M.scroll(-3) end)
+  map("<C-e>", function () M.scroll(1) end)
+  map("<C-y>", function () M.scroll(-1) end)
+  map("<C-d>", function () M.scroll(half()) end)
+  map("<C-u>", function () M.scroll(-half()) end)
+  map("<C-f>", function () M.scroll(page()) end)
+  map("<C-b>", function () M.scroll(-page()) end)
+  map("<Space>", function () M.scroll(page()) end)
+  map("gg", function () M.scroll_to("top") end)
+  map("G", function () M.scroll_to("bottom") end)
+  map("<ScrollWheelDown>", function () M.scroll(3) end)
+  map("<ScrollWheelUp>", function () M.scroll(-3) end)
+  map("<LeftMouse>", function () end)
   map("<LeftRelease>", open_link_under_mouse)
   map("q", M.close)
   map("<Esc>", M.close)
@@ -393,19 +396,20 @@ end
 local WHEEL_KEYS = { ["<ScrollWheelDown>"] = 3, ["<ScrollWheelUp>"] = -3 }
 local WHEEL_MODES = { "n", "i" }
 
----Split mode: the wheel scrolls whichever window is under the pointer while
----focus stays in the source, so the source buffer gets expr mappings that
----redirect wheel events over the preview and pass every other one through.
+--- Split mode: the wheel scrolls whichever window is under the pointer while
+--- focus stays in the source, so the source buffer gets expr mappings that
+--- redirect wheel events over the preview and pass every other one through.
 ---@param src_buf integer
 local function map_source_wheel(src_buf)
   for lhs, lines in pairs(WHEEL_KEYS) do
-    vim.keymap.set(WHEEL_MODES, lhs, function()
+    vim.keymap.set(WHEEL_MODES, lhs, function ()
       if state and vim.fn.getmousepos().winid == state.preview_win then
         M.scroll(lines)
         return "<Ignore>"
       end
       return lhs
-    end, { buffer = src_buf, expr = true, silent = true })
+    end, { buffer = src_buf, expr = true, silent = true }
+    )
   end
 end
 
@@ -426,31 +430,31 @@ local function attach_autocmds()
   vim.api.nvim_create_autocmd({ "TextChanged", "TextChangedI", "TextChangedP" }, {
     group = state.augroup,
     buffer = state.src_buf,
-    callback = function() rerender() end,
+    callback = function () rerender() end
   })
   if state.mode == "split" then
     vim.api.nvim_create_autocmd({ "CursorMoved", "CursorMovedI", "WinScrolled" }, {
       group = state.augroup,
       buffer = state.src_buf,
-      callback = function() follow() end,
+      callback = function () follow() end
     })
   end
   vim.api.nvim_create_autocmd({ "BufWinLeave", "BufDelete" }, {
     group = state.augroup,
     buffer = state.src_buf,
-    callback = function() M.close() end,
+    callback = function () M.close() end
   })
   vim.api.nvim_create_autocmd("WinClosed", {
     group = state.augroup,
     pattern = tostring(state.preview_win),
-    callback = function() M.close() end,
+    callback = function () M.close() end
   })
   vim.api.nvim_create_autocmd({ "VimResized", "WinResized" }, {
     group = state.augroup,
-    callback = function()
+    callback = function ()
       if not state then return true end
       rerender()
-    end,
+    end
   })
 end
 
@@ -467,7 +471,7 @@ local function open_float()
     title_pos = "center",
     enter = true,
     bo = { buftype = "nofile", bufhidden = "wipe" },
-    wo = { number = false, relativenumber = false, signcolumn = "no" },
+    wo = { number = false, relativenumber = false, signcolumn = "no" }
   })
   return float.win, float.buf, float
 end
@@ -506,11 +510,11 @@ local function ensure_browser()
   end
   write_template()
   browser = Chrome.new(binary, TEMPLATE)
-  browser.on_exit = function(code)
+  browser.on_exit = function (code)
     browser = nil
     if state then notify.error("chrome exited (" .. tostring(code) .. "), reopen the preview") end
   end
-  browser:start(function(message)
+  browser:start(function (message)
     notify.error(message)
     stop_browser()
   end)
@@ -567,7 +571,7 @@ function M.open(mode)
     offset = 0,
     frames = {},
     busy = false,
-    dirty = false,
+    dirty = false
   }
 
   map_scroll_keys(preview_buf)
@@ -588,10 +592,10 @@ end
 
 vim.api.nvim_create_autocmd("VimLeavePre", {
   group = vim.api.nvim_create_augroup("md_image_preview_browser", { clear = true }),
-  callback = function()
+  callback = function ()
     M.close()
     stop_browser()
-  end,
+  end
 })
 
 return M

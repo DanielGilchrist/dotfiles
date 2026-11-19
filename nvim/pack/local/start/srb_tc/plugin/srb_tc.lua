@@ -1,3 +1,4 @@
-vim.api.nvim_create_user_command("SrbTc", function()
+vim.api.nvim_create_user_command("SrbTc", function ()
   require("srb_tc").run()
-end, {})
+end, {}
+)

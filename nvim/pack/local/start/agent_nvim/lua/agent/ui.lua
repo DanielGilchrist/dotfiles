@@ -2,9 +2,9 @@ local host = require("agent.host")
 local is = require("utils.is")
 
 ---@class AgentUI
----@field new_prompt fun(on_submit: fun(text: string)): nil
----@field agent_name fun(prompt: string, on_confirm: fun(name: string)): nil
----@field pick_session fun(opts: {include_new?: boolean, on_pick: fun(name: string|nil, is_new: boolean)}): nil
+---@field new_prompt   fun(on_submit: fun(text: string)): nil
+---@field agent_name   fun(prompt: string, on_confirm: fun(name: string)): nil
+---@field pick_session fun(opts: { include_new?: boolean, on_pick: fun(name: string | nil, is_new: boolean) }): nil
 local M = {}
 
 -- zellij session names are capped by the unix socket path budget on macOS;
@@ -12,7 +12,7 @@ local M = {}
 local NAME_MAX = 20
 
 ---@param name string
----@return string|nil problem
+---@return string | nil problem
 local function name_problem(name)
   if name == "" then return nil end
   if #name > NAME_MAX then return "too long (" .. #name .. "/" .. NAME_MAX .. ")" end
@@ -21,20 +21,19 @@ local function name_problem(name)
   return nil
 end
 
----Single-line agent-name input with the limit enforced as you type: the
----title shows the count, the overflow and bad characters are highlighted,
----and confirming an invalid name re-opens the input with the text kept.
----@param prompt string
+--- Single-line agent-name input with the limit enforced as you type: the
+--- title shows the count, the overflow and bad characters are highlighted,
+--- and confirming an invalid name re-opens the input with the text kept.
+---@param prompt     string
 ---@param on_confirm fun(name: string)
----@param default? string
+---@param default?   string
 function M.agent_name(prompt, on_confirm, default)
   local function title_for(name)
     local problem = name_problem(name)
     local hl = problem and "DiagnosticError" or "SnacksInputTitle"
     return {
-      { " " .. prompt .. " ", "SnacksInputTitle" },
-      { problem or (#name .. "/" .. NAME_MAX), hl },
-      { " ", "SnacksInputTitle" },
+      { " " .. prompt .. " ", "SnacksInputTitle" }, { problem or (#name .. "/" .. NAME_MAX), hl },
+      { " ", "SnacksInputTitle" }
     }
   end
 
@@ -45,35 +44,37 @@ function M.agent_name(prompt, on_confirm, default)
     prompt_pos = false,
     icon_pos = "left",
     win = { title = title_for(default or ""), title_pos = "center" },
-    highlight = function(text)
+    highlight = function (text)
       local marks = {}
       if #text > NAME_MAX then table.insert(marks, { NAME_MAX, #text, "DiagnosticUnderlineError" }) end
       for start, stop in text:gmatch("()[^%w%-]+()") do
         table.insert(marks, { start - 1, stop - 1, "DiagnosticUnderlineError" })
       end
       return marks
-    end,
-  }, function(value)
-    local name = value and vim.trim(value) or ""
-    if name == "" then return end
-    local problem = name_problem(name)
-    if problem then
-      vim.notify("agent name " .. problem, vim.log.levels.WARN, { title = "agent" })
-      M.agent_name(prompt, on_confirm, name)
-      return
     end
-    on_confirm(name)
-  end)
+  },
+    function (value)
+      local name = value and vim.trim(value) or ""
+      if name == "" then return end
+      local problem = name_problem(name)
+      if problem then
+        vim.notify("agent name " .. problem, vim.log.levels.WARN, { title = "agent" })
+        M.agent_name(prompt, on_confirm, name)
+        return
+      end
+      on_confirm(name)
+    end)
 
-  win:on({ "TextChangedI", "TextChanged" }, function()
+  win:on({ "TextChangedI", "TextChanged" }, function ()
     if not win:valid() then return end
     win.opts.title = title_for(vim.trim(win:text()))
     win:update()
-  end, { buf = true })
+  end, { buf = true }
+  )
 end
 
 ---@param on_submit fun(text: string)
----@param opts? {title?: string, initial?: string, split?: boolean, height?: integer, on_close?: fun()}
+---@param opts?     { title?: string, initial?: string, split?: boolean, height?: integer, on_close?: fun() }
 function M.new_prompt(on_submit, opts)
   opts = opts or {}
   local title = opts.title or " new agent prompt: <C-s> submit, q/<C-c> cancel "
@@ -86,7 +87,7 @@ function M.new_prompt(on_submit, opts)
     vim.api.nvim_buf_set_lines(buf, 0, -1, false, vim.split(opts.initial, "\n", { plain = true }))
   end
 
-  ---@type integer|nil
+  ---@type integer | nil
   local win_id
   local closed = false
 
@@ -123,9 +124,9 @@ function M.new_prompt(on_submit, opts)
       width = 0.7,
       height = 0.5,
       border = "rounded",
-      keys = { q = function() close() end },
+      keys = { q = function () close() end },
       bo = { filetype = "markdown" },
-      wo = { wrap = true, linebreak = true, breakindent = true },
+      wo = { wrap = true, linebreak = true, breakindent = true }
     }).win
   end
 
@@ -138,35 +139,32 @@ end
 
 local NEW_AGENT_LABEL = "✦ new agent (this worktree)"
 
----Snacks picker over agent items with ANSI viewport preview per session
----(via `agent dump`).
----@param opts {title: string, items: {text: string, name?: string, is_new?: boolean}[], on_pick: fun(item?: {text: string, name?: string, is_new?: boolean})}
+--- Snacks picker over agent items with ANSI viewport preview per session
+--- (via `agent dump`).
+---@param opts { title: string, items: { text: string, name?: string, is_new?: boolean } [], on_pick: fun(item?: { text: string, name?: string, is_new?: boolean }) }
 local function pick_with_preview(opts)
   Snacks.picker.pick({
     source = "agent_sessions",
     title = opts.title,
     items = opts.items,
-    format = function(item) return { { item.text } } end,
-    preview = function(ctx)
+    format = function (item) return { { item.text } } end,
+    preview = function (ctx)
       if not ctx.item.name then
         ctx.preview:set_title(ctx.item.text)
         ctx.preview:set_lines({})
         return
       end
       ctx.preview:set_title(ctx.item.name)
-      return Snacks.picker.preview.cmd(
-        { "agent", "dump", ctx.item.name },
-        ctx
-      )
+      return Snacks.picker.preview.cmd({ "agent", "dump", ctx.item.name }, ctx)
     end,
-    confirm = function(picker, item)
+    confirm = function (picker, item)
       picker:close()
-      vim.schedule(function() opts.on_pick(item) end)
-    end,
+      vim.schedule(function () opts.on_pick(item) end)
+    end
   })
 end
 
----@param opts {include_new?: boolean, on_pick: fun(name: string|nil, is_new: boolean)}
+---@param opts { include_new?: boolean, on_pick: fun(name: string | nil, is_new: boolean) }
 function M.pick_session(opts)
   local sessions = host.list_sessions()
   if #sessions == 0 and not opts.include_new then
@@ -174,7 +172,7 @@ function M.pick_session(opts)
     return
   end
 
-  ---@type {text: string, name: string|nil, is_new: boolean}[]
+  ---@type { text: string, name: string | nil, is_new: boolean } []
   local items = {}
   if opts.include_new then
     table.insert(items, { text = NEW_AGENT_LABEL, is_new = true })
@@ -186,19 +184,22 @@ function M.pick_session(opts)
   pick_with_preview({
     title = "agent session",
     items = items,
-    on_pick = function(item)
+    on_pick = function (item)
       if not item then return opts.on_pick(nil, false) end
       opts.on_pick(item.name, item.is_new == true)
-    end,
+    end
   })
 end
 
----@param opts {current?: string, on_pick: fun(name?: string)}
+---@param opts { current?: string, on_pick: fun(name?: string) }
 function M.pick_kill(opts)
   local sessions = host.list_sessions()
-  if #sessions == 0 then opts.on_pick(nil) return end
+  if #sessions == 0 then
+    opts.on_pick(nil)
+    return
+  end
 
-  ---@type {text: string, name: string}[]
+  ---@type { text: string, name: string } []
   local items = {}
   if opts.current and vim.tbl_contains(sessions, opts.current) then
     table.insert(items, { text = ("(current) %s"):format(opts.current), name = opts.current })
@@ -210,7 +211,7 @@ function M.pick_kill(opts)
   pick_with_preview({
     title = "kill agent",
     items = items,
-    on_pick = function(item) opts.on_pick(item and item.name or nil) end,
+    on_pick = function (item) opts.on_pick(item and item.name or nil) end
   })
 end
 

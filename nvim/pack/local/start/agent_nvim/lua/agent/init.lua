@@ -15,19 +15,19 @@ local notify = require("utils.notify").with_title("agent")
 local M = {}
 M.config = config
 
----Map of tab page id → agent name. An agent owns one tab page; jumping to
----that page is the "attach" UX and closing it is the "detach" UX. Cleared
----on TabClosed so it can't go stale.
+--- Map of tab page id → agent name. An agent owns one tab page; jumping to
+--- that page is the "attach" UX and closing it is the "detach" UX. Cleared
+--- on TabClosed so it can't go stale.
 ---@type table<integer, string>
 M.tab_agents = {}
 M.agent_terminals = {} ---@type table<string, table> Snacks terminal objects by agent name
----Most recently focused agent, used by `<C-.>` toggle and as a fallback
----send target from non-agent tabs.
----@type string|nil
+--- Most recently focused agent, used by `<C-.>` toggle and as a fallback
+--- send target from non-agent tabs.
+---@type string | nil
 M.last_attached = nil
 
 ---@param name string
----@return integer|nil tabid
+---@return integer | nil tabid
 local function tab_for_agent(name)
   for tabid, n in pairs(M.tab_agents) do
     if n == name and vim.api.nvim_tabpage_is_valid(tabid) then return tabid end
@@ -35,16 +35,16 @@ local function tab_for_agent(name)
   return nil
 end
 
----Agent owning the current tab page (nil for the main / non-agent tab).
----@return string|nil
+--- Agent owning the current tab page (nil for the main / non-agent tab).
+---@return string | nil
 local function current_agent()
   return M.tab_agents[vim.api.nvim_get_current_tabpage()]
 end
 
----Resolve which agent a send-style action targets. Priority: explicit arg →
----agent owning the current tab → most-recently focused agent.
----@param target string|nil
----@return string|nil
+--- Resolve which agent a send-style action targets. Priority: explicit arg →
+--- agent owning the current tab → most-recently focused agent.
+---@param target string | nil
+---@return string | nil
 local function require_target(target)
   target = target or current_agent() or M.last_attached
   if not target then
@@ -58,7 +58,7 @@ local function require_target(target)
   return target
 end
 
----Send a message to the active agent and submit it. Returns true if delivered.
+--- Send a message to the active agent and submit it. Returns true if delivered.
 ---@param text string
 ---@return boolean
 function M.send_text(text)
@@ -72,9 +72,9 @@ function M.send_text(text)
   return true
 end
 
----Open the composer with a `@<abs>:<l1>-<l2>` reference to the visual
----selection pre-filled. Saves the buffer first so claude reads the same
----content we're pointing at.
+--- Open the composer with a `@<abs>:<l1>-<l2>` reference to the visual
+--- selection pre-filled. Saves the buffer first so claude reads the same
+--- content we're pointing at.
 function M.send_visual()
   local path = vim.api.nvim_buf_get_name(0)
   if is.empty(path) then
@@ -96,9 +96,9 @@ function M.send_prompt()
   composer.show()
 end
 
----Send a single-digit choice (1-9) + enter to the active agent. Covers
----claude's Yes/No and broader multi-choice prompts uniformly, and goes
----through even while the agent asks, which is when a choice is wanted.
+--- Send a single-digit choice (1-9) + enter to the active agent. Covers
+--- claude's Yes/No and broader multi-choice prompts uniformly, and goes
+--- through even while the agent asks, which is when a choice is wanted.
 ---@param n integer
 function M.send_choice(n)
   local resolved = require_target(nil)
@@ -107,17 +107,17 @@ function M.send_choice(n)
   if not ok then notify.error("couldn't answer " .. resolved .. ": " .. (why or "")) end
 end
 
----Spawn a dev-server tab in wezterm for the current tab's cwd. Wezterm
----pops a region picker and runs the same `[REGION] Open work tabs` flow as
----CMD+Shift+R. Worktrees under ~/worktrees/<repo>/* cd into the worktree;
----other cwds fall back to `cdt`.
+--- Spawn a dev-server tab in wezterm for the current tab's cwd. Wezterm
+--- pops a region picker and runs the same `[REGION] Open work tabs` flow as
+--- CMD+Shift+R. Worktrees under ~/worktrees/<repo>/* cd into the worktree;
+--- other cwds fall back to `cdt`.
 function M.spawn_dev()
   local cwd = vim.fn.getcwd()
   if not is.executable(cwd .. "/bin/dev") then
     notify.warn("spawn-dev: no bin/dev in " .. cwd)
     return
   end
-  vim.ui.select({ "us", "eu", "apac" }, { prompt = "Region for dev tabs:" }, function(region)
+  vim.ui.select({ "us", "eu", "apac" }, { prompt = "Region for dev tabs:" }, function (region)
     if not region then return end
     -- Write the OSC to nvim's stderr channel — wezterm reads OSC sequences
     -- from there. /dev/tty doesn't work when nvim has no ctty (e.g. spawned
@@ -138,8 +138,8 @@ function M.toggle_composer()
   composer.toggle()
 end
 
----Attach to an existing session. New sessions are created by the `agent`
----binary (see `spawn_headless`), which hands back the command to run here.
+--- Attach to an existing session. New sessions are created by the `agent`
+--- binary (see `spawn_headless`), which hands back the command to run here.
 ---@param name string
 ---@return string[]
 local function build_attach_cmd(name)
@@ -148,17 +148,17 @@ local function build_attach_cmd(name)
   return argv
 end
 
----Tab pages opened by `attach_in_terminal` just for an agent, as opposed to
----the user's own tab that a repo session was split into.
+--- Tab pages opened by `attach_in_terminal` just for an agent, as opposed to
+--- the user's own tab that a repo session was split into.
 ---@type table<integer, true>
 M.agent_tabs = {}
 
----Forget a terminal whose client exited (session ended, detached, or
----moved to another window by the `agent` TUI) and close what was opened for
----it, so the next attach starts fresh instead of reusing a dead buffer. A
----failed attach keeps its buffer so the error stays readable.
----@param name string
----@param buf integer
+--- Forget a terminal whose client exited (session ended, detached, or
+--- moved to another window by the `agent` TUI) and close what was opened for
+--- it, so the next attach starts fresh instead of reusing a dead buffer. A
+--- failed attach keeps its buffer so the error stays readable.
+---@param name   string
+---@param buf    integer
 ---@param status integer
 local function forget_terminal(name, buf, status)
   local term = M.agent_terminals[name]
@@ -167,7 +167,8 @@ local function forget_terminal(name, buf, status)
   for tabid, agent in pairs(M.tab_agents) do
     if agent == name then
       M.tab_agents[tabid] = nil
-      if status == 0 and M.agent_tabs[tabid] and vim.api.nvim_tabpage_is_valid(tabid) and #vim.api.nvim_list_tabpages() > 1 then
+      if status == 0 and M.agent_tabs[tabid]
+        and vim.api.nvim_tabpage_is_valid(tabid) and #vim.api.nvim_list_tabpages() > 1 then
         pcall(vim.api.nvim_command, "tabclose " .. vim.api.nvim_tabpage_get_number(tabid))
       end
       M.agent_tabs[tabid] = nil
@@ -181,21 +182,19 @@ local function forget_terminal(name, buf, status)
   if vim.api.nvim_buf_is_valid(buf) then pcall(vim.api.nvim_buf_delete, buf, { force = true }) end
 end
 
----Open the agent terminal. Terminal-mode <C-h/j/k/l> window-nav maps are
----buffer-local here — globally they'd shadow TUI apps' own bindings
----(e.g. lazygit's move-commit keys). Snacks calls `on_buf` on every show,
----so the exit hook is registered once per buffer.
+--- Open the agent terminal. Terminal-mode <C-h/j/k/l> window-nav maps are
+--- buffer-local here — globally they'd shadow TUI apps' own bindings
+--- (e.g. lazygit's move-commit keys). Snacks calls `on_buf` on every show,
+--- so the exit hook is registered once per buffer.
 ---@param cmd string[]
 local function open_agent_terminal(name, cmd)
   return Snacks.terminal.open(cmd, {
     win = {
       position = "right",
-      on_buf = function(self)
+      on_buf = function (self)
         for _, direction in ipairs({ "h", "j", "k", "l" }) do
           vim.keymap.set(
-            "t",
-            "<C-" .. direction .. ">",
-            "<C-\\><C-n><C-w>" .. direction,
+            "t", "<C-" .. direction .. ">", "<C-\\><C-n><C-w>" .. direction,
             { buffer = self.buf, desc = "agent: go to window " .. direction }
           )
         end
@@ -205,22 +204,22 @@ local function open_agent_terminal(name, cmd)
         vim.api.nvim_create_autocmd("TermClose", {
           buffer = buf,
           once = true,
-          callback = function()
+          callback = function ()
             local status = vim.v.event.status
-            vim.schedule(function() forget_terminal(name, buf, status) end)
-          end,
+            vim.schedule(function () forget_terminal(name, buf, status) end)
+          end
         })
-      end,
+      end
     },
-    auto_close = false,
+    auto_close = false
   })
 end
 
----Open a tab page for the named agent: tab-local cwd, dashboard on the left,
----attach terminal on the right. Idempotent — if a tab already exists
----for this agent, jump to it.
----@param name string
----@param opts? {cwd?: string, attach_cmd?: string[]}
+--- Open a tab page for the named agent: tab-local cwd, dashboard on the left,
+--- attach terminal on the right. Idempotent — if a tab already exists
+--- for this agent, jump to it.
+---@param name  string
+---@param opts? { cwd?: string, attach_cmd?: string[] }
 function M.attach_in_terminal(name, opts)
   opts = opts or {}
 
@@ -254,7 +253,7 @@ function M.attach_in_terminal(name, opts)
     else
       M.agent_terminals[name] = open_agent_terminal(name, cmd)
     end
-    vim.schedule(function()
+    vim.schedule(function ()
       vim.cmd("wincmd h")
       vim.cmd("stopinsert")
     end)
@@ -273,7 +272,7 @@ function M.attach_in_terminal(name, opts)
   if Snacks.dashboard then
     pcall(Snacks.dashboard, {
       buf = vim.api.nvim_get_current_buf(),
-      win = vim.api.nvim_get_current_win(),
+      win = vim.api.nvim_get_current_win()
     })
   end
 
@@ -283,16 +282,16 @@ function M.attach_in_terminal(name, opts)
   else
     M.agent_terminals[name] = open_agent_terminal(name, cmd)
   end
-  vim.schedule(function()
+  vim.schedule(function ()
     vim.cmd("wincmd h")
     vim.cmd("stopinsert")
   end)
 end
 
----Hide/show the current tab's agent terminal. snacks.win:toggle() handles
----the buf-preserving hide and the reopen, so we don't accidentally spawn
----a duplicate shell. Outside an agent tab, fall back to last-attached or
----the picker.
+--- Hide/show the current tab's agent terminal. snacks.win:toggle() handles
+--- the buf-preserving hide and the reopen, so we don't accidentally spawn
+--- a duplicate shell. Outside an agent tab, fall back to last-attached or
+--- the picker.
 function M.toggle()
   local agent = current_agent()
   local term = agent and M.agent_terminals[agent]
@@ -327,9 +326,8 @@ function M.open_or_pick()
   -- looking at. Otherwise re-pressing <leader>ao from the same worktree
   -- looks like a no-op — the user actually wanted the picker to switch.
   local already_here = resolved
-    and (tab_for_agent(resolved) == vim.api.nvim_get_current_tabpage()
-      or M.tab_agents[vim.api.nvim_get_current_tabpage()] == resolved
-      or vim.fn.getcwd() == session.session_cwd(resolved))
+    and (tab_for_agent(resolved) == vim.api.nvim_get_current_tabpage() or M.tab_agents[vim.api.nvim_get_current_tabpage()]
+        == resolved or vim.fn.getcwd() == session.session_cwd(resolved))
   if resolved and not already_here and host.session_exists(resolved) then
     M.attach_in_terminal(resolved)
     return
@@ -337,30 +335,30 @@ function M.open_or_pick()
 
   ui.pick_session({
     include_new = true,
-    on_pick = function(name, is_new)
+    on_pick = function (name, is_new)
       if is_new then
         M.new_agent()
       elseif name then
         M.attach_in_terminal(name)
       end
-    end,
+    end
   })
 end
 
----Run `agent <sub> … --headless`, which prepares the agent (worktree,
----record, session layout) and prints the session, its cwd and command; the
----session itself starts in this nvim's own terminal. The agent also shows
----up in the `agent` TUI.
----@param sub string  subcommand: "attach", "checkout" or "repo"
----@param args string[]  its arguments (e.g. { name, "--seed", path })
+--- Run `agent <sub> … --headless`, which prepares the agent (worktree,
+--- record, session layout) and prints the session, its cwd and command; the
+--- session itself starts in this nvim's own terminal. The agent also shows
+--- up in the `agent` TUI.
+---@param sub  string   subcommand: "attach", "checkout" or "repo"
+---@param args string[] its arguments (e.g. { name, "--seed", path })
 local function spawn_headless(sub, args)
   local repo = session.main_repo_root()
   local cmd = vim.list_extend({ "agent", sub }, args)
   table.insert(cmd, "--headless")
   if repo then vim.list_extend(cmd, { "--repo", repo }) end
 
-  vim.system(cmd, { text = true }, function(out)
-    vim.schedule(function()
+  vim.system(cmd, { text = true }, function (out)
+    vim.schedule(function ()
       if not cmd_utils.success(out.code) then
         notify.error("agent spawn failed: " .. (out.stderr or ""))
         return
@@ -378,37 +376,37 @@ local function spawn_headless(sub, args)
       notify.info("spawned " .. name .. " (also in the `agent` TUI)")
       M.attach_in_terminal(name, {
         cwd = cwd,
-        attach_cmd = { "fish", "-c", "cd " .. vim.fn.shellescape(cwd) .. "; and " .. agent_cmd },
+        attach_cmd = { "fish", "-c", "cd " .. vim.fn.shellescape(cwd) .. "; and " .. agent_cmd }
       })
     end)
   end)
 end
 
----Pick a branch (local or remote), then attach an existing worktree for it
----or create one and spawn a bare (no-prompt) agent.
+--- Pick a branch (local or remote), then attach an existing worktree for it
+--- or create one and spawn a bare (no-prompt) agent.
 function M.checkout_agent()
   Snacks.picker.git_branches({
     all = true,
-    confirm = function(picker, item)
+    confirm = function (picker, item)
       picker:close()
       if not (item and item.branch) then return end
       local branch = (item.branch:gsub("^remotes/", ""):gsub("^origin/", ""))
       spawn_headless("checkout", { branch })
-    end,
+    end
   })
 end
 
----Spawn a worktree agent without any seed prompt. Prompts only for the name;
----Claude starts with no initial message.
+--- Spawn a worktree agent without any seed prompt. Prompts only for the name;
+--- Claude starts with no initial message.
 function M.new_agent_no_prompt()
-  ui.agent_name("agent name (no prompt)", function(name)
+  ui.agent_name("agent name (no prompt)", function (name)
     spawn_headless("attach", { name, "--no-prompt" })
   end)
 end
 
 function M.new_agent()
-  ui.agent_name("agent name", function(name)
-    ui.new_prompt(function(text)
+  ui.agent_name("agent name", function (name)
+    ui.new_prompt(function (text)
       local tmp = vim.fn.tempname() .. ".md"
       if not file.write(tmp, text) then
         notify.error("could not write seed file")
@@ -420,9 +418,9 @@ function M.new_agent()
   end)
 end
 
----Spawn (or attach to) the agent session for the current repo's main
----checkout. No worktree, no prompts; `agent repo` names it after the repo so
----it's idempotent and discoverable from the TUI and mobile.
+--- Spawn (or attach to) the agent session for the current repo's main
+--- checkout. No worktree, no prompts; `agent repo` names it after the repo so
+--- it's idempotent and discoverable from the TUI and mobile.
 function M.new_repo_session()
   if not session.repo_root() then
     notify.warn("not in a git repo")
@@ -431,13 +429,13 @@ function M.new_repo_session()
   spawn_headless("repo", {})
 end
 
----Run `agent rm --force <name>` to tear down worktree + session + branch
----and close the owning tab page if we have one.
+--- Run `agent rm --force <name>` to tear down worktree + session + branch
+--- and close the owning tab page if we have one.
 ---@param name string
 local function tear_down(name)
   local cmd = { "agent", "rm", "--force", name }
-  vim.system(cmd, { text = true }, function(out)
-    vim.schedule(function()
+  vim.system(cmd, { text = true }, function (out)
+    vim.schedule(function ()
       if not cmd_utils.success(out.code) then
         notify.error("kill failed: " .. (out.stderr or out.stdout or ""))
         return
@@ -451,15 +449,15 @@ local function tear_down(name)
   end)
 end
 
----Open what the current agent's terminal shows and has scrolled off in a
----scratch buffer, at its end. Reuses the buffer an earlier call made.
+--- Open what the current agent's terminal shows and has scrolled off in a
+--- scratch buffer, at its end. Reuses the buffer an earlier call made.
 function M.edit_scrollback()
   local name = current_agent() or M.last_attached
   if not name then
     notify.warn("no agent to read the scrollback of")
     return
   end
-  host.scrollback(name, function(lines, why)
+  host.scrollback(name, function (lines, why)
     if not lines then
       notify.error(("couldn't read the scrollback of %s: %s"):format(name, why or ""))
       return
@@ -487,16 +485,16 @@ function M.kill_agent()
   -- Defer the picker open so we're not still inside the keymap callback when
   -- Snacks tries to set up its UI. Avoids E21 when the current buffer is
   -- non-modifiable (e.g. the dashboard).
-  vim.schedule(function()
+  vim.schedule(function ()
     ui.pick_kill({
       current = current_agent() or session.resolve(),
-      on_pick = function(name)
+      on_pick = function (name)
         if not name then return end
-        ui_utils.confirm("kill " .. name .. " (worktree + session + branch)?", function(choice)
+        ui_utils.confirm("kill " .. name .. " (worktree + session + branch)?", function (choice)
           if choice ~= "Ok" then return end
           tear_down(name)
         end)
-      end,
+      end
     })
   end)
 end
@@ -505,14 +503,14 @@ local agent_augroup = vim.api.nvim_create_augroup("agent_nvim_tabs", { clear = t
 
 vim.api.nvim_create_autocmd("TabClosed", {
   group = agent_augroup,
-  callback = function()
+  callback = function ()
     for id in pairs(M.tab_agents) do
       if not vim.api.nvim_tabpage_is_valid(id) then M.tab_agents[id] = nil end
     end
     for id in pairs(M.agent_tabs) do
       if not vim.api.nvim_tabpage_is_valid(id) then M.agent_tabs[id] = nil end
     end
-  end,
+  end
 })
 
 -- If the user `:wq`s their way out and the only thing left in an agent tab
@@ -521,8 +519,8 @@ vim.api.nvim_create_autocmd("TabClosed", {
 -- to the editor.
 vim.api.nvim_create_autocmd("WinClosed", {
   group = agent_augroup,
-  callback = function()
-    vim.schedule(function()
+  callback = function ()
+    vim.schedule(function ()
       for tab, _ in pairs(M.tab_agents) do
         if vim.api.nvim_tabpage_is_valid(tab) then
           local term_wins, non_term = {}, 0
@@ -541,7 +539,7 @@ vim.api.nvim_create_autocmd("WinClosed", {
         end
       end
     end)
-  end,
+  end
 })
 
 return M

@@ -7,31 +7,28 @@ local function default_options(opts)
 
   local notification_id = tbl.remove(opts, "notification_id")
 
-  local hide_notification = function()
+  local hide_notification = function ()
     if notification_id then
       notify.hide(notification_id)
     end
   end
 
-  return vim.tbl_extend(
-    "force",
-    {
-      on_stdout = cmd.default_handler(function(message)
-        hide_notification()
-        notify.info(message)
-      end),
-      on_stderr = cmd.default_handler(function(message)
-        hide_notification()
-        notify.error(message)
-      end),
-    },
-    opts
+  return vim.tbl_extend("force", {
+    on_stdout = cmd.default_handler(function (message)
+      hide_notification()
+      notify.info(message)
+    end),
+    on_stderr = cmd.default_handler(function (message)
+      hide_notification()
+      notify.error(message)
+    end)
+  }, opts
   )
 end
 
 local M = {}
 
-M.purge = function(force)
+M.purge = function (force)
   force = not not force
 
   if not force then

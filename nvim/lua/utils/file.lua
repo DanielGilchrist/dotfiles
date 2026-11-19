@@ -1,9 +1,9 @@
 local M = {}
 
----Read the contents of a file
+--- Read the contents of a file
 ---@param path string
 ---@return string?
-M.read = function(path)
+M.read = function (path)
   local file = io.open(path, "r")
 
   if not file then
@@ -16,8 +16,8 @@ M.read = function(path)
   return contents
 end
 
----@param path string
----@param mode "w"|"a"
+---@param path     string
+---@param mode     "w" | "a"
 ---@param contents string
 ---@return boolean
 local function put(path, mode, contents)
@@ -33,19 +33,19 @@ local function put(path, mode, contents)
   return true
 end
 
----Replace the contents of a file, creating it if needed
----@param path string
+--- Replace the contents of a file, creating it if needed
+---@param path     string
 ---@param contents string
 ---@return boolean # false if the file could not be opened for writing
-M.write = function(path, contents)
+M.write = function (path, contents)
   return put(path, "w", contents)
 end
 
----Append to a file, creating it if needed
----@param path string
+--- Append to a file, creating it if needed
+---@param path     string
 ---@param contents string
 ---@return boolean # false if the file could not be opened for writing
-M.append = function(path, contents)
+M.append = function (path, contents)
   return put(path, "a", contents)
 end
 

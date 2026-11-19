@@ -7,6 +7,6 @@ return {
     "build.gradle.kts",
     "build.gradle",
     "pom.xml",
-    ".git",
-  },
+    ".git"
+  }
 }

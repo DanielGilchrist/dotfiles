@@ -78,7 +78,4 @@ local function yank_test_line_with_number()
   end
 end
 
-return {
-  yank = yank_test_line,
-  yank_with_number = yank_test_line_with_number,
-}
+return { yank = yank_test_line, yank_with_number = yank_test_line_with_number }

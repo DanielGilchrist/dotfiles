@@ -6,8 +6,8 @@ return {
     "-cli",
     "arduino-cli",
     "-clangd",
-    "clangd",
+    "clangd"
   },
   filetypes = { "arduino" },
-  root_markers = { "sketch.yaml", ".git" },
+  root_markers = { "sketch.yaml", ".git" }
 }

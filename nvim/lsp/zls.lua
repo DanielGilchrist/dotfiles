@@ -1,5 +1,1 @@
-return {
-  cmd = { "zls" },
-  filetypes = { "zig", "zir" },
-  root_markers = { "build.zig", ".git" },
-}
+return { cmd = { "zls" }, filetypes = { "zig", "zir" }, root_markers = { "build.zig", ".git" } }

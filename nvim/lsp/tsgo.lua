@@ -27,22 +27,22 @@ return {
       inlayHints = {
         parameterNames = {
           enabled = "literals",
-          suppressWhenArgumentMatchesName = true,
+          suppressWhenArgumentMatchesName = true
         },
         parameterTypes = { enabled = true },
         variableTypes = { enabled = true },
         propertyDeclarationTypes = { enabled = true },
         functionLikeReturnTypes = { enabled = true },
-        enumMemberValues = { enabled = true },
-      },
-    },
+        enumMemberValues = { enabled = true }
+      }
+    }
   },
-  cmd = function(dispatchers, config)
+  cmd = function (dispatchers, config)
     local cmd = server_cmd((config or {}).root_dir)
     return vim.lsp.rpc.start({ cmd, "--lsp", "--stdio" }, dispatchers)
   end,
   filetypes = { "javascript", "javascriptreact", "typescript", "typescriptreact" },
-  root_dir = function(bufnr, on_dir)
+  root_dir = function (bufnr, on_dir)
     local root_markers = { "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "bun.lockb", "bun.lock" }
     root_markers = { root_markers, { ".git" } }
 
@@ -64,5 +64,5 @@ return {
     end
 
     on_dir(project_root)
-  end,
+  end
 }

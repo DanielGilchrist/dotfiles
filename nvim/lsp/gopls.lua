@@ -1,7 +1,7 @@
 local function organise_imports_and_format_on_save(client, bufnr)
   vim.api.nvim_create_autocmd("BufWritePre", {
     buffer = bufnr,
-    callback = function()
+    callback = function ()
       local params = vim.lsp.util.make_range_params(nil, client.offset_encoding)
       params = vim.tbl_extend("force", params, {
         context = { only = { "source.organizeImports" } }
@@ -20,7 +20,7 @@ local function organise_imports_and_format_on_save(client, bufnr)
 
       vim.lsp.buf.format({ async = false, bufnr = bufnr })
     end,
-    group = vim.api.nvim_create_augroup("GoFormat" .. bufnr, { clear = true }),
+    group = vim.api.nvim_create_augroup("GoFormat" .. bufnr, { clear = true })
   })
 end
 
@@ -33,11 +33,11 @@ return {
       gofumpt = true,
       staticcheck = true,
       analyses = {
-        unusedparams = true,
-      },
-    },
+        unusedparams = true
+      }
+    }
   },
-  on_attach = function(client, bufnr)
+  on_attach = function (client, bufnr)
     organise_imports_and_format_on_save(client, bufnr)
-  end,
+  end
 }

@@ -12,17 +12,19 @@ require("config.tabs").setup()
 local lazypath = vim.fn.stdpath("data") .. "/lazy/lazy.nvim"
 if not vim.uv.fs_stat(lazypath) then
   vim.fn.system({
-    "git", "clone", "--filter=blob:none",
+    "git",
+    "clone",
+    "--filter=blob:none",
     "--branch=stable",
     "https://github.com/folke/lazy.nvim.git",
-    lazypath,
+    lazypath
   })
 end
 vim.opt.rtp:prepend(lazypath)
 
 require("lazy").setup({
   spec = {
-    { import = "plugins" },
+    { import = "plugins" }
   },
   performance = {
     rtp = {
@@ -31,12 +33,12 @@ require("lazy").setup({
         "tarPlugin",
         "tohtml",
         "tutor",
-        "zipPlugin",
-      },
-    },
+        "zipPlugin"
+      }
+    }
   },
   checker = {
     enabled = true,
-    notify = false,
-  },
+    notify = false
+  }
 })
