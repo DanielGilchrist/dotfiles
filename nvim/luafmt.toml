@@ -1,0 +1,5 @@
+[syntax]
+level = "LuaJIT"
+
+[indent]
+width = 2

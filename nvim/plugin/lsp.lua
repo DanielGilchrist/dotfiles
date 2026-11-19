@@ -164,7 +164,7 @@ vim.lsp.enable({
   "heucristic",
   "gopls",
   "kotlin_lsp",
-  "lua_ls",
+  "emmylua_ls",
   "rubocop",
   "ruby_lsp",
   "rust_analyzer",
