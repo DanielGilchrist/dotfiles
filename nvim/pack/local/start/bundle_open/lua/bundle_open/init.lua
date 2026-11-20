@@ -4,6 +4,7 @@ local notify_gem_list_id = "bundle-open-gem-list-id"
 
 local function fetch_gem_list(callback)
   local gems = {}
+  ---@type string?
   local error_message = nil
 
   notify.info("Fetching gem list for " .. vim.fn.fnamemodify(vim.fn.getcwd(), ":t") .. "...", {

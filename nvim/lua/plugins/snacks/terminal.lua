@@ -24,6 +24,9 @@ local function find_snacks_terminal(buf)
   return nil
 end
 
+---@type table<snacks.win, Partial<snacks.win.Config>>
+local zoom_restore = setmetatable({}, { __mode = "k" })
+
 local function toggle_terminal_zoom()
   local buf = vim.api.nvim_get_current_buf()
 
@@ -34,13 +37,12 @@ local function toggle_terminal_zoom()
     end
 
     if snacks.opts.position == "float" then
-      snacks.opts.position = snacks._zoom_restore_position or "right"
-      snacks.opts.height = snacks._zoom_restore_height
-      snacks.opts.width = snacks._zoom_restore_width
+      local restore = zoom_restore[snacks] or {}
+      snacks.opts.position = restore.position or "right"
+      snacks.opts.height = restore.height
+      snacks.opts.width = restore.width
     else
-      snacks._zoom_restore_position = snacks.opts.position
-      snacks._zoom_restore_height = snacks.opts.height
-      snacks._zoom_restore_width = snacks.opts.width
+      zoom_restore[snacks] = { position = snacks.opts.position, height = snacks.opts.height, width = snacks.opts.width }
       snacks.opts.position = "float"
       snacks.opts.height = 0.9
       snacks.opts.width = 0.9

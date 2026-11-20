@@ -147,8 +147,11 @@ vim.api.nvim_create_autocmd("LspAttach", {
   desc = "Ruby LSP and Sorbet both list document symbols, so keep only Sorbet's",
   callback = function (ev)
     local clients = require("lsp.utils").clients_by_name(ev.buf)
-    if clients.ruby_lsp and clients.sorbet then
-      clients.ruby_lsp.server_capabilities.documentSymbolProvider = false
+
+    local ruby_lsp_capabilities = clients.ruby_lsp and clients.ruby_lsp.server_capabilities
+
+    if ruby_lsp_capabilities and clients.sorbet then
+      ruby_lsp_capabilities.documentSymbolProvider = false
     end
   end
 })

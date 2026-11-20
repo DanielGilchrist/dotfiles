@@ -20,7 +20,10 @@ return {
         },
         g = function ()
           local from = { line = 1, col = 1 }
-          local to = { line = vim.fn.line("$"), col = math.max(vim.fn.getline("$"):len(), 1) }
+          local to = {
+            line = vim.fn.line("$"),
+            col = math.max((vim.api.nvim_buf_get_lines(0, -2, -1, false)[1] or ""):len(), 1)
+          }
           return { from = from, to = to }
         end,
         u = ai.gen_spec.function_call(),

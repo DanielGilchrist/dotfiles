@@ -1,4 +1,21 @@
-local M = { compiler = nil, macros = {} }
+local is = require("utils.is")
+
+---@class heucristic.Compiler
+---@field status   string
+---@field errors?  integer
+---@field file?    string
+---@field line?    integer
+---@field message? string
+
+---@class heucristic.Macros
+---@field status string
+
+---@class heucristic.Status
+---@field compiler heucristic.Compiler?
+---@field macros   table<string, heucristic.Macros?>
+local M = {
+  macros = {}
+}
 
 local function redraw()
   vim.schedule(function ()
@@ -6,14 +23,41 @@ local function redraw()
   end)
 end
 
+---@param params unknown
+---@return heucristic.Compiler?
+local function decode_compiler(params)
+  if not is.table(params) then return nil end
+  local status, errors, file, line, message = params.status, params.errors, params.file, params.line, params.message
+  if not is.string(status) then return nil end
+  if errors ~= nil and not is.integer(errors) then return nil end
+  if file ~= nil and not is.string(file) then return nil end
+  if line ~= nil and not is.integer(line) then return nil end
+  if message ~= nil and not is.string(message) then return nil end
+  return { status = status, errors = errors, file = file, line = line, message = message }
+end
+
+---@param params unknown
+---@return string?, heucristic.Macros?
+local function decode_macros(params)
+  if not is.table(params) then return nil end
+  local status, target = params.status, params.target
+  if not is.string(status) then return nil end
+  if target ~= nil and not is.string(target) then return nil end
+  return target or "main", { status = status }
+end
+
 function M.handlers()
   return {
     ["$/heucristic/compiler"] = function (_, params)
-      M.compiler = params
+      local compiler = decode_compiler(params)
+      if not compiler then return end
+      M.compiler = compiler
       redraw()
     end,
     ["$/heucristic/macros"] = function (_, params)
-      M.macros[params.target or "main"] = params
+      local target, macros = decode_macros(params)
+      if not (target and macros) then return end
+      M.macros[target] = macros
       redraw()
     end
   }

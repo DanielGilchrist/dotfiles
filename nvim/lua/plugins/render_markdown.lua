@@ -55,7 +55,8 @@ local function preview_mermaid()
     bo = { buftype = "nofile", bufhidden = "wipe" }
   })
 
-  local placement = Snacks.image.placement.new(win.buf, png, {
+  local win_buf = assert(win.buf, "preview window has no buffer")
+  local placement = Snacks.image.placement.new(win_buf, png, {
     inline = false,
     max_width = max_w,
     max_height = max_h,
@@ -68,7 +69,7 @@ local function preview_mermaid()
     end
   })
 
-  local group = vim.api.nvim_create_augroup("mermaid_preview_" .. win.buf, { clear = true })
+  local group = vim.api.nvim_create_augroup("mermaid_preview_" .. win_buf, { clear = true })
   local reflow = Snacks.util.debounce(function ()
     if not win:valid() then return end
     local w, h = bounds()

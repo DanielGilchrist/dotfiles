@@ -3,15 +3,20 @@ local M = {}
 --- Disable formatting capabilities for an LSP client
 ---@param client vim.lsp.Client The LSP client to modify
 function M.disable_format(client)
-  client.server_capabilities.documentFormattingProvider = false
-  client.server_capabilities.documentRangeFormattingProvider = false
+  local capabilities = client.server_capabilities
+  if not capabilities then
+    return
+  end
+
+  capabilities.documentFormattingProvider = false
+  capabilities.documentRangeFormattingProvider = false
 end
 
 --- Get the path to a command via asdf shims
 ---@param command string The command name
 ---@return string[] # Array with the full path to the asdf shim
 function M.asdf_shim(command)
-  return { vim.fn.expand("~/.asdf/shims/" .. command) }
+  return { vim.fs.normalize("~/.asdf/shims/" .. command) }
 end
 
 --- Check if a gem is available in the current bundle
@@ -36,7 +41,7 @@ end
 
 --- The clients attached to a buffer, keyed by name
 ---@param bufnr integer
----@return table<string, vim.lsp.Client>
+---@return table<string, vim.lsp.Client?>
 function M.clients_by_name(bufnr)
   local by_name = {}
   M.each_client({ bufnr = bufnr }, function (client)

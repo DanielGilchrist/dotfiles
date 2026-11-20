@@ -19,7 +19,7 @@ return {
       function ()
         require("grug-far").with_visual_selection({
           startCursorRow = 2,
-          prefills = { paths = vim.fn.expand("%") }
+          prefills = { paths = vim.fn.bufname() }
         })
       end,
       mode = "v",

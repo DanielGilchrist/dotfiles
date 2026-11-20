@@ -40,9 +40,10 @@ local function ensure_buf()
   return buf
 end
 
----@return boolean
-function M.is_visible()
-  return state.win ~= nil and vim.api.nvim_win_is_valid(state.win)
+---@return integer?
+local function visible_win()
+  local win = state.win
+  if win and vim.api.nvim_win_is_valid(win) then return win end
 end
 
 --- Close any existing composer window across all tabs.
@@ -56,8 +57,9 @@ end
 
 function M.show()
   local buf = ensure_buf()
-  if M.is_visible() then
-    vim.api.nvim_set_current_win(state.win)
+  local visible = visible_win()
+  if visible then
+    vim.api.nvim_set_current_win(visible)
     return
   end
   -- Ensure only one composer window exists (e.g. if user switched tabs
@@ -77,7 +79,7 @@ function M.hide()
 end
 
 function M.toggle()
-  if M.is_visible() then
+  if visible_win() then
     M.hide()
   else
     M.show()

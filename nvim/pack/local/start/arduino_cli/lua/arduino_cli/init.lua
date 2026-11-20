@@ -1,7 +1,6 @@
 local cmd = require("utils.cmd")
 local notify = require("utils.notify")
 local is = require("utils.is")
-local str = require("utils.str")
 
 local function default_options(opts)
   opts = opts == nil and {} or opts
@@ -31,7 +30,7 @@ local function parse_board_list_line(line)
     return nil
   end
 
-  return { port = port, fqbn = fqbn, name = str.trim(board_name) }
+  return { port = port, fqbn = fqbn, name = vim.trim(board_name) }
 end
 
 local function parse_boards(data)

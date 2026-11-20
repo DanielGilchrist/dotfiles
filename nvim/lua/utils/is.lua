@@ -1,17 +1,35 @@
 local M = {}
 
 --- Check if a value is a table
----@param value any
+---@param value unknown
 ---@return boolean
+---@return_cast value table
 function M.table(value)
   return type(value) == "table"
 end
 
 --- Check if a value is a string
----@param value any
+---@param value unknown
 ---@return boolean
+---@return_cast value string
 function M.string(value)
   return type(value) == "string"
+end
+
+--- Check if a value is a number
+---@param value unknown
+---@return boolean
+---@return_cast value number
+function M.number(value)
+  return type(value) == "number"
+end
+
+--- Check if a value is a finite whole number
+---@param value unknown
+---@return boolean
+---@return_cast value integer
+function M.integer(value)
+  return type(value) == "number" and value % 1 == 0
 end
 
 --- Check if a path is executable
@@ -57,8 +75,10 @@ function M.empty(value)
 end
 
 --- Check if a value is not empty
----@param value any
+---@generic T
+---@param value T
 ---@return boolean
+---@return_cast value - nil
 function M.not_empty(value)
   return not M.empty(value)
 end

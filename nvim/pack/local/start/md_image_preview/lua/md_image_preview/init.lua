@@ -141,12 +141,13 @@ local function heading_lines(lines)
 end
 
 --- Preview window geometry. CSS px = image px / scale.
+---@param win integer
 ---@return { cols: integer, rows: integer, scale: integer, css_width: integer, css_height: integer, css_cell_height: number }
-local function viewport()
+local function viewport(win)
   local size = Snacks.image.terminal.size()
   local scale = math.max(1, math.floor(size.scale + 0.5))
-  local cols = vim.api.nvim_win_get_width(state.preview_win)
-  local rows = vim.api.nvim_win_get_height(state.preview_win)
+  local cols = vim.api.nvim_win_get_width(win)
+  local rows = vim.api.nvim_win_get_height(win)
   return {
     cols = cols,
     rows = rows,
@@ -163,7 +164,7 @@ end
 local function place(png)
   if not state or not vim.api.nvim_win_is_valid(state.preview_win) then return end
   local previous = state.placement
-  local view = viewport()
+  local view = viewport(state.preview_win)
   local swapped = false
   state.placement = Snacks.image.placement.new(state.preview_buf, png, {
     inline = false,
@@ -177,24 +178,26 @@ local function place(png)
   })
 end
 
+---@param s         MdPreviewState
 ---@param png_bytes string
 ---@return string path
-local function write_frame(png_bytes)
+local function write_frame(s, png_bytes)
   vim.fn.mkdir(FRAME_DIR, "p")
   frame_sequence = frame_sequence + 1
   local path = ("%s/frame-%d.png"):format(FRAME_DIR, frame_sequence)
   file_utils.write(path, png_bytes)
-  table.insert(state.frames, path)
-  while #state.frames > FRAMES_KEPT do
-    vim.fn.delete(table.remove(state.frames, 1))
+  table.insert(s.frames, path)
+  while #s.frames > FRAMES_KEPT do
+    vim.fn.delete(table.remove(s.frames, 1))
   end
   return path
 end
 
+---@param s MdPreviewState
 ---@return integer
-local function max_offset()
-  if not state or not state.layout then return 0 end
-  return math.max(0, state.layout.height - viewport().css_height)
+local function max_offset(s)
+  if not s.layout then return 0 end
+  return math.max(0, s.layout.height - viewport(s.preview_win).css_height)
 end
 
 --- Screenshot the slice at `state.offset` and place it. Serialised: a
@@ -208,7 +211,7 @@ local function refresh()
   end
   state.busy = true
   state.dirty = false
-  state.offset = math.max(0, math.min(state.offset, max_offset()))
+  state.offset = math.max(0, math.min(state.offset, max_offset(state)))
 
   log("capture", state.offset)
   browser:capture(state.offset, function (png, err)
@@ -219,7 +222,7 @@ local function refresh()
       return
     end
     log("captured", #png, "bytes")
-    local frame = write_frame(png)
+    local frame = write_frame(state, png)
     log("written", frame)
     place(frame)
     log("placed")
@@ -229,11 +232,13 @@ end
 
 --- CSS px position of source line <row>, interpolated between the nearest
 --- headings whose positions Chrome reported.
+---@param s           MdPreviewState
+---@param layout      MdLayout
 ---@param row         integer
 ---@param total_lines integer
 ---@return integer
-local function line_to_px(row, total_lines)
-  local layout, lines = state.layout, state.heading_lines
+local function line_to_px(s, layout, row, total_lines)
+  local lines = s.heading_lines
   local px = layout.headings
   if #lines == 0 or #lines ~= #px then
     return math.floor((row - 1) / math.max(1, total_lines - 1) * layout.height)
@@ -243,9 +248,9 @@ local function line_to_px(row, total_lines)
   local to_line, to_px = total_lines + 1, layout.height
   for index, line in ipairs(lines) do
     if line <= row then
-      from_line, from_px = line, px[index]
+      from_line, from_px = line, assert(px[index], "heading count mismatch")
     else
-      to_line, to_px = line, px[index]
+      to_line, to_px = line, assert(px[index], "heading count mismatch")
       break
     end
   end
@@ -259,8 +264,9 @@ local function follow_cursor()
   if not state or not state.layout or not vim.api.nvim_win_is_valid(state.src_win) then return end
   local row = vim.api.nvim_win_get_cursor(state.src_win)[1]
   local total = vim.api.nvim_buf_line_count(state.src_buf)
-  local target = line_to_px(row, total) - math.floor(viewport().css_height * CURSOR_ANCHOR)
-  target = math.max(0, math.min(target, max_offset()))
+  local px = line_to_px(state, state.layout, row, total)
+  local target = px - math.floor(viewport(state.preview_win).css_height * CURSOR_ANCHOR)
+  target = math.max(0, math.min(target, max_offset(state)))
   log("follow", row, "->", target, "current", state.offset)
   if target == state.offset then return end
   state.offset = target
@@ -272,7 +278,7 @@ local function render()
   if not state or not browser then return end
   local lines = vim.api.nvim_buf_get_lines(state.src_buf, 0, -1, false)
   local markdown = table.concat(lines, "\n")
-  local view = viewport()
+  local view = viewport(state.preview_win)
   local viewport_key = ("%dx%d@%d"):format(view.css_width, view.css_height, view.scale)
   local hash = vim.fn.sha256(markdown .. "\n" .. viewport_key)
   log("render", hash:sub(1, 8), "cached", hash == state.content_hash)
@@ -321,14 +327,14 @@ end
 ---@param lines number positive scrolls down
 function M.scroll(lines)
   if not state or not state.layout then return end
-  state.offset = state.offset + math.floor(lines * viewport().css_cell_height)
+  state.offset = state.offset + math.floor(lines * viewport(state.preview_win).css_cell_height)
   refresh()
 end
 
 ---@param where "top" | "bottom"
 function M.scroll_to(where)
   if not state or not state.layout then return end
-  state.offset = where == "top" and 0 or max_offset()
+  state.offset = where == "top" and 0 or max_offset(state)
   refresh()
 end
 
@@ -342,7 +348,7 @@ local function link_under_mouse()
   local mouse = vim.fn.getmousepos()
   if mouse.winid ~= state.preview_win then return nil end
   local size = Snacks.image.terminal.size()
-  local view = viewport()
+  local view = viewport(state.preview_win)
   local cell_width = size.cell_width / view.scale
   local border = state.float and 1 or 0
   local left = (mouse.wincol - 1 - border) * cell_width
@@ -366,12 +372,13 @@ local function open_link_under_mouse()
 end
 
 ---@param buf integer
-local function map_scroll_keys(buf)
+---@param win integer
+local function map_scroll_keys(buf, win)
   local function map(lhs, rhs)
     vim.keymap.set("n", lhs, rhs, { buffer = buf, nowait = true, silent = true })
   end
-  local half = function () return math.floor(viewport().rows / 2) end
-  local page = function () return viewport().rows end
+  local half = function () return math.floor(viewport(win).rows / 2) end
+  local page = function () return viewport(win).rows end
   map("j", function () M.scroll(3) end)
   map("k", function () M.scroll(-3) end)
   map("<Down>", function () M.scroll(3) end)
@@ -423,34 +430,35 @@ local function unmap_source_wheel(src_buf)
   end
 end
 
-local function attach_autocmds()
+---@param s MdPreviewState
+local function attach_autocmds(s)
   local rerender = Snacks.util.debounce(render, { ms = EDIT_DEBOUNCE_MS })
   local follow = Snacks.util.debounce(follow_cursor, { ms = FOLLOW_DEBOUNCE_MS })
 
   vim.api.nvim_create_autocmd({ "TextChanged", "TextChangedI", "TextChangedP" }, {
-    group = state.augroup,
-    buffer = state.src_buf,
+    group = s.augroup,
+    buffer = s.src_buf,
     callback = function () rerender() end
   })
-  if state.mode == "split" then
+  if s.mode == "split" then
     vim.api.nvim_create_autocmd({ "CursorMoved", "CursorMovedI", "WinScrolled" }, {
-      group = state.augroup,
-      buffer = state.src_buf,
+      group = s.augroup,
+      buffer = s.src_buf,
       callback = function () follow() end
     })
   end
   vim.api.nvim_create_autocmd({ "BufWinLeave", "BufDelete" }, {
-    group = state.augroup,
-    buffer = state.src_buf,
+    group = s.augroup,
+    buffer = s.src_buf,
     callback = function () M.close() end
   })
   vim.api.nvim_create_autocmd("WinClosed", {
-    group = state.augroup,
-    pattern = tostring(state.preview_win),
+    group = s.augroup,
+    pattern = tostring(s.preview_win),
     callback = function () M.close() end
   })
   vim.api.nvim_create_autocmd({ "VimResized", "WinResized" }, {
-    group = state.augroup,
+    group = s.augroup,
     callback = function ()
       if not state then return true end
       rerender()
@@ -473,7 +481,9 @@ local function open_float()
     bo = { buftype = "nofile", bufhidden = "wipe" },
     wo = { number = false, relativenumber = false, signcolumn = "no" }
   })
-  return float.win, float.buf, float
+  local win = assert(float.win, "float has no window")
+  local buf = assert(float.buf, "float has no buffer")
+  return win, buf, float
 end
 
 ---@return integer win, integer buf
@@ -503,7 +513,7 @@ end
 ---@return boolean
 local function ensure_browser()
   if browser and browser:alive() then return true end
-  local binary = Chrome.binary()
+  local binary = Chrome.find_binary()
   if not binary then
     notify.error("no Chrome/Chromium found for rendering")
     return false
@@ -574,9 +584,9 @@ function M.open(mode)
     dirty = false
   }
 
-  map_scroll_keys(preview_buf)
+  map_scroll_keys(preview_buf, preview_win)
   if mode == "split" then map_source_wheel(src_buf) end
-  attach_autocmds()
+  attach_autocmds(state)
   render()
 end
 

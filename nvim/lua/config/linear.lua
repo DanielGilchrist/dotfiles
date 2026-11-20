@@ -40,7 +40,10 @@ local slots = {
 local function resolve(slot)
   for _, group in ipairs(slot.groups) do
     local hl = vim.api.nvim_get_hl(0, { name = group, link = false })
-    local value = hl[slot.attr or "fg"]
+    local value = hl.fg
+    if slot.attr == "bg" then
+      value = hl.bg
+    end
 
     if value then
       return string.format("#%06x", value)

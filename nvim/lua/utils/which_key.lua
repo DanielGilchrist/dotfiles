@@ -16,7 +16,7 @@ M.refresh_triggers = function (buf)
 
     for _, mode in ipairs({ "n", "x", "o" }) do
       for _, m in ipairs(vim.api.nvim_buf_get_keymap(buf, mode)) do
-        if m.desc and m.desc:find("which-key-trigger", 1, true) and m.callback then
+        if m.lhs and m.desc and m.desc:find("which-key-trigger", 1, true) and m.callback then
           vim.keymap.del(mode, m.lhs, { buffer = buf })
           vim.keymap.set(mode, m.lhs, m.callback, { buffer = buf, nowait = true, desc = m.desc })
         end

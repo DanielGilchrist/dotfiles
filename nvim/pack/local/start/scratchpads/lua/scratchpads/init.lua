@@ -2,7 +2,7 @@ local notify = require("utils.notify")
 local is = require("utils.is")
 local str = require("utils.str")
 local ui = require("utils.ui")
-local scratchpads_dir = vim.fn.expand("~/.local/share/scratchpads/")
+local scratchpads_dir = vim.fs.normalize("~/.local/share/scratchpads") .. "/"
 
 local function scratch_search(_title, opts)
   opts = opts == nil and {} or opts

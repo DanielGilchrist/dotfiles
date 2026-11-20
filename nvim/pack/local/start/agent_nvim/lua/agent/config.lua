@@ -7,6 +7,7 @@
 ---@field icon        string            Prefix glyph on the virtual note
 ---@field virt_hl     string            Highlight group for the virtual note
 ---@field range_hl    string | nil      Optional highlight spanning the commented range
+---@field editing_hl  string            Highlight for the lines being commented on while the editor is open
 
 ---@class AgentConfig
 ---@field worktrees_dir         string            Path to the worktrees parent directory

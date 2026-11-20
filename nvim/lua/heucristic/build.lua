@@ -1,6 +1,6 @@
 local M = {}
 
-local repo = vim.fn.expand("~/repos/DanielGilchrist/heucristic")
+local repo = vim.fs.normalize("~/repos/DanielGilchrist/heucristic")
 local building = false
 
 local function installed()

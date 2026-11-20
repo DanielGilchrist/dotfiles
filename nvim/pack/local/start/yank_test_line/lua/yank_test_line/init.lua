@@ -6,7 +6,7 @@ local function double_quote(text)
 end
 
 local function maybe_test_name()
-  local file_path = vim.fn.expand("%:p")
+  local file_path = vim.api.nvim_buf_get_name(0)
   if str.starts_with(file_path, "test") then
     return
   end
@@ -34,10 +34,10 @@ local function not_a_test_file()
 end
 
 local function find_test_line_number()
-  local cursor_line = vim.fn.line(".")
+  local cursor_line = vim.api.nvim_win_get_cursor(0)[1]
 
   while cursor_line > 0 do
-    local line_content = vim.fn.getline(cursor_line)
+    local line_content = vim.api.nvim_buf_get_lines(0, cursor_line - 1, cursor_line, false)[1] or ""
     if line_content:match("^%s*test%s") then
       return cursor_line
     end

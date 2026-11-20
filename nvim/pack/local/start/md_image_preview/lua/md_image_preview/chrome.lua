@@ -6,6 +6,22 @@
 
 local is = require("utils.is")
 
+---@param value unknown
+---@param key   string
+---@return string?
+local function decode_string_field(value, key)
+  if not is.table(value) then return nil end
+  local field = value[key]
+  if is.string(field) then return field end
+end
+
+---@param result unknown
+---@return string?
+local function decode_evaluated_string(result)
+  if not is.table(result) then return nil end
+  return decode_string_field(result.result, "value")
+end
+
 ---@class MdLayout
 ---@field height   integer   content height in CSS px
 ---@field headings integer[] top of each heading in CSS px
@@ -14,6 +30,50 @@ local is = require("utils.is")
 ---@class MdLink
 ---@field href  string
 ---@field rects { left: number, top: number, right: number, bottom: number } [] page CSS px, one per line box
+
+---@param value unknown
+---@return { left: number, top: number, right: number, bottom: number }?
+local function decode_rect(value)
+  if not is.table(value) then return nil end
+  local left, top, right, bottom = value.left, value.top, value.right, value.bottom
+  if not (is.number(left) and is.number(top) and is.number(right) and is.number(bottom)) then return nil end
+  return { left = left, top = top, right = right, bottom = bottom }
+end
+
+---@param value unknown
+---@return MdLink?
+local function decode_link(value)
+  if not is.table(value) then return nil end
+  local href, raw_rects = value.href, value.rects
+  if not (is.string(href) and is.table(raw_rects)) then return nil end
+  local rects = {}
+  for index, raw in ipairs(raw_rects) do
+    local rect = decode_rect(raw)
+    if not rect then return nil end
+    rects[index] = rect
+  end
+  return { href = href, rects = rects }
+end
+
+---@param value unknown
+---@return MdLayout?
+local function decode_layout(value)
+  if not is.table(value) then return nil end
+  local height, raw_headings, raw_links = value.height, value.headings, value.links
+  if not (is.integer(height) and is.table(raw_headings) and is.table(raw_links)) then return nil end
+  local headings = {}
+  for index, top in ipairs(raw_headings) do
+    if not is.integer(top) then return nil end
+    headings[index] = top
+  end
+  local links = {}
+  for index, raw in ipairs(raw_links) do
+    local link = decode_link(raw)
+    if not link then return nil end
+    links[index] = link
+  end
+  return { height = height, headings = headings, links = links }
+end
 
 ---@class MdChrome
 ---@field binary       string
@@ -40,7 +100,7 @@ local CHROME_CANDIDATES = {
 }
 
 ---@return string | nil
-function Chrome.binary()
+function Chrome.find_binary()
   for _, candidate in ipairs(CHROME_CANDIDATES) do
     if is.executable(candidate) then return candidate end
   end
@@ -64,13 +124,14 @@ end
 
 ---@return boolean
 function Chrome:alive()
-  return self.handle ~= nil and self.handle:is_active()
+  local handle = self.handle
+  return handle ~= nil and handle:is_active() == true
 end
 
 ---@param method         string
 ---@param params?        table
----@param cb?            fun(result: table | nil, err: table | nil)
----@param browser_level? boolean                                    send without the page session (Target.*, Browser.*)
+---@param cb?            fun(result: unknown, err: unknown)
+---@param browser_level? boolean                            send without the page session (Target.*, Browser.*)
 function Chrome:send(method, params, cb, browser_level)
   if not self.to_chrome then return end
   self.next_id = self.next_id + 1
@@ -89,8 +150,8 @@ function Chrome:consume(chunk)
     local raw = self.buffer:sub(1, nul - 1)
     self.buffer = self.buffer:sub(nul + 1)
     local ok, message = pcall(vim.json.decode, raw)
-    if ok and message.id and self.callbacks[message.id] then
-      local cb = self.callbacks[message.id]
+    local cb = ok and self.callbacks[message.id]
+    if cb then
       self.callbacks[message.id] = nil
       vim.schedule(function () cb(message.result, message.error) end)
     end
@@ -116,8 +177,10 @@ end
 --- Spawn Chrome, open one page on the template and wait for marked.js.
 ---@param on_error fun(message: string)
 function Chrome:start(on_error)
-  self.to_chrome = uv.new_pipe(false)
-  self.from_chrome = uv.new_pipe(false)
+  local to_chrome = assert(uv.new_pipe(false), "could not create pipe")
+  local from_chrome = assert(uv.new_pipe(false), "could not create pipe")
+  self.to_chrome = to_chrome
+  self.from_chrome = from_chrome
 
   self.handle = uv.spawn(
     self.binary,
@@ -130,7 +193,7 @@ function Chrome:start(on_error)
         "--hide-scrollbars",
         "about:blank"
       },
-      stdio = { nil, nil, nil, self.to_chrome, self.from_chrome }
+      stdio = { nil, nil, nil, to_chrome, from_chrome }
     },
     function (code)
       self.handle = nil
@@ -143,16 +206,20 @@ function Chrome:start(on_error)
     return on_error("could not spawn " .. self.binary)
   end
 
-  self.from_chrome:read_start(function (err, chunk)
+  from_chrome:read_start(function (err, chunk)
     if err or not chunk then return end
     self:consume(chunk)
   end)
 
   self:send("Target.createTarget", { url = "about:blank" }, function (created, err)
-    if not created then return on_error("Target.createTarget failed: " .. vim.inspect(err)) end
-    self:send("Target.attachToTarget", { targetId = created.targetId, flatten = true }, function (attached, attach_err)
-      if not attached then return on_error("Target.attachToTarget failed: " .. vim.inspect(attach_err)) end
-      self.session_id = attached.sessionId
+    local target_id = decode_string_field(created, "targetId")
+    if not target_id then return on_error("Target.createTarget failed: " .. vim.inspect(err or created)) end
+    self:send("Target.attachToTarget", { targetId = target_id, flatten = true }, function (attached, attach_err)
+      local session_id = decode_string_field(attached, "sessionId")
+      if not session_id then
+        return on_error("Target.attachToTarget failed: " .. vim.inspect(attach_err or attached))
+      end
+      self.session_id = session_id
       self:send("Page.navigate", { url = "file://" .. self.template }, function (_, nav_err)
         if nav_err then return on_error("Page.navigate failed: " .. vim.inspect(nav_err)) end
         self:send(
@@ -213,11 +280,11 @@ function Chrome:set_content(markdown, cb)
       returnByValue = true
     },
     function (result, err)
-      if err or not result or not result.result or not result.result.value then
-        return cb(nil, vim.inspect(err or result))
-      end
-      local ok, layout = pcall(vim.json.decode, result.result.value)
-      if not ok or not is.table(layout) then return cb(nil, "bad layout: " .. tostring(result.result.value)) end
+      local value = decode_evaluated_string(result)
+      if err or not value then return cb(nil, vim.inspect(err or result)) end
+      local ok, decoded = pcall(vim.json.decode, value)
+      local layout = ok and decode_layout(decoded) or nil
+      if not layout then return cb(nil, "bad layout: " .. value) end
       cb(layout)
     end
   )
@@ -229,8 +296,9 @@ end
 function Chrome:capture(y, cb)
   self:send("Runtime.evaluate", { expression = ("window.scrollTo(0, %d)"):format(y) }, function ()
     self:send("Page.captureScreenshot", { format = "png", optimizeForSpeed = true }, function (result, err)
-      if err or not result or not result.data then return cb(nil, vim.inspect(err or result)) end
-      cb(vim.base64.decode(result.data))
+      local data = decode_string_field(result, "data")
+      if err or not data then return cb(nil, vim.inspect(err or result)) end
+      cb(vim.base64.decode(data))
     end)
   end)
 end
@@ -240,7 +308,8 @@ function Chrome:stop()
   if self.handle then
     self:send("Browser.close", nil, nil, true)
     local handle = self.handle
-    uv.new_timer():start(500, 0, function ()
+    local timer = assert(uv.new_timer(), "could not create timer")
+    timer:start(500, 0, function ()
       if handle:is_active() then handle:kill("sigkill") end
     end)
   end

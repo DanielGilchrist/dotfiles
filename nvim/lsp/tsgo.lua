@@ -43,8 +43,7 @@ return {
   end,
   filetypes = { "javascript", "javascriptreact", "typescript", "typescriptreact" },
   root_dir = function (bufnr, on_dir)
-    local root_markers = { "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "bun.lockb", "bun.lock" }
-    root_markers = { root_markers, { ".git" } }
+    local root_markers = { { "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "bun.lockb", "bun.lock" }, { ".git" } }
 
     local deno_root = vim.fs.root(bufnr, { "deno.json", "deno.jsonc" })
     local deno_lock_root = vim.fs.root(bufnr, { "deno.lock" })

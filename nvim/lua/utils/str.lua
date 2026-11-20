@@ -27,11 +27,4 @@ function M.excludes(s, pattern, plain)
   return not M.includes(s, pattern, plain)
 end
 
---- Trim whitespace from both ends of a string
----@param s string The string to trim
----@return string
-function M.trim(s)
-  return s:match("^%s*(.-)%s*$")
-end
-
 return M

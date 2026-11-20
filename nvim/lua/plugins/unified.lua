@@ -7,7 +7,11 @@ return {
   config = function (_, opts)
     require("unified").setup(opts)
     local async = require("unified.utils.async")
+    ---@param func     function
+    ---@param delay_ms number
+    ---@return function
     async.debounce = function (func, delay_ms)
+      ---@type uv.uv_timer_t?
       local timer
       return function (...)
         local args = { ... }
@@ -18,7 +22,7 @@ return {
         timer = vim.defer_fn(function ()
           timer = nil
           func(unpack(args))
-        end, delay_ms)
+        end, math.floor(delay_ms))
       end
     end
 
@@ -34,7 +38,7 @@ return {
       local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
       if #lines == 1 and lines[1] == "" then return show_git_diff(commit, buf) end
       local hash, code = job.await({ "git", "rev-parse", "--verify", commit }, { cwd = root })
-      if code ~= 0 or git.get_git_file_content(path, vim.trim(hash)) ~= false then
+      if not hash or code ~= 0 or git.get_git_file_content(path, vim.trim(hash)) ~= false then
         return show_git_diff(commit, buf)
       end
       diff.display_inline_diff(buf, {

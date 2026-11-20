@@ -126,8 +126,9 @@ map("n", leader("mb"), function () playback({ "seek", "--", "-10000" }) end, { d
 -- Toggle zoom + focus on any terminal window in the current tab. From any
 -- window: jump to the first terminal, max it, drop into insert mode. Press
 -- again: rebalance the splits and restore focus to where you came from.
-local term_zoom_state = nil ---@type { prev_win: integer } | nil
-vim.keymap.set({ "n", "i", "t", "x" }, "<C-,>", function ()
+---@type { prev_win: integer }?
+local term_zoom_state
+map({ "n", "i", "t", "x" }, "<C-,>", function ()
   if term_zoom_state then
     vim.cmd("stopinsert")
     vim.cmd("wincmd =")
@@ -155,6 +156,7 @@ vim.keymap.set({ "n", "i", "t", "x" }, "<C-,>", function ()
 end, { desc = "Toggle terminal zoom + focus", silent = true }
 )
 
+---@type { last: snacks.win? }
 local terminal_state = { last = nil }
 
 map("t", "<C-;>", function ()
@@ -217,6 +219,7 @@ map("n", leader("tp"), function ()
         bo = { buftype = "nofile", bufhidden = "wipe" }
       })
 
+      ---@return integer?, integer?
       local function photo_size_in_cells(photo)
         local output = vim.fn.system({ "sips", "-g", "pixelWidth", "-g", "pixelHeight", photo })
         local pixel_width = tonumber(output:match("pixelWidth: (%d+)"))
@@ -231,8 +234,11 @@ map("n", leader("tp"), function ()
         return math.max(math.floor(width * scale), 8), math.max(math.floor(height * scale), 4)
       end
 
+      ---@param width  integer
+      ---@param height integer
       local function set_window_size(width, height)
-        vim.api.nvim_win_set_config(win.win, {
+        local window = assert(win.win, "window is not open")
+        vim.api.nvim_win_set_config(window, {
           relative = "editor",
           width = width,
           height = height,
@@ -250,7 +256,7 @@ map("n", leader("tp"), function ()
           set_window_size(width, height)
         end
 
-        Snacks.image.buf.attach(win.buf, {
+        Snacks.image.buf.attach(assert(win.buf, "window has no buffer"), {
           src = photo,
           on_update = vim.schedule_wrap(function (placement)
             if not win:valid() then
@@ -263,7 +269,7 @@ map("n", leader("tp"), function ()
         })
       end
 
-      local timer = vim.uv.new_timer()
+      local timer = assert(vim.uv.new_timer(), "could not create timer")
 
       local tick = vim.schedule_wrap(function ()
         if not win:valid() then

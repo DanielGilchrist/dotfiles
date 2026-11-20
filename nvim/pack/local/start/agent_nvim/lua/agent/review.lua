@@ -1,6 +1,16 @@
 local config = require("agent.config")
 local ui = require("agent.ui")
 
+---@class AgentReview
+---@field comments ReviewComment[]
+---@field reviewed table<string, boolean>
+---@field _next_id integer
+---@field _session integer
+---@field _active  boolean
+---@field _base    string | nil
+---@field _root    string | nil
+---@field _message string | nil
+---@field _changed ChangedFile[] | nil
 local M = {}
 
 local ns = vim.api.nvim_create_namespace("agent_review")
@@ -18,23 +28,34 @@ local edit_ns = vim.api.nvim_create_namespace("agent_review_editing")
 ---@field text       string
 ---@field file_level boolean | nil
 
----@type ReviewComment[]
 M.comments = {}
 M._next_id = 1
-M._base = nil ---@type string | nil
 M._active = false
-M._root = nil ---@type string | nil
-M._message = nil ---@type string | nil
----@class ChangedFile
----@field text      string
----@field file      string
+
+---@class ReviewCommentItem: snacks.picker.finder.Item
+---@field comment ReviewComment
+---@field pos     snacks.picker.Pos
+
+---@class SavedComment
+---@field relpath    string
+---@field ft         string
+---@field lnum       integer
+---@field nlines     integer
+---@field code       string[]
+---@field text       string
+---@field file_level boolean | nil
+
+---@class ReviewState
+---@field base     string
+---@field reviewed string[]
+---@field message  string | nil
+---@field comments SavedComment[]
+
+---@class ChangedFile: snacks.picker.finder.Item
 ---@field untracked boolean
 ---@field add       integer
 ---@field del       integer
 
----@type ChangedFile[] | nil
-M._changed = nil
----@type table<string, boolean>
 M.reviewed = {}
 
 local cmd_utils = require("utils.cmd")
@@ -44,13 +65,11 @@ local path_utils = require("utils.path")
 local ui_utils = require("utils.ui")
 local notify = require("utils.notify").with_title("agent review")
 
-local function rcfg()
-  return config.review or {}
-end
-
----@return boolean
-local function has_message()
-  return M._message ~= nil and is.not_empty(vim.trim(M._message))
+---@return string | nil
+local function message()
+  local text = M._message
+  if text and is.not_empty(vim.trim(text)) then return text end
+  return nil
 end
 
 ---@param text  string
@@ -100,7 +119,7 @@ local function repo_root(path)
 end
 
 ---@param root string
----@return string[] remotes, "origin" first
+---@return string[] remotes ordered with "origin" first
 local function remotes(root)
   local out = git(root, { "remote" })
   local names = out and vim.split(out, "\n", { trimempty = true }) or {}
@@ -114,6 +133,7 @@ end
 ---@param root string
 ---@return string base, string label
 local function fork_point(root)
+  ---@type string[]
   local candidates = {}
   for _, remote in ipairs(remotes(root)) do
     vim.list_extend(candidates, { remote .. "/HEAD", remote .. "/main", remote .. "/master" })
@@ -146,13 +166,6 @@ local function is_trunk(root)
   return false
 end
 
----@param root string
----@return string base, string label
-local function resolve_base(root)
-  if rcfg().base == "head" then return "HEAD", "HEAD" end
-  return fork_point(root)
-end
-
 ---@return string | nil
 local function current_base()
   return M._base
@@ -164,14 +177,18 @@ end
 ---@param numstat   string
 ---@return ChangedFile[]
 local function parse_changed(root, tracked, untracked, numstat)
+  ---@type table<string, { add: integer, del: integer } | nil>
   local stat = {}
   for line in numstat:gmatch("[^\n]+") do
     local a, d, rel = line:match("^(%S+)\t(%S+)\t(.+)$")
     if rel then
-      stat[vim.trim(rel)] = { add = tonumber(a) or 0, del = tonumber(d) or 0 }
+      stat[vim.trim(rel)] = { add = math.floor(tonumber(a) or 0), del = math.floor(tonumber(d) or 0) }
     end
   end
-  local seen, items = {}, {}
+  ---@type table<string, boolean>
+  local seen = {}
+  ---@type ChangedFile[]
+  local items = {}
   local function add(rel, is_untracked)
     rel = vim.trim(rel)
     if is.empty(rel) or seen[rel] then return end
@@ -215,12 +232,18 @@ local function list_changed(root, base, cb)
   end
 end
 
+---@param token integer
+---@return boolean
+local function is_current(token)
+  return M._active and M._session == token
+end
+
 ---@param on_done? fun(items: ChangedFile[])
 local function refresh_changed(on_done)
   local root, base, session = M._root, current_base(), M._session
   if not (M._active and root and base) then return end
   list_changed(root, base, function (items)
-    if not (M._active and M._session == session) then return end
+    if not is_current(session) then return end
     M._changed = items
     if on_done then on_done(items) end
   end)
@@ -232,14 +255,60 @@ local function state_path(root)
   return vim.fn.stdpath("data") .. "/agent_review/" .. (root:gsub("[/\\]", "%%")) .. ".json"
 end
 
+---@param value unknown
+---@return string[]?
+local function decode_strings(value)
+  if not is.table(value) then return nil end
+  local out = {}
+  for index, item in ipairs(value) do
+    if not is.string(item) then return nil end
+    out[index] = item
+  end
+  return out
+end
+
+---@param value unknown
+---@return SavedComment?
+local function decode_comment(value)
+  if not is.table(value) then return nil end
+  local relpath, ft, text = value.relpath, value.ft, value.text
+  local lnum, nlines, code = value.lnum, value.nlines, decode_strings(value.code)
+  if not (is.string(relpath) and is.string(ft) and is.string(text)) then return nil end
+  if not (is.integer(lnum) and is.integer(nlines) and code) then return nil end
+  return {
+    relpath = relpath,
+    ft = ft,
+    lnum = lnum,
+    nlines = nlines,
+    code = code,
+    text = text,
+    file_level = value.file_level == true or nil
+  }
+end
+
+---@param value unknown
+---@return ReviewState?
+local function decode_state(value)
+  if not is.table(value) then return nil end
+  local base, raw_comments, message = value.base, value.comments, value.message
+  local reviewed = decode_strings(value.reviewed)
+  if not (is.string(base) and is.table(raw_comments) and reviewed) then return nil end
+  local comments = {}
+  for index, raw in ipairs(raw_comments) do
+    local comment = decode_comment(raw)
+    if not comment then return nil end
+    comments[index] = comment
+  end
+  return { base = base, reviewed = reviewed, message = is.string(message) and message or nil, comments = comments }
+end
+
 ---@param root string
----@return table | nil
+---@return ReviewState?
 local function read_state(root)
   local raw = file_utils.read(state_path(root))
   if not raw then return nil end
   local ok, data = pcall(vim.json.decode, raw)
-  if ok and is.table(data) then return data end
-  return nil
+  if ok then return decode_state(data) end
 end
 
 ---@param root string
@@ -255,7 +324,7 @@ local function highlight_range(buf, s, e)
   for l = s, e do
     local row = math.min(l - 1, last)
     pcall(vim.api.nvim_buf_set_extmark, buf, edit_ns, row, 0, {
-      line_hl_group = rcfg().editing_hl or "Visual",
+      line_hl_group = config.review.editing_hl,
       priority = 20000
     })
   end
@@ -327,9 +396,8 @@ local function ensure_diff(buf)
 end
 
 ---@param file string
----@param base string | nil
----@param pos? integer[]
-local function open_in_diff(file, base, pos)
+---@param pos? snacks.picker.Pos
+local function open_in_diff(file, pos)
   vim.cmd("edit " .. vim.fn.fnameescape(file))
   ensure_diff(vim.api.nvim_get_current_buf())
   if pos then pcall(vim.api.nvim_win_set_cursor, 0, pos) end
@@ -402,7 +470,7 @@ function M.pick_commit(root, cb)
     items = items,
     format = function (item) return { { item.text } } end,
     preview = function (ctx)
-      return Snacks.picker.preview.cmd({ "git", "-C", root, "show", "--stat", ctx.item.sha }, ctx, { ft = "git" })
+      Snacks.picker.preview.cmd({ "git", "-C", root, "show", "--stat", ctx.item.sha }, ctx, { ft = "git" })
     end,
     confirm = function (picker, item)
       picker:close()
@@ -433,7 +501,7 @@ function M.pick_mode(root)
 
   ---@type { text: string, run: fun() } []
   local options
-  if branch and rcfg().base ~= "head" then
+  if branch and config.review.base ~= "head" then
     options = { branch, working, commit }
   else
     options = { working }
@@ -473,9 +541,7 @@ function M.start()
     vim.ui.select(
       { "resume", "start fresh" },
       {
-        prompt = ("Resume review? %d comment(s), %d file(s) marked"):format(
-          #(saved.comments or {}), #(saved.reviewed or {})
-        )
+        prompt = ("Resume review? %d comment(s), %d file(s) marked"):format(#saved.comments, #saved.reviewed)
       },
       function (choice)
         if choice == "resume" then
@@ -492,8 +558,6 @@ function M.start()
   M.pick_mode(root)
 end
 
----@param root  string | nil
----@param base  string | nil
 ---@param items ChangedFile[]
 ---@return ChangedFile[]
 local function unreviewed_first(items)
@@ -546,11 +610,11 @@ local function pick_changed(root, base, items)
       else
         cmd = { "git", "-C", root, "diff", base, "--", ctx.item.text }
       end
-      return Snacks.picker.preview.cmd(cmd, ctx, { ft = "diff" })
+      Snacks.picker.preview.cmd(cmd, ctx, { ft = "diff" })
     end,
     confirm = function (picker, item)
       picker:close()
-      if item then vim.schedule(function() open_in_diff(item.file, base) end) end
+      if item and item.file then vim.schedule(function() open_in_diff(item.file) end) end
     end,
     actions = {
       agent_toggle_reviewed = function (picker, item)
@@ -628,19 +692,17 @@ local function target_range()
 end
 
 ---@param c ReviewComment
----@return integer[] | nil
-local function extmark_pos(c)
+---@return integer | nil row zero-based
+local function extmark_row(c)
   if not (c.bufnr and vim.api.nvim_buf_is_valid(c.bufnr)) then return nil end
-  local pos = vim.api.nvim_buf_get_extmark_by_id(c.bufnr, ns, c.id, {})
-  if pos[1] then return pos end
-  return nil
+  return vim.api.nvim_buf_get_extmark_by_id(c.bufnr, ns, c.id, {})[1]
 end
 
 ---@param c ReviewComment
 ---@return integer
 local function current_lnum(c)
-  local pos = extmark_pos(c)
-  if pos then return pos[1] + 1 end
+  local row = extmark_row(c)
+  if row then return row + 1 end
   return c.lnum
 end
 
@@ -649,8 +711,8 @@ function M._render(c)
   if not (c.bufnr and vim.api.nvim_buf_is_valid(c.bufnr)) then return end
   c.lnum = current_lnum(c)
 
-  local cfg = rcfg()
-  local prefix = "  " .. (cfg.icon or "▌") .. " "
+  local cfg = config.review
+  local prefix = "  " .. cfg.icon .. " "
   local indent = "    "
 
   local win = vim.fn.bufwinid(c.bufnr)
@@ -662,17 +724,17 @@ function M._render(c)
   local avail = math.max(width - #indent - 2, 20)
 
   local body = c.file_level and ("(file) " .. c.text) or c.text
-  ---@type table[]
+  ---@type [string, string][][]
   local virt = {}
   for i, line in ipairs(wrap_text(body, avail)) do
-    virt[#virt + 1] = { { (i == 1 and prefix or indent) .. line, cfg.virt_hl or "Comment" } }
+    virt[#virt + 1] = { { (i == 1 and prefix or indent) .. line, cfg.virt_hl } }
   end
 
   if c.file_level then
     vim.api.nvim_buf_set_extmark(c.bufnr, ns, 0, 0, {
       id = c.id,
-      sign_text = cfg.sign or "▌",
-      sign_hl_group = cfg.sign_hl or "DiagnosticInfo",
+      sign_text = cfg.sign,
+      sign_hl_group = cfg.sign_hl,
       virt_lines = virt,
       virt_lines_above = true
     })
@@ -683,8 +745,8 @@ function M._render(c)
   local row = math.min(c.lnum - 1, last)
   vim.api.nvim_buf_set_extmark(c.bufnr, ns, row, 0, {
     id = c.id,
-    sign_text = cfg.sign or "▌",
-    sign_hl_group = cfg.sign_hl or "DiagnosticInfo",
+    sign_text = cfg.sign,
+    sign_hl_group = cfg.sign_hl,
     virt_lines = virt,
     virt_lines_above = false,
     end_row = math.min(c.lnum - 1 + (c.nlines - 1), last),
@@ -692,7 +754,7 @@ function M._render(c)
   })
 end
 
----@param opts? { range?: integer[], file_level?: boolean }
+---@param opts? { range?:[integer, integer], file_level?: boolean }
 function M.add_comment(opts)
   if not require_active() then return end
   opts = opts or {}
@@ -707,13 +769,13 @@ function M.add_comment(opts)
   local relpath = vim.fn.fnamemodify(file, ":.")
   if root and vim.startswith(file, root .. "/") then relpath = file:sub(#root + 2) end
   local ft = vim.bo[buf].filetype
-  local file_level = opts.file_level or false
+  local file_level = opts.file_level == true
 
-  local s, e, code, loc
-  if file_level then
-    s, e, code = 1, 1, {}
-    loc = relpath .. " (whole file)"
-  else
+  local s, e = 1, 1
+  ---@type string[]
+  local code = {}
+  local loc = relpath .. " (whole file)"
+  if not file_level then
     if opts.range then
       s, e = opts.range[1], opts.range[2]
       if s > e then
@@ -722,7 +784,7 @@ function M.add_comment(opts)
     else
       s, e = target_range()
     end
-    if vim.bo[buf].modified then pcall(vim.cmd, "silent! update") end
+    if vim.bo[buf].modified then vim.cmd("silent! update") end
     code = vim.api.nvim_buf_get_lines(buf, s - 1, e, false)
     loc = e > s and ("%s:%d-%d"):format(relpath, s, e) or ("%s:%d"):format(relpath, s)
     highlight_range(buf, s, e)
@@ -837,7 +899,7 @@ function M.list()
   if not require_active() then return end
   if #M.comments == 0 then return notify.info("no pending comments") end
 
-  ---@type table[]
+  ---@type ReviewCommentItem[]
   local items = {}
   for _, c in ipairs(M.comments) do
     local ln = current_lnum(c)
@@ -867,7 +929,10 @@ function M.list()
     end,
     confirm = function (picker, item)
       picker:close()
-      if item then vim.schedule(function() open_in_diff(item.file, current_base(), item.pos) end) end
+      if item and item.file then
+        local pos = item.pos
+        vim.schedule(function () open_in_diff(item.file, pos) end)
+      end
     end
   })
 end
@@ -875,10 +940,11 @@ end
 ---@return string
 local function build_markdown()
   local out = { "# Review comments", "" }
-  if has_message() then
+  local overview = message()
+  if overview then
     out[#out + 1] = "## Overview"
     out[#out + 1] = ""
-    vim.list_extend(out, vim.split(M._message, "\n", { plain = true }))
+    vim.list_extend(out, vim.split(overview, "\n", { plain = true }))
     out[#out + 1] = ""
   end
   out[#out + 1] = "Notes on your recent changes. Please work through each one."
@@ -922,7 +988,7 @@ end
 ---@param count integer
 local function deliver(md, count)
   local agent = require("agent")
-  local cfg = rcfg()
+  local cfg = config.review
 
   if cfg.delivery == "inline" then
     if agent.send_text(md) then
@@ -933,7 +999,7 @@ local function deliver(md, count)
   end
 
   local root = repo_root(vim.api.nvim_buf_get_name(0)) or vim.fn.getcwd()
-  local fname = cfg.review_file or ".agent-review.md"
+  local fname = cfg.review_file
   local path = root .. "/" .. fname
   if not file_utils.write(path, md) then return notify.error("could not write " .. path) end
   add_local_exclude(root, fname)
@@ -951,9 +1017,10 @@ end
 local function preview_send(count)
   ---@type string[][]
   local pages = {}
-  if has_message() then
+  local overview = message()
+  if overview then
     local lines = { "# Overview message", "" }
-    vim.list_extend(lines, vim.split(M._message, "\n", { plain = true }))
+    vim.list_extend(lines, vim.split(overview, "\n", { plain = true }))
     pages[#pages + 1] = lines
   end
   for _, c in ipairs(M.comments) do
@@ -997,14 +1064,16 @@ local function preview_send(count)
   end
 
   local idx = 1
+  ---@type integer | nil
   local win = vim.api.nvim_open_win(buf, true, float_cfg(""))
   vim.wo[win].wrap = true
   vim.wo[win].linebreak = true
   vim.wo[win].breakindent = true
 
   local function render()
+    local page = assert(pages[idx], "review page out of range")
     vim.bo[buf].modifiable = true
-    vim.api.nvim_buf_set_lines(buf, 0, -1, false, pages[idx])
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, page)
     vim.bo[buf].modifiable = false
     if win and vim.api.nvim_win_is_valid(win) then
       pcall(
@@ -1042,7 +1111,7 @@ end
 
 function M.submit()
   if not require_active() then return end
-  if #M.comments == 0 and not has_message() then
+  if #M.comments == 0 and not message() then
     return notify.warn("nothing to send (no comments or message)")
   end
   preview_send(#M.comments)
@@ -1056,7 +1125,7 @@ function M._save_state()
   for file in pairs(M.reviewed) do
     if vim.startswith(file, prefix) then reviewed[#reviewed + 1] = file:sub(#prefix + 1) end
   end
-  ---@type table[]
+  ---@type SavedComment[]
   local comments = {}
   for _, c in ipairs(M.comments) do
     comments[#comments + 1] = {
@@ -1083,7 +1152,7 @@ function M._save_state()
 end
 
 ---@param root string
----@param data table
+---@param data ReviewState
 function M.resume(root, data)
   M._active = true
   M._root = root
@@ -1092,12 +1161,12 @@ function M.resume(root, data)
   M._changed = nil
   refresh_changed()
   M.reviewed = {}
-  for _, rel in ipairs(data.reviewed or {}) do
+  for _, rel in ipairs(data.reviewed) do
     M.reviewed[root .. "/" .. rel] = true
   end
   M._message = data.message
   M.comments = {}
-  for _, s in ipairs(data.comments or {}) do
+  for _, s in ipairs(data.comments) do
     M.comments[#M.comments + 1] = {
       id = M._next_id,
       file = root .. "/" .. s.relpath,
@@ -1125,7 +1194,7 @@ function M.resume(root, data)
 end
 
 function M.reset()
-  pcall(vim.cmd, "Unified reset")
+  pcall(function () vim.cmd("Unified reset") end)
   if M._root then clear_state(M._root) end
   M._base = nil
   M._changed = nil
@@ -1145,7 +1214,7 @@ vim.api.nvim_create_autocmd("BufWinEnter", {
     if is.empty(file) then return end
     ensure_diff(args.buf)
     for _, c in ipairs(M.comments) do
-      if c.file == file and not (c.bufnr == args.buf and extmark_pos(c)) then
+      if c.file == file and not (c.bufnr == args.buf and extmark_row(c)) then
         c.bufnr = args.buf
         M._render(c)
       end

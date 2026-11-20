@@ -6,12 +6,12 @@ local composer = require("agent.composer")
 local cmd_utils = require("utils.cmd")
 local file = require("utils.file")
 local is = require("utils.is")
-local path_utils = require("utils.path")
 local ui_utils = require("utils.ui")
 local notify = require("utils.notify").with_title("agent")
 
 ---@class Agent
----@field config AgentConfig
+---@field config        AgentConfig
+---@field last_attached string | nil Most recently focused agent, used by `<C-.>` toggle and as a fallback send target from non-agent tabs
 local M = {}
 M.config = config
 
@@ -20,11 +20,7 @@ M.config = config
 --- on TabClosed so it can't go stale.
 ---@type table<integer, string>
 M.tab_agents = {}
-M.agent_terminals = {} ---@type table<string, table> Snacks terminal objects by agent name
---- Most recently focused agent, used by `<C-.>` toggle and as a fallback
---- send target from non-agent tabs.
----@type string | nil
-M.last_attached = nil
+M.agent_terminals = {} ---@type table<string, snacks.win?> Snacks terminal objects by agent name
 
 ---@param name string
 ---@return integer | nil tabid
@@ -87,7 +83,7 @@ function M.send_visual()
     notify.warn("no visual selection")
     return
   end
-  if vim.bo.modified then pcall(vim.cmd, "silent! update") end
+  if vim.bo.modified then vim.cmd("silent! update") end
   composer.append(("@%s:%d-%d"):format(path, s[1], e[1]))
   composer.show()
 end
@@ -141,7 +137,7 @@ end
 --- Attach to an existing session. New sessions are created by the `agent`
 --- binary (see `spawn_headless`), which hands back the command to run here.
 ---@param name string
----@return string[]
+---@return string[] | nil
 local function build_attach_cmd(name)
   local argv, why = host.attach_cmd(name)
   if not argv then notify.error(("can't attach %s: %s"):format(name, why or "")) end
@@ -150,7 +146,7 @@ end
 
 --- Tab pages opened by `attach_in_terminal` just for an agent, as opposed to
 --- the user's own tab that a repo session was split into.
----@type table<integer, true>
+---@type table<integer, true?>
 M.agent_tabs = {}
 
 --- Forget a terminal whose client exited (session ended, detached, or
@@ -186,7 +182,8 @@ end
 --- buffer-local here — globally they'd shadow TUI apps' own bindings
 --- (e.g. lazygit's move-commit keys). Snacks calls `on_buf` on every show,
 --- so the exit hook is registered once per buffer.
----@param cmd string[]
+---@param name string
+---@param cmd  string[]
 local function open_agent_terminal(name, cmd)
   return Snacks.terminal.open(cmd, {
     win = {
@@ -199,13 +196,13 @@ local function open_agent_terminal(name, cmd)
           )
         end
         local buf = self.buf
-        if vim.b[buf].agent_exit_hook then return end
+        if not buf or vim.b[buf].agent_exit_hook then return end
         vim.b[buf].agent_exit_hook = true
         vim.api.nvim_create_autocmd("TermClose", {
           buffer = buf,
           once = true,
           callback = function ()
-            local status = vim.v.event.status
+            local status = vim.api.nvim_get_vvar("event").status
             vim.schedule(function () forget_terminal(name, buf, status) end)
           end
         })
@@ -236,20 +233,20 @@ function M.attach_in_terminal(name, opts)
   -- to), the agent belongs *here* — open it as a side split in the current
   -- tab rather than a new tab page. This is the repo-session case.
   local current_cwd = vim.fn.getcwd()
-  local needs_new_tab = cwd ~= nil and cwd ~= current_cwd
+  local new_tab_cwd = cwd ~= current_cwd and cwd or nil
 
   local cmd = opts.attach_cmd or build_attach_cmd(name)
   if not cmd then return end
 
-  if not needs_new_tab then
+  if not new_tab_cwd then
     M.last_attached = name
     M.tab_agents[vim.api.nvim_get_current_tabpage()] = name
     -- Use `Snacks.terminal.open` (not the callable shorthand which is
     -- actually `toggle`) so calling this twice never hides what we just
     -- opened. Reuse an existing handle if we already created one.
-    local existing = M.agent_terminals[name]
-    if existing and existing.buf and vim.api.nvim_buf_is_valid(existing.buf) then
-      if not existing:win_valid() then existing:show() end
+    local terminal = M.agent_terminals[name]
+    if terminal and terminal.buf and vim.api.nvim_buf_is_valid(terminal.buf) then
+      if not terminal:win_valid() then terminal:show() end
     else
       M.agent_terminals[name] = open_agent_terminal(name, cmd)
     end
@@ -262,23 +259,23 @@ function M.attach_in_terminal(name, opts)
 
   vim.cmd("tabnew")
   local tabid = vim.api.nvim_get_current_tabpage()
-  vim.cmd("tcd " .. vim.fn.fnameescape(cwd))
+  vim.cmd("tcd " .. vim.fn.fnameescape(new_tab_cwd))
   vim.t.tabname = name
   M.tab_agents[tabid] = name
   M.agent_tabs[tabid] = true
   M.last_attached = name
   require("config.tabs").refresh_title()
 
-  if Snacks.dashboard then
-    pcall(Snacks.dashboard, {
+  pcall(function ()
+    Snacks.dashboard({
       buf = vim.api.nvim_get_current_buf(),
       win = vim.api.nvim_get_current_win()
     })
-  end
+  end)
 
-  local existing = M.agent_terminals[name]
-  if existing and existing.buf and vim.api.nvim_buf_is_valid(existing.buf) then
-    if not existing:win_valid() then existing:show() end
+  local terminal = M.agent_terminals[name]
+  if terminal and terminal.buf and vim.api.nvim_buf_is_valid(terminal.buf) then
+    if not terminal:win_valid() then terminal:show() end
   else
     M.agent_terminals[name] = open_agent_terminal(name, cmd)
   end

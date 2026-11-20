@@ -28,9 +28,8 @@ end
 local function abbreviate(dir)
   local tilde = vim.fn.fnamemodify(dir, ":~")
   local segments = vim.split(tilde, "/", { plain = true })
-  for i = 1, #segments - 1 do
-    local segment = segments[i]
-    if segment ~= "~" and is.not_empty(segment) then
+  for i, segment in ipairs(segments) do
+    if i < #segments and segment ~= "~" and is.not_empty(segment) then
       segments[i] = segment:sub(1, segment:sub(1, 1) == "." and 2 or 1)
     end
   end

@@ -10,7 +10,7 @@ function TargetPath.new(path)
 
   self.paths = {}
 
-  local target_path = self:__parse_target_path(path)
+  local target_path = self.__parse_target_path(path)
 
   if not target_path then
     return self
@@ -18,9 +18,9 @@ function TargetPath.new(path)
 
   table.insert(self.paths, target_path)
 
-  local functional_target_path = self:__parse_functional_target_path(target_path)
-  local integration_target_path = self:__parse_integration_target_path(target_path)
-  local test_to_file_fallback_path = self:__parse_test_to_file_fallback_path(
+  local functional_target_path = self.__parse_functional_target_path(target_path)
+  local integration_target_path = self.__parse_integration_target_path(target_path)
+  local test_to_file_fallback_path = self.__parse_test_to_file_fallback_path(
     target_path or functional_target_path or integration_target_path
   )
 
@@ -59,7 +59,7 @@ function TargetPath:directory()
   return nil
 end
 
-function TargetPath:__parse_target_path(path)
+function TargetPath.__parse_target_path(path)
   if str.includes(path, "app/") then
     local result = path:gsub("app/", "test/"):gsub("%.rb$", "_test.rb")
     return result
@@ -70,7 +70,7 @@ function TargetPath:__parse_target_path(path)
   return nil
 end
 
-function TargetPath:__parse_functional_target_path(path)
+function TargetPath.__parse_functional_target_path(path)
   if str.excludes(path, "app/") and str.includes(path, "controllers/") then
     local result = path:gsub("controllers/", "functional/")
     return result
@@ -81,7 +81,7 @@ function TargetPath:__parse_functional_target_path(path)
   return nil
 end
 
-function TargetPath:__parse_integration_target_path(path)
+function TargetPath.__parse_integration_target_path(path)
   if str.excludes(path, "app/") and str.includes(path, "controllers/") then
     local result = path:gsub("controllers/", "integration/")
     return result
@@ -92,7 +92,7 @@ function TargetPath:__parse_integration_target_path(path)
   return nil
 end
 
-function TargetPath:__parse_test_to_file_fallback_path(path)
+function TargetPath.__parse_test_to_file_fallback_path(path)
   if not path or str.excludes(path, "app/") then
     return
   end

@@ -1,3 +1,5 @@
+local is = require("utils.is")
+
 local M = {}
 
 --- Iterate through all Lua modules in a config directory
@@ -12,7 +14,7 @@ M.each_config = function (dir_path, callback)
 
     if name ~= "init" then
       local ok, module = pcall(require, dir_path:gsub("/", ".") .. "." .. name)
-      if ok and module then
+      if ok and is.table(module) then
         callback(module, name)
       end
     end

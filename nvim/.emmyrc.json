@@ -4,12 +4,53 @@
     "version": "LuaJIT"
   },
   "workspace": {
-    "library": ["$VIMRUNTIME", "~/.local/share/nvim/lazy"]
+    "workspaceRoots": [
+      "./lua",
+      "./pack/local/start/agent_nvim/lua",
+      "./pack/local/start/arduino_cli/lua",
+      "./pack/local/start/bundle_open/lua",
+      "./pack/local/start/lint_disable/lua",
+      "./pack/local/start/md_image_preview/lua",
+      "./pack/local/start/scratchpads/lua",
+      "./pack/local/start/shoo/lua",
+      "./pack/local/start/srb_tc/lua",
+      "./pack/local/start/tanda_cli/lua",
+      "./pack/local/start/test_open/lua",
+      "./pack/local/start/yank_test_line/lua"
+    ],
+    "library": [
+      "$VIMRUNTIME",
+      "~/.local/share/nvim/lazy/evergarden/lua",
+      "~/.local/share/nvim/lazy/flash.nvim/lua",
+      "~/.local/share/nvim/lazy/grug-far.nvim/lua",
+      {
+        "path": "~/.local/share/nvim/lazy/lazy.nvim/lua",
+        "ignoreGlobs": [
+          "lazy/minit.lua"
+        ]
+      },
+      "~/.local/share/nvim/lazy/mini.ai/lua",
+      "~/.local/share/nvim/lazy/mini.icons/lua",
+      "~/.local/share/nvim/lazy/mini.statusline/lua",
+      "~/.local/share/nvim/lazy/mini.surround/lua",
+      "~/.local/share/nvim/lazy/mini.tabline/lua",
+      "~/.local/share/nvim/lazy/nvim-treesitter/lua",
+      "~/.local/share/nvim/lazy/nvim-treesitter-textobjects/lua",
+      "~/.local/share/nvim/lazy/oil.nvim/lua",
+      "~/.local/share/nvim/lazy/persistence.nvim/lua",
+      "~/.local/share/nvim/lazy/snacks.nvim/lua",
+      "~/.local/share/nvim/lazy/treesj/lua",
+      "~/.local/share/nvim/lazy/unified.nvim/lua"
+    ]
   },
   "format": {
     "externalTool": {
       "program": "luafmt",
-      "args": ["--stdin", "--stdin-filename", "${file}"]
+      "args": [
+        "--stdin",
+        "--stdin-filename",
+        "${file}"
+      ]
     }
   }
 }

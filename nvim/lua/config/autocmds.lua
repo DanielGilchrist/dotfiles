@@ -66,7 +66,7 @@ autocmd("InsertLeave", {
 -- Suppress "[Process exited 0]" virtual text in terminal buffers (0.12 feature)
 local term_acs = vim.api.nvim_get_autocmds({ group = "nvim.terminal", event = "TermClose" })
 for _, ac in ipairs(term_acs) do
-  if ac.desc and ac.desc:match("Process exited") then
+  if ac.id and ac.desc and ac.desc:match("Process exited") then
     vim.api.nvim_del_autocmd(ac.id)
   end
 end

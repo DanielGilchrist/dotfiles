@@ -16,7 +16,7 @@ local M = {}
 function M.repo_root()
   local res = vim.system({ "git", "rev-parse", "--show-toplevel" }, { text = true }):wait()
   if not cmd_utils.success(res.code) then return nil end
-  return vim.trim(res.stdout)
+  return vim.trim(res.stdout or "")
 end
 
 --- MAIN worktree of the current repo — never a nested worktree. Use this

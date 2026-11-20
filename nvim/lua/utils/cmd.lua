@@ -46,8 +46,7 @@ end
 ---@param args  string[]     Command arguments
 ---@param opts? TandaCliOpts Optional configuration
 M.tanda_cli = function (args, opts)
-  opts = opts == nil and {} or opts
-  ---@cast opts - nil
+  opts = opts or {}
 
   local command = build_command_with_fallback("tanda_cli", args)
 
@@ -72,8 +71,7 @@ end
 ---@param args  string[]       Command arguments
 ---@param opts? ArduinoCliOpts Optional configuration
 M.arduino_cli = function (args, opts)
-  opts = opts == nil and {} or opts
-  ---@cast opts - nil
+  opts = opts or {}
 
   validate_cli_opts(opts)
 
@@ -92,8 +90,7 @@ end
 ---@param args  string[]    Command arguments
 ---@param opts? ShooCliOpts Optional configuration
 M.shoo = function (args, opts)
-  opts = opts == nil and {} or opts
-  ---@cast opts - nil
+  opts = opts or {}
 
   validate_cli_opts(opts)
 

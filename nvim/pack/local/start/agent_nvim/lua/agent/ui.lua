@@ -38,7 +38,7 @@ function M.agent_name(prompt, on_confirm, default)
   end
 
   local win
-  win = Snacks.input.input({
+  win = Snacks.input({
     prompt = prompt,
     default = default,
     prompt_pos = false,
@@ -118,7 +118,7 @@ function M.new_prompt(on_submit, opts)
     vim.wo[win_id].number = false
     vim.wo[win_id].relativenumber = false
   else
-    win_id = require("snacks").win({
+    win_id = Snacks.win({
       buf = buf,
       title = title,
       width = 0.7,
@@ -155,7 +155,7 @@ local function pick_with_preview(opts)
         return
       end
       ctx.preview:set_title(ctx.item.name)
-      return Snacks.picker.preview.cmd({ "agent", "dump", ctx.item.name }, ctx)
+      Snacks.picker.preview.cmd({ "agent", "dump", ctx.item.name }, ctx)
     end,
     confirm = function (picker, item)
       picker:close()

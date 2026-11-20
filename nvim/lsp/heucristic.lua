@@ -4,7 +4,7 @@ require("heucristic.build").ensure()
 
 local function find_heucristic()
   local paths = {
-    vim.fn.expand("~/.local/bin/heucristic"), vim.fn.expand("~/repos/DanielGilchrist/heucristic/bin/heucristic")
+    vim.fs.normalize("~/.local/bin/heucristic"), vim.fs.normalize("~/repos/DanielGilchrist/heucristic/bin/heucristic")
   }
 
   for _, path in ipairs(paths) do

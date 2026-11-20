@@ -3,11 +3,11 @@ local function organise_imports_and_format_on_save(client, bufnr)
     buffer = bufnr,
     callback = function ()
       local params = vim.lsp.util.make_range_params(nil, client.offset_encoding)
-      params = vim.tbl_extend("force", params, {
+      local code_action_params = vim.tbl_extend("force", params, {
         context = { only = { "source.organizeImports" } }
       })
 
-      local result = vim.lsp.buf_request_sync(bufnr, "textDocument/codeAction", params, 3000)
+      local result = vim.lsp.buf_request_sync(bufnr, "textDocument/codeAction", code_action_params, 3000)
       for _, res in pairs(result or {}) do
         for _, r in pairs(res.result or {}) do
           if r.edit then
