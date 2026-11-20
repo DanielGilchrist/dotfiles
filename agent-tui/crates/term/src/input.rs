@@ -3,7 +3,7 @@ use std::num::NonZeroU16;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 use ratatui::layout::{Position, Rect};
 
-use crate::{Modes, MouseReporting};
+use crate::{KittyFlags, Modes, MouseReporting};
 
 /// A 1-based cell inside a terminal area, as mouse protocols report it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,6 +70,9 @@ pub fn encode_key(key: KeyEvent, modes: Modes) -> Vec<u8> {
             control_byte(c).map_or_else(|| c.to_string().into_bytes(), |b| vec![b])
         }
         KeyCode::Char(c) => c.to_string().into_bytes(),
+        KeyCode::Enter if param > 1 && KittyFlags::disambiguates(modes.keyboard_flags) => {
+            return format!("\x1b[13;{param}u").into_bytes();
+        }
         KeyCode::Enter if mods.contains(KeyModifiers::SHIFT) => b"\x1b\r".to_vec(),
         KeyCode::Enter => b"\r".to_vec(),
         KeyCode::Tab => b"\t".to_vec(),
@@ -182,6 +185,21 @@ mod tests {
         assert_eq!(sent(KeyCode::Char('-'), KeyModifiers::CONTROL), [0x1f]);
         assert_eq!(sent(KeyCode::Char('8'), KeyModifiers::CONTROL), [0x7f]);
         assert_eq!(sent(KeyCode::Char('?'), KeyModifiers::CONTROL), [0x7f]);
+    }
+
+    #[test]
+    fn a_modified_enter_is_a_csi_u_once_the_program_asked_for_kitty_keys() {
+        let asked = Modes {
+            keyboard_flags: 1,
+            ..Modes::default()
+        };
+        let enter = |mods| encode_key(key(KeyCode::Enter, mods), asked);
+        assert_eq!(enter(KeyModifiers::CONTROL), b"\x1b[13;5u");
+        assert_eq!(enter(KeyModifiers::SHIFT), b"\x1b[13;2u");
+        assert_eq!(enter(KeyModifiers::ALT), b"\x1b[13;3u");
+        assert_eq!(enter(KeyModifiers::NONE), b"\r");
+        let legacy = encode_key(key(KeyCode::Enter, KeyModifiers::SHIFT), Modes::default());
+        assert_eq!(legacy, b"\x1b\r");
     }
 
     #[test]

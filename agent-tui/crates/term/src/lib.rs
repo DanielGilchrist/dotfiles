@@ -3,6 +3,7 @@ mod escapes;
 mod handoff;
 mod hosted;
 mod input;
+mod kitty;
 mod pty;
 mod vt;
 
@@ -14,6 +15,7 @@ pub use escapes::{Lines, output_lines, printable, strip_escapes};
 pub use handoff::{Ended, hand_over};
 pub use hosted::{Hosted, HostedChild, HostedCommand, HostedExit, HostedPty, spawn_hosted};
 pub use input::{CellPos, encode_key, encode_mouse};
+pub use kitty::KittyFlags;
 pub use pty::{Closed, Liveness, Terminal};
 pub use vt::Vt100;
 
@@ -47,6 +49,8 @@ pub struct Modes {
     pub mouse: MouseReporting,
     pub cursor_visible: bool,
     pub screen: Screen,
+    /// The kitty keyboard flags the program last asked for, 0 when none.
+    pub keyboard_flags: u32,
 }
 
 /// Which of a terminal's two screens a program is drawing on.

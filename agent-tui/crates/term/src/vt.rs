@@ -3,19 +3,23 @@ use ratatui::layout::Rect;
 use ratatui::widgets::Widget;
 use tui_term::widget::{Cursor, PseudoTerminal};
 
-use crate::{Emulator, Modes, MouseReporting, Screen, TermSize};
+use crate::{Emulator, KittyFlags, Modes, MouseReporting, Screen, TermSize};
 
-pub struct Vt100(vt100::Parser);
+pub struct Vt100(vt100::Parser, KittyFlags);
 
 impl Vt100 {
     pub fn new(size: TermSize) -> Self {
-        Self(vt100::Parser::new(size.rows.get(), size.cols.get(), 0))
+        Self(
+            vt100::Parser::new(size.rows.get(), size.cols.get(), 0),
+            KittyFlags::default(),
+        )
     }
 }
 
 impl Emulator for Vt100 {
     fn feed(&mut self, bytes: &[u8]) {
         self.0.process(bytes);
+        self.1.feed(bytes);
     }
 
     fn resize(&mut self, size: TermSize) {
@@ -42,6 +46,7 @@ impl Emulator for Vt100 {
             } else {
                 Screen::Main
             },
+            keyboard_flags: self.1.current(),
         }
     }
 

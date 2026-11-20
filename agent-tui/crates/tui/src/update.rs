@@ -7016,6 +7016,19 @@ mod tests {
     }
 
     #[test]
+    fn switching_to_an_agent_the_pinned_tab_doesnt_list_goes_to_agents() {
+        let mut m = filtered(&["web"]);
+        m.view = View::Pinned;
+        m.set_cursor(Cursor::Entry(name("web")));
+        update(&mut m, key(KeyCode::Char(' ')));
+        for c in "fix".chars() {
+            update(&mut m, key(KeyCode::Char(c)));
+        }
+        update(&mut m, key(KeyCode::Enter));
+        assert_ne!(m.view, View::Pinned);
+    }
+
+    #[test]
     fn the_switcher_still_finds_hidden_checkouts_and_selecting_one_lists_it() {
         let mut m = filtered(&[]);
         let found = switcher_matches(&m, "web");
