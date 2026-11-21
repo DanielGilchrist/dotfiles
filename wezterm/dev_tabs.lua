@@ -21,6 +21,8 @@ end
 
 --- Dev tabs are tracked per-region in wezterm.GLOBAL.dev_tab_id_by_region
 --- (populated by commands.spawn_dev_tab).
+---@param tab MuxTab | TabInformation | nil
+---@return boolean
 function M.is_dev(tab)
   if tab == nil then return false end
 
@@ -49,13 +51,15 @@ function M.is_dev(tab)
 end
 
 M.toggle = wezterm.action_callback(function (window)
+  ---@type MuxTab[]
   local dev_tabs = {}
 
   for _, t in ipairs(window:mux_window():tabs()) do
     if M.is_dev(t) then table.insert(dev_tabs, t) end
   end
 
-  if #dev_tabs == 0 then
+  local first = dev_tabs[1]
+  if not first then
     notify(window, "dev", "no dev tabs — CMD+Shift+R spawns one")
     return
   end
@@ -75,7 +79,7 @@ M.toggle = wezterm.action_callback(function (window)
 
   if not current then
     wezterm.GLOBAL.dev_prev_tab = active_id
-    local target = dev_tabs[1]
+    local target = first
 
     for _, t in ipairs(dev_tabs) do
       if t:tab_id() == wezterm.GLOBAL.dev_last_tab then

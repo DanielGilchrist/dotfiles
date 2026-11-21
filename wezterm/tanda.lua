@@ -31,7 +31,7 @@ local function run(window, action)
 end
 
 --- Command palette entries, one per clock action.
----@return table[]
+---@return AugmentCommandPaletteReturn[]
 M.palette_entries = function ()
   local entries = {}
   for _, action in ipairs(ACTIONS) do

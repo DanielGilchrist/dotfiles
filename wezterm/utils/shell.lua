@@ -12,7 +12,7 @@ local wezterm = require("wezterm")
 ---@field run   fun(args: string[]): boolean, string
 local M = {}
 
----@type table<string, string>
+---@type table<string, string?>
 local resolved = {}
 
 --- Absolute path of <name> via the login shell, or <fallback>. Can't be
@@ -21,13 +21,15 @@ local resolved = {}
 ---@param fallback string
 ---@return string
 function M.which(name, fallback)
-  if resolved[name] then return resolved[name] end
+  local cached = resolved[name]
+  if cached then return cached end
 
   local _, out = wezterm.run_child_process({ "/bin/sh", "-lc", "command -v " .. name })
   local path = M.trim(out)
-  resolved[name] = path ~= "" and path or fallback
+  local found = path ~= "" and path or fallback
+  resolved[name] = found
 
-  return resolved[name]
+  return found
 end
 
 ---@return string

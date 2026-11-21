@@ -2,11 +2,11 @@ local os = require("os")
 local io = require("io")
 
 local wezterm = require("wezterm")
+local notify = require("utils.notify")
 local key_utils = require("utils.key")
 local os_utils = require("utils.os")
 local agents_tab = require("agents_tab")
 local dev_tabs = require("dev_tabs")
-local commands = require("commands")
 local worktree_picker = require("worktree_picker")
 
 ---@param mods   string
@@ -36,9 +36,7 @@ local function set_path()
   end
 end
 
----@class KeyConfig
----@field keys       Key[]
----@field key_tables table<string, Key[]>
+---@type Config
 local config = {}
 
 ---@class KeyMods
@@ -75,8 +73,12 @@ config.keys = {
       local text = pane:get_lines_as_text(pane:get_dimensions().scrollback_rows)
 
       local name = os.tmpname()
-      local file = io.open(name, "w+")
-      ---@cast file - nil
+      local file, err = io.open(name, "w+")
+      if not file then
+        os.remove(name)
+        notify(window, "scrollback", "couldn't write " .. name .. ": " .. tostring(err))
+        return
+      end
 
       file:write(text)
       file:flush()
@@ -107,26 +109,26 @@ config.keys = {
         return
       end
 
-      window:perform_action(wezterm.action({ ClearScrollback = "ScrollbackAndViewport" }), pane)
+      window:perform_action(wezterm.action.ClearScrollback("ScrollbackAndViewport"), pane)
     end)
   ),
 
-  keybind(keys.COMMAND, "w", wezterm.action({ CloseCurrentPane = { confirm = false } })),
-  keybind(keys.COMMAND_SHIFT, "w", wezterm.action({ CloseCurrentTab = { confirm = false } })),
+  keybind(keys.COMMAND, "w", wezterm.action.CloseCurrentPane({ confirm = false })),
+  keybind(keys.COMMAND_SHIFT, "w", wezterm.action.CloseCurrentTab({ confirm = false })),
 
   keybind(keys.COMMAND, keys.ENTER, "ToggleFullScreen"),
-  keybind(keys.SHIFT, keys.ENTER, wezterm.action({ SendString = "\x1b[13;2u" })),
+  keybind(keys.SHIFT, keys.ENTER, wezterm.action.SendString("\x1b[13;2u")),
 
   -- Pane navigation: hjkl + arrows (CMD+Alt)
-  keybind(keys.COMMAND_ALT, "h", wezterm.action({ ActivatePaneDirection = "Left" })),
-  keybind(keys.COMMAND_ALT, "l", wezterm.action({ ActivatePaneDirection = "Right" })),
-  keybind(keys.COMMAND_ALT, "k", wezterm.action({ ActivatePaneDirection = "Up" })),
-  keybind(keys.COMMAND_ALT, "j", wezterm.action({ ActivatePaneDirection = "Down" })),
+  keybind(keys.COMMAND_ALT, "h", wezterm.action.ActivatePaneDirection("Left")),
+  keybind(keys.COMMAND_ALT, "l", wezterm.action.ActivatePaneDirection("Right")),
+  keybind(keys.COMMAND_ALT, "k", wezterm.action.ActivatePaneDirection("Up")),
+  keybind(keys.COMMAND_ALT, "j", wezterm.action.ActivatePaneDirection("Down")),
 
-  keybind(keys.COMMAND_ALT, "LeftArrow", wezterm.action({ ActivatePaneDirection = "Left" })),
-  keybind(keys.COMMAND_ALT, "RightArrow", wezterm.action({ ActivatePaneDirection = "Right" })),
-  keybind(keys.COMMAND_ALT, "UpArrow", wezterm.action({ ActivatePaneDirection = "Up" })),
-  keybind(keys.COMMAND_ALT, "DownArrow", wezterm.action({ ActivatePaneDirection = "Down" })),
+  keybind(keys.COMMAND_ALT, "LeftArrow", wezterm.action.ActivatePaneDirection("Left")),
+  keybind(keys.COMMAND_ALT, "RightArrow", wezterm.action.ActivatePaneDirection("Right")),
+  keybind(keys.COMMAND_ALT, "UpArrow", wezterm.action.ActivatePaneDirection("Up")),
+  keybind(keys.COMMAND_ALT, "DownArrow", wezterm.action.ActivatePaneDirection("Down")),
 
   -- Switch between tabs (skips the agents tab when cycling)
   keybind(keys.COMMAND, "LeftArrow", agents_tab.cycle_left),
@@ -135,16 +137,16 @@ config.keys = {
   -- Scrolling
   keybind(keys.COMMAND_SHIFT, "UpArrow", "ScrollToTop"),
   keybind(keys.COMMAND_SHIFT, "DownArrow", "ScrollToBottom"),
-  keybind(keys.ALT, "PageUp", wezterm.action({ ScrollByPage = -1 })),
-  keybind(keys.ALT, "PageDown", wezterm.action({ ScrollByPage = 1 })),
+  keybind(keys.ALT, "PageUp", wezterm.action.ScrollByPage(-1)),
+  keybind(keys.ALT, "PageDown", wezterm.action.ScrollByPage(1)),
 
   -- Move tabs (refuses to move agents tab; skips it as a swap target)
   keybind(keys.SHIFT_ALT, "{", agents_tab.move_left),
   keybind(keys.SHIFT_ALT, "}", agents_tab.move_right),
 
   -- Pane swap, select, zoom
-  keybind(keys.COMMAND_SHIFT, "m", wezterm.action({ PaneSelect = { mode = "SwapWithActive" } })),
-  keybind(keys.COMMAND_SHIFT, "p", wezterm.action({ PaneSelect = { mode = "Activate" } })),
+  keybind(keys.COMMAND_SHIFT, "m", wezterm.action.PaneSelect({ mode = "SwapWithActive" })),
+  keybind(keys.COMMAND_SHIFT, "p", wezterm.action.PaneSelect({ mode = "Activate" })),
   keybind(keys.COMMAND_SHIFT, "z", wezterm.action.TogglePaneZoomState),
 
   -- Resize key table (CMD+r enters; spam hjkl; Esc exits)
@@ -176,10 +178,10 @@ config.keys = {
 
 config.key_tables = {
   resize = {
-    keybind("NONE", "h", wezterm.action({ AdjustPaneSize = { "Left", 5 } })),
-    keybind("NONE", "j", wezterm.action({ AdjustPaneSize = { "Down", 5 } })),
-    keybind("NONE", "k", wezterm.action({ AdjustPaneSize = { "Up", 5 } })),
-    keybind("NONE", "l", wezterm.action({ AdjustPaneSize = { "Right", 5 } })),
+    keybind("NONE", "h", wezterm.action.AdjustPaneSize({ "Left", 5 })),
+    keybind("NONE", "j", wezterm.action.AdjustPaneSize({ "Down", 5 })),
+    keybind("NONE", "k", wezterm.action.AdjustPaneSize({ "Up", 5 })),
+    keybind("NONE", "l", wezterm.action.AdjustPaneSize({ "Right", 5 })),
     keybind("NONE", "Escape", "PopKeyTable"),
     keybind("NONE", "Enter", "PopKeyTable"),
     keybind(keys.CTRL, "c", "PopKeyTable")

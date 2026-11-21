@@ -1,6 +1,8 @@
 local table_utils = {}
 
 -- https://github.com/bew/dotfiles/blob/main/gui/wezterm/lib/mystdlib.lua#L4
+---@param ... Config
+---@return Config
 function table_utils.merge_all(...)
   local ret = {}
   for _, tbl in ipairs({ ... }) do

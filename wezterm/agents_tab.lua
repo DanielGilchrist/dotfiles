@@ -22,6 +22,8 @@ local M = {
 -- The agents tab runs the `agent` TUI. It is identified by its wezterm tab
 -- id, kept in wezterm.GLOBAL, which survives config reloads but not a
 -- wezterm restart, so fall back to the title and adopt the id.
+---@param tab MuxTab | TabInformation | nil
+---@return boolean
 local function is_agents(tab)
   if tab == nil then return false end
   local id = wezterm.GLOBAL.agents_tab_id
@@ -34,6 +36,9 @@ local function is_agents(tab)
   return false
 end
 
+--- The agents tab in this window.
+---@param window Window
+---@return MuxTab | nil
 local function find_agents(window)
   for _, t in ipairs(window:mux_window():tabs()) do
     if is_agents(t) then return t end
@@ -42,6 +47,7 @@ local function find_agents(window)
 end
 
 --- The agents tab in any window, so a second window reuses the running TUI.
+---@param window Window
 ---@return MuxTab | nil
 local function find_agents_anywhere(window)
   local here = find_agents(window)
@@ -56,18 +62,23 @@ local function find_agents_anywhere(window)
 end
 
 -- MoveTab acts on the active tab, so we activate-move-restore.
+---@param window Window
+---@param tab    MuxTab
 local function pin_to_zero(window, tab)
   local prev = window:active_tab()
   tab:activate()
-  window:perform_action(wezterm.action.MoveTab(0), window:active_pane())
+  local pane = window:active_pane()
+  if pane then window:perform_action(wezterm.action.MoveTab(0), pane) end
   if prev and prev:tab_id() ~= tab:tab_id() then prev:activate() end
 end
 
+--- Spawn the TUI in a new tab pinned to position 0. A failed spawn raises.
+---@param window Window
+---@return MuxTab
 local function spawn_agents_tab(window)
   local tab = window:mux_window():spawn_tab({
     args = shell.login("exec agent")
   })
-  if not tab then return nil end
   wezterm.GLOBAL.agents_tab_id = tab:tab_id()
   tab:set_title(M.TITLE)
   pin_to_zero(window, tab)
@@ -78,15 +89,17 @@ end
 ---@param window Window
 function M.focus(window)
   local agents = find_agents_anywhere(window) or spawn_agents_tab(window)
-  if not agents then return end
   local active = window:active_tab()
   if active and active:tab_id() ~= agents:tab_id() then wezterm.GLOBAL.agent_prev_tab = active:tab_id() end
   agents:activate()
-  local gui = agents:window():gui_window()
-  if gui then gui:focus() end
+  local mux_window = agents:window()
+  if not mux_window then return end
+  local ok, gui = pcall(mux_window.gui_window, mux_window)
+  if ok then gui:focus() end
 end
 
 -- Find + pin, with one retry for the spawn → mux-registration race.
+---@param window Window
 local function pin_with_retry(window)
   local function try()
     local agents = find_agents(window)
@@ -111,6 +124,7 @@ M.toggle = wezterm.action_callback(function (window)
 
   -- Returning from agents: prefer remembered tab, else first non-agents.
   local prev_id = wezterm.GLOBAL.agent_prev_tab
+  ---@type MuxTab?
   local fallback
   for _, t in ipairs(window:mux_window():tabs()) do
     if not is_agents(t) then
@@ -124,6 +138,9 @@ M.toggle = wezterm.action_callback(function (window)
   if fallback then fallback:activate() end
 end)
 
+--- Action that activates the next (+1) or previous (-1) non-agents tab.
+---@param direction 1 | - 1
+---@return Action
 local function cycle(direction)
   return wezterm.action_callback(function (window)
     local tabs = {}
@@ -150,6 +167,9 @@ end
 M.cycle_left = cycle(-1)
 M.cycle_right = cycle(1)
 
+--- Action that moves the active tab one place, skipping over the agents tab.
+---@param direction 1 | - 1
+---@return Action
 local function move(direction)
   return wezterm.action_callback(function (window, pane)
     local active = window:active_tab()
@@ -165,6 +185,7 @@ local function move(direction)
     end
     if not idx then return end
 
+    ---@type integer
     local target = idx + direction
     if target < 0 or target >= #tabs then return end
     if is_agents(tabs[target + 1]) then target = target + direction end
@@ -177,17 +198,18 @@ end
 M.move_left = move(-1)
 M.move_right = move(1)
 
-M.split_horizontal = wezterm.action({ SplitHorizontal = { domain = "CurrentPaneDomain" } })
-M.split_vertical = wezterm.action({ SplitVertical = { domain = "CurrentPaneDomain" } })
-M.split_right_35 = wezterm.action({ SplitPane = { direction = "Right", size = { Percent = 35 } } })
+M.split_horizontal = wezterm.action.SplitHorizontal({ domain = "CurrentPaneDomain" })
+M.split_vertical = wezterm.action.SplitVertical({ domain = "CurrentPaneDomain" })
+M.split_right_35 = wezterm.action.SplitPane({ direction = "Right", size = { Percent = 35 } })
 
 --- Bold, coloured tab cell for the special tabs. Active tabs use the theme's
 --- active colours; inactive ones take <inactive_bg> so they stay visible.
 ---@param tab         TabInformation
----@param config      table
+---@param config      Config
 ---@param glyph       string
 ---@param title       string
 ---@param inactive_bg string
+---@return FormatItem[]
 local function highlighted_title(tab, config, glyph, title, inactive_bg)
   local colors = config.colors or {}
   local active = colors.tab_bar and colors.tab_bar.active_tab or {}
@@ -198,7 +220,12 @@ local function highlighted_title(tab, config, glyph, title, inactive_bg)
   }
 end
 
-local function format_tab_title(tab, _, _, config)
+---@param tab    TabInformation
+---@param _tabs  TabInformation[]
+---@param _panes PaneInformation[]
+---@param config Config
+---@return FormatItem[] | string
+local function format_tab_title(tab, _tabs, _panes, config)
   local title = tab.tab_title and tab.tab_title ~= "" and tab.tab_title
     or (tab.active_pane and tab.active_pane.title or "")
 

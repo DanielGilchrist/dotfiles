@@ -7,12 +7,7 @@ local tanda = require("tanda")
 
 local M = {}
 
----@class (exact) PaneDirection
----@field Right  string
----@field Bottom string
-
----@type PaneDirection
-local pane_direction = { Right = "Right", Bottom = "Bottom" }
+---@alias SplitDirection "Right" | "Left" | "Top" | "Bottom"
 
 ---@class (exact) Commands
 ---@field CDT     string
@@ -46,10 +41,10 @@ local server_success_patterns = { "Booting Puma", "Listening on http" }
 local server_failure_patterns = { "lease does not exist", "failed commit on ref", "Connection to devbox closed" }
 
 ---@param func fun(pane: Pane)
----@return fun(pane: Pane, direction: string, size?: number): Pane
+---@return fun(pane: Pane, direction: SplitDirection, size?: number): Pane
 local function split_pane_with(func)
   ---@param pane      Pane
-  ---@param direction string
+  ---@param direction SplitDirection
   ---@param size?     number
   return function (pane, direction, size)
     size = size == nil and 0.5 or size
@@ -64,9 +59,9 @@ end
 ---@param pane Pane
 ---@return string
 local function pane_text(pane)
-  local ok, dims = pcall(pane.get_dimensions, pane)
-  if not ok or not dims then return "" end
-  local ok2, text = pcall(pane.get_logical_lines_as_text, pane, dims.scrollback_rows)
+  local ok, dims = pcall(function () return pane:get_dimensions() end)
+  if not ok then return "" end
+  local ok2, text = pcall(function () return pane:get_logical_lines_as_text(dims.scrollback_rows) end)
   return ok2 and text or ""
 end
 
@@ -273,6 +268,7 @@ end
 local function spawn_dev_tab(original_window, region, cd_command)
   local use_cdt = cd_command == commands.CDT
 
+  ---@param pane Pane
   local function setup_pane(pane)
     run_commands(pane, "export REGION=" .. region, cd_command)
   end
@@ -307,10 +303,10 @@ local function spawn_dev_tab(original_window, region, cd_command)
     end
   end
 
-  local console_pane = split_pane_with_setup(server_pane, pane_direction.Right)
-  local webpack_pane = split_pane_with_setup(console_pane, pane_direction.Bottom, 0.1)
-  local tunnel_pane = split_pane_with_setup(server_pane, pane_direction.Bottom, 0.1)
-  local worker_pane = split_pane_with_setup(server_pane, pane_direction.Bottom, 0.4)
+  local console_pane = split_pane_with_setup(server_pane, "Right")
+  local webpack_pane = split_pane_with_setup(console_pane, "Bottom", 0.1)
+  local tunnel_pane = split_pane_with_setup(server_pane, "Bottom", 0.1)
+  local worker_pane = split_pane_with_setup(server_pane, "Bottom", 0.4)
 
   wait_for_text_for(tunnel_pane, "Welcome to fish")
 

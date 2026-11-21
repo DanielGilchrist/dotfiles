@@ -1,16 +1,36 @@
 {
   "$schema": "https://raw.githubusercontent.com/EmmyLuaLs/emmylua-analyzer-rust/refs/heads/main/crates/emmylua_code_analysis/resources/schema.json",
   "runtime": {
-    "version": "Lua54"
+    "version": "Lua5.4"
   },
   "workspace": {
-    "workspaceRoots": ["."],
-    "library": ["./types/lua"]
+    "workspaceRoots": [
+      "."
+    ],
+    "library": [
+      "./types/lua"
+    ],
+    "moduleMap": [
+      {
+        "pattern": "^wezterm$",
+        "replace": "wezterm.types.wezterm"
+      }
+    ]
   },
   "format": {
     "externalTool": {
       "program": "luafmt",
-      "args": ["--stdin", "--stdin-filename", "${file}"]
+      "args": [
+        "--stdin",
+        "--stdin-filename",
+        "${file}"
+      ]
     }
+  },
+  "diagnostics": {
+    "enables": [
+      "incomplete-signature-doc",
+      "missing-global-doc"
+    ]
   }
 }
