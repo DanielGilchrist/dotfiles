@@ -4,18 +4,20 @@ local shell = require("utils.shell")
 local dev_tabs = require("dev_tabs")
 
 ---@class AgentsTabModule
----@field TITLE string
----@field toggle Action
----@field cycle_left Action
----@field cycle_right Action
----@field move_left Action
----@field move_right Action
+---@field TITLE            string
+---@field toggle           Action
+---@field cycle_left       Action
+---@field cycle_right      Action
+---@field move_left        Action
+---@field move_right       Action
 ---@field split_horizontal Action
----@field split_vertical Action
----@field split_right_35 Action
----@field pin_to_zero Action
----@field register fun(): nil
-local M = { TITLE = "agents" }
+---@field split_vertical   Action
+---@field split_right_35   Action
+---@field pin_to_zero      Action
+---@field register         fun(): nil
+local M = {
+  TITLE = "agents"
+}
 
 -- The agents tab runs the `agent` TUI. It is identified by its wezterm tab
 -- id, kept in wezterm.GLOBAL, which survives config reloads but not a
@@ -39,8 +41,8 @@ local function find_agents(window)
   return nil
 end
 
----The agents tab in any window, so a second window reuses the running TUI.
----@return MuxTab|nil
+--- The agents tab in any window, so a second window reuses the running TUI.
+---@return MuxTab | nil
 local function find_agents_anywhere(window)
   local here = find_agents(window)
   if here then return here end
@@ -63,7 +65,7 @@ end
 
 local function spawn_agents_tab(window)
   local tab = window:mux_window():spawn_tab({
-    args = shell.login("exec agent"),
+    args = shell.login("exec agent")
   })
   if not tab then return nil end
   wezterm.GLOBAL.agents_tab_id = tab:tab_id()
@@ -72,7 +74,7 @@ local function spawn_agents_tab(window)
   return tab
 end
 
----Activate the agents tab, starting the TUI if it isn't running.
+--- Activate the agents tab, starting the TUI if it isn't running.
 ---@param window Window
 function M.focus(window)
   local agents = find_agents_anywhere(window) or spawn_agents_tab(window)
@@ -89,7 +91,8 @@ local function pin_with_retry(window)
   local function try()
     local agents = find_agents(window)
     if agents then
-      pin_to_zero(window, agents); return true
+      pin_to_zero(window, agents)
+      return true
     end
     return false
   end
@@ -98,7 +101,7 @@ end
 
 M.pin_to_zero = wezterm.action_callback(pin_with_retry)
 
-M.toggle = wezterm.action_callback(function(window)
+M.toggle = wezterm.action_callback(function (window)
   local agents = find_agents(window)
   local active = window:active_tab()
   if not agents or not active or active:tab_id() ~= agents:tab_id() then
@@ -112,7 +115,8 @@ M.toggle = wezterm.action_callback(function(window)
   for _, t in ipairs(window:mux_window():tabs()) do
     if not is_agents(t) then
       if t:tab_id() == prev_id then
-        t:activate(); return
+        t:activate()
+        return
       end
       fallback = fallback or t
     end
@@ -121,7 +125,7 @@ M.toggle = wezterm.action_callback(function(window)
 end)
 
 local function cycle(direction)
-  return wezterm.action_callback(function(window)
+  return wezterm.action_callback(function (window)
     local tabs = {}
     for _, t in ipairs(window:mux_window():tabs()) do
       if not is_agents(t) then table.insert(tabs, t) end
@@ -133,13 +137,12 @@ local function cycle(direction)
     local current
     for i, t in ipairs(tabs) do
       if t:tab_id() == active_id then
-        current = i; break
+        current = i
+        break
       end
     end
 
-    local target = current
-        and ((current - 1 + direction) % #tabs) + 1
-        or (direction > 0 and 1 or #tabs)
+    local target = current and ((current - 1 + direction) % #tabs) + 1 or (direction > 0 and 1 or #tabs)
     tabs[target]:activate()
   end)
 end
@@ -148,7 +151,7 @@ M.cycle_left = cycle(-1)
 M.cycle_right = cycle(1)
 
 local function move(direction)
-  return wezterm.action_callback(function(window, pane)
+  return wezterm.action_callback(function (window, pane)
     local active = window:active_tab()
     if not active or is_agents(active) then return end
 
@@ -156,7 +159,8 @@ local function move(direction)
     local idx
     for i, t in ipairs(tabs) do
       if t:tab_id() == active:tab_id() then
-        idx = i - 1; break
+        idx = i - 1
+        break
       end
     end
     if not idx then return end
@@ -177,27 +181,26 @@ M.split_horizontal = wezterm.action({ SplitHorizontal = { domain = "CurrentPaneD
 M.split_vertical = wezterm.action({ SplitVertical = { domain = "CurrentPaneDomain" } })
 M.split_right_35 = wezterm.action({ SplitPane = { direction = "Right", size = { Percent = 35 } } })
 
----Bold, coloured tab cell for the special tabs. Active tabs use the theme's
----active colours; inactive ones take <inactive_bg> so they stay visible.
----@param tab TabInformation
----@param config table
----@param glyph string
----@param title string
+--- Bold, coloured tab cell for the special tabs. Active tabs use the theme's
+--- active colours; inactive ones take <inactive_bg> so they stay visible.
+---@param tab         TabInformation
+---@param config      table
+---@param glyph       string
+---@param title       string
 ---@param inactive_bg string
 local function highlighted_title(tab, config, glyph, title, inactive_bg)
   local colors = config.colors or {}
   local active = colors.tab_bar and colors.tab_bar.active_tab or {}
   return {
     { Background = { Color = tab.is_active and (active.bg_color or "#CBE3B3") or inactive_bg } },
-    { Foreground = { Color = active.fg_color or "#171C1F" } },
-    { Attribute = { Intensity = "Bold" } },
-    { Text = " " .. glyph .. " " .. title .. " " },
+    { Foreground = { Color = active.fg_color or "#171C1F" } }, { Attribute = { Intensity = "Bold" } },
+    { Text = " " .. glyph .. " " .. title .. " " }
   }
 end
 
 local function format_tab_title(tab, _, _, config)
   local title = tab.tab_title and tab.tab_title ~= "" and tab.tab_title
-      or (tab.active_pane and tab.active_pane.title or "")
+    or (tab.active_pane and tab.active_pane.title or "")
 
   if is_agents(tab) then
     return highlighted_title(tab, config, "✦", title ~= "" and title or M.TITLE, "#E69875")
@@ -210,7 +213,7 @@ local function format_tab_title(tab, _, _, config)
   return " " .. title .. " "
 end
 
-M.register = function()
+M.register = function ()
   wezterm.on("format-tab-title", format_tab_title)
 end
 

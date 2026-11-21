@@ -3,13 +3,13 @@ local notify = require("utils.notify")
 local tab_utils = require("utils.tab")
 
 ---@class DevTabsModule
----@field is_dev fun(tab: MuxTab|TabInformation|nil): boolean
+---@field is_dev fun(tab: MuxTab | TabInformation | nil): boolean
 ---@field toggle Action
 local M = {}
 
 local REGIONS = { "apac", "eu", "us" }
 
----@param list string[]
+---@param list  string[]
 ---@param value string
 ---@return boolean
 local function is_region(list, value)
@@ -19,8 +19,8 @@ local function is_region(list, value)
   return false
 end
 
----Dev tabs are tracked per-region in wezterm.GLOBAL.dev_tab_id_by_region
----(populated by commands.spawn_dev_tab).
+--- Dev tabs are tracked per-region in wezterm.GLOBAL.dev_tab_id_by_region
+--- (populated by commands.spawn_dev_tab).
 function M.is_dev(tab)
   if tab == nil then return false end
 
@@ -48,7 +48,7 @@ function M.is_dev(tab)
   return false
 end
 
-M.toggle = wezterm.action_callback(function(window)
+M.toggle = wezterm.action_callback(function (window)
   local dev_tabs = {}
 
   for _, t in ipairs(window:mux_window():tabs()) do

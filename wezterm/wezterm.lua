@@ -26,25 +26,25 @@ local misc = {
       background = "#191E21",
       active_tab = {
         bg_color = "#CBE3B3",
-        fg_color = "#171C1F",
+        fg_color = "#171C1F"
       },
       new_tab = {
         bg_color = "#191E21",
-        fg_color = "#CBE3B3",
+        fg_color = "#CBE3B3"
       },
       new_tab_hover = {
         bg_color = "#262F33",
-        fg_color = "#CBE3B3",
+        fg_color = "#CBE3B3"
       },
       inactive_tab = {
         bg_color = "#191E21",
-        fg_color = "#6F8788",
+        fg_color = "#6F8788"
       },
       inactive_tab_hover = {
         bg_color = "#262F33",
-        fg_color = "#ADC9BC",
-      },
-    },
+        fg_color = "#ADC9BC"
+      }
+    }
   },
 
   automatically_reload_config = false,
@@ -60,7 +60,7 @@ local misc = {
     left = 0,
     right = 15, -- controls the width of the scrollbar
     top = 0,
-    bottom = 0,
+    bottom = 0
   },
   native_macos_fullscreen_mode = true,
   -- MACOS_USE_BACKGROUND_COLOR_AS_TITLEBAR_COLOR is macOS-only and unknown to older (Linux) wezterm builds
@@ -72,8 +72,8 @@ local misc = {
   font = wezterm.font_with_fallback({
     {
       family = "JetBrainsMono NF",
-      harfbuzz_features = { "liga=1" },
-    },
+      harfbuzz_features = { "liga=1" }
+    }
   }),
   font_size = os_utils.system() == "macos" and 14 or 12,
 
@@ -82,9 +82,9 @@ local misc = {
     {
       event = { Up = { streak = 1, button = "Left" } },
       mods = command,
-      action = wezterm.action.OpenLinkAtMouseCursor,
-    },
-  },
+      action = wezterm.action.OpenLinkAtMouseCursor
+    }
+  }
 }
 
 local new_tab_icon = " + "
@@ -95,10 +95,10 @@ local tabs = {
 
   tab_bar_style = {
     new_tab = new_tab_icon,
-    new_tab_hover = new_tab_icon,
+    new_tab_hover = new_tab_icon
   },
 
-  tab_max_width = 25,
+  tab_max_width = 25
 }
 
 return table_utils.merge_all(misc, require("key_bindings"), tabs, {})

@@ -2,33 +2,40 @@ local wezterm = require("wezterm")
 local path_utils = require("utils.path")
 
 ---@class WorktreeEntry
----@field repo string
+---@field repo   string
 ---@field branch string
----@field path string
+---@field path   string
 
----Worktrees live at ~/worktrees/<repo>/<branch>. The directory on disk is
----the source of truth (zellij sessions can die independently), so listing
----scans the filesystem rather than asking zellij.
+--- Worktrees live at ~/worktrees/<repo>/<branch>. The directory on disk is
+--- the source of truth (zellij sessions can die independently), so listing
+--- scans the filesystem rather than asking zellij.
 ---@class WorktreeUtils
----@field DIR string
+---@field DIR       string
 ---@field REPOS_DIR string
----@field git_dirs fun(root: string): string[]
----@field list fun(): WorktreeEntry[]
----@field contains fun(path: string): boolean
+---@field git_dirs  fun(root: string): string[]
+---@field list      fun(): WorktreeEntry[]
+---@field contains  fun(path: string): boolean
 local M = {
   DIR = wezterm.home_dir .. "/worktrees",
-  REPOS_DIR = wezterm.home_dir .. "/repos",
+  REPOS_DIR = wezterm.home_dir .. "/repos"
 }
 
----Directories exactly two levels below <root> that contain a `.git`
----(a checkout or a worktree link file).
+--- Directories exactly two levels below <root> that contain a `.git`
+--- (a checkout or a worktree link file).
 ---@param root string
 ---@return string[]
 function M.git_dirs(root)
   ---@type string[]
   local dirs = {}
   local _, out = wezterm.run_child_process({
-    "find", root, "-mindepth", "2", "-maxdepth", "2", "-type", "d",
+    "find",
+    root,
+    "-mindepth",
+    "2",
+    "-maxdepth",
+    "2",
+    "-type",
+    "d"
   })
   if not out then return dirs end
 
@@ -56,7 +63,7 @@ function M.list()
   return entries
 end
 
----True if <path> is inside ~/worktrees.
+--- True if <path> is inside ~/worktrees.
 ---@param path string
 ---@return boolean
 function M.contains(path)

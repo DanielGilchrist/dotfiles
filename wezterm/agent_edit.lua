@@ -5,9 +5,9 @@ local shell = require("utils.shell")
 local M = {}
 
 ---@param window Window
----@param pane Pane
----@param mode string
----@param cwd string
+---@param pane   Pane
+---@param mode   string
+---@param cwd    string
 local function open(window, pane, mode, cwd)
   -- wezterm ignores `cwd` here and starts in the emitting pane's directory.
   local args = shell.login("cd " .. shell.quote(cwd) .. " && exec $EDITOR")
@@ -21,7 +21,7 @@ end
 -- Listen for `agent-edit=<mode>|<cwd>` from `agent` TUI actions, where
 -- <mode> is `tab` or `right`.
 function M.register()
-  wezterm.on("user-var-changed", function(window, pane, var, value)
+  wezterm.on("user-var-changed", function (window, pane, var, value)
     if var ~= "agent-edit" then return end
     local mode, cwd = (value or ""):match("^(%a+)|(.+)$")
     if mode ~= "tab" and mode ~= "right" then

@@ -8,18 +8,18 @@ local M = {}
 
 ---@class TandaClockAction
 ---@field brief string
----@field args string[]
+---@field args  string[]
 
 ---@type TandaClockAction[]
 local ACTIONS = {
   { brief = "Tanda: Clock in", args = { "clockin", "start" } },
   { brief = "Tanda: Start break", args = { "clockin", "break", "start" } },
   { brief = "Tanda: Finish break", args = { "clockin", "break", "finish" } },
-  { brief = "Tanda: Clock out", args = { "clockin", "finish" } },
+  { brief = "Tanda: Clock out", args = { "clockin", "finish" } }
 }
 
----Run the CLI with no tab and report its output as a notification. Goes
----through a login fish so the `tanda_cli` alias resolves as it does in a shell.
+--- Run the CLI with no tab and report its output as a notification. Goes
+--- through a login fish so the `tanda_cli` alias resolves as it does in a shell.
 ---@param window Window
 ---@param action TandaClockAction
 local function run(window, action)
@@ -30,14 +30,14 @@ local function run(window, action)
   notify(window, action.brief, summary ~= "" and summary or (ok and "done" or "failed"))
 end
 
----Command palette entries, one per clock action.
+--- Command palette entries, one per clock action.
 ---@return table[]
-M.palette_entries = function()
+M.palette_entries = function ()
   local entries = {}
   for _, action in ipairs(ACTIONS) do
     table.insert(entries, {
       brief = action.brief,
-      action = wezterm.action_callback(function(window) run(window, action) end),
+      action = wezterm.action_callback(function (window) run(window, action) end)
     })
   end
   return entries

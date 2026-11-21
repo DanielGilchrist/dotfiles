@@ -8,22 +8,19 @@ local tanda = require("tanda")
 local M = {}
 
 ---@class (exact) PaneDirection
----@field Right string
+---@field Right  string
 ---@field Bottom string
 
 ---@type PaneDirection
-local pane_direction = {
-  Right = "Right",
-  Bottom = "Bottom",
-}
+local pane_direction = { Right = "Right", Bottom = "Bottom" }
 
 ---@class (exact) Commands
----@field CDT string
+---@field CDT     string
 ---@field Console string
----@field Server string
----@field Start string
----@field Tunnel string
----@field Worker string
+---@field Server  string
+---@field Start   string
+---@field Tunnel  string
+---@field Worker  string
 ---@field Webpack string
 
 ---@type Commands
@@ -34,20 +31,16 @@ local commands = {
   Start = "bin/dev start",
   Tunnel = "bin/tunnel",
   Worker = "bin/dev worker",
-  Webpack = "bin/dev webpack",
+  Webpack = "bin/dev webpack"
 }
 
 ---@class (exact) Region
 ---@field APAC string
----@field EU string
----@field US string
+---@field EU   string
+---@field US   string
 
 ---@type Region
-local regions = {
-  APAC = "apac",
-  EU = "eu",
-  US = "us"
-}
+local regions = { APAC = "apac", EU = "eu", US = "us" }
 
 local server_success_patterns = { "Booting Puma", "Listening on http" }
 local server_failure_patterns = { "lease does not exist", "failed commit on ref", "Connection to devbox closed" }
@@ -55,10 +48,10 @@ local server_failure_patterns = { "lease does not exist", "failed commit on ref"
 ---@param func fun(pane: Pane)
 ---@return fun(pane: Pane, direction: string, size?: number): Pane
 local function split_pane_with(func)
-  ---@param pane Pane
+  ---@param pane      Pane
   ---@param direction string
-  ---@param size? number
-  return function(pane, direction, size)
+  ---@param size?     number
+  return function (pane, direction, size)
     size = size == nil and 0.5 or size
     local new_pane = pane:split({ direction = direction, size = size })
 
@@ -77,7 +70,7 @@ local function pane_text(pane)
   return ok2 and text or ""
 end
 
----@param text string
+---@param text     string
 ---@param patterns string[]
 ---@return boolean
 local function find_any(text, patterns)
@@ -91,20 +84,20 @@ local function find_any(text, patterns)
 end
 
 ---@param pane Pane
----@param ... string
+---@param ...  string
 ---@return boolean
 local function has_text(pane, ...)
   return find_any(pane_text(pane), { ... })
 end
 
----@param pane Pane
+---@param pane    Pane
 ---@param command string
 local function run_command(pane, command)
   pane:send_text(command .. "\n")
 end
 
 ---@param pane Pane
----@param ... string
+---@param ...  string
 local function run_commands(pane, ...)
   local commands_table = { ... }
   local joined_command = table.concat(commands_table, " && ")
@@ -113,7 +106,7 @@ local function run_commands(pane, ...)
 end
 
 ---@param pane Pane
----@param ... string
+---@param ...  string
 local function wait_for_text_for(pane, ...)
   while true do
     if has_text(pane, ...) then
@@ -126,16 +119,16 @@ end
 
 local retry_delay_ms = 2000
 
----Run <command> and poll until a success or failure pattern shows up in
----output produced *after* the command was sent (older scrollback — e.g. a
----previous failed attempt — is ignored via the byte offset). On failure the
----command is re-run until it succeeds or max_tries (default 1) is exhausted.
----Returns true on success, false once every try has failed.
----@param pane Pane
----@param command string
+--- Run <command> and poll until a success or failure pattern shows up in
+--- output produced *after* the command was sent (older scrollback — e.g. a
+--- previous failed attempt — is ignored via the byte offset). On failure the
+--- command is re-run until it succeeds or max_tries (default 1) is exhausted.
+--- Returns true on success, false once every try has failed.
+---@param pane             Pane
+---@param command          string
 ---@param success_patterns string[]
 ---@param failure_patterns string[]
----@param max_tries? integer
+---@param max_tries?       integer
 ---@return boolean
 local function run_command_and_wait(pane, command, success_patterns, failure_patterns, max_tries)
   max_tries = max_tries or 1
@@ -194,7 +187,7 @@ local function wait_for_text()
   wezterm.sleep_ms(100)
 end
 
----@param pane Pane
+---@param pane           Pane
 ---@param already_tried? boolean
 ---@return boolean?
 local function handle_potential_interrupted_system_call_from_cdt(pane, already_tried)
@@ -222,7 +215,7 @@ local function handle_missing_cdt_command(pane)
   end
 end
 
----@param region string
+---@param region     string
 ---@param cd_command string
 ---@return string
 local function dev_tab_title(region, cd_command)
@@ -241,10 +234,10 @@ local function dev_tab_title(region, cd_command)
   return "dev:" .. region
 end
 
----Close the previously-spawned dev tab for <region> if it's still alive.
----Tracked per-region via wezterm.GLOBAL.dev_tab_id_by_region so each region
----gets its own dev tab — spawning a US tab won't tear down an existing EU
----tab, and vice versa.
+--- Close the previously-spawned dev tab for <region> if it's still alive.
+--- Tracked per-region via wezterm.GLOBAL.dev_tab_id_by_region so each region
+--- gets its own dev tab — spawning a US tab won't tear down an existing EU
+--- tab, and vice versa.
 ---@param window Window
 ---@param region string
 local function close_existing_dev_tab(window, region)
@@ -256,8 +249,14 @@ local function close_existing_dev_tab(window, region)
   for _, tab in ipairs(window:mux_window():tabs()) do
     if tab:tab_id() == tab_id then
       for _, pane in ipairs(tab:panes()) do
-        shell.run({ shell.which("wezterm", "/opt/homebrew/bin/wezterm"), "cli", "kill-pane", "--pane-id", tostring(pane
-        :pane_id()) })
+        shell.run({
+          shell.which("wezterm", "/opt/homebrew/bin/wezterm"),
+          "cli",
+          "kill-pane",
+          "--pane-id",
+          tostring(pane
+              :pane_id())
+        })
       end
 
       break
@@ -269,8 +268,8 @@ local function close_existing_dev_tab(window, region)
 end
 
 ---@param original_window Window
----@param region string
----@param cd_command string
+---@param region          string
+---@param cd_command      string
 local function spawn_dev_tab(original_window, region, cd_command)
   local use_cdt = cd_command == commands.CDT
 
@@ -338,18 +337,18 @@ local function spawn_dev_tab(original_window, region, cd_command)
   run_command(worker_pane, commands.Worker)
 end
 
----Re-entrant wrapper around spawn_dev_tab. Refuses while a spawn is in
----flight for the same region (open_work_environment yields at every
----wait_for_text, so two same-region spawns would race and clobber each
----other's panes). Different regions can spawn in parallel.
----@param region string
+--- Re-entrant wrapper around spawn_dev_tab. Refuses while a spawn is in
+--- flight for the same region (open_work_environment yields at every
+--- wait_for_text, so two same-region spawns would race and clobber each
+--- other's panes). Different regions can spawn in parallel.
+---@param region     string
 ---@param cd_command string
 ---@return fun(original_window: Window, _original_pane?: Pane, _line?: string)
 local function open_work_environment(region, cd_command)
   ---@param original_window Window
   ---@param _original_pane? Pane
-  ---@param _line? string
-  return function(original_window, _original_pane, _line)
+  ---@param _line?          string
+  return function (original_window, _original_pane, _line)
     local in_progress = wezterm.GLOBAL.dev_spawn_in_progress_by_region or {}
 
     if in_progress[region] then
@@ -391,7 +390,7 @@ local function open_work_environment(region, cd_command)
   end
 end
 
----@return { label: string, id: string }[]
+---@return { label: string, id: string } []
 local function worktree_choices()
   local choices = {}
 
@@ -406,26 +405,26 @@ end
 ---@return fun(window: Window, pane: Pane)
 local function open_worktree_selector()
   ---@param window Window
-  ---@param pane Pane
-  return function(window, pane)
+  ---@param pane   Pane
+  return function (window, pane)
     window:perform_action(wezterm.action.InputSelector({
-      title = "Select a worktree",
-      choices = worktree_choices(),
-      action = wezterm.action_callback(function(inner_window, inner_pane, id, _label)
-        if not id then
-          return
-        end
+        title = "Select a worktree",
+        choices = worktree_choices(),
+        action = wezterm.action_callback(function (inner_window, inner_pane, id, _label)
+          if not id then
+            return
+          end
 
-        local cd_command = "cd ~/worktrees/" .. id
-        open_work_environment(regions.US, cd_command)(inner_window, inner_pane)
-      end),
-    }), pane)
+          local cd_command = "cd ~/worktrees/" .. id
+          open_work_environment(regions.US, cd_command)(inner_window, inner_pane)
+        end)
+      }), pane)
   end
 end
 
----True if <cwd> has the dev-box wrapper script; notifies otherwise.
+--- True if <cwd> has the dev-box wrapper script; notifies otherwise.
 ---@param window Window
----@param cwd string
+---@param cwd    string
 ---@return boolean
 local function has_bin_dev(window, cwd)
   if path_utils.file_exists(cwd .. "/bin/dev") then return true end
@@ -433,28 +432,28 @@ local function has_bin_dev(window, cwd)
   return false
 end
 
----Pop the region picker, then run open_work_environment with cd_command.
----@param window Window
----@param pane Pane
+--- Pop the region picker, then run open_work_environment with cd_command.
+---@param window     Window
+---@param pane       Pane
 ---@param cd_command string
 local function pick_region_and_spawn(window, pane, cd_command)
   window:perform_action(wezterm.action.InputSelector({
-    title = "Region for dev tabs",
-    choices = {
-      { label = "[US] (default)", id = regions.US },
-      { label = "[EU]",           id = regions.EU },
-      { label = "[APAC]",         id = regions.APAC },
-    },
-    fuzzy = true,
-    action = wezterm.action_callback(function(inner_window, _, region)
-      if not region then return end
+      title = "Region for dev tabs",
+      choices = {
+        { label = "[US] (default)", id = regions.US },
+        { label = "[EU]", id = regions.EU },
+        { label = "[APAC]", id = regions.APAC }
+      },
+      fuzzy = true,
+      action = wezterm.action_callback(function (inner_window, _, region)
+        if not region then return end
 
-      local target = inner_window:active_pane()
-      if not target then return end
+        local target = inner_window:active_pane()
+        if not target then return end
 
-      open_work_environment(region, cd_command)(inner_window, target)
-    end),
-  }), pane)
+        open_work_environment(region, cd_command)(inner_window, target)
+      end)
+    }), pane)
 end
 
 -- Listen for `agent-spawn-dev=<region>|<cwd>` (nvim, which asks for the
@@ -462,7 +461,7 @@ end
 -- asks for the region here. If <cwd> is under ~/worktrees/<payaus>/* we cd
 -- into the worktree; otherwise we fall back to `cdt`. Refuses cwds that
 -- don't have a bin/dev script.
-wezterm.on("user-var-changed", function(window, pane, name, value)
+wezterm.on("user-var-changed", function (window, pane, name, value)
   if name ~= "agent-spawn-dev" then return end
   local region, cwd = (value or ""):match("^([^|/]+)|(.*)$")
   cwd = cwd or value
@@ -488,25 +487,25 @@ wezterm.on("user-var-changed", function(window, pane, name, value)
   end
 end)
 
-M.register_commands = function()
-  wezterm.on("augment-command-palette", function(_window, _pane)
+M.register_commands = function ()
+  wezterm.on("augment-command-palette", function (_window, _pane)
     local entries = {
       {
         brief = "[APAC] Open work tabs",
-        action = wezterm.action_callback(open_work_environment(regions.APAC, commands.CDT)),
+        action = wezterm.action_callback(open_work_environment(regions.APAC, commands.CDT))
       },
       {
         brief = "[EU] Open work tabs",
-        action = wezterm.action_callback(open_work_environment(regions.EU, commands.CDT)),
+        action = wezterm.action_callback(open_work_environment(regions.EU, commands.CDT))
       },
       {
         brief = "[US] Open work tabs",
-        action = wezterm.action_callback(open_work_environment(regions.US, commands.CDT)),
+        action = wezterm.action_callback(open_work_environment(regions.US, commands.CDT))
       },
       {
         brief = "[US] Open worktree tabs",
-        action = wezterm.action_callback(open_worktree_selector()),
-      },
+        action = wezterm.action_callback(open_worktree_selector())
+      }
     }
     for _, entry in ipairs(tanda.palette_entries()) do
       table.insert(entries, entry)

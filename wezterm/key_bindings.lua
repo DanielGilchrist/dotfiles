@@ -9,8 +9,8 @@ local dev_tabs = require("dev_tabs")
 local commands = require("commands")
 local worktree_picker = require("worktree_picker")
 
----@param mods string
----@param key string
+---@param mods   string
+---@param key    string
 ---@param action Action
 ---@return Key
 local function keybind(mods, key, action)
@@ -37,25 +37,25 @@ local function set_path()
 end
 
 ---@class KeyConfig
----@field keys Key[]
+---@field keys       Key[]
 ---@field key_tables table<string, Key[]>
 local config = {}
 
 ---@class KeyMods
----@field COMMAND string
----@field SHIFT string
----@field ALT string
----@field CTRL string
----@field ENTER string
+---@field COMMAND       string
+---@field SHIFT         string
+---@field ALT           string
+---@field CTRL          string
+---@field ENTER         string
 ---@field COMMAND_SHIFT string
----@field COMMAND_ALT string
----@field SHIFT_ALT string
+---@field COMMAND_ALT   string
+---@field SHIFT_ALT     string
 local keys = {
   COMMAND = key_utils.command_key(),
   SHIFT = "SHIFT",
   ALT = "ALT",
   CTRL = "CTRL",
-  ENTER = "Enter",
+  ENTER = "Enter"
 }
 
 keys.COMMAND_SHIFT = combine(keys.COMMAND, keys.SHIFT)
@@ -69,44 +69,47 @@ config.keys = {
 
   keybind(keys.COMMAND_SHIFT, "n", wezterm.action.SpawnWindow),
 
-  keybind(keys.COMMAND_SHIFT, "f", wezterm.action_callback(function(window, pane)
-    local text = pane:get_lines_as_text(pane:get_dimensions().scrollback_rows)
+  keybind(
+    keys.COMMAND_SHIFT, "f",
+    wezterm.action_callback(function (window, pane)
+      local text = pane:get_lines_as_text(pane:get_dimensions().scrollback_rows)
 
-    local name = os.tmpname()
-    local file = io.open(name, "w+")
-    ---@cast file -nil
+      local name = os.tmpname()
+      local file = io.open(name, "w+")
+      ---@cast file - nil
 
-    file:write(text)
-    file:flush()
-    file:close()
+      file:write(text)
+      file:flush()
+      file:close()
 
-    window:perform_action(
-      wezterm.action.SpawnCommandInNewTab({
-        args = { "nvim", name },
-        set_environment_variables = {
-          PATH = set_path(),
-        },
-      }),
-      pane
-    )
+      window:perform_action(wezterm.action.SpawnCommandInNewTab({
+          args = { "nvim", name },
+          set_environment_variables = {
+            PATH = set_path()
+          }
+        }), pane)
 
-    wezterm.sleep_ms(1000)
-    os.remove(name)
-  end)),
+      wezterm.sleep_ms(1000)
+      os.remove(name)
+    end)
+  ),
 
   -- Pane splits
   keybind(keys.COMMAND, "d", agents_tab.split_horizontal),
   keybind(keys.COMMAND, "s", agents_tab.split_right_35),
   keybind(keys.COMMAND_SHIFT, "d", agents_tab.split_vertical),
 
-  keybind(keys.COMMAND, "k", wezterm.action_callback(function(window, pane)
-    local process_name = pane:get_foreground_process_name()
-    if process_name and process_name:find("nvim") then
-      return
-    end
+  keybind(
+    keys.COMMAND, "k",
+    wezterm.action_callback(function (window, pane)
+      local process_name = pane:get_foreground_process_name()
+      if process_name and process_name:find("nvim") then
+        return
+      end
 
-    window:perform_action(wezterm.action({ ClearScrollback = "ScrollbackAndViewport" }), pane)
-  end)),
+      window:perform_action(wezterm.action({ ClearScrollback = "ScrollbackAndViewport" }), pane)
+    end)
+  ),
 
   keybind(keys.COMMAND, "w", wezterm.action({ CloseCurrentPane = { confirm = false } })),
   keybind(keys.COMMAND_SHIFT, "w", wezterm.action({ CloseCurrentTab = { confirm = false } })),
@@ -145,12 +148,15 @@ config.keys = {
   keybind(keys.COMMAND_SHIFT, "z", wezterm.action.TogglePaneZoomState),
 
   -- Resize key table (CMD+r enters; spam hjkl; Esc exits)
-  keybind(keys.COMMAND, "r", wezterm.action.ActivateKeyTable({
-    name = "resize",
-    one_shot = false,
-    timeout_milliseconds = 2000,
-    until_unknown = true,
-  })),
+  keybind(
+    keys.COMMAND, "r",
+    wezterm.action.ActivateKeyTable({
+      name = "resize",
+      one_shot = false,
+      timeout_milliseconds = 2000,
+      until_unknown = true
+    })
+  ),
 
   -- Agents tab toggle (jump to the `agent` TUI, starting it if needed / back to last tab)
   keybind(keys.COMMAND, "0", agents_tab.toggle),
@@ -160,9 +166,12 @@ config.keys = {
   keybind(keys.COMMAND_SHIFT, "0", agents_tab.pin_to_zero),
 
   -- Worktree picker (jumps to a worktree dir in a new tab)
-  keybind(keys.COMMAND_SHIFT, "o", wezterm.action_callback(function(window, pane)
-    worktree_picker.open(window, pane)
-  end)),
+  keybind(
+    keys.COMMAND_SHIFT, "o",
+    wezterm.action_callback(function (window, pane)
+      worktree_picker.open(window, pane)
+    end)
+  )
 }
 
 config.key_tables = {
@@ -173,8 +182,8 @@ config.key_tables = {
     keybind("NONE", "l", wezterm.action({ AdjustPaneSize = { "Right", 5 } })),
     keybind("NONE", "Escape", "PopKeyTable"),
     keybind("NONE", "Enter", "PopKeyTable"),
-    keybind(keys.CTRL, "c", "PopKeyTable"),
-  },
+    keybind(keys.CTRL, "c", "PopKeyTable")
+  }
 }
 
 return config
