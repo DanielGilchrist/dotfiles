@@ -282,12 +282,19 @@ local function render()
   local viewport_key = ("%dx%d@%d"):format(view.css_width, view.css_height, view.scale)
   local hash = vim.fn.sha256(markdown .. "\n" .. viewport_key)
   log("render", hash:sub(1, 8), "cached", hash == state.content_hash)
-  if hash == state.content_hash then return refresh() end
+  if hash == state.content_hash then
+    refresh()
+    return
+  end
 
   browser:when_ready(function ()
     if not state then return end
+    ---@param cb fun()
     local function with_viewport(cb)
-      if state.viewport_key == viewport_key then return cb() end
+      if state.viewport_key == viewport_key then
+        cb()
+        return
+      end
       log("set_viewport", viewport_key)
       browser:set_viewport(view.css_width, view.css_height, view.scale, function (err)
         if not state then return end
@@ -374,6 +381,8 @@ end
 ---@param buf integer
 ---@param win integer
 local function map_scroll_keys(buf, win)
+  ---@param lhs string
+  ---@param rhs fun()
   local function map(lhs, rhs)
     vim.keymap.set("n", lhs, rhs, { buffer = buf, nowait = true, silent = true })
   end

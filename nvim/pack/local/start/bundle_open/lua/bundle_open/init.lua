@@ -2,6 +2,7 @@ local notify = require("utils.notify")
 local is = require("utils.is")
 local notify_gem_list_id = "bundle-open-gem-list-id"
 
+---@param callback fun(gems: string[])
 local function fetch_gem_list(callback)
   local gems = {}
   ---@type string?
@@ -12,6 +13,8 @@ local function fetch_gem_list(callback)
     timeout = false
   })
 
+  ---@param _    integer
+  ---@param data string[]
   local function on_stdout(_, data)
     for _, line in ipairs(data) do
       if is.not_empty(line) then
@@ -20,6 +23,8 @@ local function fetch_gem_list(callback)
     end
   end
 
+  ---@param _    integer
+  ---@param data string[]
   local function on_stderr(_, data)
     error_message = table.concat(data)
   end
@@ -50,6 +55,8 @@ local function fetch_gem_list(callback)
 end
 
 local function open_gem()
+  ---@param picker snacks.Picker
+  ---@param item   snacks.picker.Item?
   local function open_selected_gem(picker, item)
     picker:close()
 

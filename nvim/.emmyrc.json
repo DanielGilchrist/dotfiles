@@ -52,5 +52,11 @@
         "${file}"
       ]
     }
+  },
+  "diagnostics": {
+    "enables": [
+      "incomplete-signature-doc",
+      "missing-global-doc"
+    ]
   }
 }

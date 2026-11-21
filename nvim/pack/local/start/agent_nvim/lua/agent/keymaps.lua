@@ -8,6 +8,10 @@ function M.register(prefix)
   local agent = function () return require("agent") end
   local review = function () return require("agent.review") end
 
+  ---@param suffix string
+  ---@param fn     fun()
+  ---@param desc   string
+  ---@param mode?  string | string[]
   local function map(suffix, fn, desc, mode)
     vim.keymap.set(mode or "n", prefix .. suffix, fn, { desc = desc, silent = true })
   end
@@ -38,6 +42,10 @@ function M.register(prefix)
   map("d", function () agent().spawn_dev() end, "spawn dev server")
   map("b", function () agent().edit_scrollback() end, "scrollback in a buffer")
 
+  ---@param suffix string
+  ---@param fn     fun()
+  ---@param desc   string
+  ---@param mode?  string | string[]
   local function rmap(suffix, fn, desc, mode)
     vim.keymap.set(mode or "n", prefix .. "r" .. suffix, fn, { desc = desc, silent = true })
   end

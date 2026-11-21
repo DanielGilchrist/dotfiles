@@ -2,8 +2,10 @@ local cmd = require("utils.cmd")
 local notify = require("utils.notify")
 local is = require("utils.is")
 
+---@param opts? CliOpts
+---@return CliOpts
 local function default_options(opts)
-  opts = opts == nil and {} or opts
+  opts = opts or {}
 
   return vim.tbl_extend("force", {
     on_stdout = cmd.default_handler(notify.info),
@@ -12,13 +14,23 @@ local function default_options(opts)
   )
 end
 
+---@param command string
+---@param args?   string[]
+---@param opts?   CliOpts
 local function arduino_cli(command, args, opts)
-  args = args == nil and {} or args
+  args = args or {}
   local combined_args = vim.list_extend({ command }, args)
 
   cmd.arduino_cli(combined_args, default_options(opts))
 end
 
+---@class ArduinoBoard
+---@field port string
+---@field fqbn string
+---@field name string
+
+---@param line string
+---@return ArduinoBoard?
 local function parse_board_list_line(line)
   local port, _protocol, _board_type, rest = line:match("^(%S+)%s+(%S+)%s+(%S+)%s+(.*)$")
   if not port or not rest then
@@ -33,6 +45,8 @@ local function parse_board_list_line(line)
   return { port = port, fqbn = fqbn, name = vim.trim(board_name) }
 end
 
+---@param data string[]
+---@return ArduinoBoard[]
 local function parse_boards(data)
   local boards = {}
 
@@ -50,6 +64,7 @@ local function parse_boards(data)
   return boards
 end
 
+---@param callback fun(boards: ArduinoBoard[])
 local function fetch_board_list(callback)
   local notify_id = "arduino-board-list-id"
 
@@ -58,6 +73,8 @@ local function fetch_board_list(callback)
     timeout = false
   })
 
+  ---@param _    integer
+  ---@param data string[]
   local function on_stdout(_, data)
     if is.empty(data) or #data == 1 then
       return
@@ -68,7 +85,8 @@ local function fetch_board_list(callback)
     notify.hide(notify_id)
 
     if is.empty(boards) then
-      return notify.warn("There are no boards connected!")
+      notify.warn("There are no boards connected!")
+      return
     end
 
     callback(boards)
@@ -77,14 +95,18 @@ local function fetch_board_list(callback)
   arduino_cli("board", { "list" }, { on_stdout = on_stdout })
 end
 
+---@param args? string[]
+---@param opts? CliOpts
 local function compile(args, opts)
   arduino_cli("compile", args, opts)
 end
 
+---@param args? string[]
 local function upload(args)
   arduino_cli("upload", args)
 end
 
+---@param board? ArduinoBoard
 local function run(board)
   local compile_opts = default_options({
     on_stdout = function (_, _data)
@@ -110,6 +132,8 @@ local function run(board)
 end
 
 local function run_select()
+  ---@param picker snacks.Picker
+  ---@param item   snacks.picker.Item?
   local function on_select(picker, item)
     picker:close()
 

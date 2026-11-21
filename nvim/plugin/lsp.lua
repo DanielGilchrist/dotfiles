@@ -33,12 +33,14 @@ local function combined_hover()
     })
   end
 
+  ---@param result? lsp.Hover
+  ---@return string?
   local function extract_contents(result)
-    if is.empty(result) then
+    if not result then
       return nil
     end
 
-    local value = result.contents.value
+    local value = table.concat(vim.lsp.util.convert_input_to_markdown_lines(result.contents), "\n")
 
     if is.empty(value) then
       return nil
@@ -55,7 +57,8 @@ local function combined_hover()
 
       client:request("textDocument/hover", params, function (err, result)
         if is.not_empty(err) then
-          return notify.error(vim.inspect(err))
+          notify.error(vim.inspect(err))
+          return
         end
 
         local contents = extract_contents(result)
@@ -106,6 +109,10 @@ vim.api.nvim_create_autocmd("BufWritePre", {
 vim.api.nvim_create_autocmd("LspAttach", {
   callback = function (ev)
     local buf = ev.buf
+    ---@param mode string | string[]
+    ---@param lhs  string
+    ---@param rhs  string | function
+    ---@param desc string
     local map = function (mode, lhs, rhs, desc)
       vim.keymap.set(mode, lhs, rhs, { buf = buf, desc = desc })
     end

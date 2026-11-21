@@ -1,6 +1,8 @@
 -- Adapted from nvim-lspconfig's lsp/tsgo.lua. Upstream only looks for `tsgo`
 -- from @typescript/native-preview; since TypeScript 7 went GA the same Go
 -- language server ships as `tsc`, which is what projects actually depend on.
+---@param root? string
+---@return string?
 local function server_cmd(root)
   if not root then
     return nil

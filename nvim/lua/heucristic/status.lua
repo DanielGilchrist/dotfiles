@@ -63,6 +63,8 @@ function M.handlers()
   }
 end
 
+---@param c heucristic.Compiler
+---@return string
 local function compiler_text(c)
   if c.status == "pending" then
     return "crystal …"

@@ -30,6 +30,9 @@ return {
     local diff = require("unified.diff")
     local job = require("unified.utils.job")
     local show_git_diff = git.show_git_diff_against_commit
+    ---@param commit string
+    ---@param buf?   integer
+    ---@return boolean
     git.show_git_diff_against_commit = function (commit, buf)
       buf = buf or vim.api.nvim_get_current_buf()
       local path = vim.api.nvim_buf_get_name(buf)

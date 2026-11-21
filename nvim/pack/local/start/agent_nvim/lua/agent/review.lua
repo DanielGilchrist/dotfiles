@@ -189,6 +189,8 @@ local function parse_changed(root, tracked, untracked, numstat)
   local seen = {}
   ---@type ChangedFile[]
   local items = {}
+  ---@param rel          string
+  ---@param is_untracked boolean
   local function add(rel, is_untracked)
     rel = vim.trim(rel)
     if is.empty(rel) or seen[rel] then return end
@@ -290,7 +292,7 @@ end
 ---@return ReviewState?
 local function decode_state(value)
   if not is.table(value) then return nil end
-  local base, raw_comments, message = value.base, value.comments, value.message
+  local base, raw_comments, raw_message = value.base, value.comments, value.message
   local reviewed = decode_strings(value.reviewed)
   if not (is.string(base) and is.table(raw_comments) and reviewed) then return nil end
   local comments = {}
@@ -299,7 +301,12 @@ local function decode_state(value)
     if not comment then return nil end
     comments[index] = comment
   end
-  return { base = base, reviewed = reviewed, message = is.string(message) and message or nil, comments = comments }
+  return {
+    base = base,
+    reviewed = reviewed,
+    message = is.string(raw_message) and raw_message or nil,
+    comments = comments
+  }
 end
 
 ---@param root string
@@ -462,7 +469,10 @@ function M.pick_commit(root, cb)
       items[#items + 1] = { text = line, sha = sha }
     end
   end
-  if #items == 0 then return notify.info("no commits to pick") end
+  if #items == 0 then
+    notify.info("no commits to pick")
+    return
+  end
 
   Snacks.picker.pick({
     source = "agent_review_commits",
@@ -534,7 +544,10 @@ function M.start()
   end
 
   local root = repo_root(vim.api.nvim_buf_get_name(0))
-  if not root then return notify.warn("not in a git repo") end
+  if not root then
+    notify.warn("not in a git repo")
+    return
+  end
 
   local saved = read_state(root)
   if saved then
@@ -640,7 +653,10 @@ function M.changed_files()
   local cached = M._changed
   if not cached then
     return refresh_changed(function (items)
-      if #items == 0 then return notify.info("no changes vs " .. base:sub(1, 8)) end
+      if #items == 0 then
+        notify.info("no changes vs " .. base:sub(1, 8))
+        return
+      end
       pick_changed(root, base, items)
     end)
   end
@@ -662,7 +678,8 @@ function M.toggle_reviewed()
   if not require_active() then return end
   local file = vim.api.nvim_buf_get_name(0)
   if is.empty(file) or is.not_empty(vim.bo.buftype) then
-    return notify.warn("not a reviewable file")
+    notify.warn("not a reviewable file")
+    return
   end
   M.reviewed[file] = (not M.reviewed[file]) or nil
 
@@ -760,10 +777,14 @@ function M.add_comment(opts)
   opts = opts or {}
   local buf = vim.api.nvim_get_current_buf()
   if is.not_empty(vim.bo[buf].buftype) then
-    return notify.warn("can only comment on file buffers")
+    notify.warn("can only comment on file buffers")
+    return
   end
   local file = vim.api.nvim_buf_get_name(buf)
-  if is.empty(file) then return notify.warn("buffer has no file path") end
+  if is.empty(file) then
+    notify.warn("buffer has no file path")
+    return
+  end
 
   local root = repo_root(file)
   local relpath = vim.fn.fnamemodify(file, ":.")
@@ -852,7 +873,8 @@ function M.remove_at_cursor()
       if line >= s and line <= s + c.nlines - 1 then
         forget(c)
         table.remove(M.comments, i)
-        return notify.info(("comment removed (%d pending)"):format(#M.comments))
+        notify.info(("comment removed (%d pending)"):format(#M.comments))
+        return
       end
     end
   end
@@ -897,7 +919,10 @@ end
 
 function M.list()
   if not require_active() then return end
-  if #M.comments == 0 then return notify.info("no pending comments") end
+  if #M.comments == 0 then
+    notify.info("no pending comments")
+    return
+  end
 
   ---@type ReviewCommentItem[]
   local items = {}
@@ -1001,7 +1026,10 @@ local function deliver(md, count)
   local root = repo_root(vim.api.nvim_buf_get_name(0)) or vim.fn.getcwd()
   local fname = cfg.review_file
   local path = root .. "/" .. fname
-  if not file_utils.write(path, md) then return notify.error("could not write " .. path) end
+  if not file_utils.write(path, md) then
+    notify.error("could not write " .. path)
+    return
+  end
   add_local_exclude(root, fname)
 
   local msg = ("Read `%s` in the repo root. It lists my review comments on your recent changes. Work through each one, then delete the file."):format(
@@ -1049,6 +1077,8 @@ local function preview_send(count)
 
   local width = math.floor(vim.o.columns * 0.7)
   local height = math.floor(vim.o.lines * 0.6)
+  ---@param title string
+  ---@return vim.api.keyset.win_config
   local function float_cfg(title)
     return {
       relative = "editor",
@@ -1092,6 +1122,7 @@ local function preview_send(count)
     close()
     deliver(build_markdown(), count)
   end
+  ---@param delta integer
   local function nav(delta)
     idx = ((idx - 1 + delta) % total) + 1
     render()
@@ -1112,7 +1143,8 @@ end
 function M.submit()
   if not require_active() then return end
   if #M.comments == 0 and not message() then
-    return notify.warn("nothing to send (no comments or message)")
+    notify.warn("nothing to send (no comments or message)")
+    return
   end
   preview_send(#M.comments)
 end

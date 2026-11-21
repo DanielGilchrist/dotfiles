@@ -37,6 +37,8 @@ local slots = {
   state_triage = { groups = { "@keyword", "Statement" } }
 }
 
+---@param slot { groups: string[], attr?: "fg" | "bg" }
+---@return string?
 local function resolve(slot)
   for _, group in ipairs(slot.groups) do
     local hl = vim.api.nvim_get_hl(0, { name = group, link = false })

@@ -18,10 +18,13 @@
 ---@class snacks.input
 ---@overload fun(opts: Partial<snacks.input.Opts>, on_confirm: fun(value?: string)): snacks.win
 
--- Window and buffer handles are integers, which Neovim's API requires.
-
 ---@class snacks.win
 ---@field win? integer
 ---@field buf? integer
 
 ---@alias snacks.picker.Pos { [1]: integer, [2]: integer }
+
+-- Ruby LSP defines its own requests, which Client:request forwards as-is
+-- (runtime/lua/vim/lsp/client.lua:726 never checks the method against the spec).
+---@class vim.lsp.Client
+---@field request fun(self: vim.lsp.Client, method: vim.lsp.protocol.Method.ClientToServer.Request | "rubyLsp/workspace/dependencies", params?: table, handler?: lsp.Handler, bufnr?: integer): boolean, integer?

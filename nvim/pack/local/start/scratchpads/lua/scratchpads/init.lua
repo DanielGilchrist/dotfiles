@@ -4,26 +4,33 @@ local str = require("utils.str")
 local ui = require("utils.ui")
 local scratchpads_dir = vim.fs.normalize("~/.local/share/scratchpads") .. "/"
 
-local function scratch_search(_title, opts)
-  opts = opts == nil and {} or opts
+---@param title        string
+---@param on_selected? fun(selected: snacks.picker.Item[])
+local function scratch_search(title, on_selected)
+  ---@type fun(picker: snacks.Picker)?
+  local confirm
+  if on_selected then
+    local handle_selected = on_selected
 
-  local args = { dirs = { scratchpads_dir }, hidden = false }
-
-  if opts.confirm then
-    args.confirm = function (picker, item)
+    ---@param picker snacks.Picker
+    confirm = function (picker)
+      local selected = picker:selected({ fallback = true })
       picker:close()
-
-      if opts.multiselect then
-        opts.confirm(picker:selected())
-      else
-        opts.confirm(item)
-      end
+      handle_selected(selected)
     end
   end
 
-  Snacks.picker.files(args)
+  Snacks.picker.files({
+    title = title,
+    dirs = { scratchpads_dir },
+    hidden = false,
+    confirm = confirm
+  })
 end
 
+---@param count     integer
+---@param extension string
+---@return string
 local function build_new_filename(count, extension)
   return scratchpads_dir .. "scratch" .. count .. extension
 end
@@ -35,12 +42,15 @@ end
 -- Scratchpads are shared across nvim instances. A name with a live swapfile
 -- is likely open (unsaved) in another instance even if the file doesn't exist
 -- on disk yet, so treat it as taken to avoid E325 on `:edit`.
+---@param filename string
+---@return boolean
 local function swapfile_exists(filename)
   local swap_dir = vim.fn.stdpath("state") .. "/swap/"
   local encoded = vim.fn.fnamemodify(filename, ":p"):gsub("/", "%%")
   return is.not_empty(vim.fn.glob(swap_dir .. encoded .. ".sw*"))
 end
 
+---@param extension string
 local function create_scratchpad(extension)
   if scratchpads_dir_not_created() then
     vim.fn.mkdir(scratchpads_dir, "p")
@@ -90,6 +100,8 @@ local function open_scratchpad()
   end
 end
 
+---@param filename string
+---@return boolean
 local function valid_scratch_file(filename)
   return is.not_empty(filename) and is.file_readable(filename) and str.includes(filename, scratchpads_dir, true)
 end
@@ -119,6 +131,7 @@ local function rename_scratchpad()
 end
 
 local function remove_scratchpad()
+  ---@param selected snacks.picker.Item[]
   local function delete_scratchpads(selected)
     if not selected or #selected == 0 then
       notify.warn("No scratchpads selected for removal!")
@@ -146,10 +159,7 @@ local function remove_scratchpad()
     end)
   end
 
-  scratch_search("Delete Scratchpad", {
-    multiselect = true,
-    confirm = delete_scratchpads
-  })
+  scratch_search("Delete Scratchpad", delete_scratchpads)
 end
 
 return { new = new_scratchpad, open = open_scratchpad, rename = rename_scratchpad, remove = remove_scratchpad }

@@ -3,6 +3,8 @@ local notify = require("utils.notify")
 local is = require("utils.is")
 
 local map = vim.keymap.set
+---@param keys string
+---@return string
 local leader = function (keys) return "<leader>" .. keys end
 
 -- Better up/down with wrapped lines
@@ -101,8 +103,9 @@ end, { desc = "Copy relative file path" }
 )
 
 -- Spotify
-local function playback(flag)
-  vim.fn.jobstart({ "spotatui", "playback", flag }, {
+---@param flags string[]
+local function playback(flags)
+  vim.fn.jobstart(vim.list_extend({ "spotatui", "playback" }, flags), {
     stderr_buffered = true,
     on_stderr = function (_, data)
       local error_message = table.concat(data)
@@ -117,9 +120,9 @@ local function playback(flag)
 end
 
 map("n", leader("mo"), function () Snacks.terminal.toggle("spotify") end, { desc = "Open spotify" })
-map("n", leader("mn"), function () playback("--next") end, { desc = "Next song" })
-map("n", leader("mp"), function () playback("--previous") end, { desc = "Previous song" })
-map("n", leader("mt"), function () playback("play-pause") end, { desc = "Toggle play/pause" })
+map("n", leader("mn"), function () playback({ "--next" }) end, { desc = "Next song" })
+map("n", leader("mp"), function () playback({ "--previous" }) end, { desc = "Previous song" })
+map("n", leader("mt"), function () playback({ "play-pause" }) end, { desc = "Toggle play/pause" })
 map("n", leader("mf"), function () playback({ "seek", "10000" }) end, { desc = "Fast-forward 10s" })
 map("n", leader("mb"), function () playback({ "seek", "--", "-10000" }) end, { desc = "Rewind 10s" })
 
@@ -205,7 +208,11 @@ map("n", leader("tp"), function ()
         return
       end
 
-      local random_photo = function () return photos[math.random(#photos)] end
+      ---@return string
+      local random_photo = function ()
+        local photo = assert(photos[math.random(#photos)], "no photos")
+        return photo
+      end
       local advance ---@type fun()
 
       local win = Snacks.win({
@@ -219,6 +226,7 @@ map("n", leader("tp"), function ()
         bo = { buftype = "nofile", bufhidden = "wipe" }
       })
 
+      ---@param photo string
       ---@return integer?, integer?
       local function photo_size_in_cells(photo)
         local output = vim.fn.system({ "sips", "-g", "pixelWidth", "-g", "pixelHeight", photo })
@@ -250,6 +258,7 @@ map("n", leader("tp"), function ()
       -- The sips estimate gets the aspect roughly right up front, but snacks
       -- computes its own render grid (DPI + terminal scale), so we snap the
       -- window to whatever it actually drew to keep the border tight.
+      ---@param photo string
       local function show(photo)
         local width, height = photo_size_in_cells(photo)
         if width and height then

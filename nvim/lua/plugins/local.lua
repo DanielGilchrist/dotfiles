@@ -1,3 +1,6 @@
+---@param name  string
+---@param opts? LazyPluginSpec
+---@return LazyPluginSpec
 local function local_plugin(name, opts)
   return vim.tbl_extend("force", {
     dir = vim.fn.stdpath("config") .. "/pack/local/start/" .. name,

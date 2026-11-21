@@ -2,6 +2,12 @@ local notify = require("utils.notify")
 local cmd = require("utils.cmd")
 local notify_id = "srb-tc-id"
 
+---@class SrbError
+---@field file string
+---@field line string
+
+---@param output string
+---@return SrbError[]
 local function parse_srb_errors(output)
   local files = {}
   local seen = {}
@@ -17,6 +23,7 @@ local function parse_srb_errors(output)
   return files
 end
 
+---@param files SrbError[]
 local function open_files_in_new_tab(files)
   if #files == 0 then
     notify.info("No type errors found!")
@@ -47,14 +54,20 @@ local function run_srb_tc()
   local output = ""
   local error_output = ""
 
+  ---@param _    integer
+  ---@param data string[]
   local function on_stdout(_, data)
     output = output .. table.concat(data, "\n")
   end
 
+  ---@param _    integer
+  ---@param data string[]
   local function on_stderr(_, data)
     error_output = error_output .. table.concat(data, "\n")
   end
 
+  ---@param _    integer
+  ---@param code integer
   local function on_exit(_, code)
     notify.hide(notify_id)
 

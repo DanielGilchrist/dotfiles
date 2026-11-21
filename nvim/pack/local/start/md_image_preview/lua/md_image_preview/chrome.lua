@@ -129,7 +129,7 @@ function Chrome:alive()
 end
 
 ---@param method         string
----@param params?        table
+---@param params?        table<string, unknown>
 ---@param cb?            fun(result: unknown, err: unknown)
 ---@param browser_level? boolean                            send without the page session (Target.*, Browser.*)
 function Chrome:send(method, params, cb, browser_level)
@@ -161,7 +161,10 @@ end
 --- Run <cb> once the page is loaded and marked.js is available.
 ---@param cb fun()
 function Chrome:when_ready(cb)
-  if self.ready then return cb() end
+  if self.ready then
+    cb()
+    return
+  end
   table.insert(self.waiting, cb)
 end
 
@@ -203,7 +206,8 @@ function Chrome:start(on_error)
   )
 
   if not self.handle then
-    return on_error("could not spawn " .. self.binary)
+    on_error("could not spawn " .. self.binary)
+    return
   end
 
   from_chrome:read_start(function (err, chunk)
@@ -213,15 +217,22 @@ function Chrome:start(on_error)
 
   self:send("Target.createTarget", { url = "about:blank" }, function (created, err)
     local target_id = decode_string_field(created, "targetId")
-    if not target_id then return on_error("Target.createTarget failed: " .. vim.inspect(err or created)) end
+    if not target_id then
+      on_error("Target.createTarget failed: " .. vim.inspect(err or created))
+      return
+    end
     self:send("Target.attachToTarget", { targetId = target_id, flatten = true }, function (attached, attach_err)
       local session_id = decode_string_field(attached, "sessionId")
       if not session_id then
-        return on_error("Target.attachToTarget failed: " .. vim.inspect(attach_err or attached))
+        on_error("Target.attachToTarget failed: " .. vim.inspect(attach_err or attached))
+        return
       end
       self.session_id = session_id
       self:send("Page.navigate", { url = "file://" .. self.template }, function (_, nav_err)
-        if nav_err then return on_error("Page.navigate failed: " .. vim.inspect(nav_err)) end
+        if nav_err then
+          on_error("Page.navigate failed: " .. vim.inspect(nav_err))
+          return
+        end
         self:send(
           "Runtime.evaluate",
           {
@@ -230,7 +241,10 @@ function Chrome:start(on_error)
             returnByValue = true
           },
           function (_, eval_err)
-            if eval_err then return on_error("template did not load: " .. vim.inspect(eval_err)) end
+            if eval_err then
+              on_error("template did not load: " .. vim.inspect(eval_err))
+              return
+            end
             self:flush_waiting()
           end
         )

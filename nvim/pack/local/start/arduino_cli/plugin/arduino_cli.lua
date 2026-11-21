@@ -25,6 +25,9 @@ end, { desc = "Select board then compile and upload to it" }
 vim.api.nvim_create_autocmd("FileType", {
   pattern = "arduino",
   callback = function (ev)
+    ---@param lhs  string
+    ---@param rhs  string
+    ---@param desc string
     local map = function (lhs, rhs, desc)
       vim.keymap.set("n", lhs, rhs, { buf = ev.buf, desc = desc })
     end

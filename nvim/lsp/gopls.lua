@@ -1,3 +1,5 @@
+---@param client vim.lsp.Client
+---@param bufnr  integer
 local function organise_imports_and_format_on_save(client, bufnr)
   vim.api.nvim_create_autocmd("BufWritePre", {
     buffer = bufnr,

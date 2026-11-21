@@ -1,6 +1,9 @@
 local cmd = require("utils.cmd")
 local notify = require("utils.notify")
 
+---@param buf  integer
+---@param lang string
+---@return string?
 local function fence_at_cursor(buf, lang)
   local total = vim.api.nvim_buf_line_count(buf)
   local cur = vim.api.nvim_win_get_cursor(0)[1]
@@ -19,7 +22,7 @@ local function fence_at_cursor(buf, lang)
     local line = vim.api.nvim_buf_get_lines(buf, i - 1, i, false)[1] or ""
     if line:match("^```%s*$") then
       local body = vim.api.nvim_buf_get_lines(buf, start, i - 1, false)
-      return table.concat(body, "\n"), start, i
+      return table.concat(body, "\n")
     end
   end
   return nil

@@ -1,6 +1,8 @@
 local notify = require("utils.notify")
 local str = require("utils.str")
 
+---@param text string
+---@return string
 local function double_quote(text)
   return '"' .. text .. '"'
 end
@@ -14,6 +16,9 @@ local function maybe_test_name()
   return file_path:match("test/(.*)_test%.rb")
 end
 
+---@param test_name    string
+---@param line_number? integer
+---@return string
 local function build_test_command(test_name, line_number)
   local test_command = "test " .. double_quote(test_name)
 
@@ -24,6 +29,7 @@ local function build_test_command(test_name, line_number)
   return test_command
 end
 
+---@param test_command string
 local function save_to_clipboard_and_notify(test_command)
   vim.fn.setreg("+", test_command)
   notify.info(test_command)

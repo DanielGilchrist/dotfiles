@@ -2,9 +2,13 @@ local notify = require("utils.notify")
 local is = require("utils.is")
 local str = require("utils.str")
 
+---@class TargetPath
+---@field paths string[]
 local TargetPath = {}
 TargetPath.__index = TargetPath
 
+---@param path string
+---@return TargetPath
 function TargetPath.new(path)
   local self = setmetatable({}, TargetPath)
 
@@ -39,6 +43,7 @@ function TargetPath.new(path)
   return self
 end
 
+---@return string?
 function TargetPath:file()
   for _, path in ipairs(self.paths) do
     if is.file_readable(path) then
@@ -48,6 +53,7 @@ function TargetPath:file()
   return nil
 end
 
+---@return string?
 function TargetPath:directory()
   for _, path in ipairs(self.paths) do
     local directory = path:gsub("_test", ""):gsub(".rb", "")
@@ -59,6 +65,8 @@ function TargetPath:directory()
   return nil
 end
 
+---@param path string
+---@return string?
 function TargetPath.__parse_target_path(path)
   if str.includes(path, "app/") then
     local result = path:gsub("app/", "test/"):gsub("%.rb$", "_test.rb")
@@ -70,6 +78,8 @@ function TargetPath.__parse_target_path(path)
   return nil
 end
 
+---@param path string
+---@return string?
 function TargetPath.__parse_functional_target_path(path)
   if str.excludes(path, "app/") and str.includes(path, "controllers/") then
     local result = path:gsub("controllers/", "functional/")
@@ -81,6 +91,8 @@ function TargetPath.__parse_functional_target_path(path)
   return nil
 end
 
+---@param path string
+---@return string?
 function TargetPath.__parse_integration_target_path(path)
   if str.excludes(path, "app/") and str.includes(path, "controllers/") then
     local result = path:gsub("controllers/", "integration/")
@@ -92,18 +104,24 @@ function TargetPath.__parse_integration_target_path(path)
   return nil
 end
 
+---@param path? string
+---@return string?
 function TargetPath.__parse_test_to_file_fallback_path(path)
   if not path or str.excludes(path, "app/") then
     return
   end
 
   local base_path = path:match("(.+)/[^/]+$")
+  if not base_path then
+    return
+  end
+
   return base_path .. ".rb"
 end
 
 return {
   open_test = function ()
-    local current_file_path = vim.fn.expand("%:p")
+    local current_file_path = vim.api.nvim_buf_get_name(0)
     local target_path = TargetPath.new(current_file_path)
     local target_file = target_path:file()
 

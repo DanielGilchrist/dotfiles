@@ -3,6 +3,7 @@ vim.g.loaded_agent_nvim = true
 
 require("agent.keymaps").register()
 
+---@param action string
 local function dispatch(action)
   local a = require("agent")
   if a[action] then a[action]() end
@@ -14,6 +15,7 @@ vim.api.nvim_create_user_command("AgentOpen", function () dispatch("open_or_pick
 vim.api.nvim_create_user_command("AgentPrompt", function () dispatch("send_prompt") end, {})
 vim.api.nvim_create_user_command("AgentKill", function () dispatch("kill_agent") end, {})
 
+---@param action string
 local function review(action)
   local r = require("agent.review")
   if r[action] then r[action]() end

@@ -35,6 +35,8 @@ function M.ensure()
   building = true
   local before = installed()
   local output = {}
+  ---@param _     string?
+  ---@param data? string
   local function collect(_, data)
     if not data then
       return

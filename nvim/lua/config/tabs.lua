@@ -99,6 +99,9 @@ end
 --- suffix where it doesn't clash with the existing Test/Toggle group.
 function M.setup()
   local prefix = "<leader><Tab>"
+  ---@param suffix string
+  ---@param fn     string | function
+  ---@param desc   string
   local function map(suffix, fn, desc)
     vim.keymap.set("n", prefix .. suffix, fn, { desc = desc, silent = true })
   end

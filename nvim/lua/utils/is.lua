@@ -61,14 +61,14 @@ function M.not_directory(path)
 end
 
 --- Check if a value is an empty table
----@param value any
+---@param value unknown
 ---@return boolean
 function M.empty_table(value)
   return M.table(value) and (vim.tbl_isempty(value) or (#value == 1 and value[1] == ""))
 end
 
 --- Check if a value is empty (nil, empty string, or empty table)
----@param value any
+---@param value unknown
 ---@return boolean
 function M.empty(value)
   return value == nil or value == "" or M.empty_table(value)

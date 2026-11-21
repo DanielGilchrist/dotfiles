@@ -28,6 +28,8 @@ end
 ---@param on_confirm fun(name: string)
 ---@param default?   string
 function M.agent_name(prompt, on_confirm, default)
+  ---@param name string
+  ---@return string[][]
   local function title_for(name)
     local problem = name_problem(name)
     local hl = problem and "DiagnosticError" or "SnacksInputTitle"

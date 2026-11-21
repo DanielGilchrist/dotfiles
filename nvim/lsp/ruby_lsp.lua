@@ -1,18 +1,51 @@
 local lsp_utils = require("lsp.utils")
+local is = require("utils.is")
 
+---@class RubyDependency
+---@field name       string
+---@field version    string
+---@field path       string
+---@field dependency boolean
+
+---@param value unknown
+---@return RubyDependency?
+local function decode_dependency(value)
+  if not is.table(value) then return nil end
+  local name, version, path = value.name, value.version, value.path
+  if not (is.string(name) and is.string(version) and is.string(path)) then return nil end
+  return { name = name, version = version, path = path, dependency = value.dependency == true }
+end
+
+---@param value unknown
+---@return RubyDependency[]
+local function decode_dependencies(value)
+  local dependencies = {}
+  if not is.table(value) then return dependencies end
+  for _, raw in ipairs(value) do
+    local dependency = decode_dependency(raw)
+    if dependency then
+      table.insert(dependencies, dependency)
+    end
+  end
+  return dependencies
+end
+
+---@param client vim.lsp.Client
+---@param bufnr  integer
 local function add_ruby_deps_command(client, bufnr)
+  ---@param opts vim.api.keyset.create_user_command.command_args
   local show_ruby_deps = function (opts)
     local params = vim.lsp.util.make_text_document_params()
     local showAll = opts.args == "all"
 
     client:request("rubyLsp/workspace/dependencies", params, function (error, result)
       if error then
-        print("Error showing deps: " .. error)
+        print("Error showing deps: " .. error.message)
         return
       end
 
       local qf_list = {}
-      for _, item in ipairs(result) do
+      for _, item in ipairs(decode_dependencies(result)) do
         if showAll or item.dependency then
           table.insert(qf_list, {
             text = string.format("%s (%s) - %s", item.name, item.version, item.dependency),
@@ -35,10 +68,13 @@ local function add_ruby_deps_command(client, bufnr)
   })
 end
 
+---@param command lsp.Command
+---@param _ctx    lsp.HandlerContext
 local function open_file(command, _ctx)
-  local args = command.arguments[1]
-  if args and args[1] then
-    vim.cmd("edit " .. vim.uri_to_fname(args[1]))
+  local args = command.arguments and command.arguments[1]
+  local uri = type(args) == "table" and args[1]
+  if type(uri) == "string" then
+    vim.cmd("edit " .. vim.uri_to_fname(uri))
   end
 end
 

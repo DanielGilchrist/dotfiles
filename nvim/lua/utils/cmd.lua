@@ -11,23 +11,28 @@ local function build_command_with_fallback(command_name, args)
   return command .. " || " .. fallback
 end
 
+---@class CliOpts
+---@field on_stdout? fun(job_id: integer, data: string[], name: string) Callback for stdout
+---@field on_stderr? fun(job_id: integer, data: string[], name: string) Callback for stderr
+
+---@param opts CliOpts
 local function validate_cli_opts(opts)
-  if opts.on_stdout or opts.onstderr then
+  if opts.on_stdout or opts.on_stderr then
     return
   end
 
-  error(string.format("`opts` must contain at least one of `on_stdout` or `onstderr`!"))
+  error(string.format("`opts` must contain at least one of `on_stdout` or `on_stderr`!"))
 end
 
 local M = {}
 
 --- Create a default handler that only calls the callback when data is not empty
----@param callback fun(data: any)
----@return fun(job_id: integer, data: any)
+---@param callback fun(data: string[])
+---@return fun(job_id: integer, data: string[], name: string)
 M.default_handler = function (callback)
   return function (_, data)
     if is.not_empty(data) then
-      return callback(data)
+      callback(data)
     end
   end
 end
@@ -39,12 +44,8 @@ M.success = function (code)
   return code == 0
 end
 
----@class TandaCliOpts
----@field on_stdout? fun(job_id: integer, data: string[], name: string) Callback for stdout
----@field on_stderr? fun(job_id: integer, data: string[], name: string) Callback for stderr
-
----@param args  string[]     Command arguments
----@param opts? TandaCliOpts Optional configuration
+---@param args  string[] Command arguments
+---@param opts? CliOpts  Optional configuration
 M.tanda_cli = function (args, opts)
   opts = opts or {}
 
@@ -64,12 +65,8 @@ M.tanda_cli_command = function (args)
   return build_command_with_fallback("tanda_cli", args)
 end
 
----@class ArduinoCliOpts
----@field on_stdout? fun(job_id: integer, data: string[], name: string) Callback for stdout
----@field on_stderr? fun(job_id: integer, data: string[], name: string) Callback for stderr
-
----@param args  string[]       Command arguments
----@param opts? ArduinoCliOpts Optional configuration
+---@param args  string[] Command arguments
+---@param opts? CliOpts  Optional configuration
 M.arduino_cli = function (args, opts)
   opts = opts or {}
 
@@ -83,12 +80,8 @@ M.arduino_cli = function (args, opts)
   })
 end
 
----@class ShooCliOpts
----@field on_stdout? fun(job_id: integer, data: string[], name: string) Callback for stdout
----@field on_stderr? fun(job_id: integer, data: string[], name: string) Callback for stderr
-
----@param args  string[]    Command arguments
----@param opts? ShooCliOpts Optional configuration
+---@param args  string[] Command arguments
+---@param opts? CliOpts  Optional configuration
 M.shoo = function (args, opts)
   opts = opts or {}
 

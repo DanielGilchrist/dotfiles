@@ -1,3 +1,5 @@
+---@param bufnr  integer
+---@param on_dir fun(root_dir?: string)
 local default_root_dir = function (bufnr, on_dir)
   local root_markers = { { "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "bun.lockb", "bun.lock" }, { ".git" } }
 

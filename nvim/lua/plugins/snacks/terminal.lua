@@ -1,19 +1,20 @@
 local path = require("utils.path")
 
+---@param opts? snacks.terminal.Opts
 local function open_terminal(opts)
-  opts = opts == nil and {} or opts
-
   local default_opts = {
     win = {
       position = "right"
     }
   }
 
-  local merged_opts = vim.tbl_extend("force", default_opts, opts)
+  local merged_opts = vim.tbl_extend("force", default_opts, opts or {})
 
   Snacks.terminal(nil, merged_opts)
 end
 
+---@param buf integer
+---@return snacks.win?
 local function find_snacks_terminal(buf)
   for _, terminal in pairs(Snacks.terminal.list()) do
     if terminal.buf == buf then

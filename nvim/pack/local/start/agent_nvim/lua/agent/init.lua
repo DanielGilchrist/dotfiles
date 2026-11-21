@@ -184,6 +184,7 @@ end
 --- so the exit hook is registered once per buffer.
 ---@param name string
 ---@param cmd  string[]
+---@return snacks.win?
 local function open_agent_terminal(name, cmd)
   return Snacks.terminal.open(cmd, {
     win = {

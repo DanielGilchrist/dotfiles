@@ -1,8 +1,10 @@
 local cmd = require("utils.cmd")
 local notify = require("utils.notify")
 
+---@param opts? CliOpts
+---@return CliOpts
 local function default_options(opts)
-  opts = opts == nil and {} or opts
+  opts = opts or {}
 
   return vim.tbl_extend("force", {
     on_stdout = cmd.default_handler(notify.info),
@@ -32,6 +34,7 @@ local function time_worked()
 end
 
 local function time_worked_display()
+  ---@param data string[]
   local function spawn_window(data)
     Snacks.win({
       title = "Time worked for the week",
