@@ -1,0 +1,5 @@
+[syntax]
+level = "Lua54"
+
+[indent]
+width = 2
