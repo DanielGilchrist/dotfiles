@@ -88,3 +88,6 @@ spotatui/mcp.json
 
 # agent-tui
 agent-tui/target/
+
+# cursor
+cursor/
