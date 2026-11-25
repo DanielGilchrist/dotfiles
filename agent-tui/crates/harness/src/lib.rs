@@ -98,14 +98,6 @@ pub struct Claude {
     processes: Arc<dyn Processes>,
 }
 
-/// `/tmp` as the filesystem resolves it (`/private/tmp` on macOS). Claude
-/// Code compares an added directory by its resolved path, so passing the
-/// symlink asks for trust again on every resume.
-fn scratch_dir() -> PathBuf {
-    let tmp = PathBuf::from("/tmp");
-    std::fs::canonicalize(&tmp).unwrap_or(tmp)
-}
-
 impl Claude {
     pub fn new(home: &Path) -> Self {
         Self::with_program(
@@ -126,7 +118,7 @@ impl Claude {
             outputs: Locations::default(),
             task_files: TaskFiles::default(),
             permission_mode: "auto".into(),
-            add_dirs: vec![scratch_dir()],
+            add_dirs: vec![PathBuf::from("/tmp")],
             chains: Chains::default(),
             processes: Arc::new(Machine { program }),
         }
@@ -524,13 +516,12 @@ impl Harness for Claude {
             .cwd(&workdir)
             .env_remove(INHERITED_SESSION_ENV.iter().copied())
             .env("CLAUDE_CODE_FORCE_SESSION_PERSISTENCE", "1");
-        for dir in &self.add_dirs {
-            spec = spec.arg("--add-dir").arg(dir);
-        }
         spec = spec.args(["--permission-mode", self.permission_mode.as_str()]);
-        spec = spec
-            .arg("--settings")
-            .arg(hook_settings(ctx.report, ctx.session.as_str()));
+        spec = spec.arg("--settings").arg(launch_settings(
+            ctx.report,
+            ctx.session.as_str(),
+            &self.add_dirs,
+        ));
         if let Some(conversation) = resume {
             spec = spec.args(["--resume", conversation.resumable().as_str()]);
         }
@@ -1045,9 +1036,11 @@ fn text_of(content: &serde_json::Value) -> String {
 }
 
 /// `--settings` JSON adding hooks that report each event to the TUI with
-/// `<report> event <session>`. Claude merges hooks from every settings
-/// source, so the user's own hooks keep running.
-fn hook_settings(report: &Path, session: &str) -> String {
+/// `<report> event <session>`, and the directories the agent may write to.
+/// Claude merges settings from every source, so the user's own hooks keep
+/// running. The directories go here rather than on `--add-dir`, which asks
+/// to trust them again on every launch, a resume included.
+fn launch_settings(report: &Path, session: &str, add_dirs: &[PathBuf]) -> String {
     let command = shell_words::join([report.to_string_lossy().as_ref(), "event", session]);
     let hooks: serde_json::Map<String, serde_json::Value> = HOOKS
         .iter()
@@ -1060,7 +1053,11 @@ fn hook_settings(report: &Path, session: &str) -> String {
             ((*event).to_string(), serde_json::Value::Array(vec![group]))
         })
         .collect();
-    serde_json::json!({ "hooks": hooks }).to_string()
+    serde_json::json!({
+        "hooks": hooks,
+        "permissions": { "additionalDirectories": add_dirs },
+    })
+    .to_string()
 }
 
 fn running_tasks(
@@ -2258,8 +2255,12 @@ mod tests {
 
     #[test]
     fn launches_report_every_state_change_through_the_agent_binary() {
-        let settings: serde_json::Value =
-            serde_json::from_str(&hook_settings(Path::new("/my bin/agent"), "fix")).expect("json");
+        let settings: serde_json::Value = serde_json::from_str(&launch_settings(
+            Path::new("/my bin/agent"),
+            "fix",
+            &[PathBuf::from("/tmp")],
+        ))
+        .expect("json");
         let command = settings
             .pointer("/hooks/Stop/0/hooks/0/command")
             .and_then(serde_json::Value::as_str);
@@ -2269,6 +2270,11 @@ mod tests {
                 .pointer("/hooks/Notification/0/matcher")
                 .and_then(serde_json::Value::as_str),
             Some("elicitation_dialog")
+        );
+        assert_eq!(
+            settings.pointer("/permissions/additionalDirectories/0"),
+            Some(&serde_json::json!("/tmp")),
+            "directories go in the settings, as --add-dir asks to trust them on every launch"
         );
     }
 
