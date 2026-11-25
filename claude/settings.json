@@ -105,6 +105,7 @@
   "enabledPlugins": {
     "developer-tooling@tanda-plugins": true
   },
+  "feedbackDrafts": "off",
   "effortLevel": "medium",
   "claudeMdExcludes": [
     "CLAUDE.md",
@@ -134,5 +135,5 @@
       "url": "https://mcp.sentry.dev/mcp"
     }
   },
-  "feedbackDrafts": "off"
+  "tui": "fullscreen"
 }
