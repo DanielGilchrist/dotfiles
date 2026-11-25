@@ -98,6 +98,14 @@ pub struct Claude {
     processes: Arc<dyn Processes>,
 }
 
+/// `/tmp` as the filesystem resolves it (`/private/tmp` on macOS). Claude
+/// Code compares an added directory by its resolved path, so passing the
+/// symlink asks for trust again on every resume.
+fn scratch_dir() -> PathBuf {
+    let tmp = PathBuf::from("/tmp");
+    std::fs::canonicalize(&tmp).unwrap_or(tmp)
+}
+
 impl Claude {
     pub fn new(home: &Path) -> Self {
         Self::with_program(
@@ -118,7 +126,7 @@ impl Claude {
             outputs: Locations::default(),
             task_files: TaskFiles::default(),
             permission_mode: "auto".into(),
-            add_dirs: vec![PathBuf::from("/tmp")],
+            add_dirs: vec![scratch_dir()],
             chains: Chains::default(),
             processes: Arc::new(Machine { program }),
         }
